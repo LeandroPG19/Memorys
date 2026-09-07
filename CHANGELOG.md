@@ -8,6 +8,15 @@ revisions without binary changes).
 
 ## [Unreleased]
 
+### Cursor: initialize en SSE dejaba todos los chats en 405
+
+Cursor anuncia `roots` en `initialize`. El daemon respondía ese handshake
+como `text/event-stream` con un `roots/list` encima. El cliente Streamable
+HTTP de Cursor daba el initialize por bueno (Settings verde) y el POST
+siguiente (`tools/call`) salía 405; al reintentar, SSE 404. Un chat nuevo
+reutiliza esa conexión rota. `initialize` vuelve a ser JSON siempre; las
+roots se siguen adoptando si el cliente las manda luego en JSON-RPC.
+
 ### Un nombre fusionado volvía a la vida al escribir sobre él
 
 `dedupe --apply` mueve todo al ganador y guarda el nombre perdedor en

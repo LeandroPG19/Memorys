@@ -417,6 +417,7 @@ fn batch_items(payload: Value) -> Result<(Vec<Value>, bool), Value> {
 
 const ROOTS_REQUEST_ID: &str = "cuba_roots";
 
+#[cfg(test)]
 fn asks_for_roots(items: &[Value]) -> bool {
     items.iter().any(|item| {
         item.get("method").and_then(Value::as_str) == Some("initialize")
@@ -453,24 +454,6 @@ async fn adopt_client_root(pool: &PgPool, key: &str, uri: &str) {
             tracing::warn!(client = %key, project = %name, error = %why, "could not adopt the client's root")
         }
     }
-}
-
-fn sse_response(server_request: Value, replies: Vec<Value>) -> Response {
-    let mut body = String::new();
-    for msg in std::iter::once(server_request).chain(replies) {
-        body.push_str("data: ");
-        body.push_str(&msg.to_string());
-        body.push_str("\n\n");
-    }
-    (
-        StatusCode::OK,
-        [
-            (axum::http::header::CONTENT_TYPE, "text/event-stream"),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
-        ],
-        body,
-    )
-        .into_response()
 }
 
 fn error_envelope(id: Value, code: i64, message: impl Into<String>) -> Value {
@@ -610,9 +593,6 @@ async fn mcp_endpoint(State(state): State<AppState>, headers: HeaderMap, body: B
         }
     }
 
-    let wants_roots =
-        crate::session::client_root_project_for(&key).is_none() && asks_for_roots(&items);
-
     let dispatch = async {
         let mut responses: Vec<Value> = Vec::with_capacity(items.len());
         for item in items {
@@ -646,16 +626,11 @@ async fn mcp_endpoint(State(state): State<AppState>, headers: HeaderMap, body: B
         return StatusCode::ACCEPTED.into_response();
     }
 
-    if wants_roots {
-        return sse_response(
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": ROOTS_REQUEST_ID,
-                "method": "roots/list"
-            }),
-            responses,
-        );
-    }
+    // Cursor's Streamable HTTP client treats an SSE initialize body as the
+    // session stream. When that short body ends it POSTs tools/call and
+    // reports 405; Settings stays green because initialize "succeeded".
+    // Roots are still adopted when the client POSTs the JSON-RPC reply
+    // (first_root_uri). Do not piggy-back roots/list on initialize.
 
     if is_batch {
         axum::Json(Value::Array(responses)).into_response()
@@ -862,19 +837,38 @@ mod tests {
         assert_eq!(first_root_uri(&ordinary_call), None);
     }
 
-    #[test]
-    fn the_roots_request_rides_out_before_the_reply_it_travels_with() {
-        let body = sse_response(
-            serde_json::json!({ "jsonrpc": "2.0", "id": ROOTS_REQUEST_ID, "method": "roots/list" }),
-            vec![serde_json::json!({ "jsonrpc": "2.0", "id": 0, "result": { "ok": true } })],
+    #[tokio::test]
+    async fn initialize_that_announces_roots_is_still_json() {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "roots": { "listChanged": true } },
+                "clientInfo": { "name": "cursor" }
+            }
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).expect("payload serializes"));
+        let response =
+            mcp_endpoint(State(state_with_clients(None, &[])), HeaderMap::new(), body).await;
+        let ctype = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            ctype.starts_with("application/json"),
+            "Cursor's Streamable HTTP client treats text/event-stream initialize as the \
+             session stream and 405s the next POST; got {ctype}"
         );
-        assert_eq!(
-            body.headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("text/event-stream"),
-            "sent as plain JSON the client sees two objects glued together and drops both"
-        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_BODY)
+            .await
+            .expect("response body");
+        let parsed: Value = serde_json::from_slice(&bytes).expect("JSON initialize body");
+        assert_eq!(parsed["id"], 1);
+        assert!(parsed.get("result").is_some(), "{parsed}");
     }
 
     #[test]
