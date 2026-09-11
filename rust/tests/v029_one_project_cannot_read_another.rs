@@ -24,7 +24,7 @@ async fn as_app_role(pool: &sqlx::PgPool, project: Uuid, sql: &str) -> Vec<Strin
 async fn the_text_of_one_project_never_comes_back_inside_another() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 

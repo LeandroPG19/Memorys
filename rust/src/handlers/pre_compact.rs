@@ -175,6 +175,23 @@ async fn snapshot(pool: &PgPool) -> Result<Value> {
         "pending_embeddings": pending_json,
         "active_goals": active_goals,
         "obs_count": key_obs.len(),
+        "saved": {
+            "observations": key_obs.len(),
+            "decisions": decisions.len(),
+            "unresolved_errors": unresolved.len(),
+            "pending_embeddings": pending.len(),
+            "summary_chars": summary_md.len(),
+        },
+        "discarded": {
+            "raw_turns": "not retained — only structured snapshot fields survive compact",
+            "observations_beyond_limit": "session observations after the newest 50",
+            "note": "pre_compact does not delete graph rows; it only freezes a recoverable slice",
+        },
+        "transparency": crate::handlers::contexto::transparency_block(
+            summary_md.len(),
+            "raw conversation turns outside this snapshot are not retained by pre_compact; \
+             restore re-injects summary_md + structured lists only",
+        ),
     }))
 }
 

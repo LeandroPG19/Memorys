@@ -1,21 +1,22 @@
 {
-  "name": "cuba-memorys",
-  "version": "0.24.0",
-  "mcpName": "io.github.LeandroPG19/cuba-memorys",
-  "description": "Persistent memory MCP server (v0.18) \u2014 self-growing knowledge graph that works without MCP sampling, poisoning quarantine, PostgreSQL + pgvector, bitemporal facts, BM25+RRF hybrid search, graph metrics/communities, Hebbian learning, episodic memory, audit log, project scoping, tree-sitter codegraph.",
+  "name": "memory-industry",
+  "version": "0.25.0",
+  "mcpName": "io.github.LeandroPG19/memory-industry",
+  "description": "Persistent memory MCP server (MemoryIndustry) \u2014 self-growing knowledge graph that works without MCP sampling, poisoning quarantine, PostgreSQL + pgvector, bitemporal facts, BM25+RRF hybrid search, graph metrics/communities, Hebbian learning, episodic memory, audit log, project scoping, tree-sitter codegraph.",
   "license": "Apache-2.0",
   "author": "Leandro P\u00e9rez G.",
   "repository": {
     "type": "git",
-    "url": "https://github.com/LeandroPG19/cuba-memorys.git"
+    "url": "https://github.com/LeandroPG19/Memorys.git"
   },
-  "homepage": "https://github.com/LeandroPG19/cuba-memorys#readme",
+  "homepage": "https://github.com/LeandroPG19/Memorys#readme",
   "bugs": {
-    "url": "https://github.com/LeandroPG19/cuba-memorys/issues"
+    "url": "https://github.com/LeandroPG19/Memorys/issues"
   },
   "keywords": [
     "mcp",
     "memory",
+    "memory-industry",
     "knowledge-graph",
     "ai-agent",
     "model-context-protocol",
@@ -29,6 +30,7 @@
     "postinstall": "node npm/postinstall.js"
   },
   "bin": {
+    "memory-industry": "npm/bin.js",
     "cuba-memorys": "npm/bin.js"
   },
   "engines": {

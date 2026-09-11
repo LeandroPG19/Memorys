@@ -148,6 +148,13 @@
     <h2>Diagnóstico completo</h2>
     <div class="body"><table id="checks"></table></div>
   </section>
+
+<section>
+  <h2>Live (SSE)</h2>
+  <div class="body">
+    <div id="live-events" class="muted">conectando a /events…</div>
+  </div>
+</section>
 </main>
 </div>
 
@@ -430,6 +437,30 @@ if (token()) {
 } else {
   $("gate").hidden = false;
 }
+</script>
+<script>
+(function liveStrip(){
+  const box = document.getElementById("live-events");
+  if (!box) return;
+  function push(line){
+    const d = document.createElement("div");
+    d.textContent = line;
+    box.prepend(d);
+    while (box.children.length > 30) box.removeChild(box.lastChild);
+  }
+  try {
+    const tok = sessionStorage.getItem("cuba_panel_token") || sessionStorage.getItem("mi_token") || "";
+    const url = tok ? ("/events?token=" + encodeURIComponent(tok)) : "/events";
+    const es = new EventSource(url);
+    es.onmessage = (ev) => {
+      try {
+        const j = JSON.parse(ev.data);
+        push((j.at||"") + "  " + (j.kind||"event") + "  " + JSON.stringify(j.payload||{}));
+      } catch(_) { push(ev.data); }
+    };
+    es.onerror = () => push("SSE desconectado…");
+  } catch(e) { push("SSE: " + e); }
+})();
 </script>
 </body>
 </html>

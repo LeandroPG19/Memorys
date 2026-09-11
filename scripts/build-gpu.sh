@@ -34,7 +34,15 @@ else
     nice -n 15 cargo build --release --features cuda -j "$JOBS"
 fi
 
-BIN="target/release/cuba-memorys"
+if [[ -f target/release/memory-industry.exe ]]; then
+    BIN="target/release/memory-industry.exe"
+elif [[ -f target/release/memory-industry ]]; then
+    BIN="target/release/memory-industry"
+elif [[ -f target/release/cuba-memorys.exe ]]; then
+    BIN="target/release/cuba-memorys.exe"
+else
+    BIN="target/release/cuba-memorys"
+fi
 echo
 "$BIN" --version
 echo

@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Open a [private security advisory](https://github.com/LeandroPG19/cuba-memorys/security/advisories/new)
+Open a [private security advisory](https://github.com/LeandroPG19/Memorys/security/advisories/new)
 on GitHub. That keeps the report private until a fix ships.
 
 Please do **not** open a public issue for anything exploitable.
@@ -17,8 +17,8 @@ maintainer; backporting to older lines is not something that can be promised hon
 
 | Version | Supported |
 |---|---|
-| 0.20.x | yes |
-| < 0.20 | no |
+| 0.25.x | yes |
+| < 0.25 | no |
 
 ## What this software actually protects, and what it does not
 

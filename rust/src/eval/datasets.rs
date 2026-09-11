@@ -12,6 +12,8 @@ pub struct EvaluationSample {
     pub expected_answer: Option<String>,
     pub ability: Option<String>,
     pub abstain: bool,
+    pub gold_entities: Vec<String>,
+    pub question_class: Option<String>,
 }
 
 impl EvaluationSample {
@@ -45,6 +47,10 @@ struct JsonlRow {
     question_type: Option<String>,
     #[serde(default)]
     abstain: bool,
+    #[serde(default)]
+    gold_entities: Vec<String>,
+    #[serde(default)]
+    question_class: Option<String>,
 }
 
 pub fn builtin_retrieval_set() -> Vec<EvaluationSample> {
@@ -56,6 +62,8 @@ pub fn builtin_retrieval_set() -> Vec<EvaluationSample> {
             expected_answer: None,
             ability: Some("information-extraction".into()),
             abstain: false,
+            gold_entities: Vec::new(),
+            question_class: Some("factoid".into()),
         },
         EvaluationSample {
             query: "decisión arquitectura MCP".into(),
@@ -64,6 +72,8 @@ pub fn builtin_retrieval_set() -> Vec<EvaluationSample> {
             expected_answer: None,
             ability: Some("information-extraction".into()),
             abstain: false,
+            gold_entities: Vec::new(),
+            question_class: Some("factoid".into()),
         },
     ]
 }
@@ -113,8 +123,10 @@ pub fn load_jsonl_dataset(path: &str) -> Result<Vec<EvaluationSample>, io::Error
             relevant_ids: ids,
             relevant_markers: markers,
             expected_answer: row.expected_answer,
-            ability: row.ability.or(row.question_type),
+            ability: row.ability.or(row.question_type.clone()),
             abstain: row.abstain,
+            gold_entities: row.gold_entities,
+            question_class: row.question_class.or(row.question_type),
         });
     }
 
@@ -135,4 +147,47 @@ pub fn load_locomo_dataset(path: &str) -> Result<Vec<EvaluationSample>, io::Erro
         return Ok(builtin_retrieval_set());
     }
     load_jsonl_dataset(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn factoid_answer_path() -> String {
+        format!(
+            "{}/eval-datasets/factoid-answer.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    #[test]
+    fn factoid_answer_jsonl_loads_as_id_scored_factoids() {
+        let samples = load_jsonl_dataset(&factoid_answer_path())
+            .expect("factoid-answer.jsonl must exist next to the other eval datasets");
+        assert!(
+            !samples.is_empty(),
+            "factoid-answer.jsonl must not be empty"
+        );
+        for (i, sample) in samples.iter().enumerate() {
+            assert_eq!(
+                sample.question_class.as_deref(),
+                Some("factoid"),
+                "row {i} must be question_class=factoid"
+            );
+            assert!(
+                sample.scored_by_id(),
+                "row {i} must score by observation UUID, not substring markers"
+            );
+            assert!(
+                (1..=3).contains(&sample.relevant_ids.len()),
+                "row {i} gold must be 1–3 observations whose content answers the question, not a top-N importance list; got {}",
+                sample.relevant_ids.len()
+            );
+            for id in &sample.relevant_ids {
+                Uuid::parse_str(id)
+                    .unwrap_or_else(|_| panic!("row {i} relevant_id {id} is not a UUID"));
+            }
+        }
+    }
 }

@@ -110,6 +110,7 @@ checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "http",
  "http-body",
@@ -125,6 +126,7 @@ dependencies = [
  "serde_core",
  "serde_json",
  "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tower",
@@ -443,47 +445,6 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
-]
-
-[[package]]
-name = "cuba-memorys"
-version = "0.24.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "flate2",
- "futures",
- "half",
- "hex",
- "hmac",
- "html2text",
- "lru",
- "mimalloc",
- "nalgebra",
- "ort",
- "pgvector",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "sysinfo",
- "tar",
- "tiktoken-rs",
- "tokenizers",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-python",
- "tree-sitter-rust",
- "url",
- "uuid",
- "zip",
- "zstd",
 ]
 
 [[package]]
@@ -1545,6 +1506,47 @@ name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+
+[[package]]
+name = "memory-industry"
+version = "0.25.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "flate2",
+ "futures",
+ "half",
+ "hex",
+ "hmac",
+ "html2text",
+ "lru",
+ "mimalloc",
+ "nalgebra",
+ "ort",
+ "pgvector",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "sysinfo",
+ "tar",
+ "tiktoken-rs",
+ "tokenizers",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "url",
+ "uuid",
+ "zip",
+ "zstd",
+]
 
 [[package]]
 name = "mimalloc"

@@ -51,7 +51,7 @@ async fn main() {
     let query = "how are candidates rescored after fusion?";
 
     let load = Instant::now();
-    let enabled = tokio::task::spawn_blocking(cuba_memorys::search::rerank::enabled)
+    let enabled = tokio::task::spawn_blocking(memory_industry::search::rerank::enabled)
         .await
         .unwrap();
     let load = load.elapsed();
@@ -66,7 +66,7 @@ async fn main() {
     let mut timings = Vec::with_capacity(runs);
     for i in 1..=runs {
         let started = Instant::now();
-        let scored = cuba_memorys::search::rerank::rerank(query, &refs)
+        let scored = memory_industry::search::rerank::rerank(query, &refs)
             .await
             .expect("rerank failed");
         let elapsed = started.elapsed();
@@ -80,7 +80,7 @@ async fn main() {
         println!("  run {i}: {elapsed:.2?}  ({verdict})");
     }
 
-    let scored = cuba_memorys::search::rerank::rerank(query, &refs)
+    let scored = memory_industry::search::rerank::rerank(query, &refs)
         .await
         .expect("rerank failed");
     println!("top-8 ranking (index:score):");

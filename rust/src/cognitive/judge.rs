@@ -46,15 +46,40 @@ pub trait ContradictionJudge: Send + Sync {
     }
 }
 
+/// Prefer MemoryIndustry env names; fall back to legacy `CUBA_*` for one release.
+fn env_alias(new_key: &str, legacy_key: &str) -> Result<String, env::VarError> {
+    env::var(new_key).or_else(|_| env::var(legacy_key))
+}
+
+fn judge_timeout_secs() -> u64 {
+    env_alias("MEMORY_INDUSTRY_LLM_TIMEOUT_SECS", "CUBA_JUEZ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(JUEZ_DEFAULT_TIMEOUT_SECS)
+}
+
 pub fn resolve_judge() -> Box<dyn ContradictionJudge> {
-    let mode = env::var("CUBA_JUDGE")
+    let mode = env_alias("MEMORY_INDUSTRY_JUDGE", "CUBA_JUDGE")
         .unwrap_or_else(|_| "auto".to_string())
         .to_lowercase();
     match mode.as_str() {
         "nli" | "nli_local" | "local" => Box::new(NliJudge::new(resolve_llm_judge())),
         "mcp_sampling" | "sampling" => Box::new(MCPSamplingJudge),
         "claude_cli" | "cli" => Box::new(ClaudeCodeJudge::from_env()),
+        "gemini_cli" | "gemini" => Box::new(GeminiCliJudge::from_env()),
         "heuristic" => Box::new(HeuristicJudge),
+        // Any named cloud/local OpenAI-compat provider (deepseek, qwen, openai, …)
+        // or explicit openai_compat / ollama aliases.
+        other
+            if other == "openai"
+                || other == "openai_compat"
+                || other == "ollama"
+                || other == "local_llm"
+                || other == "http"
+                || llm_provider_preset(other).is_some() =>
+        {
+            Box::new(OpenAiCompatJudge::from_env())
+        }
         _ => {
             let llm = resolve_llm_judge();
             if crate::cognitive::nli::available() {
@@ -76,17 +101,65 @@ pub fn resolve_offline_llm() -> Option<Box<dyn ContradictionJudge>> {
     resolve_offline_llm_within(None)
 }
 
+/// Generative backend for extract / relation-scan / judge prompts.
+/// Order: OpenAI-compat URL or provider preset (any vendor) → forced CLI → auto claude/gemini.
 pub fn resolve_offline_llm_within(
     timeout: Option<Duration>,
 ) -> Option<Box<dyn ContradictionJudge>> {
-    if which_in_path(&env::var("CUBA_JUEZ_CLI").unwrap_or_else(|_| "claude".into())) {
-        let mut judge = ClaudeCodeJudge::from_env();
+    let has_url = env_alias("MEMORY_INDUSTRY_LLM_BASE_URL", "CUBA_LLM_BASE_URL")
+        .map(|u| !u.trim().is_empty())
+        .unwrap_or(false);
+    let has_provider = env::var("MEMORY_INDUSTRY_LLM_PROVIDER")
+        .or_else(|_| env::var("CUBA_LLM_PROVIDER"))
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false);
+    if has_url || has_provider {
+        let mut judge = OpenAiCompatJudge::from_env();
         if let Some(t) = timeout {
             judge.timeout = t;
         }
         return Some(Box::new(judge));
     }
+
+    if let Ok(cli) = env_alias("MEMORY_INDUSTRY_LLM_CLI", "CUBA_JUEZ_CLI")
+        && which_in_path(&cli)
+    {
+        return Some(cli_judge_for_bin(&cli, timeout));
+    }
+
+    for bin in ["claude", "gemini"] {
+        if which_in_path(bin) {
+            return Some(cli_judge_for_bin(bin, timeout));
+        }
+    }
     None
+}
+
+fn cli_judge_for_bin(bin: &str, timeout: Option<Duration>) -> Box<dyn ContradictionJudge> {
+    let lower = bin.to_ascii_lowercase();
+    if lower.contains("gemini") {
+        let mut j = GeminiCliJudge::from_env();
+        j.cli = bin.to_string();
+        if let Some(t) = timeout {
+            j.timeout = t;
+        }
+        Box::new(j)
+    } else {
+        let mut j = ClaudeCodeJudge::from_env();
+        j.cli = bin.to_string();
+        if let Some(t) = timeout {
+            j.timeout = t;
+        }
+        Box::new(j)
+    }
+}
+
+/// How to enable generative LLM (gate / doctor). Vendor-agnostic.
+pub fn generative_llm_setup_hint() -> &'static str {
+    "Set MEMORY_INDUSTRY_LLM_PROVIDER (deepseek|qwen|moonshot|zhipu|siliconflow|openai|ollama|openrouter|…) \
+     + MEMORY_INDUSTRY_LLM_API_KEY (or the vendor key), or MEMORY_INDUSTRY_LLM_BASE_URL to any \
+     OpenAI-compatible /v1 endpoint (Chinese or Western clouds, Ollama, LM Studio, vLLM). \
+     Or authenticate `claude`/`gemini` on PATH, or use MCP sampling. Legacy CUBA_* still works."
 }
 
 pub fn unwrap_cli_reply(raw: &str) -> String {
@@ -97,7 +170,7 @@ pub fn unwrap_cli_reply(raw: &str) -> String {
 }
 
 pub fn default_max_pairs() -> usize {
-    env::var("CUBA_JUEZ_MAX_PAIRS")
+    env_alias("MEMORY_INDUSTRY_LLM_MAX_PAIRS", "CUBA_JUEZ_MAX_PAIRS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(JUEZ_DEFAULT_MAX_PAIRS)
@@ -111,16 +184,14 @@ pub struct ClaudeCodeJudge {
 
 impl ClaudeCodeJudge {
     pub fn from_env() -> Self {
-        let cli = env::var("CUBA_JUEZ_CLI").unwrap_or_else(|_| "claude".to_string());
-        let model = env::var("CUBA_JUEZ_MODEL").unwrap_or_else(|_| "claude-haiku-4-5".to_string());
-        let timeout_secs = env::var("CUBA_JUEZ_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(JUEZ_DEFAULT_TIMEOUT_SECS);
+        let cli = env_alias("MEMORY_INDUSTRY_LLM_CLI", "CUBA_JUEZ_CLI")
+            .unwrap_or_else(|_| "claude".to_string());
+        let model = env_alias("MEMORY_INDUSTRY_LLM_MODEL", "CUBA_JUEZ_MODEL")
+            .unwrap_or_else(|_| "claude-haiku-4-5".to_string());
         Self {
             cli,
             model,
-            timeout: Duration::from_secs(timeout_secs),
+            timeout: Duration::from_secs(judge_timeout_secs()),
         }
     }
 }
@@ -174,6 +245,388 @@ impl ContradictionJudge for ClaudeCodeJudge {
     }
 }
 
+/// Google Gemini CLI (`gemini`) — argv differ from Claude Code; do not reuse Claude flags.
+pub struct GeminiCliJudge {
+    pub cli: String,
+    pub model: String,
+    pub timeout: Duration,
+}
+
+impl GeminiCliJudge {
+    pub fn from_env() -> Self {
+        let cli = env_alias("MEMORY_INDUSTRY_LLM_CLI", "CUBA_JUEZ_CLI")
+            .unwrap_or_else(|_| "gemini".to_string());
+        let model = env_alias("MEMORY_INDUSTRY_LLM_MODEL", "CUBA_JUEZ_MODEL")
+            .unwrap_or_else(|_| "gemini-2.0-flash".to_string());
+        Self {
+            cli,
+            model,
+            timeout: Duration::from_secs(judge_timeout_secs()),
+        }
+    }
+}
+
+#[async_trait]
+impl ContradictionJudge for GeminiCliJudge {
+    fn backend_name(&self) -> &'static str {
+        "gemini_cli"
+    }
+    fn model_name(&self) -> Option<String> {
+        Some(self.model.clone())
+    }
+    async fn run_prompt(&self, prompt: &str) -> Result<String> {
+        let child = tokio::process::Command::new(&self.cli)
+            .args([
+                "--model",
+                &self.model,
+                "-p",
+                prompt,
+                "--output-format",
+                "text",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawn {} (is the Gemini CLI on PATH?)", self.cli))?;
+
+        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
+            .await
+            .with_context(|| format!("{} CLI timed out after {:?}", self.cli, self.timeout))?
+            .context("Gemini CLI process failed")?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "{} CLI exited with status {:?} — {err}",
+                self.cli,
+                output.status.code()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+/// OpenAI-compatible chat HTTP — works with any vendor that speaks `/v1/chat/completions`
+/// (US/EU clouds, Chinese clouds, local Ollama/LM Studio/vLLM). Presets are convenience only;
+/// any custom BASE_URL is accepted.
+pub struct OpenAiCompatJudge {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub timeout: Duration,
+    pub provider: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LlmProviderPreset {
+    pub id: &'static str,
+    pub base_url: &'static str,
+    pub default_model: &'static str,
+    /// Extra env vars checked for the API key (after MEMORY_INDUSTRY_LLM_API_KEY / CUBA_LLM_API_KEY).
+    pub api_key_envs: &'static [&'static str],
+}
+
+/// Known OpenAI-compatible endpoints. Not an allowlist — unknown providers still work via BASE_URL.
+const LLM_PROVIDER_PRESETS: &[LlmProviderPreset] = &[
+    LlmProviderPreset {
+        id: "ollama",
+        base_url: "http://127.0.0.1:11434/v1",
+        default_model: "llama3.2",
+        api_key_envs: &[],
+    },
+    LlmProviderPreset {
+        id: "lmstudio",
+        base_url: "http://127.0.0.1:1234/v1",
+        default_model: "local-model",
+        api_key_envs: &[],
+    },
+    LlmProviderPreset {
+        id: "vllm",
+        base_url: "http://127.0.0.1:8000/v1",
+        default_model: "default",
+        api_key_envs: &[],
+    },
+    LlmProviderPreset {
+        id: "openai",
+        base_url: "https://api.openai.com/v1",
+        default_model: "gpt-4o-mini",
+        api_key_envs: &["OPENAI_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "deepseek",
+        base_url: "https://api.deepseek.com/v1",
+        default_model: "deepseek-chat",
+        api_key_envs: &["DEEPSEEK_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "qwen",
+        base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        default_model: "qwen-plus",
+        api_key_envs: &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "moonshot",
+        base_url: "https://api.moonshot.cn/v1",
+        default_model: "moonshot-v1-8k",
+        api_key_envs: &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "zhipu",
+        base_url: "https://open.bigmodel.cn/api/paas/v4",
+        default_model: "glm-4-flash",
+        api_key_envs: &["ZHIPU_API_KEY", "BIGMODEL_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "siliconflow",
+        base_url: "https://api.siliconflow.cn/v1",
+        default_model: "Qwen/Qwen2.5-7B-Instruct",
+        api_key_envs: &["SILICONFLOW_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "yi",
+        base_url: "https://api.lingyiwanwu.com/v1",
+        default_model: "yi-lightning",
+        api_key_envs: &["YI_API_KEY", "LINGYI_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "minimax",
+        base_url: "https://api.minimax.chat/v1",
+        default_model: "MiniMax-Text-01",
+        api_key_envs: &["MINIMAX_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "doubao",
+        base_url: "https://ark.cn-beijing.volces.com/api/v3",
+        default_model: "doubao-pro-32k",
+        api_key_envs: &["ARK_API_KEY", "DOUBAO_API_KEY", "VOLC_ACCESS_KEY"],
+    },
+    LlmProviderPreset {
+        id: "baichuan",
+        base_url: "https://api.baichuan-ai.com/v1",
+        default_model: "Baichuan4-Turbo",
+        api_key_envs: &["BAICHUAN_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "openrouter",
+        base_url: "https://openrouter.ai/api/v1",
+        default_model: "openrouter/auto",
+        api_key_envs: &["OPENROUTER_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "together",
+        base_url: "https://api.together.xyz/v1",
+        default_model: "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        api_key_envs: &["TOGETHER_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "groq",
+        base_url: "https://api.groq.com/openai/v1",
+        default_model: "llama-3.1-8b-instant",
+        api_key_envs: &["GROQ_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "mistral",
+        base_url: "https://api.mistral.ai/v1",
+        default_model: "mistral-small-latest",
+        api_key_envs: &["MISTRAL_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "fireworks",
+        base_url: "https://api.fireworks.ai/inference/v1",
+        default_model: "accounts/fireworks/models/llama-v3p1-8b-instruct",
+        api_key_envs: &["FIREWORKS_API_KEY"],
+    },
+    LlmProviderPreset {
+        id: "gemini_openai",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        default_model: "gemini-2.0-flash",
+        api_key_envs: &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+    },
+];
+
+pub fn llm_provider_preset(id: &str) -> Option<&'static LlmProviderPreset> {
+    let id = id.trim().to_ascii_lowercase();
+    LLM_PROVIDER_PRESETS.iter().find(|p| p.id == id)
+}
+
+pub fn llm_provider_ids() -> Vec<&'static str> {
+    LLM_PROVIDER_PRESETS.iter().map(|p| p.id).collect()
+}
+
+fn resolve_api_key(preset: Option<&LlmProviderPreset>) -> Option<String> {
+    if let Ok(k) = env_alias("MEMORY_INDUSTRY_LLM_API_KEY", "CUBA_LLM_API_KEY")
+        && !k.is_empty()
+    {
+        return Some(k);
+    }
+    if let Some(p) = preset {
+        for key in p.api_key_envs {
+            if let Ok(v) = env::var(key)
+                && !v.is_empty()
+            {
+                return Some(v);
+            }
+        }
+    }
+    // Common generic fallthrough used by many SDKs.
+    env::var("OPENAI_API_KEY").ok().filter(|v| !v.is_empty())
+}
+
+impl OpenAiCompatJudge {
+    pub fn from_env() -> Self {
+        let provider = env::var("MEMORY_INDUSTRY_LLM_PROVIDER")
+            .or_else(|_| env::var("CUBA_LLM_PROVIDER"))
+            .unwrap_or_else(|_| "custom".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        let preset = llm_provider_preset(&provider);
+
+        let base_url = env_alias("MEMORY_INDUSTRY_LLM_BASE_URL", "CUBA_LLM_BASE_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| preset.map(|p| p.base_url.to_string()))
+            .unwrap_or_else(|| "http://127.0.0.1:11434/v1".to_string())
+            .trim_end_matches('/')
+            .to_string();
+
+        let model = env_alias("MEMORY_INDUSTRY_LLM_MODEL", "CUBA_JUEZ_MODEL")
+            .ok()
+            .filter(|m| !m.trim().is_empty())
+            .or_else(|| preset.map(|p| p.default_model.to_string()))
+            .unwrap_or_else(|| "llama3.2".to_string());
+
+        Self {
+            base_url,
+            model,
+            api_key: resolve_api_key(preset),
+            timeout: Duration::from_secs(judge_timeout_secs()),
+            provider: if provider.is_empty() {
+                "custom".into()
+            } else {
+                provider
+            },
+        }
+    }
+
+    /// Cheap readiness probe for the merge gate (`require_generative_llm`).
+    /// Tries GET /models, then a minimal chat/completions (some Chinese APIs omit /models).
+    pub async fn probe_health(&self) -> Result<()> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .context("building HTTP client for LLM probe")?;
+
+        let models_url = format!("{}/models", self.base_url);
+        let mut req = client.get(&models_url);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        if let Ok(resp) = req.send().await
+            && resp.status().is_success()
+        {
+            return Ok(());
+        }
+
+        // Fallback: one-token chat (covers vendors without a public /models list).
+        let chat_url = format!("{}/chat/completions", self.base_url);
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+        });
+        let mut req = client.post(&chat_url).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        } else {
+            req = req.bearer_auth("local");
+        }
+        let resp = req.send().await.with_context(|| {
+            format!(
+                "LLM provider={} at {} not reachable — check MEMORY_INDUSTRY_LLM_BASE_URL / \
+                 MEMORY_INDUSTRY_LLM_PROVIDER / API key ({})",
+                self.provider,
+                self.base_url,
+                generative_llm_setup_hint()
+            )
+        })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "LLM provider={} HTTP {status} on chat probe: {text}",
+                self.provider
+            );
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ContradictionJudge for OpenAiCompatJudge {
+    fn backend_name(&self) -> &'static str {
+        "openai_compat"
+    }
+    fn model_name(&self) -> Option<String> {
+        Some(format!("{}:{}", self.provider, self.model))
+    }
+    async fn run_prompt(&self, prompt: &str) -> Result<String> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let client = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .build()
+            .context("building HTTP client for OpenAI-compat LLM")?;
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+        });
+        let mut req = client.post(&url).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        } else {
+            // Local stacks (Ollama/LM Studio) often ignore the bearer.
+            req = req.bearer_auth("local");
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("POST {url} (provider={})", self.provider))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "OpenAI-compat LLM provider={} HTTP {status}: {text}",
+                self.provider
+            );
+        }
+        let v: serde_json::Value = resp.json().await.context("decode chat completions JSON")?;
+        // Standard OpenAI shape; also accept string content arrays used by a few vendors.
+        if let Some(content) = v
+            .pointer("/choices/0/message/content")
+            .and_then(|c| c.as_str())
+        {
+            return Ok(content.to_string());
+        }
+        if let Some(parts) = v
+            .pointer("/choices/0/message/content")
+            .and_then(|c| c.as_array())
+        {
+            let text: String = parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("");
+            if !text.is_empty() {
+                return Ok(text);
+            }
+        }
+        anyhow::bail!("chat completions missing choices[0].message.content")
+    }
+}
+
 pub struct MCPSamplingJudge;
 
 #[async_trait]
@@ -196,7 +649,7 @@ pub struct NliJudge {
 
 impl NliJudge {
     pub fn new(inner: Box<dyn ContradictionJudge>) -> Self {
-        let escalate_undecided = env::var("CUBA_NLI_ESCALATE")
+        let escalate_undecided = env_alias("MEMORY_INDUSTRY_NLI_ESCALATE", "CUBA_NLI_ESCALATE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         Self {
@@ -498,14 +951,46 @@ mod parse_tests {
 }
 
 pub fn which_in_path(cmd: &str) -> bool {
+    let direct = std::path::Path::new(cmd);
+    // Absolute / explicit paths (test stubs, CUBA_JUEZ_CLI=/opt/bin/claude) must win
+    // without being on PATH — otherwise the env var is silently ignored and we fall
+    // through to whatever `claude` happens to be installed.
+    if (direct.is_absolute() || cmd.contains('/') || (cfg!(windows) && cmd.contains('\\')))
+        && direct.is_file()
+    {
+        return true;
+    }
+    if cfg!(windows) && direct.is_absolute() {
+        for suffix in [".exe", ".cmd", ".bat"] {
+            if !cmd.ends_with(suffix) {
+                let with = std::path::PathBuf::from(format!("{cmd}{suffix}"));
+                if with.is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+
     let path = match env::var_os("PATH") {
         Some(p) => p,
         None => return false,
     };
+    let candidates: &[&str] = if cfg!(windows) {
+        // npm shims often ship as .cmd on Windows.
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
     for dir in env::split_paths(&path) {
-        let candidate = dir.join(cmd);
-        if candidate.is_file() {
-            return true;
+        for suffix in candidates {
+            let name = if suffix.is_empty() || cmd.ends_with(suffix) {
+                cmd.to_string()
+            } else {
+                format!("{cmd}{suffix}")
+            };
+            if dir.join(&name).is_file() {
+                return true;
+            }
         }
     }
     false
@@ -571,6 +1056,49 @@ mod tests {
         assert_eq!(default_max_pairs(), 11);
         unsafe {
             env::remove_var("CUBA_JUEZ_MAX_PAIRS");
+        }
+    }
+
+    #[test]
+    fn openai_compat_presets_cover_chinese_and_western_vendors() {
+        for id in [
+            "deepseek",
+            "qwen",
+            "moonshot",
+            "zhipu",
+            "siliconflow",
+            "yi",
+            "doubao",
+            "baichuan",
+            "minimax",
+            "openai",
+            "openrouter",
+            "ollama",
+            "groq",
+            "mistral",
+        ] {
+            let p = llm_provider_preset(id).unwrap_or_else(|| panic!("missing preset {id}"));
+            assert!(p.base_url.contains("://"), "{id} base_url must be absolute");
+            assert!(!p.default_model.is_empty(), "{id} needs a default model");
+        }
+        assert!(llm_provider_ids().len() >= 15);
+    }
+
+    #[test]
+    fn provider_env_resolves_deepseek_without_explicit_base_url() {
+        unsafe {
+            env::remove_var("MEMORY_INDUSTRY_LLM_BASE_URL");
+            env::remove_var("CUBA_LLM_BASE_URL");
+            env::set_var("MEMORY_INDUSTRY_LLM_PROVIDER", "deepseek");
+            env::remove_var("MEMORY_INDUSTRY_LLM_MODEL");
+            env::remove_var("CUBA_JUEZ_MODEL");
+        }
+        let j = OpenAiCompatJudge::from_env();
+        assert_eq!(j.provider, "deepseek");
+        assert!(j.base_url.contains("deepseek.com"));
+        assert_eq!(j.model, "deepseek-chat");
+        unsafe {
+            env::remove_var("MEMORY_INDUSTRY_LLM_PROVIDER");
         }
     }
 }

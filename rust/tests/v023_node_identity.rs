@@ -5,14 +5,14 @@ use uuid::Uuid;
 async fn a_machine_knows_who_it_is_without_asking_the_environment() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
-    let once = cuba_memorys::db::node_id(&pool)
+    let once = memory_industry::db::node_id(&pool)
         .await
         .expect("every migrated database has exactly one identity row");
-    let twice = cuba_memorys::db::node_id(&pool)
+    let twice = memory_industry::db::node_id(&pool)
         .await
         .expect("and reading it again gives the same answer");
     assert_eq!(

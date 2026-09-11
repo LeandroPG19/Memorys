@@ -5,7 +5,7 @@ use uuid::Uuid;
 async fn the_clock_ticks_for_changes_a_peer_cares_about_and_not_for_local_telemetry() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -99,7 +99,7 @@ async fn the_clock_ticks_for_changes_a_peer_cares_about_and_not_for_local_teleme
 async fn correcting_through_the_handler_advances_the_clock_exactly_once() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -120,7 +120,7 @@ async fn correcting_through_the_handler_advances_the_clock_exactly_once() {
     .await
     .expect("seed the observation");
 
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_eco",
         serde_json::json!({

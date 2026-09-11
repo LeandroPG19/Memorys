@@ -1,11 +1,13 @@
-# Cuba-Memorys — PostgreSQL dedicado
+# MemoryIndustry — PostgreSQL dedicado
 # Independiente del proyecto del usuario. Auto-start con Docker.
-name: cuba-memorys
+# Legacy (pre-rebrand): project name cuba-memorys, container cuba-memorys-db,
+# volume cuba_data / cuba-memorys-pgdata.
+name: memory-industry
 
 services:
   postgres:
     image: pgvector/pgvector:pg18
-    container_name: cuba-memorys-db
+    container_name: memory-industry-db
     restart: always
     environment:
       POSTGRES_USER: cuba
@@ -14,7 +16,7 @@ services:
     ports:
       - "127.0.0.1:5488:5432"  # Puerto único para evitar conflictos
     volumes:
-      - cuba_data:/var/lib/postgresql
+      - memory_industry_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cuba -d brain"]
       interval: 10s
@@ -26,6 +28,25 @@ services:
           cpus: "0.5"
           memory: 256M
 
+  # Optional graph projection (Postgres remains source of truth).
+  # Enable with: MEMORY_INDUSTRY_GRAPH_DB=falkor MEMORY_INDUSTRY_GRAPH_URL=redis://127.0.0.1:6389
+  graph:
+    image: falkordb/falkordb:latest
+    container_name: memory-industry-graph
+    profiles: ["graph"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6389:6379"
+    volumes:
+      - memory_industry_graph:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
 volumes:
-  cuba_data:
-    name: cuba-memorys-pgdata
+  memory_industry_data:
+    name: memory-industry-pgdata
+  memory_industry_graph:
+    name: memory-industry-graph

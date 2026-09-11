@@ -30,7 +30,7 @@ async function resolveBinary() {
     return await ensureBinary();
   } catch (err) {
     process.stderr.write(
-      `cuba-memorys: could not download the ${EXPECTED} binary — ${err.message}\n`
+      `memory-industry: could not download the ${EXPECTED} binary — ${err.message}\n`
     );
   }
 
@@ -39,15 +39,15 @@ async function resolveBinary() {
 
   const reason =
     found === null
-      ? "no cuba-memorys on PATH either (or it is too old to report its version)"
+      ? "no memory-industry / cuba-memorys on PATH either (or it is too old to report its version)"
       : `PATH has cuba-memorys ${found}, but this package is ${EXPECTED}`;
 
   process.stderr.write(
-    `cuba-memorys: cannot obtain the ${EXPECTED} binary — ${reason}.\n\n` +
+    `memory-industry: cannot obtain the ${EXPECTED} binary — ${reason}.\n\n` +
       `The download on first run failed (offline, or GitHub Releases unreachable).\n` +
       `Get it another way:\n` +
-      `  pip install cuba-memorys\n` +
-      `  https://github.com/LeandroPG19/cuba-memorys/releases/tag/v${EXPECTED}\n\n` +
+      `  pip install memory-industry\n` +
+      `  https://github.com/LeandroPG19/Memorys/releases/tag/v${EXPECTED}\n\n` +
       `Refusing to run a different version: this server migrates the database it\n` +
       `connects to, so the wrong binary does not just misbehave — it rewrites schema.\n`
   );
@@ -61,7 +61,7 @@ resolveBinary().then((bin) => {
   });
   proc.on("exit", (code) => process.exit(code ?? 1));
   proc.on("error", (err) => {
-    process.stderr.write(`cuba-memorys: failed to start binary — ${err.message}\n`);
+    process.stderr.write(`memory-industry: failed to start binary — ${err.message}\n`);
     process.exit(1);
   });
 });

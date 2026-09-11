@@ -104,4 +104,36 @@ mod tests {
         let picks = mmr_select(&rel, &sim, 1.0, 10);
         assert_eq!(picks.len(), 2);
     }
+
+    #[test]
+    fn zero_k_returns_empty_even_when_there_are_candidates() {
+        let rel = vec![0.9, 0.1];
+        let sim = identity_sim(2);
+        assert!(mmr_select(&rel, &sim, 1.0, 0).is_empty());
+    }
+
+    #[test]
+    fn lambda_above_one_is_clamped_to_pure_relevance() {
+        let rel = vec![0.1, 0.9, 0.5];
+        let sim = identity_sim(3);
+        assert_eq!(mmr_select(&rel, &sim, 8.0, 2), vec![1, 2]);
+    }
+
+    #[test]
+    fn diversity_weight_is_one_minus_lambda_not_one_over_lambda() {
+        // λ=0.5 → (1-λ)=0.5. Replacing the `-` inside `(1.0 - lambda)` with `/`
+        // yields 1/λ=2.0 and flips the second pick.
+        let rel = vec![0.90, 0.80, 0.70];
+        let mut sim = identity_sim(3);
+        sim[0][1] = 0.10;
+        sim[1][0] = 0.10;
+        sim[0][2] = 0.02;
+        sim[2][0] = 0.02;
+        let picks = mmr_select(&rel, &sim, 0.5, 2);
+        assert_eq!(
+            picks,
+            vec![0, 1],
+            "second pick must keep the higher-relevance neighbour when (1-λ) is 0.5"
+        );
+    }
 }

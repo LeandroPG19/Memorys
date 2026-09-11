@@ -6,7 +6,7 @@ use uuid::Uuid;
 async fn concurrent_appends_succeed_as_the_app_role_and_keep_the_chain_linear() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -18,7 +18,7 @@ async fn concurrent_appends_succeed_as_the_app_role_and_keep_the_chain_linear() 
         let pool = pool.clone();
         let action = marker.clone();
         handles.push(tokio::spawn(async move {
-            cuba_memorys::handlers::dispatch(
+            memory_industry::handlers::dispatch(
                 &pool,
                 "cuba_archivo",
                 serde_json::json!({

@@ -1,4 +1,4 @@
-use cuba_memorys::session::{Scope, with_scope};
+use memory_industry::session::{Scope, with_scope};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ async fn own_the_sync_dir(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sqlx::Po
 async fn as_peer(pool: &sqlx::PgPool, args: Value) -> anyhow::Result<Value> {
     with_scope(
         Scope::Peer,
-        cuba_memorys::handlers::dispatch(pool, "cuba_sync", args),
+        memory_industry::handlers::dispatch(pool, "cuba_sync", args),
     )
     .await
 }
@@ -31,7 +31,7 @@ fn body(envelope: &Value) -> Value {
 }
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     body(&envelope)
@@ -42,7 +42,7 @@ async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
 async fn a_notice_reaches_the_local_model_without_the_peer_writing_memory() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _one_at_a_time = own_the_sync_dir(&pool).await;
@@ -117,7 +117,7 @@ async fn a_notice_reaches_the_local_model_without_the_peer_writing_memory() {
 async fn the_one_write_a_peer_is_allowed_cannot_fill_the_disk() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _one_at_a_time = own_the_sync_dir(&pool).await;
@@ -174,7 +174,7 @@ async fn the_one_write_a_peer_is_allowed_cannot_fill_the_disk() {
 async fn a_notice_carrying_a_credential_is_refused_like_every_other_free_text_entry() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _one_at_a_time = own_the_sync_dir(&pool).await;

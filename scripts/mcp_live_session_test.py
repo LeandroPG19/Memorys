@@ -18,6 +18,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Windows consoles often default to cp1252; gate logs must not die on arrows.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parent.parent
 RUST = ROOT / "rust"
 BINARY = Path(
@@ -69,9 +77,14 @@ TOOL_CALLS: List[Tuple[str, str, Dict[str, Any]]] = [
     }),
     ("cuba_pizarra", "read", {"action": "read"}),
     ("cuba_archivo", "tail", {"action": "tail", "limit": 2}),
+    ("cuba_whoami", "identity", {}),
+    ("cuba_artefacto", "list", {"action": "list", "limit": 5}),
+    ("cuba_contexto", "budget", {"budget_chars": 4000}),
+    ("cuba_receta", "list", {"action": "list", "limit": 5}),
+    ("cuba_tools", "list", {}),
 ]
 
-SKIP_LIVE = {"cuba_forget"}
+SKIP_LIVE: set[str] = set()  # soft-skips forbidden; every live tool must run
 
 class McpSession:
     def __init__(self) -> None:
@@ -88,9 +101,14 @@ class McpSession:
             env=env,
         )
         self._responses: List[Dict[str, Any]] = []
+        self._stderr_lines: List[str] = []
         self._lock = threading.Lock()
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
+        # Without a reader, a verbose ORT/GPU binary fills the pipe and deadlocks
+        # mid-suite (seen after the first few tools/call on Windows).
+        self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
+        self._err_reader.start()
 
     def _read_stdout(self) -> None:
         assert self.proc.stdout is not None
@@ -104,6 +122,13 @@ class McpSession:
                 continue
             with self._lock:
                 self._responses.append(msg)
+
+    def _read_stderr(self) -> None:
+        assert self.proc.stderr is not None
+        for line in self.proc.stderr:
+            with self._lock:
+                if len(self._stderr_lines) < 200:
+                    self._stderr_lines.append(line.rstrip())
 
     def request(
         self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 30.0
@@ -123,8 +148,14 @@ class McpSession:
                     if mid == req_id or str(mid) == str(req_id):
                         return self._responses.pop(i)
             time.sleep(0.05)
-        raise TimeoutError(f"no response for {method} id={req_id}")
-
+        raise TimeoutError(
+            f"no response for {method} id={req_id}"
+            + (
+                f"; stderr_tail={self._stderr_lines[-8:]!r}"
+                if self._stderr_lines
+                else ""
+            )
+        )
     def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
         payload: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:

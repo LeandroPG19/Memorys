@@ -59,3 +59,11 @@ backups/
 docs/
 sandbox/
 *.jsonl.partial
+
+# User rules junction for CLI/IDE parity (points to ~/.cursor/rules)
+.cursor/rules/
+
+
+# local production secrets
+.deploy/
+

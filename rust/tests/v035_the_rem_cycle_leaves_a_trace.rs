@@ -1,7 +1,7 @@
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -31,7 +31,7 @@ async fn admin_status_reflects_a_real_row_from_brain_rem_cycles() {
              real NOW()",
     );
 
-    let status = cuba_memorys::admin::handle(&pool, "admin/status", 0, vec![])
+    let status = memory_industry::admin::handle(&pool, "admin/status", 0, vec![])
         .await
         .expect("admin/status");
 
@@ -97,7 +97,7 @@ async fn a_cycle_whose_relation_scan_gave_up_shows_up_as_degraded_through_the_re
     .await
     .expect("insert a fixture cycle whose relation scan hit the two-failure cutoff");
 
-    let status = cuba_memorys::admin::handle(&pool, "admin/status", 0, vec![])
+    let status = memory_industry::admin::handle(&pool, "admin/status", 0, vec![])
         .await
         .expect("admin/status");
 

@@ -17,7 +17,7 @@ async fn own_the_sync_dir(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sqlx::Po
 }
 
 async fn call(pool: &sqlx::PgPool, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, "cuba_sync", args)
+    let envelope = memory_industry::handlers::dispatch(pool, "cuba_sync", args)
         .await
         .unwrap_or_else(|e| panic!("cuba_sync failed: {e:#}"));
     let text = envelope["content"][0]["text"].as_str().expect("envelope");
@@ -47,7 +47,7 @@ async fn one_click_on_the_peer_button_cannot_delete_a_row() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-nodel-{}", Uuid::new_v4()));
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_sync_dir(&pool).await;

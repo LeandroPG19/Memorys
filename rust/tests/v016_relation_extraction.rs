@@ -29,7 +29,7 @@ async fn exclusive(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sqlx::Postgres>
 async fn auto_extract_relations_land_as_inferred_edges() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -43,7 +43,7 @@ async fn auto_extract_relations_land_as_inferred_edges() {
             "relations":[{{"from":"{a}","to":"{b}","relation_type":"depends_on"}}]}}"#
     );
 
-    let linked = cuba_memorys::handlers::ingesta::link_relations_from_reply(&pool, &reply)
+    let linked = memory_industry::handlers::ingesta::link_relations_from_reply(&pool, &reply)
         .await
         .expect("linking extracted relations");
     assert_eq!(linked, 1, "the one relation in the reply must be written");
@@ -80,7 +80,7 @@ async fn auto_extract_relations_land_as_inferred_edges() {
         "both endpoints must be auto-created even though only one had a fact"
     );
 
-    let second = cuba_memorys::handlers::ingesta::link_relations_from_reply(&pool, &reply)
+    let second = memory_industry::handlers::ingesta::link_relations_from_reply(&pool, &reply)
         .await
         .expect("re-linking the same relation");
     assert_eq!(
@@ -113,7 +113,7 @@ async fn auto_extract_relations_land_as_inferred_edges() {
 async fn a_reply_with_no_relations_writes_nothing() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -125,7 +125,7 @@ async fn a_reply_with_no_relations_writes_nothing() {
         .expect("counting relations");
 
     let reply = json!({"facts": [], "relations": []}).to_string();
-    let linked = cuba_memorys::handlers::ingesta::link_relations_from_reply(&pool, &reply)
+    let linked = memory_industry::handlers::ingesta::link_relations_from_reply(&pool, &reply)
         .await
         .expect("linking an empty reply");
     assert_eq!(linked, 0);

@@ -1,0 +1,5 @@
+# Gate-critical text must stay LF: sha digest of shipped migrations and bash parsers.
+*.sql text eol=lf
+*.sh text eol=lf
+AGENTS.md text eol=lf
+docs/gate.md text eol=lf

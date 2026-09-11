@@ -1,8 +1,10 @@
 use crate::cognitive::{density, prediction_error};
 use crate::constants::{DEDUP_THRESHOLD, VALID_OBSERVATION_TYPES, VALID_SOURCES};
+use crate::search::entity_factoid::embedding_status;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sqlx::PgPool;
+use std::time::{Duration, Instant};
 
 pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
@@ -25,7 +27,68 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
     }
 }
 
+const WRITE_THROUGH_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn persist_searchable(
+    pool: &PgPool,
+    obs_id: uuid::Uuid,
+    content: &str,
+    entity_type: &str,
+    entity_name: &str,
+    project_id: Option<uuid::Uuid>,
+    precomputed: Option<Vec<f32>>,
+) -> (String, usize) {
+    let loaded = crate::embeddings::onnx::is_model_loaded();
+    if !loaded {
+        return (embedding_status(false, false).to_string(), 0);
+    }
+    let work = async {
+        let emb = match precomputed {
+            Some(e) => e,
+            None => {
+                crate::embeddings::onnx::embed_passage_contextual(content, entity_type, entity_name)
+                    .await?
+            }
+        };
+        sqlx::query(
+            "UPDATE brain_observations SET embedding = $1::vector, embedding_model = $2 WHERE id = $3",
+        )
+        .bind(pgvector::Vector::from(emb))
+        .bind(crate::embeddings::onnx::current_model())
+        .bind(obs_id)
+        .execute(pool)
+        .await?;
+        let chunks = if crate::embeddings::chunk::needs_chunking(content) {
+            crate::embeddings::backfill::store_chunks(
+                pool,
+                obs_id,
+                content,
+                entity_type,
+                entity_name,
+                project_id,
+            )
+            .await
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        anyhow::Ok(chunks)
+    };
+    match tokio::time::timeout(WRITE_THROUGH_TIMEOUT, work).await {
+        Ok(Ok(chunks)) => (embedding_status(true, true).to_string(), chunks),
+        Ok(Err(e)) => {
+            tracing::warn!(obs_id = %obs_id, error = %e, "write-through embed failed — FTS still works");
+            (embedding_status(true, false).to_string(), 0)
+        }
+        Err(_) => {
+            tracing::warn!(obs_id = %obs_id, "write-through embed timed out — marked pending");
+            (embedding_status(true, false).to_string(), 0)
+        }
+    }
+}
+
 async fn add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<Value> {
+    let started = Instant::now();
     if entity_name.is_empty() {
         anyhow::bail!("entity_name is required");
     }
@@ -60,13 +123,14 @@ async fn add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<Value> {
     let density = information_density(content);
     let dedup = check_dedup(pool, entity_id, content, &dedup_entity_type, entity_name).await?;
 
-    match dedup {
+    let precomputed_embedding = match dedup {
         DedupResult::Duplicate(existing_preview) => {
             return Ok(serde_json::json!({
                 "action": "add",
                 "deduplicated": true,
                 "existing_content": existing_preview,
-                "message": "Near-duplicate detected. Observation NOT added."
+                "message": "Near-duplicate detected. Observation NOT added.",
+                "write_to_searchable_ms": started.elapsed().as_millis() as u64
             }));
         }
         DedupResult::Reinforce(obs_id) => {
@@ -85,11 +149,12 @@ async fn add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<Value> {
                 "action": "add",
                 "prediction_error": "reinforce",
                 "reinforced_id": obs_id.to_string(),
-                "message": "Very similar observation exists. Reinforced existing instead."
+                "message": "Very similar observation exists. Reinforced existing instead.",
+                "write_to_searchable_ms": started.elapsed().as_millis() as u64
             }));
         }
-        DedupResult::Unique(_) => {}
-    }
+        DedupResult::Unique(emb) => emb,
+    };
 
     let importance = crate::constants::importance_prior(obs_type, density);
     let tags = extract_tags(content);
@@ -134,69 +199,16 @@ async fn add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<Value> {
         "observation added"
     );
 
-    let embed_pool = pool.clone();
-    let obs_id_for_embed = row.0;
-    let content_for_embed = content.to_string();
-    let entity_name_for_embed = entity_name.to_string();
-    crate::tasks::spawn(async move {
-        let entity_type: String =
-            sqlx::query_scalar("SELECT entity_type FROM brain_entities WHERE name = $1")
-                .bind(&entity_name_for_embed)
-                .fetch_optional(&embed_pool)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "concept".to_string());
-
-        if crate::embeddings::onnx::is_model_loaded() {
-            match crate::embeddings::onnx::embed_passage_contextual(
-                &content_for_embed,
-                &entity_type,
-                &entity_name_for_embed,
-            )
-            .await
-            {
-                Ok(emb) => {
-                    let model = crate::embeddings::onnx::current_model();
-                    let result = sqlx::query(
-                        "UPDATE brain_observations SET embedding = $1::vector, embedding_model = $2 WHERE id = $3",
-                    )
-                    .bind(pgvector::Vector::from(emb))
-                    .bind(model)
-                    .bind(obs_id_for_embed)
-                    .execute(&embed_pool)
-                    .await;
-                    if let Err(e) = result {
-                        tracing::warn!(obs_id = %obs_id_for_embed, error = %e, "failed to store embedding");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(obs_id = %obs_id_for_embed, error = %e, "ONNX embed failed — skipping");
-                }
-            }
-
-            if crate::embeddings::chunk::needs_chunking(&content_for_embed) {
-                let stored = crate::embeddings::backfill::store_chunks(
-                    &embed_pool,
-                    obs_id_for_embed,
-                    &content_for_embed,
-                    &entity_type,
-                    &entity_name_for_embed,
-                    project_id,
-                )
-                .await;
-                match stored {
-                    Ok(n) if n > 0 => {
-                        tracing::info!(obs_id = %obs_id_for_embed, chunks = n, "long observation chunked")
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(obs_id = %obs_id_for_embed, error = %e, "chunking failed")
-                    }
-                }
-            }
-        }
-    });
+    let (embedding, _chunks) = persist_searchable(
+        pool,
+        row.0,
+        content,
+        &dedup_entity_type,
+        entity_name,
+        project_id,
+        precomputed_embedding,
+    )
+    .await;
 
     let obs_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM brain_observations WHERE entity_id = $1 AND observation_type != 'superseded'"
@@ -261,7 +273,9 @@ async fn add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<Value> {
         "importance": importance,
         "tags": tags,
         "overload_warning": overload_warning,
-        "superseded": superseded
+        "superseded": superseded,
+        "embedding": embedding,
+        "write_to_searchable_ms": started.elapsed().as_millis() as u64
     }))
 }
 
@@ -541,42 +555,19 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
         .await;
     }
 
-    if !inserted_for_embed.is_empty() {
-        let embed_pool = pool.clone();
-        crate::tasks::spawn(async move {
-            for (obs_id, content, entity_name, entity_type, precomputed) in inserted_for_embed {
-                let reused = precomputed.is_some();
-                let computed = match precomputed {
-                    Some(emb) => Ok(emb),
-                    None => {
-                        crate::embeddings::onnx::embed_passage_contextual(
-                            &content,
-                            &entity_type,
-                            &entity_name,
-                        )
-                        .await
-                    }
-                };
-                if crate::embeddings::onnx::is_model_loaded()
-                    && let Ok(emb) = computed
-                {
-                    if reused {
-                        tracing::debug!(obs = %obs_id, "reused the dedup embedding");
-                    }
-                    let stored = sqlx::query(
-                        "UPDATE brain_observations SET embedding = $1::vector, embedding_model = $2 WHERE id = $3",
-                    )
-                    .bind(pgvector::Vector::from(emb))
-                    .bind(crate::embeddings::onnx::current_model())
-                    .bind(obs_id)
-                    .execute(&embed_pool)
-                    .await;
-                    if let Err(e) = stored {
-                        tracing::warn!(obs_id = %obs_id, error = %e, "failed to store embedding — observation stays invisible to vector search");
-                    }
-                }
-            }
-        });
+    let mut chunks_written = 0usize;
+    for (obs_id, content, entity_name, entity_type, precomputed) in inserted_for_embed {
+        let (_status, n) = persist_searchable(
+            pool,
+            obs_id,
+            &content,
+            &entity_type,
+            &entity_name,
+            project_id,
+            precomputed,
+        )
+        .await;
+        chunks_written += n;
     }
 
     Ok(serde_json::json!({
@@ -584,7 +575,8 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
         "added": added,
         "deduplicated": deduplicated,
         "reinforced": reinforced,
-        "total_processed": added + deduplicated + reinforced
+        "total_processed": added + deduplicated + reinforced,
+        "chunks": chunks_written
     }))
 }
 

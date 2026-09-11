@@ -54,6 +54,34 @@ async fn explain(pool: &PgPool, args: &Value) -> Result<Value> {
         }));
     }
 
+    if let Ok(hops) = crate::graph_db::explain_falkor(effect, max_depth as i32, limit as usize)
+        && !hops.is_empty()
+    {
+        let hypotheses: Vec<Value> = hops
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "cause": h.name,
+                    "entity_type": "unknown",
+                    "importance": h.strength,
+                    "hops": h.depth,
+                    "path_strength": h.strength,
+                    "plausibility": h.strength
+                })
+            })
+            .collect();
+        let count = hypotheses.len();
+        return Ok(serde_json::json!({
+            "action": "explain",
+            "effect": effect,
+            "hypotheses": hypotheses,
+            "count": count,
+            "max_depth": max_depth,
+            "backend": "falkor",
+            "scoring": "path_strength on Falkor (importance from Postgres when backend=postgres)"
+        }));
+    }
+
     let rows: Vec<(String, String, f64, i64, f64, f64)> = sqlx::query_as(
         "WITH RECURSIVE causal_chain AS (
             -- Base: direct causes of the effect
@@ -129,6 +157,7 @@ async fn explain(pool: &PgPool, args: &Value) -> Result<Value> {
         "hypotheses": hypotheses,
         "count": count,
         "max_depth": max_depth,
-        "scoring": "plausibility = path_strength × entity_importance (incorporates PageRank + Hebbian)"
+        "scoring": "plausibility = path_strength × entity_importance (incorporates PageRank + Hebbian)",
+        "backend": "postgres"
     }))
 }

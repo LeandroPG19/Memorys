@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::sync::chunk::{
-    Counts, EntityFile, EpisodeFile, ErrorFile, FactRow, MAX_EMBEDDING_DIM, Manifest,
+    ArtifactRow, Counts, EntityFile, EpisodeFile, ErrorFile, FactRow, MAX_EMBEDDING_DIM, Manifest,
     ObservationRow, ProcedureRow, ProjectRow, RelationRow, SCHEMA_VERSION, SourceTrustRow,
     payload_hash, payload_hash_bytes,
 };
@@ -368,6 +368,8 @@ async fn export_into(
             verification: r.verification,
             verified_at: r.verified_at,
             trust: Some(r.trust),
+            crdt_actor: None,
+            crdt_counter: None,
         })
         .collect();
         obs_count += observations.len() as u32;
@@ -606,6 +608,65 @@ async fn export_into(
         &mut digest,
     )?;
 
+    let artifact_rows: Vec<ArtifactRow> = sqlx::query_as::<
+        _,
+        (
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            i64,
+            Option<uuid::Uuid>,
+            Option<String>,
+            Option<String>,
+            i64,
+            chrono::DateTime<Utc>,
+        ),
+    >(
+        "SELECT id, path, content, content_hash, version, project_id, origin_node,
+                crdt_actor, crdt_counter, updated_at
+         FROM brain_artifacts
+         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         ORDER BY path",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(
+        |(
+            id,
+            path,
+            content,
+            content_hash,
+            version,
+            project_id,
+            origin_node,
+            crdt_actor,
+            crdt_counter,
+            updated_at,
+        )| ArtifactRow {
+            id,
+            path,
+            content,
+            content_hash,
+            version,
+            project_id,
+            origin_node,
+            crdt_actor,
+            crdt_counter,
+            updated_at,
+        },
+    )
+    .collect();
+    let artifact_count = artifact_rows.len() as u32;
+    write_bundle_file(
+        &root,
+        &root.join("artifacts.json"),
+        &serde_json::to_vec_pretty(&artifact_rows)?,
+        &mut digest,
+    )?;
+
     let trust_rows: Vec<SourceTrustRow> = sqlx::query_as::<_, SourceTrustRow>(
         "SELECT source, alpha::float8 AS alpha, beta::float8 AS beta, updated_at
          FROM brain_source_trust ORDER BY source",
@@ -674,6 +735,7 @@ async fn export_into(
         decisions: decisions.len() as u32,
         errors: err_count,
         relations: rel_count,
+        artifacts: artifact_count,
     };
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
@@ -846,6 +908,15 @@ async fn resolve_conflict(pool: &PgPool, args: &Value) -> Result<Value> {
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+
+    crate::events::publish(
+        "sync.conflict_resolved",
+        serde_json::json!({
+            "id": id,
+            "observation_id": observation_id,
+            "kept": keep,
+        }),
+    );
 
     Ok(serde_json::json!({
         "action": "resolve",
@@ -1078,6 +1149,17 @@ async fn fetch(pool: &PgPool, args: &Value, conflict: &str, confirm: bool) -> Re
         None => 0,
     };
 
+    crate::events::publish(
+        "sync.fetch",
+        serde_json::json!({
+            "peer": name,
+            "url": url,
+            "notices_closed": closed,
+            "imported": imported.get("rows_inserted").cloned().unwrap_or(Value::Null),
+            "manifest_hash": imported.get("manifest_hash").cloned().unwrap_or(Value::Null),
+        }),
+    );
+
     Ok(serde_json::json!({
         "action": "fetch",
         "peer": name,
@@ -1223,6 +1305,16 @@ async fn notify(pool: &PgPool, args: &Value) -> Result<Value> {
     .fetch_one(pool)
     .await
     .context("recording the peer notice")?;
+
+    crate::events::publish(
+        "peer.notice",
+        serde_json::json!({
+            "id": id,
+            "from": node_name,
+            "summary": summary,
+            "manifest_hash": manifest_hash,
+        }),
+    );
 
     Ok(serde_json::json!({
         "action": "notify",
@@ -1946,6 +2038,19 @@ async fn import(
                 .bind(&manifest.manifest_hash)
                 .fetch_all(&mut *tx)
                 .await?;
+
+                // Leave conflicts OPEN until cuba_sync action=resolve. Auto keep-both
+                // was hiding them from action=conflicts (v026) and skipping the operator.
+                if !already.is_empty() {
+                    crate::crdt::merge_event(
+                        "concurrent",
+                        serde_json::json!({
+                            "kind": "observation",
+                            "count": already.len(),
+                            "policy": "await_resolve",
+                        }),
+                    );
+                }
                 diverged.extend(already);
             }
 
@@ -2254,6 +2359,74 @@ async fn import(
         }
     }
 
+    let artifacts_path = root.join("artifacts.json");
+    if artifacts_path.exists() {
+        let arts: Vec<ArtifactRow> = serde_json::from_slice(&std::fs::read(&artifacts_path)?)?;
+        for a in arts {
+            let local: Option<(i64, Option<String>, Option<i64>)> = sqlx::query_as(
+                "SELECT version, crdt_actor, crdt_counter FROM brain_artifacts
+                 WHERE path = $1 AND project_id IS NOT DISTINCT FROM $2",
+            )
+            .bind(&a.path)
+            .bind(a.project_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let take = match local {
+                None => true,
+                Some((ver, actor, counter)) => {
+                    let loc = crate::crdt::clock_from_row(actor.as_deref(), counter, "local");
+                    let inc = crate::crdt::clock_from_row(
+                        a.crdt_actor.as_deref(),
+                        Some(a.crdt_counter),
+                        "incoming",
+                    );
+                    match crate::crdt::pick_lww(&loc, &inc) {
+                        crate::crdt::MergePick::TakeIncoming => true,
+                        crate::crdt::MergePick::KeepLocal => false,
+                        crate::crdt::MergePick::Concurrent => a.version > ver,
+                    }
+                }
+            };
+            if !take {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO brain_artifacts
+                    (id, project_id, path, content, content_hash, version, origin_node,
+                     crdt_actor, crdt_counter, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT (project_id, path) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    content_hash = EXCLUDED.content_hash,
+                    version = EXCLUDED.version,
+                    origin_node = EXCLUDED.origin_node,
+                    crdt_actor = EXCLUDED.crdt_actor,
+                    crdt_counter = EXCLUDED.crdt_counter,
+                    updated_at = EXCLUDED.updated_at
+                 WHERE brain_artifacts.version < EXCLUDED.version
+                    OR (brain_artifacts.crdt_counter, brain_artifacts.crdt_actor)
+                       < (EXCLUDED.crdt_counter, EXCLUDED.crdt_actor)",
+            )
+            .bind(a.id)
+            .bind(a.project_id)
+            .bind(&a.path)
+            .bind(&a.content)
+            .bind(&a.content_hash)
+            .bind(a.version)
+            .bind(a.origin_node.as_deref())
+            .bind(a.crdt_actor.as_deref())
+            .bind(a.crdt_counter)
+            .bind(a.updated_at)
+            .execute(&mut *tx)
+            .await?;
+            inserted += 1;
+            crate::crdt::merge_event(
+                "merged",
+                serde_json::json!({"kind": "artifact", "path": a.path, "version": a.version}),
+            );
+        }
+    }
+
     let procedures_path = root.join("procedures.json");
     if procedures_path.exists() {
         let procedures: Vec<ProcedureRow> =
@@ -2421,11 +2594,8 @@ async fn import(
                     .expect("embedding_record_size rejects any dim whose record is not longer than the 16-byte uuid");
                 let id = Uuid::from_bytes(id_bytes);
                 let mut floats = Vec::with_capacity(dim);
-                for f_chunk in chunk[16..].chunks_exact(4) {
-                    let arr: [u8; 4] = f_chunk
-                        .try_into()
-                        .expect("chunks_exact(4) yields exactly 4 bytes");
-                    floats.push(f32::from_le_bytes(arr));
+                for f_chunk in chunk[16..].as_chunks::<4>().0 {
+                    floats.push(f32::from_le_bytes(*f_chunk));
                 }
                 let v = pgvector::Vector::from(floats);
                 let r = sqlx::query(
@@ -2500,7 +2670,7 @@ async fn import(
         )
     });
 
-    Ok(serde_json::json!({
+    let result = serde_json::json!({
         "action": "import",
         "manifest_hash": manifest.manifest_hash,
         "rows_inserted": inserted,
@@ -2529,7 +2699,20 @@ async fn import(
             )
         },
         "from": root.display().to_string(),
-    }))
+    });
+
+    crate::events::publish(
+        "sync.import",
+        serde_json::json!({
+            "manifest_hash": manifest.manifest_hash,
+            "rows_inserted": inserted,
+            "diverged": diverged.len(),
+            "quarantined": quarantined,
+            "peer_notices_closed": notices_closed,
+        }),
+    );
+
+    Ok(result)
 }
 
 async fn diff(pool: &PgPool, dir_arg: Option<&str>) -> Result<Value> {

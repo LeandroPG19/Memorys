@@ -118,7 +118,7 @@ fn the_panel_offers_no_button_that_destroys_anything() {
 
 #[test]
 fn the_admin_surface_is_not_advertised_to_models() {
-    let names: BTreeSet<String> = cuba_memorys::constants::tool_definitions()
+    let names: BTreeSet<String> = memory_industry::constants::tool_definitions()
         .iter()
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
         .collect();
@@ -128,7 +128,7 @@ fn the_admin_surface_is_not_advertised_to_models() {
         names.len()
     );
 
-    for method in cuba_memorys::admin::METHODS {
+    for method in memory_industry::admin::METHODS {
         assert!(
             !names.contains(method),
             "{method} is in the tool catalogue. The catalogue travels in the context of every \
@@ -137,14 +137,14 @@ fn the_admin_surface_is_not_advertised_to_models() {
              than tools"
         );
         assert!(
-            cuba_memorys::admin::is_admin_method(method),
+            memory_industry::admin::is_admin_method(method),
             "{method} is listed in METHODS but is_admin_method says otherwise, so the guard in \
              the HTTP layer would let it through to the tool dispatcher"
         );
     }
 
     assert!(
-        !cuba_memorys::admin::is_admin_method("cuba_faro"),
+        !memory_industry::admin::is_admin_method("cuba_faro"),
         "a matcher that says yes to everything would route ordinary tools into the admin \
          handler and refuse them for peers"
     );

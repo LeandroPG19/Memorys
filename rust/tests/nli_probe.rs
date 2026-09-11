@@ -1,13 +1,13 @@
-use cuba_memorys::cognitive::nli;
+use memory_industry::cognitive::nli;
 
 #[tokio::test]
 #[ignore = "diagnóstico, no aserción: imprime distribuciones. \
             `cargo test --test nli_probe -- --ignored --nocapture`"]
 async fn probe() {
-    if !nli::available() || !nli::enabled() {
-        eprintln!("SKIP: no hay modelo NLI");
-        return;
-    }
+    assert!(
+        nli::available() && nli::enabled(),
+        "NLI model required by the local merge gate — install with cuba-memorys models nli"
+    );
 
     let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap())
         .join(".cache/cuba-memorys/models-nli");

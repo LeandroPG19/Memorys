@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"].as_str().expect("envelope");
@@ -34,7 +34,7 @@ async fn own_the_trigger_table(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sql
 async fn a_note_left_for_another_agent_arrives_when_it_opens_its_session() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_trigger_table(&pool).await;
@@ -107,7 +107,7 @@ async fn a_note_left_for_another_agent_arrives_when_it_opens_its_session() {
         .execute(&pool)
         .await
         .ok();
-    cuba_memorys::session::clear();
+    memory_industry::session::clear();
 }
 
 #[tokio::test]
@@ -115,7 +115,7 @@ async fn a_note_left_for_another_agent_arrives_when_it_opens_its_session() {
 async fn the_notes_cannot_grow_without_end() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_trigger_table(&pool).await;

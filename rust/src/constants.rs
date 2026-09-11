@@ -366,7 +366,7 @@ pub fn tool_definitions() -> &'static Vec<Value> {
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["ingest", "parse", "auto_extract"], "description": "Ingestion mode. 'ingest' for structured items, 'parse' for raw text splitting, 'auto_extract' for LLM extraction via MCP sampling."},
+                    "action": {"type": "string", "enum": ["ingest", "parse", "auto_extract"], "default": "ingest", "description": "Ingestion mode. Default 'ingest' is the fast raw path (no LLM). 'parse' splits long text. 'auto_extract' is opt-in LLM extraction via MCP sampling — do not use it as the default write."},
                     "items": {"type": "array", "items": {"type": "object"}, "description": "Array of {entity_name, content, observation_type?} objects (for ingest action, max 200)"},
                     "entity_name": {"type": "string", "description": "Entity to attach parsed observations to (for parse action)"},
                     "text": {"type": "string", "description": "Raw text: paragraphs to split (parse) or a turn/conversation to extract facts from (auto_extract)"},
@@ -486,6 +486,43 @@ pub fn tool_definitions() -> &'static Vec<Value> {
             }),
         ),
         tool_def(
+            "cuba_whoami",
+            "Identify this MCP client against the MemoryIndustry daemon: client id, project, session, node, LLM, graph-db, resource plan. Alias: memory_whoami.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ),
+        tool_def(
+            "cuba_artefacto",
+            "Shared versioned artifacts between agents on the same daemon (and peers). put requires base_version (optimistic concurrency); lock is a short lease. Alias: memory_artifact.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "get", "put", "patch", "lock", "unlock", "watch_hint"], "description": "Artifact operation"},
+                    "path": {"type": "string", "description": "Logical path, e.g. notes/plan.md"},
+                    "content": {"type": "string", "description": "Full content for put"},
+                    "base_version": {"type": "integer", "description": "Required for concurrent-safe put; omit or 0 to create"},
+                    "find": {"type": "string", "description": "patch: substring to replace once"},
+                    "replace": {"type": "string", "description": "patch: replacement"},
+                    "ttl_seconds": {"type": "integer", "description": "lock lease length (default 60)"},
+                    "prefix": {"type": "string", "description": "list: path prefix filter"},
+                    "limit": {"type": "integer", "description": "list limit"}
+                },
+                "required": ["action"]
+            }),
+        ),
+        tool_def(
+            "cuba_contexto",
+            "Visible context window for the agent: working memory + agent notes (exact Mcp-Client-Id) + artifact index + recall of this session's recent writes (then WM mentions, then importance). Call at the start of a turn; call cuba_cronica add BEFORE editing. Alias: memory_context.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "budget_chars": {"type": "integer", "description": "Max serialized size (default 12000)"}
+                }
+            }),
+        ),
+        tool_def(
             "cuba_receta",
             "PROCEDURAL MEMORY: how things are DONE here — bring up the dev services, run the test suite, deploy, migrate. \
              The other tools remember what is TRUE; this one remembers what to DO, so an agent stops rediscovering it every session. \
@@ -535,7 +572,7 @@ fn meta_tool_defs() -> Vec<Value> {
     vec![
         tool_def(
             "cuba_tools",
-            "Find cuba-memorys tools and load their schemas ON DEMAND. The server exposes 28 tools; \
+            "Find cuba-memorys tools and load their schemas ON DEMAND. The server exposes 31 tools; \
              under CUBA_TOOL_PROFILE=lean only the everyday core is pre-loaded and the rest live here. \
              Search by capability ('audit', 'decay', 'contradiction', 'session'), then call what you \
              find with cuba_call. detail='names' is cheapest, 'full' returns the exact argument schema.",
@@ -564,7 +601,7 @@ fn meta_tool_defs() -> Vec<Value> {
     ]
 }
 
-const PROFILE_AGENT: [&str; 14] = [
+const PROFILE_AGENT: [&str; 17] = [
     "cuba_receta",
     "cuba_faro",
     "cuba_cronica",
@@ -579,6 +616,9 @@ const PROFILE_AGENT: [&str; 14] = [
     "cuba_proyecto",
     "cuba_pre_compact",
     "cuba_pizarra",
+    "cuba_whoami",
+    "cuba_artefacto",
+    "cuba_contexto",
 ];
 
 const PROFILE_STANDARD_EXTRA: [&str; 6] = [
@@ -590,7 +630,7 @@ const PROFILE_STANDARD_EXTRA: [&str; 6] = [
     "cuba_calibrar",
 ];
 
-const PROFILE_LEAN: [&str; 10] = [
+const PROFILE_LEAN: [&str; 13] = [
     "cuba_faro",
     "cuba_expediente",
     "cuba_decreto",
@@ -601,10 +641,49 @@ const PROFILE_LEAN: [&str; 10] = [
     "cuba_remedio",
     "cuba_receta",
     "cuba_pizarra",
+    "cuba_whoami",
+    "cuba_artefacto",
+    "cuba_contexto",
 ];
 
 pub fn tools_for_profile() -> Vec<Value> {
-    tools_for(&std::env::var("CUBA_TOOL_PROFILE").unwrap_or_else(|_| "full".to_string()))
+    tools_with_memory_aliases(tools_for(
+        &std::env::var("CUBA_TOOL_PROFILE").unwrap_or_else(|_| "full".to_string()),
+    ))
+}
+
+/// Announce both `cuba_*` and `memory_*` names for one release (dispatch still canonicalizes).
+pub fn tools_with_memory_aliases(tools: Vec<Value>) -> Vec<Value> {
+    let mut out = Vec::with_capacity(tools.len() * 2);
+    for tool in tools {
+        let Some(name) = tool.get("name").and_then(Value::as_str).map(str::to_string) else {
+            out.push(tool);
+            continue;
+        };
+        out.push(tool.clone());
+        if let Some(rest) = name.strip_prefix("cuba_") {
+            let alias = match rest {
+                "artefacto" => "memory_artifact".to_string(),
+                "contexto" => "memory_context".to_string(),
+                other => format!("memory_{other}"),
+            };
+            let mut aliased = tool;
+            if let Some(obj) = aliased.as_object_mut() {
+                obj.insert("name".into(), Value::String(alias));
+                let desc = obj
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                obj.insert(
+                    "description".into(),
+                    Value::String(format!("[alias of {name}] {desc}")),
+                );
+            }
+            out.push(aliased);
+        }
+    }
+    out
 }
 
 pub fn tools_for(profile: &str) -> Vec<Value> {
@@ -703,6 +782,41 @@ mod profile_tests {
             "lean sin cuba_call deja las demás inalcanzables"
         );
         assert!(names.contains(&"cuba_faro"));
+        assert!(
+            names.contains(&"cuba_whoami"),
+            "lean debe exponer whoami para onboarding"
+        );
+        assert!(
+            names.contains(&"cuba_artefacto"),
+            "lean debe exponer artefacto para coordinación multi-agente"
+        );
+    }
+
+    #[test]
+    fn tools_list_announces_memory_aliases() {
+        let listed = tools_with_memory_aliases(tools_for("full"));
+        let names: Vec<_> = listed
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(names.contains(&"cuba_whoami"));
+        assert!(names.contains(&"memory_whoami"));
+        assert!(names.contains(&"cuba_artefacto"));
+        assert!(names.contains(&"memory_artifact"));
+    }
+
+    #[test]
+    fn agent_profile_includes_coordination_tools() {
+        let names: Vec<String> = tools_for("agent")
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
+            .collect();
+        for required in ["cuba_whoami", "cuba_artefacto", "cuba_contexto"] {
+            assert!(
+                names.iter().any(|n| n == required),
+                "agent sin {required} deja la vista compartida inalcanzable"
+            );
+        }
     }
 
     #[test]
@@ -795,5 +909,33 @@ mod profile_tests {
                  flip it on a live credential"
             );
         }
+    }
+
+    #[test]
+    fn ingest_schema_defaults_to_fast_path_not_llm_extract() {
+        let tool = tool_definitions()
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("cuba_ingesta"))
+            .expect("cuba_ingesta");
+        let action = tool
+            .pointer("/inputSchema/properties/action")
+            .expect("action property");
+        assert_ne!(
+            action.get("default").and_then(Value::as_str),
+            Some("auto_extract"),
+            "auto_extract is the ~18s LLM path and must stay opt-in"
+        );
+        assert_eq!(
+            action.get("default").and_then(Value::as_str),
+            Some("ingest"),
+            "the contract default is raw ingest"
+        );
+        let modes: Vec<&str> = action
+            .get("enum")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(modes.first().copied(), Some("ingest"));
+        assert!(modes.contains(&"auto_extract"));
     }
 }

@@ -71,6 +71,8 @@ async fn create(pool: &PgPool, name: &str, args: &Value) -> Result<Value> {
 
     tracing::info!(entity = %name, entity_type = %entity_type, "entity created");
 
+    let _ = crate::graph_db::project_entity(name, entity_type).await;
+
     Ok(serde_json::json!({
         "action": "create",
         "already_existed": false,

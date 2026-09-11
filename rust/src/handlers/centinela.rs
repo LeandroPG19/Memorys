@@ -182,20 +182,44 @@ pub async fn check_triggers(
     }
 
     type TrigRow = (uuid::Uuid, String, String, i32, i32, Option<String>);
-    let triggers: Vec<TrigRow> = sqlx::query_as(
-        "SELECT id, entity_pattern, message, fire_count, max_fires, from_agent
-         FROM brain_triggers
-         WHERE active = TRUE
-           AND (expires_at IS NULL OR expires_at > NOW())
-           AND condition_type = $1
-           AND (entity_pattern = $2 OR similarity(entity_pattern, $2) > 0.5)
-         LIMIT 10",
-    )
-    .bind(condition)
-    .bind(entity_name)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let client = crate::session::current_client();
+    let triggers: Vec<TrigRow> = if condition == "on_session_start" {
+        // Exact match only: session name OR Mcp-Client-Id. Similarity caused
+        // silent cross-delivery between similarly named agents.
+        sqlx::query_as(
+            "SELECT id, entity_pattern, message, fire_count, max_fires, from_agent
+             FROM brain_triggers
+             WHERE active = TRUE
+               AND (expires_at IS NULL OR expires_at > NOW())
+               AND condition_type = $1
+               AND (
+                    entity_pattern = $2
+                 OR ($3::text IS NOT NULL AND entity_pattern = $3)
+               )
+             LIMIT 10",
+        )
+        .bind(condition)
+        .bind(entity_name)
+        .bind(client.as_deref())
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query_as(
+            "SELECT id, entity_pattern, message, fire_count, max_fires, from_agent
+             FROM brain_triggers
+             WHERE active = TRUE
+               AND (expires_at IS NULL OR expires_at > NOW())
+               AND condition_type = $1
+               AND (entity_pattern = $2 OR similarity(entity_pattern, $2) > 0.5)
+             LIMIT 10",
+        )
+        .bind(condition)
+        .bind(entity_name)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    };
 
     let mut fired: Vec<Value> = Vec::new();
 

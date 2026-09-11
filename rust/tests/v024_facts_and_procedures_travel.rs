@@ -17,7 +17,7 @@ async fn own_the_sync_dir(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sqlx::Po
 }
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"]
@@ -32,7 +32,7 @@ async fn a_fact_carries_its_layer_by_name_because_the_uuid_is_local_to_one_insta
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-f4-{}", Uuid::new_v4()));
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_sync_dir(&pool).await;
@@ -122,7 +122,7 @@ async fn two_machines_that_disagree_do_not_leave_two_current_truths() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-f4c-{}", Uuid::new_v4()));
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_sync_dir(&pool).await;

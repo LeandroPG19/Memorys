@@ -6,7 +6,7 @@ async fn subscribed(url: &str) -> PgListener {
         .await
         .expect("a listener connection of its own, outside the pool");
     listener
-        .listen(cuba_memorys::protocol::SYNC_CLOCK_CHANNEL)
+        .listen(memory_industry::protocol::SYNC_CLOCK_CHANNEL)
         .await
         .expect("subscribe to the sync clock channel");
     listener
@@ -17,7 +17,7 @@ async fn subscribed(url: &str) -> PgListener {
 async fn a_real_edit_wakes_the_listener_and_decay_does_not() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 

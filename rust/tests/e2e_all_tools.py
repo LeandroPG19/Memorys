@@ -551,8 +551,10 @@ def test_cuba_eco():
             obs_id = observations[0].get("id")
 
     if not obs_id:
-        print("  SKIP: Could not get observation_id for feedback tests")
-        return True
+        raise AssertionError(
+            "Could not get observation_id for cuba_eco — seed/search fixture failed "
+            "(soft-skip forbidden)"
+        )
 
     # Positive feedback
     result = test(
@@ -654,8 +656,10 @@ def test_cuba_remedio():
             error_id = results_list[0].get("id")
 
     if not error_id:
-        print("  SKIP: Could not get error_id from expediente")
-        return True
+        raise AssertionError(
+            "Could not get error_id from expediente for cuba_remedio — fixture failed "
+            "(soft-skip forbidden)"
+        )
 
     # Resolve it
     result = test(
@@ -1042,6 +1046,22 @@ def test_v08_v09_tools():
     test("cuba_archivo", "verify", {"action": "verify", "limit": 5})
     test("cuba_archivo", "tail", {"action": "tail", "limit": 3})
 
+    test("cuba_whoami", "identity", {})
+    test(
+        "cuba_artefacto",
+        "put",
+        {
+            "action": "put",
+            "path": "_e2e/note.md",
+            "content": "e2e artifact",
+            "base_version": 0,
+        },
+    )
+    test("cuba_artefacto", "list", {"action": "list", "prefix": "_e2e/"})
+    test("cuba_artefacto", "get", {"action": "get", "path": "_e2e/note.md"})
+    test("cuba_contexto", "budget", {"budget_chars": 4000})
+    test("memory_whoami", "alias", {})
+
 
 def cleanup():
     """Clean up remaining test entities."""
@@ -1193,13 +1213,36 @@ def test_refusals():
     )
 
 
+def test_cuba_receta_tools_call():
+    """Cover meta tools and receta that were missing from the E2E suite."""
+    print("\n" + "=" * 60)
+    print("cuba_receta / cuba_tools / cuba_call")
+    print("=" * 60)
+
+    if test("cuba_receta", "list", {"action": "list", "limit": 5}) is None:
+        return False
+    if test("cuba_tools", "list", {}) is None:
+        return False
+    # Proxy a safe read-only tool through cuba_call.
+    if (
+        test(
+            "cuba_call",
+            "proxy_vigia",
+            {"tool": "cuba_vigia", "args": {}},
+        )
+        is None
+    ):
+        return False
+    return True
+
+
 def main():
     """Run all E2E tests."""
     global tests_run, tests_passed, tests_failed
 
     print("\n")
     print("=" * 60)
-    print("CUBA-MEMORYS E2E TEST SUITE - ALL TOOLS, HAPPY PATH AND REFUSALS")
+    print("MEMORYINDUSTRY E2E TEST SUITE - ALL TOOLS, HAPPY PATH AND REFUSALS")
     print(f"binary:  {BINARY_PATH}")
     print(f"timeout: {CALL_TIMEOUT_SECS}s per call (CUBA_E2E_TIMEOUT_SECS)")
     print("=" * 60)
@@ -1220,6 +1263,7 @@ def main():
     test_cuba_forget()
     test_v08_v09_tools()
     test_refusals()
+    test_cuba_receta_tools_call()
 
     # Cleanup
     cleanup()

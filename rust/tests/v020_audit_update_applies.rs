@@ -5,7 +5,7 @@ use uuid::Uuid;
 async fn an_admin_update_on_the_audit_log_actually_changes_the_row() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 

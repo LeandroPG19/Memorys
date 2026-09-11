@@ -1,7 +1,9 @@
 use std::process::Command;
 use std::time::Duration;
 
-const CONTAINER_NAME: &str = "cuba-memorys-db";
+const CONTAINER_NAME: &str = "memory-industry-db";
+const LEGACY_CONTAINER_NAME: &str = "cuba-memorys-db"; // pre-rebrand
+const VOLUME_NAME: &str = "memory_industry_data";
 const PG_IMAGE: &str = "pgvector/pgvector:pg18";
 const PG_USER: &str = "cuba";
 const PG_PASSWORD: &str = "memorys2026";
@@ -33,7 +35,7 @@ pub async fn resolve_database_url() -> String {
 
     if !is_docker_available() {
         log("");
-        log("=== Cuba-Memorys Setup Required ===");
+        log("=== MemoryIndustry Setup Required ===");
         log("");
         log("PostgreSQL with pgvector is needed but DATABASE_URL is not set");
         log("and Docker is not available for automatic setup.");
@@ -52,11 +54,11 @@ pub async fn resolve_database_url() -> String {
 
     match get_container_state() {
         ContainerState::Running => {
-            log("PostgreSQL container 'cuba-memorys-db' is already running.");
+            log("PostgreSQL container 'memory-industry-db' is already running.");
             return build_url();
         }
         ContainerState::Stopped => {
-            log("Starting existing PostgreSQL container 'cuba-memorys-db'...");
+            log("Starting existing PostgreSQL container 'memory-industry-db'...");
             docker_start();
         }
         ContainerState::Unknown => {
@@ -72,17 +74,19 @@ pub async fn resolve_database_url() -> String {
         }
         ContainerState::NotFound => {
             log("");
-            log("=== Cuba-Memorys Automatic Setup ===");
+            log("=== MemoryIndustry Automatic Setup ===");
             log("");
             log("This will create a local PostgreSQL database for AI memory storage.");
-            log("A Docker container 'cuba-memorys-db' will be created with:");
+            log("A Docker container 'memory-industry-db' will be created with:");
             log(&format!("  - Image:    {PG_IMAGE}"));
             log(&format!(
                 "  - Port:     {PG_PORT} (mapped to container 5432)"
             ));
             log(&format!("  - Database: {PG_DB}"));
             log(&format!("  - User:     {PG_USER}"));
-            log("  - Volume:   cuba_memorys_data (persistent across restarts)");
+            log(&format!(
+                "  - Volume:   {VOLUME_NAME} (persistent across restarts)"
+            ));
             log("");
             log("Creating and starting PostgreSQL container...");
             docker_create_and_start();
@@ -97,7 +101,7 @@ pub async fn resolve_database_url() -> String {
         log("");
     } else {
         log("ERROR: PostgreSQL did not become ready within 60 seconds.");
-        log("Check Docker logs: docker logs cuba-memorys-db");
+        log("Check Docker logs: docker logs memory-industry-db");
         std::process::exit(1);
     }
 
@@ -105,7 +109,7 @@ pub async fn resolve_database_url() -> String {
 }
 
 fn log(msg: &str) {
-    eprintln!("[cuba-memorys] {msg}");
+    eprintln!("[memory-industry] {msg}");
 }
 
 fn build_url() -> String {
@@ -157,7 +161,14 @@ fn password_file() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;
-    Some(std::path::PathBuf::from(home).join(".cache/cuba-memorys/pgpass"))
+    let cache = std::path::PathBuf::from(home).join(".cache");
+    let preferred = cache.join("memory-industry").join("pgpass");
+    let legacy = cache.join("cuba-memorys").join("pgpass");
+    if preferred.exists() || !legacy.exists() {
+        Some(preferred)
+    } else {
+        Some(legacy)
+    }
 }
 
 fn generate_password() -> String {
@@ -194,7 +205,7 @@ pub fn resolve_password() -> String {
         ContainerState::Running | ContainerState::Stopped
     ) {
         log("contenedor preexistente: conservo la credencial anterior para no dejarte");
-        log("fuera de tu propia base. Rotala con: cuba-memorys setup --rotate-password");
+        log("fuera de tu propia base. Rotala con: memory-industry setup --rotate-password");
         PG_PASSWORD.to_string()
     } else {
         generate_password()
@@ -240,12 +251,20 @@ enum ContainerState {
 }
 
 fn get_container_state() -> ContainerState {
+    let primary = inspect_container(CONTAINER_NAME);
+    if !matches!(primary, ContainerState::NotFound) {
+        return primary;
+    }
+    inspect_container(LEGACY_CONTAINER_NAME)
+}
+
+fn inspect_container(name: &str) -> ContainerState {
     let output = Command::new("docker")
         .args([
             "ps",
             "-a",
             "--filter",
-            &format!("name=^{CONTAINER_NAME}$"),
+            &format!("name=^{name}$"),
             "--format",
             "{{.Status}}",
         ])
@@ -254,6 +273,22 @@ fn get_container_state() -> ContainerState {
     match output {
         Ok(o) if o.status.success() => parse_container_status(&String::from_utf8_lossy(&o.stdout)),
         _ => ContainerState::Unknown,
+    }
+}
+
+fn active_container_name() -> &'static str {
+    match inspect_container(CONTAINER_NAME) {
+        ContainerState::NotFound => {
+            if matches!(
+                inspect_container(LEGACY_CONTAINER_NAME),
+                ContainerState::Running | ContainerState::Stopped
+            ) {
+                LEGACY_CONTAINER_NAME
+            } else {
+                CONTAINER_NAME
+            }
+        }
+        _ => CONTAINER_NAME,
     }
 }
 
@@ -269,14 +304,15 @@ fn parse_container_status(stdout: &str) -> ContainerState {
 }
 
 fn docker_start() {
-    let status = Command::new("docker")
-        .args(["start", CONTAINER_NAME])
-        .status();
+    let name = active_container_name();
+    let status = Command::new("docker").args(["start", name]).status();
 
     if let Ok(s) = status
         && !s.success()
     {
-        log("ERROR: Failed to start container. Run: docker start cuba-memorys-db");
+        log(&format!(
+            "ERROR: Failed to start container. Run: docker start {name}"
+        ));
         std::process::exit(1);
     }
 }
@@ -297,7 +333,7 @@ fn docker_create_and_start() {
             "-p",
             &format!("{}:{PG_PORT}:5432", listen_address()),
             "-v",
-            "cuba_memorys_data:/var/lib/postgresql",
+            &format!("{VOLUME_NAME}:/var/lib/postgresql"),
             "--health-cmd",
             &format!("pg_isready -U {PG_USER} -d {PG_DB}"),
             "--health-interval",
@@ -336,7 +372,7 @@ async fn wait_for_healthy(timeout: Duration) -> bool {
         let ok = Command::new("docker")
             .args([
                 "exec",
-                CONTAINER_NAME,
+                active_container_name(),
                 "pg_isready",
                 "-U",
                 PG_USER,

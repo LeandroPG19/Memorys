@@ -4,7 +4,7 @@ use uuid::Uuid;
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -23,7 +23,7 @@ async fn a_second_concurrent_rem_cycle_does_no_work_and_returns_quickly() {
         .await
         .expect("a connection to hold the REM lock on, the way a first cycle would");
     sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(cuba_memorys::protocol::REM_LOCK)
+        .bind(memory_industry::protocol::REM_LOCK)
         .execute(&mut *holder)
         .await
         .expect("take the REM lock the way a first, still-running cycle would");
@@ -39,12 +39,12 @@ async fn a_second_concurrent_rem_cycle_does_no_work_and_returns_quickly() {
 
     let cycled = tokio::time::timeout(
         Duration::from_secs(5),
-        cuba_memorys::protocol::run_rem_consolidation(&pool),
+        memory_industry::protocol::run_rem_consolidation(&pool),
     )
     .await;
 
     sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(cuba_memorys::protocol::REM_LOCK)
+        .bind(memory_industry::protocol::REM_LOCK)
         .execute(&mut *holder)
         .await
         .ok();

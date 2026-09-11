@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"].as_str().expect("envelope");
@@ -14,11 +14,11 @@ async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
 async fn a_search_without_an_embedding_model_says_it_is_degraded() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
-    let model_loaded = cuba_memorys::embeddings::onnx::is_model_loaded();
+    let model_loaded = memory_industry::embeddings::onnx::is_model_loaded();
 
     let marker = format!("v030nomodel{}", &Uuid::new_v4().to_string()[..8]);
     let entity_id = Uuid::new_v4();

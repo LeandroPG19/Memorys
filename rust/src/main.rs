@@ -18,12 +18,14 @@ async fn drain_then_report(result: anyhow::Result<()>, command: &str) {
 
 fn print_help() {
     println!(
-        "cuba-memorys {version} — knowledge-graph memory server (MCP)
+        "MemoryIndustry {version} — knowledge-graph memory server (MCP)
 
 USAGE:
-  cuba-memorys                  run the MCP server on stdio (how an MCP client launches it)
-  cuba-memorys serve [addr]     run one shared daemon over HTTP for every client
-  cuba-memorys <command> [args]
+  memory-industry                  run the MCP server on stdio (how an MCP client launches it)
+  memory-industry serve [addr]     run one shared daemon over HTTP for every client
+  memory-industry <command> [args]
+
+  (deprecated alias for this release: cuba-memorys — same binary)
 
 ONE PROCESS FOR EVERY CLIENT:
   serve             stdio gives each client its own process, and each process its
@@ -60,6 +62,8 @@ OPERATIONS:
   rem               run one consolidation cycle now (decay, autolink, backfill, PageRank)
   setup             wire this server into your MCP clients; `setup check` audits them
   models            download the embedding, NLI and reranker models and the ONNX runtime
+  llm               pick a chat model the easy way (DeepSeek/Qwen/Ollama/…); saves config
+  graph             optional FalkorDB/Neo4j projection status|reconcile (Postgres stays SoT)
   secure            create the non-superuser cuba_app role so RLS and the audit trigger bite
 
   -h, --help        this
@@ -72,7 +76,7 @@ Docs: https://github.com/LeandroPG19/cuba-memorys",
 }
 
 async fn drain_background_tasks() {
-    let lost = cuba_memorys::tasks::drain(DRAIN_TIMEOUT).await;
+    let lost = memory_industry::tasks::drain(DRAIN_TIMEOUT).await;
     if lost > 0 {
         tracing::error!(
             lost,
@@ -89,12 +93,12 @@ fn main() {
         .json()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cuba_memorys=info".parse().unwrap()),
+                .unwrap_or_else(|_| "memory_industry=info".parse().unwrap()),
         )
         .init();
 
-    let machine = cuba_memorys::resources::probe();
-    let plan = cuba_memorys::resources::plan(&machine);
+    let machine = memory_industry::resources::probe();
+    let plan = memory_industry::resources::plan(&machine);
     tracing::info!(
         ram_total_mb = machine.ram_total_mb,
         ram_available_mb = machine.ram_available_mb,
@@ -106,7 +110,7 @@ fn main() {
         plan = %plan.describe(),
         "resource plan"
     );
-    cuba_memorys::resources::apply(&plan);
+    memory_industry::resources::apply(&plan);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(plan.worker_threads)
@@ -119,10 +123,14 @@ fn main() {
 }
 
 async fn async_main() {
+    // Saved by `memory-industry llm set` — easiest path for humans and agents.
+    memory_industry::llm_cli::load_saved_config_into_env();
+    memory_industry::graph_db::load_saved_config_into_env();
+
     let argv: Vec<String> = std::env::args().collect();
     match argv.get(1).map(String::as_str) {
         Some("eval") => {
-            if let Err(e) = cuba_memorys::eval::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::eval::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "eval failed");
                 eprintln!("eval error: {e:#}");
                 std::process::exit(1);
@@ -130,7 +138,7 @@ async fn async_main() {
             return;
         }
         Some("skills") => {
-            if let Err(e) = cuba_memorys::skills_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::skills_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "skills failed");
                 eprintln!("skills error: {e:#}");
                 std::process::exit(1);
@@ -138,12 +146,12 @@ async fn async_main() {
             return;
         }
         Some("reembed") => {
-            let result = cuba_memorys::reembed_cli::run_cli(&argv[2..]).await;
+            let result = memory_industry::reembed_cli::run_cli(&argv[2..]).await;
             drain_then_report(result, "reembed").await;
             return;
         }
         Some("recall") => {
-            if let Err(e) = cuba_memorys::recall_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::recall_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "recall failed");
                 eprintln!("recall error: {e:#}");
                 std::process::exit(1);
@@ -151,15 +159,31 @@ async fn async_main() {
             return;
         }
         Some("models") => {
-            if let Err(e) = cuba_memorys::models_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::models_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "models failed");
                 eprintln!("models: {e:#}");
                 std::process::exit(1);
             }
             return;
         }
+        Some("llm") => {
+            if let Err(e) = memory_industry::llm_cli::run_cli(&argv[2..]).await {
+                tracing::error!(error = %format!("{e:#}"), "llm failed");
+                eprintln!("llm: {e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("graph") => {
+            if let Err(e) = memory_industry::graph_cli::run_cli(&argv[2..]).await {
+                tracing::error!(error = %format!("{e:#}"), "graph failed");
+                eprintln!("graph: {e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Some("link") => {
-            if let Err(e) = cuba_memorys::link_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::link_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "link failed");
                 eprintln!("link error: {e:#}");
                 std::process::exit(1);
@@ -167,7 +191,7 @@ async fn async_main() {
             return;
         }
         Some("calibrate") => {
-            if let Err(e) = cuba_memorys::calibrate_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::calibrate_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "calibrate failed");
                 eprintln!("calibrate error: {e:#}");
                 std::process::exit(1);
@@ -175,7 +199,7 @@ async fn async_main() {
             return;
         }
         Some("dedupe") => {
-            if let Err(e) = cuba_memorys::dedupe_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::dedupe_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "dedupe failed");
                 eprintln!("dedupe error: {e:#}");
                 std::process::exit(1);
@@ -183,7 +207,7 @@ async fn async_main() {
             return;
         }
         Some("sync") => {
-            if let Err(e) = cuba_memorys::sync_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::sync_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "sync failed");
                 eprintln!("sync error: {e:#}");
                 std::process::exit(1);
@@ -191,12 +215,12 @@ async fn async_main() {
             return;
         }
         Some("rem") => {
-            let result = cuba_memorys::rem_cli::run_cli(&argv[2..]).await;
+            let result = memory_industry::rem_cli::run_cli(&argv[2..]).await;
             drain_then_report(result, "rem").await;
             return;
         }
         Some("codegraph") => {
-            if let Err(e) = cuba_memorys::codegraph_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::codegraph_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "codegraph failed");
                 eprintln!("codegraph error: {e:#}");
                 std::process::exit(1);
@@ -204,7 +228,7 @@ async fn async_main() {
             return;
         }
         Some("hook") => {
-            if let Err(e) = cuba_memorys::hooks_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::hooks_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "hook failed");
                 eprintln!("hook error: {e:#}");
                 std::process::exit(1);
@@ -212,7 +236,7 @@ async fn async_main() {
             return;
         }
         Some("secure") => {
-            if let Err(e) = cuba_memorys::secure_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::secure_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "secure failed");
                 eprintln!("secure: {e:#}");
                 std::process::exit(1);
@@ -220,7 +244,7 @@ async fn async_main() {
             return;
         }
         Some("doctor") => {
-            if let Err(e) = cuba_memorys::doctor::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::doctor::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "doctor failed");
                 eprintln!("doctor error: {e:#}");
                 std::process::exit(1);
@@ -230,17 +254,17 @@ async fn async_main() {
         Some(cmd @ ("search" | "save" | "delete" | "export" | "dashboard")) => {
             let rest = &argv[2..];
             let result = match cmd {
-                "search" => cuba_memorys::cli::run_search(rest).await,
-                "save" => cuba_memorys::cli::run_save(rest).await,
-                "delete" => cuba_memorys::cli::run_delete(rest).await,
-                "dashboard" => cuba_memorys::dashboard::run_cli(rest).await,
-                _ => cuba_memorys::export::run_cli(rest).await,
+                "search" => memory_industry::cli::run_search(rest).await,
+                "save" => memory_industry::cli::run_save(rest).await,
+                "delete" => memory_industry::cli::run_delete(rest).await,
+                "dashboard" => memory_industry::dashboard::run_cli(rest).await,
+                _ => memory_industry::export::run_cli(rest).await,
             };
             drain_then_report(result, cmd).await;
             return;
         }
         Some("setup") => {
-            if let Err(e) = cuba_memorys::setup_agent::run_cli(&argv[2..]) {
+            if let Err(e) = memory_industry::setup_agent::run_cli(&argv[2..]) {
                 tracing::error!(error = %format!("{e:#}"), "setup failed");
                 eprintln!("setup: {e:#}");
                 std::process::exit(1);
@@ -249,7 +273,7 @@ async fn async_main() {
         }
 
         Some("tunnel") => {
-            if let Err(e) = cuba_memorys::tunnel_cli::run_cli(&argv[2..]).await {
+            if let Err(e) = memory_industry::tunnel_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "tunnel failed");
                 eprintln!("tunnel error: {e:#}");
                 std::process::exit(1);
@@ -260,8 +284,8 @@ async fn async_main() {
             let addr = argv
                 .get(2)
                 .cloned()
-                .unwrap_or_else(cuba_memorys::http::bind_addr);
-            let outcome = cuba_memorys::http::serve(&addr).await;
+                .unwrap_or_else(memory_industry::http::bind_addr);
+            let outcome = memory_industry::http::serve(&addr).await;
             drain_background_tasks().await;
             if let Err(e) = outcome {
                 tracing::error!(error = %format!("{e:#}"), "daemon failed");
@@ -272,7 +296,7 @@ async fn async_main() {
         }
 
         Some("--version" | "-V" | "version") => {
-            println!("cuba-memorys {}", env!("CARGO_PKG_VERSION"));
+            println!("memory-industry {}", env!("CARGO_PKG_VERSION"));
             return;
         }
         Some("--help" | "-h" | "help") => {
@@ -282,8 +306,8 @@ async fn async_main() {
 
         Some(unknown) => {
             eprintln!(
-                "cuba-memorys: unknown command '{unknown}'\n\nknown commands: {}\n",
-                cuba_memorys::cli::COMMANDS.join(", ")
+                "memory-industry: unknown command '{unknown}'\n\nknown commands: {}\n",
+                memory_industry::cli::COMMANDS.join(", ")
             );
             print_help();
             std::process::exit(2);
@@ -292,15 +316,18 @@ async fn async_main() {
         None => {}
     }
 
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "cuba-memorys starting");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "MemoryIndustry starting"
+    );
 
     {
-        let url = cuba_memorys::setup::resolve_database_url().await;
-        match cuba_memorys::db::create_pool(&url).await {
+        let url = memory_industry::setup::resolve_database_url().await;
+        match memory_industry::db::create_pool(&url).await {
             Ok(pool) => {
-                if let Err(e) = cuba_memorys::db::assert_embedding_dim(&pool).await {
+                if let Err(e) = memory_industry::db::assert_embedding_dim(&pool).await {
                     tracing::error!(error = %format!("{e:#}"), "arranque abortado");
-                    eprintln!("\ncuba-memorys NO puede arrancar:\n\n{e:#}\n");
+                    eprintln!("\nMemoryIndustry NO puede arrancar:\n\n{e:#}\n");
                     std::process::exit(1);
                 }
             }
@@ -329,7 +356,7 @@ async fn async_main() {
     };
 
     tokio::select! {
-        result = cuba_memorys::protocol::run_mcp() => {
+        result = memory_industry::protocol::run_mcp() => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "MCP protocol error");
                 drain_background_tasks().await;

@@ -135,6 +135,6 @@ sleep 0.3
 
 echo -e "\n${GREEN}${BOLD}"
 echo "  ✓ 28 MCP tools · 234 tests · 0 clippy warnings · cargo audit clean"
-echo "  github.com/LeandroPG19/cuba-memorys"
+echo "  github.com/LeandroPG19/Memorys"
 echo -e "${NC}"
 sleep 1.5

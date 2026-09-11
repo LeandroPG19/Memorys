@@ -3,9 +3,9 @@ requires = ["maturin>=1.8,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "cuba-memorys"
-version = "1.26.0"
-description = "Persistent memory MCP server for AI agents. 28 tools, self-growing graph without MCP sampling, poisoning quarantine: bitemporal facts, sqlx-migrate, BM25+MMR+OOD hybrid retrieval, graph metrics, conformal prediction, Hebbian/BCM, project scoping, tamper-evident audit chain (21 CFR Part 11-oriented), tree-sitter codegraph, git-native sync hooks. Rust + PostgreSQL + pgvector."
+name = "memory-industry"
+version = "1.27.0"
+description = "MemoryIndustry — Persistent memory MCP server for AI agents. 31 tools, self-growing graph without MCP sampling, poisoning quarantine: bitemporal facts, sqlx-migrate, BM25+MMR+OOD hybrid retrieval, graph metrics, conformal prediction, Hebbian/BCM, project scoping, tamper-evident audit chain (21 CFR Part 11-oriented), tree-sitter codegraph, git-native sync hooks. Rust + PostgreSQL + pgvector."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
@@ -24,7 +24,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",

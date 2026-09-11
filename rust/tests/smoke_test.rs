@@ -2,7 +2,7 @@ use serde_json::Value;
 
 #[test]
 fn test_all_tools_defined() {
-    let tools = cuba_memorys::constants::tool_definitions();
+    let tools = memory_industry::constants::tool_definitions();
 
     let tool_names: Vec<&str> = tools
         .iter()
@@ -50,7 +50,7 @@ fn test_all_tools_defined() {
 
 #[test]
 fn test_tool_schema_structure() {
-    let tools = cuba_memorys::constants::tool_definitions();
+    let tools = memory_industry::constants::tool_definitions();
 
     for tool in tools.iter() {
         let name = tool
@@ -83,7 +83,7 @@ fn test_tool_schema_structure() {
 
 #[test]
 fn test_threshold_invariants() {
-    use cuba_memorys::constants::*;
+    use memory_industry::constants::*;
 
     const _: () = assert!(PRED_ERROR_REINFORCE > DEDUP_THRESHOLD);
     const _: () = assert!(DEDUP_THRESHOLD > PRED_ERROR_UPDATE);
@@ -92,7 +92,7 @@ fn test_threshold_invariants() {
 
 #[test]
 fn advertised_tools_are_all_dispatchable() {
-    let tools = cuba_memorys::constants::tool_definitions();
+    let tools = memory_industry::constants::tool_definitions();
 
     for tool in tools.iter() {
         let name = tool
@@ -101,7 +101,7 @@ fn advertised_tools_are_all_dispatchable() {
             .expect("every tool definition has a name");
 
         assert!(
-            cuba_memorys::handlers::is_known_tool(name),
+            memory_industry::handlers::is_known_tool(name),
             "{name} se anuncia en tools/list pero el dispatcher no la conoce: \
              un cliente que la llame recibiría 'unknown tool' en runtime"
         );
@@ -164,7 +164,7 @@ fn the_embedded_migrations_build_every_object_the_handlers_query() {
 
 #[test]
 fn test_cognitive_constants_valid() {
-    use cuba_memorys::constants::*;
+    use memory_industry::constants::*;
 
     const _: () = assert!(HEBBIAN_ACCESS_BOOST > 0.0 && HEBBIAN_ACCESS_BOOST < 1.0);
     const _: () = assert!(BCM_THROTTLE_SCALE > 0.0 && BCM_THROTTLE_SCALE <= 1.0);
@@ -172,14 +172,14 @@ fn test_cognitive_constants_valid() {
 
 #[test]
 fn test_cache_constants_valid() {
-    use cuba_memorys::constants::*;
+    use memory_industry::constants::*;
     const _: () = assert!(CACHE_MAX_ENTRIES > 0);
     const _: () = assert!(CACHE_TTL_SECS > 0);
 }
 
 #[test]
 fn test_valid_types_lists() {
-    use cuba_memorys::constants::*;
+    use memory_industry::constants::*;
 
     assert!(!VALID_ENTITY_TYPES.is_empty());
     assert!(!VALID_OBSERVATION_TYPES.is_empty());
@@ -194,7 +194,7 @@ fn test_valid_types_lists() {
 
 #[test]
 fn test_importance_priors() {
-    use cuba_memorys::constants::importance_prior;
+    use memory_industry::constants::importance_prior;
 
     assert!((importance_prior("decision", 0.5) - 0.8).abs() < f64::EPSILON);
     assert!((importance_prior("lesson", 0.5) - 0.75).abs() < f64::EPSILON);
@@ -229,14 +229,14 @@ fn model_tag_follows_the_environment() {
     let _env = own_the_environment();
     unsafe { std::env::remove_var("CUBA_EMBED_MODEL") };
     assert_eq!(
-        cuba_memorys::embeddings::onnx::current_model(),
+        memory_industry::embeddings::onnx::current_model(),
         "multilingual-e5-small",
         "with nothing set, the default stands"
     );
 
     unsafe { std::env::set_var("CUBA_EMBED_MODEL", "bge-m3") };
     assert_eq!(
-        cuba_memorys::embeddings::onnx::current_model(),
+        memory_industry::embeddings::onnx::current_model(),
         "bge-m3",
         "CUBA_EMBED_MODEL must win — it is the only thing that knows which model ran"
     );
@@ -246,7 +246,7 @@ fn model_tag_follows_the_environment() {
 
 #[test]
 fn a_request_without_an_id_parses_as_a_notification() {
-    use cuba_memorys::protocol::JsonRpcRequest;
+    use memory_industry::protocol::JsonRpcRequest;
 
     let notification: JsonRpcRequest = serde_json::from_str(
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,

@@ -3,7 +3,7 @@ use uuid::Uuid;
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -37,7 +37,7 @@ async fn writing_under_a_name_that_was_merged_away_lands_on_the_winner() {
         "content": "a note written under the name that no longer has an entity of its own",
         "observation_type": "fact",
     });
-    cuba_memorys::handlers::cronica::handle(&pool, args)
+    memory_industry::handlers::cronica::handle(&pool, args)
         .await
         .expect("writing an observation under the merged-away name");
 

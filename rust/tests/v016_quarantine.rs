@@ -8,7 +8,7 @@ fn unique_name(prefix: &str) -> String {
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -21,7 +21,7 @@ async fn quarantined_memories_are_withheld_from_search_until_promoted() {
     let marker = unique_name("zzmarker");
     let content = format!("The quarantine canary phrase is {marker}");
 
-    cuba_memorys::handlers::cronica::handle(
+    memory_industry::handlers::cronica::handle(
         &pool,
         json!({
             "action": "add",
@@ -46,7 +46,7 @@ async fn quarantined_memories_are_withheld_from_search_until_promoted() {
     .expect("the observation must be stored even while quarantined");
     assert_eq!(stored.1, "quarantined");
 
-    let found = cuba_memorys::handlers::faro::handle(
+    let found = memory_industry::handlers::faro::handle(
         &pool,
         json!({ "query": marker, "limit": 20, "format": "verbose" }),
     )
@@ -67,7 +67,7 @@ async fn quarantined_memories_are_withheld_from_search_until_promoted() {
         "a quarantined memory must not surface in search; results were {surfaced:?}"
     );
 
-    let listed = cuba_memorys::handlers::eco::handle(&pool, json!({ "action": "pending" }))
+    let listed = memory_industry::handlers::eco::handle(&pool, json!({ "action": "pending" }))
         .await
         .expect("listing pending");
     assert!(
@@ -77,7 +77,7 @@ async fn quarantined_memories_are_withheld_from_search_until_promoted() {
         "a quarantined memory must be visible for review"
     );
 
-    cuba_memorys::handlers::eco::handle(
+    memory_industry::handlers::eco::handle(
         &pool,
         json!({ "action": "promote", "observation_id": stored.0.to_string() }),
     )
@@ -91,7 +91,7 @@ async fn quarantined_memories_are_withheld_from_search_until_promoted() {
         .expect("reading trust back");
     assert_eq!(after, "trusted", "promotion must flip the row to trusted");
 
-    let found_after = cuba_memorys::handlers::faro::handle(
+    let found_after = memory_industry::handlers::faro::handle(
         &pool,
         json!({ "query": marker, "limit": 20, "format": "verbose" }),
     )
@@ -125,7 +125,7 @@ async fn a_trusted_write_is_retrievable_as_before() {
     let entity = unique_name("trust_entity");
     let marker = unique_name("yymarker");
 
-    cuba_memorys::handlers::cronica::handle(
+    memory_industry::handlers::cronica::handle(
         &pool,
         json!({
             "action": "add",

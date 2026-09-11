@@ -98,4 +98,37 @@ mod tests {
             "rank-0 score must equal 1/61: {score_rank0}"
         );
     }
+
+    #[test]
+    fn empty_or_punctuation_only_query_has_zero_entropy() {
+        assert_eq!(query_entropy(""), 0.0);
+        assert_eq!(query_entropy("!!! ???"), 0.0);
+    }
+
+    #[test]
+    fn shannon_uses_p_times_log_p_not_p_plus_log_p() {
+        // Tokens a,a,a,b → p=(3/4,1/4). H ≈ 0.811.
+        // Replacing `p * p.log2()` with `p + p.log2()` yields ≈ 1.811.
+        let e = query_entropy("a a a b");
+        let p1 = 0.75_f64;
+        let p2 = 0.25_f64;
+        let expected = -(p1 * p1.log2() + p2 * p2.log2());
+        assert!(
+            (e - expected).abs() < 1e-9,
+            "Shannon H(3/4,1/4) expected {expected}, got {e}"
+        );
+    }
+
+    #[test]
+    fn empty_side_has_zero_overlap() {
+        assert_eq!(content_overlap("", "hello world"), 0.0);
+        assert_eq!(content_overlap("hello world", ""), 0.0);
+        assert_eq!(content_overlap("!!!", "hello"), 0.0);
+    }
+
+    #[test]
+    fn overlap_is_case_insensitive_and_partial() {
+        let o = content_overlap("Hello World", "hello there");
+        assert!((o - 0.5).abs() < 1e-9, "one shared token of two: {o}");
+    }
 }

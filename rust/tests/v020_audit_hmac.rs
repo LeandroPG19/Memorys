@@ -1,4 +1,6 @@
-use cuba_memorys::handlers::archivo::{ChainVerdict, HashKind, audit_key, classify_hash, ratchet};
+use memory_industry::handlers::archivo::{
+    ChainVerdict, HashKind, audit_key, classify_hash, ratchet,
+};
 
 const PREV: &[u8] = b"previous";
 const ACTION: &str = "test";
@@ -35,6 +37,7 @@ fn the_key_is_resolved_from_env_then_disk_and_legacy_sha256_rows_keep_verifying(
         .expect("a scratch HOME must be creatable, otherwise this test cannot be deterministic");
     let _ = std::fs::remove_file(&key_file);
     unsafe { std::env::set_var("HOME", &home) };
+    unsafe { std::env::set_var("USERPROFILE", &home) };
     unsafe { std::env::remove_var("CUBA_AUDIT_KEY") };
 
     assert!(
@@ -128,7 +131,7 @@ fn the_key_is_resolved_from_env_then_disk_and_legacy_sha256_rows_keep_verifying(
 #[test]
 fn a_key_actually_produces_a_different_hash_than_no_key() {
     let _env = own_the_environment();
-    use cuba_memorys::handlers::archivo::compute_hash;
+    use memory_industry::handlers::archivo::compute_hash;
 
     const PREV: &[u8] = b"\x01\x02\x03";
     const ACTION: &str = "append";
@@ -136,6 +139,7 @@ fn a_key_actually_produces_a_different_hash_than_no_key() {
     const STAMP: &str = "2026-08-11T00:00:00.000000+00:00";
 
     unsafe { std::env::set_var("HOME", std::env::temp_dir().join("cuba-hmac-probe")) };
+    unsafe { std::env::set_var("USERPROFILE", std::env::temp_dir().join("cuba-hmac-probe")) };
     unsafe { std::env::remove_var("CUBA_AUDIT_KEY") };
     let plain = compute_hash(PREV, ACTION, PAYLOAD, STAMP);
 

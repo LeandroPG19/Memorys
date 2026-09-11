@@ -1,18 +1,15 @@
-# Cuba-Memorys — Rust
+# MemoryIndustry — Rust
 
-[![CI](https://github.com/LeandroPG19/cuba-memorys/actions/workflows/ci.yml/badge.svg)](https://github.com/LeandroPG19/cuba-memorys/actions/workflows/ci.yml)
+[![CI](https://github.com/LeandroPG19/Memorys/actions/workflows/ci.yml/badge.svg)](https://github.com/LeandroPG19/Memorys/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.93+-orange?logo=rust&logoColor=white)](https://rust-lang.org)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/LeandroPG19/cuba-memorys/releases/tag/v0.3.0)
+[![Version](https://img.shields.io/badge/version-0.25.0-blue)](https://github.com/LeandroPG19/Memorys/releases/tag/v0.25.0)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-336791?logo=postgresql&logoColor=white)](https://postgresql.org)
 [![MCP](https://img.shields.io/badge/MCP-compatible-8A2BE2)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-51%20pass-brightgreen)](https://github.com/LeandroPG19/cuba-memorys)
-[![Audit](https://img.shields.io/badge/audit-GO-brightgreen)](https://github.com/LeandroPG19/cuba-memorys)
-[![Tech Debt](https://img.shields.io/badge/tech%20debt-0-brightgreen)](https://github.com/LeandroPG19/cuba-memorys)
 
-**Persistent memory for AI agents** — Complete Rust rewrite of the Cuba-Memorys MCP server. Knowledge graph with neuroscience-inspired algorithms: exponential decay, Hebbian learning with BCM metaplasticity, Leiden community detection, hybrid search (RRF + pgvector), and anti-hallucination grounding.
+**Persistent memory for AI agents** — MemoryIndustry MCP server (crate `memory_industry`; binaries `memory-industry` and the `cuba-memorys` alias). Knowledge graph with neuroscience-inspired algorithms: exponential decay, Hebbian learning with BCM metaplasticity, Leiden community detection, hybrid search (RRF + pgvector), and anti-hallucination grounding.
 
-28 tools · 7.6MB binary · Sub-millisecond handlers · Zero tech debt · Audited GO
+31 tools · Rust + PostgreSQL + pgvector
 
 ---
 
@@ -26,15 +23,15 @@
 ### 2. Build
 
 ```bash
-cd cuba-memorys/rust
+cd Memorys/rust
 
-# Release build
+# Release build (both `memory-industry` and `cuba-memorys` bins)
 cargo build --release
 
-# Run tests (40 unit + 11 smoke)
+# Library + unit tests
 cargo test
 
-# Run E2E tests against real DB (55 tests, all 28 tools)
+# E2E against a real DB (all 31 tools)
 python3 tests/e2e_all_tools.py
 ```
 
@@ -42,7 +39,7 @@ python3 tests/e2e_all_tools.py
 
 ```bash
 DATABASE_URL="postgresql://user:pass@localhost:5488/brain" \
-  ./target/release/cuba-memorys
+  ./target/release/memory-industry
 ```
 
 The server auto-creates the database schema on first run.
@@ -52,8 +49,8 @@ The server auto-creates the database schema on first run.
 ```json
 {
   "mcpServers": {
-    "cuba-memorys": {
-      "command": "/path/to/cuba-memorys",
+    "memory-industry": {
+      "command": "/path/to/memory-industry",
       "env": {
         "DATABASE_URL": "postgresql://user:pass@localhost:5488/brain"
       }
@@ -134,7 +131,7 @@ rust/
 │       └── pagerank.rs      # Personalized PageRank (alpha=0.85)
 └── tests/
     ├── smoke_test.rs        # 11 smoke tests (no DB required)
-    └── e2e_all_tools.py     # 55 E2E tests (all 28 tools vs real DB)
+    └── e2e_all_tools.py     # 55 E2E tests (all 31 tools vs real DB)
 ```
 
 ---

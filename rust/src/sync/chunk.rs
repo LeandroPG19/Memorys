@@ -32,6 +32,8 @@ pub struct Counts {
     pub decisions: u32,
     pub errors: u32,
     pub relations: u32,
+    #[serde(default)]
+    pub artifacts: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -81,6 +83,10 @@ pub struct ObservationRow {
     pub verified_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub trust: Option<String>,
+    #[serde(default)]
+    pub crdt_actor: Option<String>,
+    #[serde(default)]
+    pub crdt_counter: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -184,6 +190,24 @@ pub struct SourceTrustRow {
     pub beta: f64,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ArtifactRow {
+    pub id: Uuid,
+    pub path: String,
+    pub content: String,
+    pub content_hash: String,
+    pub version: i64,
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub origin_node: Option<String>,
+    #[serde(default)]
+    pub crdt_actor: Option<String>,
+    #[serde(default)]
+    pub crdt_counter: i64,
+    pub updated_at: DateTime<Utc>,
 }
 
 pub fn payload_hash_bytes(bytes: &[u8]) -> String {

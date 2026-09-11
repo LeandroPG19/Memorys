@@ -17,7 +17,7 @@ async fn own_the_sync_dir(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sqlx::Po
 }
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"]
@@ -32,7 +32,7 @@ async fn a_tombstone_for_a_table_not_keyed_by_id_does_not_abort_the_import() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-tk-{}", Uuid::new_v4()));
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_sync_dir(&pool).await;
@@ -101,7 +101,7 @@ async fn a_tombstone_for_a_table_not_keyed_by_id_does_not_abort_the_import() {
 async fn the_import_deletes_from_exactly_the_tables_that_write_tombstones() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -115,7 +115,7 @@ async fn the_import_deletes_from_exactly_the_tables_that_write_tombstones() {
     .await
     .expect("read the tombstone triggers");
 
-    let mut allowed: Vec<String> = cuba_memorys::handlers::sync::TOMBSTONED_TABLES
+    let mut allowed: Vec<String> = memory_industry::handlers::sync::TOMBSTONED_TABLES
         .iter()
         .map(|(t, _)| t.to_string())
         .collect();
@@ -132,7 +132,7 @@ async fn the_import_deletes_from_exactly_the_tables_that_write_tombstones() {
          deletions stop travelling and nothing says so"
     );
 
-    for (table, key) in cuba_memorys::handlers::sync::TOMBSTONED_TABLES {
+    for (table, key) in memory_industry::handlers::sync::TOMBSTONED_TABLES {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM information_schema.columns
                             WHERE table_name = $1 AND column_name = $2)",

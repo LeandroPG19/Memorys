@@ -90,6 +90,14 @@ pub struct EvalReport {
     pub questions_with_missing_ids: usize,
     #[serde(default)]
     pub unmeasurable_questions: usize,
+    #[serde(default)]
+    pub mean_graph_tokens: f64,
+    #[serde(default)]
+    pub mean_hop_ball_tokens: f64,
+    #[serde(default)]
+    pub graph_token_ratio: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_query_ability: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,6 +163,10 @@ pub async fn run_faro_eval(
             missing_relevant_ids: 0,
             questions_with_missing_ids: 0,
             unmeasurable_questions: 0,
+            mean_graph_tokens: 0.0,
+            mean_hop_ball_tokens: 0.0,
+            graph_token_ratio: 0.0,
+            per_query_ability: Vec::new(),
         });
     }
 
@@ -195,6 +207,9 @@ pub async fn run_faro_eval(
     let warmup_ms = warmup_started.elapsed().as_secs_f64() * 1000.0;
 
     let mut latencies_ms: Vec<f64> = Vec::new();
+    let mut graph_tok_sum = 0.0;
+    let mut hop_tok_sum = 0.0;
+    let mut per_query_ability: Vec<String> = Vec::new();
     for sample in samples {
         let args = faro_args(&sample.query, cfg, k);
         let started = std::time::Instant::now();
@@ -206,6 +221,14 @@ pub async fn run_faro_eval(
         let cost = crate::search::budget::count_tokens(&response.to_string());
         token_sum += cost;
         token_max = token_max.max(cost);
+        graph_tok_sum += response
+            .get("graph_context_tokens")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        hop_tok_sum += response
+            .get("graph_hop_ball_tokens")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
 
         let ranked = extract_ranked(&response);
         let rels: Vec<bool> = ranked.iter().map(|hit| hit.is_relevant(sample)).collect();
@@ -245,6 +268,13 @@ pub async fn run_faro_eval(
         let s_recall = recall_at_k(&rels, total_rel, k);
         ndcg_sum += s_ndcg;
         ndcg_scores.push(s_ndcg);
+        per_query_ability.push(
+            sample
+                .ability
+                .clone()
+                .or_else(|| sample.question_class.clone())
+                .unwrap_or_default(),
+        );
         prec_sum += precision_at_k(&rels, k);
         recall_sum += s_recall;
         relevance_lists.push(rels);
@@ -323,6 +353,14 @@ pub async fn run_faro_eval(
         missing_relevant_ids: audit.missing_ids,
         questions_with_missing_ids: audit.affected_questions,
         unmeasurable_questions: audit.unmeasurable_questions,
+        mean_graph_tokens: graph_tok_sum / n as f64,
+        mean_hop_ball_tokens: hop_tok_sum / n as f64,
+        graph_token_ratio: if hop_tok_sum > 0.0 {
+            graph_tok_sum / hop_tok_sum
+        } else {
+            0.0
+        },
+        per_query_ability,
     })
 }
 
@@ -491,6 +529,8 @@ mod tests {
             expected_answer: None,
             ability: None,
             abstain: false,
+            gold_entities: Vec::new(),
+            question_class: None,
         }
     }
 
@@ -502,6 +542,8 @@ mod tests {
             expected_answer: None,
             ability: None,
             abstain: false,
+            gold_entities: Vec::new(),
+            question_class: None,
         }
     }
 
@@ -690,6 +732,8 @@ mod wiring_tests {
             expected_answer: None,
             ability: None,
             abstain: false,
+            gold_entities: Vec::new(),
+            question_class: None,
         }];
 
         let report = run_faro_eval(&pool, &samples, &EvalConfig::default())

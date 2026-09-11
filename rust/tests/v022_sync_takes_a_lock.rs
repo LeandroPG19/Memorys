@@ -9,7 +9,7 @@ async fn an_export_waits_instead_of_racing_a_concurrent_one() {
     std::fs::create_dir_all(&bundle).expect("a scratch bundle directory");
     unsafe { std::env::set_var("CUBA_SYNC_DIR", &bundle) };
 
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -18,12 +18,12 @@ async fn an_export_waits_instead_of_racing_a_concurrent_one() {
         .await
         .expect("a connection to hold the lock on");
     sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(cuba_memorys::handlers::sync::SYNC_LOCK)
+        .bind(memory_industry::handlers::sync::SYNC_LOCK)
         .execute(&mut *holder)
         .await
         .expect("take the sync lock the way a concurrent export would");
 
-    let racing = cuba_memorys::handlers::dispatch(
+    let racing = memory_industry::handlers::dispatch(
         &pool,
         "cuba_sync",
         serde_json::json!({"action": "export", "scope": "all", "dir": bundle.display().to_string()}),
@@ -41,7 +41,7 @@ async fn an_export_waits_instead_of_racing_a_concurrent_one() {
     );
 
     sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(cuba_memorys::handlers::sync::SYNC_LOCK)
+        .bind(memory_industry::handlers::sync::SYNC_LOCK)
         .execute(&mut *holder)
         .await
         .expect("release the lock");
@@ -49,7 +49,7 @@ async fn an_export_waits_instead_of_racing_a_concurrent_one() {
 
     let freed = tokio::time::timeout(
         Duration::from_secs(60),
-        cuba_memorys::handlers::dispatch(
+        memory_industry::handlers::dispatch(
             &pool,
             "cuba_sync",
             serde_json::json!({"action": "export", "scope": "all", "dir": bundle.display().to_string()}),

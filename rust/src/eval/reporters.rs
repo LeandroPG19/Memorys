@@ -28,6 +28,10 @@ fn report_with_warmup(warmup_ms: f64) -> EvalReport {
         missing_relevant_ids: 0,
         questions_with_missing_ids: 0,
         unmeasurable_questions: 0,
+        mean_graph_tokens: 0.0,
+        mean_hop_ball_tokens: 0.0,
+        graph_token_ratio: 0.0,
+        per_query_ability: Vec::new(),
     }
 }
 
@@ -68,6 +72,12 @@ pub fn summary_line(report: &EvalReport) -> String {
         " | tokens: mean={:.0} max={}",
         report.mean_response_tokens, report.max_response_tokens
     ));
+    if report.mean_hop_ball_tokens > 0.0 || report.mean_graph_tokens > 0.0 {
+        s.push_str(&format!(
+            " | grafo: paths={:.0}tok bola={:.0}tok ratio={:.2}",
+            report.mean_graph_tokens, report.mean_hop_ball_tokens, report.graph_token_ratio
+        ));
+    }
     if report.latency_p50_ms > 0.0 {
         s.push_str(&format!(
             " | latencia: p50={:.0}ms p95={:.0}ms",

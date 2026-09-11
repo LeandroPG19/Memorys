@@ -7,7 +7,7 @@ fn unique_name(prefix: &str) -> String {
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -16,7 +16,7 @@ async fn pool() -> sqlx::PgPool {
 #[ignore]
 async fn a_long_observation_becomes_reachable_past_the_truncation_limit() {
     assert!(
-        cuba_memorys::embeddings::onnx::is_model_loaded(),
+        memory_industry::embeddings::onnx::is_model_loaded(),
         "no ONNX model loaded. Chunking exists so a long observation stays reachable past the \
          truncation limit, and that is a claim about SIMILARITY — under the hash fallback it \
          means nothing, so reporting ok would be reporting on a measurement never taken"
@@ -41,7 +41,7 @@ async fn a_long_observation_becomes_reachable_past_the_truncation_limit() {
     .repeat(3);
     let content = format!("{head}\n\n{tail}");
 
-    let threshold = cuba_memorys::embeddings::chunk::threshold_chars();
+    let threshold = memory_industry::embeddings::chunk::threshold_chars();
     assert!(
         content.chars().count() > threshold,
         "the fixture must exceed the chunking threshold"
@@ -71,7 +71,7 @@ async fn a_long_observation_becomes_reachable_past_the_truncation_limit() {
     .expect("creating observation");
 
     let full =
-        cuba_memorys::embeddings::onnx::embed_passage_contextual(&content, "concept", &entity)
+        memory_industry::embeddings::onnx::embed_passage_contextual(&content, "concept", &entity)
             .await
             .expect("embedding the full text");
     sqlx::query("UPDATE brain_observations SET embedding = $1::vector WHERE id = $2")
@@ -81,14 +81,14 @@ async fn a_long_observation_becomes_reachable_past_the_truncation_limit() {
         .await
         .expect("storing the full-text embedding");
 
-    let stored = cuba_memorys::embeddings::backfill::store_chunks(
+    let stored = memory_industry::embeddings::backfill::store_chunks(
         &pool, obs_id.0, &content, "concept", &entity, None,
     )
     .await
     .expect("chunking");
     assert!(stored > 1, "a text this long must produce several chunks");
 
-    let query_vec = cuba_memorys::embeddings::onnx::embed(&format!(
+    let query_vec = memory_industry::embeddings::onnx::embed(&format!(
         "how does the bee colony overwinter, and what is {tail_marker} swarm control"
     ))
     .await
@@ -155,7 +155,7 @@ async fn chunking_is_idempotent_and_never_duplicates() {
     .expect("creating observation");
 
     for _ in 0..2 {
-        cuba_memorys::embeddings::backfill::store_chunks(
+        memory_industry::embeddings::backfill::store_chunks(
             &pool, obs_id.0, &content, "concept", &entity, None,
         )
         .await

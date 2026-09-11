@@ -61,14 +61,23 @@ pub fn is_configured() -> bool {
     if let Ok(p) = std::env::var("CUBA_RERANKER_PATH") {
         return PathBuf::from(p).join("model.onnx").exists();
     }
-    std::env::var("HOME")
-        .ok()
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".cache/cuba-memorys/reranker/model.onnx")
-                .exists()
-        })
+    default_reranker_dir()
+        .map(|d| d.join("model.onnx").exists())
         .unwrap_or(false)
+}
+
+fn default_reranker_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let cache = PathBuf::from(home).join(".cache");
+    let preferred = cache.join("memory-industry").join("reranker");
+    let legacy = cache.join("cuba-memorys").join("reranker");
+    Some(if preferred.exists() || !legacy.exists() {
+        preferred
+    } else {
+        legacy
+    })
 }
 
 const WARMUP_CANDIDATES: usize = 50;
@@ -97,10 +106,7 @@ fn get_status() -> &'static RerankerStatus {
             {
                 return Some(p);
             }
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".cache/cuba-memorys/reranker"))
-                .filter(|p| p.join("model.onnx").exists())
+            default_reranker_dir().filter(|p| p.join("model.onnx").exists())
         });
         match path {
             Some(p) => match init_session(p) {

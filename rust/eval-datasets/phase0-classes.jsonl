@@ -1,0 +1,5 @@
+{"query": "servidor MCP en Rust con PostgreSQL", "question_class": "factoid", "relevant_markers": ["MCP", "Rust", "PostgreSQL"], "gold_entities": ["PostgreSQL"]}
+{"query": "busqueda hibrida RRF y embeddings", "question_class": "factoid", "relevant_markers": ["RRF", "embedding"], "gold_entities": ["PostgreSQL"]}
+{"query": "como se relaciona Mapupita-Web con Backend FastAPI", "question_class": "multi_hop", "relevant_markers": ["Mapupita", "FastAPI"], "gold_entities": ["Mapupita-Web", "Backend FastAPI"]}
+{"query": "causas de la latencia en el retrieval", "question_class": "multi_hop", "relevant_markers": ["latencia", "retrieval"], "gold_entities": []}
+{"query": "cuales son los temas principales del corpus", "question_class": "global", "relevant_markers": ["tema", "comunidad"], "gold_entities": []}

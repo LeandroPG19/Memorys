@@ -7,7 +7,7 @@ fn unique_name(prefix: &str) -> String {
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -39,7 +39,7 @@ async fn isolated_entity_with_notes(pool: &sqlx::PgPool, name: &str, notes: &[&s
 #[ignore]
 async fn an_isolated_entity_gets_wired_into_the_graph_from_its_own_notes() {
     assert!(
-        cuba_memorys::cognitive::judge::resolve_offline_llm().is_some(),
+        memory_industry::cognitive::judge::resolve_offline_llm().is_some(),
         "no local LLM CLI on PATH. The relation scan is the engine behind the self-growing \
          graph; a skip that counts as success is how it would rot unnoticed"
     );
@@ -75,7 +75,7 @@ async fn an_isolated_entity_gets_wired_into_the_graph_from_its_own_notes() {
             .expect("counting edges before");
     assert_eq!(before.0, 0, "the fixture must start isolated");
 
-    let pending = cuba_memorys::handlers::ingesta::entities_awaiting_relation_scan(&pool, 5_000)
+    let pending = memory_industry::handlers::ingesta::entities_awaiting_relation_scan(&pool, 5_000)
         .await
         .expect("listing candidates");
     assert!(
@@ -89,7 +89,7 @@ async fn an_isolated_entity_gets_wired_into_the_graph_from_its_own_notes() {
 
     let mut linked = 0;
     for _ in 0..3 {
-        linked = cuba_memorys::handlers::ingesta::scan_entity_relations(&pool, id)
+        linked = memory_industry::handlers::ingesta::scan_entity_relations(&pool, id)
             .await
             .expect("scanning");
         if linked > 0 {
@@ -137,9 +137,10 @@ async fn an_isolated_entity_gets_wired_into_the_graph_from_its_own_notes() {
         "a scanned entity must be stamped so the daemon does not pay for it twice"
     );
 
-    let requeued = cuba_memorys::handlers::ingesta::entities_awaiting_relation_scan(&pool, 5_000)
-        .await
-        .expect("listing candidates again");
+    let requeued =
+        memory_industry::handlers::ingesta::entities_awaiting_relation_scan(&pool, 5_000)
+            .await
+            .expect("listing candidates again");
     assert!(
         !requeued.contains(&id),
         "an entity that now has edges must drop out of the queue"
@@ -165,7 +166,7 @@ async fn a_scanned_entity_is_revisited_once_new_notes_arrive() {
         .await
         .expect("stamping as scanned");
 
-    let queue = cuba_memorys::handlers::ingesta::entities_awaiting_relation_scan(&pool, 200)
+    let queue = memory_industry::handlers::ingesta::entities_awaiting_relation_scan(&pool, 200)
         .await
         .expect("listing candidates");
     assert!(
@@ -182,7 +183,7 @@ async fn a_scanned_entity_is_revisited_once_new_notes_arrive() {
     .await
     .expect("adding a later observation");
 
-    let requeued = cuba_memorys::handlers::ingesta::entities_awaiting_relation_scan(&pool, 200)
+    let requeued = memory_industry::handlers::ingesta::entities_awaiting_relation_scan(&pool, 200)
         .await
         .expect("listing candidates after new notes");
     assert!(
@@ -199,7 +200,7 @@ async fn a_scanned_entity_is_revisited_once_new_notes_arrive() {
 
 #[test]
 fn the_scan_prompt_carries_the_notes_and_the_known_entities() {
-    let prompt = cuba_memorys::handlers::ingesta::build_relation_scan_prompt(
+    let prompt = memory_industry::handlers::ingesta::build_relation_scan_prompt(
         "Orquestador",
         "project",
         &["Corre sobre Rust.".to_string()],

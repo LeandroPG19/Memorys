@@ -1,12 +1,12 @@
-use cuba_memorys::cognitive::nli;
+use memory_industry::cognitive::nli;
 
 #[tokio::test]
 #[ignore = "medición, no aserción"]
 async fn cost_by_premise_length() {
-    if !nli::available() || !nli::enabled() {
-        eprintln!("SKIP: no hay modelo NLI");
-        return;
-    }
+    assert!(
+        nli::available() && nli::enabled(),
+        "NLI model required by the local merge gate — install with cuba-memorys models nli"
+    );
     let claim = "cuba-memorys está escrito en Java";
     let unit = "cuba-memorys es un servidor MCP de memoria escrito en Rust. ";
 

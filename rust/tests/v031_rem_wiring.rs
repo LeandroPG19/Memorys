@@ -36,7 +36,7 @@ async fn own_the_rem_extraction_batch_env(
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -96,9 +96,10 @@ async fn a_fresh_observation_queues_for_extraction_until_marked() {
     let (entity_id, obs_id) =
         trusted_observation(&pool, &name, "nota fresca para la extracción automática").await;
 
-    let pending = cuba_memorys::handlers::ingesta::observations_awaiting_extraction(&pool, 5_000)
-        .await
-        .expect("listing candidates");
+    let pending =
+        memory_industry::handlers::ingesta::observations_awaiting_extraction(&pool, 5_000)
+            .await
+            .expect("listing candidates");
     assert!(
         pending.iter().any(|(id, _)| *id == obs_id),
         "a freshly written trusted observation with extracted_at NULL must queue for extraction"
@@ -110,9 +111,10 @@ async fn a_fresh_observation_queues_for_extraction_until_marked() {
         .await
         .expect("marking as extracted");
 
-    let requeued = cuba_memorys::handlers::ingesta::observations_awaiting_extraction(&pool, 5_000)
-        .await
-        .expect("listing candidates again");
+    let requeued =
+        memory_industry::handlers::ingesta::observations_awaiting_extraction(&pool, 5_000)
+            .await
+            .expect("listing candidates again");
     assert!(
         !requeued.iter().any(|(id, _)| *id == obs_id),
         "once extracted_at is stamped, the observation must not queue again"
@@ -146,7 +148,7 @@ async fn autolink_apply_tags_its_edges_as_predicted_not_extracted() {
     .await
     .expect("creating entity b");
 
-    let candidate = cuba_memorys::graph::autolink::Candidate {
+    let candidate = memory_industry::graph::autolink::Candidate {
         from_id: a.0,
         to_id: b.0,
         from_name: a_name.clone(),
@@ -155,7 +157,7 @@ async fn autolink_apply_tags_its_edges_as_predicted_not_extracted() {
         npmi: 0.5,
     };
 
-    let inserted = cuba_memorys::graph::autolink::apply(&pool, &[candidate])
+    let inserted = memory_industry::graph::autolink::apply(&pool, &[candidate])
         .await
         .expect("applying the candidate");
     assert_eq!(inserted, 1);
@@ -189,7 +191,7 @@ async fn autolink_apply_tags_its_edges_as_predicted_not_extracted() {
 #[ignore]
 async fn duplicate_candidates_grow_when_near_duplicate_names_exist() {
     let pool = pool().await;
-    let baseline = cuba_memorys::protocol::rem_count_duplicate_candidates(&pool).await;
+    let baseline = memory_industry::protocol::rem_count_duplicate_candidates(&pool).await;
 
     let stem = &Uuid::new_v4().to_string()[..8];
     let a_name = format!("Dedupe Target Alpha {stem}");
@@ -209,7 +211,7 @@ async fn duplicate_candidates_grow_when_near_duplicate_names_exist() {
     .await
     .expect("creating entity b");
 
-    let after = cuba_memorys::protocol::rem_count_duplicate_candidates(&pool).await;
+    let after = memory_industry::protocol::rem_count_duplicate_candidates(&pool).await;
 
     sqlx::query("DELETE FROM brain_entities WHERE id IN ($1, $2)")
         .bind(a.0)
@@ -233,7 +235,7 @@ async fn an_explicit_extraction_batch_override_wins_and_zero_disables() {
     let _owns = own_the_rem_extraction_batch_env(&pool).await;
 
     unsafe { std::env::set_var("CUBA_REM_EXTRACTION_BATCH", "9") };
-    let batch = cuba_memorys::protocol::rem_extraction_batch();
+    let batch = memory_industry::protocol::rem_extraction_batch();
     assert_eq!(
         batch, 9,
         "an explicit CUBA_REM_EXTRACTION_BATCH must override the default of 5, the operator's \
@@ -241,14 +243,14 @@ async fn an_explicit_extraction_batch_override_wins_and_zero_disables() {
     );
 
     unsafe { std::env::set_var("CUBA_REM_EXTRACTION_BATCH", "0") };
-    let batch = cuba_memorys::protocol::rem_extraction_batch();
+    let batch = memory_industry::protocol::rem_extraction_batch();
     assert_eq!(
         batch, 0,
         "CUBA_REM_EXTRACTION_BATCH=0 must be able to turn auto-extraction off entirely"
     );
 
     unsafe { std::env::remove_var("CUBA_REM_EXTRACTION_BATCH") };
-    let batch = cuba_memorys::protocol::rem_extraction_batch();
+    let batch = memory_industry::protocol::rem_extraction_batch();
     unsafe { std::env::remove_var("CUBA_REM_EXTRACTION_BATCH") };
     assert_eq!(
         batch, 5,
@@ -287,7 +289,7 @@ async fn community_detection_assigns_every_entity_a_community_after_one_rem_cycl
 
     let cycled = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        cuba_memorys::protocol::run_rem_consolidation(&pool),
+        memory_industry::protocol::run_rem_consolidation(&pool),
     )
     .await;
 
@@ -351,14 +353,14 @@ async fn a_session_start_reports_how_many_observations_are_waiting_for_review() 
             .await
             .expect("measuring the ground truth count");
 
-    let response = cuba_memorys::handlers::jornada::handle(
+    let response = memory_industry::handlers::jornada::handle(
         &pool,
         serde_json::json!({"action": "start", "name": &name}),
     )
     .await
     .expect("starting a session");
 
-    cuba_memorys::handlers::jornada::handle(&pool, serde_json::json!({"action": "end"}))
+    memory_industry::handlers::jornada::handle(&pool, serde_json::json!({"action": "end"}))
         .await
         .ok();
 
@@ -401,7 +403,7 @@ async fn an_observation_that_can_never_be_extracted_leaves_the_queue() {
     .await
     .expect("seeding an observation the write gate refuses to hand to a model");
 
-    let outcome = cuba_memorys::handlers::ingesta::rem_extract_observation(
+    let outcome = memory_industry::handlers::ingesta::rem_extract_observation(
         &pool,
         observation.0,
         "el token es ghp_0123456789abcdefghijklmnopqrstuvwxyzAB y no se puede procesar",

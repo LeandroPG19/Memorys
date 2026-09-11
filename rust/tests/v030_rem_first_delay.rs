@@ -18,7 +18,7 @@ async fn own_the_rem_first_delay_env(pool: &sqlx::PgPool) -> sqlx::Transaction<'
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -30,7 +30,7 @@ async fn rem_first_delay_defaults_to_five_minutes() {
     let _owns = own_the_rem_first_delay_env(&pool).await;
     unsafe { std::env::remove_var("CUBA_REM_FIRST_DELAY_SECS") };
 
-    let delay = cuba_memorys::protocol::rem_first_delay();
+    let delay = memory_industry::protocol::rem_first_delay();
 
     assert_eq!(
         delay,
@@ -47,7 +47,7 @@ async fn cuba_rem_first_delay_secs_overrides_the_default() {
     let _owns = own_the_rem_first_delay_env(&pool).await;
     unsafe { std::env::set_var("CUBA_REM_FIRST_DELAY_SECS", "7") };
 
-    let delay = cuba_memorys::protocol::rem_first_delay();
+    let delay = memory_industry::protocol::rem_first_delay();
 
     unsafe { std::env::remove_var("CUBA_REM_FIRST_DELAY_SECS") };
 
@@ -89,7 +89,7 @@ async fn the_daemon_decays_a_stale_observation_within_seconds_not_within_four_ho
     .expect("creating the fixture observation");
 
     let daemon_pool = pool.clone();
-    let daemon = tokio::spawn(cuba_memorys::protocol::rem_daemon(daemon_pool));
+    let daemon = tokio::spawn(memory_industry::protocol::rem_daemon(daemon_pool));
 
     let cycled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {

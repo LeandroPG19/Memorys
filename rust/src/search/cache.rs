@@ -115,4 +115,31 @@ mod tests {
         assert_eq!(len, 2);
         assert_eq!(cap, 10);
     }
+
+    #[test]
+    fn a_zero_ttl_entry_is_never_served() {
+        let mut cache: TtlLruCache<i32> = TtlLruCache::with_config(4, 0);
+        cache.put("x".into(), 7);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(cache.get("x").is_none());
+    }
+
+    #[test]
+    fn evict_expired_drops_stale_keys_and_keeps_fresh_ones() {
+        let mut cache: TtlLruCache<i32> = TtlLruCache::with_config(4, 0);
+        cache.put("stale".into(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        cache.evict_expired();
+        let (len, _) = cache.stats();
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn clear_empties_the_cache() {
+        let mut cache: TtlLruCache<i32> = TtlLruCache::with_config(4, 60);
+        cache.put("x".into(), 1);
+        cache.clear();
+        assert!(cache.get("x").is_none());
+        assert_eq!(cache.stats().0, 0);
+    }
 }

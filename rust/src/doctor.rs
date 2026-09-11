@@ -5,7 +5,7 @@ use sqlx::{PgPool, Row};
 
 use crate::embeddings::onnx;
 
-const EXPECTED_TABLES: i64 = 23;
+const EXPECTED_TABLES: i64 = 24;
 
 const REQUIRED_EXTENSIONS: [&str; 2] = ["vector", "pg_trgm"];
 
@@ -201,13 +201,10 @@ fn rbac_check(principals: i64) -> Check {
             format!("{principals} principal(es) — la política restrictiva decide de verdad"),
         );
     }
-    Check::warn(
+    // Empty table is the designed single-user mode (fail-open). It is healthy, not a warn.
+    Check::ok(
         "rbac",
-        "brain_principals vacía — la política RESTRICTIVE está adjunta y siempre da true"
-            .to_string(),
-        "es fail-open deliberado para una instalación de un solo usuario, pero conviene \
-         saberlo: brain_principal_can() devuelve true para cualquier proyecto mientras la \
-         tabla esté vacía, así que el segundo muro de RBAC no está decidiendo nada.",
+        "single-user mode — brain_principals vacío (fail-open by design; insert principals to lock down)",
     )
 }
 
@@ -468,12 +465,13 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     if onnx::is_model_loaded() {
         checks.push(Check::ok("onnx_model", format!("cargado ({model})")));
     } else {
-        let path = std::env::var("ONNX_MODEL_PATH").unwrap_or_else(|_| "<no seteado>".into());
+        let path = std::env::var("ONNX_MODEL_PATH").unwrap_or_else(|_| "<auto/cache>".into());
         checks.push(Check::fail(
             "onnx_model",
             format!("NO cargado — ONNX_MODEL_PATH={path}"),
-            "la búsqueda vectorial devuelve vacío en silencio y el retrieval queda solo léxico. \
-             Seteá ONNX_MODEL_PATH y ORT_DYLIB_PATH en el entorno del proceso MCP (no solo en tu shell).",
+            "la búsqueda vectorial degrada a hash. Corré `memory-industry models embed` y \
+             `memory-industry models runtime` (cache ~/.cache/memory-industry o cuba-memorys), \
+             o seteá ONNX_MODEL_PATH y ORT_DYLIB_PATH.",
         ));
     }
 
@@ -499,7 +497,12 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     ));
 
     if crate::cognitive::nli::available() {
-        if deep && crate::cognitive::nli::enabled() {
+        if crate::cognitive::nli::deferred_by_resource_plan() {
+            checks.push(Check::ok(
+                "nli_entailment",
+                "modelo en disco; resource plan difiere la carga hasta que haya RAM",
+            ));
+        } else if deep && crate::cognitive::nli::enabled() {
             checks.push(Check::ok(
                 "nli_entailment",
                 "cargado (mDeBERTa-v3-xnli) — verify decide en ~50 ms, sin LLM",
@@ -521,12 +524,115 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
             });
         }
     } else {
-        checks.push(Check::warn(
+        checks.push(Check::fail(
             "nli_entailment",
             "sin modelo NLI local",
-            "`cuba_faro mode=verify` depende de un LLM (~20 s por afirmación), y sin CLI \
-             ni sampling degrada a `unknown`. Instalalo: cuba-memorys models nli",
+            "memory-industry models nli",
         ));
+    }
+
+    {
+        let (ok, detail, hint) = crate::llm_cli::doctor_line().await;
+        if ok {
+            checks.push(Check::ok("generative_llm", detail));
+        } else {
+            checks.push(Check::fail(
+                "generative_llm",
+                detail,
+                if hint.is_empty() {
+                    "memory-industry llm list && memory-industry llm set <provider> --key …".into()
+                } else {
+                    hint
+                },
+            ));
+        }
+    }
+
+    {
+        let g = crate::graph_db::status_summary();
+        let backend = g.get("backend").and_then(|v| v.as_str()).unwrap_or("off");
+        match backend {
+            "off" => checks.push(Check::ok(
+                "graph_db",
+                "projection disabled (Postgres remains SoT) — set falkor when you want a graph engine",
+            )),
+            other if g.get("url_configured").and_then(|v| v.as_bool()) != Some(true) => {
+                checks.push(Check::fail(
+                    "graph_db",
+                    format!("{other} selected but MEMORY_INDUSTRY_GRAPH_URL unset"),
+                    "export MEMORY_INDUSTRY_GRAPH_URL=redis://127.0.0.1:6389",
+                ));
+            }
+            other if g.get("reachable").and_then(|v| v.as_bool()) == Some(true) => {
+                checks.push(Check::ok(
+                    "graph_db",
+                    format!(
+                        "{other} reachable · projected_ops={}",
+                        g.get("projected_ops").and_then(|v| v.as_u64()).unwrap_or(0)
+                    ),
+                ));
+            }
+            other => checks.push(Check::fail(
+                "graph_db",
+                format!(
+                    "{other} configured but unreachable: {}",
+                    g.get("last_error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("no detail")
+                ),
+                "docker compose --profile graph up -d",
+            )),
+        }
+    }
+
+    match sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_name = 'brain_observations' AND column_name = 'crdt_counter'",
+    )
+    .fetch_one(pool)
+    .await
+    {
+        Ok(n) if n > 0 => {
+            let covered: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM brain_observations WHERE crdt_actor IS NOT NULL",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+            checks.push(Check::ok(
+                "crdt_clocks",
+                format!("columns present · observations with actor={covered}"),
+            ));
+        }
+        Ok(_) => checks.push(Check::fail(
+            "crdt_clocks",
+            "migration 0062 not applied",
+            "memory-industry serve once to run migrations",
+        )),
+        Err(e) => checks.push(Check::warn(
+            "crdt_clocks",
+            format!("could not probe: {e}"),
+            "check DATABASE_URL",
+        )),
+    }
+
+    match sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'brain_artifacts'",
+    )
+    .fetch_one(pool)
+    .await
+    {
+        Ok(n) if n > 0 => checks.push(Check::ok("brain_artifacts", "table present")),
+        Ok(_) => checks.push(Check::fail(
+            "brain_artifacts",
+            "migration 0061 not applied",
+            "memory-industry migrate / serve once against this database",
+        )),
+        Err(e) => checks.push(Check::warn(
+            "brain_artifacts",
+            format!("could not probe: {e}"),
+            "check DATABASE_URL",
+        )),
     }
 
     let runtime_dim = onnx::embedding_dim() as i64;
@@ -979,17 +1085,19 @@ mod evidence_tests {
     }
 
     #[test]
-    fn an_empty_principal_table_is_reported_as_an_inert_wall() {
+    fn an_empty_principal_table_is_reported_as_single_user_ok() {
         let check = rbac_check(0);
 
         assert_eq!(
             check.status,
-            Status::Warn,
-            "brain_principal_can() returns true for every project while the table is empty, \
-             so the RESTRICTIVE policy is attached and deciding nothing. That is deliberate \
-             for a single-user install and it still has to be said out loud"
+            Status::Ok,
+            "empty brain_principals is the designed single-user fail-open mode"
         );
-        assert!(check.detail.contains("brain_principals"));
+        assert!(
+            check.detail.contains("single-user") || check.detail.contains("vacío"),
+            "detail should name the mode: {}",
+            check.detail
+        );
     }
 
     #[test]

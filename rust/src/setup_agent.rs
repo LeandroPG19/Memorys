@@ -59,15 +59,11 @@ fn desired_config() -> Result<Value> {
     let exe = std::env::current_exe().context("no se pudo resolver la ruta del binario")?;
 
     let db = std::env::var("DATABASE_URL").unwrap_or_default();
-    let onnx = std::env::var("ONNX_MODEL_PATH").unwrap_or_else(|_| {
-        home()
-            .join(".cache/cuba-memorys/models")
-            .display()
-            .to_string()
-    });
+    let onnx = std::env::var("ONNX_MODEL_PATH")
+        .unwrap_or_else(|_| prefer_cache_subdir("models").display().to_string());
     let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| {
-        home()
-            .join(".cache/cuba-memorys/onnxruntime/libonnxruntime.so")
+        prefer_cache_subdir("onnxruntime")
+            .join("libonnxruntime.so")
             .display()
             .to_string()
     });
@@ -83,13 +79,30 @@ fn desired_config() -> Result<Value> {
     }))
 }
 
+fn prefer_cache_subdir(subdir: &str) -> PathBuf {
+    let home = home();
+    let preferred = home.join(".cache/memory-industry").join(subdir);
+    let legacy = home.join(".cache/cuba-memorys").join(subdir);
+    if preferred.exists() || !legacy.exists() {
+        preferred
+    } else {
+        legacy
+    }
+}
+
 fn read_json(path: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
+const MCP_SERVER_KEY: &str = "memory-industry";
+const MCP_SERVER_KEY_LEGACY: &str = "cuba-memorys";
+
 fn cuba_block(cfg: &Value) -> Option<&Value> {
-    cfg.get("mcpServers")?.get("cuba-memorys")
+    let servers = cfg.get("mcpServers")?;
+    servers
+        .get(MCP_SERVER_KEY)
+        .or_else(|| servers.get(MCP_SERVER_KEY_LEGACY))
 }
 
 fn run_check() -> Result<()> {
@@ -169,8 +182,10 @@ fn run_check() -> Result<()> {
     }
 
     if found == 0 {
-        println!("No encontré ninguna config con un bloque «cuba-memorys».");
-        println!("Generá una con:  cuba-memorys setup print");
+        println!(
+            "No encontré ninguna config con un bloque «memory-industry» (ni el legado «cuba-memorys»)."
+        );
+        println!("Generá una con:  memory-industry setup print");
         return Ok(());
     }
 
@@ -201,7 +216,7 @@ fn run_check() -> Result<()> {
         println!("{found} config(s) revisada(s): todas completas y coherentes entre sí.");
     } else {
         println!("{found} config(s) revisada(s): {problems} problema(s).");
-        println!("Arreglalo con:  cuba-memorys setup <cliente> --apply");
+        println!("Arreglalo con:  memory-industry setup <cliente> --apply");
     }
     Ok(())
 }
@@ -229,13 +244,13 @@ fn run_write(target: &str, apply: bool) -> Result<()> {
     println!("Se escribiría en {}:\n", path.display());
     println!(
         "{}",
-        serde_json::to_string_pretty(&json!({ "mcpServers": { "cuba-memorys": desired } }))?
+        serde_json::to_string_pretty(&json!({ "mcpServers": { MCP_SERVER_KEY: desired } }))?
     );
     println!();
 
     if !apply {
         println!("Esto fue un plan — no se tocó ningún archivo.");
-        println!("Para aplicarlo:  cuba-memorys setup {target} --apply");
+        println!("Para aplicarlo:  memory-industry setup {target} --apply");
         return Ok(());
     }
 
@@ -262,7 +277,10 @@ fn run_write(target: &str, apply: bool) -> Result<()> {
         .expect("checked above")
         .entry("mcpServers")
         .or_insert_with(|| json!({}));
-    cfg["mcpServers"]["cuba-memorys"] = desired;
+    cfg["mcpServers"][MCP_SERVER_KEY] = desired;
+    if let Some(servers) = cfg["mcpServers"].as_object_mut() {
+        servers.remove(MCP_SERVER_KEY_LEGACY);
+    }
 
     std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)
         .with_context(|| format!("no se pudo escribir {}", path.display()))?;
@@ -281,7 +299,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
             "--apply" => apply = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys setup <check | print | claude | mcp | cursor> [--apply]\n\n\
+                    "usage: memory-industry setup <check | print | claude | mcp | cursor> [--apply]\n\n\
                      check   audita las configs existentes: variables faltantes, rutas muertas,\n\
                              y divergencias entre clientes (el bug que mató el recall vectorial).\n\
                      print   imprime el bloque correcto para pegarlo donde haga falta.\n\
@@ -302,7 +320,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &json!({ "mcpServers": { "cuba-memorys": desired_config()? } })
+                    &json!({ "mcpServers": { MCP_SERVER_KEY: desired_config()? } })
                 )?
             );
             Ok(())
@@ -328,7 +346,7 @@ fn run_hook(apply: bool) -> Result<()> {
 
     if !apply {
         println!("Esto fue un plan — no se tocó ningún archivo.");
-        println!("Para aplicarlo:  cuba-memorys setup hook --apply");
+        println!("Para aplicarlo:  memory-industry setup hook --apply");
         return Ok(());
     }
 
@@ -362,9 +380,10 @@ fn run_hook(apply: bool) -> Result<()> {
             .and_then(Value::as_array)
             .is_some_and(|inner| {
                 inner.iter().any(|i| {
-                    i.get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(|c| c.contains("cuba-memorys") && c.contains("recall"))
+                    i.get("command").and_then(Value::as_str).is_some_and(|c| {
+                        c.contains("recall")
+                            && (c.contains("memory-industry") || c.contains("cuba-memorys"))
+                    })
                 })
             })
     });
@@ -429,9 +448,11 @@ mod tests {
 
     #[test]
     fn finds_the_cuba_block_only_when_present() {
-        let with = json!({"mcpServers": {"cuba-memorys": {"command": "/bin/x"}}});
+        let with = json!({"mcpServers": {"memory-industry": {"command": "/bin/x"}}});
+        let legacy = json!({"mcpServers": {"cuba-memorys": {"command": "/bin/x"}}});
         let without = json!({"mcpServers": {"otro": {"command": "/bin/y"}}});
         assert!(cuba_block(&with).is_some());
+        assert!(cuba_block(&legacy).is_some());
         assert!(cuba_block(&without).is_none());
         assert!(cuba_block(&json!({})).is_none());
     }

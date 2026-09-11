@@ -8,7 +8,7 @@ static ENV_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn daemon(port: u16, panel: bool, public: bool) -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -30,7 +30,7 @@ async fn daemon(port: u16, panel: bool, public: bool) -> sqlx::PgPool {
     let served = pool.clone();
     let addr = format!("127.0.0.1:{port}");
     tokio::spawn(async move {
-        let _ = cuba_memorys::http::serve_pool(&addr, served, true).await;
+        let _ = memory_industry::http::serve_pool(&addr, served, true).await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     pool
@@ -55,7 +55,7 @@ async fn a_peer_token_cannot_open_the_admin_surface() {
     let _env = ENV_GUARD.lock().await;
     let _pool = daemon(18811, true, false).await;
 
-    for method in cuba_memorys::admin::METHODS {
+    for method in memory_industry::admin::METHODS {
         let (status, body) = rpc(18811, ADMIN, method).await;
         assert_eq!(status, 200, "{method} refused the admin token: {body}");
         assert!(
@@ -140,14 +140,14 @@ async fn the_panel_refuses_a_request_that_arrived_through_a_tunnel() {
     );
 
     assert!(
-        cuba_memorys::http::FORWARDING_HEADERS.contains(&"forwarded"),
+        memory_industry::http::FORWARDING_HEADERS.contains(&"forwarded"),
         "the list has to include RFC 7239 `Forwarded`, which is the standard header and the one \
          a proxy that follows the spec sends instead of the x- ones. The first version of this \
          check knew only three names and tested itself against exactly those three: it proved \
          the code matched its own list, not that the list matched what proxies send"
     );
 
-    for header in cuba_memorys::http::FORWARDING_HEADERS {
+    for header in memory_industry::http::FORWARDING_HEADERS {
         let forwarded = client
             .get("http://127.0.0.1:18813/panel")
             .header(header, "203.0.113.7")

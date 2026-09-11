@@ -70,6 +70,8 @@ async fn create(pool: &PgPool, args: &Value) -> Result<Value> {
         );
     }
 
+    let _ = crate::graph_db::project_relation_full(from, to, rel_type, 1.0).await;
+
     if bidirectional {
         sqlx::query(
             "INSERT INTO brain_relations (from_entity, to_entity, relation_type, bidirectional, project_id)
@@ -85,6 +87,7 @@ async fn create(pool: &PgPool, args: &Value) -> Result<Value> {
         .bind(project_id)
         .execute(pool)
         .await?;
+        let _ = crate::graph_db::project_relation_full(to, from, rel_type, 1.0).await;
     }
 
     Ok(serde_json::json!({
@@ -120,6 +123,10 @@ async fn delete(pool: &PgPool, args: &Value) -> Result<Value> {
     .execute(pool)
     .await?;
 
+    if result.rows_affected() > 0 {
+        let _ = crate::graph_db::unproject_relation(from, to, rel_type).await;
+    }
+
     Ok(serde_json::json!({
         "action": "delete",
         "deleted": result.rows_affected() > 0
@@ -139,6 +146,47 @@ async fn traverse(pool: &PgPool, args: &Value) -> Result<Value> {
 
     if start.is_empty() {
         anyhow::bail!("start_entity is required");
+    }
+
+    if let Ok((hops, pruned)) = crate::graph_db::traverse_falkor_with_paths(start, max_depth as i32)
+        && !hops.is_empty()
+    {
+        let nodes: Vec<Value> = hops
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "name": h.name,
+                    "relation": h.relation,
+                    "strength": h.strength,
+                    "depth": h.depth,
+                    "provenance": "falkor"
+                })
+            })
+            .collect();
+        let paths: Vec<Value> = pruned
+            .iter()
+            .map(crate::graph_db::compact_rel_path)
+            .collect();
+        let hop_ball_tokens =
+            crate::search::budget::count_tokens(&serde_json::json!(nodes).to_string());
+        let path_tokens =
+            crate::search::budget::count_tokens(&serde_json::json!(paths).to_string());
+        return Ok(serde_json::json!({
+            "action": "traverse",
+            "start": start,
+            "max_depth": max_depth,
+            "nodes": nodes,
+            "paths": paths,
+            "count": nodes.len(),
+            "backend": "falkor",
+            "graph_hop_ball_tokens": hop_ball_tokens,
+            "graph_context_tokens": path_tokens,
+            "graph_token_ratio": if hop_ball_tokens > 0 {
+                path_tokens as f64 / hop_ball_tokens as f64
+            } else {
+                0.0
+            }
+        }));
     }
 
     let start_id = get_entity_id(pool, start).await?;
@@ -217,7 +265,8 @@ async fn traverse(pool: &PgPool, args: &Value) -> Result<Value> {
         "start": start,
         "max_depth": max_depth,
         "nodes": nodes,
-        "count": nodes.len()
+        "count": nodes.len(),
+        "backend": "postgres"
     }))
 }
 

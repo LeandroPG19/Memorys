@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"].as_str().expect("envelope");
@@ -14,7 +14,7 @@ async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
 async fn an_agent_without_a_session_cannot_read_or_wipe_another_agents_scratchpad() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -25,7 +25,7 @@ async fn an_agent_without_a_session_cannot_read_or_wipe_another_agents_scratchpa
     .fetch_one(&pool)
     .await
     .expect("the other agent opened a session");
-    cuba_memorys::session::set(session, None);
+    memory_industry::session::set(session, None);
 
     call(
         &pool,
@@ -42,7 +42,7 @@ async fn an_agent_without_a_session_cannot_read_or_wipe_another_agents_scratchpa
         "the agent that wrote it has to see its own note: {mine}"
     );
 
-    cuba_memorys::session::clear();
+    memory_industry::session::clear();
 
     let seen = call(&pool, "cuba_pizarra", json!({"action": "read"})).await;
     assert!(
@@ -69,7 +69,7 @@ async fn an_agent_without_a_session_cannot_read_or_wipe_another_agents_scratchpa
          cuba_jornada wipes every other agent's plan mid-task. Reported: {wiped}"
     );
 
-    cuba_memorys::session::set(session, None);
+    memory_industry::session::set(session, None);
     let still_mine = call(&pool, "cuba_pizarra", json!({"action": "read"})).await;
     assert!(
         serde_json::to_string(&still_mine)
@@ -89,5 +89,5 @@ async fn an_agent_without_a_session_cannot_read_or_wipe_another_agents_scratchpa
         .execute(&pool)
         .await
         .ok();
-    cuba_memorys::session::clear();
+    memory_industry::session::clear();
 }

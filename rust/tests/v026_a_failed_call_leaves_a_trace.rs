@@ -5,13 +5,13 @@ use serde_json::json;
 async fn a_handler_that_fails_is_recorded_and_one_that_works_is_not() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
     let marker = format!("no-such-action-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let failed =
-        cuba_memorys::handlers::dispatch(&pool, "cuba_sync", json!({"action": marker})).await;
+        memory_industry::handlers::dispatch(&pool, "cuba_sync", json!({"action": marker})).await;
     assert!(failed.is_err(), "that call was supposed to fail");
 
     let rows: Vec<(String, String)> = sqlx::query_as(
@@ -36,7 +36,7 @@ async fn a_handler_that_fails_is_recorded_and_one_that_works_is_not() {
         rows[0].1
     );
 
-    cuba_memorys::handlers::dispatch(&pool, "cuba_sync", json!({"action": "status"}))
+    memory_industry::handlers::dispatch(&pool, "cuba_sync", json!({"action": "status"}))
         .await
         .expect("a good call");
 
@@ -58,7 +58,7 @@ async fn a_handler_that_fails_is_recorded_and_one_that_works_is_not() {
          assertion red for a reason that had nothing to do with what it checks"
     );
 
-    let ring = cuba_memorys::observability::recent_calls(10);
+    let ring = memory_industry::observability::recent_calls(10);
     assert!(
         ring.iter()
             .any(|c| c.tool == "cuba_sync" && c.outcome == "ok"),
@@ -79,7 +79,7 @@ async fn a_handler_that_fails_is_recorded_and_one_that_works_is_not() {
 async fn a_failure_carrying_a_credential_is_redacted_before_it_is_stored() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     const TOKEN: &str = "ghp_abcdefghijklmnop";
@@ -87,7 +87,7 @@ async fn a_failure_carrying_a_credential_is_redacted_before_it_is_stored() {
     let mark = format!("redact{tail}");
     let secret = format!("{mark}-{TOKEN}{tail}");
     let failed =
-        cuba_memorys::handlers::dispatch(&pool, "cuba_sync", json!({"action": secret})).await;
+        memory_industry::handlers::dispatch(&pool, "cuba_sync", json!({"action": secret})).await;
     let message = format!("{:#}", failed.expect_err("an unknown action fails"));
     assert!(
         message.contains(&secret),

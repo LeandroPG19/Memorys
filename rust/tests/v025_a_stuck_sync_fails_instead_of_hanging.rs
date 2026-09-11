@@ -7,7 +7,7 @@ async fn a_sync_that_cannot_get_the_lock_gives_up_and_says_why() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-stuck-{}", Uuid::new_v4()));
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     std::fs::create_dir_all(&bundle).expect("a scratch bundle directory");
@@ -15,7 +15,7 @@ async fn a_sync_that_cannot_get_the_lock_gives_up_and_says_why() {
 
     let mut holder = pool.begin().await.expect("begin the blocking transaction");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(cuba_memorys::handlers::sync::SYNC_LOCK)
+        .bind(memory_industry::handlers::sync::SYNC_LOCK)
         .execute(&mut *holder)
         .await
         .expect("hold the sync lock the way a running import would");
@@ -23,7 +23,7 @@ async fn a_sync_that_cannot_get_the_lock_gives_up_and_says_why() {
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        cuba_memorys::handlers::dispatch(
+        memory_industry::handlers::dispatch(
             &pool,
             "cuba_sync",
             json!({"action": "export", "scope": "all", "dir": bundle.display().to_string()}),

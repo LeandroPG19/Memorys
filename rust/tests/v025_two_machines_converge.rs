@@ -17,7 +17,7 @@ async fn own_the_process(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sqlx::Pos
 }
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"].as_str().expect("envelope");
@@ -39,12 +39,12 @@ async fn what_one_machine_learns_offline_reaches_the_other_when_the_link_comes_b
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let remote_url = second_node_url();
 
-    let local = cuba_memorys::db::create_pool(&url)
+    let local = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to the local database");
     let _one_at_a_time = own_the_process(&local).await;
 
-    let remote = cuba_memorys::db::create_pool(&remote_url)
+    let remote = memory_industry::db::create_pool(&remote_url)
         .await
         .unwrap_or_else(|e| panic!("connecting to the second node at {remote_url}: {e:#}"));
     sqlx::query("DELETE FROM brain_sync_peers")
@@ -80,7 +80,7 @@ async fn what_one_machine_learns_offline_reaches_the_other_when_the_link_comes_b
 
     let served = remote.clone();
     let daemon = tokio::spawn(async move {
-        cuba_memorys::http::serve_pool("127.0.0.1:18797", served, true).await
+        memory_industry::http::serve_pool("127.0.0.1:18797", served, true).await
     });
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 

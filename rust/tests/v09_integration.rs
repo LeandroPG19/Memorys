@@ -10,14 +10,14 @@ fn unique(prefix: &str) -> String {
 async fn test_v09_all() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("pool init w/ sqlx-migrate");
 
     println!("  [1/8] PR #5: sqlx-migrate idempotency");
     {
         drop(pool);
-        let pool2 = cuba_memorys::db::create_pool(&url)
+        let pool2 = memory_industry::db::create_pool(&url)
             .await
             .expect("second pool init must be idempotent");
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
@@ -36,12 +36,12 @@ async fn test_v09_all() {
         drop(pool2);
     }
 
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("re-open pool");
 
     let proj = unique("test_v09_proj");
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_jornada",
         json!({"action": "start", "name": "v09-tests", "project": proj}),
@@ -50,7 +50,7 @@ async fn test_v09_all() {
     .expect("session start");
 
     let entity_a = unique("rust_async");
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_alma",
         json!({"action": "create", "name": entity_a, "entity_type": "technology"}),
@@ -65,7 +65,7 @@ async fn test_v09_all() {
         "Smol is a smaller async runtime focused on simplicity",
         "Rust does not have green threads in stdlib",
     ] {
-        cuba_memorys::handlers::dispatch(
+        memory_industry::handlers::dispatch(
             &pool,
             "cuba_cronica",
             json!({"action": "add", "entity_name": entity_a, "content": content, "observation_type": "fact"}),
@@ -77,7 +77,7 @@ async fn test_v09_all() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     println!("  [2/8] PR #6: BM25 hybrid as third RRF signal");
-    let with_bm25 = cuba_memorys::handlers::dispatch(
+    let with_bm25 = memory_industry::handlers::dispatch(
         &pool,
         "cuba_faro",
         json!({"query": "Tokio runtime", "limit": 10, "enable_bm25": true, "format": "verbose"}),
@@ -92,7 +92,7 @@ async fn test_v09_all() {
     println!("  ✓ BM25 score present in fused results");
 
     println!("  [2b/8] v0.11: compact is the default shape, verbose is opt-in");
-    let default_shape = cuba_memorys::handlers::dispatch(
+    let default_shape = memory_industry::handlers::dispatch(
         &pool,
         "cuba_faro",
         json!({"query": "Tokio runtime", "limit": 3}),
@@ -115,14 +115,14 @@ async fn test_v09_all() {
     println!("  ✓ compact by default, verbose on request — both shapes pinned");
 
     println!("  [3/8] PR #6: MMR diversification");
-    let no_div = cuba_memorys::handlers::dispatch(
+    let no_div = memory_industry::handlers::dispatch(
         &pool,
         "cuba_faro",
         json!({"query": "Tokio runtime", "limit": 3, "diversify": false}),
     )
     .await
     .expect("faro no diversify");
-    let with_div = cuba_memorys::handlers::dispatch(
+    let with_div = memory_industry::handlers::dispatch(
         &pool,
         "cuba_faro",
         json!({"query": "Tokio runtime", "limit": 3, "diversify": true, "mmr_lambda": 0.5}),
@@ -138,7 +138,7 @@ async fn test_v09_all() {
     println!("  ✓ MMR returns {with_div_count} diversified results");
 
     println!("  [4/8] PR #6: OOD abstention (Mahalanobis)");
-    let ood_attempt = cuba_memorys::handlers::dispatch(
+    let ood_attempt = memory_industry::handlers::dispatch(
         &pool,
         "cuba_faro",
         json!({
@@ -162,7 +162,7 @@ async fn test_v09_all() {
     );
 
     println!("  [5/8] PR #6: tiktoken-rs token budget exact counting");
-    let tight_budget = cuba_memorys::handlers::dispatch(
+    let tight_budget = memory_industry::handlers::dispatch(
         &pool,
         "cuba_faro",
         json!({"query": "Tokio", "limit": 10, "max_tokens": 30}),
@@ -174,7 +174,7 @@ async fn test_v09_all() {
     println!("  ✓ tiktoken budget enforcement works (no UTF-8 panic)");
 
     println!("  [6/8] PR #7: conformal prediction wired in PE gating");
-    use cuba_memorys::cognitive::prediction_error::{
+    use memory_industry::cognitive::prediction_error::{
         adaptive_thresholds_conformal, adaptive_thresholds_zscore,
     };
     let skewed: Vec<f64> = vec![
@@ -189,7 +189,7 @@ async fn test_v09_all() {
 
     println!("  [7/8] PR #7: testing effect (Karpicke-Roediger 2008)");
     let decay_result =
-        cuba_memorys::handlers::dispatch(&pool, "cuba_zafra", json!({"action": "decay"}))
+        memory_industry::handlers::dispatch(&pool, "cuba_zafra", json!({"action": "decay"}))
             .await
             .expect("zafra decay");
     let decay_text = extract_text(&decay_result);
@@ -201,7 +201,7 @@ async fn test_v09_all() {
 
     println!("  [8/8] PR #7: source credibility (Yin-Han-Yu IEEE TKDE 2008)");
     let trust =
-        cuba_memorys::handlers::dispatch(&pool, "cuba_calibrar", json!({"action": "trust"}))
+        memory_industry::handlers::dispatch(&pool, "cuba_calibrar", json!({"action": "trust"}))
             .await
             .expect("calibrar trust");
     let trust_text = extract_text(&trust);
@@ -222,7 +222,7 @@ async fn test_v09_all() {
         let tag = unique("test-model-tag");
         unsafe { std::env::set_var("CUBA_EMBED_MODEL", &tag) };
 
-        let added = cuba_memorys::handlers::dispatch(
+        let added = memory_industry::handlers::dispatch(
             &pool,
             "cuba_cronica",
             json!({
@@ -275,7 +275,7 @@ async fn test_v09_all() {
         }
     }
 
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_jornada",
         json!({"action": "end", "outcome": "success", "summary": "v09 tests"}),

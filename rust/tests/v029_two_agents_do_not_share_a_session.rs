@@ -8,7 +8,7 @@ const ADMIN: &str = "identity-admin-token";
 async fn daemon(port: u16) -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     unsafe {
@@ -19,7 +19,7 @@ async fn daemon(port: u16) -> sqlx::PgPool {
     let served = pool.clone();
     let addr = format!("127.0.0.1:{port}");
     tokio::spawn(async move {
-        let _ = cuba_memorys::http::serve_pool(&addr, served, true).await;
+        let _ = memory_industry::http::serve_pool(&addr, served, true).await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     pool

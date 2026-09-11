@@ -3,7 +3,7 @@
 async fn resources_starving_it_of_ram_reads_differently_from_no_model_installed() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -12,10 +12,10 @@ async fn resources_starving_it_of_ram_reads_differently_from_no_model_installed(
     unsafe {
         std::env::set_var(
             "CUBA_RERANKER_PATH",
-            cuba_memorys::resources::disabled_model_path(),
+            memory_industry::resources::disabled_model_path(),
         )
     };
-    let starved = cuba_memorys::doctor::run_checks_with(&pool, &url, false).await;
+    let starved = memory_industry::doctor::run_checks_with(&pool, &url, false).await;
     let starved_reranker = starved
         .iter()
         .find(|c| c.name == "reranker")
@@ -43,7 +43,7 @@ async fn resources_starving_it_of_ram_reads_differently_from_no_model_installed(
             std::env::temp_dir().join("cuba-v032-nothing-here-at-all"),
         )
     };
-    let never_installed = cuba_memorys::doctor::run_checks_with(&pool, &url, false).await;
+    let never_installed = memory_industry::doctor::run_checks_with(&pool, &url, false).await;
     let never_installed_reranker = never_installed
         .iter()
         .find(|c| c.name == "reranker")

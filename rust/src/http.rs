@@ -88,7 +88,7 @@ fn ensure_tokens_differ() -> Result<()> {
     match (auth_token(), peer_token()) {
         (Some(admin), Some(peer)) if admin == peer => anyhow::bail!(
             "CUBA_PEER_TOKEN is the same string as CUBA_HTTP_TOKEN, so the restricted token \
-             is not restricted: it matches the admin arm first and gets all 28 tools. The \
+             is not restricted: it matches the admin arm first and gets all 31 tools. The \
              point of a peer token is that handing it to the other machine — and to the \
              Cloudflare tunnel, which uses CUBA_HTTP_TOKEN — are different acts"
         ),
@@ -177,11 +177,16 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
 
     let mut app = Router::new()
         .route("/mcp", post(mcp_endpoint))
-        .route("/health", get(health));
+        .route("/health", get(health))
+        .route("/", get(connect_page))
+        .route("/connect", get(connect_page))
+        .route("/events", get(events_sse))
+        .route("/events/ticket", post(events_ticket));
     if panel_enabled() {
         tracing::info!("control panel at http://{addr}/panel");
         app = app.route("/panel", get(panel));
     }
+    tracing::info!("connect page at http://{addr}/connect");
     let app = app.layer(DefaultBodyLimit::max(MAX_BODY)).with_state(state);
 
     let listener = match systemd_listener() {
@@ -201,7 +206,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
     tracing::info!(
         %addr,
         auth = auth_token().is_some(),
-        "cuba-memorys daemon listening — point clients at http://{addr}/mcp"
+        "MemoryIndustry daemon listening — point clients at http://{addr}/mcp (connect: /connect)"
     );
 
     tokio::spawn(async {
@@ -488,6 +493,149 @@ fn came_through_a_proxy(headers: &HeaderMap) -> bool {
     FORWARDING_HEADERS.iter().any(|h| headers.contains_key(*h))
 }
 
+fn html_security_headers(response: &mut Response) {
+    let h = response.headers_mut();
+    h.insert(
+        "content-security-policy",
+        axum::http::HeaderValue::from_static(
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+             connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; \
+             frame-ancestors 'none'",
+        ),
+    );
+    h.insert(
+        "x-frame-options",
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    h.insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        "referrer-policy",
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+}
+
+async fn connect_page() -> Response {
+    let mut response = (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("panel/connect.html"),
+    )
+        .into_response();
+    html_security_headers(&mut response);
+    response
+}
+
+#[derive(serde::Deserialize)]
+struct EventsQuery {
+    token: Option<String>,
+    ticket: Option<String>,
+}
+
+fn authorized_events(state: &AppState, headers: &HeaderMap, query: &EventsQuery) -> bool {
+    if state.token.is_none() {
+        return true;
+    }
+    if authorized(state, headers).is_some() {
+        return true;
+    }
+    if let Some(ticket) = query
+        .ticket
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && crate::events::ticket_valid(ticket)
+    {
+        return true;
+    }
+    let Some(expected) = state.token.as_deref() else {
+        return true;
+    };
+    let presented = query
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    matches!(presented, Some(p) if same_secret(p, expected))
+}
+
+async fn events_ticket(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match authorized(&state, &headers) {
+        Some(Scope::Full) => {
+            let ticket = crate::events::issue_ticket();
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "ticket": ticket,
+                    "expires_in_secs": 120,
+                    "events": "/events",
+                })),
+            )
+                .into_response()
+        }
+        Some(Scope::Peer) => (
+            StatusCode::FORBIDDEN,
+            axum::Json(error_envelope(
+                Value::Null,
+                -32001,
+                "peer token cannot mint SSE tickets",
+            )),
+        )
+            .into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(error_envelope(Value::Null, -32001, "invalid bearer token")),
+        )
+            .into_response(),
+    }
+}
+
+async fn events_sse(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<EventsQuery>,
+) -> Response {
+    if !authorized_events(&state, &headers, &query) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(error_envelope(Value::Null, -32001, "invalid bearer token")),
+        )
+            .into_response();
+    }
+
+    let rx = crate::events::subscribe();
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(ev) => {
+                let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
+                Some((
+                    Ok::<_, std::convert::Infallible>(
+                        axum::response::sse::Event::default().data(data),
+                    ),
+                    rx,
+                ))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((
+                Ok(axum::response::sse::Event::default()
+                    .event("lagged")
+                    .data("{}")),
+                rx,
+            )),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+        }
+    });
+
+    axum::response::sse::Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
 async fn panel(headers: HeaderMap) -> Response {
     if came_through_a_proxy(&headers) && !panel_allows_forwarded() {
         return (
@@ -750,6 +898,9 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
         "uptime_secs": state.started.elapsed().as_secs(),
         "requests_served": state.served.load(Ordering::Relaxed),
         "database": if db_ok { "up" } else { "unreachable" },
+        "graph_db": crate::graph_db::status_summary(),
+        "connect": "/connect",
+        "events": "/events",
     });
 
     if authorized(&state, &headers) == Some(Scope::Full) {
@@ -931,15 +1082,26 @@ mod tests {
 
     #[test]
     fn non_loopback_bind_is_refused_without_a_token() {
+        let prev = std::env::var("CUBA_HTTP_TOKEN").ok();
+        unsafe { std::env::remove_var("CUBA_HTTP_TOKEN") };
+
         let public: SocketAddr = "0.0.0.0:8787".parse().unwrap();
         assert!(ensure_loopback(&public).is_err());
 
         let local: SocketAddr = "127.0.0.1:8787".parse().unwrap();
         assert!(ensure_loopback(&local).is_ok());
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CUBA_HTTP_TOKEN", v) },
+            None => unsafe { std::env::remove_var("CUBA_HTTP_TOKEN") },
+        }
     }
 
     #[test]
     fn a_systemd_socket_open_to_every_interface_is_refused_even_when_the_argument_was_loopback() {
+        let prev = std::env::var("CUBA_HTTP_TOKEN").ok();
+        unsafe { std::env::remove_var("CUBA_HTTP_TOKEN") };
+
         let from_argument: SocketAddr = DEFAULT_ADDR.parse().unwrap();
         assert!(
             ensure_loopback(&from_argument).is_ok(),
@@ -958,6 +1120,11 @@ mod tests {
             "the operator has to be told the fix lives in the .socket unit, not in the \
              environment they were staring at: {text}"
         );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CUBA_HTTP_TOKEN", v) },
+            None => unsafe { std::env::remove_var("CUBA_HTTP_TOKEN") },
+        }
     }
 
     #[test]

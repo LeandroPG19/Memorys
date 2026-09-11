@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const DEFAULT_LIMIT: i64 = 10;
 const MAX_LIMIT: i64 = 50;
@@ -272,11 +272,18 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
     let query_entropy = crate::search::rrf::query_entropy(query);
     let (text_weight, vector_weight) = entropy_weights(query_entropy);
     let bm25_weight = text_weight;
+    let query_class = crate::search::query_class::classify_query(query);
+    let mentioned = mentioned_entities(pool, query).await;
+    let scope = crate::search::entity_factoid::factoid_effective_scope(
+        query_class,
+        !mentioned.is_empty(),
+        opts.scope,
+    );
 
     let mut text_results = text_search(
         pool,
         query,
-        opts.scope,
+        scope,
         opts.limit * 2,
         &opts.time_bounds,
         opts.project_id,
@@ -332,7 +339,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
     let vector_results = vector_search(
         pool,
         query,
-        opts.scope,
+        scope,
         opts.limit * 2,
         &opts.time_bounds,
         opts.project_id,
@@ -404,7 +411,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
         let bm25_results = match crate::search::bm25::bm25_search(
             pool,
             query,
-            opts.scope,
+            scope,
             opts.limit * 2,
             opts.project_id,
         )
@@ -439,6 +446,39 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
                     text_score: 0.0,
                     vector_score: 0.0,
                     bm25_score: rrf_score,
+                    session_boosted: false,
+                    total: rrf_score,
+                    data: result.clone(),
+                });
+        }
+    }
+
+    if crate::search::entity_factoid::entity_factoid_enabled()
+        && query_class == crate::search::query_class::QueryClass::Factoid
+        && !mentioned.is_empty()
+    {
+        let entity_leg =
+            entity_factoid_observations(pool, query, &mentioned, opts.limit * 2, opts.project_id)
+                .await;
+        for (rank, result) in entity_leg.iter().enumerate() {
+            let id = result
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let rrf_score = 1.0 / (rrf_k + rank as f64 + 1.0);
+            fused_scores
+                .entry(id.clone())
+                .and_modify(|fr| {
+                    fr.total += rrf_score;
+                })
+                .or_insert(FusedResult {
+                    text_score: 0.0,
+                    vector_score: 0.0,
+                    bm25_score: 0.0,
                     session_boosted: false,
                     total: rrf_score,
                     data: result.clone(),
@@ -574,28 +614,26 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
     let (session_boost, session_started) = session_context(pool).await.unwrap_or_default();
     if !session_boost.is_empty() {
         for (_, fr) in &mut results {
-            if let Some(content) = fr.data.get("content").and_then(|v| v.as_str()) {
-                let content_words: std::collections::HashSet<String> = content
-                    .to_lowercase()
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|w| w.len() > 1)
-                    .map(String::from)
-                    .collect();
-                for goal in &session_boost {
-                    let goal_words: std::collections::HashSet<String> = goal
-                        .to_lowercase()
-                        .split(|c: char| !c.is_alphanumeric())
-                        .filter(|w| w.len() > 1)
-                        .map(String::from)
-                        .collect();
-                    let overlap = content_words.intersection(&goal_words).count();
-                    if overlap > 0 {
-                        let match_ratio = overlap as f64 / goal_words.len().max(1) as f64;
-                        fr.total *= 1.0 + 0.3 * match_ratio;
-                        fr.session_boosted = true;
-                        break;
-                    }
-                }
+            let content = fr
+                .data
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let entity_name = fr
+                .data
+                .get("entity_name")
+                .or_else(|| fr.data.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let (boosted, flagged) = crate::search::entity_factoid::apply_session_entity_boost(
+                fr.total,
+                entity_name,
+                content,
+                &session_boost,
+            );
+            if flagged {
+                fr.total = boosted;
+                fr.session_boosted = true;
             }
         }
         results.sort_by(|a, b| {
@@ -658,7 +696,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
 
     let graphrag_context = enrich_graphrag(pool, &results, GRAPHRAG_TOP_K).await;
 
-    let results_json: Vec<Value> = results
+    let mut results_json: Vec<Value> = results
         .iter()
         .map(|(_, fr)| {
             let mut r = fr.data.clone();
@@ -678,6 +716,77 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
             r
         })
         .collect();
+
+    let mut ppr_names: Vec<String> = Vec::new();
+    let mut graph_paths_json: Option<Value> = None;
+    let mut graph_backend: Option<&'static str> = None;
+    let mut graph_context_tokens = 0usize;
+    let mut graph_hop_ball_tokens = 0usize;
+    if query_class == crate::search::query_class::QueryClass::MultiHop {
+        let mentioned = mentioned_entities(pool, query).await;
+        let seeds = merge_seed_names(mentioned, entity_names_from_list(&results_json));
+        if !seeds.is_empty() {
+            if let Ok(ranked) = crate::graph_db::ppr_around_seeds(&seeds, 3, 15)
+                && !ranked.is_empty()
+            {
+                graph_backend = Some("falkor");
+                ppr_names = ranked.iter().take(5).map(|n| n.name.clone()).collect();
+                let mut existing: HashSet<String> = results_json
+                    .iter()
+                    .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect();
+                let mut extras: Vec<Value> = Vec::new();
+                for node in &ranked {
+                    if extras.len() >= 3 {
+                        break;
+                    }
+                    for obs in
+                        observations_for_entities(pool, std::slice::from_ref(&node.name), 2).await
+                    {
+                        let Some(id) = obs.get("id").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        if !existing.insert(id.to_string()) {
+                            continue;
+                        }
+                        extras.push(obs);
+                        if extras.len() >= 3 {
+                            break;
+                        }
+                    }
+                }
+                if !extras.is_empty() {
+                    let keep = (opts.limit as usize).saturating_sub(extras.len());
+                    results_json.truncate(keep);
+                    results_json.extend(extras);
+                }
+            }
+            if let Some(seed) = seeds.first()
+                && let Ok((hops, paths)) = crate::graph_db::traverse_falkor_with_paths(seed, 3)
+            {
+                if !hops.is_empty() || !paths.is_empty() {
+                    graph_backend = Some("falkor");
+                }
+                if !paths.is_empty() {
+                    graph_paths_json = Some(serde_json::json!(
+                        paths
+                            .iter()
+                            .map(crate::graph_db::compact_rel_path)
+                            .collect::<Vec<_>>()
+                    ));
+                }
+                graph_hop_ball_tokens = crate::search::budget::count_tokens(
+                    &crate::graph_db::hop_ball_payload(&hops).to_string(),
+                );
+                let compact_ctx = serde_json::json!({
+                    "paths": graph_paths_json.clone().unwrap_or(serde_json::json!([])),
+                    "ppr": ppr_names,
+                });
+                graph_context_tokens =
+                    crate::search::budget::count_tokens(&compact_ctx.to_string());
+            }
+        }
+    }
 
     use crate::search::budget::{count_tokens, truncate_to_budget};
 
@@ -724,10 +833,32 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
     let mut response = serde_json::json!({
         "mode": "hybrid",
         "query": query,
+        "query_class": match query_class {
+            crate::search::query_class::QueryClass::Factoid => "factoid",
+            crate::search::query_class::QueryClass::MultiHop => "multi_hop",
+            crate::search::query_class::QueryClass::Global => "global",
+        },
         "results": final_results,
         "count": final_results.len(),
         "graphrag_context": graphrag_context
     });
+    if let Some(backend) = graph_backend {
+        response["graph_backend"] = serde_json::json!(backend);
+    }
+    if !ppr_names.is_empty() {
+        response["ppr_entities"] = serde_json::json!(ppr_names);
+    }
+    if let Some(paths) = graph_paths_json {
+        response["graph_paths"] = paths;
+    }
+    if graph_context_tokens > 0 || graph_hop_ball_tokens > 0 {
+        response["graph_context_tokens"] = serde_json::json!(graph_context_tokens);
+        response["graph_hop_ball_tokens"] = serde_json::json!(graph_hop_ball_tokens);
+        if graph_hop_ball_tokens > 0 {
+            response["graph_token_ratio"] =
+                serde_json::json!(graph_context_tokens as f64 / graph_hop_ball_tokens as f64);
+        }
+    }
 
     if !fresh.is_empty() {
         response["new_since_you_started"] = serde_json::json!(fresh);
@@ -747,6 +878,142 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
     );
 
     Ok(response)
+}
+
+async fn mentioned_entities(pool: &PgPool, query: &str) -> Vec<String> {
+    let names: Vec<(String,)> =
+        match sqlx::query_as("SELECT name FROM brain_entities WHERE char_length(name) >= 4")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+    crate::search::mentions::names_in_query(query, names.iter().map(|(n,)| n.as_str()))
+}
+
+fn merge_seed_names(mentioned: Vec<String>, from_results: Vec<String>) -> Vec<String> {
+    let mut out = mentioned;
+    let mut seen: HashSet<String> = out.iter().map(|s| s.to_ascii_lowercase()).collect();
+    for n in from_results {
+        if seen.insert(n.to_ascii_lowercase()) {
+            out.push(n);
+        }
+    }
+    out.truncate(8);
+    out
+}
+
+fn entity_names_from_list(results: &[Value]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for r in results {
+        for key in ["entity_name", "e", "name", "entity"] {
+            if let Some(s) = r.get(key).and_then(|v| v.as_str()) {
+                let t = s.trim();
+                if !t.is_empty() && seen.insert(t.to_ascii_lowercase()) {
+                    out.push(t.to_string());
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+async fn entity_factoid_observations(
+    pool: &PgPool,
+    query: &str,
+    names: &[String],
+    limit: i64,
+    project_id: Option<uuid::Uuid>,
+) -> Vec<Value> {
+    if names.is_empty() || limit <= 0 {
+        return Vec::new();
+    }
+    let rows: Vec<(uuid::Uuid, String, String, String, f64, f64)> = match sqlx::query_as(
+        "SELECT o.id, e.name, o.content, o.observation_type, o.importance::float8,
+                (  (ts_rank(o.search_vector, cuba_or_tsquery($1))
+                  + similarity(o.content, $1)) * 0.7
+                 + o.importance::float8 * 0.3
+                )::float8 AS score
+         FROM brain_observations o
+         JOIN brain_entities e ON o.entity_id = e.id
+         WHERE e.name = ANY($2)
+           AND o.observation_type != 'superseded'
+           AND o.trust = 'trusted'
+           AND ($4::uuid IS NULL OR o.project_id = $4 OR o.project_id IS NULL)
+         ORDER BY score DESC
+         LIMIT $3",
+    )
+    .bind(query)
+    .bind(names)
+    .bind(limit)
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!(error = %e, "entity-factoid observation fetch failed");
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .map(|(id, entity_name, content, obs_type, importance, score)| {
+            serde_json::json!({
+                "id": id.to_string(),
+                "type": "observation",
+                "entity_name": entity_name,
+                "content": content,
+                "observation_type": obs_type,
+                "importance": importance,
+                "score": score,
+                "entity_factoid": true
+            })
+        })
+        .collect()
+}
+
+async fn observations_for_entities(pool: &PgPool, names: &[String], limit: i64) -> Vec<Value> {
+    if names.is_empty() || limit <= 0 {
+        return Vec::new();
+    }
+    let rows: Vec<(uuid::Uuid, String, String, String, f64)> = match sqlx::query_as(
+        "SELECT o.id, e.name, o.content, o.observation_type, o.importance::float8
+         FROM brain_observations o
+         JOIN brain_entities e ON o.entity_id = e.id
+         WHERE e.name = ANY($1)
+           AND o.observation_type != 'superseded'
+           AND o.trust = 'trusted'
+         ORDER BY o.importance DESC
+         LIMIT $2",
+    )
+    .bind(names)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!(error = %e, "ppr observation expand failed");
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .map(|(id, entity_name, content, obs_type, importance)| {
+            serde_json::json!({
+                "id": id.to_string(),
+                "type": "observation",
+                "entity_name": entity_name,
+                "content": content,
+                "observation_type": obs_type,
+                "importance": importance,
+                "score": 0.0,
+                "ppr_expanded": true
+            })
+        })
+        .collect()
 }
 
 fn compact_chars() -> usize {
@@ -1436,13 +1703,30 @@ async fn session_context(pool: &PgPool) -> Result<SessionContext> {
     .fetch_optional(pool)
     .await?;
 
-    match row {
-        Some((goals, started_at)) => Ok((
+    let (mut boosts, started) = match row {
+        Some((goals, started_at)) => (
             serde_json::from_value(goals).unwrap_or_default(),
             Some(started_at),
-        )),
-        None => Ok((Vec::new(), None)),
+        ),
+        None => (Vec::new(), None),
+    };
+    let wm: Vec<(String,)> = sqlx::query_as(
+        "SELECT content FROM brain_wm
+         WHERE expires_at > NOW()
+           AND session_id IS NOT DISTINCT FROM $1
+         ORDER BY created_at DESC
+         LIMIT 20",
+    )
+    .bind(sid)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    for (content,) in wm {
+        if !content.trim().is_empty() {
+            boosts.push(content);
+        }
     }
+    Ok((boosts, started))
 }
 
 async fn written_since(pool: &PgPool, results: &[Value], since: DateTime<Utc>) -> Vec<usize> {

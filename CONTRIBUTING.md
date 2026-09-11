@@ -1,4 +1,4 @@
-# Contributing to Cuba MCP Suite
+# Contributing to MemoryIndustry
 
 Thank you for your interest in contributing to the **Cuba MCP** ecosystem. These servers power mission-critical AI agent workflows — contributions must meet a high technical bar.
 
@@ -40,29 +40,34 @@ Be respectful, constructive, and technically honest. If your argument lacks data
 
 ## Quality Gates
 
-Every PR must pass **all** of these before merge:
+Every change is mergeable only when the **local** judge is green in this turn:
 
-| Gate | Requirement | Tool |
-|---|---|---|
-| **Type Safety** | 0 errors | `mypy --strict` (Python) / `tsc --noEmit` (TS) |
-| **Linting** | 0 warnings | `ruff check` (Python) / ESLint (TS) |
-| **Tests** | 100% pass, no skips | `pytest` / `jest` |
-| **Coverage** | ≥80% on changed files | `pytest-cov` / `jest --coverage` |
-| **Complexity** | Cyclomatic ≤ 7 per function | `radon cc -n C` / ESLint complexity |
-| **Security** | 0 findings | `bandit -r` (Python) / `npm audit` (TS) |
-| **Build** | Clean build | `python -m build` / `npm run build` |
+```bash
+./scripts/merge-gate.sh
+```
 
-> **No exceptions.** If a gate fails, the PR is not ready.
+| Gate | Requirement |
+|---|---|
+| **Local merge gate** | Full suite: fmt, clippy `-D warnings`, throwaway DB, ONNX models, **generative LLM** (Ollama URL or claude/gemini), e2e MCP + live (no soft-skip), eval smoke, `--features docs`, `cargo deny`, npm smoke, audit, `codigo-muerto`, `crap-gate`, `mutants-gate` |
+| **CLI** | `./scripts/memory-industry-test.sh all` ≡ merge-gate |
+| **Log** | No `SKIPPED`, no soft alerts — fix root causes |
+| **Fixtures** | Mutating tests only on `brain_gate` / peer — never the live corpus |
+
+Details: [docs/gate.md](docs/gate.md) and [AGENTS.md](AGENTS.md).
+
+GitHub Actions is **not** the merge judge. A green badge alone does not make a PR mergeable.
+
+> **No exceptions.** If the local gate fails, the change is not ready.
 
 ---
 
 ## Development Setup
 
-### Python projects (cuba-memorys, cuba-exec, cuba-search)
+### This repo (MemoryIndustry; crate in `rust/`)
 
 ```bash
 # Clone
-git clone https://github.com/LeandroPG19/<project>.git
+git clone https://github.com/LeandroPG19/Memorys.git
 cd <project>
 
 # Virtual environment (Python 3.14+ required)
@@ -292,7 +297,7 @@ If your PR claims an algorithmic improvement, include:
 
 ## Questions?
 
-Open a [Discussion](https://github.com/LeandroPG19/cuba-memorys/discussions) or tag `@LeandroPG19` in your issue.
+Open a [Discussion](https://github.com/LeandroPG19/Memorys/discussions) or tag `@LeandroPG19` in your issue.
 
 ---
 

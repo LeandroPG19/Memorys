@@ -10,7 +10,7 @@ async fn admin_pool() -> sqlx::PgPool {
 
 fn app_url() -> Option<String> {
     let admin = std::env::var("DATABASE_URL").ok()?;
-    let password = cuba_memorys::setup::app_role_password()?;
+    let password = memory_industry::setup::app_role_password()?;
     let tail = admin.split('@').nth(1)?.to_string();
     Some(format!("postgresql://cuba_app:{password}@{tail}"))
 }
@@ -42,7 +42,7 @@ async fn the_audit_log_rejects_mutation_from_the_application_role() {
     let admin = admin_pool().await;
     sqlx::query(&format!(
         "ALTER ROLE cuba_app PASSWORD '{}'",
-        cuba_memorys::setup::app_role_password().expect("an app password")
+        memory_industry::setup::app_role_password().expect("an app password")
     ))
     .execute(&admin)
     .await

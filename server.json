@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.LeandroPG19/cuba-memorys",
-  "description": "Persistent memory MCP server. 28 tools, BM25+MMR+OOD retrieval, tamper-evident audit, code graph.",
+  "name": "io.github.LeandroPG19/memory-industry",
+  "description": "Persistent memory MCP server (MemoryIndustry). 31 tools, BM25+MMR+OOD retrieval, tamper-evident audit, code graph.",
   "repository": {
-    "url": "https://github.com/LeandroPG19/cuba-memorys",
+    "url": "https://github.com/LeandroPG19/Memorys",
     "source": "github"
   },
-  "version": "0.24.0",
+  "version": "0.25.0",
   "packages": [
     {
       "registryType": "npm",
-      "identifier": "cuba-memorys",
-      "version": "0.24.0",
+      "identifier": "memory-industry",
+      "version": "0.25.0",
       "transport": {
         "type": "stdio"
       },
@@ -32,7 +32,7 @@
         },
         {
           "name": "CUBA_SYNC_DIR",
-          "description": "Directory used by cuba_sync export/import (default ./.cuba-memorys/).",
+          "description": "Directory used by cuba_sync export/import (default ./.memory-industry/, falls back to ./.cuba-memorys/).",
           "isRequired": false,
           "isSecret": false,
           "format": "string"
@@ -83,8 +83,8 @@
     },
     {
       "registryType": "pypi",
-      "identifier": "cuba-memorys",
-      "version": "1.26.0",
+      "identifier": "memory-industry",
+      "version": "1.27.0",
       "transport": {
         "type": "stdio"
       },
@@ -97,6 +97,22 @@
           "format": "string"
         }
       ]
+    },
+    {
+      "registryType": "npm",
+      "identifier": "cuba-memorys",
+      "version": "0.25.0",
+      "transport": {
+        "type": "stdio"
+      }
+    },
+    {
+      "registryType": "pypi",
+      "identifier": "cuba-memorys",
+      "version": "1.27.0",
+      "transport": {
+        "type": "stdio"
+      }
     }
   ]
 }

@@ -1,24 +1,21 @@
-use cuba_memorys::cognitive::nli::{self, Entailment};
+use memory_industry::cognitive::nli::{self, Entailment};
 
 const EVIDENCE_RUST: &str = "cuba-memorys es un servidor MCP de memoria escrito en Rust, \
                              con PostgreSQL y pgvector para la búsqueda semántica.";
 
-fn skip_unless_model() -> bool {
-    if nli::available() && nli::enabled() {
-        return false;
-    }
-    eprintln!(
-        "SKIP: no hay modelo NLI instalado (CUBA_NLI_PATH o ~/.cache/cuba-memorys/models-nli)"
+fn require_nli_model() {
+    assert!(
+        nli::available() && nli::enabled(),
+        "NLI model required by the local merge gate — missing CUBA_NLI_PATH / \
+         ~/.cache/cuba-memorys/models-nli. Install with `cuba-memorys models nli` \
+         (or `models all`). Soft-skip is forbidden."
     );
-    true
 }
 
 #[tokio::test]
 #[ignore]
 async fn true_claim_is_supported() {
-    if skip_unless_model() {
-        return;
-    }
+    require_nli_model();
     let v = nli::entails(EVIDENCE_RUST, "cuba-memorys está escrito en Rust")
         .await
         .expect("el NLI debe emitir un veredicto, no un error");
@@ -39,9 +36,7 @@ async fn true_claim_is_supported() {
 #[tokio::test]
 #[ignore]
 async fn false_claim_is_contradicted() {
-    if skip_unless_model() {
-        return;
-    }
+    require_nli_model();
     let v = nli::entails(EVIDENCE_RUST, "cuba-memorys está escrito en Java")
         .await
         .expect("el NLI debe emitir un veredicto, no un error");
@@ -57,9 +52,7 @@ async fn false_claim_is_contradicted() {
 #[tokio::test]
 #[ignore]
 async fn unrelated_claim_is_neutral() {
-    if skip_unless_model() {
-        return;
-    }
+    require_nli_model();
     let v = nli::entails(EVIDENCE_RUST, "la paella es un plato valenciano")
         .await
         .expect("el NLI debe emitir un veredicto, no un error");
@@ -75,9 +68,7 @@ async fn unrelated_claim_is_neutral() {
 #[tokio::test]
 #[ignore]
 async fn english_still_works() {
-    if skip_unless_model() {
-        return;
-    }
+    require_nli_model();
     let v = nli::entails(
         "The reranker runs as a separate ONNX session and is disabled by default.",
         "The reranker is enabled by default.",
@@ -91,9 +82,7 @@ async fn english_still_works() {
 #[tokio::test]
 #[ignore]
 async fn distractor_clauses_do_not_dilute_the_verdict() {
-    if skip_unless_model() {
-        return;
-    }
+    require_nli_model();
     let v = nli::entails(EVIDENCE_RUST, "cuba-memorys está escrito en Java")
         .await
         .expect("veredicto");
@@ -116,9 +105,7 @@ async fn distractor_clauses_do_not_dilute_the_verdict() {
 #[tokio::test]
 #[ignore]
 async fn a_false_claim_is_never_confirmed_on_weak_entailment() {
-    if skip_unless_model() {
-        return;
-    }
+    require_nli_model();
     let v = nli::entails(
         "The reranker is a cross-encoder based on XLM-RoBERTa.",
         "The reranker is a bi-encoder.",
@@ -148,9 +135,7 @@ async fn a_false_claim_is_never_confirmed_on_weak_entailment() {
 #[tokio::test]
 #[ignore]
 async fn technical_substitutions_are_caught_decisively() {
-    if skip_unless_model() {
-        return;
-    }
+    require_nli_model();
     let cases = [
         ("El servidor usa PostgreSQL.", "El servidor usa MySQL."),
         ("El índice es HNSW.", "El índice es IVFFlat."),
@@ -182,9 +167,7 @@ async fn technical_substitutions_are_caught_decisively() {
 #[tokio::test]
 #[ignore]
 async fn a_verdict_costs_milliseconds_not_seconds() {
-    if skip_unless_model() {
-        return;
-    }
+    require_nli_model();
     let _ = nli::entails(EVIDENCE_RUST, "cuba-memorys usa PostgreSQL").await;
 
     let t0 = std::time::Instant::now();

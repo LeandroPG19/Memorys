@@ -5,8 +5,10 @@ use sqlx::PgPool;
 pub mod alarma;
 pub mod alma;
 pub mod archivo;
+pub mod artefacto;
 pub mod calibrar;
 pub mod centinela;
+pub mod contexto;
 pub mod contradiccion;
 pub mod cronica;
 pub mod decreto;
@@ -30,10 +32,67 @@ pub mod remedio;
 pub mod sync;
 pub mod tools;
 pub mod vigia;
+pub mod whoami;
 pub mod zafra;
+
+/// Map `memory_*` aliases (and a few synonyms) onto canonical `cuba_*` tool names.
+pub fn canonicalize_tool_name(name: &str) -> &str {
+    match name {
+        "memory_whoami" | "cuba_whoami" => "cuba_whoami",
+        "memory_artifact" | "memory_artefacto" | "cuba_artefacto" => "cuba_artefacto",
+        "memory_context" | "memory_contexto" | "cuba_contexto" => "cuba_contexto",
+        other if let Some(rest) = other.strip_prefix("memory_") => {
+            // memory_faro -> cuba_faro etc. Resolved via a static table below.
+            CANON_MEMORY
+                .iter()
+                .find(|(alias, _)| *alias == rest)
+                .map(|(_, canon)| *canon)
+                .unwrap_or(name)
+        }
+        other => other,
+    }
+}
+
+const CANON_MEMORY: &[(&str, &str)] = &[
+    ("alma", "cuba_alma"),
+    ("cronica", "cuba_cronica"),
+    ("faro", "cuba_faro"),
+    ("receta", "cuba_receta"),
+    ("tools", "cuba_tools"),
+    ("call", "cuba_call"),
+    ("forget", "cuba_forget"),
+    ("hipotesis", "cuba_hipotesis"),
+    ("puente", "cuba_puente"),
+    ("reflexion", "cuba_reflexion"),
+    ("eco", "cuba_eco"),
+    ("alarma", "cuba_alarma"),
+    ("remedio", "cuba_remedio"),
+    ("expediente", "cuba_expediente"),
+    ("jornada", "cuba_jornada"),
+    ("decreto", "cuba_decreto"),
+    ("vigia", "cuba_vigia"),
+    ("zafra", "cuba_zafra"),
+    ("centinela", "cuba_centinela"),
+    ("contradiccion", "cuba_contradiccion"),
+    ("calibrar", "cuba_calibrar"),
+    ("ingesta", "cuba_ingesta"),
+    ("proyecto", "cuba_proyecto"),
+    ("pre_compact", "cuba_pre_compact"),
+    ("sync", "cuba_sync"),
+    ("juez", "cuba_juez"),
+    ("pizarra", "cuba_pizarra"),
+    ("archivo", "cuba_archivo"),
+    ("docs", "cuba_docs"),
+    ("whoami", "cuba_whoami"),
+    ("artefacto", "cuba_artefacto"),
+    ("artifact", "cuba_artefacto"),
+    ("contexto", "cuba_contexto"),
+    ("context", "cuba_contexto"),
+];
 
 #[tracing::instrument(skip(pool, args), fields(tool = %tool_name))]
 pub async fn dispatch(pool: &PgPool, tool_name: &str, args: Value) -> Result<Value> {
+    let tool_name = canonicalize_tool_name(tool_name);
     let start = std::time::Instant::now();
 
     if crate::session::current_scope() == crate::session::Scope::Peer {
@@ -87,6 +146,9 @@ pub async fn dispatch(pool: &PgPool, tool_name: &str, args: Value) -> Result<Val
             "cuba_juez" => juez::handle(pool, args).await,
             "cuba_pizarra" => pizarra::handle(pool, args).await,
             "cuba_archivo" => archivo::handle(pool, args).await,
+            "cuba_whoami" => whoami::handle(pool, args).await,
+            "cuba_artefacto" => artefacto::handle(pool, args).await,
+            "cuba_contexto" => contexto::handle(pool, args).await,
             #[cfg(feature = "docs")]
             "cuba_docs" => docs::handle(&args).await,
             _ => {
@@ -135,6 +197,7 @@ pub async fn dispatch(pool: &PgPool, tool_name: &str, args: Value) -> Result<Val
 }
 
 pub fn is_known_tool(name: &str) -> bool {
+    let name = canonicalize_tool_name(name);
     #[cfg(feature = "docs")]
     if name == "cuba_docs" {
         return docs::enabled();
@@ -169,5 +232,22 @@ pub fn is_known_tool(name: &str) -> bool {
             | "cuba_tools"
             | "cuba_call"
             | "cuba_receta"
+            | "cuba_whoami"
+            | "cuba_artefacto"
+            | "cuba_contexto"
     )
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::canonicalize_tool_name;
+
+    #[test]
+    fn memory_aliases_resolve_to_cuba_tools() {
+        assert_eq!(canonicalize_tool_name("memory_whoami"), "cuba_whoami");
+        assert_eq!(canonicalize_tool_name("memory_artifact"), "cuba_artefacto");
+        assert_eq!(canonicalize_tool_name("memory_context"), "cuba_contexto");
+        assert_eq!(canonicalize_tool_name("memory_faro"), "cuba_faro");
+        assert_eq!(canonicalize_tool_name("cuba_faro"), "cuba_faro");
+    }
 }

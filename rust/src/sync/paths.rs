@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 const ENV_VAR: &str = "CUBA_SYNC_DIR";
-const DEFAULT_DIR: &str = ".cuba-memorys";
+const DEFAULT_DIR: &str = ".memory-industry";
+const LEGACY_DIR: &str = ".cuba-memorys";
 
 fn configured_root() -> Option<PathBuf> {
     std::env::var(ENV_VAR)
@@ -10,6 +11,16 @@ fn configured_root() -> Option<PathBuf> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+}
+
+fn default_sync_dir(root: &Path) -> PathBuf {
+    let preferred = root.join(DEFAULT_DIR);
+    let legacy = root.join(LEGACY_DIR);
+    if preferred.exists() || !legacy.exists() {
+        preferred
+    } else {
+        legacy
+    }
 }
 
 fn target_under_root(
@@ -27,7 +38,7 @@ fn target_under_root(
             }
         }
         None if root_is_explicit => root.to_path_buf(),
-        None => root.join(DEFAULT_DIR),
+        None => default_sync_dir(root),
     };
     ensure_within(root, &candidate).with_context(|| {
         format!("sync directories are confined to {root:?}. Set {ENV_VAR} to work somewhere else")
@@ -77,8 +88,9 @@ pub fn slug(name: &str) -> String {
 }
 
 pub fn ensure_within(root: &Path, candidate: &Path) -> Result<()> {
-    let normalized = lexical_join(root, candidate);
-    if !normalized.starts_with(root) {
+    let root_cmp = for_containment(root);
+    let normalized = for_containment(&lexical_join(&root_cmp, candidate));
+    if !normalized.starts_with(&root_cmp) {
         anyhow::bail!("path traversal blocked: {candidate:?} escapes root {root:?}");
     }
 
@@ -88,11 +100,31 @@ pub fn ensure_within(root: &Path, candidate: &Path) -> Result<()> {
         .unwrap_or(candidate);
     if let Ok(real) = existing.canonicalize()
         && let Ok(real_root) = root.canonicalize()
-        && !real.starts_with(&real_root)
     {
-        anyhow::bail!("path traversal blocked: {candidate:?} resolves outside {root:?}");
+        let real = for_containment(&real);
+        let real_root = for_containment(&real_root);
+        if !real.starts_with(&real_root) {
+            anyhow::bail!("path traversal blocked: {candidate:?} resolves outside {root:?}");
+        }
     }
     Ok(())
+}
+
+/// Windows `canonicalize` yields `\\?\C:\...` while `CUBA_SYNC_DIR` is usually plain
+/// `C:\...`. `Path::starts_with` treats those as different prefixes, so a path under
+/// the sync root looks like an escape. Strip the verbatim prefix before comparing.
+fn for_containment(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            if let Some(unc) = rest.strip_prefix("UNC\\") {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            return PathBuf::from(rest.to_string());
+        }
+    }
+    path.to_path_buf()
 }
 
 fn lexical_join(root: &Path, candidate: &Path) -> PathBuf {
@@ -164,6 +196,16 @@ mod tests {
         assert_eq!(slug("---"), "entity");
         assert_eq!(slug(""), "entity");
         assert_eq!(slug("Auth_Flow-v2"), "auth_flow-v2");
+    }
+
+    #[test]
+    fn verbatim_windows_prefix_does_not_look_like_an_escape() {
+        let root = PathBuf::from(r"C:\Users\someone\AppData\Local\Temp\cuba-sync");
+        let inside =
+            PathBuf::from(r"\\?\C:\Users\someone\AppData\Local\Temp\cuba-sync\.peer-inbox");
+        ensure_within(&root, &inside).expect(
+            "canonicalize on Windows adds \\\\?\\; confinement must still see a child of the root",
+        );
     }
 
     fn root() -> PathBuf {

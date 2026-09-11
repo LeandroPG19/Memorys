@@ -1,9 +1,11 @@
-<!-- mcp-name: io.github.LeandroPG19/cuba-memorys -->
-# Cuba-Memorys
+<!-- mcp-name: io.github.LeandroPG19/memory-industry -->
+# MemoryIndustry
 
-[![CI](https://github.com/LeandroPG19/cuba-memorys/actions/workflows/ci.yml/badge.svg)](https://github.com/LeandroPG19/cuba-memorys/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/cuba-memorys?logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/cuba-memorys/)
-[![npm](https://img.shields.io/npm/v/cuba-memorys?logo=npm&logoColor=white&label=npm)](https://www.npmjs.com/package/cuba-memorys)
+Formerly **cuba-memorys**. Same daemon, same `cuba_*` MCP tools, new product name.
+
+[![CI](https://github.com/LeandroPG19/Memorys/actions/workflows/ci.yml/badge.svg)](https://github.com/LeandroPG19/Memorys/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/memory-industry?logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/memory-industry/)
+[![npm](https://img.shields.io/npm/v/memory-industry?logo=npm&logoColor=white&label=npm)](https://www.npmjs.com/package/memory-industry)
 [![MCP Registry](https://img.shields.io/badge/MCP_Registry-published-8A2BE2)](https://registry.modelcontextprotocol.io)
 [![Rust](https://img.shields.io/badge/rust-1.93+-orange?logo=rust&logoColor=white)](https://rust-lang.org)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-336791?logo=postgresql&logoColor=white)](https://postgresql.org)
@@ -11,10 +13,10 @@
 
 **Long-term memory for AI coding agents.** An MCP server that gives your agent a knowledge graph it can search, reason over, and be corrected by — so it stops forgetting your codebase between sessions.
 
-Written in Rust. Backed by PostgreSQL + pgvector. **28 MCP tools** (29 with `CUBA_DOCS=1`), **22 CLI commands**, and every number below measured on a benchmark that — as of v0.12 — actually measures what it claims to. (The previous one did not. See [Measured](#measured--and-the-benchmark-that-was-lying).)
+Written in Rust. Backed by PostgreSQL + pgvector. **31 MCP tools** (32 with `CUBA_DOCS=1`), **23 CLI commands**, and every number below measured on a benchmark that — as of v0.12 — actually measures what it claims to. (The previous one did not. See [Measured](#measured--and-the-benchmark-that-was-lying).)
 
 <p align="center">
-  <img src="assets/demo.gif" alt="cuba-memorys terminal demo — hybrid search, claim verification with an LLM judge, procedural memory, and the CLI" width="760" />
+  <img src="assets/demo.gif" alt="MemoryIndustry terminal demo — hybrid search, claim verification with an LLM judge, procedural memory, and the CLI" width="760" />
 </p>
 
 ---
@@ -22,11 +24,15 @@ Written in Rust. Backed by PostgreSQL + pgvector. **28 MCP tools** (29 with `CUB
 ## Install
 
 ```bash
-pip install cuba-memorys        # or: npm install -g cuba-memorys
-claude mcp add cuba-memorys -- cuba-memorys
+pip install memory-industry        # or: npm install -g memory-industry
+claude mcp add memory-industry -- memory-industry
+
+# Previous names still install the same binary:
+#   pip install cuba-memorys
+#   npm install -g cuba-memorys
 ```
 
-That is the whole setup. On first run it provisions a PostgreSQL 18 + pgvector container via Docker and initializes the schema. **[Docker](https://docs.docker.com/get-docker/) must be running.**
+That is the whole setup. On first run it provisions a PostgreSQL 18 + pgvector container via Docker and initializes the schema. **[Docker](https://docs.docker.com/get-docker/) must be running.** The `cuba-memorys` command remains a binary alias.
 
 <details>
 <summary><b>Cursor / Windsurf / VS Code / Zed</b></summary>
@@ -34,14 +40,14 @@ That is the whole setup. On first run it provisions a PostgreSQL 18 + pgvector c
 ```json
 {
   "mcpServers": {
-    "cuba-memorys": {
-      "command": "cuba-memorys"
+    "memory-industry": {
+      "command": "memory-industry"
     }
   }
 }
 ```
 
-No `DATABASE_URL` needed. Or run `cuba-memorys setup` and it writes the config for every client it finds — then `cuba-memorys setup check` audits them for disagreement, which is the failure that actually bites (two configs, two embedding dimensions, one silently broken search).
+No `DATABASE_URL` needed. Or run `cuba-memorys setup` (or `memory-industry setup`) and it writes the config for every client it finds — then `cuba-memorys setup check` audits them for disagreement, which is the failure that actually bites (two configs, two embedding dimensions, one silently broken search).
 </details>
 
 <details>
@@ -50,8 +56,8 @@ No `DATABASE_URL` needed. Or run `cuba-memorys setup` and it writes the config f
 ```json
 {
   "mcpServers": {
-    "cuba-memorys": {
-      "command": "cuba-memorys",
+    "memory-industry": {
+      "command": "memory-industry",
       "env": { "DATABASE_URL": "postgresql://user:pass@localhost:5432/brain" }
     }
   }
@@ -72,12 +78,12 @@ cuba-memorys serve                      # 127.0.0.1:8787 by default
 cuba-memorys serve 127.0.0.1:9000       # or pick the address
 ```
 
-Point every client at it, and give each one its own `Mcp-Client-Id` so their sessions stay separate — without it `jornada start` in one window becomes the active session of the next:
+`memory-industry serve` is the same command. Point every client at it, and give each one its own `Mcp-Client-Id` so their sessions stay separate — without it `jornada start` in one window becomes the active session of the next:
 
 ```json
 {
   "mcpServers": {
-    "cuba-memorys": {
+    "memory-industry": {
       "type": "http",
       "url": "http://127.0.0.1:8787/mcp",
       "headers": { "Mcp-Client-Id": "editor-window-1" }
@@ -237,7 +243,7 @@ This exists because the failure mode of a hybrid search engine is not a crash �
 
 ## The CLI: your memory without an LLM in the middle
 
-Twenty-two commands. `cuba-memorys --help` lists them all.
+Twenty-three commands. `memory-industry --help` lists them all.
 
 | | |
 |---|---|
@@ -265,9 +271,9 @@ So `--apply` merges only what is **provable** (identical after normalizing case 
 
 ---
 
-## The 28 tools
+## The 31 tools
 
-Named after Cuban culture. `cuba-memorys` advertises all of them, or set `CUBA_TOOL_PROFILE=lean` to advertise an everyday core of 10 plus `cuba_tools` + `cuba_call` — **12 of 28, a 51% smaller catalogue with zero functions lost**, the rest reachable on demand.
+Named after Cuban culture. `cuba-memorys` advertises all of them, or set `CUBA_TOOL_PROFILE=lean` to advertise an everyday core of 13 plus `cuba_tools` + `cuba_call` — **15 of 31, a 49% smaller catalogue with zero functions lost**, the rest reachable on demand.
 
 **Knowledge graph** — `cuba_alma` (entities) · `cuba_cronica` (observations, episodes, timeline) · `cuba_puente` (typed relations, traversal, link prediction) · `cuba_ingesta` (bulk import)
 
@@ -300,13 +306,20 @@ Named after Cuban culture. `cuba-memorys` advertises all of them, or set `CUBA_T
 | `CUBA_QUERY_PREFIX` · `CUBA_PASSAGE_PREFIX` | `query: ` · `passage: ` | Instruction prefixes prepended before tokenising. E5 was trained with them; `bge-m3` was not — set both to the empty string when you switch, or every vector is computed on text the model never saw that way |
 | `CUBA_CHUNK_THRESHOLD_CHARS` · `CUBA_CHUNK_CHARS` | `1800` · `1400` | Content longer than the threshold is split into chunks of this many characters (200-char overlap). `CUBA_CHUNK_CHARS` is floored at 200. A value that is not a positive integer falls back to the default |
 | `CUBA_EMBED_CONCURRENCY` | `1` | Permits on the semaphore around the ONNX embedding session. Sized once, on first use |
-| `CUBA_TOOL_PROFILE` | `full` | `lean` → 12 tools of 28, 51% smaller catalogue, nothing lost. The ten are the ten most called over 33 days of real use; the other 16 stay reachable through `cuba_call` |
-| `CUBA_JUDGE` | `auto` | `nli` / `mcp_sampling` / `claude_cli` / `heuristic` |
-| `CUBA_JUEZ_CLI` · `CUBA_JUEZ_MODEL` | `claude` · `claude-haiku-4-5` | The CLI the offline judge shells out to, and the model it asks for. `CUBA_JUEZ_CLI` also decides the automatic path: if that name is not on `PATH` there is no CLI judge and the choice falls through |
-| `CUBA_JUEZ_TIMEOUT_SECS` | `30` | Budget for one judgement, CLI and API alike. Anything that does not parse as an integer leaves the default |
-| `CUBA_JUEZ_MAX_PAIRS` | `5` | Candidate pairs `cuba_juez` sends per call |
+| `CUBA_TOOL_PROFILE` | `full` | `lean` → 15 tools of 31, 49% smaller catalogue, nothing lost. The thirteen are the everyday core (incl. whoami/artefacto/contexto); the rest stay reachable through `cuba_call` |
+| `CUBA_JUDGE` · `MEMORY_INDUSTRY_JUDGE` | `auto` | `nli` / `mcp_sampling` / `claude_cli` / `heuristic` / named OpenAI-compat providers. `MEMORY_INDUSTRY_*` is the preferred name; `CUBA_*` still works |
+| `CUBA_JUEZ_CLI` · `MEMORY_INDUSTRY_LLM_CLI` · `CUBA_JUEZ_MODEL` · `MEMORY_INDUSTRY_LLM_MODEL` | `claude` · `claude-haiku-4-5` | The CLI the offline judge shells out to, and the model it asks for. `CUBA_JUEZ_CLI` / `MEMORY_INDUSTRY_LLM_CLI` also decide the automatic path: if that name is not on `PATH` there is no CLI judge and the choice falls through |
+| `CUBA_JUEZ_TIMEOUT_SECS` · `MEMORY_INDUSTRY_LLM_TIMEOUT_SECS` | `30` | Budget for one judgement, CLI and API alike. Anything that does not parse as an integer leaves the default |
+| `CUBA_JUEZ_MAX_PAIRS` · `MEMORY_INDUSTRY_LLM_MAX_PAIRS` | `5` | Candidate pairs `cuba_juez` sends per call |
+| `MEMORY_INDUSTRY_LLM_PROVIDER` · `CUBA_LLM_PROVIDER` | unset | Named cloud/local preset (`deepseek`, `qwen`, `ollama`, …) or `openai_compat` |
+| `MEMORY_INDUSTRY_LLM_BASE_URL` · `CUBA_LLM_BASE_URL` | unset | OpenAI-compatible `/v1` base URL (Ollama, vLLM, vendor gateways) |
+| `MEMORY_INDUSTRY_LLM_API_KEY` · `CUBA_LLM_API_KEY` | unset | Bearer for that base. Vendor fallthroughs: `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (and other preset keys) |
 | `CUBA_NLI_PATH` | `~/.cache/cuba-memorys/models-nli` | Local entailment model (`cuba-memorys models nli`) |
-| `CUBA_NLI_ESCALATE` | off | Send claims the NLI could not decide to an LLM. Buys recall, costs ~12 s each |
+| `CUBA_NLI_ESCALATE` · `MEMORY_INDUSTRY_NLI_ESCALATE` | off | Send claims the NLI could not decide to an LLM. Buys recall, costs ~12 s each |
+| `MEMORY_INDUSTRY_GRAPH_DB` · `CUBA_GRAPH_DB` | `off` | Optional graph projection: `falkor` / `neo4j` / `off`. Postgres remains source of truth |
+| `MEMORY_INDUSTRY_GRAPH_URL` · `CUBA_GRAPH_URL` | unset | Graph endpoint (`redis://…` for FalkorDB) |
+| `MEMORY_INDUSTRY_GRAPH_NAME` · `CUBA_GRAPH_NAME` | `memory_industry` | Falkor/RedisGraph graph key. The gate keeps this unset/`off` so throwaway writes never land on the live graph |
+| `MEMORY_INDUSTRY_ENTITY_FACTOID` | `on` | Extra RRF leg for factoid queries that mention an entity. Set `off` / `0` / `false` to keep the hybrid ranking unchanged |
 | `CUBA_RERANKER_PATH` · `CUBA_RERANK_TIMEOUT_SECS` | `~/.cache/…/reranker` · `20` | Cross-encoder reranker (+93% nDCG); on CPU it falls back to RRF past the budget |
 | `CUBA_RERANK_INTRA_THREADS` | physical cores (2 on GPU) | ONNX threads per rerank inference. Past the physical core count it gets *slower* — measure with `rerank_bench` before raising it |
 | `CUBA_RERANK_LENGTH_BUCKETING` | on (off under fixed shape) | Batch similar-length candidates so padding does not become compute. Scores are unchanged |
@@ -504,7 +517,7 @@ The real number is not 0.894. On 221 id-scored queries it is **nDCG@10 = 0.50** 
 |---|---|
 | **`compact` by default** | **−30% tokens, nDCG +0.0090** (paired 95% CI [+0.0024, +0.0166], n=191). The earlier "exactly 0.0000" was measured with a harness that let the 5000-token response budget truncate the ranking before scoring it: verbose lost its tail, compact did not. The old "−40%" came from the broken benchmark. |
 | **Conformal abstention** | 100% of out-of-distribution queries caught, 0% false abstentions. |
-| **`lean` tool profile** | 12 tools of 28, −51% catalogue, zero functions lost. |
+| **`lean` tool profile** | 15 tools of 31, −49% catalogue, zero functions lost. |
 | **bge-m3 over e5-small** | Direction almost certainly right; **the +21.2 nDCG figure is withdrawn** — it came from the broken benchmark and re-establishing it would mean re-embedding the corpus twice. |
 | **The benchmark itself** | 221 queries (was 10), relevance by document **id**, bootstrap confidence intervals, and the **minimum detectable effect** printed beside every result — so nobody reads a 3-point difference as a finding again. |
 
@@ -535,8 +548,8 @@ The real number is not 0.894. On 221 id-scored queries it is **nDCG@10 = 0.50** 
 ## Development
 
 ```bash
-git clone https://github.com/LeandroPG19/cuba-memorys.git
-cd cuba-memorys/rust && cargo build --release
+git clone https://github.com/LeandroPG19/Memorys.git
+cd Memorys/rust && cargo build --release
 
 # On an NVIDIA machine, build this way instead — without it the reranker spends
 # its whole budget for a ranking that gets discarded. It accelerates the
@@ -544,11 +557,11 @@ cd cuba-memorys/rust && cargo build --release
 cargo build --release --features docs,cuda
 
 ./scripts/demo.sh                  # runs on a throwaway Postgres it removes on exit
-./scripts/merge-gate.sh            # fmt · clippy -D warnings · 316 tests · audit · integration
+./scripts/merge-gate.sh            # local CI 100% — sole merge judge (see docs/gate.md)
 cargo run --release --example rerank_bench   # does the reranker fit its budget here?
 ```
 
-Publishing is tag-driven: `v*` triggers GitHub Release binaries (5 platforms), PyPI wheels, npm, and the MCP Registry. A test pins all four files that hold a version number to the same value, because they used to drift and nothing caught it.
+Publishing is tag-driven: `v*` on [LeandroPG19/Memorys](https://github.com/LeandroPG19/Memorys) triggers GitHub Release binaries (5 platforms), PyPI wheels (`memory-industry` and the `cuba-memorys` alias), npm (`memory-industry` and the `cuba-memorys` alias), and the MCP Registry (`io.github.LeandroPG19/memory-industry`). A test pins `Cargo.toml`, `package.json`, `pyproject.toml` and `server.json` so those versions cannot drift.
 
 ## License
 

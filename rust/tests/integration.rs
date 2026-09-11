@@ -10,7 +10,7 @@ fn unique_name(prefix: &str) -> String {
 async fn test_all_integration() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("Failed to connect to test database");
 
@@ -55,7 +55,7 @@ async fn test_all_integration() {
     println!("  [3/7] alma create + get...");
     {
         let name = unique_name("alma");
-        let result = cuba_memorys::handlers::dispatch(
+        let result = memory_industry::handlers::dispatch(
             &pool,
             "cuba_alma",
             json!({ "action": "create", "name": &name, "entity_type": "concept" }),
@@ -67,7 +67,7 @@ async fn test_all_integration() {
             "create should return content"
         );
 
-        let result = cuba_memorys::handlers::dispatch(
+        let result = memory_industry::handlers::dispatch(
             &pool,
             "cuba_alma",
             json!({ "action": "get", "name": &name }),
@@ -81,7 +81,7 @@ async fn test_all_integration() {
     println!("  [4/7] cronica add + list...");
     {
         let name = unique_name("cronica");
-        let result = cuba_memorys::handlers::dispatch(
+        let result = memory_industry::handlers::dispatch(
             &pool,
             "cuba_cronica",
             json!({
@@ -96,7 +96,7 @@ async fn test_all_integration() {
         .unwrap();
         assert!(result.get("content").is_some(), "add should return content");
 
-        let result = cuba_memorys::handlers::dispatch(
+        let result = memory_industry::handlers::dispatch(
             &pool,
             "cuba_cronica",
             json!({ "action": "list", "entity_name": &name }),
@@ -113,7 +113,7 @@ async fn test_all_integration() {
     println!("  [5/7] faro search...");
     {
         let name = unique_name("faro");
-        let _ = cuba_memorys::handlers::dispatch(
+        let _ = memory_industry::handlers::dispatch(
             &pool, "cuba_cronica",
             json!({
                 "action": "add",
@@ -123,7 +123,7 @@ async fn test_all_integration() {
             }),
         ).await;
 
-        let result = cuba_memorys::handlers::dispatch(
+        let result = memory_industry::handlers::dispatch(
             &pool,
             "cuba_faro",
             json!({ "query": "rust programming safety", "mode": "hybrid", "limit": 5 }),
@@ -139,7 +139,7 @@ async fn test_all_integration() {
 
     println!("  [6/7] jornada lifecycle...");
     {
-        let result = cuba_memorys::handlers::dispatch(
+        let result = memory_industry::handlers::dispatch(
             &pool,
             "cuba_jornada",
             json!({
@@ -155,16 +155,19 @@ async fn test_all_integration() {
             "start should return content"
         );
 
-        let result =
-            cuba_memorys::handlers::dispatch(&pool, "cuba_jornada", json!({ "action": "current" }))
-                .await
-                .unwrap();
+        let result = memory_industry::handlers::dispatch(
+            &pool,
+            "cuba_jornada",
+            json!({ "action": "current" }),
+        )
+        .await
+        .unwrap();
         assert!(
             result.get("content").is_some(),
             "current should return content"
         );
 
-        let _ = cuba_memorys::handlers::dispatch(
+        let _ = memory_industry::handlers::dispatch(
             &pool,
             "cuba_jornada",
             json!({ "action": "end", "outcome": "success", "summary": "Integration test done" }),
@@ -175,10 +178,13 @@ async fn test_all_integration() {
 
     println!("  [7/7] vigia summary...");
     {
-        let result =
-            cuba_memorys::handlers::dispatch(&pool, "cuba_vigia", json!({ "metric": "summary" }))
-                .await
-                .unwrap();
+        let result = memory_industry::handlers::dispatch(
+            &pool,
+            "cuba_vigia",
+            json!({ "metric": "summary" }),
+        )
+        .await
+        .unwrap();
         assert!(
             result.get("content").is_some(),
             "vigia should return content"

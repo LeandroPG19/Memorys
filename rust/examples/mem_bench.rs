@@ -101,14 +101,14 @@ async fn main() {
     );
 
     let (before, vb) = (read_mem(), read_vram_mib());
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to database");
     report("postgres pool", before, read_mem(), vb, read_vram_mib());
 
     let (before, vb) = (read_mem(), read_vram_mib());
     let started = Instant::now();
-    let _ = cuba_memorys::embeddings::onnx::embed("warm up the embedder").await;
+    let _ = memory_industry::embeddings::onnx::embed("warm up the embedder").await;
     let embed_load = started.elapsed();
     report(
         "embedder (first embed)",
@@ -120,7 +120,7 @@ async fn main() {
 
     let (before, vb) = (read_mem(), read_vram_mib());
     let started = Instant::now();
-    let warmed = cuba_memorys::search::rerank::warm_up().await;
+    let warmed = memory_industry::search::rerank::warm_up().await;
     let rerank_load = started.elapsed();
     report(
         "reranker (warm_up)",
@@ -144,7 +144,7 @@ async fn main() {
     let n = raw.len();
     let embeddings: Vec<Vec<f32>> = raw.into_iter().map(|(v,)| v.to_vec()).collect();
     let d = embeddings.first().map(Vec::len).unwrap_or(0);
-    let stats = cuba_memorys::search::ood::OodStats::fit(&embeddings);
+    let stats = memory_industry::search::ood::OodStats::fit(&embeddings);
     let ood_time = started.elapsed();
     report("OOD fit", before, read_mem(), vb, read_vram_mib());
 

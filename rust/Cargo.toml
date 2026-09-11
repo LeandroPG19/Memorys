@@ -1,9 +1,17 @@
 [package]
-name = "cuba-memorys"
-version = "0.24.0"
+name = "memory-industry"
+version = "0.25.0"
 edition = "2024"
-description = "Knowledge Graph MCP Server — 28 tools, sqlx-migrate, BM25/MMR/OOD search, conformal prediction, testing-effect/Δt-Hebbian/Robbins-Monro cognitive, source credibility, closeness/harmonic/k-core graph, working-memory, audit hash-chain (21 CFR Part 11-oriented) + RLS, MCP Resources URI scheme, MCPSamplingJudge, tree-sitter codegraph, git-native sync hooks, relation provenance"
+description = "MemoryIndustry — Knowledge Graph MCP Server — 31 tools, sqlx-migrate, BM25/MMR/OOD search, conformal prediction, testing-effect/Δt-Hebbian/Robbins-Monro cognitive, source credibility, closeness/harmonic/k-core graph, working-memory, audit hash-chain (21 CFR Part 11-oriented) + RLS, MCP Resources URI scheme, MCPSamplingJudge, tree-sitter codegraph, git-native sync hooks, relation provenance"
 license = "Apache-2.0"
+
+[[bin]]
+name = "memory-industry"
+path = "src/main.rs"
+
+[[bin]]
+name = "cuba-memorys"
+path = "src/main.rs"
 
 [dependencies]
 half = "2"
@@ -51,7 +59,7 @@ zstd = "0.13"
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 
 flate2 = "1"
 tar = "0.4"

@@ -17,7 +17,7 @@ async fn own_the_process(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sqlx::Pos
 }
 
 async fn call(pool: &sqlx::PgPool, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, "cuba_sync", args)
+    let envelope = memory_industry::handlers::dispatch(pool, "cuba_sync", args)
         .await
         .unwrap_or_else(|e| panic!("cuba_sync failed: {e:#}"));
     let text = envelope["content"][0]["text"].as_str().expect("envelope");
@@ -34,11 +34,11 @@ async fn taking_what_the_peer_offered_silences_its_bell() {
          is absent would report green for a machine that never ran two nodes",
     );
 
-    let local = cuba_memorys::db::create_pool(&url)
+    let local = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to the local database");
     let _one_at_a_time = own_the_process(&local).await;
-    let remote = cuba_memorys::db::create_pool(&remote_url)
+    let remote = memory_industry::db::create_pool(&remote_url)
         .await
         .expect("connect to the second node");
 
@@ -96,7 +96,7 @@ async fn taking_what_the_peer_offered_silences_its_bell() {
 
     let served = remote.clone();
     let daemon = tokio::spawn(async move {
-        cuba_memorys::http::serve_pool("127.0.0.1:18821", served, true).await
+        memory_industry::http::serve_pool("127.0.0.1:18821", served, true).await
     });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 

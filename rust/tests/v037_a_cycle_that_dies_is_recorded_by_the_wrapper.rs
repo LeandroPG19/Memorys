@@ -54,7 +54,7 @@ async fn a_cycle_that_dies_is_written_down_by_the_caller_that_watched_it_die() {
         .await
         .expect("creating the only table the failure path is allowed to touch");
 
-    let outcome = cuba_memorys::protocol::run_rem_consolidation(&pool).await;
+    let outcome = memory_industry::protocol::run_rem_consolidation(&pool).await;
 
     let recorded: Vec<(Option<String>, i64)> =
         sqlx::query_as("SELECT error, entities_scanned FROM brain_rem_cycles")

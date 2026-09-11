@@ -25,7 +25,7 @@ fn version_is_inert_and_matches_the_crate() {
     );
     assert_eq!(
         stdout.trim(),
-        format!("cuba-memorys {}", env!("CARGO_PKG_VERSION")),
+        format!("memory-industry {}", env!("CARGO_PKG_VERSION")),
         "--version must print exactly the crate version on stdout"
     );
     assert!(
@@ -48,7 +48,7 @@ fn help_documents_the_command_surface() {
     let (stdout, _, code) = run(&["--help"]);
     assert_eq!(code, 0, "--help must exit 0");
 
-    for cmd in cuba_memorys::cli::COMMANDS {
+    for cmd in memory_industry::cli::COMMANDS {
         assert!(
             stdout.contains(cmd),
             "--help must document `{cmd}`. This used to check a hand-written list of 13 \
@@ -167,7 +167,7 @@ fn every_file_that_holds_a_version_agrees() {
 
 #[test]
 fn every_listed_command_is_actually_dispatched() {
-    for cmd in cuba_memorys::cli::COMMANDS {
+    for cmd in memory_industry::cli::COMMANDS {
         let (_, stderr, code) = run(&[cmd, "--help"]);
         assert_ne!(
             code, 2,
@@ -203,20 +203,22 @@ fn the_readme_counts_the_commands_that_exist() {
 
     assert_eq!(
         claimed,
-        cuba_memorys::cli::COMMANDS.len(),
+        memory_industry::cli::COMMANDS.len(),
         "the README says {claimed} CLI commands and the binary dispatches {}. A count in \
          prose is a claim like any other, and this one drifted through three different \
          numbers — 19 in the README, 20 in --help, 22 dispatched — before anything checked it",
-        cuba_memorys::cli::COMMANDS.len()
+        memory_industry::cli::COMMANDS.len()
     );
 }
 
 #[test]
 fn nothing_can_exit_a_draining_command_without_draining_first() {
+    // Windows checkouts may store CRLF; the structural scan below matches on `\n`.
     let main_rs = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
     )
-    .expect("src/main.rs");
+    .expect("src/main.rs")
+    .replace("\r\n", "\n");
 
     let helper = main_rs
         .split_once("async fn drain_then_report")
@@ -247,7 +249,7 @@ fn nothing_can_exit_a_draining_command_without_draining_first() {
             .split('"')
             .skip(1)
             .step_by(2)
-            .filter(|c| cuba_memorys::cli::COMMANDS.contains(c))
+            .filter(|c| memory_industry::cli::COMMANDS.contains(c))
             .collect();
         if named.is_empty() {
             continue;

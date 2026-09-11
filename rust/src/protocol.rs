@@ -272,7 +272,7 @@ fn server_info(params: Option<&Value>) -> Value {
             "resources": { "listChanged": false, "subscribe": false }
         },
         "serverInfo": {
-            "name": "cuba-memorys",
+            "name": "MemoryIndustry",
             "version": env!("CARGO_PKG_VERSION")
         }
     })
@@ -1259,6 +1259,25 @@ async fn rem_backfill_embeddings(pool: &PgPool) -> crate::embeddings::backfill::
 async fn list_resources(pool: &PgPool) -> Result<Value> {
     let mut resources: Vec<Value> = Vec::new();
 
+    resources.push(serde_json::json!({
+        "uri": "memory://context",
+        "name": "agent context",
+        "description": "Working memory + notes + artifacts + top recall (budgeted)",
+        "mimeType": "application/json"
+    }));
+    resources.push(serde_json::json!({
+        "uri": "memory://status",
+        "name": "daemon status",
+        "description": "Same payload as cuba_whoami / memory_whoami",
+        "mimeType": "application/json"
+    }));
+    resources.push(serde_json::json!({
+        "uri": "memory://artifacts",
+        "name": "artifacts index",
+        "description": "Shared multi-agent artifact paths",
+        "mimeType": "application/json"
+    }));
+
     let entities: Vec<(String, String)> = sqlx::query_as(
         "SELECT name, entity_type FROM brain_entities
          ORDER BY access_count DESC NULLS LAST, updated_at DESC NULLS LAST
@@ -1316,9 +1335,45 @@ async fn list_resources(pool: &PgPool) -> Result<Value> {
 }
 
 async fn read_resource(pool: &PgPool, uri: &str) -> Result<Value> {
+    if uri == "memory://context" || uri == "cuba://context" {
+        let body = crate::handlers::contexto::handle(pool, serde_json::json!({})).await?;
+        return Ok(serde_json::json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": serde_json::to_string_pretty(&body)?
+            }]
+        }));
+    }
+    if uri == "memory://status" || uri == "cuba://status" {
+        let body = crate::handlers::whoami::handle(pool, serde_json::json!({})).await?;
+        return Ok(serde_json::json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": serde_json::to_string_pretty(&body)?
+            }]
+        }));
+    }
+    if uri == "memory://artifacts" || uri == "cuba://artifacts" {
+        let body = crate::handlers::artefacto::handle(
+            pool,
+            serde_json::json!({"action": "list", "limit": 50}),
+        )
+        .await?;
+        return Ok(serde_json::json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": serde_json::to_string_pretty(&body)?
+            }]
+        }));
+    }
+
     let stripped = uri
         .strip_prefix("cuba://")
-        .ok_or_else(|| anyhow::anyhow!("URI must start with cuba://"))?;
+        .or_else(|| uri.strip_prefix("memory://"))
+        .ok_or_else(|| anyhow::anyhow!("URI must start with cuba:// or memory://"))?;
 
     if let Some(name) = stripped.strip_prefix("entity/") {
         let row: Option<(String, String, f64, i32)> = sqlx::query_as(
@@ -1600,7 +1655,7 @@ mod tests {
         let info = server_info(Some(&params));
 
         assert_eq!(info["protocolVersion"], "2025-06-18");
-        assert_eq!(info["serverInfo"]["name"], "cuba-memorys");
+        assert_eq!(info["serverInfo"]["name"], "MemoryIndustry");
         assert!(info["capabilities"]["tools"].is_object());
     }
 

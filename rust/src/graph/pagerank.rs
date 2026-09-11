@@ -140,6 +140,59 @@ pub async fn compute_and_store(pool: &PgPool) -> Result<usize> {
     Ok(n)
 }
 
+/// Personalized PageRank (HippoRAG / Gutiérrez et al. 2024). Teleport mass
+/// stays on `seeds`. Same damping as the global ranker (0.85).
+pub fn personalized(outgoing: &[Vec<(usize, f64)>], seeds: &[usize]) -> Vec<f64> {
+    let n = outgoing.len();
+    if n == 0 || seeds.is_empty() {
+        return vec![0.0; n];
+    }
+    let mut out_sum = vec![0.0; n];
+    for (i, edges) in outgoing.iter().enumerate() {
+        out_sum[i] = edges.iter().map(|(_, w)| *w).sum();
+    }
+    let teleport = 1.0 / seeds.len() as f64;
+    let init = 1.0 / n as f64;
+    let mut ranks = vec![init; n];
+    let mut next = vec![0.0; n];
+    for _ in 0..ITERATIONS {
+        next.fill(0.0);
+        for &s in seeds {
+            if s < n {
+                next[s] += (1.0 - DAMPING) * teleport;
+            }
+        }
+        let mut dangling = 0.0;
+        for i in 0..n {
+            if out_sum[i] > 0.0 {
+                for &(j, w) in &outgoing[i] {
+                    next[j] += DAMPING * ranks[i] * w / out_sum[i];
+                }
+            } else {
+                dangling += DAMPING * ranks[i];
+            }
+        }
+        if dangling > 0.0 {
+            let share = dangling * teleport;
+            for &s in seeds {
+                if s < n {
+                    next[s] += share;
+                }
+            }
+        }
+        let delta: f64 = ranks
+            .iter()
+            .zip(next.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        std::mem::swap(&mut ranks, &mut next);
+        if delta < CONVERGENCE_THRESHOLD {
+            break;
+        }
+    }
+    ranks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +249,25 @@ mod tests {
         assert!(
             decay_with_zero_norm < existing,
             "without guard, importance decays from {existing} to {decay_with_zero_norm}"
+        );
+    }
+
+    #[test]
+    fn personalized_mass_stays_near_the_seed() {
+        // 0 → 1 → 2, seed = 0. Rank[0] must beat rank[2].
+        let outgoing = vec![vec![(1, 1.0)], vec![(2, 1.0)], vec![]];
+        let ranks = personalized(&outgoing, &[0]);
+        assert_eq!(ranks.len(), 3);
+        assert!(
+            ranks[0] > ranks[2],
+            "seed 0={:.4} leaf 2={:.4}",
+            ranks[0],
+            ranks[2]
+        );
+        let sum: f64 = ranks.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.05,
+            "PPR should be nearly stochastic: sum={sum}"
         );
     }
 

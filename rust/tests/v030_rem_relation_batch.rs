@@ -20,7 +20,7 @@ async fn own_the_rem_relation_batch_env(
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -53,7 +53,7 @@ async fn an_explicit_batch_override_wins_over_the_queue_size() {
     let _owns = own_the_rem_relation_batch_env(&pool).await;
     unsafe { std::env::set_var("CUBA_REM_RELATION_BATCH", "7") };
 
-    let batch = cuba_memorys::protocol::rem_relation_scan_batch(&pool).await;
+    let batch = memory_industry::protocol::rem_relation_scan_batch(&pool).await;
 
     unsafe { std::env::remove_var("CUBA_REM_RELATION_BATCH") };
 
@@ -72,7 +72,7 @@ async fn a_batch_of_zero_still_disables_the_scan() {
     let _owns = own_the_rem_relation_batch_env(&pool).await;
     unsafe { std::env::set_var("CUBA_REM_RELATION_BATCH", "0") };
 
-    let batch = cuba_memorys::protocol::rem_relation_scan_batch(&pool).await;
+    let batch = memory_industry::protocol::rem_relation_scan_batch(&pool).await;
 
     unsafe { std::env::remove_var("CUBA_REM_RELATION_BATCH") };
 
@@ -90,7 +90,7 @@ async fn a_backlog_of_fifty_or_more_grows_the_batch_past_the_default() {
     let _owns = own_the_rem_relation_batch_env(&pool).await;
     unsafe { std::env::remove_var("CUBA_REM_RELATION_BATCH") };
 
-    let baseline = cuba_memorys::handlers::ingesta::entities_awaiting_relation_scan(&pool, 50)
+    let baseline = memory_industry::handlers::ingesta::entities_awaiting_relation_scan(&pool, 50)
         .await
         .expect("measuring the ambient queue")
         .len();
@@ -101,7 +101,7 @@ async fn a_backlog_of_fifty_or_more_grows_the_batch_past_the_default() {
         fixtures.push(isolated_entity_awaiting_scan(&pool, &name).await);
     }
 
-    let batch = cuba_memorys::protocol::rem_relation_scan_batch(&pool).await;
+    let batch = memory_industry::protocol::rem_relation_scan_batch(&pool).await;
 
     for id in &fixtures {
         sqlx::query("DELETE FROM brain_entities WHERE id = $1")
@@ -130,7 +130,7 @@ async fn a_small_backlog_keeps_the_default_batch_of_five() {
     let _owns = own_the_rem_relation_batch_env(&pool).await;
     unsafe { std::env::remove_var("CUBA_REM_RELATION_BATCH") };
 
-    let baseline = cuba_memorys::handlers::ingesta::entities_awaiting_relation_scan(&pool, 50)
+    let baseline = memory_industry::handlers::ingesta::entities_awaiting_relation_scan(&pool, 50)
         .await
         .expect("measuring the ambient queue")
         .len();
@@ -144,7 +144,7 @@ async fn a_small_backlog_keeps_the_default_batch_of_five() {
          this one"
     );
 
-    let batch = cuba_memorys::protocol::rem_relation_scan_batch(&pool).await;
+    let batch = memory_industry::protocol::rem_relation_scan_batch(&pool).await;
 
     assert_eq!(
         batch, 5,

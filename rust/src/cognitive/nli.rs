@@ -53,20 +53,44 @@ fn semaphore() -> &'static tokio::sync::Semaphore {
 }
 
 fn model_dir() -> Option<PathBuf> {
+    if deferred_by_resource_plan() {
+        return None;
+    }
     if let Ok(p) = std::env::var("CUBA_NLI_PATH") {
         let p = PathBuf::from(p);
-        return p.exists().then_some(p);
+        if p.exists() && !p.to_string_lossy().contains("disabled-by-resource-plan") {
+            return Some(p);
+        }
     }
-    let home = std::env::var("HOME").ok()?;
-    let p = PathBuf::from(home)
-        .join(".cache")
-        .join("cuba-memorys")
-        .join("models-nli");
-    p.exists().then_some(p)
+    cache_model_dir()
+}
+
+/// Cache install path, ignoring a resource-plan disable sentinel.
+pub fn cache_model_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let cache = PathBuf::from(home).join(".cache");
+    let preferred = cache.join("memory-industry").join("models-nli");
+    let legacy = cache.join("cuba-memorys").join("models-nli");
+    if preferred.join("model.onnx").exists() || preferred.join("model_quantized.onnx").exists() {
+        return Some(preferred);
+    }
+    if legacy.join("model.onnx").exists() || legacy.join("model_quantized.onnx").exists() {
+        return Some(legacy);
+    }
+    None
 }
 
 pub fn available() -> bool {
-    model_dir().is_some()
+    cache_model_dir().is_some()
+}
+
+pub fn deferred_by_resource_plan() -> bool {
+    std::env::var("CUBA_NLI_PATH")
+        .ok()
+        .is_some_and(|p| p.contains("disabled-by-resource-plan"))
+        && cache_model_dir().is_some()
 }
 
 pub fn enabled() -> bool {

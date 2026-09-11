@@ -19,30 +19,31 @@ fn a_symlink_loop_does_not_hang_the_walker() {
     fs::write(nested.join("real.rs"), "pub fn only_real() {}\n").expect("writing a real file");
 
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&root, nested.join("loop_back")).expect("creating the cycle");
-    #[cfg(not(unix))]
-    return;
+    {
+        std::os::unix::fs::symlink(&root, nested.join("loop_back")).expect("creating the cycle");
 
-    let result = cuba_memorys::codegraph::extract_dir(&root, &["rs"])
-        .expect("walking a tree that links back to itself must terminate");
+        let result = memory_industry::codegraph::extract_dir(&root, &["rs"])
+            .expect("walking a tree that links back to itself must terminate");
 
-    assert_eq!(
-        result.files_parsed, 1,
-        "the one real file must be parsed exactly once, not once per loop iteration"
-    );
-    assert!(
-        result.files_skipped.iter().any(|(_, why)| why == "symlink"),
-        "the skipped symlink must be reported, not silently ignored: {:?}",
-        result.files_skipped
-    );
+        assert_eq!(
+            result.files_parsed, 1,
+            "the one real file must be parsed exactly once, not once per loop iteration"
+        );
+        assert!(
+            result.files_skipped.iter().any(|(_, why)| why == "symlink"),
+            "the skipped symlink must be reported, not silently ignored: {:?}",
+            result.files_skipped
+        );
+    }
 
     fs::remove_dir_all(&root).ok();
 }
 
 #[test]
 fn the_symbol_identity_survives_line_number_changes() {
-    let before = cuba_memorys::codegraph_cli::symbol_identity("function", "handle", "src/api.rs");
-    let after = cuba_memorys::codegraph_cli::symbol_identity("function", "handle", "src/api.rs");
+    let before =
+        memory_industry::codegraph_cli::symbol_identity("function", "handle", "src/api.rs");
+    let after = memory_industry::codegraph_cli::symbol_identity("function", "handle", "src/api.rs");
     assert_eq!(
         before, after,
         "identity must not depend on where the symbol currently sits"
@@ -54,12 +55,13 @@ fn the_symbol_identity_survives_line_number_changes() {
     );
 
     let other_file =
-        cuba_memorys::codegraph_cli::symbol_identity("function", "handle", "src/other.rs");
+        memory_industry::codegraph_cli::symbol_identity("function", "handle", "src/other.rs");
     assert_ne!(
         before, other_file,
         "the same name in another file is a different symbol"
     );
-    let other_kind = cuba_memorys::codegraph_cli::symbol_identity("struct", "handle", "src/api.rs");
+    let other_kind =
+        memory_industry::codegraph_cli::symbol_identity("struct", "handle", "src/api.rs");
     assert_ne!(before, other_kind, "kind is part of the identity");
 }
 
@@ -71,7 +73,7 @@ async fn build(root: &std::path::Path) {
         "rust".to_string(),
         "--json".to_string(),
     ];
-    cuba_memorys::codegraph_cli::run_cli(&args)
+    memory_industry::codegraph_cli::run_cli(&args)
         .await
         .expect("codegraph build");
 }
@@ -81,7 +83,7 @@ async fn build(root: &std::path::Path) {
 async fn rebuilding_after_an_edit_refreshes_the_row_instead_of_orphaning_it() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 

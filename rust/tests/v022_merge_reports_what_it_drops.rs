@@ -2,7 +2,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"]
@@ -20,7 +20,7 @@ async fn merge_says_out_loud_which_rows_it_refused_to_touch() {
     std::fs::create_dir_all(&bundle).expect("a scratch bundle directory");
     unsafe { std::env::set_var("CUBA_SYNC_DIR", &bundle) };
 
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 

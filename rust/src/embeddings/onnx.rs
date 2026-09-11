@@ -83,8 +83,18 @@ pub(crate) fn locate_onnxruntime() -> Option<PathBuf> {
     };
 
     let cache_lib = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
-        .map(|h| PathBuf::from(h).join(".cache/cuba-memorys/onnxruntime"));
+        .map(|h| {
+            let cache = PathBuf::from(h).join(".cache");
+            let preferred = cache.join("memory-industry").join("onnxruntime");
+            let legacy = cache.join("cuba-memorys").join("onnxruntime");
+            if preferred.exists() || !legacy.exists() {
+                preferred
+            } else {
+                legacy
+            }
+        });
 
     let search: Vec<PathBuf> = cache_lib
         .into_iter()
@@ -120,48 +130,90 @@ pub(crate) fn locate_onnxruntime() -> Option<PathBuf> {
     Some(found)
 }
 
+fn cache_roots() -> Vec<PathBuf> {
+    let Some(home) = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+    else {
+        return Vec::new();
+    };
+    let cache = PathBuf::from(home).join(".cache");
+    let preferred = cache.join("memory-industry");
+    let legacy = cache.join("cuba-memorys");
+    if preferred.exists() {
+        vec![preferred, legacy]
+    } else if legacy.exists() {
+        vec![legacy, preferred]
+    } else {
+        vec![preferred, legacy]
+    }
+}
+
+/// Prefer explicit ONNX_MODEL_PATH; otherwise the cache installed by `models embed`.
+fn resolve_model_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ONNX_MODEL_PATH") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    for root in cache_roots() {
+        let dir = root.join("models");
+        let quantized = dir.join("model_quantized.onnx");
+        if quantized.exists() {
+            return Some(dir);
+        }
+        let plain = dir.join("model.onnx");
+        if plain.exists() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
 fn get_model_status() -> &'static ModelStatus {
     MODEL_STATUS.get_or_init(|| {
-        if std::env::var("ONNX_MODEL_PATH").is_ok_and(|p| !p.is_empty())
-            && locate_onnxruntime().is_none()
-        {
+        let Some(model_dir) = resolve_model_dir() else {
+            tracing::info!(
+                "no ONNX embedder found — set ONNX_MODEL_PATH or run `memory-industry models embed`"
+            );
+            return ModelStatus::Fallback;
+        };
+
+        if locate_onnxruntime().is_none() {
             tracing::error!(
-                "ONNX_MODEL_PATH está definido pero no encuentro la librería de ONNX Runtime. \
+                "encontré el modelo en {} pero no la librería de ONNX Runtime. \
                  `ort` la carga dinámicamente: sin ella el servidor NO falla — se cuelga en el \
-                 primer embedding, sin decir nada. Degradando al fallback de hash (la búsqueda \
-                 léxica y BM25 siguen funcionando; la semántica no).\n\
-                 Definí ORT_DYLIB_PATH con la ruta a libonnxruntime.so — \
-                 `cuba-memorys doctor` lo diagnostica."
+                 primer embedding. Degradando al fallback de hash.\n\
+                 Corré `memory-industry models runtime` o definí ORT_DYLIB_PATH.",
+                model_dir.display()
             );
             return ModelStatus::Fallback;
         }
 
-        match std::env::var("ONNX_MODEL_PATH") {
-            Ok(path) if !path.is_empty() => {
-                let p = PathBuf::from(&path);
-                let model_file = if p.is_dir() {
-                    p.join("model_quantized.onnx")
-                } else {
-                    p.clone()
-                };
-                if model_file.exists() {
-                    match init_onnx_session(&model_file, &p) {
-                        Ok(()) => {
-                            tracing::info!(path = %model_file.display(), "ONNX model loaded successfully");
-                            ModelStatus::Loaded
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to load ONNX model — using fallback");
-                            ModelStatus::Fallback
-                        }
-                    }
-                } else {
-                    tracing::warn!(path = %model_file.display(), "ONNX model file not found — using fallback");
-                    ModelStatus::Fallback
-                }
+        let model_file = if model_dir.is_dir() {
+            let quantized = model_dir.join("model_quantized.onnx");
+            if quantized.exists() {
+                quantized
+            } else {
+                model_dir.join("model.onnx")
             }
-            _ => {
-                tracing::info!("ONNX_MODEL_PATH not set — using hash-based fallback embeddings");
+        } else {
+            model_dir.clone()
+        };
+
+        if !model_file.exists() {
+            tracing::warn!(path = %model_file.display(), "ONNX model file not found — using fallback");
+            return ModelStatus::Fallback;
+        }
+
+        match init_onnx_session(&model_file, &model_dir) {
+            Ok(()) => {
+                tracing::info!(path = %model_file.display(), "ONNX model loaded successfully");
+                ModelStatus::Loaded
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load ONNX model — using fallback");
                 ModelStatus::Fallback
             }
         }

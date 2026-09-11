@@ -8,7 +8,7 @@ fn unique_name(prefix: &str) -> String {
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -17,14 +17,13 @@ async fn pool() -> sqlx::PgPool {
 #[ignore]
 async fn auto_extract_falls_back_to_the_local_cli_when_the_client_has_no_sampling() {
     assert!(
-        !cuba_memorys::protocol::client_supports_sampling(),
+        !memory_industry::protocol::client_supports_sampling(),
         "this test must run outside an MCP session so the fallback is what gets exercised"
     );
     assert!(
-        cuba_memorys::cognitive::judge::resolve_offline_llm().is_some(),
-        "no local LLM CLI on PATH. This test exists because auto_extract was dead for \
-         months while its suite reported green — a silent skip here recreates exactly that. \
-         Install one, or run this suite where one exists"
+        memory_industry::cognitive::judge::resolve_offline_llm().is_some(),
+        "no generative LLM (OpenAI-compat URL or claude/gemini CLI). {}",
+        memory_industry::cognitive::judge::generative_llm_setup_hint()
     );
 
     let pool = pool().await;
@@ -34,7 +33,7 @@ async fn auto_extract_falls_back_to_the_local_cli_when_the_client_has_no_samplin
          trabajos. Lo mantiene el equipo de plataforma."
     );
 
-    let result = cuba_memorys::handlers::ingesta::handle(
+    let result = memory_industry::handlers::ingesta::handle(
         &pool,
         json!({ "action": "auto_extract", "text": text, "entity_hint": subject }),
     )
@@ -50,24 +49,24 @@ async fn auto_extract_falls_back_to_the_local_cli_when_the_client_has_no_samplin
          for months while its suite reported green. Got: {result}"
     );
     if matches!(reason, Some("out_of_budget") | Some("backend_failed")) {
-        eprintln!(
-            "SKIPPED the extraction assertions: the backend was found and wired, and then \
-             {reason:?} — the model was slow or errored on this run. That is an environment \
-             outcome, not a wiring one, and failing here would teach everyone to re-run the \
-             gate instead of reading it. What this run does NOT establish: that a reply gets \
-             parsed into entities. Result: {result}"
+        panic!(
+            "generative LLM was found but the call failed ({reason:?}). Soft-skipping here \
+             made the gate green while extract was broken. Fix auth/timeout/model, or point \
+             MEMORY_INDUSTRY_LLM_BASE_URL at a healthy OpenAI-compat server. Result: {result}"
         );
-        return;
     }
     assert_ne!(
         result.get("degraded").and_then(|v| v.as_bool()),
         Some(true),
-        "with a CLI on PATH auto_extract must no longer degrade: {result}"
+        "with a generative backend reachable auto_extract must not degrade: {result}"
     );
-    assert_eq!(
-        result.get("backend").and_then(|v| v.as_str()),
-        Some("claude_cli"),
-        "the reply must say which backend ran: {result}"
+    let backend = result.get("backend").and_then(|v| v.as_str());
+    assert!(
+        matches!(
+            backend,
+            Some("claude_cli") | Some("gemini_cli") | Some("openai_compat")
+        ),
+        "the reply must name a known generative backend, got {backend:?}: {result}"
     );
 
     let extracted = result
@@ -112,24 +111,27 @@ async fn auto_extract_falls_back_to_the_local_cli_when_the_client_has_no_samplin
 #[ignore]
 async fn the_judge_still_reaches_a_verdict_with_mcp_servers_disabled() {
     assert!(
-        cuba_memorys::cognitive::judge::which_in_path("claude"),
-        "no claude CLI on PATH: the fallback this asserts cannot be exercised, and \
-         reporting ok would claim it was"
+        memory_industry::cognitive::judge::resolve_offline_llm().is_some(),
+        "no generative LLM for the offline judge: {}",
+        memory_industry::cognitive::judge::generative_llm_setup_hint()
     );
-    if false {
-        return;
-    }
 
-    let judge = cuba_memorys::cognitive::judge::ClaudeCodeJudge::from_env();
-    let judgment = cuba_memorys::cognitive::judge::ContradictionJudge::judge(
-        &judge,
+    let judge = memory_industry::cognitive::judge::resolve_offline_llm().expect("checked above");
+    let judgment = memory_industry::cognitive::judge::ContradictionJudge::judge(
+        judge.as_ref(),
         "El servicio corre en el puerto 8080.",
         "El servicio corre en el puerto 9090.",
     )
     .await
-    .expect("the CLI judge must still answer once MCP servers are excluded");
+    .expect("the offline judge must still answer once MCP servers are excluded");
 
-    assert_eq!(judgment.backend, "claude_cli");
+    assert!(
+        matches!(
+            judgment.backend.as_str(),
+            "claude_cli" | "gemini_cli" | "openai_compat"
+        ),
+        "unexpected backend: {judgment:?}"
+    );
     assert_eq!(
         judgment.verdict, "contradicts",
         "two different ports for one service contradict each other: {judgment:?}"
@@ -141,21 +143,21 @@ fn the_cli_json_envelope_is_unwrapped_but_a_bare_reply_is_left_alone() {
     let enveloped = r#"{"type":"result","subtype":"success","is_error":false,
         "result":"{\"facts\":[],\"relations\":[]}","session_id":"abc","total_cost_usd":0.01}"#;
     assert_eq!(
-        cuba_memorys::cognitive::judge::unwrap_cli_reply(enveloped),
+        memory_industry::cognitive::judge::unwrap_cli_reply(enveloped),
         r#"{"facts":[],"relations":[]}"#,
         "the CLI wraps its answer in an envelope; the extractor must see the inner text"
     );
 
     let bare = r#"{"facts":[{"entity_name":"x","content":"y"}],"relations":[]}"#;
     assert_eq!(
-        cuba_memorys::cognitive::judge::unwrap_cli_reply(bare),
+        memory_industry::cognitive::judge::unwrap_cli_reply(bare),
         bare,
         "a sampling reply has no envelope and must survive untouched"
     );
 
     let fenced = "```json\n{\"facts\":[]}\n```";
     assert_eq!(
-        cuba_memorys::cognitive::judge::unwrap_cli_reply(fenced),
+        memory_industry::cognitive::judge::unwrap_cli_reply(fenced),
         fenced,
         "non-JSON text must pass through for the downstream parser to handle"
     );

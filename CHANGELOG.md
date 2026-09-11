@@ -1,12 +1,33 @@
 # Changelog
 
-All notable changes to cuba-memorys are documented here. Format follows
+All notable changes to MemoryIndustry (formerly cuba-memorys) are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows
 [SemVer](https://semver.org/) for the Rust crate (`Cargo.toml`). PyPI
-versioning is independent (~ +1.0 offset since v0.6.0 era to allow wheel
-revisions without binary changes).
+versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.25.0 → PyPI 1.27.0).
 
 ## [Unreleased]
+
+## [0.25.0] — 2026-09-11
+
+### MemoryIndustry
+
+- Product name is **MemoryIndustry**. Crate `memory_industry`, binaries
+  `memory-industry` and the `cuba-memorys` alias. MCP tools stay `cuba_*`.
+- GitHub repo is [LeandroPG19/Memorys](https://github.com/LeandroPG19/Memorys)
+  (`cuba-memorys` still redirects).
+- Canonical packages: `memory-industry` on npm (`0.25.0`) and PyPI (`1.27.0`).
+  The `cuba-memorys` names on both registries stay as aliases so existing
+  `pip install cuba-memorys` / `npm i -g cuba-memorys` keep working.
+- MCP Registry name: `io.github.LeandroPG19/memory-industry`.
+
+### Write-ahead, factoids, session prefetch
+
+- `cuba_cronica add` / `batch_add` wait for embed+chunk before answering
+  (`embedding: ready|pending`, `write_to_searchable_ms`).
+- Factoid queries that mention an entity get an extra RRF leg
+  (`MEMORY_INDUSTRY_ENTITY_FACTOID`, default on).
+- `cuba_contexto` prefetches recent session writes and working-memory mentions.
+- `cuba_ingesta` default action is `ingest`; `auto_extract` is opt-in.
 
 ### Cursor: initialize en SSE dejaba todos los chats en 405
 
@@ -2043,6 +2064,7 @@ centrality normalization, cache LRU, jornada race condition, six MCP
 schemas. Removed `blake3` dependency. 68 tests, 0 clippy warnings,
 0 tech debt.
 
+[0.25.0]: https://github.com/LeandroPG19/Memorys/releases/tag/v0.25.0
 [0.9.0]: https://github.com/LeandroPG19/cuba-memorys/releases/tag/v0.9.0
 [0.8.0]: https://github.com/LeandroPG19/cuba-memorys/releases/tag/v0.8.0
 [0.7.0]: https://github.com/LeandroPG19/cuba-memorys/releases/tag/v0.7.0

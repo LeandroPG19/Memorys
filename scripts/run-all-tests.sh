@@ -7,13 +7,40 @@ RUST_DIR="$ROOT/rust"
 LIVE_DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
 export CUBA_JUDGE="${CUBA_JUDGE:-heuristic}"
 
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cuba-memorys"
-export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-$CACHE/models-bge-m3}"
-export ORT_DYLIB_PATH="${ORT_DYLIB_PATH:-$CACHE/onnxruntime/libonnxruntime.so}"
-export CUBA_RERANKER_PATH="${CUBA_RERANKER_PATH:-$CACHE/reranker-fused}"
+CACHE_NEW="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry"
+CACHE_OLD="${XDG_CACHE_HOME:-$HOME/.cache}/cuba-memorys"
+# Prefer the cache that actually has the embedder. An empty memory-industry/
+# dir (e.g. only audit_key) must not steal paths from a populated cuba-memorys/.
+if [[ -f "$CACHE_NEW/models/model_quantized.onnx" ]]; then
+  CACHE="$CACHE_NEW"
+elif [[ -f "$CACHE_OLD/models/model_quantized.onnx" ]]; then
+  CACHE="$CACHE_OLD"
+elif [[ -d "$CACHE_NEW" ]]; then
+  CACHE="$CACHE_NEW"
+elif [[ -d "$CACHE_OLD" ]]; then
+  CACHE="$CACHE_OLD"
+else
+  CACHE="$CACHE_NEW"
+fi
+# Paths must match `memory-industry models all` (see rust/src/models_cli.rs).
+export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-$CACHE/models}"
+if [[ -z "${ORT_DYLIB_PATH:-}" ]]; then
+  if [[ -f "$CACHE/onnxruntime/libonnxruntime.so" ]]; then
+    export ORT_DYLIB_PATH="$CACHE/onnxruntime/libonnxruntime.so"
+  elif [[ -f "$CACHE/onnxruntime/onnxruntime.dll" ]]; then
+    export ORT_DYLIB_PATH="$CACHE/onnxruntime/onnxruntime.dll"
+  elif [[ -f "$CACHE_OLD/onnxruntime/onnxruntime.dll" ]]; then
+    export ORT_DYLIB_PATH="$CACHE_OLD/onnxruntime/onnxruntime.dll"
+  elif [[ -f "$CACHE_OLD/onnxruntime/libonnxruntime.so" ]]; then
+    export ORT_DYLIB_PATH="$CACHE_OLD/onnxruntime/libonnxruntime.so"
+  else
+    export ORT_DYLIB_PATH="$CACHE/onnxruntime/libonnxruntime.so"
+  fi
+fi
+export CUBA_RERANKER_PATH="${CUBA_RERANKER_PATH:-$CACHE/reranker}"
 export CUBA_NLI_PATH="${CUBA_NLI_PATH:-$CACHE/models-nli}"
-export CUBA_EMBEDDING_DIM="${CUBA_EMBEDDING_DIM:-1024}"
-export CUBA_EMBED_MODEL="${CUBA_EMBED_MODEL:-bge-m3}"
+export CUBA_EMBEDDING_DIM="${CUBA_EMBEDDING_DIM:-384}"
+export CUBA_EMBED_MODEL="${CUBA_EMBED_MODEL:-e5-small}"
 export CUBA_POOLING="${CUBA_POOLING:-cls}"
 
 # Disk, before anything compiles. A gate run of this repo linked with `ld` dying on
@@ -32,7 +59,7 @@ SWEEP_OLDER_THAN_DAYS="${CUBA_GATE_SWEEP_DAYS:-7}"
 free_gb() { df --output=avail -BG "$RUST_DIR" | tail -1 | tr -dc '0-9'; }
 
 sweep_stale_artifacts() {
-  local before after
+  local before afte
   before="$(free_gb)"
   echo "disk: ${before}G free — sweeping build artifacts older than ${SWEEP_OLDER_THAN_DAYS}d"
   rm -rf "$RUST_DIR/target/debug/incremental" 2>/dev/null || true
@@ -58,17 +85,74 @@ if [[ "$(free_gb)" -lt "$MIN_FREE_GB" ]]; then
   exit 1
 fi
 
-run_if_present() {
+require_present() {
   local what="$1" probe="$2"
   shift 2
-  if [[ -e "$probe" ]]; then
-    echo "=== $what ==="
-    "$@"
-  else
-    echo "SKIPPED: $what — nothing at $probe"
-    echo "         These targets are NOT covered by this run. Install with"
-    echo "         \`cuba-memorys models all\` to make them run."
+  if [[ ! -e "$probe" ]]; then
+    echo "FAIL: $what — nothing at $probe" >&2
+    echo "      This gate does not skip model/CLI coverage. Install with" >&2
+    echo "      \`memory-industry models all\` (and a generative LLM — see require_generative_llm)." >&2
+    exit 1
   fi
+  echo "=== $what ==="
+  "$@"
+}
+
+require_generative_llm() {
+  local what="$1"
+  shift
+  local base="${MEMORY_INDUSTRY_LLM_BASE_URL:-${CUBA_LLM_BASE_URL:-}}"
+  local provider="${MEMORY_INDUSTRY_LLM_PROVIDER:-${CUBA_LLM_PROVIDER:-}}"
+  local ok=0
+  if [[ -n "$base" ]]; then
+    base="${base%/}"
+    if curl -fsS --max-time 5 "${base}/models" >/dev/null 2>&1 \
+      || curl -fsS --max-time 8 -X POST "${base}/chat/completions" \
+           -H "Content-Type: application/json" \
+           -H "Authorization: Bearer ${MEMORY_INDUSTRY_LLM_API_KEY:-${CUBA_LLM_API_KEY:-local}}" \
+           -d '{"model":"'"${MEMORY_INDUSTRY_LLM_MODEL:-ping}"'","messages":[{"role":"user","content":"ping"}],"max_tokens":1}' \
+           >/dev/null 2>&1; then
+      ok=1
+      echo "OK  generative LLM via OpenAI-compat at $base"
+    else
+      echo "FAIL: $what — MEMORY_INDUSTRY_LLM_BASE_URL=$base is set but probe failed." >&2
+      echo "      Fix the endpoint/API key — the gate does not soft-skip." >&2
+      exit 1
+    fi
+  fi
+  if [[ "$ok" -eq 0 && -n "$provider" ]]; then
+    # Provider presets are resolved in Rust; presence of provider + any common key is enough to proceed.
+    if [[ -n "${MEMORY_INDUSTRY_LLM_API_KEY:-${CUBA_LLM_API_KEY:-${OPENAI_API_KEY:-${DEEPSEEK_API_KEY:-${DASHSCOPE_API_KEY:-${MOONSHOT_API_KEY:-${ZHIPU_API_KEY:-${SILICONFLOW_API_KEY:-${OPENROUTER_API_KEY:-}}}}}}}}}" ]] \
+      || [[ "$provider" == "ollama" || "$provider" == "lmstudio" || "$provider" == "vllm" ]]; then
+      ok=1
+      echo "OK  generative LLM via MEMORY_INDUSTRY_LLM_PROVIDER=$provider"
+    else
+      echo "FAIL: $what — provider=$provider set but no API key found." >&2
+      echo "      Export MEMORY_INDUSTRY_LLM_API_KEY or the vendor key (DEEPSEEK_API_KEY, DASHSCOPE_API_KEY, …)." >&2
+      exit 1
+    fi
+  fi
+  if [[ "$ok" -eq 0 ]] && command -v claude >/dev/null 2>&1; then
+    if claude -p "reply with the single word ok" --output-format text >/dev/null 2>&1; then
+      ok=1
+      echo "OK  generative LLM via authenticated claude CLI"
+    fi
+  fi
+  if [[ "$ok" -eq 0 ]] && command -v gemini >/dev/null 2>&1; then
+    if gemini -p "reply with the single word ok" --output-format text >/dev/null 2>&1; then
+      ok=1
+      echo "OK  generative LLM via authenticated gemini CLI"
+    fi
+  fi
+  if [[ "$ok" -eq 0 ]]; then
+    echo "FAIL: $what — no generative LLM ready." >&2
+    echo "      Set MEMORY_INDUSTRY_LLM_PROVIDER=deepseek|qwen|moonshot|zhipu|openai|ollama|…" >&2
+    echo "      (+ vendor API key), or MEMORY_INDUSTRY_LLM_BASE_URL to any OpenAI-compat /v1," >&2
+    echo "      or authenticate \`claude\`/\`gemini\`, or use MCP sampling." >&2
+    exit 1
+  fi
+  echo "=== $what ==="
+  "$@"
 }
 
 GATE_DB="${GATE_DB:-brain_gate}"
@@ -89,12 +173,34 @@ fi
 
 cd "$RUST_DIR"
 
+# Prefer an already-built binary. `cargo run` under timeout used to spend the
+# whole budget recompiling and leave the throwaway DB with zero tables while
+# `|| true` hid the failure (exit 124).
+gate_bin() {
+  if [[ -x "$RUST_DIR/target/debug/memory-industry" ]]; then
+    echo "$RUST_DIR/target/debug/memory-industry"
+  elif [[ -x "$RUST_DIR/target/release/memory-industry" ]]; then
+    echo "$RUST_DIR/target/release/memory-industry"
+  elif [[ -x "$RUST_DIR/target/debug/cuba-memorys" ]]; then
+    echo "$RUST_DIR/target/debug/cuba-memorys"
+  elif [[ -x "$RUST_DIR/target/release/cuba-memorys" ]]; then
+    echo "$RUST_DIR/target/release/cuba-memorys"
+  else
+    cargo build --quiet --bin memory-industry >&2
+    echo "$RUST_DIR/target/debug/memory-industry"
+  fi
+}
+
 provision_gate_db() {
+  local bin
+  bin="$(gate_bin)"
   psql "$ADMIN_DATABASE_URL" -q \
     -c "DROP DATABASE IF EXISTS $GATE_DB WITH (FORCE)" \
     -c "CREATE DATABASE $GATE_DB" >/dev/null
+  # doctor exits non-zero when ONNX_MODEL_PATH is empty (policy checks). Migrations
+  # still apply first — trust the table count below, not the exit code alone.
   DATABASE_URL="$GATE_DATABASE_URL" CUBA_APP_ROLE=0 ONNX_MODEL_PATH="" \
-    timeout 300 cargo run --quiet --bin cuba-memorys -- doctor >/dev/null 2>&1 || true
+    "$bin" doctor >/dev/null 2>&1 || true
   if [[ "$CUBA_EMBEDDING_DIM" != "384" ]]; then
     DATABASE_URL="$GATE_DATABASE_URL" "$ROOT/scripts/migrate-embedding-dim.sh" \
       "$CUBA_EMBEDDING_DIM" >/dev/null 2>&1 || {
@@ -115,6 +221,7 @@ provision_gate_db() {
     "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")"
   if ((tables < 20)); then
     echo "FAIL: could not migrate the throwaway database (only $tables tables)." >&2
+    echo "      doctor via $bin did not apply schema. Re-run with that binary visible." >&2
     exit 1
   fi
   echo "OK  throwaway database $GATE_DB ready ($tables tables, vector($dim))"
@@ -123,7 +230,7 @@ provision_gate_db() {
     -c "DROP DATABASE IF EXISTS $PEER_DB WITH (FORCE)" \
     -c "CREATE DATABASE $PEER_DB" >/dev/null
   DATABASE_URL="$PEER_DATABASE_URL" CUBA_APP_ROLE=0 ONNX_MODEL_PATH="" \
-    timeout 300 cargo run --quiet --bin cuba-memorys -- doctor >/dev/null 2>&1 || true
+    "$bin" doctor >/dev/null 2>&1 || true
   if [[ "$CUBA_EMBEDDING_DIM" != "384" ]]; then
     DATABASE_URL="$PEER_DATABASE_URL" "$ROOT/scripts/migrate-embedding-dim.sh" \
       "$CUBA_EMBEDDING_DIM" >/dev/null 2>&1 || true
@@ -141,7 +248,7 @@ provision_gate_db() {
 }
 
 # The exit code is written here before anything else can overwrite $?. A 20-minute
-# gate gets launched in the background, and then its result is read from whatever
+# gate gets launched in the background, and then its result is read from whateve
 # the wrapper reports — which is the exit code of the last command in the chain,
 # not of the gate. That is how GATE_EXIT=101 was once reported as green. Reading
 # this file is the only honest answer, and /tmp is swept on reboot, so it lives
@@ -180,18 +287,19 @@ export DATABASE_URL="$GATE_DATABASE_URL"
 # green over the very commits that added them. A gate whose coverage depends on
 # somebody remembering to edit it is a gate that quietly shrinks.
 RUN_ELSEWHERE=(v020_audit_update_applies v020_role_separation v020_audit_hmac
-               v020_embed_cache_key v016_chunking nli_entailment nli_cost nli_probe)
+               v020_embed_cache_key v016_chunking nli_entailment nli_cost nli_probe
+               v016_extract_without_sampling v017_relation_scan v017_rerank_gpu)
 DISCOVERED=()
-SKIPPED=()
+DEFERRED_SECTIONS=()
 for file in tests/*.rs; do
   name="$(basename "$file" .rs)"
   if printf '%s\n' "${RUN_ELSEWHERE[@]}" | grep -qx "$name"; then
-    SKIPPED+=("$name")
+    DEFERRED_SECTIONS+=("$name")
   else
     DISCOVERED+=(--test "$name")
   fi
 done
-echo "running ${#SKIPPED[@]} file(s) in their own sections: ${SKIPPED[*]}"
+echo "deferred ${#DEFERRED_SECTIONS[@]} file(s) to their own sections: ${DEFERRED_SECTIONS[*]}"
 echo "running $(( ${#DISCOVERED[@]} / 2 )) discovered test file(s)"
 cargo test "${DISCOVERED[@]}" -- --ignored --nocapture
 
@@ -201,20 +309,18 @@ echo "=== admin-role tests (they rewrite roles and the audit log) ==="
 CUBA_APP_ROLE=0 cargo test --test v020_audit_update_applies --test v020_role_separation \
            -- --ignored --nocapture
 
-run_if_present "tests that need the embedding model" "$ONNX_MODEL_PATH/model_quantized.onnx" \
+echo "=== audit HMAC + embed cache key ==="
+cargo test --test v020_audit_hmac --test v020_embed_cache_key -- --ignored --nocapture
+
+require_present "tests that need the embedding model" "$ONNX_MODEL_PATH/model_quantized.onnx" \
   cargo test --test v016_chunking -- --ignored --nocapture
 
-run_if_present "tests that need the NLI model" "$CUBA_NLI_PATH" \
-  cargo test --test nli_entailment -- --ignored --nocapture
+require_present "tests that need the NLI model" "$CUBA_NLI_PATH" \
+  cargo test --test nli_entailment --test nli_cost --test nli_probe -- --ignored --nocapture
 
-if command -v claude >/dev/null 2>&1; then
-  echo "=== tests that need a local LLM CLI ==="
+require_generative_llm "tests that need a generative LLM (extract / relation-scan)" \
   cargo test --test v016_extract_without_sampling --test v017_relation_scan \
              -- --ignored --nocapture
-else
-  echo "SKIPPED: tests that need a local LLM CLI — no \`claude\` on PATH."
-  echo "         v016_extract_without_sampling and v017_relation_scan are NOT covered."
-fi
 
 # build-gpu.sh, not a bare `cargo build --release`. Without --features cuda,
 # gpu::wants_gpu() returns false unconditionally, CUBA_RERANK_DEVICE=gpu goes
@@ -225,20 +331,52 @@ fi
 echo "=== release build (same feature set production runs) ==="
 "$ROOT/scripts/build-gpu.sh"
 
-run_if_present "reranker tests (release: 387s in debug, seconds here)" \
+require_present "reranker tests (release: 387s in debug, seconds here)" \
   "$CUBA_RERANKER_PATH/model.onnx" \
   cargo test --release --test v017_rerank_gpu -- --ignored --nocapture
 
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
-export CUBA_BINARY_PATH="$RUST_DIR/target/release/cuba-memorys"
-python3 tests/e2e_all_tools.py
+export CUBA_BINARY_PATH="${CUBA_BINARY_PATH:-$RUST_DIR/target/release/memory-industry}"
+if [[ ! -f "$CUBA_BINARY_PATH" && -f "${CUBA_BINARY_PATH}.exe" ]]; then
+  CUBA_BINARY_PATH="${CUBA_BINARY_PATH}.exe"
+fi
+if [[ ! -f "$CUBA_BINARY_PATH" ]]; then
+  CUBA_BINARY_PATH="$RUST_DIR/target/release/cuba-memorys"
+  if [[ ! -f "$CUBA_BINARY_PATH" && -f "${CUBA_BINARY_PATH}.exe" ]]; then
+    CUBA_BINARY_PATH="${CUBA_BINARY_PATH}.exe"
+  fi
+fi
+# Prefer PYTHON_BIN (set by run-gate on Windows). Never use the Microsoft Store
+# python3.exe stub under WindowsApps — it prints install text and exits 49.
+resolve_python() {
+  if [[ -n "${PYTHON_BIN:-}" && ( -x "$PYTHON_BIN" || -f "$PYTHON_BIN" ) ]]; then
+    printf '%s\n' "$PYTHON_BIN"
+    return
+  fi
+  local c p
+  for c in python3 python; do
+    p="$(command -v "$c" 2>/dev/null || true)"
+    [[ -n "$p" ]] || continue
+    case "$p" in
+      */WindowsApps/*) continue ;;
+    esac
+    printf '%s\n' "$p"
+    return
+  done
+  printf '%s\n' "python3"
+}
+PY="$(resolve_python)"
+echo "python=$PY"
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+"$PY" tests/e2e_all_tools.py
 
 echo "=== MCP live session (single process, initialize + tools/list + calls) ==="
-python3 "$ROOT/scripts/mcp_live_session_test.py"
+"$PY" "$ROOT/scripts/mcp_live_session_test.py"
 
 echo "=== eval harness smoke (read-only, so it runs against the real corpus) ==="
 DATABASE_URL="$LIVE_DATABASE_URL" \
-  "$RUST_DIR/target/release/cuba-memorys" eval \
+  "$CUBA_BINARY_PATH" eval \
   --dataset "$RUST_DIR/eval-datasets/smoke.jsonl" --k 10
 
 echo ""

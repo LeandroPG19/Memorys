@@ -37,7 +37,10 @@ fn spec(name: &str) -> Option<ModelSpec> {
             dir: "reranker",
             hf_repo: "celinehoang/bge-reranker-v2-m3-onnx",
             files: &[
+                // Hub split the former monolithic ~1.1 GB graph: tiny model.onnx +
+                // external weights in model.onnx_data (ONNX external-data format).
                 ("model.onnx", "model.onnx"),
+                ("model.onnx_data", "model.onnx_data"),
                 ("tokenizer.json", "tokenizer.json"),
                 ("config.json", "config.json"),
             ],
@@ -51,7 +54,14 @@ fn cache_root() -> Result<PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .context("no HOME/USERPROFILE — no sé dónde está la caché")?;
-    Ok(PathBuf::from(home).join(".cache").join("cuba-memorys"))
+    let cache = PathBuf::from(home).join(".cache");
+    let preferred = cache.join("memory-industry");
+    let legacy = cache.join("cuba-memorys");
+    if preferred.exists() || !legacy.exists() {
+        Ok(preferred)
+    } else {
+        Ok(legacy)
+    }
 }
 
 pub async fn run_cli(args: &[String]) -> Result<()> {
@@ -69,14 +79,24 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             for m in ["embed", "nli", "reranker"] {
                 download_model(&spec(m).unwrap()).await?;
             }
+            println!(
+                "\nChat model (extract/judge) is separate — set it in one line:\n\
+                   memory-industry llm set ollama\n\
+                   memory-industry llm set deepseek --key YOUR_KEY\n\
+                   memory-industry llm list"
+            );
+        }
+        "llm" => {
+            // Discoverability: people already know `models all`.
+            crate::llm_cli::run_cli(&args[1..]).await?;
         }
         "" | "-h" | "--help" | "help" => {
             print_help();
         }
         other => {
             bail!(
-                "modelo desconocido `{other}`. Usá: embed | nli | reranker | runtime | all\n\
-                 (`cuba-memorys models help` para más detalle)"
+                "modelo desconocido `{other}`. Usá: embed | nli | reranker | runtime | all | llm\n\
+                 (`memory-industry models help` para más detalle)"
             );
         }
     }
@@ -85,22 +105,29 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
 
 fn print_help() {
     println!(
-        "cuba-memorys models <embed|nli|reranker|runtime|all>\n\n\
-         Descarga los modelos ONNX y el runtime a ~/.cache/cuba-memorys/, en cualquier\n\
-         sistema. cuba-memorys los encuentra ahí solo — no hace falta setear env vars.\n\n\
+        "memory-industry models <embed|nli|reranker|runtime|all|llm>\n\n\
+         Descarga los modelos ONNX y el runtime a ~/.cache/memory-industry/ (o la caché\n\
+         legado ~/.cache/cuba-memorys/ si ya existe), en cualquier sistema.\n\
+         memory-industry los encuentra ahí solo — no hace falta setear env vars.\n\n\
            embed      multilingual-e5-small (384-d) — búsqueda semántica. ~113 MB\n\
            nli        mDeBERTa-v3-xnli — verify sin LLM. ~1.1 GB\n\
-           reranker   bge-reranker-v2-m3 — reordena candidatos. ~1.1 GB\n\
+           reranker   bge-reranker-v2-m3 — reordena candidatos. ~4.5 GB (onnx + onnx_data)\n\
            runtime    libonnxruntime para tu plataforma. ~15 MB\n\
-           all        el runtime + los tres modelos\n\n\
-         Verificá con:  cuba-memorys doctor"
+           all        el runtime + los tres modelos\n\
+           llm        chat model for extract/judge — alias of `memory-industry llm`\n\n\
+         Chat (DeepSeek/Qwen/Ollama/…):  memory-industry llm set <provider> [--key KEY]\n\
+         Verificá con:  memory-industry doctor"
     );
 }
 
 const KNOWN_DIGESTS: &[(&str, &str)] = &[
     (
         "reranker/model.onnx",
-        "66f799551ae4406f27f7642969cb266805f1635bef010170d98c2b9ab3f94489",
+        "77f102be02885c81e5064485c5358e87721856d15ba750ae893480d39903a461",
+    ),
+    (
+        "reranker/model.onnx_data",
+        "c75282ab65d3f53c20a45f637fafbeb7f064cbd6b7c9df01bd8a32e41abe879b",
     ),
     (
         "reranker/tokenizer.json",
@@ -174,7 +201,7 @@ async fn download_model(spec: &ModelSpec) -> Result<()> {
         println!("{mb} MB");
     }
     println!(
-        "  listo. cuba-memorys lo encuentra en {} (o {}=<ruta>)",
+        "  listo. memory-industry lo encuentra en {} (o {}=<ruta>)",
         dir.display(),
         spec.env_hint
     );
@@ -266,7 +293,7 @@ async fn download_runtime(gpu: bool) -> Result<()> {
         println!("     {name}");
     }
     println!(
-        "  listo. cuba-memorys lo encuentra en {} (o ORT_DYLIB_PATH=<ruta>)",
+        "  listo. memory-industry lo encuentra en {} (o ORT_DYLIB_PATH=<ruta>)",
         lib_dest.display()
     );
     if gpu {
@@ -383,7 +410,7 @@ fn extract_runtime(
 
 async fn download_to(url: &str, dest: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
-        .user_agent(concat!("cuba-memorys/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("memory-industry/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let resp = client.get(url).send().await?.error_for_status()?;
     let expected = resp.content_length();

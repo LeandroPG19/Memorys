@@ -17,7 +17,7 @@ fn canonical_iso(t: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 async fn verify(pool: &sqlx::PgPool) -> serde_json::Value {
-    let envelope = cuba_memorys::handlers::dispatch(
+    let envelope = memory_industry::handlers::dispatch(
         pool,
         "cuba_archivo",
         serde_json::json!({"action": "verify", "limit": 1_000_000}),
@@ -31,7 +31,7 @@ async fn verify(pool: &sqlx::PgPool) -> serde_json::Value {
 }
 
 async fn append(pool: &sqlx::PgPool, action: &str, i: i32) {
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         pool,
         "cuba_archivo",
         serde_json::json!({"action": "append", "event_action": action, "payload": {"i": i}}),
@@ -48,9 +48,12 @@ async fn a_forged_sha256_row_appended_after_the_key_is_rejected_as_a_downgrade()
     let scratch_home = std::env::temp_dir().join(format!("cuba-downgrade-{}", std::process::id()));
     std::fs::create_dir_all(&scratch_home).expect("a scratch HOME keeps a real key file out");
     unsafe { std::env::set_var("HOME", &scratch_home) };
+    // Windows resolves the key via USERPROFILE when tests forget to override it;
+    // earlier gate phases would then HMAC every append under the operator's real key.
+    unsafe { std::env::set_var("USERPROFILE", &scratch_home) };
     unsafe { std::env::remove_var("CUBA_AUDIT_KEY") };
 
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let marker = format!("downgrade_{}", &uuid::Uuid::new_v4().to_string()[..8]);

@@ -46,7 +46,7 @@ async fn a_relation_pointing_nowhere_is_refused_before_the_database_is_touched()
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-valid-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&bundle).expect("a scratch bundle directory");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_sync_dir(&pool).await;
@@ -73,7 +73,7 @@ async fn a_relation_pointing_nowhere_is_refused_before_the_database_is_touched()
         }]),
     );
 
-    let refused = cuba_memorys::handlers::dispatch(
+    let refused = memory_industry::handlers::dispatch(
         &pool,
         "cuba_sync",
         json!({"action": "import", "dir": bundle.display().to_string()}),
@@ -114,7 +114,7 @@ async fn a_relation_pointing_nowhere_is_refused_before_the_database_is_touched()
 async fn the_closed_value_lists_match_what_the_database_actually_enforces() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 
@@ -122,17 +122,17 @@ async fn the_closed_value_lists_match_what_the_database_actually_enforces() {
         (
             "brain_observations",
             "observation_type",
-            cuba_memorys::handlers::sync::OBSERVATION_TYPES.to_vec(),
+            memory_industry::handlers::sync::OBSERVATION_TYPES.to_vec(),
         ),
         (
             "brain_observations",
             "source",
-            cuba_memorys::handlers::sync::OBSERVATION_SOURCES.to_vec(),
+            memory_industry::handlers::sync::OBSERVATION_SOURCES.to_vec(),
         ),
         (
             "brain_relations",
             "provenance",
-            cuba_memorys::handlers::sync::RELATION_PROVENANCES.to_vec(),
+            memory_industry::handlers::sync::RELATION_PROVENANCES.to_vec(),
         ),
     ] {
         let defs: Vec<String> = sqlx::query_scalar(

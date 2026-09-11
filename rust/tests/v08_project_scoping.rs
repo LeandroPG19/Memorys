@@ -11,11 +11,11 @@ async fn test_project_scoping_end_to_end() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
 
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("first init_schema");
     drop(pool);
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("second init_schema (idempotent)");
     println!("  ✓ project scoping migration is idempotent");
@@ -55,7 +55,7 @@ async fn test_project_scoping_end_to_end() {
     let project_a = unique("test_proj_a");
     let project_b = unique("test_proj_b");
 
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_jornada",
         json!({"action": "start", "name": "session-a", "project": project_a}),
@@ -64,14 +64,14 @@ async fn test_project_scoping_end_to_end() {
     .expect("start session A");
 
     let ent_a = unique("entity_a");
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_alma",
         json!({"action": "create", "name": ent_a, "entity_type": "concept"}),
     )
     .await
     .expect("alma create A");
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_cronica",
         json!({
@@ -83,7 +83,7 @@ async fn test_project_scoping_end_to_end() {
     )
     .await
     .expect("cronica add A");
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_alarma",
         json!({
@@ -95,7 +95,7 @@ async fn test_project_scoping_end_to_end() {
     .await
     .expect("alarma A");
 
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_jornada",
         json!({"action": "end", "outcome": "success", "summary": "A done"}),
@@ -103,7 +103,7 @@ async fn test_project_scoping_end_to_end() {
     .await
     .expect("end session A");
 
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_jornada",
         json!({"action": "start", "name": "session-b", "project": project_b}),
@@ -112,14 +112,14 @@ async fn test_project_scoping_end_to_end() {
     .expect("start session B");
 
     let ent_b = unique("entity_b");
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_alma",
         json!({"action": "create", "name": ent_b, "entity_type": "concept"}),
     )
     .await
     .expect("alma create B");
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_cronica",
         json!({
@@ -134,7 +134,7 @@ async fn test_project_scoping_end_to_end() {
 
     println!("  ✓ wrote entities/observations/errors under two projects");
 
-    let faro_b = cuba_memorys::handlers::dispatch(
+    let faro_b = memory_industry::handlers::dispatch(
         &pool,
         "cuba_faro",
         json!({"query": "Project A specific observation", "limit": 20}),
@@ -149,7 +149,7 @@ async fn test_project_scoping_end_to_end() {
     println!("  ✓ faro under project B does not leak project A content");
 
     let vigia_b =
-        cuba_memorys::handlers::dispatch(&pool, "cuba_vigia", json!({"metric": "summary"}))
+        memory_industry::handlers::dispatch(&pool, "cuba_vigia", json!({"metric": "summary"}))
             .await
             .expect("vigia summary B");
     let vigia_b_text = extract_content_text(&vigia_b);
@@ -159,14 +159,14 @@ async fn test_project_scoping_end_to_end() {
     );
     println!("  ✓ vigia summary is project_scoped under active project");
 
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_jornada",
         json!({"action": "end", "outcome": "success", "summary": "B done"}),
     )
     .await
     .expect("end session B");
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_jornada",
         json!({"action": "start", "name": "session-global"}),
@@ -174,7 +174,7 @@ async fn test_project_scoping_end_to_end() {
     .await
     .expect("start global session");
 
-    let faro_global = cuba_memorys::handlers::dispatch(
+    let faro_global = memory_industry::handlers::dispatch(
         &pool,
         "cuba_faro",
         json!({"query": ent_a.clone(), "limit": 20}),
@@ -192,16 +192,17 @@ async fn test_project_scoping_end_to_end() {
     );
     println!("  ✓ session without project sees rows from any project");
 
-    let list = cuba_memorys::handlers::dispatch(&pool, "cuba_proyecto", json!({"action": "list"}))
-        .await
-        .expect("proyecto list");
+    let list =
+        memory_industry::handlers::dispatch(&pool, "cuba_proyecto", json!({"action": "list"}))
+            .await
+            .expect("proyecto list");
     let list_text = extract_content_text(&list);
     assert!(
         list_text.contains(&project_a) && list_text.contains(&project_b),
         "proyecto list missing projects: {list_text}"
     );
 
-    let stats_a = cuba_memorys::handlers::dispatch(
+    let stats_a = memory_industry::handlers::dispatch(
         &pool,
         "cuba_proyecto",
         json!({"action": "stats", "name": project_a}),
@@ -218,7 +219,7 @@ async fn test_project_scoping_end_to_end() {
     unsafe {
         std::env::set_var("CUBA_PROJECT_FILTER", "off");
     }
-    let pid = cuba_memorys::project::current_project_id(&pool)
+    let pid = memory_industry::project::current_project_id(&pool)
         .await
         .expect("current_project_id with kill-switch");
     assert!(
@@ -230,7 +231,7 @@ async fn test_project_scoping_end_to_end() {
     }
     println!("  ✓ CUBA_PROJECT_FILTER=off disables scoping");
 
-    cuba_memorys::handlers::dispatch(
+    memory_industry::handlers::dispatch(
         &pool,
         "cuba_jornada",
         json!({"action": "end", "outcome": "success", "summary": "test cleanup"}),

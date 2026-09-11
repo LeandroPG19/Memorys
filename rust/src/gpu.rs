@@ -193,7 +193,14 @@ fn runtime_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;
-    Some(PathBuf::from(home).join(".cache/cuba-memorys/onnxruntime"))
+    let cache = PathBuf::from(home).join(".cache");
+    let preferred = cache.join("memory-industry").join("onnxruntime");
+    let legacy = cache.join("cuba-memorys").join("onnxruntime");
+    Some(if preferred.exists() || !legacy.exists() {
+        preferred
+    } else {
+        legacy
+    })
 }
 
 #[cfg(any(feature = "cuda", feature = "directml"))]

@@ -3,10 +3,13 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
-    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ingest");
 
     match action {
-        "ingest" => ingest(pool, &args).await,
+        "ingest" | "" => ingest(pool, &args).await,
         "parse" => parse(pool, &args).await,
         "auto_extract" => auto_extract(pool, &args).await,
         _ => anyhow::bail!("Invalid action: {action}. Use ingest/parse/auto_extract"),
@@ -49,6 +52,7 @@ async fn auto_extract(pool: &PgPool, args: &Value) -> Result<Value> {
                 "action": "auto_extract",
                 "extracted": 0,
                 "added": 0,
+                "relations_linked": 0,
                 "degraded": true,
                 "reason": match why {
                     NoExtraction::NoBackend => "no_backend",

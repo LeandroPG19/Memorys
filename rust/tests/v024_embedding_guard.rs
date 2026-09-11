@@ -22,14 +22,14 @@ async fn vectors_from_another_model_are_refused_instead_of_quietly_ruining_searc
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-emb-{}", Uuid::new_v4()));
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_sync_dir(&pool).await;
     std::fs::create_dir_all(bundle.join("entities")).expect("entities dir");
     unsafe { std::env::set_var("CUBA_SYNC_DIR", &bundle) };
 
-    let dim = cuba_memorys::embeddings::onnx::embedding_dim();
+    let dim = memory_industry::embeddings::onnx::embedding_dim();
     std::fs::write(
         bundle.join("manifest.json"),
         serde_json::to_vec_pretty(&json!({
@@ -47,11 +47,11 @@ async fn vectors_from_another_model_are_refused_instead_of_quietly_ruining_searc
     .expect("manifest");
     std::fs::write(
         bundle.join("embeddings.bin.zst"),
-        cuba_memorys::sync::compressor::compress(&vec![0u8; 16 + dim * 4]).expect("compress"),
+        memory_industry::sync::compressor::compress(&vec![0u8; 16 + dim * 4]).expect("compress"),
     )
     .expect("blob");
 
-    let refused = cuba_memorys::handlers::dispatch(
+    let refused = memory_industry::handlers::dispatch(
         &pool,
         "cuba_sync",
         json!({"action": "import", "dir": bundle.display().to_string()}),

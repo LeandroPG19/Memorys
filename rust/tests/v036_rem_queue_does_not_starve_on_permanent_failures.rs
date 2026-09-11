@@ -3,7 +3,7 @@ use uuid::Uuid;
 async fn pool() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database")
 }
@@ -68,7 +68,7 @@ async fn a_row_that_keeps_failing_sinks_behind_fresh_work_it_used_to_block() {
         .await
         .expect("simulating three prior consecutive failures");
 
-    let queue = cuba_memorys::handlers::ingesta::observations_awaiting_extraction(&pool, 5_000)
+    let queue = memory_industry::handlers::ingesta::observations_awaiting_extraction(&pool, 5_000)
         .await
         .expect("listing candidates");
 
@@ -111,8 +111,8 @@ async fn a_failed_extraction_attempt_is_recorded_on_the_row_it_failed_on() {
     )
     .await;
 
-    cuba_memorys::handlers::ingesta::mark_extraction_attempt_failed(&pool, obs_id).await;
-    cuba_memorys::handlers::ingesta::mark_extraction_attempt_failed(&pool, obs_id).await;
+    memory_industry::handlers::ingesta::mark_extraction_attempt_failed(&pool, obs_id).await;
+    memory_industry::handlers::ingesta::mark_extraction_attempt_failed(&pool, obs_id).await;
 
     let attempts: (i32,) =
         sqlx::query_as("SELECT extraction_attempts FROM brain_observations WHERE id = $1")
@@ -186,7 +186,7 @@ async fn an_entity_that_keeps_failing_its_relation_scan_sinks_behind_fresh_entit
         .await
         .expect("simulating three prior consecutive failures");
 
-    let queue = cuba_memorys::handlers::ingesta::entities_awaiting_relation_scan(&pool, 5_000)
+    let queue = memory_industry::handlers::ingesta::entities_awaiting_relation_scan(&pool, 5_000)
         .await
         .expect("listing candidates");
 
@@ -224,8 +224,8 @@ async fn a_failed_relation_scan_attempt_is_recorded_on_the_entity_it_failed_on()
         isolated_entity_awaiting_scan_created_at(&pool, &unique_name("ScanAttemptCounter"), None)
             .await;
 
-    cuba_memorys::handlers::ingesta::mark_relation_scan_attempt_failed(&pool, id).await;
-    cuba_memorys::handlers::ingesta::mark_relation_scan_attempt_failed(&pool, id).await;
+    memory_industry::handlers::ingesta::mark_relation_scan_attempt_failed(&pool, id).await;
+    memory_industry::handlers::ingesta::mark_relation_scan_attempt_failed(&pool, id).await;
 
     let attempts: (i32,) =
         sqlx::query_as("SELECT relation_scan_attempts FROM brain_entities WHERE id = $1")

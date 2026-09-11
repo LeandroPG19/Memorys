@@ -30,19 +30,19 @@ async fn own_the_sync_dir(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sqlx::Po
 async fn pool_a() -> sqlx::PgPool {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    cuba_memorys::db::create_pool(&url)
+    memory_industry::db::create_pool(&url)
         .await
         .expect("connect to node A")
 }
 
 async fn pool_b() -> sqlx::PgPool {
-    cuba_memorys::db::create_pool(&peer_pool_env())
+    memory_industry::db::create_pool(&peer_pool_env())
         .await
         .expect("connect to node B")
 }
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"]
@@ -488,7 +488,7 @@ async fn breaking_content_round_trips_or_fails_loudly_never_silently() {
     .await
     .expect("seed a 300-char-named entity");
 
-    let export_result = cuba_memorys::handlers::sync::handle(
+    let export_result = memory_industry::handlers::sync::handle(
         &a,
         json!({"action": "export", "scope": "all", "dir": bundle.display().to_string()}),
     )
@@ -673,7 +673,7 @@ async fn a_corrupted_bundle_file_leaves_the_database_untouched_and_unmarked() {
             .expect("count sync_state before"),
     );
 
-    let import_result = cuba_memorys::handlers::sync::handle(
+    let import_result = memory_industry::handlers::sync::handle(
         &b,
         json!({"action": "import", "dir": bundle.display().to_string(), "confirm": true}),
     )

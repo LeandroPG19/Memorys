@@ -38,7 +38,7 @@ pub fn extract_tunnel_url(line: &str) -> Option<String> {
 pub fn client_config(public_url: &str, token: &str) -> String {
     let body = serde_json::json!({
         "mcpServers": {
-            "cuba-memorys": {
+            "memory-industry": {
                 "type": "http",
                 "url": format!("{public_url}/mcp"),
                 "headers": {
@@ -76,12 +76,12 @@ fn refuse_unprotected_daemon(probe: Option<reqwest::StatusCode>, addr: &str) -> 
              Que este proceso tenga el token en su entorno no dice nada del daemon, que \
              puede haber arrancado en otra terminal.\n\n\
              Parálo y arrancalo con el token:\n\n  \
-             CUBA_HTTP_TOKEN=$CUBA_HTTP_TOKEN cuba-memorys serve {addr}\n"
+             CUBA_HTTP_TOKEN=$CUBA_HTTP_TOKEN memory-industry serve {addr}\n"
         )),
         None => Some(format!(
             "no hay daemon respondiendo en http://{addr}/mcp.\n\
              Arrancalo primero con el mismo token:\n\n  \
-             CUBA_HTTP_TOKEN=$CUBA_HTTP_TOKEN cuba-memorys serve {addr}\n"
+             CUBA_HTTP_TOKEN=$CUBA_HTTP_TOKEN memory-industry serve {addr}\n"
         )),
     }
 }
@@ -101,7 +101,7 @@ fn refuse_without_token(verdict: &TokenVerdict) -> Option<String> {
          escribe tu memoria.\n\n\
          Generá uno y arrancá el daemon con él:\n\n  \
          export CUBA_HTTP_TOKEN={}\n  \
-         cuba-memorys serve\n",
+         memory-industry serve\n",
         suggest_token()
     ))
 }
@@ -114,7 +114,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             "--addr" => addr = it.next().cloned().context("--addr needs an address")?,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys tunnel [--addr HOST:PORT]\n\n\
+                    "usage: memory-industry tunnel [--addr HOST:PORT]\n\n\
                      Publishes the running daemon through a Cloudflare quick tunnel and \
                      prints the client configuration to paste into Claude on the web.\n\n\
                      Requires CUBA_HTTP_TOKEN, because the daemon serves the whole graph \
@@ -167,6 +167,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     };
 
     println!("\n  túnel arriba: {public_url}");
+    println!("  Open:         {public_url}/connect");
     println!("  MCP endpoint: {public_url}/mcp\n");
     println!("  Configuración para el cliente:\n");
     println!("{}\n", client_config(&public_url, &token));
@@ -307,7 +308,8 @@ mod tests {
         let cfg = client_config("https://a-b-c.trycloudflare.com", "s3cret-token-value-here");
         let parsed: serde_json::Value = serde_json::from_str(&cfg).expect("valid JSON");
 
-        let server = &parsed["mcpServers"]["cuba-memorys"];
+        let server = &parsed["mcpServers"]["memory-industry"];
+        // Also accept legacy configs that still use "cuba-memorys" when reading elsewhere.
         assert_eq!(server["url"], "https://a-b-c.trycloudflare.com/mcp");
         assert_eq!(server["type"], "http");
         assert_eq!(

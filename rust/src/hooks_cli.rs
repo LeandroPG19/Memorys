@@ -154,12 +154,12 @@ fn remove_gitattributes_line(root: &Path) -> Result<bool> {
 
 fn git_config(root: &Path, key: &str, value: &str) -> Result<()> {
     let status = Command::new("git")
-        .args(["config", key, value])
+        .args(["config", "--local", key, value])
         .current_dir(root)
         .status()
-        .with_context(|| format!("running `git config {key}`"))?;
+        .with_context(|| format!("running `git config --local {key}`"))?;
     if !status.success() {
-        anyhow::bail!("git config {key} failed (exit {status})");
+        anyhow::bail!("git config --local {key} failed (exit {status})");
     }
     Ok(())
 }
@@ -804,8 +804,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn git_config_returns_err_when_the_git_process_exits_non_zero() {
-        use std::os::unix::fs::PermissionsExt;
-
+        // Do NOT rely on chmod 555 of `.git`: the merge gate often runs as root in WSL,
+        // and root bypasses directory mode bits, so that setup falsely stays green.
+        // Replacing `.git/config` with a directory makes `git config --local` exit
+        // non-zero even for uid 0.
         let dir = std::env::temp_dir().join(format!("cuba-git-config-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let init_status = Command::new("git")
@@ -815,20 +817,15 @@ mod tests {
             .unwrap();
         assert!(init_status.success());
 
-        let git_dir = dir.join(".git");
-        let mut perms = std::fs::metadata(&git_dir).unwrap().permissions();
-        perms.set_mode(0o555);
-        std::fs::set_permissions(&git_dir, perms).unwrap();
+        let config = dir.join(".git").join("config");
+        std::fs::remove_file(&config).unwrap();
+        std::fs::create_dir(&config).unwrap();
 
         let result = git_config(&dir, "merge.cuba-memorys-test.name", "irrelevant value");
 
-        let mut perms = std::fs::metadata(&git_dir).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&git_dir, perms).unwrap();
-
         assert!(
             result.is_err(),
-            "git config against a read-only .git dir must return Err, not be silently ignored"
+            "git config --local must return Err when git exits non-zero, got Ok"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

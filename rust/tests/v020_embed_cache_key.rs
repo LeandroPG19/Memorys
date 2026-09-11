@@ -1,10 +1,10 @@
 #[test]
 fn the_cache_key_changes_with_the_model_so_a_switch_cannot_serve_stale_vectors() {
     unsafe { std::env::set_var("CUBA_EMBED_MODEL", "bge-m3") };
-    let a = cuba_memorys::embeddings::onnx::model_fingerprint();
+    let a = memory_industry::embeddings::onnx::model_fingerprint();
 
     unsafe { std::env::set_var("CUBA_EMBED_MODEL", "e5-small") };
-    let b = cuba_memorys::embeddings::onnx::model_fingerprint();
+    let b = memory_industry::embeddings::onnx::model_fingerprint();
 
     assert_ne!(
         a, b,
@@ -14,7 +14,7 @@ fn the_cache_key_changes_with_the_model_so_a_switch_cannot_serve_stale_vectors()
     );
 
     unsafe { std::env::remove_var("CUBA_EMBED_MODEL") };
-    let fallback = cuba_memorys::embeddings::onnx::model_fingerprint();
+    let fallback = memory_industry::embeddings::onnx::model_fingerprint();
     assert!(
         !fallback.is_empty(),
         "an unset model must still produce a stable key component, not an empty one"

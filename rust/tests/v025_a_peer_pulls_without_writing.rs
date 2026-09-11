@@ -1,4 +1,4 @@
-use cuba_memorys::session::{Scope, with_scope};
+use memory_industry::session::{Scope, with_scope};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -18,7 +18,7 @@ async fn own_the_sync_dir(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sqlx::Po
 }
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"]
@@ -30,7 +30,7 @@ async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
 async fn pull_page(pool: &sqlx::PgPool, offset: u64) -> Value {
     let envelope = with_scope(
         Scope::Peer,
-        cuba_memorys::handlers::dispatch(
+        memory_industry::handlers::dispatch(
             pool,
             "cuba_sync",
             json!({"action": "pull", "offset": offset, "limit": 1, "with_embeddings": false}),
@@ -48,7 +48,7 @@ async fn a_peer_pull_writes_nothing_and_still_hands_over_the_whole_bundle() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-pl-{}", Uuid::new_v4()));
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_sync_dir(&pool).await;
@@ -176,7 +176,7 @@ async fn what_a_peer_pulls_is_a_bundle_the_import_accepts() {
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-pl2-{}", Uuid::new_v4()));
     let landed = bundle.join("from-peer");
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_sync_dir(&pool).await;

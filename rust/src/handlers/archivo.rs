@@ -27,7 +27,16 @@ pub fn audit_key() -> Option<Vec<u8>> {
     let path = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
-        .map(|h| std::path::PathBuf::from(h).join(".cache/cuba-memorys/audit_key"))?;
+        .map(|h| {
+            let cache = std::path::PathBuf::from(h).join(".cache");
+            let preferred = cache.join("memory-industry").join("audit_key");
+            let legacy = cache.join("cuba-memorys").join("audit_key");
+            if preferred.exists() || !legacy.exists() {
+                preferred
+            } else {
+                legacy
+            }
+        })?;
     let key = std::fs::read_to_string(path).ok()?;
     let key = key.trim();
     (!key.is_empty()).then(|| key.as_bytes().to_vec())

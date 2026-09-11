@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 
 const VERSION = require("../package.json").version;
-const REPO = "LeandroPG19/cuba-memorys";
+const REPO = "LeandroPG19/Memorys";
 const BIN_DIR = path.join(__dirname, ".bin");
 
 const PLATFORM_MAP = {
@@ -88,13 +88,13 @@ async function ensureBinary(log = (m) => process.stderr.write(m + "\n")) {
   const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${name}`;
   const tmp = dest + ".part";
 
-  log(`cuba-memorys: downloading ${VERSION} binary from ${url}`);
+  log(`memory-industry: downloading ${VERSION} binary from ${url}`);
   await download(url, tmp);
   fs.renameSync(tmp, dest);
   if (process.platform !== "win32") {
     fs.chmodSync(dest, 0o755);
   }
-  log(`cuba-memorys: binary installed to ${dest}`);
+  log(`memory-industry: binary installed to ${dest}`);
   return dest;
 }
 
@@ -102,12 +102,12 @@ module.exports = { ensureBinary, binPath, artifactName, download };
 
 if (require.main === module) {
   if (process.env.CUBA_MEMORYS_SKIP_INSTALL) {
-    console.log("cuba-memorys: skipping binary install (CUBA_MEMORYS_SKIP_INSTALL set)");
+    console.log("memory-industry: skipping binary install (CUBA_MEMORYS_SKIP_INSTALL set)");
     process.exit(0);
   }
   ensureBinary((m) => console.log(m)).catch((err) => {
-    console.warn(`cuba-memorys: postinstall could not fetch the binary — ${err.message}`);
-    console.warn("  It will be retried automatically the first time you run cuba-memorys.");
+    console.warn(`memory-industry: postinstall could not fetch the binary — ${err.message}`);
+    console.warn("  It will be retried automatically the first time you run memory-industry.");
     process.exit(0);
   });
 }

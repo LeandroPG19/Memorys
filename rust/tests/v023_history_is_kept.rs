@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"]
@@ -19,7 +19,7 @@ async fn an_overwriting_import_keeps_the_version_it_replaced() {
     let bundle = std::env::temp_dir().join(format!("cuba-hist-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&bundle).expect("a scratch bundle directory");
     unsafe { std::env::set_var("CUBA_SYNC_DIR", &bundle) };
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
 

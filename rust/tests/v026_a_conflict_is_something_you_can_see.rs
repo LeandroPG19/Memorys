@@ -17,7 +17,7 @@ async fn own_the_sync_dir(pool: &sqlx::PgPool) -> sqlx::Transaction<'_, sqlx::Po
 }
 
 async fn call(pool: &sqlx::PgPool, tool: &str, args: Value) -> Value {
-    let envelope = cuba_memorys::handlers::dispatch(pool, tool, args)
+    let envelope = memory_industry::handlers::dispatch(pool, tool, args)
         .await
         .unwrap_or_else(|e| panic!("{tool} failed: {e:#}"));
     let text = envelope["content"][0]["text"].as_str().expect("envelope");
@@ -92,7 +92,7 @@ async fn what_the_import_dropped_is_still_there_to_read_afterwards() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-cf-{}", Uuid::new_v4()));
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_sync_dir(&pool).await;
@@ -201,7 +201,7 @@ async fn keeping_theirs_takes_the_text_and_files_ours_instead_of_dropping_it() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let bundle = std::env::temp_dir().join(format!("cuba-cf2-{}", Uuid::new_v4()));
-    let pool = cuba_memorys::db::create_pool(&url)
+    let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
     let _owns = own_the_sync_dir(&pool).await;
@@ -218,7 +218,7 @@ async fn keeping_theirs_takes_the_text_and_files_ours_instead_of_dropping_it() {
         .bind(obs_id)
         .bind(pgvector::Vector::from(vec![
             0.1f32;
-            cuba_memorys::embeddings::onnx::embedding_dim()
+            memory_industry::embeddings::onnx::embedding_dim()
         ]))
         .execute(&pool)
         .await

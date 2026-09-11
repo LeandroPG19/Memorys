@@ -4,7 +4,27 @@ fn read(relative: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+        // Windows checkouts may store CRLF; doc scans match on `\n` / backticks.
+        .replace("\r\n", "\n")
+}
+
+/// Drop markdown fenced blocks so ```bash\n./scripts/foo.sh``` is not mistaken
+/// for an inline `` `bash\n./scripts/foo.sh` `` path when splitting on backticks.
+fn without_fenced_code(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("```") {
+        out.push_str(&rest[..start]);
+        rest = &rest[start + 3..];
+        match rest.find("```") {
+            Some(end) => rest = &rest[end + 3..],
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn number(word: &str) -> Option<usize> {
@@ -81,8 +101,8 @@ fn percents_claimed(text: &str) -> BTreeSet<u64> {
 
 #[test]
 fn every_tool_count_in_the_docs_is_one_the_code_can_produce() {
-    let full_tools = cuba_memorys::constants::tools_for("full");
-    let lean_tools = cuba_memorys::constants::tools_for("lean");
+    let full_tools = memory_industry::constants::tools_for("full");
+    let lean_tools = memory_industry::constants::tools_for("lean");
     let full = full_tools.len();
     let lean = lean_tools.len();
 
@@ -149,7 +169,7 @@ fn every_tool_count_in_the_docs_is_one_the_code_can_produce() {
 #[test]
 fn the_docs_do_not_promise_commands_the_binary_does_not_have() {
     let readme = read("README.md");
-    let known: BTreeSet<&str> = cuba_memorys::cli::COMMANDS.iter().copied().collect();
+    let known: BTreeSet<&str> = memory_industry::cli::COMMANDS.iter().copied().collect();
 
     let mut promised = BTreeSet::new();
     let mut inside_fence = false;
@@ -164,14 +184,16 @@ fn the_docs_do_not_promise_commands_the_binary_does_not_have() {
             line.split('`').skip(1).step_by(2).collect()
         };
         for span in spans {
-            for rest in span.split("cuba-memorys ").skip(1) {
-                let word = rest.split_whitespace().next().unwrap_or("");
-                if word.starts_with('-') {
-                    continue;
-                }
-                let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-                if !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
-                    promised.insert(word.to_string());
+            for prefix in ["cuba-memorys ", "memory-industry "] {
+                for rest in span.split(prefix).skip(1) {
+                    let word = rest.split_whitespace().next().unwrap_or("");
+                    if word.starts_with('-') {
+                        continue;
+                    }
+                    let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+                    if !word.is_empty() && word.chars().all(|c: char| c.is_ascii_lowercase() || c == '-') {
+                        promised.insert(word.to_string());
+                    }
                 }
             }
         }
@@ -253,7 +275,9 @@ fn env_names_read_in(body: &str) -> BTreeSet<String> {
 
     for line in body.lines() {
         for literal in line.split('"').skip(1).step_by(2) {
-            if literal.starts_with("CUBA_") && looks_like_an_env_name(literal) {
+            if (literal.starts_with("CUBA_") || literal.starts_with("MEMORY_INDUSTRY_"))
+                && looks_like_an_env_name(literal)
+            {
                 names.insert(literal.to_string());
             }
         }
@@ -585,11 +609,12 @@ fn every_repo_file_the_docs_point_at_is_a_file_that_exists() {
         "CONTRIBUTING.md",
         "rust/README.md",
     ] {
-        let text = read(source);
+        let text = without_fenced_code(&read(source));
         for span in text.split('`').skip(1).step_by(2) {
             let path = span.trim();
             let looks_like_a_repo_file = path.contains('/')
                 && !path.contains(' ')
+                && !path.contains('\n')
                 && !path.starts_with('/')
                 && !path.starts_with("http")
                 && !path.contains('$')

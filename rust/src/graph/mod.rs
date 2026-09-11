@@ -6,3 +6,4 @@ pub mod community;
 pub mod energy;
 pub mod kcore;
 pub mod pagerank;
+pub mod paths;
