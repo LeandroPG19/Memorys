@@ -114,9 +114,9 @@ pub fn ensure_within(root: &Path, candidate: &Path) -> Result<()> {
 /// `C:\...`. `Path::starts_with` treats those as different prefixes, so a path under
 /// the sync root looks like an escape. Strip the verbatim prefix before comparing.
 fn for_containment(path: &Path) -> PathBuf {
-    let raw = path.to_string_lossy();
     #[cfg(windows)]
     {
+        let raw = path.to_string_lossy();
         if let Some(rest) = raw.strip_prefix(r"\\?\") {
             if let Some(unc) = rest.strip_prefix("UNC\\") {
                 return PathBuf::from(format!(r"\\{unc}"));
