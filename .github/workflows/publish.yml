@@ -302,7 +302,7 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Publish to npm (memory-industry + cuba-memorys alias)
+      - name: Publish to npm (cuba-memorys alias + memory-industry)
         run: |
           set -euo pipefail
           VER=$(node -p "require('./package.json').version")
@@ -318,9 +318,14 @@ jobs:
             npm publish --access public
           }
           cp package.json package.json.publish-bak
-          publish_named memory-industry
-          cp package.json.publish-bak package.json
+          # Existing name first. A granular NPM_TOKEN scoped to cuba-memorys can
+          # update it. Creating memory-industry with that token comes back as
+          # npm's misleading E404 (permission denied, not "name missing").
           publish_named cuba-memorys
+          cp package.json.publish-bak package.json
+          if ! publish_named memory-industry; then
+            echo "::warning::NPM_TOKEN cannot create memory-industry (npm reports E404 when a granular token is not allowed to create new packages). Widen the token or create the package on npmjs.com, then re-run Publish. cuba-memorys@$VER was published."
+          fi
           mv package.json.publish-bak package.json
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

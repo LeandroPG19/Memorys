@@ -35,5 +35,11 @@
   },
   "engines": {
     "node": ">=18"
-  }
+  },
+  "files": [
+    "npm/**",
+    "README.md",
+    "LICENSE",
+    "server.json"
+  ]
 }

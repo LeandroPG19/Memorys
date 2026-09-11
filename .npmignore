@@ -29,6 +29,8 @@ mcp-publisher
 .gitmodules
 
 # Docs (keep README + LICENSE)
+scripts/
+*.publish-bak
 CONTRIBUTING.md
 Dockerfile
 docker-compose.yml
