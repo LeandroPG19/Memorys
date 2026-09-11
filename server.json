@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.LeandroPG19/memory-industry",
-  "description": "Persistent memory MCP server (MemoryIndustry). 31 tools, BM25+MMR+OOD retrieval, tamper-evident audit, code graph.",
+  "description": "MemoryIndustry persistent memory MCP server: BM25+MMR retrieval and audit.",
   "repository": {
     "url": "https://github.com/LeandroPG19/Memorys",
     "source": "github"

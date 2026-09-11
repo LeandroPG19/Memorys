@@ -141,6 +141,15 @@ fn every_file_that_holds_a_version_agrees() {
         "server.json ({srv_version}) vs Cargo.toml ({cargo}) — this is what the MCP Registry \
          publishes; stale here means the registry advertises the previous release"
     );
+    let srv_desc = srv["description"]
+        .as_str()
+        .expect("server.json has a description");
+    assert!(
+        srv_desc.chars().count() <= 100,
+        "MCP Registry rejects descriptions longer than 100 characters (422). \
+         server.json is {} chars",
+        srv_desc.chars().count()
+    );
 
     for p in srv["packages"]
         .as_array()
