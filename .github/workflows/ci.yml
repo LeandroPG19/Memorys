@@ -153,12 +153,11 @@ jobs:
           # MODEL_OR_CLI_ONLY hard-assert a model or CLI this runner does not have: no
           # ONNX embedding model (ONNX_MODEL_PATH is unset here), no NLI model, no
           # reranker model, no `claude` on PATH. scripts/run-all-tests.sh runs them
-          # locally behind run_if_present/`command -v claude`; this job has no such
-          # environment to run them against, so it excludes them instead of failing on
-          # every push. nli_entailment/nli_cost/nli_probe self-skip via
-          # nli::available() and are NOT in this list — they run here for free and
-          # print SKIPPED without failing.
-          MODEL_OR_CLI_ONLY=(v016_chunking v016_extract_without_sampling v017_relation_scan v017_rerank_gpu)
+          # locally behind require_present; this job has no such environment, so it
+          # excludes them instead of failing on every push. nli_entailment/nli_cost/
+          # nli_probe used to self-skip via nli::available(); they now hard-assert the
+          # model (the local merge gate forbids a soft skip), so they belong here.
+          MODEL_OR_CLI_ONLY=(v016_chunking v016_extract_without_sampling v017_relation_scan v017_rerank_gpu nli_entailment nli_cost nli_probe)
           # ROLE0 rewrites roles and the audit log under CUBA_APP_ROLE=0 and runs in
           # its own step below, outside the default-role discovery loop.
           ROLE0=(v020_audit_update_applies v020_role_separation)
