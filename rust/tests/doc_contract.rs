@@ -191,7 +191,11 @@ fn the_docs_do_not_promise_commands_the_binary_does_not_have() {
                         continue;
                     }
                     let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-                    if !word.is_empty() && word.chars().all(|c: char| c.is_ascii_lowercase() || c == '-') {
+                    if !word.is_empty()
+                        && word
+                            .chars()
+                            .all(|c: char| c.is_ascii_lowercase() || c == '-')
+                    {
                         promised.insert(word.to_string());
                     }
                 }
