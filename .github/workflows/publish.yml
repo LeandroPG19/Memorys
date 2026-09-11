@@ -266,7 +266,15 @@ jobs:
           before-script-linux: ${{ matrix.openssl_before_script }}
 
       - name: Alias the same binary as cuba-memorys
-        run: python -c "from pathlib import Path; p=Path('pyproject.toml'); t=p.read_text(); p.write_text(t.replace('name = \"memory-industry\"', 'name = \"cuba-memorys\"', 1))"
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("pyproject.toml")
+          text = path.read_text()
+          needle = 'name = "memory-industry"'
+          if needle not in text:
+              raise SystemExit(f"expected {needle} in pyproject.toml")
+          path.write_text(text.replace(needle, 'name = "cuba-memorys"', 1))
 
       - name: Build wheel (cuba-memorys alias)
         uses: PyO3/maturin-action@v1
