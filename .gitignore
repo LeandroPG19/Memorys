@@ -64,6 +64,7 @@ backups/
 # git will not un-ignore a file whose parent directory is ignored.
 docs/*
 !docs/gate.md
+!docs/despliegue-lan.md
 sandbox/
 *.jsonl.partial
 

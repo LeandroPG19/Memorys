@@ -157,6 +157,7 @@ fn six_pack_rules_are_versioned_and_not_gitignored() {
         "scripts/como-el-ci.sh",
         "scripts/validar-handoff.sh",
         "docs/gate.md",
+        "docs/despliegue-lan.md",
     ] {
         assert!(
             repo_root().join(rel).is_file(),
@@ -172,25 +173,34 @@ fn six_pack_rules_are_versioned_and_not_gitignored() {
         !ignores_rules,
         ".gitignore must not ignore .cursor/rules/ — that is why the six-pack never shipped"
     );
-    assert!(
-        gi.contains("!docs/gate.md"),
-        "docs/* is ignored; docs/gate.md must stay force-included"
-    );
+    for doc in ["!docs/gate.md", "!docs/despliegue-lan.md"] {
+        assert!(
+            gi.contains(doc),
+            "docs/* is ignored, so {doc} must stay force-included or the file is invisible to              git: it would sit in the tree, pass every test that reads it from disk, and never              reach a clone"
+        );
+    }
     assert!(
         !gi.lines().any(|l| l.trim() == "docs/"),
         "a trailing-slash `docs/` ignores the directory itself and makes !docs/gate.md a no-op"
     );
-    let addable = std::process::Command::new("git")
-        .args(["add", "-n", "--", "docs/gate.md"])
-        .current_dir(repo_root())
-        .output()
-        .expect("git add -n");
-    let stdout = String::from_utf8_lossy(&addable.stdout);
-    assert!(
-        addable.status.success() && stdout.contains("docs/gate.md"),
-        "docs/gate.md must be addable (docs/* + !docs/gate.md). git add -n said: {stdout} {}",
-        String::from_utf8_lossy(&addable.stderr)
-    );
+    // `git check-ignore`, not `git add -n`. The latter prints the path only
+    // while the file is still untracked, so the moment one of these docs got
+    // committed the assertion went quiet and stopped testing anything — which
+    // is precisely what happened to docs/gate.md. check-ignore answers the
+    // question we actually care about, in any tracked state: exit 1 means git
+    // does not ignore this path, so the force-include is doing its job.
+    for doc in ["docs/gate.md", "docs/despliegue-lan.md"] {
+        let ignored = std::process::Command::new("git")
+            .args(["check-ignore", "-q", "--", doc])
+            .current_dir(repo_root())
+            .status()
+            .expect("git check-ignore runs");
+        assert!(
+            !ignored.success(),
+            "git ignores {doc}. `docs/*` hides the whole directory, so without its own              `!docs/{}` line the file sits in the tree, passes every test that reads it from              disk, and never reaches a clone",
+            doc.trim_start_matches("docs/")
+        );
+    }
 }
 
 #[test]

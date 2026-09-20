@@ -653,3 +653,107 @@ fn every_repo_file_the_docs_point_at_is_a_file_that_exists() {
          fails for the person who types it"
     );
 }
+
+/// Files whose variables somebody must set to stand a daemon up: the HTTP
+/// surface, the GPU placement, the mode and the resource plan.
+///
+/// This is derived from where a variable is *read*, never from a hand-kept
+/// list, because a hand-kept list is exactly what drifts. That is not a
+/// hypothetical: a 0.25.0 deployment onto a GPU machine had to read `rust/src`
+/// to discover `CUBA_RERANK_DEVICE` and `CUBA_GPU_MEM_LIMIT_MB`, because the
+/// README documents them and `.env.example` — the file an operator actually
+/// copies — never mentioned them.
+const DEPLOYMENT_SURFACE_FILES: [&str; 4] = ["http.rs", "gpu.rs", "mode.rs", "resources.rs"];
+
+fn deployment_surface() -> BTreeSet<String> {
+    let excluded: BTreeMap<&str, &str> = NOT_A_KNOB_AN_OPERATOR_SETS.into_iter().collect();
+    env_names_the_code_reads()
+        .into_iter()
+        .filter(|(name, _)| !excluded.contains_key(name.as_str()))
+        .filter(|(_, files)| {
+            files
+                .iter()
+                .any(|f| DEPLOYMENT_SURFACE_FILES.contains(&f.as_str()))
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
+#[test]
+fn every_variable_on_the_deployment_surface_is_offered_in_env_example() {
+    let surface = deployment_surface();
+
+    // Anchor before absence: a scanner that found nothing would pass this test
+    // while proving nothing at all.
+    for anchor in ["CUBA_HTTP_TOKEN", "CUBA_GPU_MEM_LIMIT_MB"] {
+        assert!(
+            surface.contains(anchor),
+            "{anchor} is read on the deployment surface and the scan missed it, so it is the \
+             scan that is broken and not the file. Found: {surface:?}"
+        );
+    }
+
+    let offered = variables_offered_in_env_example();
+    let missing: Vec<&String> = surface.difference(&offered).collect();
+
+    assert!(
+        missing.is_empty(),
+        "these variables decide how the daemon binds, which device each model lands on and how \
+         much VRAM the arena may take, and `.env.example` does not offer them: {missing:?}. The \
+         README is not a substitute: it is 56 KB of reference and nobody opens it to start a \
+         service. Whoever installs this next will do what the last operator did — read the \
+         source — unless the file they copy lists the knob."
+    );
+}
+
+#[test]
+fn the_env_example_agrees_with_the_units_it_is_meant_to_feed() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crate sits under the repository root")
+        .join("packaging");
+
+    let mut set_by_units: BTreeSet<String> = BTreeSet::new();
+    let mut units_seen = 0usize;
+    for entry in std::fs::read_dir(&root)
+        .expect("packaging/ is readable")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "service") {
+            continue;
+        }
+        units_seen += 1;
+        for line in std::fs::read_to_string(&path).expect("readable").lines() {
+            if let Some(assignment) = line.trim().strip_prefix("Environment=")
+                && let Some(name) = assignment.split('=').next()
+                && looks_like_an_env_name(name)
+            {
+                set_by_units.insert(name.to_string());
+            }
+        }
+    }
+
+    assert!(
+        units_seen > 0 && set_by_units.len() >= 10,
+        "the parser read {units_seen} unit file(s) and found {} Environment= names. packaging/ \
+         ships a unit that sets more than a dozen, so a green result here would mean the parser \
+         stopped working, not that the files agree",
+        set_by_units.len()
+    );
+
+    let offered = variables_offered_in_env_example();
+    let excluded: BTreeMap<&str, &str> = NOT_A_KNOB_AN_OPERATOR_SETS.into_iter().collect();
+    let missing: Vec<&String> = set_by_units
+        .difference(&offered)
+        .filter(|name| !excluded.contains_key(name.as_str()))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "packaging/ pins these variables and `.env.example` never mentions them: {missing:?}. \
+         Two deployment artifacts that disagree are worse than one: the unit silently wins on \
+         Linux while the operator edits a file that has no effect, and on Windows — where there \
+         is no unit — the value simply never gets set."
+    );
+}
