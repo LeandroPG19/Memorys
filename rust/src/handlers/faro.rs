@@ -244,11 +244,45 @@ struct SearchOpts<'a> {
     include_unscoped: bool,
 }
 
+/// What actually happened to a search that asked to be reranked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankOutcome {
+    /// Nobody asked, or there was nothing to reorder.
+    NotRequested,
+    /// The cross-encoder scored the candidates and its scores were used.
+    Applied,
+    /// No model on disk, so the ranking came back exactly as RRF left it.
+    NoModel,
+    /// A model is there and the batch failed.
+    Failed,
+    /// A model is there and the batch ran past its budget.
+    TimedOut,
+}
+
+/// Why a caller should not read this ranking as reranked. `None` means it was.
+///
+/// The reasons are deliberately different sentences: two root causes producing
+/// one message is the bug `v032_reranker_says_why_its_off` exists to catch.
+fn reranker_degraded_reason(outcome: RerankOutcome) -> Option<&'static str> {
+    match outcome {
+        RerankOutcome::NotRequested | RerankOutcome::Applied => None,
+        RerankOutcome::NoModel => Some(
+            "Pediste rerank y no hay modelo cross-encoder en esta máquina: estos resultados              salen en el orden de RRF, sin reordenar. No falló nada — nunca se instaló.              Instalalo con `memory-industry models reranker`, o mirá el check «reranker» de              `doctor` si creías que ya estaba.",
+        ),
+        RerankOutcome::TimedOut => Some(
+            "Pediste rerank y el cross-encoder no terminó dentro de su presupuesto: estos              resultados vienen SIN reordenar. Subí CUBA_RERANK_TIMEOUT_SECS, o bajá              CUBA_RERANK_CHUNK, o mirá si está corriendo en CPU (check «gpu» de `doctor`),              donde un lote cuesta 60-110 s.",
+        ),
+        RerankOutcome::Failed => Some(
+            "Pediste rerank y el cross-encoder falló: estos resultados vienen SIN reordenar,              tal cual los dejó RRF. Se pagó el tiempo de inferencia y no se aplicó nada.              Mirá los logs (nivel ERROR) para la causa.",
+        ),
+    }
+}
+
 fn annotate_degradation(
     response: &mut Value,
     vector_failure: Option<&str>,
     bm25_failed: bool,
-    reranker_failed: bool,
+    rerank_outcome: RerankOutcome,
 ) {
     if let Some(reason) = vector_failure {
         let reason = crate::redact::redact_secrets(reason);
@@ -265,13 +299,9 @@ fn annotate_degradation(
              consulta con términos raros pierde recall. Mirá los logs (nivel ERROR)."
         );
     }
-    if reranker_failed {
+    if let Some(reason) = reranker_degraded_reason(rerank_outcome) {
         response["reranker_degraded"] = serde_json::json!(true);
-        response["reranker_degraded_reason"] = serde_json::json!(
-            "Pediste rerank y el cross-encoder falló: estos resultados vienen SIN reordenar, \
-             tal cual los dejó RRF. Se pagó el tiempo de inferencia y no se aplicó nada. \
-             Mirá los logs (nivel ERROR) para la causa."
-        );
+        response["reranker_degraded_reason"] = serde_json::json!(reason);
     }
 }
 
@@ -545,7 +575,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
     };
     results.truncate(pool_size);
 
-    let mut reranker_failed = false;
+    let mut rerank_outcome = RerankOutcome::NotRequested;
     if opts.enable_rerank && results.len() > 1 {
         let contents: Vec<&str> = results
             .iter()
@@ -579,11 +609,20 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
                     secs = rerank_budget.as_secs(),
                     "reranker excedió su presupuesto — se devuelve el ranking RRF"
                 );
+                rerank_outcome = RerankOutcome::TimedOut;
                 Err(anyhow::anyhow!("reranker timeout"))
             }
         };
         match rerank_result {
             Ok(reranked) => {
+                // `rerank()` answers with identity scores when there is no
+                // model, so this branch is reached either way. Without saying
+                // which, the caller reads an untouched RRF ranking as reranked.
+                rerank_outcome = if have_model {
+                    RerankOutcome::Applied
+                } else {
+                    RerankOutcome::NoModel
+                };
                 let original = results.clone();
                 results = reranked
                     .into_iter()
@@ -605,7 +644,9 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
                      cargó y se gastó el tiempo de inferencia, pero sus scores se \
                      descartaron: los resultados son los de RRF."
                 );
-                reranker_failed = true;
+                if rerank_outcome != RerankOutcome::TimedOut {
+                    rerank_outcome = RerankOutcome::Failed;
+                }
             }
         }
     }
@@ -890,7 +931,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
         &mut response,
         vector_failure.as_deref(),
         bm25_failed,
-        reranker_failed,
+        rerank_outcome,
     );
 
     Ok(response)
@@ -2027,9 +2068,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_rerank_that_had_no_model_is_degraded_too_and_says_something_else() {
+        let no_model = reranker_degraded_reason(RerankOutcome::NoModel)
+            .expect(
+                "asking for rerank:true on a machine with no cross-encoder returns the RRF                  order untouched, and used to say nothing at all: identity scores travel back                  through the Ok branch, so `reranker_failed` stayed false and the caller read                  a plain ranking as a reranked one",
+            );
+        let failed = reranker_degraded_reason(RerankOutcome::Failed).expect("still degraded");
+
+        assert_ne!(
+            no_model, failed,
+            "one sentence for two root causes is the bug v032_reranker_says_why_its_off              exists to catch: an operator who installs the model and still sees the same              words has no way to tell whether anything changed"
+        );
+        assert!(
+            no_model.contains("modelo"),
+            "the reason has to name what is missing so it can be fixed: {no_model}"
+        );
+
+        assert_eq!(reranker_degraded_reason(RerankOutcome::Applied), None);
+        assert_eq!(reranker_degraded_reason(RerankOutcome::NotRequested), None);
+
+        // Every degraded cause gets its own words, and each names the action
+        // that fixes it: install the model, raise the budget, read the logs.
+        let reasons: Vec<&str> = [
+            RerankOutcome::NoModel,
+            RerankOutcome::TimedOut,
+            RerankOutcome::Failed,
+        ]
+        .into_iter()
+        .filter_map(reranker_degraded_reason)
+        .collect();
+        let unique: std::collections::BTreeSet<&&str> = reasons.iter().collect();
+        assert_eq!(
+            unique.len(),
+            reasons.len(),
+            "two degraded causes share a sentence: {reasons:?}"
+        );
+        assert!(
+            reranker_degraded_reason(RerankOutcome::TimedOut)
+                .is_some_and(|r| r.contains("CUBA_RERANK_TIMEOUT_SECS")),
+            "a budget that ran out is fixed by a different knob than a broken model, and the              message is the only place that says which"
+        );
+    }
+
+    #[test]
     fn every_branch_that_silently_degrades_says_so_in_the_response() {
         let mut clean = serde_json::json!({"results": []});
-        annotate_degradation(&mut clean, None, false, false);
+        annotate_degradation(&mut clean, None, false, RerankOutcome::NotRequested);
         assert_eq!(
             clean,
             serde_json::json!({"results": []}),
@@ -2037,9 +2121,14 @@ mod tests {
         );
 
         for (vector, bm25, rerank, key) in [
-            (Some("no model loaded"), false, false, "degraded"),
-            (None, true, false, "bm25_degraded"),
-            (None, false, true, "reranker_degraded"),
+            (
+                Some("no model loaded"),
+                false,
+                RerankOutcome::NotRequested,
+                "degraded",
+            ),
+            (None, true, RerankOutcome::NotRequested, "bm25_degraded"),
+            (None, false, RerankOutcome::Failed, "reranker_degraded"),
         ] {
             let mut response = serde_json::json!({"results": []});
             annotate_degradation(&mut response, vector, bm25, rerank);
