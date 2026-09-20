@@ -184,6 +184,21 @@ pub fn gpu_cap_with_floor(explicit: Option<u64>, planned: u64, floor: u64) -> (u
     }
 }
 
+/// Candidates per forward pass.
+///
+/// Pure, so the table of four cases is checkable without building a Machine -
+/// and reachable by `cargo mutants`, which only drives the library.
+fn rerank_chunk_for(reranker: bool, on_gpu: bool, wide_batch_fits: bool) -> usize {
+    match (reranker, on_gpu, wide_batch_fits) {
+        // Nothing will rerank, so the number is inert.
+        (false, _, _) => MAX_RERANK_CHUNK,
+        // On CPU the batch is small because each pair costs real time, not VRAM.
+        (true, false, _) => CPU_RERANK_CHUNK,
+        (true, true, true) => MAX_RERANK_CHUNK,
+        (true, true, false) => NARROW_GPU_RERANK_CHUNK,
+    }
+}
+
 pub fn plan(m: &Machine) -> Plan {
     let budget_mb = m.budget_mb();
     let vram_free_mb = m.vram_free_mb.unwrap_or(0);
@@ -223,15 +238,7 @@ pub fn plan(m: &Machine) -> Plan {
         half_cores.min(MAX_RERANK_INTRA_THREADS)
     };
 
-    let rerank_chunk = if !reranker {
-        MAX_RERANK_CHUNK
-    } else if !reranker_on_gpu {
-        CPU_RERANK_CHUNK
-    } else if fits_on_gpu(MAX_RERANK_CHUNK) {
-        MAX_RERANK_CHUNK
-    } else {
-        NARROW_GPU_RERANK_CHUNK
-    };
+    let rerank_chunk = rerank_chunk_for(reranker, reranker_on_gpu, fits_on_gpu(MAX_RERANK_CHUNK));
 
     // The cap is the whole free budget minus the reserve. It used to be
     // `DEFAULT_GPU_MEM_LIMIT_MB.min(...)`, i.e. 2048 MiB on every machine no
@@ -636,6 +643,30 @@ mod tests {
             emitted(&roomy, "CUBA_RERANK_DEVICE"),
             Some("gpu"),
             "it has to speak in both directions, or a machine that can use its card depends on              a default rather than on the measurement"
+        );
+    }
+
+    #[test]
+    fn the_batch_size_follows_the_placement_not_the_other_way_round() {
+        // (will rerank, on the card, the wide batch fits) -> candidates per pass
+        let cases = [
+            (false, false, false, MAX_RERANK_CHUNK),
+            (false, true, true, MAX_RERANK_CHUNK),
+            (true, false, false, CPU_RERANK_CHUNK),
+            (true, false, true, CPU_RERANK_CHUNK),
+            (true, true, false, NARROW_GPU_RERANK_CHUNK),
+            (true, true, true, MAX_RERANK_CHUNK),
+        ];
+        for (reranker, on_gpu, wide_fits, expected) in cases {
+            assert_eq!(
+                rerank_chunk_for(reranker, on_gpu, wide_fits),
+                expected,
+                "reranker={reranker} on_gpu={on_gpu} wide_fits={wide_fits}"
+            );
+        }
+        assert_ne!(
+            CPU_RERANK_CHUNK, NARROW_GPU_RERANK_CHUNK,
+            "the CPU batch is small because each pair costs time; the narrow GPU batch is              small because each pair costs VRAM. If these ever became the same number this              table would stop distinguishing the two reasons"
         );
     }
 

@@ -86,34 +86,34 @@ pub fn cpu_reason(wants_gpu: bool, runtime_gpu: bool, device_present: bool) -> O
     None
 }
 
-pub fn configure(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {
-    #[cfg(any(feature = "cuda", feature = "directml"))]
-    let (runtime_gpu, device_present) = {
-        let provider = if cfg!(feature = "cuda") {
-            "cuda"
-        } else {
-            "directml"
-        };
-        (
-            runtime_has_gpu_provider(provider),
-            provider != "cuda" || nvidia_present(),
-        )
+/// Whether the provider libraries and a device are actually there.
+///
+/// Split out of `configure` so the cfg walls live in one place: with them
+/// inline, the function that decides placement had a different shape per
+/// feature set and nothing about the decision was readable in either.
+#[cfg(any(feature = "cuda", feature = "directml"))]
+fn gpu_availability() -> (bool, bool) {
+    let provider = if cfg!(feature = "cuda") {
+        "cuda"
+    } else {
+        "directml"
     };
-    #[cfg(not(any(feature = "cuda", feature = "directml")))]
-    let (runtime_gpu, device_present) = (false, false);
+    (
+        runtime_has_gpu_provider(provider),
+        provider != "cuda" || nvidia_present(),
+    )
+}
+
+#[cfg(not(any(feature = "cuda", feature = "directml")))]
+fn gpu_availability() -> (bool, bool) {
+    (false, false)
+}
+
+pub fn configure(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {
+    let (runtime_gpu, device_present) = gpu_availability();
 
     if let Some(reason) = cpu_reason(wants_gpu(workload), runtime_gpu, device_present) {
-        // Wanting a GPU and not having one is worth saying once. It is not an
-        // error: these machines have to keep working, which is why the check
-        // happens here and not by letting the provider registration fail.
-        if !matches!(reason, CpuReason::NotAskedFor) {
-            tracing::warn!(
-                model = workload.label(),
-                reason = ?reason,
-                "se pidió GPU para este modelo y no está disponible — sigue en CPU"
-            );
-        }
-        return configure_cpu(builder, workload);
+        return fall_back_to_cpu(builder, workload, reason);
     }
 
     let providers: Vec<ort::ep::ExecutionProviderDispatch> = [
@@ -137,6 +137,25 @@ pub fn configure(builder: SessionBuilder, workload: Workload) -> Result<SessionB
     // quietly fallen back to the CPU underneath it.
     tracing::info!(model = workload.label(), "sesión ONNX en GPU");
     Ok(configured)
+}
+
+/// Wanting a GPU and not having one is worth saying once. It is not an error:
+/// these machines have to keep working, which is the whole reason the
+/// precondition is checked here instead of by letting the provider
+/// registration fail.
+fn fall_back_to_cpu(
+    builder: SessionBuilder,
+    workload: Workload,
+    reason: CpuReason,
+) -> Result<SessionBuilder> {
+    if !matches!(reason, CpuReason::NotAskedFor) {
+        tracing::warn!(
+            model = workload.label(),
+            reason = ?reason,
+            "se pidió GPU para este modelo y no está disponible — sigue en CPU"
+        );
+    }
+    configure_cpu(builder, workload)
 }
 
 fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {

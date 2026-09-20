@@ -153,15 +153,22 @@ pub fn resolved_model_dir() -> Option<PathBuf> {
 pub fn model_weights_mb() -> Option<u64> {
     let dir = resolved_model_dir()?;
     let model = model_file_in(&dir)?;
-    let mut bytes = std::fs::metadata(&model).ok()?.len();
-
+    let graph = std::fs::metadata(&model).ok()?.len();
     let name = model.file_name()?.to_string_lossy().into_owned();
-    for spelling in [format!("{name}_data"), format!("{name}.data")] {
-        if let Ok(meta) = std::fs::metadata(dir.join(spelling)) {
-            bytes += meta.len();
-        }
-    }
-    Some(bytes / (1024 * 1024))
+    Some((graph + external_data_bytes(&dir, &name)) / (1024 * 1024))
+}
+
+/// Weights kept beside the graph rather than inside it. ORT accepts both
+/// spellings and neither is required to exist.
+fn external_data_bytes(dir: &std::path::Path, model_file_name: &str) -> u64 {
+    [
+        format!("{model_file_name}_data"),
+        format!("{model_file_name}.data"),
+    ]
+    .iter()
+    .filter_map(|name| std::fs::metadata(dir.join(name)).ok())
+    .map(|meta| meta.len())
+    .sum()
 }
 
 /// The file `init_session` would open, in the order it would try them.

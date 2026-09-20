@@ -11,11 +11,23 @@ echo "NO CORRE: ./scripts/merge-gate.sh"
 echo "SIL: ./scripts/merge-gate.sh  (alias: ./scripts/como-el-ci.sh todo)"
 echo "HAY scripts/merge-gate.sh — este script NO lo sustituye."
 
-diff=$(git diff --name-only HEAD 2>/dev/null || true)
-[[ -n "$diff" ]] || diff=$(git diff --name-only --cached 2>/dev/null || true)
+# QG_BASE lets this judge a branch. Without it the diff is whatever is still
+# uncommitted, so running it after committing the work it was meant to judge
+# printed "SIN DIFF" and exited 0 - a clean pass over nothing at all, which
+# reads exactly like a real one in a log.
+base="${QG_BASE:-}"
+if [[ -n "$base" ]]; then
+  git rev-parse --verify --quiet "$base" >/dev/null || { echo "FAIL: QG_BASE=$base is not a ref" >&2; exit 2; }
+  diff=$(git diff --name-only "$base...HEAD" 2>/dev/null || true)
+  echo "base: $base"
+else
+  diff=$(git diff --name-only HEAD 2>/dev/null || true)
+  [[ -n "$diff" ]] || diff=$(git diff --name-only --cached 2>/dev/null || true)
+fi
 echo "diff: $diff"
 if [[ -z "$diff" ]]; then
-  echo "SIN DIFF: no hay archivos tocados en HEAD/index. No se afirma cobertura del cambio."
+  echo "SIN DIFF: no hay archivos tocados. No se afirma NADA sobre ningun cambio."
+  echo "         Para juzgar una rama ya commiteada: QG_BASE=main $0"
 fi
 
 fail=0
@@ -36,12 +48,19 @@ run_lizard() {
   local cwd="$1"
   shift
   if [[ "$#" -eq 0 ]]; then return 0; fi
+  # `|| true` plus no threshold meant lizard's exit code carried no
+  # information and the CRAP gate was a line of printed text. -C is the
+  # ceiling that makes it an exit code. This only ever looks at files in the
+  # diff, so it fails a new function that is too tangled rather than asking
+  # anybody to rewrite the tree.
+  local cc_max="${LIZARD_CC_MAX:-8}"
   if command -v lizard >/dev/null; then
-    (cd "$cwd" && lizard "$@") || true
+    (cd "$cwd" && lizard -C "$cc_max" -L 80 -a 6 "$@") || return 1
     return 0
   fi
   if command -v python >/dev/null; then
-    (cd "$cwd" && python -m lizard "$@") && return 0
+    (cd "$cwd" && python -m lizard -C "$cc_max" -L 80 -a 6 "$@") && return 0
+    return 1
   fi
   echo "FALTA lizard (CRAP/cc). Puerta CRAP 6; CC <= 4 orienta."
   return 2

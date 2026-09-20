@@ -263,6 +263,22 @@ pub enum RerankOutcome {
 ///
 /// The reasons are deliberately different sentences: two root causes producing
 /// one message is the bug `v032_reranker_says_why_its_off` exists to catch.
+/// What the search should report, from the three facts the rerank path knows.
+///
+/// Pure, so the four outcomes are a table a unit test can walk and
+/// `cargo mutants` can reach - it only drives the library, never a handler.
+fn rerank_outcome_of(applied: bool, have_model: bool, timed_out: bool) -> RerankOutcome {
+    match (applied, have_model, timed_out) {
+        // `rerank()` answers with identity scores when there is no model, so
+        // the success path is reached either way. Without telling them apart,
+        // a caller reads an untouched RRF ranking as a reranked one.
+        (true, true, _) => RerankOutcome::Applied,
+        (true, false, _) => RerankOutcome::NoModel,
+        (false, _, true) => RerankOutcome::TimedOut,
+        (false, _, false) => RerankOutcome::Failed,
+    }
+}
+
 fn reranker_degraded_reason(outcome: RerankOutcome) -> Option<&'static str> {
     match outcome {
         RerankOutcome::NotRequested | RerankOutcome::Applied => None,
@@ -597,6 +613,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(20),
         );
+        let mut timed_out = false;
         let rerank_result = match tokio::time::timeout(
             rerank_budget,
             crate::search::rerank::rerank(query, &contents),
@@ -609,20 +626,13 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
                     secs = rerank_budget.as_secs(),
                     "reranker excedió su presupuesto — se devuelve el ranking RRF"
                 );
-                rerank_outcome = RerankOutcome::TimedOut;
+                timed_out = true;
                 Err(anyhow::anyhow!("reranker timeout"))
             }
         };
+        rerank_outcome = rerank_outcome_of(rerank_result.is_ok(), have_model, timed_out);
         match rerank_result {
             Ok(reranked) => {
-                // `rerank()` answers with identity scores when there is no
-                // model, so this branch is reached either way. Without saying
-                // which, the caller reads an untouched RRF ranking as reranked.
-                rerank_outcome = if have_model {
-                    RerankOutcome::Applied
-                } else {
-                    RerankOutcome::NoModel
-                };
                 let original = results.clone();
                 results = reranked
                     .into_iter()
@@ -644,9 +654,6 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
                      cargó y se gastó el tiempo de inferencia, pero sus scores se \
                      descartaron: los resultados son los de RRF."
                 );
-                if rerank_outcome != RerankOutcome::TimedOut {
-                    rerank_outcome = RerankOutcome::Failed;
-                }
             }
         }
     }
@@ -2066,6 +2073,30 @@ async fn check_ood(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_outcome_of_a_rerank_is_decided_by_all_three_facts() {
+        // (the call returned Ok, a model was loaded, the budget expired)
+        let cases = [
+            (true, true, false, RerankOutcome::Applied),
+            (true, false, false, RerankOutcome::NoModel),
+            (false, true, true, RerankOutcome::TimedOut),
+            (false, true, false, RerankOutcome::Failed),
+            (false, false, true, RerankOutcome::TimedOut),
+        ];
+        for (applied, have_model, timed_out, expected) in cases {
+            assert_eq!(
+                rerank_outcome_of(applied, have_model, timed_out),
+                expected,
+                "applied={applied} have_model={have_model} timed_out={timed_out}"
+            );
+        }
+        assert_eq!(
+            rerank_outcome_of(true, false, false),
+            RerankOutcome::NoModel,
+            "a success with no model behind it is the case the old boolean could not              express, and the one that let an untouched ranking read as reranked"
+        );
+    }
 
     #[test]
     fn a_rerank_that_had_no_model_is_degraded_too_and_says_something_else() {
