@@ -123,6 +123,29 @@ pub fn resolved_model_dir() -> Option<PathBuf> {
     }
 }
 
+/// Megabytes ONNX Runtime will have to place on the device, read from disk
+/// without opening a session.
+///
+/// `model.onnx` is often only the graph: measured on a 2026-09 install it is
+/// 614 KB against a sibling `model.onnx_data` of 4,23 GiB. Sizing a VRAM
+/// budget from the `.onnx` alone is wrong by three orders of magnitude, so the
+/// external-data file is part of the measurement. And the answer legitimately
+/// differs per machine — an FP16 export of the same model is about 1,7 GiB —
+/// which is exactly why this is measured instead of written down as a constant.
+pub fn model_weights_mb() -> Option<u64> {
+    let dir = resolved_model_dir()?;
+    let model = model_file_in(&dir)?;
+    let mut bytes = std::fs::metadata(&model).ok()?.len();
+
+    let name = model.file_name()?.to_string_lossy().into_owned();
+    for spelling in [format!("{name}_data"), format!("{name}.data")] {
+        if let Ok(meta) = std::fs::metadata(dir.join(spelling)) {
+            bytes += meta.len();
+        }
+    }
+    Some(bytes / (1024 * 1024))
+}
+
 /// The file `init_session` would open, in the order it would try them.
 fn model_file_in(dir: &std::path::Path) -> Option<PathBuf> {
     ["model_quantized.onnx", "model.onnx"]
@@ -560,6 +583,30 @@ mod tests {
                 "is_configured with CUBA_RERANKER_PATH={env:?} — this and the loader read the                  same rule now, so they cannot answer differently about the same machine"
             );
         }
+    }
+
+    #[test]
+    fn the_plan_sizes_the_file_the_session_will_actually_open() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = FakeHome::with_a_model_in_the_cache("weights");
+
+        let dir = home.root.join("weighed");
+        std::fs::create_dir_all(&dir).expect("writable");
+        // A decoy the loader would never open, deliberately the largest file.
+        std::fs::write(dir.join("model.onnx"), vec![0u8; 5 * 1024 * 1024]).expect("writable");
+        std::fs::write(dir.join("model_quantized.onnx"), vec![0u8; 1024 * 1024]).expect("writable");
+        std::fs::write(
+            dir.join("model_quantized.onnx_data"),
+            vec![0u8; 2 * 1024 * 1024],
+        )
+        .expect("writable");
+
+        unsafe { std::env::set_var("CUBA_RERANKER_PATH", &dir) };
+        assert_eq!(
+            model_weights_mb(),
+            Some(3),
+            "the weight of a reranker is the file init_session would open plus its external              data, never whatever .onnx happens to be biggest. A real install has 614 KB of              graph next to 4,23 GiB of model.onnx_data: reading only the graph under-counts by              three orders of magnitude, and picking the wrong candidate counts a model that              will never be loaded"
+        );
     }
 
     #[test]

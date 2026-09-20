@@ -7,9 +7,27 @@ const BASE_MB: u64 = 220;
 const EMBEDDER_MB: u64 = 900;
 const RERANKER_MB: u64 = 1100;
 const NLI_MB: u64 = 1100;
-const RERANKER_VRAM_MB: u64 = 1600;
-const RERANKER_VRAM_WIDE_MB: u64 = 3000;
 const GPU_VRAM_RESERVE_MB: u64 = 512;
+
+/// Activation memory one (query, candidate) pair costs on the device.
+/// Measured, not guessed: the README reports the same model at
+/// `CUBA_RERANK_CHUNK` 16 using 2938 MiB and at 4 using 2364 MiB — 574 MiB
+/// across 12 extra pairs. Under fixed shapes every batch pads to 512 tokens,
+/// so the cost per pair does not depend on how long the candidates are.
+const ACTIVATION_MB_PER_PAIR: u64 = 48;
+
+/// What a CUDA session holds before it computes anything: the context, the
+/// cuDNN handles and their workspaces. From the same table — the fused FP16
+/// reranker adds 1034,7 MiB on top of a 1460 MiB total, leaving ~425 MiB that
+/// is not the model. Rounded up: running out of this is a crash, while
+/// over-reserving it only costs an admission we could have granted.
+const CUDA_CONTEXT_MB: u64 = 448;
+
+/// Weights do not map 1:1 — ORT copies initializers to the device while it
+/// builds the fused graph. Cross-check on the shipped FP16: 2364 MiB total,
+/// minus 425 of context and 191 of activations, leaves 1748 MiB of weights
+/// against 1,65 GB on disk, about 103%. 110 carries the margin.
+const WEIGHT_DEVICE_EXPANSION_PCT: u64 = 110;
 
 const MAX_EMBED_INTRA_THREADS: usize = 4;
 const MAX_RERANK_INTRA_THREADS: usize = 8;
@@ -26,7 +44,6 @@ const MAX_DB_CONNECTIONS: u32 = 4;
 const MIN_DB_CONNECTIONS: u32 = 2;
 const MAX_OOD_FIT_LIMIT: i64 = 5000;
 const MIN_OOD_FIT_LIMIT: i64 = 500;
-const DEFAULT_GPU_MEM_LIMIT_MB: u64 = 2048;
 
 const OOD_BYTES_PER_SAMPLE: u64 = 1024 * 8 * 2;
 const OOD_BUDGET_DIVISOR: u64 = 20;
@@ -42,6 +59,9 @@ pub struct Machine {
     pub cores_logical: usize,
     pub cores_physical: usize,
     pub vram_free_mb: Option<u64>,
+    /// What the reranker on this disk actually weighs. `None` means we could
+    /// not weigh it, and we do not place a model we cannot size.
+    pub reranker_weights_mb: Option<u64>,
 }
 
 impl Machine {
@@ -130,6 +150,16 @@ impl Plan {
     }
 }
 
+/// Device footprint of the reranker at a given batch size.
+///
+/// This is an admission test, not a budget: it answers "does this model fit on
+/// this card", never "how big should the arena cap be".
+pub fn reranker_vram_required_mb(weights_mb: u64, chunk: usize) -> u64 {
+    weights_mb * WEIGHT_DEVICE_EXPANSION_PCT / 100
+        + CUDA_CONTEXT_MB
+        + ACTIVATION_MB_PER_PAIR * chunk as u64
+}
+
 pub fn plan(m: &Machine) -> Plan {
     let budget_mb = m.budget_mb();
     let vram_free_mb = m.vram_free_mb.unwrap_or(0);
@@ -137,7 +167,14 @@ pub fn plan(m: &Machine) -> Plan {
     let embedder = budget_mb >= BASE_MB + EMBEDDER_MB;
     let mut committed_mb = BASE_MB + if embedder { EMBEDDER_MB } else { 0 };
 
-    let reranker_on_gpu = vram_free_mb >= RERANKER_VRAM_MB;
+    let vram_ceiling_mb = vram_free_mb.saturating_sub(GPU_VRAM_RESERVE_MB);
+    // No measurement, no placement: we do not size a card for a model we could
+    // not weigh.
+    let fits_on_gpu = |chunk: usize| {
+        m.reranker_weights_mb
+            .is_some_and(|w| reranker_vram_required_mb(w, chunk) <= vram_ceiling_mb)
+    };
+    let reranker_on_gpu = fits_on_gpu(NARROW_GPU_RERANK_CHUNK);
     let reranker = embedder && budget_mb >= committed_mb + RERANKER_MB;
     if reranker {
         committed_mb += RERANKER_MB;
@@ -166,14 +203,17 @@ pub fn plan(m: &Machine) -> Plan {
         MAX_RERANK_CHUNK
     } else if !reranker_on_gpu {
         CPU_RERANK_CHUNK
-    } else if vram_free_mb >= RERANKER_VRAM_WIDE_MB {
+    } else if fits_on_gpu(MAX_RERANK_CHUNK) {
         MAX_RERANK_CHUNK
     } else {
         NARROW_GPU_RERANK_CHUNK
     };
 
-    let gpu_mem_limit_mb = (reranker && reranker_on_gpu)
-        .then(|| DEFAULT_GPU_MEM_LIMIT_MB.min(vram_free_mb.saturating_sub(GPU_VRAM_RESERVE_MB)));
+    // The cap is the whole free budget minus the reserve. It used to be
+    // `DEFAULT_GPU_MEM_LIMIT_MB.min(...)`, i.e. 2048 MiB on every machine no
+    // matter how large the card, and the cross-encoder does not fit in 2048 —
+    // so every GPU install failed until somebody raised the variable by hand.
+    let gpu_mem_limit_mb = (reranker && reranker_on_gpu).then_some(vram_ceiling_mb);
 
     let ood_fit_limit = ((budget_mb * MIB / OOD_BUDGET_DIVISOR) / OOD_BYTES_PER_SAMPLE)
         .min(MAX_OOD_FIT_LIMIT as u64) as i64;
@@ -270,6 +310,7 @@ pub fn probe() -> Machine {
         cores_logical,
         cores_physical,
         vram_free_mb: vram_free_mb(),
+        reranker_weights_mb: crate::search::rerank::model_weights_mb(),
     }
 }
 
@@ -332,6 +373,12 @@ pub fn db_max_connections() -> u32 {
 mod tests {
     use super::*;
 
+    /// The FP16 export this repo ships, as weighed on disk. Fixtures carry it
+    /// so the arithmetic in these tests is the arithmetic a real machine does;
+    /// an FP32 export of the same model is nearer 4,2 GiB, which is the whole
+    /// reason the plan measures instead of assuming.
+    const SHIPPED_FP16_WEIGHTS_MB: u64 = 1750;
+
     fn laptop_4gb_no_gpu() -> Machine {
         Machine {
             ram_total_mb: 3900,
@@ -341,6 +388,7 @@ mod tests {
             cores_logical: 4,
             cores_physical: 2,
             vram_free_mb: None,
+            reranker_weights_mb: Some(SHIPPED_FP16_WEIGHTS_MB),
         }
     }
 
@@ -353,6 +401,7 @@ mod tests {
             cores_logical: 8,
             cores_physical: 4,
             vram_free_mb: None,
+            reranker_weights_mb: Some(SHIPPED_FP16_WEIGHTS_MB),
         }
     }
 
@@ -365,6 +414,7 @@ mod tests {
             cores_logical: 12,
             cores_physical: 6,
             vram_free_mb: Some(5900),
+            reranker_weights_mb: Some(SHIPPED_FP16_WEIGHTS_MB),
         }
     }
 
@@ -377,6 +427,7 @@ mod tests {
             cores_logical: 32,
             cores_physical: 16,
             vram_free_mb: None,
+            reranker_weights_mb: Some(SHIPPED_FP16_WEIGHTS_MB),
         }
     }
 
@@ -389,6 +440,7 @@ mod tests {
             cores_logical: 8,
             cores_physical: 4,
             vram_free_mb: Some(2100),
+            reranker_weights_mb: Some(SHIPPED_FP16_WEIGHTS_MB),
         }
     }
 
@@ -450,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_with_room_for_everything_reproduces_todays_hardcoded_values() {
+    fn a_machine_with_room_for_everything_gets_every_ceiling_its_card_allows() {
         let p = plan(&desktop_16gb_with_gpu());
 
         assert_eq!(p.tier, Tier::Full, "{}", p.describe());
@@ -458,10 +510,79 @@ mod tests {
         assert_eq!(p.rerank_intra_threads, GPU_RERANK_INTRA_THREADS);
         assert_eq!(p.nli_intra_threads, 4);
         assert_eq!(p.rerank_chunk, MAX_RERANK_CHUNK);
-        assert_eq!(p.gpu_mem_limit_mb, Some(DEFAULT_GPU_MEM_LIMIT_MB));
+        assert_eq!(
+            p.gpu_mem_limit_mb,
+            Some(5900 - GPU_VRAM_RESERVE_MB),
+            "the cap follows the card. It used to be pinned at 2048 MiB here and on every              other machine, which is the defect this number replaces"
+        );
         assert_eq!(p.worker_threads, MAX_WORKER_THREADS);
         assert_eq!(p.db_max_connections, MAX_DB_CONNECTIONS);
         assert_eq!(p.ood_fit_limit, MAX_OOD_FIT_LIMIT);
+    }
+
+    #[test]
+    fn a_bigger_card_raises_the_ceiling_instead_of_hitting_a_constant() {
+        let mut small = desktop_16gb_with_gpu();
+        small.vram_free_mb = Some(4000);
+        let mut big = desktop_16gb_with_gpu();
+        big.vram_free_mb = Some(9000);
+
+        let small_cap = plan(&small)
+            .gpu_mem_limit_mb
+            .expect("4 GB of free VRAM holds this reranker");
+        let big_cap = plan(&big)
+            .gpu_mem_limit_mb
+            .expect("9 GB of free VRAM holds this reranker");
+
+        assert!(
+            big_cap > small_cap,
+            "the same plan gave a 9 GB card and a 4 GB card the same {small_cap} MiB arena.              The cap was DEFAULT_GPU_MEM_LIMIT_MB.min(free - reserve), so it could never              exceed 2048 MiB on any machine no matter how large the card — which is why every              GPU install failed to load the cross-encoder until somebody raised the variable              by hand"
+        );
+        assert_eq!(
+            big_cap,
+            9000 - GPU_VRAM_RESERVE_MB,
+            "the cap is the free VRAM minus the reserve. With SameAsRequested the arena only              grows by what a call asks for, so capping it lower saves nothing and just turns a              working card into BFCArena::AllocateRawInternal"
+        );
+    }
+
+    #[test]
+    fn the_admission_test_is_checked_at_its_exact_boundary() {
+        // 1000 MiB of weights need 1000*110/100 + 448 + 48*8 = 1932 MiB at the
+        // narrow batch, so a 2444 MiB card clears it by exactly nothing.
+        let required = reranker_vram_required_mb(1000, NARROW_GPU_RERANK_CHUNK);
+        assert_eq!(
+            required, 1932,
+            "the arithmetic this boundary is built on moved"
+        );
+
+        let mut exact = desktop_16gb_with_gpu();
+        exact.reranker_weights_mb = Some(1000);
+        exact.vram_free_mb = Some(required + GPU_VRAM_RESERVE_MB);
+        assert!(
+            plan(&exact).reranker_on_gpu,
+            "a card with exactly the required headroom is admitted: the test is <=, not <"
+        );
+
+        let mut one_short = exact;
+        one_short.vram_free_mb = Some(required + GPU_VRAM_RESERVE_MB - 1);
+        assert!(
+            !plan(&one_short).reranker_on_gpu,
+            "one mebibyte short is short. This pair exists so a mutant that flips <= to < or              drops the reserve cannot survive"
+        );
+    }
+
+    #[test]
+    fn a_machine_whose_reranker_cannot_be_measured_is_not_placed_on_the_gpu() {
+        let mut unweighable = desktop_16gb_with_gpu();
+        unweighable.reranker_weights_mb = None;
+        unweighable.vram_free_mb = Some(24000);
+
+        let p = plan(&unweighable);
+        assert!(
+            !p.reranker_on_gpu && p.gpu_mem_limit_mb.is_none(),
+            "24 GB of VRAM is not a reason to place a model we could not weigh: {}",
+            p.describe()
+        );
     }
 
     #[test]
@@ -476,8 +597,15 @@ mod tests {
             assert!(p.max_blocking_threads <= MAX_BLOCKING_THREADS, "{name}");
             assert!(p.db_max_connections <= MAX_DB_CONNECTIONS, "{name}");
             assert!(p.ood_fit_limit <= MAX_OOD_FIT_LIMIT, "{name}");
+            // The cap is bounded by the card, not by a constant. Asserting it
+            // against DEFAULT_GPU_MEM_LIMIT_MB was the defect written down as
+            // an invariant: it passed precisely because the plan could never
+            // offer a large card more than 2048 MiB.
             assert!(
-                p.gpu_mem_limit_mb.unwrap_or(0) <= DEFAULT_GPU_MEM_LIMIT_MB,
+                p.gpu_mem_limit_mb.unwrap_or(0)
+                    <= m.vram_free_mb
+                        .unwrap_or(0)
+                        .saturating_sub(GPU_VRAM_RESERVE_MB),
                 "{name}"
             );
         }
@@ -536,18 +664,28 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_gpu_keeps_the_reranker_but_halves_its_batch() {
-        let p = plan(&workstation_8gb_narrow_gpu());
+    fn a_card_that_cannot_hold_the_weights_goes_to_cpu_not_to_a_smaller_batch() {
+        let m = workstation_8gb_narrow_gpu();
+        let p = plan(&m);
 
-        assert!(p.reranker_on_gpu, "{}", p.describe());
-        assert_eq!(
-            p.rerank_chunk, NARROW_GPU_RERANK_CHUNK,
-            "las activaciones escalan con chunk × tokens; con 2,1 GiB libres la tanda entera \
-             no entra y partirla es lo que evita el fallo de asignación"
-        );
+        // 2100 MiB free leaves a 1588 MiB ceiling. Even the narrow batch needs
+        // 1750*110/100 + 448 + 48*8 = 2757 MiB, so nothing fits.
+        //
+        // This test used to assert the opposite: that the reranker stayed on
+        // the card and halved its batch. That premise was wrong for this model.
+        // The weights alone do not fit, so splitting the batch saves nothing
+        // and the allocation fails partway through a load instead of cleanly.
         assert!(
-            p.gpu_mem_limit_mb.unwrap() < DEFAULT_GPU_MEM_LIMIT_MB,
-            "la arena no puede pedir más VRAM de la que hay libre"
+            !p.reranker_on_gpu,
+            "{} - {} MiB of weights cannot go on a card with {} MiB of headroom",
+            p.describe(),
+            m.reranker_weights_mb.unwrap_or(0),
+            2100 - GPU_VRAM_RESERVE_MB
+        );
+        assert_eq!(p.rerank_chunk, CPU_RERANK_CHUNK);
+        assert_eq!(
+            p.gpu_mem_limit_mb, None,
+            "no cap is published for a model that is not going on the card"
         );
     }
 
