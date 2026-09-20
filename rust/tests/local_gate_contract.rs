@@ -317,3 +317,54 @@ fn comments_stay_plant_rules_are_not_copied() {
         );
     }
 }
+
+/// The guard that could not fail.
+///
+/// `codigo-muerto.sh` printed "OK every #[ignore] integration file is covered"
+/// over every commit for months while being structurally incapable of
+/// returning anything else: `has_discovery` was always 1, so every file hit an
+/// empty `if` body and `continue`d before reaching the counter.
+///
+/// Reading the script's text would not have caught that, and would not catch
+/// the next version of it either. This runs the script against fixtures built
+/// to break each of its guards, and the script reports whether they broke.
+#[test]
+fn codigo_muerto_can_actually_fail() {
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/codigo-muerto.sh", "--self-test"])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "codigo-muerto.sh --self-test did not pass, so at least one of its guards no longer          fails when it should. stdout: {stdout}
+stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("every guard in this script failed against a fixture built to break it"),
+        "the self-test exited 0 without saying it ran. An exit code alone is what let the          original guard pass while doing nothing. stdout: {stdout}"
+    );
+}
+
+/// On Windows the `bash` on PATH is WSL's, and it cannot translate a `D:\...`
+/// working directory — it prints "Failed to translate" and exits without ever
+/// reading the script. The gate itself is documented as running under Git
+/// Bash for exactly this reason, so a test that shells out has to resolve the
+/// same interpreter rather than trust PATH.
+fn git_bash() -> std::path::PathBuf {
+    if cfg!(windows) {
+        for candidate in [
+            "C:/Program Files/Git/bin/bash.exe",
+            "C:/Program Files (x86)/Git/bin/bash.exe",
+        ] {
+            let path = std::path::PathBuf::from(candidate);
+            if path.is_file() {
+                return path;
+            }
+        }
+    }
+    std::path::PathBuf::from("bash")
+}
