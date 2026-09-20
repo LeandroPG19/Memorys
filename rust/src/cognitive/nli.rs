@@ -136,7 +136,7 @@ fn init(dir: &std::path::Path) -> Result<()> {
     // A factory, not a builder: if the GPU provider refuses to start we
     // need a second, clean builder for the CPU path.
     let make_builder = || {
-        Ok(Session::builder()
+        Session::builder()
             .map_err(|e| anyhow::anyhow!("session builder: {e}"))?
             .with_intra_threads(intra_threads())
             .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?
@@ -145,7 +145,7 @@ fn init(dir: &std::path::Path) -> Result<()> {
             .with_intra_op_spinning(false)
             .map_err(|e| anyhow::anyhow!("intra-op spinning: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?)
+            .map_err(|e| anyhow::anyhow!("optimization level: {e}"))
     };
     let session = crate::gpu::configure(make_builder, crate::gpu::Workload::Nli)?
         .commit_from_file(&model_file)
