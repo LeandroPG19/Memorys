@@ -711,7 +711,9 @@ async fn mcp_endpoint(State(state): State<AppState>, headers: HeaderMap, body: B
         }
     };
 
-    let (key, declared) = client_key(&headers, &payload);
+    let (label, declared) = client_key(&headers, &payload);
+    let mcp_sid = mcp_session_id(&headers);
+    let key = crate::session::bind_key(&label, mcp_sid.as_deref());
     if let Ok(mut guard) = state.seen.write() {
         guard.insert(key.clone(), Instant::now());
     }
@@ -730,7 +732,7 @@ async fn mcp_endpoint(State(state): State<AppState>, headers: HeaderMap, body: B
     let mut carried_roots = false;
     for item in &items {
         if let Some(uri) = first_root_uri(item) {
-            adopt_client_root(&state.pool, &key, uri).await;
+            adopt_client_root(&state.pool, &label, uri).await;
             carried_roots = true;
         }
     }
@@ -745,7 +747,9 @@ async fn mcp_endpoint(State(state): State<AppState>, headers: HeaderMap, body: B
         let mut responses: Vec<Value> = Vec::with_capacity(items.len());
         for item in items {
             state.served.fetch_add(1, Ordering::Relaxed);
-            if let Some(reply) = dispatch_one(&state, &key, declared, scope, item).await {
+            if let Some(reply) =
+                dispatch_one(&state, &label, mcp_sid.clone(), declared, scope, item).await
+            {
                 responses.push(reply);
             }
         }
@@ -787,9 +791,26 @@ async fn mcp_endpoint(State(state): State<AppState>, headers: HeaderMap, body: B
     }
 }
 
+fn mcp_session_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Bind task-local identity when the client declared itself *or* sent a
+/// protocol session. `&&` here would drop Mcp-Client-Id-only Cursor chats
+/// (no Mcp-Session-Id) into the anonymous pool and clobber every other chat.
+fn should_bind_identity(declared: bool, mcp_session: Option<&str>) -> bool {
+    declared || mcp_session.is_some()
+}
+
 async fn dispatch_one(
     state: &AppState,
-    key: &str,
+    label: &str,
+    mcp_sid: Option<String>,
     declared: bool,
     scope: Scope,
     item: Value,
@@ -847,10 +868,12 @@ async fn dispatch_one(
         crate::session::with_scope(scope, protocol::handle_request(&pool, request)).await
     };
     let work = async {
-        let rooted =
-            crate::session::with_root_project(crate::session::client_root_project_for(key), served);
-        if declared {
-            crate::session::with_client(key.to_string(), rooted).await
+        let rooted = crate::session::with_root_project(
+            crate::session::client_root_project_for(label),
+            served,
+        );
+        if should_bind_identity(declared, mcp_sid.as_deref()) {
+            crate::session::with_identity(label.to_string(), mcp_sid, rooted).await
         } else {
             rooted.await
         }
@@ -864,7 +887,7 @@ async fn dispatch_one(
                 .map(|s| (*s).to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
-            tracing::error!(client = %key, method = %method, detail = %detail, "handler panicked");
+            tracing::error!(client = %label, method = %method, detail = %detail, "handler panicked");
             Err(anyhow::anyhow!("handler panicked: {detail}"))
         }
     };
@@ -880,7 +903,7 @@ async fn dispatch_one(
         Ok(v) => serde_json::json!({ "jsonrpc": "2.0", "id": req_id, "result": v }),
         Err(e) => {
             let chain = format!("{e:#}");
-            tracing::error!(client = %key, method = %method, error = %chain, "handler failed");
+            tracing::error!(client = %label, method = %method, error = %chain, "handler failed");
             error_envelope(req_id, -32603, chain)
         }
     })
@@ -1020,6 +1043,41 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&bytes).expect("JSON initialize body");
         assert_eq!(parsed["id"], 1);
         assert!(parsed.get("result").is_some(), "{parsed}");
+    }
+
+    #[test]
+    fn a_protocol_session_splits_two_chats_of_the_same_window() {
+        let payload = serde_json::json!({
+            "params": { "clientInfo": { "name": "cursor" } }
+        });
+        let mut headers = headers_with("mcp-client-id", "cursor");
+        headers.insert(
+            "mcp-session-id",
+            axum::http::HeaderValue::from_static("chat-a"),
+        );
+        assert_eq!(
+            crate::session::bind_key("cursor", mcp_session_id(&headers).as_deref()),
+            "cursor::chat-a"
+        );
+        let _ = payload;
+    }
+
+    #[test]
+    fn a_declared_client_binds_even_without_a_protocol_session() {
+        assert!(
+            should_bind_identity(true, None),
+            "Mcp-Client-Id alone must bind — Cursor chats often omit Mcp-Session-Id; \
+             replacing || with && would dump them into the anonymous pool"
+        );
+        assert!(
+            should_bind_identity(false, Some("chat-a")),
+            "a protocol session alone must bind even when the client id was invented"
+        );
+        assert!(
+            !should_bind_identity(false, None),
+            "anonymous requests stay unbound"
+        );
+        assert!(should_bind_identity(true, Some("chat-a")));
     }
 
     #[test]

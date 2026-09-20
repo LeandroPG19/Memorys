@@ -1,6 +1,6 @@
 {
   "name": "memory-industry",
-  "version": "0.25.0",
+  "version": "0.26.0",
   "mcpName": "io.github.LeandroPG19/memory-industry",
   "description": "Persistent memory MCP server (MemoryIndustry) \u2014 self-growing knowledge graph that works without MCP sampling, poisoning quarantine, PostgreSQL + pgvector, bitemporal facts, BM25+RRF hybrid search, graph metrics/communities, Hebbian learning, episodic memory, audit log, project scoping, tree-sitter codegraph.",
   "license": "Apache-2.0",

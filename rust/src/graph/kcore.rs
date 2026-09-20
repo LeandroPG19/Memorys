@@ -62,7 +62,7 @@ async fn fetch_adjacency(pool: &PgPool) -> Result<HashMap<Uuid, Vec<Uuid>>> {
     let project_id = crate::project::current_project_id(pool).await?;
     let edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "SELECT from_entity, to_entity FROM brain_relations
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+         WHERE ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_all(pool)

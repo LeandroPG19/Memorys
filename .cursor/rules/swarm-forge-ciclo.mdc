@@ -1,0 +1,14 @@
+---
+description: Ciclo Swarm Forge de 6 roles — el humano mira métricas, no cada línea
+alwaysApply: true
+---
+
+# Ciclo six-pack
+
+Todo cambio de comportamiento pasa, en orden: **especificador → implementador → mejorador → arquitecto → endurecedor → qa**. Cerrar sin specifier está prohibido.
+
+El ingeniero supervisa **resultados agregados** (merge-gate, quality-gate, CRAP, mutantes, handoffs), no cada línea.
+
+Artefactos del specifier: Gherkin (comportamiento) + procedimiento QA de tool MCP / CLI / HTTP. Sin eso no hay handoff al coder.
+
+No copiar roles de planta (guardian-planta, Playwright, React Query). Este repo no tiene UI.

@@ -57,6 +57,11 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let include_unscoped = args
+        .get("include_unscoped")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let before = args.get("before").and_then(|v| v.as_str());
     let after = args.get("after").and_then(|v| v.as_str());
     let time_bounds = parse_time_bounds(before, after)?;
@@ -114,6 +119,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         enable_rerank,
         track_access,
         associative,
+        include_unscoped,
     };
 
     let mut response = match mode {
@@ -235,6 +241,7 @@ struct SearchOpts<'a> {
     enable_rerank: bool,
     track_access: bool,
     associative: bool,
+    include_unscoped: bool,
 }
 
 fn annotate_degradation(
@@ -287,51 +294,58 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
         opts.limit * 2,
         &opts.time_bounds,
         opts.project_id,
+        opts.include_unscoped,
     )
     .await?;
 
     if let Some(tag) = opts.tag_filter {
-        let tagged_obs: Vec<(uuid::Uuid, String, String, String, f64, f64)> = sqlx::query_as(
-            "SELECT o.id, e.name, o.content, o.observation_type, o.importance::float8,
+        if scope != "all" && scope != "observations" {
+            // A tag is an observation filter. Applying it under scope=errors
+            // used to dump observations into a result set that claimed to be errors.
+        } else {
+            let tagged_obs: Vec<(uuid::Uuid, String, String, String, f64, f64)> = sqlx::query_as(
+                "SELECT o.id, e.name, o.content, o.observation_type, o.importance::float8,
                     (o.importance::float8 * 0.8 + 0.2)::float8 AS score
              FROM brain_observations o
              JOIN brain_entities e ON o.entity_id = e.id
              WHERE $1 = ANY(o.tags)
                AND o.observation_type != 'superseded'
                AND o.trust = 'trusted'
-               AND ($3::uuid IS NULL OR o.project_id = $3 OR o.project_id IS NULL)
+               AND ($3::uuid IS NULL OR o.project_id = $3 OR ($4::bool AND o.project_id IS NULL))
              ORDER BY o.importance DESC
              LIMIT $2",
-        )
-        .bind(tag)
-        .bind(opts.limit)
-        .bind(opts.project_id)
-        .fetch_all(pool)
-        .await
-        .with_context(|| {
-            format!(
-                "looking up observations tagged {tag:?}. Failing loud instead of returning \
+            )
+            .bind(tag)
+            .bind(opts.limit)
+            .bind(opts.project_id)
+            .bind(opts.include_unscoped)
+            .fetch_all(pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "looking up observations tagged {tag:?}. Failing loud instead of returning \
                  the untagged ranking: those results would be presented as if the tag had \
                  been applied and simply matched nothing."
-            )
-        })?;
+                )
+            })?;
 
-        for (id, entity_name, content, obs_type, importance, score) in tagged_obs {
-            let id_str = id.to_string();
-            if !text_results
-                .iter()
-                .any(|r| r.get("id").and_then(|v| v.as_str()) == Some(&id_str))
-            {
-                text_results.push(serde_json::json!({
-                    "id": id_str,
-                    "type": "observation",
-                    "entity_name": entity_name,
-                    "content": content,
-                    "observation_type": obs_type,
-                    "importance": importance,
-                    "score": score,
-                    "matched_tag": tag
-                }));
+            for (id, entity_name, content, obs_type, importance, score) in tagged_obs {
+                let id_str = id.to_string();
+                if !text_results
+                    .iter()
+                    .any(|r| r.get("id").and_then(|v| v.as_str()) == Some(&id_str))
+                {
+                    text_results.push(serde_json::json!({
+                        "id": id_str,
+                        "type": "observation",
+                        "entity_name": entity_name,
+                        "content": content,
+                        "observation_type": obs_type,
+                        "importance": importance,
+                        "score": score,
+                        "matched_tag": tag
+                    }));
+                }
             }
         }
     }
@@ -343,6 +357,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
         opts.limit * 2,
         &opts.time_bounds,
         opts.project_id,
+        opts.include_unscoped,
     )
     .await;
 
@@ -414,6 +429,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
             scope,
             opts.limit * 2,
             opts.project_id,
+            opts.include_unscoped,
         )
         .await
         {
@@ -942,7 +958,7 @@ async fn entity_factoid_observations(
          WHERE e.name = ANY($2)
            AND o.observation_type != 'superseded'
            AND o.trust = 'trusted'
-           AND ($4::uuid IS NULL OR o.project_id = $4 OR o.project_id IS NULL)
+           AND ($4::uuid IS NULL OR o.project_id = $4)
          ORDER BY score DESC
          LIMIT $3",
     )
@@ -1102,7 +1118,7 @@ async fn verify_claim(pool: &PgPool, claim: &str, project_id: Option<uuid::Uuid>
          WHERE similarity(o.content, $1) > 0.3
            AND o.observation_type != 'superseded'
                AND o.trust = 'trusted'
-           AND ($2::uuid IS NULL OR o.project_id = $2 OR o.project_id IS NULL)
+           AND ($2::uuid IS NULL OR o.project_id = $2)
          ORDER BY sim DESC
          LIMIT 10",
     )
@@ -1124,7 +1140,7 @@ async fn verify_claim(pool: &PgPool, claim: &str, project_id: Option<uuid::Uuid>
                            AND o.observation_type != 'superseded'
                AND o.trust = 'trusted'
                            AND (o.embedding <=> $1::vector) < 0.8
-                           AND ($2::uuid IS NULL OR o.project_id = $2 OR o.project_id IS NULL)
+                           AND ($2::uuid IS NULL OR o.project_id = $2)
                          ORDER BY o.embedding <=> $1::vector
                          LIMIT 10",
                 )
@@ -1292,6 +1308,7 @@ async fn text_search(
     limit: i64,
     tb: &TimeBounds,
     project_id: Option<uuid::Uuid>,
+    include_unscoped: bool,
 ) -> Result<Vec<Value>> {
     let mut results = Vec::new();
 
@@ -1306,7 +1323,7 @@ async fn text_search(
              WHERE (search_vector @@ cuba_or_tsquery($1)
                 OR similarity(name, $1) > 0.3)
                AND created_at >= $3 AND created_at <= $4
-               AND ($5::uuid IS NULL OR project_id = $5 OR project_id IS NULL)
+               AND ($5::uuid IS NULL OR project_id = $5 OR ($6::bool AND project_id IS NULL))
              ORDER BY score DESC
              LIMIT $2",
         )
@@ -1315,6 +1332,7 @@ async fn text_search(
         .bind(tb.after)
         .bind(tb.before)
         .bind(project_id)
+        .bind(include_unscoped)
         .fetch_all(pool)
         .await?;
         results.extend(
@@ -1346,7 +1364,7 @@ async fn text_search(
                AND o.observation_type != 'superseded'
                AND o.trust = 'trusted'
                AND o.created_at >= $3 AND o.created_at <= $4
-               AND ($5::uuid IS NULL OR o.project_id = $5 OR o.project_id IS NULL)
+               AND ($5::uuid IS NULL OR o.project_id = $5 OR ($6::bool AND o.project_id IS NULL))
              ORDER BY score DESC
              LIMIT $2",
         )
@@ -1355,6 +1373,7 @@ async fn text_search(
         .bind(tb.after)
         .bind(tb.before)
         .bind(project_id)
+        .bind(include_unscoped)
         .fetch_all(pool)
         .await?;
         results.extend(rows.into_iter().map(
@@ -1381,7 +1400,7 @@ async fn text_search(
              WHERE (search_vector @@ cuba_or_tsquery($1)
                 OR similarity(error_message, $1) > 0.3)
                AND created_at >= $3 AND created_at <= $4
-               AND ($5::uuid IS NULL OR project_id = $5 OR project_id IS NULL)
+               AND ($5::uuid IS NULL OR project_id = $5 OR ($6::bool AND project_id IS NULL))
              ORDER BY score DESC
              LIMIT $2",
         )
@@ -1390,6 +1409,7 @@ async fn text_search(
         .bind(tb.after)
         .bind(tb.before)
         .bind(project_id)
+        .bind(include_unscoped)
         .fetch_all(pool)
         .await?;
         results.extend(
@@ -1419,7 +1439,7 @@ async fn text_search(
              WHERE (ep.search_vector @@ cuba_or_tsquery($1)
                 OR similarity(ep.content, $1) > 0.3)
                AND ep.created_at >= $3 AND ep.created_at <= $4
-               AND ($5::uuid IS NULL OR ep.project_id = $5 OR ep.project_id IS NULL)
+               AND ($5::uuid IS NULL OR ep.project_id = $5 OR ($6::bool AND ep.project_id IS NULL))
                AND ep.trust = 'trusted'
              ORDER BY score DESC
              LIMIT $2",
@@ -1429,6 +1449,7 @@ async fn text_search(
         .bind(tb.after)
         .bind(tb.before)
         .bind(project_id)
+        .bind(include_unscoped)
         .fetch_all(pool)
         .await
         .unwrap_or_else(|e| {
@@ -1457,14 +1478,31 @@ async fn text_search(
     Ok(results)
 }
 
+pub fn vector_kinds_for_scope(scope: &str) -> &'static [&'static str] {
+    match scope {
+        "errors" => &[],
+        "entities" => &[],
+        "observations" => &["observation"],
+        "all" => &["observation", "episode"],
+        _ => &["observation", "episode"],
+    }
+}
+
 async fn vector_search(
     pool: &PgPool,
     query: &str,
-    _scope: &str,
+    scope: &str,
     limit: i64,
     tb: &TimeBounds,
     project_id: Option<uuid::Uuid>,
+    include_unscoped: bool,
 ) -> Result<Vec<Value>> {
+    let kinds = vector_kinds_for_scope(scope);
+    if kinds.is_empty() {
+        let _ = include_unscoped;
+        return Ok(Vec::new());
+    }
+
     if !crate::embeddings::onnx::is_model_loaded() {
         anyhow::bail!(
             "no hay modelo de embeddings cargado (ONNX_MODEL_PATH ausente o sin librería de \
@@ -1476,8 +1514,11 @@ async fn vector_search(
         .await
         .context("ONNX embed failed in vector_search")?;
 
-    let observations: Vec<(uuid::Uuid, String, String, f64, f64)> = sqlx::query_as(
-        "WITH direct AS (
+    let mut results: Vec<Value> = Vec::new();
+
+    if kinds.contains(&"observation") {
+        let observations: Vec<(uuid::Uuid, String, String, f64, f64)> = sqlx::query_as(
+            "WITH direct AS (
              SELECT o.id, e.name, o.content, o.importance::float8 AS importance,
                     1.0 - (o.embedding <=> $1::vector) AS cosine_sim
              FROM brain_observations o
@@ -1486,7 +1527,7 @@ async fn vector_search(
                AND o.observation_type != 'superseded'
                AND o.trust = 'trusted'
                AND o.created_at >= $3 AND o.created_at <= $4
-               AND ($5::uuid IS NULL OR o.project_id = $5 OR o.project_id IS NULL)
+               AND ($5::uuid IS NULL OR o.project_id = $5 OR ($6::bool AND o.project_id IS NULL))
              ORDER BY o.embedding <=> $1::vector
              LIMIT $2
          ),
@@ -1501,7 +1542,7 @@ async fn vector_search(
                AND o.observation_type != 'superseded'
                AND o.trust = 'trusted'
                AND o.created_at >= $3 AND o.created_at <= $4
-               AND ($5::uuid IS NULL OR o.project_id = $5 OR o.project_id IS NULL)
+               AND ($5::uuid IS NULL OR o.project_id = $5 OR ($6::bool AND o.project_id IS NULL))
              ORDER BY o.id, c.embedding <=> $1::vector
          )
          SELECT id, name, content, importance, cosine_sim FROM (
@@ -1511,57 +1552,65 @@ async fn vector_search(
          ) deduped
          ORDER BY cosine_sim DESC
          LIMIT $2",
-    )
-    .bind(pgvector::Vector::from(embedding.clone()))
-    .bind(limit)
-    .bind(tb.after)
-    .bind(tb.before)
-    .bind(project_id)
-    .fetch_all(pool)
-    .await?;
+        )
+        .bind(pgvector::Vector::from(embedding.clone()))
+        .bind(limit)
+        .bind(tb.after)
+        .bind(tb.before)
+        .bind(project_id)
+        .bind(include_unscoped)
+        .fetch_all(pool)
+        .await?;
 
-    let mut results: Vec<Value> = observations
-        .iter()
-        .map(|(id, entity_name, content, importance, sim)| {
-            serde_json::json!({
-                "id": id.to_string(),
-                "type": "observation",
-                "entity_name": entity_name,
-                "content": content,
-                "importance": importance,
-                "cosine_similarity": sim
-            })
-        })
-        .collect();
+        results.extend(
+            observations
+                .iter()
+                .map(|(id, entity_name, content, importance, sim)| {
+                    serde_json::json!({
+                        "id": id.to_string(),
+                        "type": "observation",
+                        "entity_name": entity_name,
+                        "content": content,
+                        "importance": importance,
+                        "cosine_similarity": sim
+                    })
+                }),
+        );
+    }
 
-    let episodes: Vec<(uuid::Uuid, String, String, f64)> = sqlx::query_as(
-        "SELECT ep.id, e.name, ep.content,
+    let episodes: Vec<(uuid::Uuid, String, String, f64)> = if kinds.contains(&"episode") {
+        sqlx::query_as(
+            "SELECT ep.id, e.name, ep.content,
                 1.0 - (ep.embedding <=> $1::vector) AS cosine_sim
          FROM brain_episodes ep
          JOIN brain_entities e ON ep.entity_id = e.id
          WHERE ep.embedding IS NOT NULL
            AND ep.created_at >= $3 AND ep.created_at <= $4
-           AND ($5::uuid IS NULL OR ep.project_id = $5 OR ep.project_id IS NULL)
+           AND ($5::uuid IS NULL OR ep.project_id = $5 OR ($6::bool AND ep.project_id IS NULL))
            AND ep.trust = 'trusted'
          ORDER BY ep.embedding <=> $1::vector
          LIMIT $2",
-    )
-    .bind(pgvector::Vector::from(embedding))
-    .bind(limit)
-    .bind(tb.after)
-    .bind(tb.before)
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_else(|e| {
-        tracing::error!(
-            error = %e,
-            "EPISODE VECTOR SEARCH FAILED — the semantic half of the ranking carries \
-             observations only. Usual cause is the same as for observations: the episode \
-             embedding column disagrees with the model's dimension. Run `cuba-memorys doctor`."
-        );
+        )
+        .bind(pgvector::Vector::from(embedding))
+        .bind(limit)
+        .bind(tb.after)
+        .bind(tb.before)
+        .bind(project_id)
+        .bind(include_unscoped)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                error = %e,
+                "EPISODE VECTOR SEARCH FAILED — the semantic half of the ranking carries \
+                 observations only. Usual cause is the same as for observations: the episode \
+                 embedding column disagrees with the model's dimension. Run `cuba-memorys doctor`."
+            );
+            Vec::new()
+        })
+    } else {
         Vec::new()
-    });
+    };
 
     results.extend(episodes.iter().map(|(id, entity_name, content, sim)| {
         serde_json::json!({
@@ -1600,7 +1649,7 @@ async fn associative_expand(
     let seeds: Vec<(uuid::Uuid,)> = match sqlx::query_as(
         "SELECT id FROM brain_entities
          WHERE (search_vector @@ cuba_or_tsquery($1) OR similarity(name, $1) > 0.3)
-           AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)
+           AND ($2::uuid IS NULL OR project_id = $2)
          ORDER BY importance DESC
          LIMIT $3",
     )
@@ -1643,7 +1692,7 @@ async fn associative_expand(
              WHERE o.entity_id = $1
                AND o.observation_type != 'superseded'
                AND o.trust = 'trusted'
-               AND ($2::uuid IS NULL OR o.project_id = $2 OR o.project_id IS NULL)
+               AND ($2::uuid IS NULL OR o.project_id = $2)
              ORDER BY o.importance DESC
              LIMIT $3",
         )
@@ -1953,7 +2002,7 @@ async fn check_ood(
         "SELECT embedding FROM brain_observations
          WHERE embedding IS NOT NULL AND observation_type != 'superseded'
            AND trust = 'trusted'
-           AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+           AND ($1::uuid IS NULL OR project_id = $1)
          ORDER BY id
          LIMIT $2",
     )
@@ -2200,6 +2249,24 @@ mod tests {
                 entropies[i]
             );
         }
+    }
+
+    #[test]
+    fn a_scope_of_errors_does_not_ask_the_vector_branch_for_observations() {
+        assert!(
+            super::vector_kinds_for_scope("errors").is_empty(),
+            "vector_search used to ignore scope and always load observations+episodes, \
+             so faro scope=errors returned the same documents as scope=all"
+        );
+        assert_eq!(
+            super::vector_kinds_for_scope("observations"),
+            &["observation"]
+        );
+        assert_eq!(
+            super::vector_kinds_for_scope("all"),
+            &["observation", "episode"]
+        );
+        assert!(super::vector_kinds_for_scope("entities").is_empty());
     }
 
     #[test]

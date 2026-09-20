@@ -75,6 +75,16 @@ pub fn builtin_retrieval_set() -> Vec<EvaluationSample> {
             gold_entities: Vec::new(),
             question_class: Some("factoid".into()),
         },
+        EvaluationSample {
+            query: "secret of a different project must not be recalled".into(),
+            relevant_ids: HashSet::new(),
+            relevant_markers: Vec::new(),
+            expected_answer: None,
+            ability: Some("isolation".into()),
+            abstain: true,
+            gold_entities: Vec::new(),
+            question_class: Some("isolation".into()),
+        },
     ]
 }
 
@@ -159,6 +169,33 @@ mod tests {
             "{}/eval-datasets/factoid-answer.jsonl",
             env!("CARGO_MANIFEST_DIR")
         )
+    }
+
+    #[test]
+    fn isolation_jsonl_names_the_tenant_contract() {
+        let path = format!(
+            "{}/eval-datasets/isolation.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let samples = load_jsonl_dataset(&path).expect("isolation.jsonl");
+        assert!(
+            samples
+                .iter()
+                .any(|s| s.question_class.as_deref() == Some("isolation") && s.abstain),
+            "at least one row must be an isolation abstention: other-project secrets must not score as hits"
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|s| s.question_class.as_deref() == Some("errors")),
+            "errors-scope oracle missing"
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|s| s.question_class.as_deref() == Some("decreto")),
+            "decreto-title oracle missing"
+        );
     }
 
     #[test]

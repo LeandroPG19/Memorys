@@ -313,7 +313,7 @@ async fn export_into(
     let entity_rows: Vec<EntityCols> = sqlx::query_as(
         "SELECT id, name, entity_type, importance::float8, access_count, project_id, created_at
          FROM brain_entities
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          ORDER BY name",
     )
     .bind(project_id)
@@ -434,7 +434,7 @@ async fn export_into(
         "SELECT id, entity_id, content, actors, artifacts, importance::float8,
                 project_id, started_at, ended_at
          FROM brain_episodes
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          ORDER BY started_at",
     )
     .bind(project_id)
@@ -478,7 +478,7 @@ async fn export_into(
     let error_rows: Vec<ErrCols> = sqlx::query_as(
         "SELECT id, error_type, error_message, solution, resolved, project, project_id, created_at
          FROM brain_errors
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          ORDER BY created_at",
     )
     .bind(project_id)
@@ -510,7 +510,7 @@ async fn export_into(
     let decisions: Vec<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
         "SELECT id, content, project_id FROM brain_observations
          WHERE observation_type = 'decision'
-           AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+           AND ($1::uuid IS NULL OR project_id = $1)
          ORDER BY created_at",
     )
     .bind(project_id)
@@ -534,7 +534,7 @@ async fn export_into(
         "SELECT id, from_entity, to_entity, relation_type, strength::float8,
                 bidirectional, project_id, created_at, provenance
          FROM brain_relations
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          ORDER BY created_at",
     )
     .bind(project_id)
@@ -560,7 +560,7 @@ async fn export_into(
                 f.is_current, f.created_at, l.layer_name::text AS layer_name
          FROM brain_facts f
          LEFT JOIN brain_memory_layers l ON l.layer_id = f.layer_id
-         WHERE ($1::uuid IS NULL OR f.project_id = $1 OR f.project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR f.project_id = $1)
          ORDER BY f.observed_at",
     )
     .bind(project_id)
@@ -595,7 +595,7 @@ async fn export_into(
                 verification, success_count, failure_count, last_outcome, last_used_at,
                 project_id, embedding_model
          FROM brain_procedures
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          ORDER BY created_at",
     )
     .bind(project_id)
@@ -626,7 +626,7 @@ async fn export_into(
         "SELECT id, path, content, content_hash, version, project_id, origin_node,
                 crdt_actor, crdt_counter, updated_at
          FROM brain_artifacts
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          ORDER BY path",
     )
     .bind(project_id)
@@ -2734,7 +2734,7 @@ async fn diff(pool: &PgPool, dir_arg: Option<&str>) -> Result<Value> {
 
     let db_rows: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, name FROM brain_entities
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+         WHERE ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_all(pool)

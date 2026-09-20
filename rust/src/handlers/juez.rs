@@ -88,8 +88,8 @@ async fn scan_entity(pool: &PgPool, entity_name: &str, max_pairs: usize) -> Resu
            AND b.observation_type NOT IN ('superseded', 'tool_usage')
            AND (1.0 - (a.embedding <=> b.embedding)) BETWEEN $2 AND $3
            AND a.entity_id = (SELECT id FROM brain_entities WHERE name = $1)
-           AND ($4::uuid IS NULL OR a.project_id = $4 OR a.project_id IS NULL)
-           AND ($4::uuid IS NULL OR b.project_id = $4 OR b.project_id IS NULL)
+           AND ($4::uuid IS NULL OR a.project_id = $4)
+           AND ($4::uuid IS NULL OR b.project_id = $4)
          ORDER BY ABS((1.0 - (a.embedding <=> b.embedding)) - 0.7) ASC
          LIMIT $5",
     )

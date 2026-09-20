@@ -343,7 +343,7 @@ async fn list(pool: &PgPool, entity_name: &str) -> Result<Value> {
         "SELECT id, content, observation_type, importance, source, access_count
          FROM brain_observations
          WHERE entity_id = $1 AND observation_type != 'superseded'
-           AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)
+           AND ($2::uuid IS NULL OR project_id = $2)
          ORDER BY importance DESC, created_at DESC",
     )
     .bind(entity_id)
@@ -602,7 +602,7 @@ async fn timeline(pool: &PgPool, entity_name: &str) -> Result<Value> {
          FROM brain_observations o
          JOIN brain_entities e ON o.entity_id = e.id
          WHERE e.name = $1 AND o.observation_type != 'superseded'
-           AND ($2::uuid IS NULL OR o.project_id = $2 OR o.project_id IS NULL)
+           AND ($2::uuid IS NULL OR o.project_id = $2)
          ORDER BY o.created_at ASC
          LIMIT 100",
     )
@@ -625,7 +625,7 @@ async fn timeline(pool: &PgPool, entity_name: &str) -> Result<Value> {
          FROM brain_episodes ep
          JOIN brain_entities e ON ep.entity_id = e.id
          WHERE e.name = $1
-           AND ($2::uuid IS NULL OR ep.project_id = $2 OR ep.project_id IS NULL)
+           AND ($2::uuid IS NULL OR ep.project_id = $2)
          ORDER BY ep.started_at ASC
          LIMIT 50",
     )
@@ -777,11 +777,14 @@ async fn ensure_entity_typed(
     name: &str,
     project_id: Option<uuid::Uuid>,
 ) -> Result<(uuid::Uuid, String)> {
-    let existing: Option<(uuid::Uuid, String)> =
-        sqlx::query_as("SELECT id, entity_type FROM brain_entities WHERE name = $1")
-            .bind(name)
-            .fetch_optional(pool)
-            .await?;
+    let existing: Option<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, entity_type FROM brain_entities
+         WHERE name = $1 AND project_id IS NOT DISTINCT FROM $2",
+    )
+    .bind(name)
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
 
     if let Some(found) = existing {
         return Ok(found);
@@ -804,7 +807,8 @@ async fn ensure_entity_typed(
     let row: (uuid::Uuid, String) = sqlx::query_as(
         "INSERT INTO brain_entities (name, entity_type, project_id)
          VALUES ($1, 'concept', $2)
-         ON CONFLICT (name) DO UPDATE SET updated_at = NOW()
+         ON CONFLICT ON CONSTRAINT uq_brain_entities_name_project
+         DO UPDATE SET updated_at = NOW()
          RETURNING id, entity_type",
     )
     .bind(name)
@@ -957,7 +961,7 @@ async fn episode_list(pool: &PgPool, entity_name: &str) -> Result<Value> {
              FROM brain_episodes ep
              JOIN brain_entities e ON ep.entity_id = e.id
              WHERE e.name = $1
-               AND ($2::uuid IS NULL OR ep.project_id = $2 OR ep.project_id IS NULL)
+               AND ($2::uuid IS NULL OR ep.project_id = $2)
              ORDER BY ep.started_at DESC
              LIMIT 50",
     )

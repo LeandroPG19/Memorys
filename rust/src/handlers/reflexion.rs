@@ -104,7 +104,7 @@ async fn find_isolated(
          FROM brain_entities e
          LEFT JOIN brain_relations r ON e.id = r.from_entity OR e.id = r.to_entity
          WHERE r.id IS NULL
-           AND ($1::uuid IS NULL OR e.project_id = $1 OR e.project_id IS NULL)
+           AND ($1::uuid IS NULL OR e.project_id = $1)
          ORDER BY e.importance DESC
          LIMIT 20",
     )
@@ -124,7 +124,7 @@ async fn find_underconnected(
                    COUNT(r.id) AS degree
             FROM brain_entities e
             LEFT JOIN brain_relations r ON e.id = r.from_entity OR e.id = r.to_entity
-            WHERE ($1::uuid IS NULL OR e.project_id = $1 OR e.project_id IS NULL)
+            WHERE ($1::uuid IS NULL OR e.project_id = $1)
             GROUP BY e.id, e.name, e.importance
         )
         SELECT name, importance, degree
@@ -145,7 +145,7 @@ async fn find_type_silos(
 ) -> Result<Vec<(String, String)>> {
     let types: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT entity_type FROM brain_entities
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          ORDER BY entity_type",
     )
     .bind(project_id)
@@ -159,8 +159,8 @@ async fn find_type_silos(
          JOIN brain_entities e1 ON r.from_entity = e1.id
          JOIN brain_entities e2 ON r.to_entity = e2.id
          WHERE e1.entity_type != e2.entity_type
-           AND ($1::uuid IS NULL OR e1.project_id = $1 OR e1.project_id IS NULL)
-           AND ($1::uuid IS NULL OR e2.project_id = $1 OR e2.project_id IS NULL)",
+           AND ($1::uuid IS NULL OR e1.project_id = $1)
+           AND ($1::uuid IS NULL OR e2.project_id = $1)",
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -192,7 +192,7 @@ async fn find_observation_gaps(
          FROM brain_entities e
          JOIN brain_observations o ON e.id = o.entity_id
          WHERE o.observation_type != 'superseded'
-           AND ($1::uuid IS NULL OR e.project_id = $1 OR e.project_id IS NULL)
+           AND ($1::uuid IS NULL OR e.project_id = $1)
          GROUP BY e.id, e.name
          HAVING COUNT(*) FILTER (WHERE o.observation_type = 'fact') > 3
             AND (COUNT(*) FILTER (WHERE o.observation_type = 'decision') = 0
@@ -219,7 +219,7 @@ async fn find_density_anomalies(
             LEFT JOIN brain_observations o ON e.id = o.entity_id
                 AND o.observation_type != 'superseded'
             LEFT JOIN brain_relations r ON e.id = r.from_entity OR e.id = r.to_entity
-            WHERE ($1::uuid IS NULL OR e.project_id = $1 OR e.project_id IS NULL)
+            WHERE ($1::uuid IS NULL OR e.project_id = $1)
             GROUP BY e.id, e.name
         ),
         global AS (

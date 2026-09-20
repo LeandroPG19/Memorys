@@ -705,7 +705,8 @@ async fn upsert_entity(
     let row: Result<(uuid::Uuid,), _> = sqlx::query_as(
         "INSERT INTO brain_entities (name, entity_type, project_id)
          VALUES ($1, 'concept', $2)
-         ON CONFLICT (name) DO UPDATE SET updated_at = NOW()
+         ON CONFLICT ON CONSTRAINT uq_brain_entities_name_project
+         DO UPDATE SET updated_at = NOW()
          RETURNING id",
     )
     .bind(name)
@@ -1208,16 +1209,39 @@ mod tests {
     #[tokio::test]
     async fn a_degraded_extraction_is_an_error_and_leaves_the_observation_unmarked() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
-        let previous_cli = std::env::var("CUBA_JUEZ_CLI").ok();
-        unsafe { std::env::set_var("CUBA_JUEZ_CLI", "cuba-memorys-no-such-cli-on-this-machine") };
+        // The SIL requires a generative LLM, so this process often has
+        // MEMORY_INDUSTRY_LLM_BASE_URL / PROVIDER or `claude` on PATH.
+        // This test is about the no-backend branch; hide those or it
+        // returns Ok(empty) and REM would stamp extracted_at anyway.
+        let saved = [
+            "CUBA_JUEZ_CLI",
+            "MEMORY_INDUSTRY_LLM_CLI",
+            "MEMORY_INDUSTRY_LLM_BASE_URL",
+            "CUBA_LLM_BASE_URL",
+            "MEMORY_INDUSTRY_LLM_PROVIDER",
+            "CUBA_LLM_PROVIDER",
+            "PATH",
+        ]
+        .map(|k| (k, std::env::var(k).ok()));
+        unsafe {
+            std::env::set_var("CUBA_JUEZ_CLI", "cuba-memorys-no-such-cli-on-this-machine");
+            std::env::remove_var("MEMORY_INDUSTRY_LLM_CLI");
+            std::env::remove_var("MEMORY_INDUSTRY_LLM_BASE_URL");
+            std::env::remove_var("CUBA_LLM_BASE_URL");
+            std::env::remove_var("MEMORY_INDUSTRY_LLM_PROVIDER");
+            std::env::remove_var("CUBA_LLM_PROVIDER");
+            std::env::set_var("PATH", "");
+        }
 
         let pool = pool_that_cannot_connect();
         let result =
             rem_extract_observation(&pool, uuid::Uuid::new_v4(), "una nota cualquiera").await;
 
-        match previous_cli {
-            Some(v) => unsafe { std::env::set_var("CUBA_JUEZ_CLI", v) },
-            None => unsafe { std::env::remove_var("CUBA_JUEZ_CLI") },
+        for (k, v) in saved {
+            match v {
+                Some(val) => unsafe { std::env::set_var(k, val) },
+                None => unsafe { std::env::remove_var(k) },
+            }
         }
 
         assert!(

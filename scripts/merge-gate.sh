@@ -49,8 +49,9 @@ if command -v pg_isready >/dev/null 2>&1; then
     || { echo "FAIL: Postgres not ready on :5488"; exit 1; }
   echo "OK  Postgres :5488"
 else
-  docker exec cuba-memorys-db pg_isready -U cuba -d brain >/dev/null \
-    || { echo "FAIL: cuba-memorys-db container not healthy"; exit 1; }
+  docker exec memory-industry-db pg_isready -U cuba -d brain >/dev/null \
+    || docker exec cuba-memorys-db pg_isready -U cuba -d brain >/dev/null \
+    || { echo "FAIL: memory-industry-db / cuba-memorys-db container not healthy"; exit 1; }
   echo "OK  Postgres (docker)"
 fi
 

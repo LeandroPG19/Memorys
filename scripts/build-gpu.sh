@@ -34,17 +34,27 @@ else
     nice -n 15 cargo build --release --features cuda -j "$JOBS"
 fi
 
-if [[ -f target/release/memory-industry.exe ]]; then
-    BIN="target/release/memory-industry.exe"
-elif [[ -f target/release/memory-industry ]]; then
-    BIN="target/release/memory-industry"
-elif [[ -f target/release/cuba-memorys.exe ]]; then
-    BIN="target/release/cuba-memorys.exe"
-else
-    BIN="target/release/cuba-memorys"
+# cargo writes here when Cursor/sandbox sets CARGO_TARGET_DIR. A hardcoded
+# rust/target/release then 127s on `cuba-memorys` after a six-minute link.
+td="${CARGO_TARGET_DIR:-target}"
+BIN=""
+for cand in \
+  "$td/release/memory-industry.exe" \
+  "$td/release/memory-industry" \
+  "$td/release/cuba-memorys.exe" \
+  "$td/release/cuba-memorys"
+do
+  if [[ -f "$cand" ]]; then
+    BIN="$cand"
+    break
+  fi
+done
+if [[ -z "$BIN" ]]; then
+  echo "FAIL: no release binary under $td/release after cargo build." >&2
+  exit 1
 fi
 echo
 "$BIN" --version
 echo
-echo "point your MCP client at: $(pwd)/$BIN"
+echo "point your MCP client at: $BIN"
 echo "confirm the GPU is live with: $BIN doctor | grep -i gpu"

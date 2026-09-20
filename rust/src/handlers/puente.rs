@@ -206,7 +206,7 @@ async fn traverse(pool: &PgPool, args: &Value) -> Result<Value> {
             FROM brain_relations r
             JOIN brain_entities e2 ON r.to_entity = e2.id
             WHERE r.from_entity = $1
-              AND ($3::uuid IS NULL OR r.project_id = $3 OR r.project_id IS NULL)
+              AND ($3::uuid IS NULL OR r.project_id = $3)
 
             UNION ALL
 
@@ -221,7 +221,7 @@ async fn traverse(pool: &PgPool, args: &Value) -> Result<Value> {
             JOIN brain_entities e2 ON r.to_entity = e2.id
             JOIN graph_walk gw ON r.from_entity = gw.current_node
             WHERE gw.depth < $2
-              AND ($3::uuid IS NULL OR r.project_id = $3 OR r.project_id IS NULL)
+              AND ($3::uuid IS NULL OR r.project_id = $3)
         )
         SELECT node_name, relation_type, strength, depth, provenance
         FROM graph_walk
@@ -240,7 +240,7 @@ async fn traverse(pool: &PgPool, args: &Value) -> Result<Value> {
             strength = LEAST(strength + 0.02, 1.0),
             last_traversed = NOW()
          WHERE from_entity = $1
-           AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+           AND ($2::uuid IS NULL OR project_id = $2)",
     )
     .bind(start_id)
     .bind(project_id)
@@ -298,7 +298,7 @@ async fn infer(pool: &PgPool, args: &Value) -> Result<Value> {
                 r.strength AS path_strength
             FROM brain_relations r
             WHERE r.from_entity = $1
-              AND ($3::uuid IS NULL OR r.project_id = $3 OR r.project_id IS NULL)
+              AND ($3::uuid IS NULL OR r.project_id = $3)
 
             UNION ALL
 
@@ -309,13 +309,13 @@ async fn infer(pool: &PgPool, args: &Value) -> Result<Value> {
             FROM brain_relations r
             JOIN transitive_closure tc ON r.from_entity = tc.current_node
             WHERE tc.depth < $2
-              AND ($3::uuid IS NULL OR r.project_id = $3 OR r.project_id IS NULL)
+              AND ($3::uuid IS NULL OR r.project_id = $3)
         )
         SELECT e.name, tc.depth, tc.path_strength
         FROM transitive_closure tc
         JOIN brain_entities e ON tc.current_node = e.id
         WHERE tc.depth > 1
-          AND ($3::uuid IS NULL OR e.project_id = $3 OR e.project_id IS NULL)
+          AND ($3::uuid IS NULL OR e.project_id = $3)
         ORDER BY tc.path_strength DESC
         LIMIT 20
         "#,
@@ -375,7 +375,7 @@ async fn predict_links(pool: &PgPool, args: &Value) -> Result<Value> {
     let entity_id: Option<(uuid::Uuid,)> = sqlx::query_as(
         "SELECT id FROM brain_entities
          WHERE name = $1
-           AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)
+           AND ($2::uuid IS NULL OR project_id = $2)
          LIMIT 1",
     )
     .bind(entity_name)
@@ -401,7 +401,7 @@ async fn predict_links(pool: &PgPool, args: &Value) -> Result<Value> {
             SELECT CASE WHEN from_entity = $1 THEN to_entity ELSE from_entity END AS neighbor
             FROM brain_relations
             WHERE (from_entity = $1 OR to_entity = $1)
-              AND ($3::uuid IS NULL OR project_id = $3 OR project_id IS NULL)
+              AND ($3::uuid IS NULL OR project_id = $3)
         ),
         candidate_links AS (
             SELECT DISTINCT
@@ -412,16 +412,16 @@ async fn predict_links(pool: &PgPool, args: &Value) -> Result<Value> {
             WHERE CASE WHEN r.from_entity = en.neighbor THEN r.to_entity ELSE r.from_entity END != $1
               AND CASE WHEN r.from_entity = en.neighbor THEN r.to_entity ELSE r.from_entity END
                   NOT IN (SELECT neighbor FROM entity_neighbors)
-              AND ($3::uuid IS NULL OR r.project_id = $3 OR r.project_id IS NULL)
+              AND ($3::uuid IS NULL OR r.project_id = $3)
         ),
         neighbor_degrees AS (
             SELECT node, SUM(cnt) AS degree FROM (
                 SELECT from_entity AS node, COUNT(*) AS cnt FROM brain_relations
-                  WHERE ($3::uuid IS NULL OR project_id = $3 OR project_id IS NULL)
+                  WHERE ($3::uuid IS NULL OR project_id = $3)
                   GROUP BY from_entity
                 UNION ALL
                 SELECT to_entity, COUNT(*) FROM brain_relations
-                  WHERE ($3::uuid IS NULL OR project_id = $3 OR project_id IS NULL)
+                  WHERE ($3::uuid IS NULL OR project_id = $3)
                   GROUP BY to_entity
             ) sub GROUP BY node
         ),
@@ -434,7 +434,7 @@ async fn predict_links(pool: &PgPool, args: &Value) -> Result<Value> {
         SELECT aa.candidate, e.name, e.entity_type, aa.aa_score::float8
         FROM aa_scores aa
         JOIN brain_entities e ON aa.candidate = e.id
-        WHERE ($3::uuid IS NULL OR e.project_id = $3 OR e.project_id IS NULL)
+        WHERE ($3::uuid IS NULL OR e.project_id = $3)
         ORDER BY aa.aa_score DESC
         LIMIT $2
         "#,

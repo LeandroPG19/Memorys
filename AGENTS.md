@@ -1,14 +1,39 @@
 # Agent contract — MemoryIndustry
 
+Claude Code / Cursor / CLI: if a global rule (`rust.mdc`, «cero comentarios», plant e2e) clashes with this file, **this repo wins**.
+
 ## Mergeable (local CI only)
 
-Mergeable means **`./scripts/merge-gate.sh`** (or `./scripts/memory-industry-test.sh all`) exited 0 in this turn with a clean log: no `SKIPPED`, no soft alerts, no “should pass”.
+Mergeable means **`./scripts/merge-gate.sh`** exited 0 in this turn with a clean log: no `SKIPPED`, no soft alerts, no “should pass”.
 
-GitHub Actions is **not** the merge judge.
+Aliases of the same SIL: `./scripts/como-el-ci.sh todo`, `./scripts/como-el-ci.sh extra`, `./scripts/memory-industry-test.sh all`.
+
+GitHub Actions is **not** the merge judge. A green badge is not mergeable. That workflow excludes `MODEL_OR_CLI_ONLY` and has no ONNX / NLI / reranker / generative LLM.
+
+## Two judges, chained
+
+| Judge | What it is | What it is not |
+|---|---|---|
+| `./scripts/merge-gate.sh` | The SIL. fmt, clippy `-D warnings`, `--ignored`, e2e (no soft-skip), deny, audit, `codigo-muerto`, `crap-gate` floor, `mutants-gate` on mmr/rrf/cache. | A fraction (`cargo test --lib`). GitHub Actions. |
+| `./scripts/quality-gate.sh` | CRAP/lizard + `cargo mutants` on `rust/src` **in the diff**. | A substitute for the SIL. Does not run merge-gate. |
+
+`quality-gate` after the SIL when the change touched `rust/src` or Python. A missing lizard / cargo-mutants is exit 2: the hardener does not close.
+
+## Six-pack
+
+Behaviour change: **especificador → implementador → mejorador → arquitecto → endurecedor → qa**.
+
+Handoffs: `.cursor/handoffs/*.yml`. Shape judge: `./scripts/validar-handoff.sh`. Example: `.cursor/handoffs/handoff.example.yml`.
+
+The parent dispatches. The parent **may** write product code when Mapupita asked this chat to implement, or when there is no `Task`. Rules, gate scripts, and `AGENTS.md` are always in-parent.
+
+Do not copy plant roles: no guardian-planta, no Playwright planta, no React Query.
+
+## Comments stay
+
+Comments in this crate are load-bearing (frozen migrations, SHA-384, gate lessons, RLS). Do not strip them. Do not apply Mapupita-Rust «cero comentarios». Rename a comment that only restates the line; keep the why.
 
 ## Generative LLM (easy path)
-
-For humans and agent installers — **one command**, no hunting env vars:
 
 ```bash
 memory-industry llm list
@@ -26,13 +51,15 @@ Encode models (embed / NLI / reranker) stay ONNX via `memory-industry models all
 ## Blind gate extras
 
 - E2E must cover tools without soft-skip
-- `scripts/crap-gate.sh` — coverage floor
-- `scripts/mutants-gate.sh` — kill-rate floor
+- `scripts/crap-gate.sh` — coverage floor (inside the SIL)
+- `scripts/mutants-gate.sh` — kill-rate floor on mmr/rrf/cache (inside the SIL)
 - Oracles / fixtures decide green — not an AI opinion
 
 ## Immutable fixtures
 
 Mutating tests use throwaway DBs (`brain_gate` / peer). Eval smoke may read the live corpus read-only.
+
+Published migrations through **0060** are frozen (SHA-384). Wrong shipped SQL gets a **new** migration.
 
 ## Product ids
 

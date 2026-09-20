@@ -20,6 +20,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: GitHub Actions is not the merge judge
+        working-directory: .
+        run: |
+          echo "This workflow is not mergeable."
+          echo "Mergeable = ./scripts/merge-gate.sh (or ./scripts/como-el-ci.sh todo) exit 0 locally."
+          echo "This job excludes MODEL_OR_CLI_ONLY and has no ONNX/NLI/reranker/LLM."
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

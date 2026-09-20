@@ -1,0 +1,11 @@
+---
+description: Una prueba que no puede fallar no existe — ancla, sin skip silencioso, sabotaje luego verde
+alwaysApply: true
+---
+
+# Testear hasta el rojo
+
+- Primero el ancla de que el handler o la API está (MCP result / HTTP 200 / row count). Afirmar solo ausencia pasa igual sobre un corpus vacío.
+- `skip` y `return` silencioso están prohibidos. Si falta el entorno, la corrida **falla** y lo dice. Sembrar el dato, no saltar.
+- Un test apagado no prueba nada. `#[ignore]` solo existe porque el SIL los corre (`cargo test -- --ignored`). Un ignore que el gate no ejecuta es un skip silencioso.
+- Sabotear el assert, ver rojo, luego verde. Un test que nunca se puso rojo no está verificado.

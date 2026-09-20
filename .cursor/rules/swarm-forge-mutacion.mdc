@@ -1,0 +1,15 @@
+---
+description: Mutación — piso mmr/rrf/cache en el SIL; del diff en quality-gate
+alwaysApply: true
+---
+
+# Mutación
+
+Dos alcances, no se sustituyen:
+
+- **SIL**: `scripts/mutants-gate.sh` — `src/search/mmr.rs`, `rrf.rs`, `cache.rs`, kill-rate ≥ `MUTANTS_MIN_KILL` (default 0.7).
+- **Diff**: `scripts/quality-gate.sh` — `cargo mutants` acotado a `rust/src` del diff. Cero sobrevivientes en ese alcance, o el endurecedor no cierra.
+
+Si hay Gherkin: mutación blanda de escenarios (cambiar then/when y exigir que el test falle).
+
+Afirmar «los tests son buenos» sin la corrida de este turno está prohibido.

@@ -44,14 +44,18 @@ Every change is mergeable only when the **local** judge is green in this turn:
 
 ```bash
 ./scripts/merge-gate.sh
+# same SIL:
+./scripts/como-el-ci.sh todo
 ```
 
 | Gate | Requirement |
 |---|---|
-| **Local merge gate** | Full suite: fmt, clippy `-D warnings`, throwaway DB, ONNX models, **generative LLM** (Ollama URL or claude/gemini), e2e MCP + live (no soft-skip), eval smoke, `--features docs`, `cargo deny`, npm smoke, audit, `codigo-muerto`, `crap-gate`, `mutants-gate` |
+| **Local merge gate (SIL)** | Full suite: fmt, clippy `-D warnings`, throwaway DB, ONNX models, **generative LLM** (Ollama URL or claude/gemini), e2e MCP + live (no soft-skip), eval smoke, `--features docs`, `cargo deny`, npm smoke, audit, `codigo-muerto`, `crap-gate`, `mutants-gate` |
 | **CLI** | `./scripts/memory-industry-test.sh all` ≡ merge-gate |
+| **Second judge** | `./scripts/quality-gate.sh` — lizard + `cargo mutants` on `rust/src` in the diff. Does **not** replace the SIL |
 | **Log** | No `SKIPPED`, no soft alerts — fix root causes |
 | **Fixtures** | Mutating tests only on `brain_gate` / peer — never the live corpus |
+| **Rules** | `.cursor/rules/` is of the repo. Comments stay. No plant Playwright / React Query |
 
 Details: [docs/gate.md](docs/gate.md) and [AGENTS.md](AGENTS.md).
 
@@ -66,21 +70,12 @@ GitHub Actions is **not** the merge judge. A green badge alone does not make a P
 ### This repo (MemoryIndustry; crate in `rust/`)
 
 ```bash
-# Clone
 git clone https://github.com/LeandroPG19/Memorys.git
-cd <project>
-
-# Virtual environment (Python 3.14+ required)
-python3.14 -m venv .venv
-source .venv/bin/activate
-
-# Install with dev dependencies
-pip install -e ".[dev]"
-
-# Verify setup
-mypy --strict src/
-ruff check src/
-pytest
+cd Memorys
+# Postgres :5488, ONNX models, generative LLM — see docs/gate.md
+cd rust && cargo build --release && cd ..
+./scripts/merge-gate.sh            # SIL — the only merge judge
+./scripts/quality-gate.sh          # second judge (diff CRAP / mutants)
 ```
 
 ### TypeScript project (cuba-thinking)
@@ -110,12 +105,15 @@ cargo clippy -- -D warnings
 
 ```
 1. Fork → Branch (feat/fix/refactor prefix)
-2. Write failing test FIRST (TDD: Red)
+2. Specify (Gherkin) then write the failing test FIRST (TDD: Red)
 3. Implement minimal code to pass (Green)
-4. Refactor without breaking tests (Refactor)
-5. Run ALL quality gates locally
-6. Push → Open PR with template below
+4. Cleaner / architect / hardener (diff CRAP + mutants) then QA
+5. Run the SIL: ./scripts/merge-gate.sh
+6. Run the second judge: ./scripts/quality-gate.sh
+7. Push → Open PR with template below
 ```
+
+Behaviour changes use the six-pack in [AGENTS.md](AGENTS.md). Handoffs: `.cursor/handoffs/*.yml` via `scripts/validar-handoff.sh`.
 
 ### PR Template
 
@@ -136,15 +134,12 @@ cargo clippy -- -D warnings
 - Δ: [improvement]
 
 ## Checklist
-- [ ] Tests added/updated (Red-Green-Refactor)
-- [ ] `mypy --strict` / `tsc --noEmit` passes
-- [ ] `ruff check` / ESLint passes
-- [ ] `radon cc -n C` shows no function > 7
-- [ ] `bandit -r` / `npm audit` clean
-- [ ] Docstrings on all public functions (Google Style)
-- [ ] No `print()` — use `structlog`
-- [ ] No `Any` without documented justification
+- [ ] Tests added/updated (Red-Green-Refactor; sabotaged once)
+- [ ] `./scripts/merge-gate.sh` green in this turn
+- [ ] `./scripts/quality-gate.sh` green (or exit 0 with SIN DIFF)
+- [ ] Published migrations ≤0060 untouched
 - [ ] CHANGELOG updated
+- [ ] Comments that explain why were kept; no silent skip
 ```
 
 ---
@@ -169,7 +164,7 @@ These are **non-negotiable** rules that protect the system's integrity:
 | Hebbian weight ∈ [0.0, 1.0] | Oja's rule bounded normalization |
 | FSRS decay produces monotonically decreasing importance | Spaced repetition math: `I(t+1) ≤ I(t)` |
 | PageRank convergence tolerance ≤ 1e-6 | Numerical stability guarantee |
-| Entity names are case-insensitive unique | Graph identity invariant |
+| Entity names are unique per project (`UNIQUE NULLS NOT DISTINCT (name, project_id)`) | Two projects may share a name; leftovers with `project_id NULL` stay hidden unless `include_unscoped` |
 | Dedup gate blocks cosine similarity > 0.85 | Prevents observation explosion |
 
 ### cuba-thinking (Reasoning Engine)

@@ -13,7 +13,7 @@ Formerly **cuba-memorys**. Same daemon, same `cuba_*` MCP tools, new product nam
 
 **Long-term memory for AI coding agents.** An MCP server that gives your agent a knowledge graph it can search, reason over, and be corrected by — so it stops forgetting your codebase between sessions.
 
-Written in Rust. Backed by PostgreSQL + pgvector. **31 MCP tools** (32 with `CUBA_DOCS=1`), **23 CLI commands**, and every number below measured on a benchmark that — as of v0.12 — actually measures what it claims to. (The previous one did not. See [Measured](#measured--and-the-benchmark-that-was-lying).)
+Written in Rust. Backed by PostgreSQL + pgvector. **31 MCP tools** (32 with `CUBA_DOCS=1`), **25 CLI commands**, and every number below measured on a benchmark that — as of v0.12 — actually measures what it claims to. (The previous one did not. See [Measured](#measured--and-the-benchmark-that-was-lying).)
 
 <p align="center">
   <img src="assets/demo.gif" alt="MemoryIndustry terminal demo — hybrid search, claim verification with an LLM judge, procedural memory, and the CLI" width="760" />
@@ -332,7 +332,8 @@ Named after Cuban culture. `cuba-memorys` advertises all of them, or set `CUBA_T
 | `CUBA_EMBED_INTRA_THREADS` | half the logical cores, max 4 | ONNX threads per embedding. Measured on 12 threads: 1 → 94,8 ms, 2 → 52,3 ms, **4 → 35,8 ms**, 6 → 68,1 ms, 12 → 155,4 ms per query |
 | `CUBA_IDLE_SHUTDOWN_SECS` | `0` (off) | Exit after this long with no request from any client. Pairs with a systemd `.socket` unit so the next call brings the daemon back — see [Footprint](#footprint) |
 | `CUBA_WARM_RERANKER` | off | Load the cross-encoder at startup instead of on its first batch. Off, a cold start costs 0,027 s instead of 11 s and holds no VRAM until something actually reranks |
-| `CUBA_HTTP_ADDR` · `CUBA_HTTP_TOKEN` | `127.0.0.1:8787` · unset | Address for `serve`, and the bearer token it requires. A token is mandatory to bind anything but loopback |
+| `CUBA_HTTP_ADDR` · `CUBA_HTTP_TOKEN` | `127.0.0.1:8787` · unset | Address for `serve`, and the bearer token it requires. A token is mandatory to bind anything but loopback. `8788` is Cursor's OAuth callback — `doctor` warns if you bind there |
+| `MEMORY_INDUSTRY_CLIENT_ID` · `CUBA_CLIENT_ID` | unset | Workspace label for stdio/`whoami` when the client does not send `Mcp-Client-Id`. HTTP still needs the header per workspace; the daemon is one process and cannot use this env to split chats |
 | `CUBA_PANEL` | unset | Set to `1` and `serve` also answers `GET /panel`: a control page compiled into the binary that reads the daemon's state, connected clients, recent calls and open problems. It carries no data of its own — everything it shows it asks for over `POST /mcp` with the same bearer token as any MCP client, so there is no second endpoint to protect. Off by default |
 | `CUBA_PANEL_PUBLIC` | unset | Without it, `/panel` refuses any request carrying a forwarding header (`Forwarded`, `X-Forwarded-For`, `CF-Connecting-IP` and six more) — the signature of an HTTP proxy. The Cloudflare tunnel connects to `127.0.0.1`, so the client address is loopback either way and only the header tells the two apart. **What it does not catch**: a raw TCP forward (`ssh -L`, `socat`, `ngrok tcp`) adds no header and is indistinguishable from a local request, so this stops HTTP proxies rather than proving a request is local. Set to `1` to publish the panel deliberately |
 | `CUBA_PEER_URL` | unset | Default address of the other daemon for `cuba_sync action=fetch`, e.g. `https://brain.example.net`. Only a fallback: the address is remembered per peer name after the first successful fetch |
@@ -558,6 +559,8 @@ cargo build --release --features docs,cuda
 
 ./scripts/demo.sh                  # runs on a throwaway Postgres it removes on exit
 ./scripts/merge-gate.sh            # local CI 100% — sole merge judge (see docs/gate.md)
+./scripts/como-el-ci.sh todo       # same SIL
+./scripts/quality-gate.sh          # second judge: CRAP + mutants of rust/src in the diff
 cargo run --release --example rerank_bench   # does the reranker fit its budget here?
 ```
 

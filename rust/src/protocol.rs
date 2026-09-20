@@ -1315,7 +1315,7 @@ async fn list_resources(pool: &PgPool) -> Result<Value> {
         .flatten();
     let snapshots: Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "SELECT id, created_at FROM brain_compaction_snapshots
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          ORDER BY created_at DESC LIMIT 20",
     )
     .bind(scope)
@@ -1451,7 +1451,7 @@ async fn read_resource(pool: &PgPool, uri: &str) -> Result<Value> {
             .flatten();
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT summary_md FROM brain_compaction_snapshots
-             WHERE id = $1 AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+             WHERE id = $1 AND ($2::uuid IS NULL OR project_id = $2)",
         )
         .bind(id)
         .bind(scope)

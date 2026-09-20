@@ -1,0 +1,81 @@
+---
+description: Preflight, anti-sobreingeniería, CI-as-gate, anti-patrones — este repo gana
+alwaysApply: true
+---
+
+# Gobernanza (MemoryIndustry)
+
+## 0. Antes de tocar nada
+
+1. Memoria: `cuba_faro` / `cuba_expediente` (MCP `cuba_*`; alias `memory_*`).
+2. Leer lo que ya existe. Buscar el handler, el contrato o el guion antes de escribir uno nuevo.
+3. Prueba de sobre-ingeniería (§1). Si no pasa, se recorta antes de escribir.
+
+## 1. Sobre-ingeniería: lo que NO se escribe
+
+¿Qué se podría borrar y el programa seguiría haciendo lo pedido? Eso no se escribe.
+
+- Una abstracción con un solo llamante es una capa.
+- Cero configuración para lo que nunca varía.
+- Cero dependencia nueva si std lo resuelve en veinte líneas.
+- Cero fichero nuevo si cabe donde ya vive lo parecido.
+- Cero manejo de errores especulativo.
+- Cero código para un futuro hipotético.
+- Cero refactor de paso.
+- Cero envoltorio que solo renombra.
+
+### Comentarios: el PORQUÉ se queda
+
+Este repo **no** es «cero comentarios». Los comentarios de migraciones, gate, RLS y contratos son load-bearing: un SHA y un `include_str!` los leen.
+
+- Un comentario que dice QUÉ hace la línea sobra. Se renombra.
+- Lo que merece comentario es el PORQUÉ: la decisión rara, el bug que obliga, el número medido.
+- Cero código comentado. Cero TODO sin dueño.
+- Un comentario que contradice al código es peor que ninguno.
+- No aplicar `rust.mdc` genérico ni «cero comentarios en `.rs`» de Mapupita-Rust.
+
+## 2. El CI es la puerta
+
+Un comando replica el CI: `./scripts/merge-gate.sh` (alias `./scripts/como-el-ci.sh todo`).
+
+- `scripts/quality-gate.sh` es el **segundo** juez (CRAP/mutación del diff). Se encadena; no sustituye al SIL.
+- Nada se declara mergeable sin haber corrido el SIL **en este turno**.
+- El gate imprime lo que NO mira.
+- Un test saltado no es un test verde.
+- Un verificador que no puede fallar no es una comprobación.
+
+## 3. Identidad y stack
+
+- **Mapupita / Leandro** — MCP, memoria de agentes, Rust.
+- Hablar en español; código, commits, PRs y docs de producto en inglés (salvo comentarios de lección en el gate).
+- Stack de **este** árbol: Rust edición 2024, PostgreSQL 18 + pgvector, MCP `cuba_*`.
+- Doctrina: integridad transaccional, tipos estrictos, errores manejados. Aquí el daño no es físico de planta: es un agente que recuerda mal o filtra el tenant.
+
+## 4. Cómo responder
+
+Directo. Sin disclaimers. Si algo no se puede hacer, una frase y se sigue.
+
+## 5. Anti-alucinación
+
+- Ruta dudosa → listar o abrir. Nunca inventar.
+- Esquema dudoso → medir la base (o `verificador-esquema`). Nunca inventar una columna.
+- API dudosa → docs actuales. Nunca asumir de memoria.
+- Si no se puede verificar, se declara.
+
+## 6. Detección de proyecto
+
+`AGENTS.md` de este repo manda sobre este fichero y sobre `~/.cursor/rules`. El juez es `merge-gate.sh`, no `cargo test` suelto.
+
+## 7. Anti-patrones (PROHIBIDOS)
+
+- AP1 Arreglo a escopetazos
+- AP2 Amnesia (sin preflight)
+- AP3 Fallo en silencio
+- AP4 Deriva de API
+- AP5 Cascada de suposiciones
+- AP6 Verificación aproximada
+- AP7 Corrida imaginaria
+- AP8 Terminado parcial
+- AP9 Reporte por síntoma
+- AP10 Sobre-ingeniería
+- AP11 Verde falso

@@ -1,0 +1,16 @@
+---
+description: Handoff YAML estricto — un script valida; malformado no es entrega
+alwaysApply: true
+---
+
+# Handoff
+
+Cada entrega entre roles es un fichero `.cursor/handoffs/*.yml` con exactamente:
+
+- `from`, `to`: `especificador` | `implementador` | `mejorador` | `arquitecto` | `endurecedor` | `qa`
+- `type`: `git_handoff` | `note`
+- `task`: una línea
+- `commit`: hash o `none` (solo `note`)
+- `evidence`: comando corrido + resultado (o `none` en specifier)
+
+El receptor no avanza si `scripts/validar-handoff.sh` falla. No hay entrega «de palabra».

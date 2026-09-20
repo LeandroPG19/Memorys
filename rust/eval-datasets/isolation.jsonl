@@ -1,0 +1,3 @@
+{"query": "secret of a different project must not be recalled", "relevant_markers": [], "ability": "isolation", "abstain": true, "question_class": "isolation"}
+{"query": "error de conexión postgres", "relevant_markers": ["error", "postgres"], "ability": "isolation", "question_class": "errors"}
+{"query": "E2E Test Decision", "relevant_markers": ["E2E Test Decision"], "ability": "isolation", "question_class": "decreto"}

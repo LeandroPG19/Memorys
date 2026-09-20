@@ -59,7 +59,7 @@ async fn an_isolated_entity_gets_wired_into_the_graph_from_its_own_notes() {
     for neighbour in ["Rust", "Docker", "PostgreSQL"] {
         sqlx::query(
             "INSERT INTO brain_entities (name, entity_type) VALUES ($1, 'tech')
-             ON CONFLICT (name) DO NOTHING",
+             ON CONFLICT ON CONSTRAINT uq_brain_entities_name_project DO NOTHING",
         )
         .bind(neighbour)
         .execute(&pool)

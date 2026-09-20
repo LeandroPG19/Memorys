@@ -65,6 +65,7 @@ OPERATIONS:
   llm               pick a chat model the easy way (DeepSeek/Qwen/Ollama/…); saves config
   graph             optional FalkorDB/Neo4j projection status|reconcile (Postgres stays SoT)
   secure            create the non-superuser cuba_app role so RLS and the audit trigger bite
+  project backfill  assign leftover NULL project_id rows to a named project (dry-run; --apply writes)
 
   -h, --help        this
   -V, --version     print the version and exit — touches no database
@@ -231,6 +232,14 @@ async fn async_main() {
             if let Err(e) = memory_industry::hooks_cli::run_cli(&argv[2..]).await {
                 tracing::error!(error = %format!("{e:#}"), "hook failed");
                 eprintln!("hook error: {e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("project") => {
+            if let Err(e) = memory_industry::cli::run_project(&argv[2..]).await {
+                tracing::error!(error = %format!("{e:#}"), "project failed");
+                eprintln!("project: {e:#}");
                 std::process::exit(1);
             }
             return;

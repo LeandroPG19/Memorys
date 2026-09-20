@@ -71,7 +71,7 @@ async fn list(pool: &PgPool, args: &Value) -> Result<Value> {
          FROM brain_artifacts
          WHERE (
                 ($1::uuid IS NULL AND project_id IS NULL)
-             OR ($1::uuid IS NOT NULL AND (project_id IS NOT DISTINCT FROM $1 OR project_id IS NULL))
+             OR ($1::uuid IS NOT NULL AND (project_id IS NOT DISTINCT FROM $1))
            )
            AND ($2 = '' OR path LIKE $2 || '%')
          ORDER BY path
@@ -126,7 +126,7 @@ async fn get(pool: &PgPool, args: &Value) -> Result<Value> {
          WHERE path = $1
            AND (
                 ($2::uuid IS NULL AND project_id IS NULL)
-             OR ($2::uuid IS NOT NULL AND (project_id IS NOT DISTINCT FROM $2 OR project_id IS NULL))
+             OR ($2::uuid IS NOT NULL AND (project_id IS NOT DISTINCT FROM $2))
            )
          ORDER BY updated_at DESC
          LIMIT 1",
@@ -318,7 +318,7 @@ async fn patch(pool: &PgPool, args: &Value) -> Result<Value> {
          WHERE path = $1
            AND (
                 ($2::uuid IS NULL AND project_id IS NULL)
-             OR ($2::uuid IS NOT NULL AND (project_id IS NOT DISTINCT FROM $2 OR project_id IS NULL))
+             OR ($2::uuid IS NOT NULL AND (project_id IS NOT DISTINCT FROM $2))
            )
          LIMIT 1",
     )

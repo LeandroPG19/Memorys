@@ -22,7 +22,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         "SELECT content, tag FROM brain_wm
          WHERE expires_at > NOW()
            AND session_id IS NOT DISTINCT FROM $1
-           AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)
+           AND ($2::uuid IS NULL OR project_id = $2)
          ORDER BY created_at DESC
          LIMIT 20",
     )
@@ -54,7 +54,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         "SELECT path, version, content_hash FROM brain_artifacts
          WHERE (
                 ($1::uuid IS NULL AND project_id IS NULL)
-             OR ($1::uuid IS NOT NULL AND (project_id IS NOT DISTINCT FROM $1 OR project_id IS NULL))
+             OR ($1::uuid IS NOT NULL AND project_id IS NOT DISTINCT FROM $1)
            )
          ORDER BY updated_at DESC
          LIMIT 30",
@@ -71,7 +71,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
              JOIN brain_entities e ON e.id = o.entity_id
              WHERE o.session_id = $1
                AND o.observation_type != 'superseded'
-               AND ($2::uuid IS NULL OR o.project_id = $2 OR o.project_id IS NULL)
+               AND ($2::uuid IS NULL OR o.project_id = $2)
              ORDER BY o.created_at DESC
              LIMIT 8",
         )
@@ -107,7 +107,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                  WHERE e.name = ANY($1)
                    AND o.observation_type != 'superseded'
                    AND o.trust = 'trusted'
-                   AND ($2::uuid IS NULL OR o.project_id = $2 OR o.project_id IS NULL)
+                   AND ($2::uuid IS NULL OR o.project_id = $2)
                  ORDER BY o.importance DESC NULLS LAST, o.created_at DESC
                  LIMIT 8",
             )
@@ -125,7 +125,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         "SELECT e.name, left(o.content, 240), o.importance::float8
          FROM brain_observations o
          JOIN brain_entities e ON e.id = o.entity_id
-         WHERE ($1::uuid IS NULL OR o.project_id = $1 OR o.project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR o.project_id = $1)
          ORDER BY o.importance DESC NULLS LAST, o.updated_at DESC NULLS LAST
          LIMIT 15",
     )

@@ -3,3 +3,4 @@
 *.sh text eol=lf
 AGENTS.md text eol=lf
 docs/gate.md text eol=lf
+*.mdc text eol=lf

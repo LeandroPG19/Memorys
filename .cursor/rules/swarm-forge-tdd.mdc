@@ -1,0 +1,12 @@
+---
+description: TDD — el test de comportamiento se escribe y se ve rojo antes del código
+alwaysApply: true
+---
+
+# TDD
+
+El **test de comportamiento** (unidad, contrato o e2e desde Gherkin) se escribe **antes** de la implementación. Rojo → código → verde. Encaja con `testear-hasta-rojo.mdc`.
+
+Prohibido implementar primero y «cubrir después». Un test que nunca estuvo rojo no está verificado.
+
+El implementador razona el rojo si no puede ejecutar; el padre o `tester`/`qa` lo corre. Afirmar rojo sin corrida ni razonamiento concreto es mentira.

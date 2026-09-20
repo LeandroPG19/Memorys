@@ -20,7 +20,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
     let result = sqlx::query(
         "UPDATE brain_errors SET solution = $2, resolved = true, resolved_at = NOW()
          WHERE id = $1
-           AND ($3::uuid IS NULL OR project_id = $3 OR project_id IS NULL)",
+           AND ($3::uuid IS NULL OR project_id = $3)",
     )
     .bind(error_id)
     .bind(solution)

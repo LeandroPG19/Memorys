@@ -29,6 +29,14 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             let to = required_str(&args, "to")?;
             merge(pool, from, to).await
         }
+        "backfill" => {
+            let name = required_str(&args, "name")?;
+            let confirm = args
+                .get("confirm")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            backfill(pool, name, confirm).await
+        }
         _ => anyhow::bail!("Invalid action: {action}"),
     }
 }
@@ -102,6 +110,7 @@ async fn switch(pool: &PgPool, name: &str) -> Result<Value> {
 
     let updated: Option<(Uuid,)> = match crate::session::session_id() {
         Some(sid) => {
+            let mut tx = project::begin_write_scope(pool).await?;
             let row: Option<(Uuid,)> = sqlx::query_as(
                 "UPDATE brain_sessions SET project_id = $1
                  WHERE id = $2 AND ended_at IS NULL
@@ -109,8 +118,9 @@ async fn switch(pool: &PgPool, name: &str) -> Result<Value> {
             )
             .bind(pid)
             .bind(sid)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?;
+            tx.commit().await?;
             if row.is_some() {
                 crate::session::set(sid, Some(pid));
             }
@@ -123,6 +133,16 @@ async fn switch(pool: &PgPool, name: &str) -> Result<Value> {
         "action": "switch",
         "project": {"id": pid.to_string(), "name": name},
         "bound_to_session": updated.map(|(id,)| id.to_string()),
+    }))
+}
+
+async fn backfill(pool: &PgPool, name: &str, confirm: bool) -> Result<Value> {
+    let pid = project::upsert_project(pool, name).await?;
+    let body = project::backfill_unscoped(pool, pid, confirm).await?;
+    Ok(serde_json::json!({
+        "action": "backfill",
+        "project": {"id": pid.to_string(), "name": name},
+        "result": body,
     }))
 }
 

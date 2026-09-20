@@ -68,15 +68,35 @@ fn desired_config() -> Result<Value> {
             .to_string()
     });
 
+    let mut env = json!({
+        "DATABASE_URL": db,
+        "ONNX_MODEL_PATH": onnx,
+        "ORT_DYLIB_PATH": ort,
+    });
+    if let Some(id) = workspace_client_id() {
+        env["MEMORY_INDUSTRY_CLIENT_ID"] = json!(id);
+    }
+
     Ok(json!({
         "command": exe.display().to_string(),
         "args": [],
-        "env": {
-            "DATABASE_URL": db,
-            "ONNX_MODEL_PATH": onnx,
-            "ORT_DYLIB_PATH": ort,
-        }
+        "env": env
     }))
+}
+
+fn workspace_client_id() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    if !(cwd.join(".git").exists()
+        || cwd.join("Cargo.toml").exists()
+        || cwd.join(".mcp.json").exists())
+    {
+        return None;
+    }
+    let name = cwd.file_name()?.to_str()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 fn prefer_cache_subdir(subdir: &str) -> PathBuf {
@@ -97,6 +117,32 @@ fn read_json(path: &Path) -> Option<Value> {
 
 const MCP_SERVER_KEY: &str = "memory-industry";
 const MCP_SERVER_KEY_LEGACY: &str = "cuba-memorys";
+
+fn http_config_problem(block: &Value) -> Option<String> {
+    let url = block.get("url").and_then(Value::as_str).unwrap_or("");
+    if url.contains(":8788") {
+        return Some(
+            "URL en :8788 — ese puerto es el OAuth de Cursor, no MemoryIndustry (8787)".into(),
+        );
+    }
+    if url.is_empty() {
+        return None;
+    }
+    let headers = block.get("headers").and_then(Value::as_object);
+    let has_id = headers.is_some_and(|h| {
+        h.get("Mcp-Client-Id")
+            .or_else(|| h.get("mcp-client-id"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    });
+    if !has_id {
+        return Some(
+            "HTTP sin header Mcp-Client-Id — todos los workspaces compartirían la misma jornada"
+                .into(),
+        );
+    }
+    None
+}
 
 fn cuba_block(cfg: &Value) -> Option<&Value> {
     let servers = cfg.get("mcpServers")?;
@@ -131,6 +177,10 @@ fn run_check() -> Result<()> {
         println!("── {name}  ({})", path.display());
         let command = block.get("command").and_then(Value::as_str).unwrap_or("");
         println!("   command: {command}");
+        if let Some(why) = http_config_problem(block) {
+            println!("   PROBLEMA: {why}");
+            problems += 1;
+        }
         if !command.is_empty() && !Path::new(command).exists() {
             println!("   PROBLEMA: ese binario no existe");
             problems += 1;
@@ -245,6 +295,11 @@ fn run_write(target: &str, apply: bool) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({ "mcpServers": { MCP_SERVER_KEY: desired } }))?
+    );
+    println!();
+    println!(
+        "Si el cliente es HTTP (`serve`): url http://127.0.0.1:8787/mcp y un header \
+         Mcp-Client-Id distinto por workspace. 8788 es el OAuth de Cursor — no lo uses."
     );
     println!();
 
@@ -444,6 +499,24 @@ mod tests {
     fn the_vars_that_must_agree_include_the_dimension() {
         assert!(MUST_AGREE.contains(&"CUBA_EMBEDDING_DIM"));
         assert!(MUST_AGREE.contains(&"CUBA_EMBED_MODEL"));
+    }
+
+    #[test]
+    fn http_on_cursor_oauth_is_a_problem() {
+        let bad = json!({"url": "http://127.0.0.1:8788/mcp"});
+        assert!(http_config_problem(&bad).expect("8788").contains("8788"));
+        let no_id = json!({"url": "http://127.0.0.1:8787/mcp"});
+        assert!(
+            http_config_problem(&no_id)
+                .expect("missing client id")
+                .contains("Mcp-Client-Id")
+        );
+        let ok = json!({
+            "url": "http://127.0.0.1:8787/mcp",
+            "headers": {"Mcp-Client-Id": "Memorys"}
+        });
+        assert_eq!(http_config_problem(&ok), None);
+        assert_eq!(http_config_problem(&json!({"command": "/bin/x"})), None);
     }
 
     #[test]

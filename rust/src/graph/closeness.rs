@@ -69,7 +69,7 @@ async fn fetch_adjacency(pool: &PgPool) -> Result<HashMap<Uuid, Vec<Uuid>>> {
     let edges: Vec<(Uuid, Uuid, bool)> = sqlx::query_as(
         "SELECT from_entity, to_entity, bidirectional
          FROM brain_relations
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+         WHERE ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_all(pool)

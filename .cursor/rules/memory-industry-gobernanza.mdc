@@ -1,0 +1,18 @@
+---
+description: Este repo gana si choca con rust.mdc / governance genéricos / cero comentarios
+alwaysApply: true
+---
+
+# Gobernanza de MemoryIndustry sobre el perfil
+
+Las reglas del perfil (`governance`, `el-gate-es-el-juez`, Swarm Forge) aplican.
+Cuando choquen con `AGENTS.md` de **este** repo, manda el repo.
+
+No aplicar aquí como alwaysApply:
+
+- `rust.mdc` genérico (mimalloc, serde camelCase, clippy distinto)
+- `python.mdc` / `fastapi.mdc` como si este crate fuera Python
+- Mapupita-Rust's no-comments-in-Rust-sources rule
+- `mapupita-guardian-planta`, `mapupita-e2e` (Playwright), `mapupita-react-query`
+
+No sustituir `.cursor/rules` de este repo por un junction a `~/.cursor/rules`.

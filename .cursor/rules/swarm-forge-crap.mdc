@@ -1,0 +1,13 @@
+---
+description: CRAP — complejidad y cobertura las imprime un script, no el modelo
+alwaysApply: true
+---
+
+# CRAP
+
+Change Risk Anti-Patterns: complejidad ciclomática combinada con hueco de cobertura. El **número lo imprime** un script, no una opinión.
+
+- **SIL / piso**: `scripts/crap-gate.sh` (line coverage `CRAP_MIN_LINE_COV`, default 15%). Vive dentro de `merge-gate.sh`.
+- **Diff**: `scripts/quality-gate.sh` (lizard sobre `rust/src` tocado). Puerta: ninguna función **nueva** por encima de CRAP 6; ninguna existente sube frente a `HEAD`. CC ≤ 4 **orienta**; no se parte una función de un solo trabajo para bajar el número.
+
+El cleaner (`mejorador`) baja funciones que el script reporta.

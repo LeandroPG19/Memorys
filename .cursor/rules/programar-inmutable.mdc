@@ -1,0 +1,11 @@
+---
+description: Programar inmutable — fixtures desechables, pending no es denegado, medir antes de afirmar
+alwaysApply: true
+---
+
+# Programar inmutable
+
+- El corpus vivo no se parchea a mano para que un test pase. El test crea su mundo (`brain_gate` / peer) y lo tira.
+- Fixtures desechables. No mutar datos compartidos ni «arreglar la fila» en `brain`.
+- Pending / loading / `observations_pending_review` no es denegado, vacío ni cero. Cuarentena no es «no existe».
+- No afirmar «listo», «más rápido» o «cubierto» sin el comando y el número de este turno. Si no se midió, se dice «no lo medí».

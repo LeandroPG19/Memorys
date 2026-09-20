@@ -39,7 +39,7 @@ async fn summary(pool: &PgPool) -> Result<Value> {
 
     let entities: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM brain_entities
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+         WHERE ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_one(pool)
@@ -47,35 +47,35 @@ async fn summary(pool: &PgPool) -> Result<Value> {
     let observations: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM brain_observations
          WHERE observation_type != 'superseded'
-           AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+           AND ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_one(pool)
     .await?;
     let relations: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM brain_relations
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+         WHERE ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_one(pool)
     .await?;
     let errors: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM brain_errors
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+         WHERE ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_one(pool)
     .await?;
     let sessions: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM brain_sessions
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+         WHERE ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_one(pool)
     .await?;
     let episodes: i64 = sqlx::query_as::<_, (i64,)>(
         "SELECT COUNT(*) FROM brain_episodes
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+         WHERE ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_one(pool)
@@ -102,7 +102,7 @@ async fn health(pool: &PgPool) -> Result<Value> {
 
     let avg_importance: (Option<f64>,) = sqlx::query_as(
         "SELECT AVG(importance)::float8 FROM brain_entities
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+         WHERE ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_one(pool)
@@ -111,7 +111,7 @@ async fn health(pool: &PgPool) -> Result<Value> {
     let stale_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM brain_observations
          WHERE last_accessed < NOW() - INTERVAL '30 days'
-           AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+           AND ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_one(pool)
@@ -120,7 +120,7 @@ async fn health(pool: &PgPool) -> Result<Value> {
     let unused_entities: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM brain_entities
          WHERE access_count = 0
-           AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+           AND ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_one(pool)
@@ -133,7 +133,7 @@ async fn health(pool: &PgPool) -> Result<Value> {
 
     let type_counts: Vec<(String, i64)> = sqlx::query_as(
         "SELECT entity_type, COUNT(*) FROM brain_entities
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          GROUP BY entity_type",
     )
     .bind(project_id)
@@ -149,7 +149,7 @@ async fn health(pool: &PgPool) -> Result<Value> {
 
     let obs_counts: Vec<(String, i64)> = sqlx::query_as(
         "SELECT observation_type, COUNT(*) FROM brain_observations
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          GROUP BY observation_type",
     )
     .bind(project_id)
@@ -168,12 +168,12 @@ async fn health(pool: &PgPool) -> Result<Value> {
     let err_stats: (i64, i64, Option<f64>) = sqlx::query_as(
         "SELECT \
             (SELECT COUNT(*) FROM brain_errors WHERE resolved \
-              AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)), \
+              AND ($1::uuid IS NULL OR project_id = $1)), \
             (SELECT COUNT(*) FROM brain_errors \
-              WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)), \
+              WHERE ($1::uuid IS NULL OR project_id = $1)), \
             (SELECT AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)))::float8 \
              FROM brain_errors WHERE resolved AND resolved_at IS NOT NULL \
-               AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL))",
+               AND ($1::uuid IS NULL OR project_id = $1))",
     )
     .bind(project_id)
     .fetch_one(pool)
@@ -188,7 +188,7 @@ async fn health(pool: &PgPool) -> Result<Value> {
     let null_embeddings: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM brain_observations
          WHERE embedding IS NULL AND observation_type != 'superseded'
-           AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+           AND ($1::uuid IS NULL OR project_id = $1)",
     )
     .bind(project_id)
     .fetch_one(pool)
@@ -245,7 +245,7 @@ async fn drift(pool: &PgPool) -> Result<Value> {
     let recent: Vec<(String, i64)> = sqlx::query_as(
         "SELECT error_type, COUNT(*) FROM brain_errors \
          WHERE created_at > NOW() - INTERVAL '7 days' \
-           AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL) \
+           AND ($1::uuid IS NULL OR project_id = $1) \
          GROUP BY error_type",
     )
     .bind(project_id)
@@ -255,7 +255,7 @@ async fn drift(pool: &PgPool) -> Result<Value> {
     let historical: Vec<(String, f64)> = sqlx::query_as(
         "SELECT error_type, COUNT(*)::float8 / 4.0 FROM brain_errors \
          WHERE created_at BETWEEN NOW() - INTERVAL '37 days' AND NOW() - INTERVAL '7 days' \
-           AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL) \
+           AND ($1::uuid IS NULL OR project_id = $1) \
          GROUP BY error_type",
     )
     .bind(project_id)
@@ -321,7 +321,7 @@ async fn communities(pool: &PgPool) -> Result<Value> {
             let project_id = crate::project::current_project_id(pool).await?;
             let components: Vec<(String, i64)> = sqlx::query_as(
                 "SELECT e.entity_type, COUNT(*) FROM brain_entities e \
-                 WHERE ($1::uuid IS NULL OR e.project_id = $1 OR e.project_id IS NULL) \
+                 WHERE ($1::uuid IS NULL OR e.project_id = $1) \
                  GROUP BY e.entity_type ORDER BY COUNT(*) DESC",
             )
             .bind(project_id)
@@ -365,7 +365,7 @@ async fn bridges(pool: &PgPool) -> Result<Value> {
             let bridges: Vec<(String, i64)> = sqlx::query_as(
                 "SELECT e.name, COUNT(r.id) as connection_count FROM brain_entities e
                  LEFT JOIN brain_relations r ON e.id = r.from_entity OR e.id = r.to_entity
-                 WHERE ($1::uuid IS NULL OR e.project_id = $1 OR e.project_id IS NULL)
+                 WHERE ($1::uuid IS NULL OR e.project_id = $1)
                  GROUP BY e.name HAVING COUNT(r.id) > 2
                  ORDER BY connection_count DESC LIMIT 10",
             )

@@ -61,6 +61,19 @@ fn literal_test_names(yaml: &str) -> Vec<String> {
 }
 
 #[test]
+fn github_actions_declares_it_is_not_the_merge_judge() {
+    let yaml = ci_yaml();
+    assert!(
+        yaml.contains("This workflow is not mergeable"),
+        "ci.yml must say out loud that a green badge is not mergeable — the judge is merge-gate.sh"
+    );
+    assert!(
+        yaml.contains("merge-gate.sh"),
+        "ci.yml must name the local SIL so a reader is not sent to the badge"
+    );
+}
+
+#[test]
 fn the_integration_step_discovers_tests_by_glob_not_by_a_hand_written_list() {
     let yaml = ci_yaml();
     assert!(

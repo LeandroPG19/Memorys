@@ -9,6 +9,13 @@ DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain
 
 COUNTED_TABLES=(brain_observations brain_entities brain_relations brain_episodes brain_audit_log)
 
+# Same names as rust/src/setup.rs. compose.yml is memory-industry-db;
+# cuba-memorys-db is the pre-rebrand container. Host pg_dump is 16 and
+# cannot dump the PG 18 cluster — that path is last resort only.
+pg_container() {
+  docker ps --format '{{.Names}}' 2>/dev/null | tr -d '\r' | grep -Ex 'memory-industry-db|cuba-memorys-db' | head -1
+}
+
 mkdir -p "$BACKUP_DIR"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -16,13 +23,11 @@ OUT="$BACKUP_DIR/brain_${STAMP}.dump"
 PART="$OUT.part"
 META="$BACKUP_DIR/brain_${STAMP}.meta.json"
 
-in_container() {
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'cuba-memorys-db'
-}
+PG_CONTAINER="$(pg_container || true)"
 
 run_psql() {
-  if in_container; then
-    docker exec cuba-memorys-db psql -U cuba -d brain -Atc "$1"
+  if [[ -n "${PG_CONTAINER:-}" ]]; then
+    docker exec "$PG_CONTAINER" psql -U cuba -d brain -Atc "$1"
   else
     psql "$DATABASE_URL" -Atc "$1"
   fi
@@ -46,22 +51,22 @@ done
 # by the postmaster, and an adopted child exiting non-zero makes the postmaster
 # restart the whole cluster. Measured 2026-08-14 — recovery is automatic and
 # nothing was lost, but do not kill a running backup.
-if in_container; then
-  echo "Using pg_dump from container cuba-memorys-db (PG18)."
-  docker exec cuba-memorys-db pg_dump -U cuba -d brain \
+if [[ -n "${PG_CONTAINER:-}" ]]; then
+  echo "Using pg_dump from container $PG_CONTAINER (PG18)."
+  docker exec "$PG_CONTAINER" pg_dump -U cuba -d brain \
     --format=custom --no-owner --no-acl >"$PART"
 elif command -v pg_dump >/dev/null 2>&1; then
   echo "Using host pg_dump."
-  pg_dump "$DATABASE_URL" --format=custom --no-owner --no-acl --file="$PART"
+  pg_dump --format=custom --no-owner --no-acl --file="$PART" "$DATABASE_URL"
 else
-  echo "error: no pg_dump and cuba-memorys-db container not running." >&2
+  echo "error: no pg_dump and neither memory-industry-db nor cuba-memorys-db is running." >&2
   exit 1
 fi
 
 echo "Verifying the dump before trusting it ..."
 
-if in_container; then
-  TOC="$(docker exec -i cuba-memorys-db pg_restore --list </"$PART" 2>&1)" || {
+if [[ -n "${PG_CONTAINER:-}" ]]; then
+  TOC="$(docker exec -i "$PG_CONTAINER" pg_restore --list <"$PART" 2>&1)" || {
     echo "FAIL: pg_restore --list cannot read the dump. It is unusable." >&2
     exit 1
   }

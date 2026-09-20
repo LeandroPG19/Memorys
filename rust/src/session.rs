@@ -19,6 +19,8 @@ static DAEMON: AtomicBool = AtomicBool::new(false);
 
 tokio::task_local! {
     static CLIENT: String;
+    static CLIENT_LABEL: String;
+    static MCP_SESSION: String;
     static SCOPE: Scope;
 }
 
@@ -60,6 +62,44 @@ pub fn current_client() -> Option<String> {
     CLIENT.try_with(|c| c.clone()).ok()
 }
 
+pub fn configured_client_label() -> Option<String> {
+    std::env::var("MEMORY_INDUSTRY_CLIENT_ID")
+        .or_else(|_| std::env::var("CUBA_CLIENT_ID"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn current_client_label() -> Option<String> {
+    CLIENT_LABEL
+        .try_with(|c| c.clone())
+        .ok()
+        .or_else(|| current_client().map(client_label_of))
+        .or_else(configured_client_label)
+}
+
+pub fn current_mcp_session() -> Option<String> {
+    MCP_SESSION
+        .try_with(|s| s.clone())
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+pub fn bind_key(client: &str, mcp_session: Option<&str>) -> String {
+    match mcp_session {
+        Some(s) if !s.is_empty() => format!("{client}::{s}"),
+        _ => client.to_string(),
+    }
+}
+
+fn client_label_of(bind: String) -> String {
+    bind.split("::")
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&bind)
+        .to_string()
+}
+
 pub async fn with_client<F, R>(key: String, fut: F) -> R
 where
     F: std::future::Future<Output = R>,
@@ -67,12 +107,26 @@ where
     CLIENT.scope(key, fut).await
 }
 
+pub async fn with_identity<F, R>(label: String, mcp_session: Option<String>, fut: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    let bind = bind_key(&label, mcp_session.as_deref());
+    let session = mcp_session.unwrap_or_default();
+    CLIENT_LABEL
+        .scope(label, MCP_SESSION.scope(session, CLIENT.scope(bind, fut)))
+        .await
+}
+
 pub fn forget_client(key: &str) {
+    let prefix = format!("{key}::");
     if let Ok(mut guard) = PER_CLIENT.write() {
         guard.remove(key);
+        guard.retain(|k, _| !k.starts_with(&prefix));
     }
     if let Ok(mut guard) = CLIENT_ROOTS.write() {
         guard.remove(key);
+        guard.retain(|k, _| !k.starts_with(&prefix));
     }
 }
 
@@ -196,6 +250,43 @@ pub fn session_id() -> Option<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blank_env_client_id_is_not_an_identity() {
+        let prev_a = std::env::var("MEMORY_INDUSTRY_CLIENT_ID").ok();
+        let prev_b = std::env::var("CUBA_CLIENT_ID").ok();
+        unsafe {
+            std::env::set_var("MEMORY_INDUSTRY_CLIENT_ID", "   ");
+            std::env::remove_var("CUBA_CLIENT_ID");
+        }
+        assert_eq!(
+            configured_client_label(),
+            None,
+            "whitespace is not a workspace identity"
+        );
+        unsafe {
+            match prev_a {
+                Some(v) => std::env::set_var("MEMORY_INDUSTRY_CLIENT_ID", v),
+                None => std::env::remove_var("MEMORY_INDUSTRY_CLIENT_ID"),
+            }
+            match prev_b {
+                Some(v) => std::env::set_var("CUBA_CLIENT_ID", v),
+                None => std::env::remove_var("CUBA_CLIENT_ID"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_protocol_session_is_not_the_same_client_as_the_window() {
+        assert_eq!(bind_key("cursor", None), "cursor");
+        assert_eq!(
+            bind_key("cursor", Some("chat-9")),
+            "cursor::chat-9",
+            "two Cursor chats share Mcp-Client-Id=cursor; without the protocol session \
+             they inherit each other's jornada"
+        );
+        assert_eq!(bind_key("cursor", Some("")), "cursor");
+    }
 
     #[test]
     fn a_root_uri_becomes_the_name_of_the_directory_it_points_at() {
@@ -333,6 +424,115 @@ mod tests {
 
         with_client("ephemeral".to_string(), async {
             assert_eq!(session_id(), None, "row is gone after forget_client");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn with_identity_exposes_the_protocol_session() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        with_identity("cursor".into(), Some("chat-a".into()), async {
+            assert_eq!(
+                current_mcp_session().as_deref(),
+                Some("chat-a"),
+                "whoami.mcp_session and the bind key both read this"
+            );
+            assert_eq!(current_client_label().as_deref(), Some("cursor"));
+            assert_eq!(
+                current_client().as_deref(),
+                Some("cursor::chat-a"),
+                "bind_key must join label and protocol session"
+            );
+        })
+        .await;
+        assert_eq!(
+            current_mcp_session(),
+            None,
+            "the protocol session must not leak outside with_identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_protocol_session_is_not_a_session() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        with_identity("cursor".into(), Some(String::new()), async {
+            assert_eq!(
+                current_mcp_session(),
+                None,
+                "empty Mcp-Session-Id must not invent a session (filter !is_empty)"
+            );
+            assert_eq!(
+                current_client().as_deref(),
+                Some("cursor"),
+                "bind_key falls back to the bare client when the session is blank"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_label_strips_the_protocol_session_suffix() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        with_client("cursor::chat-a".into(), async {
+            assert_eq!(
+                current_client_label().as_deref(),
+                Some("cursor"),
+                "CLIENT holds the bind key; the label is the part before ::"
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn a_configured_client_id_is_an_identity() {
+        let prev_a = std::env::var("MEMORY_INDUSTRY_CLIENT_ID").ok();
+        let prev_b = std::env::var("CUBA_CLIENT_ID").ok();
+        unsafe {
+            std::env::set_var("MEMORY_INDUSTRY_CLIENT_ID", "desk-one");
+            std::env::remove_var("CUBA_CLIENT_ID");
+        }
+        assert_eq!(configured_client_label().as_deref(), Some("desk-one"));
+        unsafe {
+            match prev_a {
+                Some(v) => std::env::set_var("MEMORY_INDUSTRY_CLIENT_ID", v),
+                None => std::env::remove_var("MEMORY_INDUSTRY_CLIENT_ID"),
+            }
+            match prev_b {
+                Some(v) => std::env::set_var("CUBA_CLIENT_ID", v),
+                None => std::env::remove_var("CUBA_CLIENT_ID"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forget_client_also_drops_protocol_session_keys() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let one = Uuid::new_v4();
+        let sid = Uuid::new_v4();
+        remember_client_root("cursor::chat-a", one);
+        with_client("cursor::chat-a".into(), async {
+            set(sid, None);
+            assert_eq!(session_id(), Some(sid));
+        })
+        .await;
+        assert_eq!(client_root_project_for("cursor::chat-a"), Some(one));
+
+        forget_client("cursor");
+
+        assert_eq!(
+            client_root_project_for("cursor::chat-a"),
+            None,
+            "forget_client must retain(!starts_with(prefix)) on CLIENT_ROOTS — without \
+             the ! it would keep every protocol-session key and chat-a would leak"
+        );
+        with_client("cursor::chat-a".into(), async {
+            assert_eq!(
+                session_id(),
+                None,
+                "forget_client must retain(!starts_with(prefix)) on PER_CLIENT too — \
+                 the line-125 mutant deleted only that ! and the roots-only assert \
+                 could not see it"
+            );
         })
         .await;
     }

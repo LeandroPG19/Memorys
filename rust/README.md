@@ -31,6 +31,10 @@ cargo build --release
 # Library + unit tests
 cargo test
 
+# Local SIL (GitHub Actions is not the merge judge — see docs/gate.md)
+../scripts/merge-gate.sh
+../scripts/quality-gate.sh
+
 # E2E against a real DB (all 31 tools)
 python3 tests/e2e_all_tools.py
 ```

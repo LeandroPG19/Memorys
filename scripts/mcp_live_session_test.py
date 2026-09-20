@@ -28,12 +28,26 @@ if hasattr(sys.stdout, "reconfigure"):
 
 ROOT = Path(__file__).resolve().parent.parent
 RUST = ROOT / "rust"
-BINARY = Path(
-    os.environ.get(
-        "CUBA_BINARY_PATH",
-        str(RUST / "target" / "release" / "cuba-memorys"),
+
+
+def _resolve_binary() -> Path:
+    raw = Path(
+        os.environ.get(
+            "CUBA_BINARY_PATH",
+            str(RUST / "target" / "release" / "cuba-memorys"),
+        )
     )
-)
+    if raw.is_file():
+        return raw
+    # Git Bash `test -f memory-industry` is true for memory-industry.exe;
+    # native Python Path.is_file() is not.
+    exe = Path(str(raw) + ".exe") if raw.suffix.lower() != ".exe" else raw
+    if exe.is_file():
+        return exe
+    return raw
+
+
+BINARY = _resolve_binary()
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://cuba:memorys2026@127.0.0.1:5488/brain"
 )

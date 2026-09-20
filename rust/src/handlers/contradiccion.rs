@@ -57,8 +57,8 @@ async fn scan_entity(pool: &PgPool, entity_name: &str) -> Result<Value> {
            AND b.observation_type NOT IN ('superseded', 'tool_usage')
            AND (1.0 - (a.embedding <=> b.embedding)) BETWEEN 0.3 AND 0.85
            AND a.entity_id = (SELECT id FROM brain_entities WHERE name = $1)
-           AND ($2::uuid IS NULL OR a.project_id = $2 OR a.project_id IS NULL)
-           AND ($2::uuid IS NULL OR b.project_id = $2 OR b.project_id IS NULL)
+           AND ($2::uuid IS NULL OR a.project_id = $2)
+           AND ($2::uuid IS NULL OR b.project_id = $2)
          ORDER BY cosine_sim DESC
          LIMIT 20",
     )
@@ -88,7 +88,7 @@ async fn scan_top_entities(pool: &PgPool) -> Result<Value> {
          JOIN brain_observations o ON o.entity_id = e.id
          WHERE o.observation_type NOT IN ('superseded', 'tool_usage')
            AND o.embedding IS NOT NULL
-           AND ($1::uuid IS NULL OR o.project_id = $1 OR o.project_id IS NULL)
+           AND ($1::uuid IS NULL OR o.project_id = $1)
          GROUP BY e.name
          HAVING COUNT(*) >= 2
          ORDER BY COUNT(*) DESC
@@ -112,8 +112,8 @@ async fn scan_top_entities(pool: &PgPool) -> Result<Value> {
                AND b.observation_type NOT IN ('superseded', 'tool_usage')
                AND (1.0 - (a.embedding <=> b.embedding)) BETWEEN 0.3 AND 0.85
                AND a.entity_id = (SELECT id FROM brain_entities WHERE name = $1)
-               AND ($2::uuid IS NULL OR a.project_id = $2 OR a.project_id IS NULL)
-               AND ($2::uuid IS NULL OR b.project_id = $2 OR b.project_id IS NULL)
+               AND ($2::uuid IS NULL OR a.project_id = $2)
+               AND ($2::uuid IS NULL OR b.project_id = $2)
              ORDER BY cosine_sim DESC
              LIMIT 5",
         )

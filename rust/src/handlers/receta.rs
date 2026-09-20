@@ -150,7 +150,7 @@ async fn get(pool: &PgPool, args: &Value) -> Result<Value> {
 
     let row = sqlx::query(
         "SELECT * FROM brain_procedures
-         WHERE name = $1 AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)
+         WHERE name = $1 AND ($2::uuid IS NULL OR project_id = $2)
          LIMIT 1",
     )
     .bind(name)
@@ -184,7 +184,7 @@ async fn search(pool: &PgPool, args: &Value) -> Result<Value> {
             "SELECT *, 1 - (embedding <=> $1) AS score
              FROM brain_procedures
              WHERE embedding IS NOT NULL
-               AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)
+               AND ($2::uuid IS NULL OR project_id = $2)
              ORDER BY embedding <=> $1
              LIMIT $3",
         )
@@ -197,7 +197,7 @@ async fn search(pool: &PgPool, args: &Value) -> Result<Value> {
         sqlx::query(
             "SELECT *, similarity(name || ' ' || trigger_context, $1) AS score
              FROM brain_procedures
-             WHERE ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)
+             WHERE ($2::uuid IS NULL OR project_id = $2)
                AND (name || ' ' || trigger_context) % $1
              ORDER BY score DESC
              LIMIT $3",
@@ -244,7 +244,7 @@ async fn outcome(pool: &PgPool, args: &Value) -> Result<Value> {
             last_outcome  = CASE WHEN $1 THEN 'success' ELSE 'failure' END,
             last_used_at  = now(),
             updated_at    = now()
-         WHERE name = $2 AND ($3::uuid IS NULL OR project_id = $3 OR project_id IS NULL)
+         WHERE name = $2 AND ($3::uuid IS NULL OR project_id = $3)
          RETURNING *",
     )
     .bind(ok)
@@ -275,7 +275,7 @@ async fn list(pool: &PgPool, args: &Value) -> Result<Value> {
 
     let rows = sqlx::query(
         "SELECT * FROM brain_procedures
-         WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+         WHERE ($1::uuid IS NULL OR project_id = $1)
          ORDER BY last_used_at DESC NULLS LAST, name
          LIMIT $2",
     )
@@ -300,7 +300,7 @@ async fn delete(pool: &PgPool, args: &Value) -> Result<Value> {
 
     let result = sqlx::query(
         "DELETE FROM brain_procedures
-         WHERE name = $1 AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+         WHERE name = $1 AND ($2::uuid IS NULL OR project_id = $2)",
     )
     .bind(name)
     .bind(project_id)

@@ -3,9 +3,80 @@
 All notable changes to MemoryIndustry (formerly cuba-memorys) are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows
 [SemVer](https://semver.org/) for the Rust crate (`Cargo.toml`). PyPI
-versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.25.0 → PyPI 1.27.0).
+versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI 1.28.0).
 
 ## [Unreleased]
+
+## [0.26.0] — 2026-09-18
+
+### rustls advisory
+
+- `rustls` 0.23.37 → 0.23.45 (`RUSTSEC-2026-0285`). `cargo audit` was the last red of the SIL.
+
+### Live MCP session finds the Windows .exe
+
+- `mcp_live_session_test.py` and the gate prefer `memory-industry.exe`. Git Bash `test -f` treats the extensionless name as present; Python `Path.is_file()` does not.
+
+### Release/E2E honor CARGO_TARGET_DIR
+
+- `build-gpu.sh` and E2E `CUBA_BINARY_PATH` look under `CARGO_TARGET_DIR/release`. After a six-minute CUDA link the gate 127'd on `rust/target/release/cuba-memorys`.
+
+### Relation-scan fixture matches unique-per-project entities
+
+- `v017_relation_scan` seeds neighbours with `ON CONFLICT ON CONSTRAINT uq_brain_entities_name_project`. `ON CONFLICT (name)` died after 0064.
+
+### Isolation tests do not share the process session
+
+- `v041_isolation.rs` takes `GLOBAL_STATE_GUARD`. Parallel tokio tests were writing decreto A under project B (RLS) and searching faro in an empty tenant.
+
+### Unit test isolation
+
+- `a_degraded_extraction_is_an_error_and_leaves_the_observation_unmarked` hides LLM URL/provider and PATH. The SIL requires a generative LLM; without isolation the test saw Ok(empty) instead of no-backend.
+
+### Gate provisioning on Windows
+
+- `gate_bin` honors `CARGO_TARGET_DIR` and `memory-industry.exe`. A sandbox target dir left `rust/target/debug` empty, so doctor never migrated `brain_gate`.
+
+- Host `psql` is called as `psql -d URI -c SQL`. `psql URI -c SQL` on PostgreSQL 16 for Windows ignores `-c`.
+
+### Backup finds the renamed Postgres container
+
+- `backup-db.sh` / `restore-db.sh` / `merge-gate.sh` look for `memory-industry-db` (and the legacy `cuba-memorys-db`). Host pg_dump 16 cannot dump the PG 18 cluster.
+- Verify reads the dump with `<"$PART"` (not `</"$PART"`). Git Bash treats `//d/...` as UNC.
+
+### Swarm Forge / two judges (aligned with Mapupita-Rust, not the plant)
+
+- `.cursor/rules/` is of the repo (no junction to `~/.cursor/rules`). Six-pack, TDD, two judges. Comments stay.
+- `scripts/como-el-ci.sh` aliases the SIL (`todo`/`extra` → `merge-gate.sh`).
+- `scripts/quality-gate.sh` is the second judge (lizard + `cargo mutants` on `rust/src` in the diff). It no longer execs merge-gate.
+- Handoffs: `scripts/validar-handoff.sh` + `.cursor/handoffs/handoff.example.yml`.
+- GitHub Actions prints that it is not the merge judge.
+
+### Isolation (session is the control plane)
+
+- `brain_sessions` no longer uses the observation `tenant_isolation` policy for writes. SELECT stays scoped; INSERT/UPDATE/DELETE are allowed so `cuba_jornada start` and `cuba_proyecto switch` can change tenant under `cuba_app`.
+- Starting a jornada closes the previous open session on that client as `abandoned` in the same transaction.
+- `memory-industry project backfill <name> [--apply]` assigns leftover `project_id NULL` rows.
+
+### Recall does not mix tenants
+
+- An active project hides `project_id NULL` rows. `cuba_faro include_unscoped=true` is the escape hatch.
+- `cuba_faro scope=errors` searches only errors (vector + text + tags).
+- Entity names are unique per project (`UNIQUE NULLS NOT DISTINCT (name, project_id)`). Each project gets its own `architecture_decisions` node.
+- `cuba_decreto query` uses `ts_rank` + `ILIKE` so an exact title matches.
+- `cuba_faro` / vigia / alma / sync / recall no longer treat `OR project_id IS NULL` as “in scope”.
+
+### Identity
+
+- HTTP bind key is `Mcp-Client-Id` + `Mcp-Session-Id`, so two Cursor chats do not inherit each other's jornada.
+- `setup check` flags HTTP on `:8788` (Cursor OAuth) and HTTP without `Mcp-Client-Id`.
+- `doctor` warns if `CUBA_HTTP_ADDR` is `:8788`.
+- `whoami.llm.configured` is true only when a provider or base URL is set (a `claude` binary on PATH is `judge_available`, not configured).
+
+### Honesty
+
+- Quarantined observations still do not reach faro (contract in v041).
+- Recall injects unresolved **trusted** errors and decisions for the named project, not the whole corpus.
 
 ## [0.25.0] — 2026-09-11
 
@@ -2064,6 +2135,7 @@ centrality normalization, cache LRU, jornada race condition, six MCP
 schemas. Removed `blake3` dependency. 68 tests, 0 clippy warnings,
 0 tech debt.
 
+[0.26.0]: https://github.com/LeandroPG19/Memorys/releases/tag/v0.26.0
 [0.25.0]: https://github.com/LeandroPG19/Memorys/releases/tag/v0.25.0
 [0.9.0]: https://github.com/LeandroPG19/cuba-memorys/releases/tag/v0.9.0
 [0.8.0]: https://github.com/LeandroPG19/cuba-memorys/releases/tag/v0.8.0

@@ -32,17 +32,20 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             sqlx::query(
                 "INSERT INTO brain_entities (name, entity_type, project_id)
                  VALUES ($1, 'concept', $2)
-                 ON CONFLICT (name) DO NOTHING",
+                 ON CONFLICT ON CONSTRAINT uq_brain_entities_name_project DO NOTHING",
             )
             .bind(entity_name)
             .bind(project_id)
             .execute(pool)
             .await?;
-            let entity_id: (uuid::Uuid,) =
-                sqlx::query_as("SELECT id FROM brain_entities WHERE name = $1")
-                    .bind(entity_name)
-                    .fetch_one(pool)
-                    .await?;
+            let entity_id: (uuid::Uuid,) = sqlx::query_as(
+                "SELECT id FROM brain_entities
+                 WHERE name = $1 AND project_id IS NOT DISTINCT FROM $2",
+            )
+            .bind(entity_name)
+            .bind(project_id)
+            .fetch_one(pool)
+            .await?;
 
             let row: (uuid::Uuid,) = sqlx::query_as(
                 "INSERT INTO brain_observations (entity_id, content, observation_type, source, project_id)
@@ -59,9 +62,15 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         "query" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let decisions: Vec<(uuid::Uuid, String, f64)> = sqlx::query_as(
-                "SELECT id, content, similarity(content, $1)::float8 AS sim FROM brain_observations
-                 WHERE observation_type = 'decision' AND similarity(content, $1) > 0.2
-                   AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)
+                "SELECT id, content,
+                        (ts_rank(search_vector, cuba_or_tsquery($1))
+                         + similarity(content, $1))::float8 AS sim
+                 FROM brain_observations
+                 WHERE observation_type = 'decision'
+                   AND (search_vector @@ cuba_or_tsquery($1)
+                        OR content ILIKE '%' || $1 || '%'
+                        OR similarity(content, $1) > 0.1)
+                   AND ($2::uuid IS NULL OR project_id = $2)
                  ORDER BY sim DESC LIMIT 10",
             )
             .bind(query)
@@ -77,7 +86,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             let decisions: Vec<(uuid::Uuid, String)> = sqlx::query_as(
                 "SELECT id, content FROM brain_observations
                  WHERE observation_type = 'decision'
-                   AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+                   AND ($1::uuid IS NULL OR project_id = $1)
                  ORDER BY created_at DESC LIMIT 20",
             )
             .bind(project_id)

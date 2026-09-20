@@ -1,0 +1,13 @@
+---
+description: merge-gate.sh is the CI — a green GitHub badge is not mergeable
+alwaysApply: true
+---
+
+# El gate es el juez
+
+- El comando del repo es el CI: `./scripts/merge-gate.sh` (alias `./scripts/como-el-ci.sh todo`, `./scripts/memory-industry-test.sh all`).
+- No declarar mergeable, «el CI debería pasar» ni «listo» sin haber corrido **ese** comando en este turno.
+- GitHub Actions no es el juez. Un badge verde no hace mergeable un cambio.
+- Un clippy limpio no es el gate. fmt, tests `--ignored`, e2e, deny, audit, crap y mutantes van juntos.
+- Verificar una fracción (`cargo test --lib`, un archivo) no es verificar.
+- Segundo juez, encadenado: `./scripts/quality-gate.sh` (CRAP/lizard + mutación **del diff**). No sustituye al SIL.

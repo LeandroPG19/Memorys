@@ -16,14 +16,16 @@ if [[ ! -f "$DUMP" ]]; then
   exit 1
 fi
 
-in_container() {
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'cuba-memorys-db'
+# Same names as rust/src/setup.rs / docker-compose.yml.
+pg_container() {
+  docker ps --format '{{.Names}}' 2>/dev/null | tr -d '\r' | grep -Ex 'memory-industry-db|cuba-memorys-db' | head -1
 }
+PG_CONTAINER="$(pg_container || true)"
 
 echo "Validating $DUMP before touching the database ..."
 
-if in_container; then
-  TOC="$(docker exec -i cuba-memorys-db pg_restore --list <"$DUMP" 2>&1)" || {
+if [[ -n "${PG_CONTAINER:-}" ]]; then
+  TOC="$(docker exec -i "$PG_CONTAINER" pg_restore --list <"$DUMP" 2>&1)" || {
     echo "FAIL: this dump is unreadable. Nothing was changed." >&2
     exit 1
   }
@@ -33,7 +35,7 @@ elif command -v pg_restore >/dev/null 2>&1; then
     exit 1
   }
 else
-  echo "error: pg_restore not found and cuba-memorys-db container not running." >&2
+  echo "error: pg_restore not found and neither memory-industry-db nor cuba-memorys-db is running." >&2
   exit 1
 fi
 
@@ -59,9 +61,9 @@ if [[ "${ans,,}" != "y" ]]; then
   exit 0
 fi
 
-if in_container; then
-  echo "Using pg_restore inside container cuba-memorys-db ..."
-  docker exec -i cuba-memorys-db pg_restore -U cuba -d brain \
+if [[ -n "${PG_CONTAINER:-}" ]]; then
+  echo "Using pg_restore inside container $PG_CONTAINER ..."
+  docker exec -i "$PG_CONTAINER" pg_restore -U cuba -d brain \
     --clean \
     --if-exists \
     --no-owner \

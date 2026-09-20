@@ -47,6 +47,70 @@ pub async fn upsert_project(pool: &PgPool, name: &str) -> Result<Uuid> {
     Ok(row.0)
 }
 
+/// SQL predicate: no active project → unfiltered; active project → that id only.
+/// `include_unscoped` is the escape hatch for rows that still have project_id NULL.
+pub fn project_match_sql(column: &str, bind: u32, include_unscoped: bool) -> String {
+    if include_unscoped {
+        format!("(${bind}::uuid IS NULL OR {column} = ${bind} OR {column} IS NULL)")
+    } else {
+        format!("(${bind}::uuid IS NULL OR {column} = ${bind})")
+    }
+}
+
+/// Open a transaction whose RLS setting cannot lock the writer into the previous tenant.
+/// Used by jornada/proyecto when they write brain_sessions (control plane).
+pub async fn begin_write_scope(pool: &PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.current_project', '*', true)")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+const BACKFILL_TABLES: [&str; 5] = [
+    "brain_entities",
+    "brain_observations",
+    "brain_episodes",
+    "brain_errors",
+    "brain_sessions",
+];
+
+pub async fn backfill_unscoped(
+    pool: &PgPool,
+    project_id: Uuid,
+    apply: bool,
+) -> Result<serde_json::Value> {
+    let mut counts = serde_json::Map::new();
+    for table in BACKFILL_TABLES {
+        let n: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {table} WHERE project_id IS NULL"
+        ))
+        .fetch_one(pool)
+        .await?;
+        counts.insert(table.to_string(), serde_json::json!(n));
+    }
+    if !apply {
+        return Ok(serde_json::json!({
+            "dry_run": true,
+            "would_assign": counts,
+            "note": "pass confirm=true to write. This assigns every NULL project_id row \
+                     to the named project — run dry_run first on a live corpus.",
+        }));
+    }
+    let mut moved = serde_json::Map::new();
+    let mut tx = begin_write_scope(pool).await?;
+    for table in BACKFILL_TABLES {
+        let q = format!("UPDATE {table} SET project_id = $1 WHERE project_id IS NULL");
+        let rows = sqlx::query(&q).bind(project_id).execute(&mut *tx).await?;
+        moved.insert(table.to_string(), serde_json::json!(rows.rows_affected()));
+    }
+    tx.commit().await?;
+    Ok(serde_json::json!({
+        "dry_run": false,
+        "assigned": moved,
+    }))
+}
+
 pub async fn observation_in_scope(
     pool: &PgPool,
     observation_id: Uuid,
@@ -60,7 +124,7 @@ pub async fn observation_in_scope(
     };
     let row: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 FROM brain_observations
-         WHERE id = $1 AND (project_id = $2 OR project_id IS NULL)
+         WHERE id = $1 AND project_id = $2
          LIMIT 1",
     )
     .bind(observation_id)
@@ -162,6 +226,20 @@ mod tests {
         );
 
         crate::session::clear();
+    }
+
+    #[test]
+    fn an_active_project_does_not_see_null_rows_unless_asked() {
+        assert_eq!(
+            project_match_sql("o.project_id", 5, false),
+            "($5::uuid IS NULL OR o.project_id = $5)",
+            "the silent OR project_id IS NULL is what mixed every imported memory into \
+             every scoped faro call"
+        );
+        assert!(
+            project_match_sql("project_id", 1, true).contains("OR project_id IS NULL"),
+            "include_unscoped is the explicit escape, not the default"
+        );
     }
 
     #[tokio::test]

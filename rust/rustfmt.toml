@@ -1,0 +1,3 @@
+# edition.workspace is 2024. Without this file rustfmt falls back to whoever
+# called it and can reorder `use` (2021 vs 2024). Same lesson as Mapupita-Rust.
+style_edition = "2024"

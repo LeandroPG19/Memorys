@@ -7,7 +7,7 @@ async fn refresh_ood_cache(pool: &PgPool, project_id: Option<uuid::Uuid>) -> Res
     let raw: Vec<(pgvector::Vector,)> = sqlx::query_as(
         "SELECT embedding FROM brain_observations
          WHERE embedding IS NOT NULL AND observation_type != 'superseded'
-           AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+           AND ($1::uuid IS NULL OR project_id = $1)
          ORDER BY id LIMIT $2",
     )
     .bind(project_id)
@@ -93,7 +93,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                         updated_at = NOW()
                      WHERE observation_type NOT IN ('decision', 'lesson', 'superseded')
                        AND last_accessed < NOW() - INTERVAL '1 day'
-                       AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)"
+                       AND ($2::uuid IS NULL OR project_id = $2)"
                 )
                 .bind(halflife)
                 .bind(project_id)
@@ -121,7 +121,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                         updated_at = NOW()
                      WHERE observation_type NOT IN ('decision', 'lesson', 'superseded')
                        AND last_accessed < NOW() - INTERVAL '1 day'
-                       AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)"
+                       AND ($1::uuid IS NULL OR project_id = $1)"
                 )
                 .bind(project_id)
                 .execute(pool)
@@ -157,7 +157,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                  LEFT JOIN brain_projects p ON p.id = o.project_id
                  WHERE o.importance < $1
                    AND o.observation_type NOT IN ('decision', 'lesson')
-                   AND ($2::uuid IS NULL OR o.project_id = $2 OR o.project_id IS NULL)
+                   AND ($2::uuid IS NULL OR o.project_id = $2)
                  GROUP BY p.name
                  ORDER BY COUNT(*) DESC",
             )
@@ -195,7 +195,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                 "DELETE FROM brain_observations
                  WHERE importance < $1
                    AND observation_type NOT IN ('decision', 'lesson')
-                   AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+                   AND ($2::uuid IS NULL OR project_id = $2)",
             )
             .bind(threshold)
             .bind(project_id)
@@ -227,8 +227,8 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                 "SELECT a.id, b.id, similarity(a.content, b.content)::float8 AS sim
                  FROM brain_observations a JOIN brain_observations b ON a.entity_id = b.entity_id AND a.id < b.id
                  WHERE similarity(a.content, b.content) > $1 AND a.observation_type != 'superseded' AND b.observation_type != 'superseded'
-                   AND ($2::uuid IS NULL OR a.project_id = $2 OR a.project_id IS NULL)
-                   AND ($2::uuid IS NULL OR b.project_id = $2 OR b.project_id IS NULL)
+                   AND ($2::uuid IS NULL OR a.project_id = $2)
+                   AND ($2::uuid IS NULL OR b.project_id = $2)
                  LIMIT 100"
             ).bind(sim_threshold).bind(project_id).fetch_all(pool).await?;
 
@@ -258,14 +258,14 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             refresh_ood_cache(pool, project_id).await.ok();
             let entities: (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM brain_entities
-                 WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+                 WHERE ($1::uuid IS NULL OR project_id = $1)",
             )
             .bind(project_id)
             .fetch_one(pool)
             .await?;
             let observations: (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM brain_observations
-                 WHERE ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+                 WHERE ($1::uuid IS NULL OR project_id = $1)",
             )
             .bind(project_id)
             .fetch_one(pool)
@@ -273,7 +273,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             let superseded: (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM brain_observations
                  WHERE observation_type = 'superseded'
-                   AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+                   AND ($1::uuid IS NULL OR project_id = $1)",
             )
             .bind(project_id)
             .fetch_one(pool)
@@ -315,7 +315,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             crate::redact::refuse_secrets(&args, "compressed_summary", summary)?;
             let entity_id: (uuid::Uuid,) = sqlx::query_as(
                 "SELECT id FROM brain_entities
-                 WHERE name = $1 AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+                 WHERE name = $1 AND ($2::uuid IS NULL OR project_id = $2)",
             )
             .bind(entity_name)
             .bind(project_id)
@@ -324,7 +324,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             let marked = sqlx::query(
                 "UPDATE brain_observations SET observation_type = 'superseded'
                  WHERE entity_id = $1 AND observation_type != 'superseded'
-                   AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+                   AND ($2::uuid IS NULL OR project_id = $2)",
             )
             .bind(entity_id.0)
             .bind(project_id)
@@ -341,8 +341,8 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                 "SELECT a.content, b.content, similarity(a.content, b.content)::float8 AS sim
                  FROM brain_observations a JOIN brain_observations b ON a.entity_id = b.entity_id AND a.id < b.id
                  WHERE similarity(a.content, b.content) > 0.7 AND a.observation_type != 'superseded' AND b.observation_type != 'superseded'
-                   AND ($1::uuid IS NULL OR a.project_id = $1 OR a.project_id IS NULL)
-                   AND ($1::uuid IS NULL OR b.project_id = $1 OR b.project_id IS NULL)
+                   AND ($1::uuid IS NULL OR a.project_id = $1)
+                   AND ($1::uuid IS NULL OR b.project_id = $1)
                  ORDER BY sim DESC LIMIT 20"
             ).bind(project_id).fetch_all(pool).await?;
             let results: Vec<Value> = dupes

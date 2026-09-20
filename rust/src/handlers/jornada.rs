@@ -26,6 +26,27 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                 _ => None,
             };
 
+            let mut tx = crate::project::begin_write_scope(pool)
+                .await
+                .context("failed to open a write scope for the new session")?;
+
+            let replaced = if let Some(prev) = crate::session::session_id() {
+                sqlx::query(
+                    "UPDATE brain_sessions
+                     SET ended_at = NOW(),
+                         outcome = 'abandoned',
+                         summary = 'replaced by a new jornada start on this client'
+                     WHERE id = $1 AND ended_at IS NULL",
+                )
+                .bind(prev)
+                .execute(&mut *tx)
+                .await
+                .context("failed to close the previous session on this client")?
+                .rows_affected()
+            } else {
+                0
+            };
+
             let row: (uuid::Uuid,) = sqlx::query_as(
                 "INSERT INTO brain_sessions (session_name, goals, project_id)
                  VALUES ($1, $2, $3) RETURNING id",
@@ -33,9 +54,13 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             .bind(name)
             .bind(&goals)
             .bind(project_id)
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await
             .context("failed to start session")?;
+
+            tx.commit()
+                .await
+                .context("failed to commit the new session")?;
 
             crate::session::set(row.0, project_id);
 
@@ -47,7 +72,8 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                     "started_at": chrono::Utc::now().to_rfc3339(),
                     "project_id": project_id.map(|p| p.to_string()),
                     "project_name": project_arg,
-                }
+                },
+                "replaced_previous": replaced > 0,
             });
 
             let prev_session: Option<(Option<String>, Option<String>, Option<String>)> =
@@ -92,7 +118,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             let pending_review: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM brain_observations
                  WHERE trust = 'quarantined'
-                   AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)",
+                   AND ($1::uuid IS NULL OR project_id = $1)",
             )
             .bind(project_id)
             .fetch_one(pool)

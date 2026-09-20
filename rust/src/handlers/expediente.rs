@@ -52,7 +52,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
              WHERE (search_vector @@ cuba_or_tsquery($1) OR similarity(error_message, $1) > 0.3)
                AND resolved = true
                AND ($2::text IS NULL OR project = $2)
-               AND ($3::uuid IS NULL OR project_id = $3 OR project_id IS NULL)
+               AND ($3::uuid IS NULL OR project_id = $3)
                AND trust = 'trusted'
              ORDER BY sim DESC LIMIT 20",
         )
@@ -68,7 +68,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
              FROM brain_errors
              WHERE (search_vector @@ cuba_or_tsquery($1) OR similarity(error_message, $1) > 0.3)
                AND ($2::text IS NULL OR project = $2)
-               AND ($3::uuid IS NULL OR project_id = $3 OR project_id IS NULL)
+               AND ($3::uuid IS NULL OR project_id = $3)
                AND trust = 'trusted'
              ORDER BY sim DESC LIMIT 20",
         )
@@ -101,7 +101,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         let failed_similar: Vec<(String,)> = sqlx::query_as(
             "SELECT error_message FROM brain_errors
              WHERE resolved = false AND similarity(error_message, $1) > 0.5
-               AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)
+               AND ($2::uuid IS NULL OR project_id = $2)
                AND trust = 'trusted'
              LIMIT 3",
         )

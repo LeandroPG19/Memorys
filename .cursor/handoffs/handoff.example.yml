@@ -1,0 +1,6 @@
+from: especificador
+to: implementador
+type: git_handoff
+task: "una línea: qué se entrega"
+commit: none
+evidence: none

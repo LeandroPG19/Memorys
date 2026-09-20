@@ -162,6 +162,16 @@ PEER_DATABASE_URL="${LIVE_DATABASE_URL%/*}/$PEER_DB"
 ADMIN_DATABASE_URL="${LIVE_DATABASE_URL%/*}/postgres"
 export CUBA_PEER_DATABASE_URL="$PEER_DATABASE_URL"
 
+# Windows PostgreSQL 16 client: `psql URI -c SQL` prints
+# "extra command-line argument -c ignored" and never runs the SQL.
+# Measured 2026-09-17, Git Bash + C:\Program Files\PostgreSQL\16\bin\psql.exe.
+# The URI must be -d, not argv[1].
+psql_url() {
+  local url="$1"
+  shift
+  psql -d "$url" "$@"
+}
+
 if ! command -v psql >/dev/null; then
   echo "FAIL: psql is not on PATH, and the gate needs it to provision its throwaway databases." >&2
   echo "      It used to reach the server with 'docker exec <container> psql', which makes psql" >&2
@@ -176,31 +186,70 @@ cd "$RUST_DIR"
 # Prefer an already-built binary. `cargo run` under timeout used to spend the
 # whole budget recompiling and leave the throwaway DB with zero tables while
 # `|| true` hid the failure (exit 124).
-gate_bin() {
-  if [[ -x "$RUST_DIR/target/debug/memory-industry" ]]; then
-    echo "$RUST_DIR/target/debug/memory-industry"
-  elif [[ -x "$RUST_DIR/target/release/memory-industry" ]]; then
-    echo "$RUST_DIR/target/release/memory-industry"
-  elif [[ -x "$RUST_DIR/target/debug/cuba-memorys" ]]; then
-    echo "$RUST_DIR/target/debug/cuba-memorys"
-  elif [[ -x "$RUST_DIR/target/release/cuba-memorys" ]]; then
-    echo "$RUST_DIR/target/release/cuba-memorys"
+#
+# Honor CARGO_TARGET_DIR (Cursor sandbox points it off-tree). On Windows the
+# file is memory-industry.exe; `[[ -x memory-industry ]]` is false in Git Bash.
+gate_target_dir() {
+  if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    printf '%s\n' "$CARGO_TARGET_DIR"
   else
-    cargo build --quiet --bin memory-industry >&2
-    echo "$RUST_DIR/target/debug/memory-industry"
+    printf '%s\n' "$RUST_DIR/target"
   fi
+}
+
+gate_bin() {
+  local td cand
+  td="$(gate_target_dir)"
+  for cand in \
+    "$td/debug/memory-industry.exe" \
+    "$td/debug/memory-industry" \
+    "$td/release/memory-industry.exe" \
+    "$td/release/memory-industry" \
+    "$td/debug/cuba-memorys.exe" \
+    "$td/debug/cuba-memorys" \
+    "$td/release/cuba-memorys.exe" \
+    "$td/release/cuba-memorys"
+  do
+    if [[ -x "$cand" ]]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  cargo build --quiet --bin memory-industry >&2
+  td="$(gate_target_dir)"
+  for cand in "$td/debug/memory-industry.exe" "$td/debug/memory-industry"; do
+    if [[ -x "$cand" ]]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  echo "FAIL: cargo build --bin memory-industry produced no binary under $td/debug." >&2
+  exit 1
 }
 
 provision_gate_db() {
   local bin
   bin="$(gate_bin)"
-  psql "$ADMIN_DATABASE_URL" -q \
+  psql_url "$ADMIN_DATABASE_URL" -q \
     -c "DROP DATABASE IF EXISTS $GATE_DB WITH (FORCE)" \
     -c "CREATE DATABASE $GATE_DB" >/dev/null
   # doctor exits non-zero when ONNX_MODEL_PATH is empty (policy checks). Migrations
   # still apply first — trust the table count below, not the exit code alone.
+  local doctor_log
+  doctor_log="$(mktemp)"
   DATABASE_URL="$GATE_DATABASE_URL" CUBA_APP_ROLE=0 ONNX_MODEL_PATH="" \
-    "$bin" doctor >/dev/null 2>&1 || true
+    "$bin" doctor >"$doctor_log" 2>&1 || true
+  local tables
+  tables="$(psql_url "$GATE_DATABASE_URL" -Atc \
+    "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")"
+  if ((tables < 20)); then
+    echo "FAIL: could not migrate the throwaway database (only $tables tables)." >&2
+    echo "      doctor via $bin did not apply schema. Its output:" >&2
+    cat "$doctor_log" >&2 || true
+    rm -f "$doctor_log"
+    exit 1
+  fi
+  rm -f "$doctor_log"
   if [[ "$CUBA_EMBEDDING_DIM" != "384" ]]; then
     DATABASE_URL="$GATE_DATABASE_URL" "$ROOT/scripts/migrate-embedding-dim.sh" \
       "$CUBA_EMBEDDING_DIM" >/dev/null 2>&1 || {
@@ -209,24 +258,16 @@ provision_gate_db() {
       }
   fi
   local dim
-  dim="$(psql "$GATE_DATABASE_URL" -Atc \
+  dim="$(psql_url "$GATE_DATABASE_URL" -Atc \
     "SELECT atttypmod FROM pg_attribute WHERE attrelid='brain_observations'::regclass AND attname='embedding'")"
   if [[ "$dim" != "$CUBA_EMBEDDING_DIM" ]]; then
     echo "FAIL: throwaway database is vector($dim) but the model produces $CUBA_EMBEDDING_DIM." >&2
     echo "      Every embedding write would fail with 'expected $dim dimensions'." >&2
     exit 1
   fi
-  local tables
-  tables="$(psql "$GATE_DATABASE_URL" -Atc \
-    "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")"
-  if ((tables < 20)); then
-    echo "FAIL: could not migrate the throwaway database (only $tables tables)." >&2
-    echo "      doctor via $bin did not apply schema. Re-run with that binary visible." >&2
-    exit 1
-  fi
   echo "OK  throwaway database $GATE_DB ready ($tables tables, vector($dim))"
 
-  psql "$ADMIN_DATABASE_URL" -q \
+  psql_url "$ADMIN_DATABASE_URL" -q \
     -c "DROP DATABASE IF EXISTS $PEER_DB WITH (FORCE)" \
     -c "CREATE DATABASE $PEER_DB" >/dev/null
   DATABASE_URL="$PEER_DATABASE_URL" CUBA_APP_ROLE=0 ONNX_MODEL_PATH="" \
@@ -236,7 +277,7 @@ provision_gate_db() {
       "$CUBA_EMBEDDING_DIM" >/dev/null 2>&1 || true
   fi
   local peer_tables
-  peer_tables="$(psql "$PEER_DATABASE_URL" -Atc \
+  peer_tables="$(psql_url "$PEER_DATABASE_URL" -Atc \
     "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")"
   if ((peer_tables < 20)); then
     echo "FAIL: could not migrate the second node's database (only $peer_tables tables)." >&2
@@ -259,7 +300,7 @@ rm -f "$EXIT_FILE"
 
 on_exit() {
   local code=$?
-  psql "$ADMIN_DATABASE_URL" -q \
+  psql_url "$ADMIN_DATABASE_URL" -q \
     -c "DROP DATABASE IF EXISTS $GATE_DB WITH (FORCE)" \
     -c "DROP DATABASE IF EXISTS $PEER_DB WITH (FORCE)" >/dev/null 2>&1 || true
   mkdir -p "$(dirname "$EXIT_FILE")"
@@ -336,16 +377,23 @@ require_present "reranker tests (release: 387s in debug, seconds here)" \
   cargo test --release --test v017_rerank_gpu -- --ignored --nocapture
 
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
-export CUBA_BINARY_PATH="${CUBA_BINARY_PATH:-$RUST_DIR/target/release/memory-industry}"
-if [[ ! -f "$CUBA_BINARY_PATH" && -f "${CUBA_BINARY_PATH}.exe" ]]; then
+if [[ -z "${CUBA_BINARY_PATH:-}" ]]; then
+  td="$(gate_target_dir)"
+  CUBA_BINARY_PATH="$td/release/memory-industry"
+fi
+# Prefer .exe even when Git Bash treats the extensionless name as existing
+# (PATHEXT). Native Python Path.is_file() does not.
+if [[ -f "${CUBA_BINARY_PATH}.exe" ]]; then
   CUBA_BINARY_PATH="${CUBA_BINARY_PATH}.exe"
 fi
 if [[ ! -f "$CUBA_BINARY_PATH" ]]; then
-  CUBA_BINARY_PATH="$RUST_DIR/target/release/cuba-memorys"
-  if [[ ! -f "$CUBA_BINARY_PATH" && -f "${CUBA_BINARY_PATH}.exe" ]]; then
+  td="$(gate_target_dir)"
+  CUBA_BINARY_PATH="$td/release/cuba-memorys"
+  if [[ -f "${CUBA_BINARY_PATH}.exe" ]]; then
     CUBA_BINARY_PATH="${CUBA_BINARY_PATH}.exe"
   fi
 fi
+export CUBA_BINARY_PATH
 # Prefer PYTHON_BIN (set by run-gate on Windows). Never use the Microsoft Store
 # python3.exe stub under WindowsApps — it prints install text and exits 49.
 resolve_python() {

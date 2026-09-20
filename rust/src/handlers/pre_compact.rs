@@ -85,7 +85,7 @@ async fn snapshot(pool: &PgPool) -> Result<Value> {
         "SELECT id, error_type, error_message
          FROM brain_errors
          WHERE resolved = FALSE
-           AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+           AND ($1::uuid IS NULL OR project_id = $1)
          ORDER BY created_at DESC
          LIMIT 20",
     )

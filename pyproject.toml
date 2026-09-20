@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "memory-industry"
-version = "1.27.0"
+version = "1.28.0"
 description = "MemoryIndustry — Persistent memory MCP server for AI agents. 31 tools, self-growing graph without MCP sampling, poisoning quarantine: bitemporal facts, sqlx-migrate, BM25+MMR+OOD hybrid retrieval, graph metrics, conformal prediction, Hebbian/BCM, project scoping, tamper-evident audit chain (21 CFR Part 11-oriented), tree-sitter codegraph, git-native sync hooks. Rust + PostgreSQL + pgvector."
 readme = "README.md"
 license = { text = "Apache-2.0" }

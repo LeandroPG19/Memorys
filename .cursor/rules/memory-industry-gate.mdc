@@ -1,0 +1,16 @@
+---
+description: Gate de MemoryIndustry — merge-gate.sh es terminado; quality-gate no lo sustituye
+alwaysApply: true
+---
+
+# Gate de MemoryIndustry
+
+- Terminado = `./scripts/merge-gate.sh` (o `./scripts/como-el-ci.sh todo`) en verde **en este turno**. Incluye `--ignored`, e2e sin soft-skip, deny, audit, crap-gate, mutants-gate.
+- GitHub Actions no es el juez. Excluye `MODEL_OR_CLI_ONLY` y no tiene ONNX/NLI/reranker/LLM.
+- `front`/`back` de Mapupita-Rust no existen aquí. `cargo test --lib` no sustituye al SIL.
+- Antes de empujar: el mismo SIL. `como-el-ci.sh extra` ≡ `todo` (no hay un extra más ligero).
+- Los comentarios se quedan (migraciones ≤0060, SHA-384, lecciones del gate).
+- Migraciones publicadas hasta **0060** están congeladas. El fallo se arregla con una migración nueva.
+- Los agentes no compilán ni cambian de rama en paralelo. Un `cargo` a la vez.
+- `scripts/quality-gate.sh` se encadena **después** del SIL: lizard + `cargo mutants` del diff sobre `rust/src`. No sustituye a `merge-gate.sh`.
+- No junction de `.cursor/rules` al perfil: se perderían estas reglas.

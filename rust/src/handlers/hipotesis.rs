@@ -36,7 +36,7 @@ async fn explain(pool: &PgPool, args: &Value) -> Result<Value> {
     let effect_exists: Option<(uuid::Uuid,)> = sqlx::query_as(
         "SELECT id FROM brain_entities
          WHERE name = $1
-           AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)
+           AND ($2::uuid IS NULL OR project_id = $2)
          LIMIT 1",
     )
     .bind(effect)
@@ -95,7 +95,7 @@ async fn explain(pool: &PgPool, args: &Value) -> Result<Value> {
             JOIN brain_entities target ON r.to_entity = target.id
             WHERE target.name = $1
               AND r.relation_type IN ('causes', 'related_to', 'depends_on')
-              AND ($4::uuid IS NULL OR r.project_id = $4 OR r.project_id IS NULL)
+              AND ($4::uuid IS NULL OR r.project_id = $4)
 
             UNION ALL
 
@@ -111,7 +111,7 @@ async fn explain(pool: &PgPool, args: &Value) -> Result<Value> {
             WHERE cc.depth < $2
               AND r.relation_type IN ('causes', 'related_to', 'depends_on')
               AND NOT (r.from_entity = ANY(cc.path))
-              AND ($4::uuid IS NULL OR r.project_id = $4 OR r.project_id IS NULL)
+              AND ($4::uuid IS NULL OR r.project_id = $4)
         )
         SELECT
             e.name,
@@ -122,7 +122,7 @@ async fn explain(pool: &PgPool, args: &Value) -> Result<Value> {
             (cc.path_strength * e.importance)::float8 AS plausibility_score
         FROM causal_chain cc
         JOIN brain_entities e ON cc.current_node = e.id
-        WHERE ($4::uuid IS NULL OR e.project_id = $4 OR e.project_id IS NULL)
+        WHERE ($4::uuid IS NULL OR e.project_id = $4)
         ORDER BY plausibility_score DESC
         LIMIT $3",
     )

@@ -59,7 +59,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
 
     let entity_deleted = sqlx::query(
         "DELETE FROM brain_entities WHERE name = $1
-         AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+         AND ($2::uuid IS NULL OR project_id = $2)",
     )
     .bind(entity_name)
     .bind(project_id)

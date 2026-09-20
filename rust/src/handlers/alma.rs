@@ -118,7 +118,7 @@ async fn delete(pool: &PgPool, name: &str) -> Result<Value> {
     let result = sqlx::query(
         "DELETE FROM brain_entities
          WHERE name = $1
-           AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+           AND ($2::uuid IS NULL OR project_id = $2)",
     )
     .bind(name)
     .bind(project_id)
@@ -145,7 +145,7 @@ async fn get(pool: &PgPool, name: &str) -> Result<Value> {
         "SELECT id, name, entity_type, importance, access_count
          FROM brain_entities
          WHERE name = $1
-           AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+           AND ($2::uuid IS NULL OR project_id = $2)",
     )
     .bind(name)
     .bind(project_id)

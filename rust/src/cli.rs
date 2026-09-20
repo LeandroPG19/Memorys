@@ -4,7 +4,7 @@ use sqlx::{PgPool, Row};
 
 use crate::handlers;
 
-pub const COMMANDS: [&str; 23] = [
+pub const COMMANDS: [&str; 25] = [
     "serve",
     "tunnel",
     "search",
@@ -28,6 +28,8 @@ pub const COMMANDS: [&str; 23] = [
     "llm",
     "secure",
     "setup",
+    "graph",
+    "project",
 ];
 
 fn undo_dir() -> std::path::PathBuf {
@@ -347,4 +349,35 @@ pub async fn run_delete(args: &[String]) -> Result<()> {
     println!("Borrada.");
     println!("  undo: {}", path.display());
     Ok(())
+}
+
+pub async fn run_project(args: &[String]) -> Result<()> {
+    let action = args.first().map(String::as_str).unwrap_or("help");
+    match action {
+        "backfill" => {
+            let name = args
+                .get(1)
+                .context("usage: project backfill <name> [--apply]")?;
+            let apply = args.iter().any(|a| a == "--apply");
+            let pool = pool().await?;
+            let result = handlers::proyecto::handle(
+                &pool,
+                json!({
+                    "action": "backfill",
+                    "name": name,
+                    "confirm": apply,
+                }),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        _ => {
+            eprintln!(
+                "usage: memory-industry project backfill <name> [--apply]\n\n\
+                 Assigns every row with project_id NULL to <name>. Without --apply this is a dry-run."
+            );
+            Ok(())
+        }
+    }
 }

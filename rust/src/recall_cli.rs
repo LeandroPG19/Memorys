@@ -68,17 +68,27 @@ async fn build(pool: &PgPool, project: Option<&str>, budget: usize) -> Result<St
         }
     }
 
+    let project_id = match project {
+        Some(name) => crate::project::resolve_project_name(pool, name)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+
     let mut out = String::new();
     let mut spent = 0usize;
 
     out.push_str("## Memoria de cuba-memorys\n");
 
     if let Ok(Some(row)) = sqlx::query(
-        "SELECT name, summary, outcome, ended_at::date::text AS d
+        "SELECT session_name AS name, summary, outcome, ended_at::date::text AS d
          FROM brain_sessions
          WHERE summary IS NOT NULL AND ended_at IS NOT NULL
+           AND ($1::uuid IS NULL OR project_id = $1)
          ORDER BY ended_at DESC LIMIT 1",
     )
+    .bind(project_id)
     .fetch_optional(pool)
     .await
     {
@@ -98,11 +108,14 @@ async fn build(pool: &PgPool, project: Option<&str>, budget: usize) -> Result<St
     if let Ok(rows) = sqlx::query(
         "SELECT error_type, error_message FROM brain_errors
          WHERE resolved = false
+           AND trust = 'trusted'
            AND error_type NOT ILIKE '%test%'
            AND error_message NOT ILIKE '%test error%'
            AND error_message NOT ILIKE '%smoke test%'
+           AND ($1::uuid IS NULL OR project_id = $1)
          ORDER BY created_at DESC LIMIT 4",
     )
+    .bind(project_id)
     .fetch_all(pool)
     .await
         && !rows.is_empty()
@@ -124,8 +137,11 @@ async fn build(pool: &PgPool, project: Option<&str>, budget: usize) -> Result<St
          FROM brain_observations o
          JOIN brain_entities e ON e.id = o.entity_id
          WHERE o.observation_type = 'decision'
+           AND o.trust = 'trusted'
+           AND ($1::uuid IS NULL OR o.project_id = $1)
          ORDER BY o.importance DESC, o.created_at DESC LIMIT 4",
     )
+    .bind(project_id)
     .fetch_all(pool)
     .await
         && !rows.is_empty()
@@ -179,9 +195,11 @@ async fn build(pool: &PgPool, project: Option<&str>, budget: usize) -> Result<St
             "SELECT e.name, e.entity_type
              FROM brain_entities e
              WHERE e.name ILIKE '%' || $1 || '%'
+               AND ($2::uuid IS NULL OR e.project_id = $2)
              ORDER BY e.importance DESC LIMIT 5",
         )
         .bind(p)
+        .bind(project_id)
         .fetch_all(pool)
         .await
         && !rows.is_empty()

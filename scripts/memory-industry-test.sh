@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Unified test CLI for MemoryIndustry — same judge as merge-gate (no second CI).
-# Usage: scripts/memory-industry-test.sh [unit|contracts|e2e|crap|mutants|all]
+# Usage: scripts/memory-industry-test.sh [unit|contracts|e2e|crap|mutants|quality|all]
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD="${1:-all}"
@@ -29,8 +29,11 @@ case "$CMD" in
   mutants)
     exec "$ROOT/scripts/mutants-gate.sh"
     ;;
+  quality)
+    exec "$ROOT/scripts/quality-gate.sh"
+    ;;
   *)
-    echo "usage: $0 [unit|contracts|e2e|crap|mutants|all]" >&2
+    echo "usage: $0 [unit|contracts|e2e|crap|mutants|quality|all]" >&2
     exit 2
     ;;
 esac

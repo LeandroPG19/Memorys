@@ -63,6 +63,22 @@ impl Check {
     }
 }
 
+pub fn http_port_check(addr: Option<&str>) -> Check {
+    let addr = addr.unwrap_or(crate::http::DEFAULT_ADDR);
+    if addr.contains(":8788") {
+        return Check::warn(
+            "http_port",
+            format!("{addr} is Cursor's OAuth callback port"),
+            "MemoryIndustry serve binds 127.0.0.1:8787. 8788 is Cursor OAuth — \
+             do not put the daemon there or the editor's login callback dies.",
+        );
+    }
+    Check::ok(
+        "http_port",
+        format!("{addr} (8788 is Cursor OAuth; leave it alone)"),
+    )
+}
+
 pub fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return "<unparseable>".to_string();
@@ -307,6 +323,9 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     ));
 
     checks.push(Check::ok("database_url", redact_url(url)));
+    checks.push(http_port_check(
+        std::env::var("CUBA_HTTP_ADDR").ok().as_deref(),
+    ));
 
     let machine = crate::resources::probe();
     let resource_plan = crate::resources::plan(&machine);
@@ -1012,6 +1031,23 @@ mod tests {
         assert_eq!(parse_vector_dim("vector(384)"), Some(384));
         assert_eq!(parse_vector_dim("vector(1024)"), Some(1024));
         assert_eq!(parse_vector_dim("text"), None);
+    }
+
+    #[test]
+    fn binding_the_daemon_on_cursor_oauth_is_a_warning() {
+        let check = http_port_check(Some("127.0.0.1:8788"));
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.hint.as_deref().is_some_and(|h| h.contains("8787")),
+            "the hint has to name the port MemoryIndustry actually uses: {:?}",
+            check.hint
+        );
+    }
+
+    #[test]
+    fn the_default_http_port_is_not_cursor_oauth() {
+        assert_eq!(http_port_check(None).status, Status::Ok);
+        assert_eq!(http_port_check(Some("127.0.0.1:8787")).status, Status::Ok);
     }
 }
 

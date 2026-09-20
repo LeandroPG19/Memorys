@@ -162,7 +162,8 @@ async fn upsert_symbol(
     let entity_id: (uuid::Uuid,) = sqlx::query_as(
         "INSERT INTO brain_entities (name, entity_type, project_id)
          VALUES ($1, 'code_symbol', $2)
-         ON CONFLICT (name) DO UPDATE SET entity_type = 'code_symbol'
+         ON CONFLICT ON CONSTRAINT uq_brain_entities_name_project
+         DO UPDATE SET entity_type = 'code_symbol'
          RETURNING id",
     )
     .bind(&symbol.qualified_name)
@@ -227,7 +228,7 @@ async fn upsert_placeholder_entity(
     sqlx::query(
         "INSERT INTO brain_entities (name, entity_type, project_id)
          VALUES ($1, $2, $3)
-         ON CONFLICT (name) DO NOTHING",
+         ON CONFLICT ON CONSTRAINT uq_brain_entities_name_project DO NOTHING",
     )
     .bind(name)
     .bind(entity_type)

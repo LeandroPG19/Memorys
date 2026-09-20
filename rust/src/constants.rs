@@ -128,7 +128,8 @@ pub fn tool_definitions() -> &'static Vec<Value> {
                     "ood_threshold": {"type": "number", "description": "Mahalanobis distance threshold for abstention. Defaults to sqrt(chi2_0.99(d)), which scales with the embedding dimension (~21.25 for d=384). Override only if you calibrated on your own corpus."},
                     "enable_bm25": {"type": "boolean", "description": "Enable BM25 (ts_rank_cd) as third RRF signal alongside text + vector. Catches queries with rare terms that dense embeddings miss. Default true."},
                     "rerank": {"type": "boolean", "description": "Cross-encoder rerank top-50 → top-K with bge-reranker-v2-m3. Auto-enabled when CUBA_MODE=completo, or when this build has a real GPU provider active (CUDA/DirectML compiled in AND a working device). Off by default everywhere else, even with the model on disk: on CPU it costs 60-110s and blows the search budget. Explicit true/false always wins; run `cuba-memorys doctor` to see which reason applies here."},
-                    "associative": {"type": "boolean", "description": "Multi-hop expansion: seeds spreading activation from query-matched entities and pulls in observations on graph-connected entities that no lexical/vector signal surfaced. Additive — never lowers a base hit. Default false."}
+                    "associative": {"type": "boolean", "description": "Multi-hop expansion: seeds spreading activation from query-matched entities and pulls in observations on graph-connected entities that no lexical/vector signal surfaced. Additive — never lowers a base hit. Default false."},
+                    "include_unscoped": {"type": "boolean", "description": "When a project is active, rows with project_id NULL are hidden. Set true to include that leftover corpus. Default false."}
                 },
                 "required": ["query"]
             }),
@@ -380,13 +381,14 @@ pub fn tool_definitions() -> &'static Vec<Value> {
         ),
         tool_def(
             "cuba_proyecto",
-            "Project scoping (v0.8): isolate memories per project so multiple projects sharing one DB don't bleed into each other. Active project is bound to the current session (cuba_jornada start --project NAME). Legacy rows with NULL project_id remain visible from every scope.",
+            "Project scoping (v0.8): isolate memories per project so multiple projects sharing one DB don't bleed into each other. Active project is bound to the current session (cuba_jornada start --project NAME). Legacy NULL project_id rows are hidden while a project is active unless faro include_unscoped=true or you backfill them.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["list", "current", "switch", "stats", "rename", "merge"], "description": "Project action"},
-                    "name": {"type": "string", "description": "Project name (for switch/stats/rename source)"},
-                    "to": {"type": "string", "description": "Destination name (for rename/merge)"}
+                    "action": {"type": "string", "enum": ["list", "current", "switch", "stats", "rename", "merge", "backfill"], "description": "Project action. backfill assigns every NULL project_id row to `name` (dry-run unless confirm=true)."},
+                    "name": {"type": "string", "description": "Project name (for switch/stats/rename source/backfill)"},
+                    "to": {"type": "string", "description": "Destination name (for rename/merge)"},
+                    "confirm": {"type": "boolean", "description": "backfill only: write the assignment. Default false (dry-run)."}
                 },
                 "required": ["action"]
             }),

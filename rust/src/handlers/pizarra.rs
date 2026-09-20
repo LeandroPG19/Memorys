@@ -77,7 +77,7 @@ async fn read(pool: &PgPool, args: &Value) -> Result<Value> {
          WHERE expires_at > NOW()
            AND session_id IS NOT DISTINCT FROM $1
            AND ($2::text IS NULL OR tag = $2)
-           AND ($3::uuid IS NULL OR project_id = $3 OR project_id IS NULL)
+           AND ($3::uuid IS NULL OR project_id = $3)
          ORDER BY created_at DESC
          LIMIT 100",
     )

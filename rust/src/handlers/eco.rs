@@ -95,12 +95,12 @@ async fn in_scope(
         }
         Kind::Episode => {
             "SELECT 1 FROM brain_episodes
-             WHERE id = $1 AND (project_id = $2 OR project_id IS NULL)
+             WHERE id = $1 AND (project_id = $2)
              LIMIT 1"
         }
         Kind::Error => {
             "SELECT 1 FROM brain_errors
-             WHERE id = $1 AND (project_id = $2 OR project_id IS NULL)
+             WHERE id = $1 AND (project_id = $2)
              LIMIT 1"
         }
     };
@@ -189,7 +189,7 @@ async fn list_quarantined(pool: &PgPool, args: &Value) -> Result<Value> {
              FROM brain_observations o
              JOIN brain_entities e ON e.id = o.entity_id
              WHERE o.trust = 'quarantined'
-               AND ($1::uuid IS NULL OR o.project_id = $1 OR o.project_id IS NULL)
+               AND ($1::uuid IS NULL OR o.project_id = $1)
              ORDER BY o.created_at DESC
              LIMIT $2",
     )
@@ -219,7 +219,7 @@ async fn list_quarantined(pool: &PgPool, args: &Value) -> Result<Value> {
              FROM brain_episodes ep
              JOIN brain_entities e ON e.id = ep.entity_id
              WHERE ep.trust = 'quarantined'
-               AND ($1::uuid IS NULL OR ep.project_id = $1 OR ep.project_id IS NULL)
+               AND ($1::uuid IS NULL OR ep.project_id = $1)
              ORDER BY ep.created_at DESC
              LIMIT $2",
         )
@@ -253,7 +253,7 @@ async fn list_quarantined(pool: &PgPool, args: &Value) -> Result<Value> {
         "SELECT id, error_type, error_message, project, created_at
              FROM brain_errors
              WHERE trust = 'quarantined'
-               AND ($1::uuid IS NULL OR project_id = $1 OR project_id IS NULL)
+               AND ($1::uuid IS NULL OR project_id = $1)
              ORDER BY created_at DESC
              LIMIT $2",
     )
@@ -326,7 +326,7 @@ async fn positive(
                 access_count = access_count + 1,
                 updated_at = NOW()
              WHERE name = $1
-               AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+               AND ($2::uuid IS NULL OR project_id = $2)",
         )
         .bind(name)
         .bind(project_id)
@@ -379,7 +379,7 @@ async fn negative(
                 ),
                 updated_at = NOW()
              WHERE name = $1
-               AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+               AND ($2::uuid IS NULL OR project_id = $2)",
         )
         .bind(name)
         .bind(project_id)

@@ -781,6 +781,7 @@ def test_cuba_jornada():
 
 def test_cuba_decreto():
     """Test cuba_decreto: record, query, list decisions."""
+    global tests_failed, failed_tests
     print("\n" + "=" * 60)
     print("TESTING: cuba_decreto")
     print("=" * 60)
@@ -811,6 +812,12 @@ def test_cuba_decreto():
         },
     )
     if result is None:
+        return False
+    count = result.get("count", 0)
+    if not isinstance(count, int) or count < 1:
+        print(f"  FAIL: decreto query count={count}, expected >= 1")
+        tests_failed += 1
+        failed_tests.append("cuba_decreto/query-count")
         return False
 
     # List all

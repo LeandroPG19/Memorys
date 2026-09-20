@@ -1,0 +1,18 @@
+---
+description: Six-pack por defecto — el padre despacha; puede codear si el humano de este repo lo pide
+alwaysApply: true
+---
+
+# Orquestador
+
+Cada cambio de comportamiento: **six-pack** (`especificador` → `implementador` → `mejorador` → `arquitecto` → `endurecedor` → `qa`). El padre despacha, lee informes, rechaza handoffs malos, corre `scripts/validar-handoff.sh` y `scripts/quality-gate.sh`, y reporta métricas.
+
+Excepciones (el padre **sí** toca disco):
+
+- `.cursor/rules/`, `.cursor/handoffs/`, `AGENTS.md`, `docs/gate.md`, `scripts/como-el-ci.sh`, `scripts/quality-gate.*`, `scripts/validar-handoff.sh`
+- El humano de **este** repo (Mapupita) pidió implementar en este chat — entonces el padre puede codear, con TDD hasta rojo y el gate como juez
+- El runtime no tiene `Task` (CLI): se codea en el mismo cerebro; **no** se declara bloqueado
+
+«Lo hago yo que es más rápido» **sin** que el humano lo haya pedido no es excepción.
+
+No correr `tester` a la vez que implementadores.

@@ -9,6 +9,7 @@ pub async fn bm25_search(
     scope: &str,
     limit: i64,
     project_id: Option<Uuid>,
+    include_unscoped: bool,
 ) -> Result<Vec<Value>> {
     let mut results = Vec::new();
 
@@ -21,13 +22,14 @@ pub async fn bm25_search(
              WHERE o.search_vector @@ cuba_or_tsquery($1)
                AND o.observation_type != 'superseded'
                AND o.trust = 'trusted'
-               AND ($3::uuid IS NULL OR o.project_id = $3 OR o.project_id IS NULL)
+               AND ($3::uuid IS NULL OR o.project_id = $3 OR ($4::bool AND o.project_id IS NULL))
              ORDER BY bm25 DESC
              LIMIT $2",
         )
         .bind(query)
         .bind(limit)
         .bind(project_id)
+        .bind(include_unscoped)
         .fetch_all(pool)
         .await
         .context(
@@ -56,13 +58,14 @@ pub async fn bm25_search(
                     ts_rank_cd(search_vector, cuba_or_tsquery($1))::float8 AS bm25
              FROM brain_entities
              WHERE search_vector @@ cuba_or_tsquery($1)
-               AND ($3::uuid IS NULL OR project_id = $3 OR project_id IS NULL)
+               AND ($3::uuid IS NULL OR project_id = $3 OR ($4::bool AND project_id IS NULL))
              ORDER BY bm25 DESC
              LIMIT $2",
         )
         .bind(query)
         .bind(limit)
         .bind(project_id)
+        .bind(include_unscoped)
         .fetch_all(pool)
         .await
         .context(
@@ -91,13 +94,14 @@ pub async fn bm25_search(
                     ts_rank_cd(search_vector, cuba_or_tsquery($1))::float8 AS bm25
              FROM brain_errors
              WHERE search_vector @@ cuba_or_tsquery($1)
-               AND ($3::uuid IS NULL OR project_id = $3 OR project_id IS NULL)
+               AND ($3::uuid IS NULL OR project_id = $3 OR ($4::bool AND project_id IS NULL))
              ORDER BY bm25 DESC
              LIMIT $2",
         )
         .bind(query)
         .bind(limit)
         .bind(project_id)
+        .bind(include_unscoped)
         .fetch_all(pool)
         .await
         .context(
@@ -152,7 +156,8 @@ mod tests {
             ("errors", "brain_errors"),
             ("all", "brain_observations"),
         ] {
-            let Err(failure) = bm25_search(&pool, "anything at all", scope, 10, None).await else {
+            let Err(failure) = bm25_search(&pool, "anything at all", scope, 10, None, false).await
+            else {
                 panic!(
                     "scope {scope:?} answered Ok on a pool that cannot connect: the lexical \
                      half of the hybrid contributed nothing and the caller has no way to tell \
