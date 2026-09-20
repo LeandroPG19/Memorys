@@ -85,10 +85,30 @@ pub fn current_mcp_session() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub fn bind_key(client: &str, mcp_session: Option<&str>) -> String {
+/// Where a request came from, for the single purpose of telling two machines
+/// apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// The caller is on this machine. Every loopback client shares one bucket,
+    /// which is exactly what every install does today.
+    Local,
+    /// Another machine, named by its `Mcp-Machine-Id` or, failing that, by the
+    /// address it connected from.
+    Remote(String),
+}
+
+pub fn bind_key(client: &str, mcp_session: Option<&str>, origin: &Origin) -> String {
+    // The machine goes before the `::` so that forget_client, which purges by
+    // the `{key}::` prefix, still reaches every session belonging to one
+    // machine. Local carries no suffix at all: that keeps the key byte for
+    // byte what every install running today already has.
+    let who = match origin {
+        Origin::Local => client.to_string(),
+        Origin::Remote(machine) => format!("{client}@{machine}"),
+    };
     match mcp_session {
-        Some(s) if !s.is_empty() => format!("{client}::{s}"),
-        _ => client.to_string(),
+        Some(s) if !s.is_empty() => format!("{who}::{s}"),
+        _ => who,
     }
 }
 
@@ -111,7 +131,7 @@ pub async fn with_identity<F, R>(label: String, mcp_session: Option<String>, fut
 where
     F: std::future::Future<Output = R>,
 {
-    let bind = bind_key(&label, mcp_session.as_deref());
+    let bind = bind_key(&label, mcp_session.as_deref(), &Origin::Local);
     let session = mcp_session.unwrap_or_default();
     CLIENT_LABEL
         .scope(label, MCP_SESSION.scope(session, CLIENT.scope(bind, fut)))
@@ -278,14 +298,14 @@ mod tests {
 
     #[test]
     fn a_protocol_session_is_not_the_same_client_as_the_window() {
-        assert_eq!(bind_key("cursor", None), "cursor");
+        assert_eq!(bind_key("cursor", None, &Origin::Local), "cursor");
         assert_eq!(
-            bind_key("cursor", Some("chat-9")),
+            bind_key("cursor", Some("chat-9"), &Origin::Local),
             "cursor::chat-9",
             "two Cursor chats share Mcp-Client-Id=cursor; without the protocol session \
              they inherit each other's jornada"
         );
-        assert_eq!(bind_key("cursor", Some("")), "cursor");
+        assert_eq!(bind_key("cursor", Some(""), &Origin::Local), "cursor");
     }
 
     #[test]
@@ -535,5 +555,46 @@ mod tests {
             );
         })
         .await;
+    }
+
+    #[test]
+    fn two_machines_that_share_a_client_id_do_not_share_a_session() {
+        let one = bind_key("claude-code", None, &Origin::Remote("10.0.0.2".into()));
+        let two = bind_key("claude-code", None, &Origin::Remote("10.0.0.3".into()));
+        assert_ne!(
+            one, two,
+            "the key saw only the client id, so two workstations configured from the same example config landed in one bucket and inherited each other's open jornada and root project. Nothing errored: the corruption is silent, and on a LAN daemon it is not a risk but the default."
+        );
+    }
+
+    #[test]
+    fn a_local_caller_keys_exactly_as_it_did_before() {
+        assert_eq!(
+            bind_key("cursor", None, &Origin::Local),
+            "cursor",
+            "every install running today is loopback. If the key changed shape for them they would all lose their open session on upgrade, and v029 would break."
+        );
+        assert_eq!(
+            bind_key("cursor", Some("chat-9"), &Origin::Local),
+            "cursor::chat-9"
+        );
+    }
+
+    #[test]
+    fn a_remote_key_still_carries_its_protocol_session_and_its_label() {
+        let key = bind_key(
+            "claude-code",
+            Some("chat-a"),
+            &Origin::Remote("ws-7".into()),
+        );
+        assert_eq!(
+            key, "claude-code@ws-7::chat-a",
+            "the machine goes before the :: so that forget_client, which purges by the {{key}}:: prefix, still reaches every session of one machine"
+        );
+        assert_eq!(
+            client_label_of(key.clone()),
+            "claude-code@ws-7",
+            "two machines are two workspaces; the label has to say which one"
+        );
     }
 }

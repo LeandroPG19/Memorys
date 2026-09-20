@@ -96,7 +96,36 @@ fn ensure_tokens_differ() -> Result<()> {
     }
 }
 
+/// The shortest bearer token worth calling a secret on a routable address.
+/// 32 characters of base64 is 192 bits; the point is only that it is not in
+/// anybody's wordlist.
+const MIN_ROUTABLE_TOKEN_CHARS: usize = 32;
+
+/// Why this token is not good enough for this address, if it is not.
+///
+/// On loopback the token is a convenience and anything goes: whoever is asking
+/// already has the machine. On an address other machines can reach it is the
+/// only thing between the graph and anyone who can route a packet to the port,
+/// and `same_secret` compares in constant time but nothing stops an attacker
+/// on the LAN trying tokens as fast as the daemon answers.
+fn token_too_weak(addr_is_loopback: bool, token: Option<&str>) -> Option<String> {
+    if addr_is_loopback {
+        return None;
+    }
+    let token = token?;
+    if token.chars().count() >= MIN_ROUTABLE_TOKEN_CHARS {
+        return None;
+    }
+    Some(format!(
+        "CUBA_HTTP_TOKEN is {} characters. On an address other machines can reach it is the only thing standing between them and the entire graph, so it needs at least {MIN_ROUTABLE_TOKEN_CHARS}. Generate one: head -c 32 /dev/urandom | base64",
+        token.chars().count()
+    ))
+}
+
 fn ensure_loopback(addr: &SocketAddr) -> Result<()> {
+    if let Some(why) = token_too_weak(addr.ip().is_loopback(), auth_token().as_deref()) {
+        anyhow::bail!("refusing to bind {addr}: {why}");
+    }
     if addr.ip().is_loopback() || auth_token().is_some() {
         return Ok(());
     }
@@ -107,6 +136,9 @@ fn ensure_loopback(addr: &SocketAddr) -> Result<()> {
 }
 
 fn ensure_adopted_loopback(addr: &SocketAddr) -> Result<()> {
+    if let Some(why) = token_too_weak(addr.ip().is_loopback(), auth_token().as_deref()) {
+        anyhow::bail!("refusing the socket systemd handed over on {addr}: {why}");
+    }
     if addr.ip().is_loopback() || auth_token().is_some() {
         return Ok(());
     }
@@ -215,10 +247,13 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         tracing::info!(secs = started.elapsed().as_secs_f32(), "models warm");
     });
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(idle_shutdown))
-        .await
-        .context("http server failed")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(idle_shutdown))
+    .await
+    .context("http server failed")?;
 
     tracing::info!("daemon shut down");
     Ok(())
@@ -687,7 +722,36 @@ async fn panel(headers: HeaderMap) -> Response {
     response
 }
 
-async fn mcp_endpoint(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+/// Which machine a request came from.
+///
+/// Loopback is always one bucket: every caller on this machine is this
+/// machine, and keying them apart would change the key shape for every
+/// install running today. Off-box, an explicit `Mcp-Machine-Id` wins because a
+/// client that names itself survives DHCP; otherwise the address it connected
+/// from is the only thing that distinguishes it.
+fn origin_of(peer_is_loopback: bool, machine: Option<&str>, peer: &str) -> crate::session::Origin {
+    use crate::session::Origin;
+    if peer_is_loopback {
+        return Origin::Local;
+    }
+    match machine.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => Origin::Remote(id.to_string()),
+        None => Origin::Remote(peer.to_string()),
+    }
+}
+
+fn request_origin(peer: SocketAddr, headers: &HeaderMap) -> crate::session::Origin {
+    let machine = headers.get("mcp-machine-id").and_then(|v| v.to_str().ok());
+    origin_of(peer.ip().is_loopback(), machine, &peer.ip().to_string())
+}
+
+async fn mcp_endpoint(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let origin = request_origin(peer, &headers);
     let Some(scope) = authorized(&state, &headers) else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -713,7 +777,7 @@ async fn mcp_endpoint(State(state): State<AppState>, headers: HeaderMap, body: B
 
     let (label, declared) = client_key(&headers, &payload);
     let mcp_sid = mcp_session_id(&headers);
-    let key = crate::session::bind_key(&label, mcp_sid.as_deref());
+    let key = crate::session::bind_key(&label, mcp_sid.as_deref(), &origin);
     if let Ok(mut guard) = state.seen.write() {
         guard.insert(key.clone(), Instant::now());
     }
@@ -909,24 +973,45 @@ async fn dispatch_one(
     })
 }
 
+/// What a caller who has proved nothing may see of the graph backend.
+///
+/// `graph_db::status_summary()` carries `last_error`, and a connection failure
+/// names the host and port it could not reach. It also carries the graph name
+/// and whether a URL is configured. On a loopback bind none of that matters,
+/// but `/health` answers on a LAN bind too, where it was handing anyone who
+/// could route a packet a piece of internal topology, unauthenticated.
+///
+/// What survives is what a monitor actually needs: which backend, and whether
+/// it answers.
+fn graph_summary_for(full_scope: bool, summary: Value) -> Value {
+    if full_scope {
+        return summary;
+    }
+    serde_json::json!({
+        "backend": summary.get("backend").cloned().unwrap_or(Value::Null),
+        "reachable": summary.get("reachable").cloned().unwrap_or(Value::Null),
+    })
+}
+
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.pool)
         .await
         .is_ok();
 
+    let full_scope = authorized(&state, &headers) == Some(Scope::Full);
     let mut body = serde_json::json!({
         "status": if db_ok { "ok" } else { "degraded" },
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": state.started.elapsed().as_secs(),
         "requests_served": state.served.load(Ordering::Relaxed),
         "database": if db_ok { "up" } else { "unreachable" },
-        "graph_db": crate::graph_db::status_summary(),
+        "graph_db": graph_summary_for(full_scope, crate::graph_db::status_summary()),
         "connect": "/connect",
         "events": "/events",
     });
 
-    if authorized(&state, &headers) == Some(Scope::Full) {
+    if full_scope {
         let clients: Vec<String> = state
             .seen
             .read()
@@ -948,6 +1033,11 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every test in this module speaks for something on this machine.
+    fn local_peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 55555))
+    }
 
     fn headers_with(name: &'static str, value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -1024,8 +1114,13 @@ mod tests {
             }
         });
         let body = Bytes::from(serde_json::to_vec(&payload).expect("payload serializes"));
-        let response =
-            mcp_endpoint(State(state_with_clients(None, &[])), HeaderMap::new(), body).await;
+        let response = mcp_endpoint(
+            State(state_with_clients(None, &[])),
+            axum::extract::ConnectInfo(local_peer()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
         let ctype = response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -1056,7 +1151,11 @@ mod tests {
             axum::http::HeaderValue::from_static("chat-a"),
         );
         assert_eq!(
-            crate::session::bind_key("cursor", mcp_session_id(&headers).as_deref()),
+            crate::session::bind_key(
+                "cursor",
+                mcp_session_id(&headers).as_deref(),
+                &crate::session::Origin::Local
+            ),
             "cursor::chat-a"
         );
         let _ = payload;
@@ -1201,8 +1300,13 @@ mod tests {
 
     async fn post_mcp(payload: Value) -> (StatusCode, Value) {
         let body = Bytes::from(serde_json::to_vec(&payload).expect("payload serializes"));
-        let response =
-            mcp_endpoint(State(state_with_clients(None, &[])), HeaderMap::new(), body).await;
+        let response = mcp_endpoint(
+            State(state_with_clients(None, &[])),
+            axum::extract::ConnectInfo(local_peer()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), MAX_BODY)
             .await
@@ -1370,6 +1474,100 @@ mod tests {
             Some(1),
             "with no token the daemon is loopback-only by ensure_loopback, and hiding \
              the list there would cost debugging for no security"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lan_exposure_tests {
+    use super::*;
+
+    #[test]
+    fn a_token_anybody_could_guess_is_refused_on_an_address_other_machines_can_reach() {
+        for weak in ["1234", "memoria", "changeme", "cuba", ""] {
+            assert!(
+                token_too_weak(false, Some(weak)).is_some(),
+                "CUBA_HTTP_TOKEN={weak:?} passes the bind guard today: it only asks whether a token exists, never whether it is worth anything. On a LAN that token is the whole boundary around every observation, decision and episode the graph holds."
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_token_and_a_loopback_bind_are_both_left_alone() {
+        let strong = "k7Qx2mVb9LpZ4tRw8sNc1JyH6fDgEa0U";
+        assert_eq!(strong.len(), MIN_ROUTABLE_TOKEN_CHARS);
+        assert!(
+            token_too_weak(false, Some(strong)).is_none(),
+            "a token at the minimum length is acceptable: the boundary is inclusive"
+        );
+        assert!(
+            token_too_weak(true, Some("1234")).is_none(),
+            "on loopback the token is a convenience, not a boundary. Whoever is asking already has the machine, and refusing here would break every developer running the daemon locally."
+        );
+        assert!(
+            token_too_weak(true, None).is_none(),
+            "no token on loopback is the documented default and must stay silent"
+        );
+    }
+
+    #[test]
+    fn health_does_not_hand_an_anonymous_caller_the_graph_backend_error() {
+        let full = serde_json::json!({
+            "backend": "falkor",
+            "graph_name": "memory_industry",
+            "url_configured": true,
+            "reachable": false,
+            "projected_ops": 7,
+            "last_error": "connection refused to redis://10.0.0.5:6379",
+        });
+
+        let public = graph_summary_for(false, full.clone()).to_string();
+        for leaked in ["10.0.0.5", "6379", "memory_industry", "url_configured"] {
+            assert!(
+                !public.contains(leaked),
+                "/health answers unauthenticated and this body reaches anyone who can route a packet to the port. It must not carry {leaked:?}: {public}"
+            );
+        }
+        assert!(
+            public.contains("falkor") && public.contains("reachable"),
+            "a monitor still has to be able to see which backend it is and whether it answers: {public}"
+        );
+
+        assert_eq!(
+            graph_summary_for(true, full.clone()),
+            full,
+            "a caller with the admin token is the operator; redacting from them would just send them to SSH"
+        );
+    }
+
+    #[test]
+    fn only_an_off_box_caller_gets_told_apart() {
+        use crate::session::Origin;
+
+        assert_eq!(
+            origin_of(true, None, "127.0.0.1"),
+            Origin::Local,
+            "every caller on this machine is this machine"
+        );
+        assert_eq!(
+            origin_of(true, Some("laptop"), "127.0.0.1"),
+            Origin::Local,
+            "loopback stays one bucket even when a client volunteers a machine id, or a developer who sets the header would silently start a new session"
+        );
+        assert_eq!(
+            origin_of(false, Some("ws-7"), "10.0.0.2"),
+            Origin::Remote("ws-7".into()),
+            "a client that names itself beats an address, which DHCP can move"
+        );
+        assert_eq!(
+            origin_of(false, Some("   "), "10.0.0.2"),
+            Origin::Remote("10.0.0.2".into()),
+            "a blank header is not an identity"
+        );
+        assert_eq!(
+            origin_of(false, None, "10.0.0.3"),
+            Origin::Remote("10.0.0.3".into()),
+            "with nothing volunteered the address is the only thing that distinguishes two machines, and it is what protects an operator who copied one config to every workstation"
         );
     }
 }
