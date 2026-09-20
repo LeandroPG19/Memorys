@@ -35,6 +35,9 @@ struct AppState {
     served: Arc<AtomicU64>,
     seen: Arc<std::sync::RwLock<std::collections::HashMap<String, Instant>>>,
     last_activity: Arc<Mutex<Instant>>,
+    /// False until the models finished loading. The port opens before that is
+    /// true only when warming ran past its budget, and `/health` says so.
+    ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub fn bind_addr() -> String {
@@ -187,6 +190,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         tokio::spawn(async move { protocol::sync_listener(listen_pool, listen_url).await });
     }
 
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
         pool,
         token: auth_token().map(Arc::new),
@@ -195,6 +199,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         served: Arc::new(AtomicU64::new(0)),
         seen: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         last_activity: Arc::new(Mutex::new(Instant::now())),
+        ready: ready.clone(),
     };
 
     let reaper_seen = state.seen.clone();
@@ -235,17 +240,44 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
             .with_context(|| format!("cannot bind {addr} — is another daemon already running?"))?,
     };
 
+    // Bind first: a port already taken, a non-loopback address without a token
+    // or a weak one all fail here, in a second, instead of after two minutes of
+    // loading. Then warm, and only then say the daemon is listening.
+    //
+    // Warming before the bind was the other obvious order and it is worse: the
+    // port stays shut while the models load, so clients get ECONNREFUSED and
+    // mark the server dead, and a warm-up that hangs means the daemon never
+    // binds at all and cannot be asked why.
+    //
+    // Between bind and serve the kernel queues connections, so a client that
+    // arrives early waits and then gets a real answer rather than a 200 with an
+    // unreranked ranking in it.
+    let warming = tokio::spawn({
+        let ready = ready.clone();
+        async move {
+            let started = Instant::now();
+            warm_models().await;
+            ready.store(true, Ordering::Relaxed);
+            tracing::info!(secs = started.elapsed().as_secs_f32(), "models warm");
+        }
+    });
+    let warm_budget = warm_before_serve_budget();
+    if tokio::time::timeout(warm_budget, warming).await.is_err() {
+        // Dropping the handle detaches the task; it keeps loading and flips
+        // `ready` when it lands. Serving now is the lesser evil: a daemon that
+        // never opens its port cannot even be asked what it is doing.
+        tracing::warn!(
+            secs = warm_budget.as_secs(),
+            "los modelos no terminaron de calentar dentro del presupuesto — se sirve igual, /health dice ready:false y las búsquedas con rerank salen marcadas como degradadas"
+        );
+    }
+
     tracing::info!(
         %addr,
         auth = auth_token().is_some(),
+        ready = ready.load(Ordering::Relaxed),
         "MemoryIndustry daemon listening — point clients at http://{addr}/mcp (connect: /connect)"
     );
-
-    tokio::spawn(async {
-        let started = Instant::now();
-        warm_models().await;
-        tracing::info!(secs = started.elapsed().as_secs_f32(), "models warm");
-    });
 
     axum::serve(
         listener,
@@ -283,10 +315,27 @@ async fn shutdown_signal(idle: Arc<tokio::sync::Notify>) {
     }
 }
 
+/// How long the daemon waits for its models before it opens for business
+/// anyway. Long enough for a cold cross-encoder, short enough that a broken
+/// model does not leave the port shut with nobody able to ask why.
+fn warm_before_serve_budget() -> std::time::Duration {
+    let secs = std::env::var("MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS")
+        .or_else(|_| std::env::var("CUBA_WARM_BEFORE_SERVE_SECS"))
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(180);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Opt-out, not opt-in.
+///
+/// Deferring the load does not save the cost, it moves it inside the first
+/// search that asks for reranking — a request with a 20 s budget paying for a
+/// 1.1 GB read. The daemon has time at startup and the search does not.
 fn warm_reranker_eagerly() -> bool {
-    matches!(
+    !matches!(
         std::env::var("CUBA_WARM_RERANKER").as_deref(),
-        Ok("1") | Ok("on") | Ok("true") | Ok("yes")
+        Ok("0") | Ok("off") | Ok("false") | Ok("no")
     )
 }
 
@@ -1007,6 +1056,7 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
         "requests_served": state.served.load(Ordering::Relaxed),
         "database": if db_ok { "up" } else { "unreachable" },
         "graph_db": graph_summary_for(full_scope, crate::graph_db::status_summary()),
+        "ready": state.ready.load(Ordering::Relaxed),
         "connect": "/connect",
         "events": "/events",
     });
@@ -1416,6 +1466,7 @@ mod tests {
             clients.iter().map(|c| ((*c).to_string(), Instant::now())),
         );
         AppState {
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             pool: crate::db::create_lazy_pool("postgres://unused/unused"),
             token: token.map(|t| Arc::new(t.to_string())),
             peer_token: None,
@@ -1568,6 +1619,71 @@ mod lan_exposure_tests {
             origin_of(false, None, "10.0.0.3"),
             Origin::Remote("10.0.0.3".into()),
             "with nothing volunteered the address is the only thing that distinguishes two machines, and it is what protects an operator who copied one config to every workstation"
+        );
+    }
+
+    #[test]
+    fn the_port_opens_after_the_models_are_warm_and_the_announcement_comes_last() {
+        // The daemon used to bind, announce itself as listening, and only
+        // then spawn the warm-up detached. The announcement was a lie for as
+        // long as the load took, and a search that arrived in that window got
+        // 200 OK with an unreranked ranking in it.
+        let source = include_str!("http.rs");
+        let body = source
+            .split_once("pub async fn serve_pool(")
+            .expect("serve_pool is in this file")
+            .1;
+        let body = body
+            .split_once(
+                "
+}",
+            )
+            .expect("the function ends")
+            .0;
+
+        let bind = body
+            .find("let listener = match systemd_listener()")
+            .expect("the bind");
+        let warm = body.find("warm_models().await").expect("the warm-up");
+        let announce = body.find("daemon listening").expect("the announcement");
+        let serve = body.find("axum::serve(").expect("the server");
+
+        assert!(
+            bind < warm,
+            "bind first: a taken port, a missing token or a weak one all fail in a second, and finding that out after two minutes of loading helps nobody"
+        );
+        assert!(
+            warm < announce && announce < serve,
+            "the models have to be warm before the daemon claims to be listening, and the claim has to come before anything is served"
+        );
+    }
+
+    #[test]
+    fn a_warm_up_that_never_finishes_does_not_keep_the_port_shut() {
+        let source = include_str!("http.rs");
+        let body = source
+            .split_once("pub async fn serve_pool(")
+            .expect("serve_pool is in this file")
+            .1;
+        let body = body
+            .split_once(
+                "
+}",
+            )
+            .expect("the function ends")
+            .0;
+        assert!(
+            body.contains("warm_before_serve_budget()") && body.contains("tokio::time::timeout("),
+            "the wait for the models has to be bounded. Warming before the bind was the other obvious order and it is worse: a model that never loads leaves the daemon unbound, so nobody can even ask it what is wrong."
+        );
+    }
+
+    #[test]
+    fn the_warm_up_budget_falls_back_rather_than_becoming_zero() {
+        assert_eq!(
+            warm_before_serve_budget(),
+            std::time::Duration::from_secs(180),
+            "the default has to leave room for a cold cross-encoder"
         );
     }
 }
