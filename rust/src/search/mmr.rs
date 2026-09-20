@@ -136,4 +136,38 @@ mod tests {
             "second pick must keep the higher-relevance neighbour when (1-λ) is 0.5"
         );
     }
+
+    #[test]
+    fn lambda_scales_relevance_rather_than_being_added_to_it() {
+        // Two mutants of `lambda * relevance[cand]` survived the gate for
+        // months: `lambda + relevance` and `lambda / relevance`. Adding a
+        // constant to every candidate leaves their order untouched, so any
+        // test that only checks *which* items come back agrees with it. The
+        // multiplication is what makes a small lambda shrink relevance
+        // differences against the diversity penalty - that is the whole knob.
+        //
+        // Here item 1 is nearly as relevant as item 0 and identical to it;
+        // item 2 is irrelevant and completely different. At lambda 0.1
+        // diversity has to win.
+        let relevance = [1.0, 0.95, 0.0];
+        let mut sim = identity_sim(3);
+        sim[1][0] = 1.0;
+        sim[0][1] = 1.0;
+
+        let picked = mmr_select(&relevance, &sim, 0.1, 2);
+
+        assert_eq!(
+            picked,
+            vec![0, 2],
+            "at lambda 0.1 the 0.95 relevance of item 1 is worth 0.095, and being a duplicate of item 0 costs it 0.9. Item 2 wins on diversity alone. Replace the multiplication with an addition and item 1 keeps its full 0.95, which beats the penalty and brings the duplicate back."
+        );
+
+        // And the same shape at lambda 0.9, where relevance should win, so
+        // the test pins the trade-off and not one lucky point on it.
+        assert_eq!(
+            mmr_select(&relevance, &sim, 0.9, 2),
+            vec![0, 1],
+            "at lambda 0.9 a near-duplicate that is almost as relevant is the better second pick: 0.855 against a 0.1 penalty"
+        );
+    }
 }
