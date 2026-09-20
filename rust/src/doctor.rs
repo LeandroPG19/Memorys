@@ -345,6 +345,42 @@ fn reranker_check(
     }
 }
 
+/// How long `--deep` will wait for one model to open before calling it a
+/// failure. Generous: a cold cross-encoder off a slow disk is minutes.
+fn deep_load_budget() -> std::time::Duration {
+    let secs = std::env::var("MEMORY_INDUSTRY_DOCTOR_DEEP_SECS")
+        .or_else(|_| std::env::var("CUBA_DOCTOR_DEEP_SECS"))
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(300);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Force a lazily-loaded model to resolve, off the runtime and under a budget.
+///
+/// `enabled()` on either model reads a gigabyte off disk on its first call, so
+/// invoking it from an async task stalls every other task sharing the runtime.
+/// That is the bug 4d5dd76 fixed for the reranker; the NLI branch kept doing it
+/// for another release.
+///
+/// The budget is the other half: a load that never returns must not take
+/// `doctor` with it. Expiring is a failure with a reason on it, never a skip -
+/// the tool exists to say what is wrong, and hanging says nothing.
+async fn resolve_under_budget<F>(load: F) -> Result<bool, String>
+where
+    F: FnOnce() -> bool + Send + 'static,
+{
+    let budget = deep_load_budget();
+    match tokio::time::timeout(budget, tokio::task::spawn_blocking(load)).await {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(e)) => Err(format!("la carga entro en panico: {e}")),
+        Err(_) => Err(format!(
+            "no abrio en {}s (MEMORY_INDUSTRY_DOCTOR_DEEP_SECS)",
+            budget.as_secs()
+        )),
+    }
+}
+
 pub async fn run_checks(pool: &PgPool, url: &str) -> Vec<Check> {
     run_checks_with(pool, url, false).await
 }
@@ -537,11 +573,27 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     });
 
     let rerank_configured = crate::search::rerank::is_configured();
-    let rerank_resolved = crate::search::rerank::status_resolved();
-    let rerank_enabled = rerank_resolved && crate::search::rerank::enabled();
     let rerank_disabled_by_resources = std::env::var("CUBA_RERANKER_PATH").ok().as_deref()
         == Some(crate::resources::disabled_model_path().as_str());
-    let rerank_failure = crate::search::rerank::failure_reason();
+
+    // `--deep` says it loads the reranker. It never did: the guard below reads
+    // the status only when something else had already resolved it, so the deep
+    // flag changed nothing for this model and the help text was a promise the
+    // code did not keep.
+    let (rerank_resolved, rerank_enabled, rerank_failure) =
+        if deep && rerank_configured && !rerank_disabled_by_resources {
+            match resolve_under_budget(crate::search::rerank::enabled).await {
+                Ok(enabled) => (true, enabled, crate::search::rerank::failure_reason()),
+                Err(why) => (true, false, Some(why)),
+            }
+        } else {
+            let resolved = crate::search::rerank::status_resolved();
+            (
+                resolved,
+                resolved && crate::search::rerank::enabled(),
+                crate::search::rerank::failure_reason(),
+            )
+        };
     checks.push(reranker_check(
         RerankerLoad::observe(
             rerank_configured,
@@ -561,26 +613,32 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
                 "nli_entailment",
                 "modelo en disco; resource plan difiere la carga hasta que haya RAM",
             ));
-        } else if deep && crate::cognitive::nli::enabled() {
-            checks.push(Check::ok(
-                "nli_entailment",
-                "cargado (mDeBERTa-v3-xnli) — verify decide en ~50 ms, sin LLM",
-            ));
-        } else {
-            checks.push(if deep {
-                Check::fail(
+        } else if deep {
+            // Was `deep && nli::enabled()`, called straight from this async
+            // task: a gigabyte read on the runtime worker, which is the same
+            // defect 4d5dd76 removed from the reranker path and left here.
+            let outcome = resolve_under_budget(crate::cognitive::nli::enabled).await;
+            checks.push(match outcome {
+                Ok(true) => Check::ok(
+                    "nli_entailment",
+                    "cargado (mDeBERTa-v3-xnli) - verify decide en ~50 ms, sin LLM",
+                ),
+                Ok(false) => Check::fail(
                     "nli_entailment",
                     "hay un modelo NLI en disco pero NO carga",
-                    "verify se cae al juez LLM (~20 s por afirmación) o al heurístico, que \
-                     no decide nada. Suele ser libonnxruntime.so: comprobá ORT_DYLIB_PATH.",
-                )
-            } else {
-                Check::ok(
+                    "verify se cae al juez LLM (~20 s por afirmacion) o al heuristico, que no decide nada. Suele ser libonnxruntime.so: comproba ORT_DYLIB_PATH.",
+                ),
+                Err(why) => Check::fail(
                     "nli_entailment",
-                    "presente en disco — carga a su primer veredicto (no lo cargo aquí: \
-                     son ~1 GB; `doctor --deep` lo comprueba de verdad)",
-                )
+                    format!("el modelo NLI esta en disco y {why}"),
+                    "verify se cae al juez LLM o al heuristico. Si el disco es lento subi el presupuesto; si no vuelve nunca, el modelo esta corrupto.",
+                ),
             });
+        } else {
+            checks.push(Check::ok(
+                "nli_entailment",
+                "presente en disco - carga a su primer veredicto (no lo cargo aqui: son ~1 GB; `doctor --deep` lo comprueba de verdad)",
+            ));
         }
     } else {
         checks.push(Check::fail(
@@ -1305,5 +1363,74 @@ mod reranker_tests {
         let check = reranker_check(RerankerLoad::NoModel, false, 8000, "full", false);
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("no hay modelo en disco"));
+    }
+}
+
+#[cfg(test)]
+mod deep_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_load_that_never_finishes_fails_instead_of_hanging() {
+        unsafe { std::env::set_var("MEMORY_INDUSTRY_DOCTOR_DEEP_SECS", "1") };
+        let started = std::time::Instant::now();
+
+        let answer = resolve_under_budget(|| {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            true
+        })
+        .await;
+
+        unsafe { std::env::remove_var("MEMORY_INDUSTRY_DOCTOR_DEEP_SECS") };
+        let why = answer.expect_err("a 4 s load under a 1 s budget has to give up");
+        assert!(
+            why.contains("1s"),
+            "the message has to name the budget, or an operator on a slow disk cannot tell a corrupt model from one that needed longer: {why}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "doctor exists to say what is wrong; a check that hangs says nothing. It waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_load_that_answers_comes_straight_back() {
+        assert_eq!(resolve_under_budget(|| true).await, Ok(true));
+        assert_eq!(resolve_under_budget(|| false).await, Ok(false));
+    }
+
+    #[test]
+    fn deep_resolves_both_models_off_the_runtime() {
+        // Structural, and it is the regression that matters: the reranker
+        // branch silently did nothing under --deep while the help text
+        // promised it loaded, and the NLI branch called enabled() straight
+        // from the async task, reading a gigabyte on the runtime worker.
+        let source = include_str!("doctor.rs");
+        let body = source
+            .split_once("pub async fn run_checks_with(")
+            .expect("run_checks_with is in this file")
+            .1;
+        // Bounded to the function: a column-zero brace is where it ends. Left
+        // open, the slice runs to the end of the file and counts the mentions
+        // in this very test.
+        let body = body
+            .split_once(
+                "
+}
+",
+            )
+            .expect("the function ends")
+            .0;
+
+        assert_eq!(
+            body.matches("resolve_under_budget(").count(),
+            2,
+            "both the reranker and the NLI have to resolve through the budgeted, off-runtime helper. A direct enabled() here is a gigabyte read on the executor, and a missing one is a --deep that checks nothing."
+        );
+        assert!(
+            !body.contains("deep && crate::cognitive::nli::enabled()"),
+            "that is the exact call that blocked the runtime"
+        );
     }
 }
