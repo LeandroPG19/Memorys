@@ -16,7 +16,14 @@ static RERANKER_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
 
 enum RerankerStatus {
     Loaded,
-    Fallback,
+    /// No model to load: nothing is wrong, the ranking just comes back in RRF
+    /// order.
+    Unavailable,
+    /// A model is on disk and the session did not open. The reason is kept
+    /// because `doctor` used to guess at it, and guessed wrong: it answered
+    /// every load failure with "check ORT_DYLIB_PATH" while a real deployment
+    /// was failing on a CUDA arena that was too small.
+    Failed(String),
 }
 
 fn semaphore() -> &'static tokio::sync::Semaphore {
@@ -55,6 +62,17 @@ pub fn enabled() -> bool {
 
 pub fn status_resolved() -> bool {
     RERANKER_STATUS.get().is_some()
+}
+
+/// Why the reranker is not loaded, when something already tried to load it.
+///
+/// `None` means it loaded, or nobody has asked yet. Reading the resolved cell
+/// rather than forcing it keeps this callable from an async task.
+pub fn failure_reason() -> Option<String> {
+    match RERANKER_STATUS.get()? {
+        RerankerStatus::Loaded | RerankerStatus::Unavailable => None,
+        RerankerStatus::Failed(reason) => Some(reason.clone()),
+    }
 }
 
 pub fn is_configured() -> bool {
@@ -164,11 +182,12 @@ fn get_status() -> &'static RerankerStatus {
                     RerankerStatus::Loaded
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "reranker init failed — identity fallback");
-                    RerankerStatus::Fallback
+                    let reason = format!("{e:#}");
+                    tracing::error!(error = %reason, "reranker init failed — identity fallback");
+                    RerankerStatus::Failed(reason)
                 }
             },
-            None => RerankerStatus::Fallback,
+            None => RerankerStatus::Unavailable,
         }
     })
 }

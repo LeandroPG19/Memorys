@@ -261,6 +261,7 @@ fn reranker_check(
     ram_available_mb: u64,
     tier: &str,
     on_by_default: bool,
+    failure: Option<&str>,
 ) -> Check {
     if disabled_by_resources {
         return Check::warn(
@@ -290,12 +291,22 @@ fn reranker_check(
                 }
             ),
         ),
-        (true, true) => Check::fail(
-            "reranker",
-            "hay un modelo en disco pero NO carga",
-            "el ranking se devuelve tal cual. Suele ser libonnxruntime.so: comprobá \
-             ORT_DYLIB_PATH.",
-        ),
+        (true, true) => match failure {
+            // The loader knows why. This is the only place the operator reads
+            // it, so pass it through instead of offering a likelier-sounding
+            // guess: on one deployment the guess named the wrong library while
+            // the real cause was a CUDA arena ceiling below the model's size.
+            Some(reason) => Check::fail(
+                "reranker",
+                format!("hay un modelo en disco y NO carga: {reason}"),
+                "el ranking se devuelve tal cual (RRF, sin reordenar). El mensaje de arriba                  viene del cargador: es la causa medida, no una conjetura.",
+            ),
+            None => Check::fail(
+                "reranker",
+                "hay un modelo en disco pero NO carga",
+                "el ranking se devuelve tal cual. Sin un motivo del cargador, lo más probable                  es libonnxruntime.so: comprobá ORT_DYLIB_PATH.",
+            ),
+        },
         (true, false) => Check::ok(
             "reranker",
             "configurado — carga en su primer lote (no lo cargo aquí: son ~1,1 GB)",
@@ -513,6 +524,7 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
         machine.ram_available_mb,
         resource_plan.tier.as_str(),
         mode.rerank_default(),
+        crate::search::rerank::failure_reason().as_deref(),
     ));
 
     if crate::cognitive::nli::available() {
@@ -1148,7 +1160,7 @@ mod reranker_tests {
 
     #[test]
     fn resources_disabling_it_for_ram_is_distinguished_from_no_model_at_all() {
-        let starved = reranker_check(false, false, false, true, 373, "minimal", false);
+        let starved = reranker_check(false, false, false, true, 373, "minimal", false, None);
         assert_eq!(
             starved.status,
             Status::Warn,
@@ -1169,7 +1181,7 @@ mod reranker_tests {
              required, or raising the memory limit later looks like it should have worked"
         );
 
-        let never_installed = reranker_check(false, false, false, false, 8000, "full", false);
+        let never_installed = reranker_check(false, false, false, false, 8000, "full", false, None);
         assert_ne!(
             starved.detail, never_installed.detail,
             "two different root causes collapsing into the same sentence is the exact bug \
@@ -1179,8 +1191,38 @@ mod reranker_tests {
     }
 
     #[test]
+    fn a_model_that_fails_to_load_says_why_instead_of_guessing_at_the_library() {
+        // The message ONNX Runtime actually produced on a 2026-09 deployment,
+        // where the CUDA arena ceiling was too low for the cross-encoder.
+        let arena = "load model: BFCArena::AllocateRawInternal: Available memory of 2423552                      is smaller than requested bytes of 4194304";
+        let check = reranker_check(true, true, false, false, 8000, "full", true, Some(arena));
+
+        assert_eq!(check.status, Status::Fail);
+        let said = format!("{} {}", check.detail, check.hint.as_deref().unwrap_or(""));
+        assert!(
+            said.contains("BFCArena"),
+            "the loader knows exactly why the session did not open and this is the only place              an operator sees it. Throwing the error away leaves the check guessing: {said}"
+        );
+        assert!(
+            !said.contains("ORT_DYLIB_PATH"),
+            "this check used to answer every load failure with 'suele ser libonnxruntime.so:              comprobá ORT_DYLIB_PATH'. On that deployment the library was fine and the arena              was too small, and the guess sent the operator to read the wrong thing. A hint              that is right sometimes is worse than no hint when the real cause is in hand:              {said}"
+        );
+
+        // With nothing known, the old advice is still the best available guess.
+        let unexplained = reranker_check(true, true, false, false, 8000, "full", true, None);
+        assert_eq!(unexplained.status, Status::Fail);
+        assert!(
+            unexplained
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("ORT_DYLIB_PATH")),
+            "when the reason is genuinely unknown the library is still the likeliest cause"
+        );
+    }
+
+    #[test]
     fn a_loaded_model_says_whether_it_is_reachable_by_default() {
-        let with_gpu = reranker_check(true, true, true, false, 8000, "full", true);
+        let with_gpu = reranker_check(true, true, true, false, 8000, "full", true, None);
         assert_eq!(with_gpu.status, Status::Ok);
         assert!(
             with_gpu.detail.contains("activo por defecto: true"),
@@ -1188,7 +1230,7 @@ mod reranker_tests {
             with_gpu.detail
         );
 
-        let without_gpu = reranker_check(true, true, true, false, 8000, "full", false);
+        let without_gpu = reranker_check(true, true, true, false, 8000, "full", false, None);
         assert_eq!(without_gpu.status, Status::Ok);
         assert!(
             without_gpu.detail.contains("activo por defecto: false"),
@@ -1206,14 +1248,14 @@ mod reranker_tests {
     #[test]
     fn a_model_on_disk_that_fails_to_load_is_still_a_failure() {
         assert_eq!(
-            reranker_check(true, true, false, false, 8000, "full", true).status,
+            reranker_check(true, true, false, false, 8000, "full", true, None).status,
             Status::Fail
         );
     }
 
     #[test]
     fn genuinely_no_model_on_disk_is_only_a_warning() {
-        let check = reranker_check(false, false, false, false, 8000, "full", false);
+        let check = reranker_check(false, false, false, false, 8000, "full", false, None);
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("no hay modelo en disco"));
     }
