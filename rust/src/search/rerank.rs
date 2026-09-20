@@ -58,12 +58,7 @@ pub fn status_resolved() -> bool {
 }
 
 pub fn is_configured() -> bool {
-    if let Ok(p) = std::env::var("CUBA_RERANKER_PATH") {
-        return PathBuf::from(p).join("model.onnx").exists();
-    }
-    default_reranker_dir()
-        .map(|d| d.join("model.onnx").exists())
-        .unwrap_or(false)
+    resolved_model_dir().is_some_and(|dir| model_file_in(&dir).is_some())
 }
 
 fn default_reranker_dir() -> Option<PathBuf> {
@@ -96,18 +91,49 @@ pub async fn warm_up() -> bool {
         .is_ok()
 }
 
+/// The name the resource plan uses to switch a model off: a directory under
+/// the temp dir that nothing ever creates. Matching on the name rather than on
+/// existence is the whole point — the directory is *supposed* not to be there.
+const DISABLED_MARKER: &str = "disabled-by-resource-plan";
+
+/// The one rule that answers "which reranker directory, if any".
+///
+/// `is_configured()` and the loader both derive from this, so they cannot
+/// disagree. They used to resolve the path differently: `is_configured` looked
+/// at whatever `CUBA_RERANKER_PATH` named, while the loader filtered that path
+/// through `.exists()` and fell through to the cache when it did not. Since the
+/// plan disables the reranker with a directory it never creates, the filter
+/// dropped the sentinel, the loader found the real model in the cache, and a
+/// plan that said "no room for the reranker" still loaded it inside the first
+/// search — while `doctor` reported it disabled.
+///
+/// A path that names a directory with no model in it now stays that path.
+/// Quietly reranking with a different model than the one an operator pointed at
+/// is the same class of bug.
+pub fn resolved_model_dir() -> Option<PathBuf> {
+    match std::env::var("CUBA_RERANKER_PATH") {
+        Ok(raw) => {
+            let dir = PathBuf::from(raw);
+            if dir.to_string_lossy().contains(DISABLED_MARKER) {
+                return None;
+            }
+            Some(dir)
+        }
+        Err(_) => default_reranker_dir(),
+    }
+}
+
+/// The file `init_session` would open, in the order it would try them.
+fn model_file_in(dir: &std::path::Path) -> Option<PathBuf> {
+    ["model_quantized.onnx", "model.onnx"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.exists())
+}
+
 fn get_status() -> &'static RerankerStatus {
     RERANKER_STATUS.get_or_init(|| {
-        let path = RERANKER_PATH.get_or_init(|| {
-            if let Some(p) = std::env::var("CUBA_RERANKER_PATH")
-                .ok()
-                .map(PathBuf::from)
-                .filter(|p| p.exists())
-            {
-                return Some(p);
-            }
-            default_reranker_dir().filter(|p| p.join("model.onnx").exists())
-        });
+        let path = RERANKER_PATH.get_or_init(resolved_model_dir);
         match path {
             Some(p) => match init_session(p) {
                 Ok(()) => {
@@ -393,6 +419,85 @@ fn identity_pairs(n: usize) -> Vec<(usize, f64)> {
 mod tests {
     use super::*;
 
+    /// These tests move HOME and CUBA_RERANKER_PATH, which every other test in
+    /// this process reads. Serialise them.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A throwaway HOME whose cache holds a plausible reranker, so the tests
+    /// below never depend on what this machine happens to have installed.
+    struct FakeHome {
+        root: PathBuf,
+        home: Option<String>,
+        userprofile: Option<String>,
+    }
+
+    impl FakeHome {
+        fn with_a_model_in_the_cache(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "memory-industry-rerank-{}-{tag}",
+                std::process::id()
+            ));
+            let cache = root.join(".cache").join("memory-industry").join("reranker");
+            std::fs::create_dir_all(&cache).expect("temp dir is writable");
+            std::fs::write(cache.join("model.onnx"), b"not a real graph").expect("writable");
+
+            let me = Self {
+                home: std::env::var("HOME").ok(),
+                userprofile: std::env::var("USERPROFILE").ok(),
+                root,
+            };
+            unsafe {
+                std::env::set_var("HOME", &me.root);
+                std::env::set_var("USERPROFILE", &me.root);
+            }
+            me
+        }
+    }
+
+    impl Drop for FakeHome {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.userprofile {
+                    Some(v) => std::env::set_var("USERPROFILE", v),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+                std::env::remove_var("CUBA_RERANKER_PATH");
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn the_path_the_plan_disabled_does_not_fall_through_to_the_cache() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = FakeHome::with_a_model_in_the_cache("disabled");
+
+        // Positive control first: without the sentinel the fixture resolves, so
+        // a None below means the sentinel did its job and not that the fake
+        // cache was never found.
+        unsafe { std::env::remove_var("CUBA_RERANKER_PATH") };
+        assert!(
+            resolved_model_dir().is_some(),
+            "the fixture itself is broken: a cache with model.onnx must resolve"
+        );
+
+        unsafe {
+            std::env::set_var(
+                "CUBA_RERANKER_PATH",
+                crate::resources::disabled_model_path(),
+            )
+        };
+        assert_eq!(
+            resolved_model_dir(),
+            None,
+            "the resource plan switches the reranker off by pointing CUBA_RERANKER_PATH at a              directory it deliberately never creates. Filtering that path on `.exists()` drops              the sentinel and falls through to the cache, so the plan says 'no room for the              reranker', doctor reports it disabled, and the first search still loads 1.1 GB"
+        );
+    }
+
     fn force_fallback_if_unresolved() {
         if !status_resolved() {
             unsafe { std::env::set_var("CUBA_RERANKER_PATH", std::env::temp_dir()) };
@@ -412,6 +517,49 @@ mod tests {
         assert_eq!(pairs.len(), 3);
         assert_eq!(pairs[0].0, 0);
         assert!(pairs[0].1 > pairs[1].1);
+    }
+
+    #[test]
+    fn both_answers_about_the_reranker_come_from_the_same_rule() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = FakeHome::with_a_model_in_the_cache("same-rule");
+
+        let empty = home.root.join("empty");
+        std::fs::create_dir_all(&empty).expect("writable");
+        let named = home.root.join("named");
+        std::fs::create_dir_all(&named).expect("writable");
+        std::fs::write(named.join("model_quantized.onnx"), b"graph").expect("writable");
+
+        // (what CUBA_RERANKER_PATH says, does a directory resolve, is a model there)
+        let cases: [(Option<PathBuf>, bool, bool); 4] = [
+            (None, true, true),
+            (
+                Some(PathBuf::from(crate::resources::disabled_model_path())),
+                false,
+                false,
+            ),
+            (Some(empty), true, false),
+            (Some(named), true, true),
+        ];
+
+        for (env, resolves, configured) in cases {
+            unsafe {
+                match &env {
+                    Some(path) => std::env::set_var("CUBA_RERANKER_PATH", path),
+                    None => std::env::remove_var("CUBA_RERANKER_PATH"),
+                }
+            }
+            assert_eq!(
+                resolved_model_dir().is_some(),
+                resolves,
+                "resolving with CUBA_RERANKER_PATH={env:?}"
+            );
+            assert_eq!(
+                is_configured(),
+                configured,
+                "is_configured with CUBA_RERANKER_PATH={env:?} — this and the loader read the                  same rule now, so they cannot answer differently about the same machine"
+            );
+        }
     }
 
     #[test]
