@@ -109,7 +109,14 @@ fn gpu_availability() -> (bool, bool) {
     (false, false)
 }
 
-pub fn configure(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {
+/// Takes a factory rather than a builder: when the GPU provider refuses to
+/// start we need a second, clean builder for the CPU path, and a
+/// `SessionBuilder` is consumed by the attempt.
+pub fn configure<F>(make_builder: F, workload: Workload) -> Result<SessionBuilder>
+where
+    F: Fn() -> Result<SessionBuilder>,
+{
+    let builder = make_builder()?;
     let (runtime_gpu, device_present) = gpu_availability();
 
     if let Some(reason) = cpu_reason(wants_gpu(workload), runtime_gpu, device_present) {
@@ -129,14 +136,32 @@ pub fn configure(builder: SessionBuilder, workload: Workload) -> Result<SessionB
         return configure_cpu(builder, workload);
     }
 
-    let configured = builder
-        .with_execution_providers(providers)
-        .map_err(|e| anyhow::anyhow!("registrando execution providers GPU: {e}"))?;
-    // After the registration, not before. This line used to be emitted first,
-    // so a log could claim the session was on the GPU while ONNX Runtime had
-    // quietly fallen back to the CPU underneath it.
-    tracing::info!(model = workload.label(), "sesión ONNX en GPU");
-    Ok(configured)
+    match builder.with_execution_providers(providers) {
+        Ok(configured) => {
+            // After the registration, not before. This line used to be emitted
+            // first, so a log could claim the session was on the GPU while ONNX
+            // Runtime had quietly fallen back to the CPU underneath it.
+            tracing::info!(model = workload.label(), "sesión ONNX en GPU");
+            Ok(configured)
+        }
+        // The card and the provider libraries are both there and the provider
+        // still would not start: the CUDA runtime itself is unusable here,
+        // usually cudart/cublas/cuDNN missing from the loader path.
+        //
+        // That is a broken installation, not a broken model, and it must not
+        // take the daemon down with it - this machine worked on CPU before and
+        // has to keep working. But it must not be quiet either: without
+        // `error_on_failure` ORT swallows this and runs on the CPU while every
+        // log line and every check still says GPU. Loud, and on the CPU.
+        Err(e) => {
+            tracing::error!(
+                model = workload.label(),
+                error = %e,
+                "el provider GPU no inicializó pese a haber tarjeta y librerías: esta sesión corre en CPU. Revisá que las DLL/so de CUDA estén en PATH/LD_LIBRARY_PATH junto al runtime de ONNX"
+            );
+            configure_cpu(make_builder()?, workload)
+        }
+    }
 }
 
 /// Wanting a GPU and not having one is worth saying once. It is not an error:
@@ -401,5 +426,41 @@ mod placement_tests {
                 "{unmet:?} means somebody configured a GPU and is not getting one. Silence there is how a deployment believes it is reranking on a card for months."
             );
         }
+    }
+
+    #[test]
+    fn a_provider_that_will_not_start_drops_to_cpu_loudly_and_not_quietly() {
+        // ort defaults error_on_failure to false, which means a CUDA provider
+        // that cannot initialise is swallowed and the session runs on the CPU
+        // while every log line still says GPU. Turning it on made that
+        // visible - and also killed machines whose CUDA runtime simply is not
+        // installed, which used to work on CPU. Both halves matter: the
+        // fallback has to happen, and it has to be impossible to miss.
+        let source = include_str!("gpu.rs");
+        let body = source
+            .split_once("pub fn configure<F>(")
+            .expect("configure is in this file")
+            .1;
+        let body = body
+            .split_once(
+                "
+}",
+            )
+            .expect("the function ends")
+            .0;
+
+        assert!(
+            body.contains("error_on_failure") || source.contains("error_on_failure()"),
+            "without error_on_failure the provider failure never reaches this code at all"
+        );
+        let failure = body.find("Err(e) => {").expect("the provider-failed arm");
+        assert!(
+            body[failure..].contains("tracing::error!"),
+            "a GPU that silently became a CPU is the defect this whole path exists to stop: the fallback has to be logged at error"
+        );
+        assert!(
+            body[failure..].contains("configure_cpu(make_builder()?"),
+            "and it has to actually keep working. A machine without the CUDA runtime ran on CPU before and must keep doing so; failing the session there turns a slow daemon into a dead one."
+        );
     }
 }

@@ -101,6 +101,8 @@ fn default_reranker_dir() -> Option<PathBuf> {
 }
 
 const WARMUP_CANDIDATES: usize = 50;
+/// Startup has time; a request does not.
+const WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
 const WARMUP_PASSAGE_CHARS: usize = 240;
 
 pub async fn warm_up() -> bool {
@@ -111,9 +113,17 @@ pub async fn warm_up() -> bool {
                    cross-encoder rescores the surviving candidates in a single batch "
         .repeat(WARMUP_PASSAGE_CHARS / 100 + 1);
     let passages: Vec<&str> = std::iter::repeat_n(passage.as_str(), WARMUP_CANDIDATES).collect();
-    rerank("which passage answers the question best", &passages)
-        .await
-        .is_ok()
+    // Not the search budget: warming up exists precisely to pay the load, and
+    // measuring it against a ceiling meant for a request would fail on any
+    // machine where the model takes longer than one search may.
+    let deadline = std::time::Instant::now() + WARMUP_BUDGET;
+    rerank_within(
+        "which passage answers the question best",
+        &passages,
+        deadline,
+    )
+    .await
+    .is_ok()
 }
 
 /// The name the resource plan uses to switch a model off: a directory under
@@ -216,13 +226,17 @@ fn init_session(model_dir: &std::path::Path) -> Result<()> {
             anyhow::anyhow!("no model.onnx / model_quantized.onnx found in {model_dir:?}")
         })?;
 
-    let builder = Session::builder()
-        .map_err(|e| anyhow::anyhow!("session builder: {e}"))?
-        .with_intra_threads(intra_threads())
-        .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?;
-    let session = crate::gpu::configure(builder, crate::gpu::Workload::Reranker)?
+    // A factory, not a builder: if the GPU provider refuses to start we
+    // need a second, clean builder for the CPU path.
+    let make_builder = || {
+        Ok(Session::builder()
+            .map_err(|e| anyhow::anyhow!("session builder: {e}"))?
+            .with_intra_threads(intra_threads())
+            .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?)
+    };
+    let session = crate::gpu::configure(make_builder, crate::gpu::Workload::Reranker)?
         .commit_from_file(&model_file)
         .map_err(|e| anyhow::anyhow!("load model: {e}"))?;
     RERANKER_SESSION
@@ -254,20 +268,45 @@ fn init_session(model_dir: &std::path::Path) -> Result<()> {
 }
 
 pub async fn rerank(query: &str, candidates: &[&str]) -> Result<Vec<(usize, f64)>> {
+    rerank_within(query, candidates, std::time::Instant::now() + budget()).await
+}
+
+/// One rerank, finished by `deadline` or not at all.
+///
+/// The deadline covers resolving the model as well as the inference. It used
+/// to start after the model had resolved, so a cold 1.1 GB read was unbounded
+/// time the caller's 20 s never accounted for.
+pub async fn rerank_within(
+    query: &str,
+    candidates: &[&str],
+    deadline: std::time::Instant,
+) -> Result<Vec<(usize, f64)>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
+    }
+
+    let n = candidates.len();
+
+    // Resolve the model *before* taking the permit. Loading is already
+    // serialised by the OnceLock, so holding the single session permit through
+    // a multi-gigabyte read only makes every other caller wait for a load they
+    // are not the one doing — and then time out on a permit, which reads like
+    // a busy reranker rather than a cold one.
+    let loaded = tokio::task::spawn_blocking(enabled)
+        .await
+        .context("reranker status task panicked")?;
+    if !loaded {
+        return Ok(identity_pairs(n));
+    }
+    if std::time::Instant::now() >= deadline {
+        anyhow::bail!("el modelo terminó de cargar pero ya no queda presupuesto para reordenar");
     }
 
     let query_owned = query.to_string();
     let candidates_owned: Vec<String> = candidates.iter().map(|c| c.to_string()).collect();
 
-    // One budget for the whole thing: waiting for the permit, loading the
-    // model on first use, and the inference. It used to start after the model
-    // had resolved, so a cold 1.1 GB load was unbounded time that the caller's
-    // 20 s never covered.
-    let deadline = std::time::Instant::now() + budget();
-
-    let _permit = match tokio::time::timeout(budget(), semaphore().acquire()).await {
+    let wait = deadline.saturating_duration_since(std::time::Instant::now());
+    let _permit = match tokio::time::timeout(wait, semaphore().acquire()).await {
         Ok(permit) => permit.map_err(|_| anyhow::anyhow!("reranker semaphore closed"))?,
         // spawn_blocking is not cancellable, so a batch whose caller gave up
         // keeps the permit and the session mutex until it finishes. Without a
@@ -277,19 +316,10 @@ pub async fn rerank(query: &str, candidates: &[&str]) -> Result<Vec<(usize, f64)
         ),
     };
 
-    let n = candidates.len();
-    let scored = tokio::task::spawn_blocking(move || {
-        if !enabled() {
-            return Ok(None);
-        }
-        score_pairs(&query_owned, &candidates_owned, deadline).map(Some)
-    })
-    .await
-    .context("reranker task panicked")??;
-
-    let Some(scored) = scored else {
-        return Ok(identity_pairs(n));
-    };
+    let scored =
+        tokio::task::spawn_blocking(move || score_pairs(&query_owned, &candidates_owned, deadline))
+            .await
+            .context("reranker task panicked")??;
 
     let mut indexed: Vec<(usize, f64)> = scored.into_iter().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

@@ -133,17 +133,21 @@ fn init(dir: &std::path::Path) -> Result<()> {
         anyhow::bail!("no hay model.onnx ni model_quantized.onnx en {dir:?}");
     };
 
-    let builder = Session::builder()
-        .map_err(|e| anyhow::anyhow!("session builder: {e}"))?
-        .with_intra_threads(intra_threads())
-        .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?
-        .with_memory_pattern(false)
-        .map_err(|e| anyhow::anyhow!("memory pattern: {e}"))?
-        .with_intra_op_spinning(false)
-        .map_err(|e| anyhow::anyhow!("intra-op spinning: {e}"))?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?;
-    let session = crate::gpu::configure(builder, crate::gpu::Workload::Nli)?
+    // A factory, not a builder: if the GPU provider refuses to start we
+    // need a second, clean builder for the CPU path.
+    let make_builder = || {
+        Ok(Session::builder()
+            .map_err(|e| anyhow::anyhow!("session builder: {e}"))?
+            .with_intra_threads(intra_threads())
+            .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?
+            .with_memory_pattern(false)
+            .map_err(|e| anyhow::anyhow!("memory pattern: {e}"))?
+            .with_intra_op_spinning(false)
+            .map_err(|e| anyhow::anyhow!("intra-op spinning: {e}"))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?)
+    };
+    let session = crate::gpu::configure(make_builder, crate::gpu::Workload::Nli)?
         .commit_from_file(&model_file)
         .map_err(|e| anyhow::anyhow!("cargando {model_file:?}: {e}"))?;
 

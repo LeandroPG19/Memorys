@@ -63,9 +63,19 @@ pub fn current_client() -> Option<String> {
 }
 
 pub fn configured_client_label() -> Option<String> {
-    std::env::var("MEMORY_INDUSTRY_CLIENT_ID")
-        .or_else(|_| std::env::var("CUBA_CLIENT_ID"))
-        .ok()
+    client_label_from(
+        std::env::var("MEMORY_INDUSTRY_CLIENT_ID").ok().as_deref(),
+        std::env::var("CUBA_CLIENT_ID").ok().as_deref(),
+    )
+}
+
+/// Split from the lookup so it can be checked without touching the process
+/// environment. `set_var` is unsound in a multi-threaded program, and a test
+/// that mutates the environment can make an unrelated one read a torn value —
+/// which is how this very assertion failed once in a hundred gate runs.
+fn client_label_from(preferred: Option<&str>, legacy: Option<&str>) -> Option<String> {
+    preferred
+        .or(legacy)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -272,28 +282,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_blank_env_client_id_is_not_an_identity() {
-        let prev_a = std::env::var("MEMORY_INDUSTRY_CLIENT_ID").ok();
-        let prev_b = std::env::var("CUBA_CLIENT_ID").ok();
-        unsafe {
-            std::env::set_var("MEMORY_INDUSTRY_CLIENT_ID", "   ");
-            std::env::remove_var("CUBA_CLIENT_ID");
-        }
+    fn a_blank_client_id_is_not_a_workspace_identity() {
+        assert_eq!(client_label_from(Some("   "), None), None);
+        assert_eq!(client_label_from(Some(""), None), None);
+        assert_eq!(client_label_from(None, None), None);
         assert_eq!(
-            configured_client_label(),
-            None,
-            "whitespace is not a workspace identity"
+            client_label_from(Some(" cursor "), None),
+            Some("cursor".to_string()),
+            "the label is trimmed, because a config file with a trailing space would otherwise key a whole second workspace"
         );
-        unsafe {
-            match prev_a {
-                Some(v) => std::env::set_var("MEMORY_INDUSTRY_CLIENT_ID", v),
-                None => std::env::remove_var("MEMORY_INDUSTRY_CLIENT_ID"),
-            }
-            match prev_b {
-                Some(v) => std::env::set_var("CUBA_CLIENT_ID", v),
-                None => std::env::remove_var("CUBA_CLIENT_ID"),
-            }
-        }
+        assert_eq!(
+            client_label_from(None, Some("legacy")),
+            Some("legacy".to_string()),
+            "CUBA_CLIENT_ID still answers for one release"
+        );
+        assert_eq!(
+            client_label_from(Some("new"), Some("legacy")),
+            Some("new".to_string()),
+            "the preferred spelling wins when both are set"
+        );
     }
 
     #[test]

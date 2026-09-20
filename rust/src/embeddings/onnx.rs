@@ -234,15 +234,19 @@ fn intra_threads() -> usize {
 }
 
 fn init_onnx_session(model_file: &std::path::Path, model_dir: &std::path::Path) -> Result<()> {
-    let builder = Session::builder()
-        .map_err(|e| anyhow::anyhow!("session builder: {e}"))?
-        .with_intra_threads(intra_threads())
-        .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?
-        .with_memory_pattern(false)
-        .map_err(|e| anyhow::anyhow!("memory pattern: {e}"))?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?;
-    let session = crate::gpu::configure(builder, crate::gpu::Workload::Embedder)?
+    // A factory, not a builder: if the GPU provider refuses to start we
+    // need a second, clean builder for the CPU path.
+    let make_builder = || {
+        Ok(Session::builder()
+            .map_err(|e| anyhow::anyhow!("session builder: {e}"))?
+            .with_intra_threads(intra_threads())
+            .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?
+            .with_memory_pattern(false)
+            .map_err(|e| anyhow::anyhow!("memory pattern: {e}"))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?)
+    };
+    let session = crate::gpu::configure(make_builder, crate::gpu::Workload::Embedder)?
         .commit_from_file(model_file)
         .map_err(|e| anyhow::anyhow!("load model: {e}"))?;
 
