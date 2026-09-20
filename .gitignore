@@ -9,6 +9,11 @@ __pycache__/
 dist/
 build/
 rust/target/
+# Scratch target dirs the gate scripts create so a run does not clobber the
+# locked live exe, plus cargo-mutants scratch. Never committed.
+rust/target-*/
+rust/mutants.out/
+rust/mutants.out.old/
 
 # Dependencies
 .venv/
@@ -55,13 +60,17 @@ backups/
 !backups/.gitkeep
 
 # Internal working files — kept local, never published.
-# docs/ are work plans (not install docs); sandbox/ has local paths + brain refs.
-docs/
+# `docs/*` (not `docs/`) so `!docs/gate.md` can re-include the merge-judge doc.
+# git will not un-ignore a file whose parent directory is ignored.
+docs/*
+!docs/gate.md
 sandbox/
 *.jsonl.partial
 
-# User rules junction for CLI/IDE parity (points to ~/.cursor/rules)
-.cursor/rules/
+# Six-pack / gate rules are of the repo (Mapupita-Rust lesson: a junction
+# to ~/.cursor/rules wipes project rules on clone). Handoffs are per-turn.
+.cursor/handoffs/*
+!.cursor/handoffs/handoff.example.yml
 
 
 # local production secrets
