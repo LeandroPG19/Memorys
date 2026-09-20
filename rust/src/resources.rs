@@ -328,28 +328,53 @@ pub fn disabled_model_path() -> String {
         .into_owned()
 }
 
-pub fn apply(p: &Plan) {
-    set_if_absent(
-        "CUBA_EMBED_INTRA_THREADS",
-        &p.embed_intra_threads.to_string(),
-    );
-    set_if_absent(
-        "CUBA_RERANK_INTRA_THREADS",
-        &p.rerank_intra_threads.to_string(),
-    );
-    set_if_absent("CUBA_NLI_INTRA_THREADS", &p.nli_intra_threads.to_string());
-    set_if_absent("CUBA_RERANK_CHUNK", &p.rerank_chunk.to_string());
-    set_if_absent("CUBA_DB_MAX_CONNECTIONS", &p.db_max_connections.to_string());
-    set_if_absent("CUBA_OOD_FIT_LIMIT", &p.ood_fit_limit.to_string());
+/// What the plan would put in the environment, as pairs.
+///
+/// Pure on purpose. `apply` writes to a process-wide environment that every
+/// other test in this binary reads, so a test that called it to check one
+/// decision would quietly change the answer for everything running beside it.
+pub fn plan_env(p: &Plan) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        (
+            "CUBA_EMBED_INTRA_THREADS",
+            p.embed_intra_threads.to_string(),
+        ),
+        (
+            "CUBA_RERANK_INTRA_THREADS",
+            p.rerank_intra_threads.to_string(),
+        ),
+        ("CUBA_NLI_INTRA_THREADS", p.nli_intra_threads.to_string()),
+        ("CUBA_RERANK_CHUNK", p.rerank_chunk.to_string()),
+        ("CUBA_DB_MAX_CONNECTIONS", p.db_max_connections.to_string()),
+        ("CUBA_OOD_FIT_LIMIT", p.ood_fit_limit.to_string()),
+        // In both directions, and not only to switch it off. `gpu.rs` decides
+        // placement from `gpu_by_default(Reranker)`, which is `true` — a
+        // sensible last resort for library use where nothing ran the planner,
+        // and the wrong answer once the planner has measured the card. Saying
+        // it out loud here also settles `mode::rerank_default()`, which reads
+        // the same flag and would otherwise turn reranking on by default on a
+        // machine where it costs 60-110 s and the work is thrown away.
+        (
+            "CUBA_RERANK_DEVICE",
+            if p.reranker_on_gpu { "gpu" } else { "cpu" }.to_string(),
+        ),
+    ];
 
     if let Some(limit) = p.gpu_mem_limit_mb {
-        set_if_absent("CUBA_GPU_MEM_LIMIT_MB", &limit.to_string());
+        env.push(("CUBA_GPU_MEM_LIMIT_MB", limit.to_string()));
     }
     if !p.reranker {
-        set_if_absent("CUBA_RERANKER_PATH", &disabled_model_path());
+        env.push(("CUBA_RERANKER_PATH", disabled_model_path()));
     }
     if !p.nli {
-        set_if_absent("CUBA_NLI_PATH", &disabled_model_path());
+        env.push(("CUBA_NLI_PATH", disabled_model_path()));
+    }
+    env
+}
+
+pub fn apply(p: &Plan) {
+    for (key, value) in plan_env(p) {
+        set_if_absent(key, &value);
     }
 }
 
@@ -542,6 +567,27 @@ mod tests {
             big_cap,
             9000 - GPU_VRAM_RESERVE_MB,
             "the cap is the free VRAM minus the reserve. With SameAsRequested the arena only              grows by what a call asks for, so capping it lower saves nothing and just turns a              working card into BFCArena::AllocateRawInternal"
+        );
+    }
+
+    fn emitted<'a>(env: &'a [(&'static str, String)], key: &str) -> Option<&'a str> {
+        env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn the_plan_that_says_no_gpu_also_says_it_where_the_session_reads_it() {
+        let narrow = plan_env(&plan(&workstation_8gb_narrow_gpu()));
+        assert_eq!(
+            emitted(&narrow, "CUBA_RERANK_DEVICE"),
+            Some("cpu"),
+            "the plan worked out that this card cannot hold the reranker and then kept it to              itself. gpu::wants_gpu(Reranker) defaults to true, so the session still opened on              the GPU and the decision never reached the code that reads it"
+        );
+
+        let roomy = plan_env(&plan(&desktop_16gb_with_gpu()));
+        assert_eq!(
+            emitted(&roomy, "CUBA_RERANK_DEVICE"),
+            Some("gpu"),
+            "it has to speak in both directions, or a machine that can use its card depends on              a default rather than on the measurement"
         );
     }
 
