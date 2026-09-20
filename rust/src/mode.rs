@@ -98,15 +98,29 @@ mod tests {
     #[test]
     fn completo_turns_capabilities_on_others_leave_them_off() {
         assert!(Mode::Completo.docs_default());
-        assert!(Mode::Completo.rerank_default());
         assert!(!Mode::Local.docs_default());
-        assert!(
-            !Mode::Local.rerank_default(),
-            "false here only because this build has neither cuda nor directml compiled in \
-             — every `cargo test` gate in this repo runs without them. On a build that has \
-             them and a working card, rerank_default_for takes the other branch on purpose"
-        );
-        assert!(!Mode::Red.rerank_default());
+
+        // Completo is an operator's explicit choice, so it does not depend on
+        // what hardware is underneath.
+        assert!(Mode::Completo.rerank_default());
+
+        // Local and Red defer to the hardware. That is the contract, and
+        // stating it this way is true on a CPU build and on a GPU one.
+        //
+        // These used to assert a plain `false`, which was green only because
+        // every `cargo test` in this gate compiles without cuda. The release
+        // matrix builds Windows with `docs,cuda,directml`, and on a machine
+        // with a working card this test went red for being right - measured
+        // here on 2026-09-20 with `cargo test --lib --features cuda`.
+        for mode in [Mode::Local, Mode::Red] {
+            assert_eq!(
+                mode.rerank_default(),
+                rerank_gpu_active(),
+                "{mode:?} follows the card, and this build says the reranker is {}on it",
+                if rerank_gpu_active() { "" } else { "not " }
+            );
+        }
+
         assert!(Mode::Red.is_cloud());
         assert!(!Mode::Local.is_cloud());
     }

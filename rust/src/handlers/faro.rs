@@ -2270,41 +2270,63 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn fitting_ood_stats_leaves_the_single_runtime_worker_free_for_other_tasks() {
-        let embeddings = deterministic_embeddings(400, 128);
-
-        let (fitted, fit_elapsed, probe_latency) = tokio::spawn(async move {
-            let spawned_at = std::time::Instant::now();
-            let probe = tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                spawned_at.elapsed()
-            });
-
-            let started = std::time::Instant::now();
-            let stats = fit_ood_stats(embeddings).await;
-            let fit_elapsed = started.elapsed();
-            (
-                stats.is_some(),
-                fit_elapsed,
-                probe.await.expect("the probe task must not panic"),
+    #[test]
+    fn fit_ood_stats_hands_its_work_to_a_blocking_thread() {
+        // Structural, and deliberately so. The behavioural half below proves
+        // the runtime keeps turning; this one names the exact regression, and
+        // it cannot flake on a fast machine or a loaded one.
+        let source = include_str!("faro.rs");
+        let body = source
+            .split_once("async fn fit_ood_stats(")
+            .expect("fit_ood_stats is in this file")
+            .1;
+        // Bounded to this function's own body. Slicing to the next `.await`
+        // would run past the end the moment the call disappeared, and could
+        // match a spawn_blocking that belongs to something else entirely.
+        let body = body
+            .split_once(
+                "
+}",
             )
-        })
-        .await
-        .expect("the fitting task must not panic");
-
-        assert!(fitted, "400 samples of 128 dimensions must fit");
+            .expect("the function ends")
+            .0;
         assert!(
-            fit_elapsed > std::time::Duration::from_millis(50),
-            "the fit has to stay slow enough for a stalled worker to be measurable; it took \
-             {fit_elapsed:?}, so raise the sample size or this test cannot fail"
+            body.contains("spawn_blocking"),
+            "fit_ood_stats has to hand the fit to a blocking thread before it awaits              anything. Run on the runtime worker it blocks every other task sharing it -              measured at 11,4 s with n=1811 in production, on a daemon several clients share"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_fit_does_not_finish_on_the_first_poll_of_the_runtime() {
+        // The behavioural half, and deterministic: no durations, no ratios.
+        //
+        // A future built on spawn_blocking cannot be ready the first time it
+        // is polled - the blocking thread has not answered yet - so a
+        // zero-length timeout has to expire. A body that runs the fit inline
+        // is ready immediately, and the timeout returns Ok.
+        //
+        // The previous version of this test asserted the fit took over 50 ms
+        // and that a 10 ms probe came back in under half of that. Those are
+        // wall-clock thresholds: a faster machine, a cold cache or a loaded
+        // one moves them either way, and the failure message told whoever hit
+        // it to raise the sample size, which is a test asking to be silenced.
+        // It also could not actually detect the regression - removing
+        // spawn_blocking left it green.
+        let embeddings = deterministic_embeddings(400, 128);
+        let first_poll =
+            tokio::time::timeout(std::time::Duration::ZERO, fit_ood_stats(embeddings)).await;
+
         assert!(
-            probe_latency * 2 < fit_elapsed,
-            "a 10 ms sleep spawned before the fit resolved after {probe_latency:?} while the \
-             fit ran for {fit_elapsed:?}: the fit is running on the runtime worker instead of \
-             spawn_blocking, so every other task on this runtime waits for it (measured 11,4 s \
-             with n=1811 in production)"
+            first_poll.is_err(),
+            "fit_ood_stats was ready on its very first poll, so it ran the fit inline on the              runtime worker. Every other task sharing that worker waits for it - measured at              11,4 s with n=1811 in production, on a daemon several clients share"
+        );
+
+        // And it does finish, so the assertion above is about where the work
+        // runs and not about the fit being broken.
+        let embeddings = deterministic_embeddings(400, 128);
+        assert!(
+            fit_ood_stats(embeddings).await.is_some(),
+            "400 samples of 128 dimensions must fit"
         );
     }
 
