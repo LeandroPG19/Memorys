@@ -261,17 +261,28 @@ pub async fn rerank(query: &str, candidates: &[&str]) -> Result<Vec<(usize, f64)
     let query_owned = query.to_string();
     let candidates_owned: Vec<String> = candidates.iter().map(|c| c.to_string()).collect();
 
-    let _permit = semaphore()
-        .acquire()
-        .await
-        .map_err(|_| anyhow::anyhow!("reranker semaphore closed"))?;
+    // One budget for the whole thing: waiting for the permit, loading the
+    // model on first use, and the inference. It used to start after the model
+    // had resolved, so a cold 1.1 GB load was unbounded time that the caller's
+    // 20 s never covered.
+    let deadline = std::time::Instant::now() + budget();
+
+    let _permit = match tokio::time::timeout(budget(), semaphore().acquire()).await {
+        Ok(permit) => permit.map_err(|_| anyhow::anyhow!("reranker semaphore closed"))?,
+        // spawn_blocking is not cancellable, so a batch whose caller gave up
+        // keeps the permit and the session mutex until it finishes. Without a
+        // bound here the next search waits on it forever.
+        Err(_) => anyhow::bail!(
+            "el reranker sigue ocupado con un lote anterior y este agotó su presupuesto"
+        ),
+    };
 
     let n = candidates.len();
     let scored = tokio::task::spawn_blocking(move || {
         if !enabled() {
             return Ok(None);
         }
-        score_pairs(&query_owned, &candidates_owned).map(Some)
+        score_pairs(&query_owned, &candidates_owned, deadline).map(Some)
     })
     .await
     .context("reranker task panicked")??;
@@ -331,7 +342,24 @@ fn length_bucketing() -> bool {
     }
 }
 
-fn score_pairs(query: &str, candidates: &[String]) -> Result<Vec<f64>> {
+/// The budget one rerank gets, end to end.
+pub fn budget() -> std::time::Duration {
+    budget_from(std::env::var("CUBA_RERANK_TIMEOUT_SECS").ok().as_deref())
+}
+
+fn budget_from(raw: Option<&str>) -> std::time::Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(20);
+    std::time::Duration::from_secs(secs)
+}
+
+fn score_pairs(
+    query: &str,
+    candidates: &[String],
+    deadline: std::time::Instant,
+) -> Result<Vec<f64>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -352,7 +380,17 @@ fn score_pairs(query: &str, candidates: &[String]) -> Result<Vec<f64>> {
 
     let chunk_size = rerank_chunk();
     let mut scores = vec![0.0_f64; candidates.len()];
+    let total = order.len();
+    let mut done = 0usize;
     for chunk in order.chunks(chunk_size) {
+        // Cooperative, because spawn_blocking cannot be cancelled from outside.
+        // Running the remaining chunks for a caller that already gave up keeps
+        // the session mutex held, and the next search waits behind it.
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "el reranker agotó su presupuesto tras {done} de {total} candidatos; suelta la sesión en vez de terminar un lote que ya nadie espera"
+            );
+        }
         let texts: Vec<String> = chunk.iter().map(|&i| candidates[i].clone()).collect();
 
         let chunk_scores = if !fixed_shape() || texts.len() == chunk_size {
@@ -368,6 +406,7 @@ fn score_pairs(query: &str, candidates: &[String]) -> Result<Vec<f64>> {
         for (pos, &original) in chunk.iter().enumerate() {
             scores[original] = chunk_scores[pos];
         }
+        done += chunk.len();
     }
     Ok(scores)
 }
@@ -702,6 +741,60 @@ mod tests {
             reason_of(&RerankerStatus::Failed(arena.into())),
             Some(String::new()),
             "an empty reason is worse than none: doctor would print a failure with nothing after the colon"
+        );
+    }
+
+    #[test]
+    fn the_budget_falls_back_rather_than_becoming_zero() {
+        assert_eq!(budget_from(Some("5")), std::time::Duration::from_secs(5));
+        assert_eq!(
+            budget_from(Some(" 45 ")),
+            std::time::Duration::from_secs(45)
+        );
+        assert_eq!(budget_from(None), std::time::Duration::from_secs(20));
+        assert_eq!(
+            budget_from(Some("0")),
+            std::time::Duration::from_secs(20),
+            "a zero budget would expire before the permit was even acquired, so every search would report a timeout and no rerank would ever run"
+        );
+        assert_eq!(
+            budget_from(Some("no")),
+            std::time::Duration::from_secs(20),
+            "a typo must not silently disable reranking"
+        );
+    }
+
+    #[test]
+    fn the_batch_loop_asks_the_clock_before_each_chunk() {
+        // spawn_blocking cannot be cancelled, so the only way a batch whose
+        // caller gave up releases the session mutex is by checking a deadline
+        // itself. Without this the next search waits behind a result nobody
+        // is going to read.
+        let source = include_str!("rerank.rs");
+        let body = source
+            .split_once("fn score_pairs(")
+            .expect("score_pairs is in this file")
+            .1;
+        let body = body
+            .split_once(
+                "
+}",
+            )
+            .expect("the function ends")
+            .0;
+
+        let loop_start = body
+            .find("for chunk in order.chunks")
+            .expect("the batch loop");
+        let first_work = body.find("score_chunk(").expect("the inference call");
+        // The check itself, not the word: `deadline` is also the parameter
+        // name, which appears in the signature before the loop.
+        let check = body
+            .find("Instant::now() >= deadline")
+            .expect("the deadline check");
+        assert!(
+            loop_start < check && check < first_work,
+            "the deadline has to be consulted inside the loop and before the inference, or the check only runs once the work it was meant to stop is already done"
         );
     }
 }

@@ -603,31 +603,34 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
                     .unwrap_or("")
             })
             .collect();
-        let have_model = tokio::task::spawn_blocking(crate::search::rerank::enabled)
-            .await
-            .context("reranker status task panicked")?;
-
-        let rerank_budget = std::time::Duration::from_secs(
-            std::env::var("CUBA_RERANK_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(20),
-        );
+        // The budget starts here, before the model is resolved. It used to
+        // start after: the first search on a cold daemon pays a 1.1 GB read,
+        // and measuring only the inference that followed made 20 s look
+        // generous while the caller waited minutes for a number that was never
+        // being timed.
+        let rerank_budget = crate::search::rerank::budget();
         let mut timed_out = false;
-        let rerank_result = match tokio::time::timeout(
-            rerank_budget,
-            crate::search::rerank::rerank(query, &contents),
-        )
-        .await
-        {
-            Ok(inner) => inner,
+        let attempted = tokio::time::timeout(rerank_budget, async {
+            let have_model = tokio::task::spawn_blocking(crate::search::rerank::enabled)
+                .await
+                .context("reranker status task panicked")?;
+            anyhow::Ok((
+                have_model,
+                crate::search::rerank::rerank(query, &contents).await,
+            ))
+        })
+        .await;
+
+        let (have_model, rerank_result) = match attempted {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => (false, Err(e)),
             Err(_) => {
                 tracing::warn!(
                     secs = rerank_budget.as_secs(),
                     "reranker excedió su presupuesto — se devuelve el ranking RRF"
                 );
                 timed_out = true;
-                Err(anyhow::anyhow!("reranker timeout"))
+                (false, Err(anyhow::anyhow!("reranker timeout")))
             }
         };
         rerank_outcome = rerank_outcome_of(rerank_result.is_ok(), have_model, timed_out);
@@ -2455,5 +2458,34 @@ mod tests {
                 "sigmoid should be smooth: jump of {jump:.4} at threshold {threshold} (V2 had ~0.20)"
             );
         }
+    }
+
+    #[test]
+    fn the_rerank_budget_starts_before_the_model_is_resolved() {
+        // It used to start after. The first search on a cold daemon pays a
+        // 1.1 GB read, and timing only the inference that followed made the
+        // 20 s look generous while the caller waited minutes for something
+        // nobody was measuring.
+        let source = include_str!("faro.rs");
+        let timeout_at = source
+            .find("tokio::time::timeout(rerank_budget")
+            .expect("the rerank budget wraps something");
+        // From the timeout onwards: an earlier spawn_blocking decides whether
+        // rerank is on by default, and matching that one would prove nothing.
+        let resolve_at = timeout_at
+            + source[timeout_at..]
+                .find("spawn_blocking(crate::search::rerank::enabled)")
+                .expect("the model still has to be resolved off the runtime");
+        let closes_at = timeout_at
+            + source[timeout_at..]
+                .find(
+                    "})
+        .await;",
+                )
+                .expect("the timed block closes");
+        assert!(
+            resolve_at < closes_at,
+            "resolving the model has to happen inside the budget, not before it"
+        );
     }
 }
