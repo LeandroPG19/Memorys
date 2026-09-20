@@ -120,11 +120,6 @@ const MCP_SERVER_KEY_LEGACY: &str = "cuba-memorys";
 
 fn http_config_problem(block: &Value) -> Option<String> {
     let url = block.get("url").and_then(Value::as_str).unwrap_or("");
-    if url.contains(":8788") {
-        return Some(
-            "URL en :8788 — ese puerto es el OAuth de Cursor, no MemoryIndustry (8787)".into(),
-        );
-    }
     if url.is_empty() {
         return None;
     }
@@ -299,7 +294,7 @@ fn run_write(target: &str, apply: bool) -> Result<()> {
     println!();
     println!(
         "Si el cliente es HTTP (`serve`): url http://127.0.0.1:8787/mcp y un header \
-         Mcp-Client-Id distinto por workspace. 8788 es el OAuth de Cursor — no lo uses."
+         Mcp-Client-Id distinto por workspace."
     );
     println!();
 
@@ -502,9 +497,12 @@ mod tests {
     }
 
     #[test]
-    fn http_on_cursor_oauth_is_a_problem() {
-        let bad = json!({"url": "http://127.0.0.1:8788/mcp"});
-        assert!(http_config_problem(&bad).expect("8788").contains("8788"));
+    fn an_http_client_without_its_own_id_is_a_problem() {
+        // The port assertion that used to live here said `:8788` is Cursor's
+        // OAuth callback and MemoryIndustry belongs on 8787. That is one
+        // workstation's Cursor install, and it is backwards on the deployment
+        // this ships to, where the daemon runs on 8787. A port belongs to a
+        // machine; `doctor` now reports whether the address is actually free.
         let no_id = json!({"url": "http://127.0.0.1:8787/mcp"});
         assert!(
             http_config_problem(&no_id)

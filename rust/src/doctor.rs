@@ -63,19 +63,29 @@ impl Check {
     }
 }
 
+/// Whether anything already holds the address the daemon would bind.
+///
+/// This used to assert, as a property of the product, that `:8788` is Cursor's
+/// OAuth callback and that one should move to `:8787`. That is a fact about
+/// one developer's workstation: the deployment this ships to runs the daemon
+/// on 8787 and has nothing on 8788, so the advice was backwards there. A port
+/// number belongs to a machine, not to MemoryIndustry.
+///
+/// What is true anywhere is whether the port is free, so that is what this
+/// reports.
 pub fn http_port_check(addr: Option<&str>) -> Check {
     let addr = addr.unwrap_or(crate::http::DEFAULT_ADDR);
-    if addr.contains(":8788") {
-        return Check::warn(
-            "http_port",
-            format!("{addr} is Cursor's OAuth callback port"),
-            "MemoryIndustry serve binds 127.0.0.1:8787. 8788 is Cursor OAuth — \
-             do not put the daemon there or the editor's login callback dies.",
-        );
+    port_verdict(addr, std::net::TcpListener::bind(addr).is_ok())
+}
+
+fn port_verdict(addr: &str, free: bool) -> Check {
+    if free {
+        return Check::ok("http_port", format!("{addr} is free"));
     }
-    Check::ok(
+    Check::warn(
         "http_port",
-        format!("{addr} (8788 is Cursor OAuth; leave it alone)"),
+        format!("something is already listening on {addr}"),
+        "if that is this daemon, nothing is wrong. If it is not, `serve` will refuse to start here: pick another address with CUBA_HTTP_ADDR and point the clients at it.",
     )
 }
 
@@ -581,9 +591,15 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     }
 
     {
-        let (ok, detail, hint) = crate::llm_cli::doctor_line().await;
-        if ok {
+        use crate::llm_cli::LlmVerdict;
+        let (verdict, detail, hint) = crate::llm_cli::doctor_line().await;
+        if verdict == LlmVerdict::Ready {
             checks.push(Check::ok("generative_llm", detail));
+        } else if verdict == LlmVerdict::SamplingUnreachable {
+            // Not a fail: nothing is broken, the deployment simply cannot get a
+            // model this way. Not an ok either, which is what a 2026-09 patch
+            // made it report.
+            checks.push(Check::warn("generative_llm", detail, hint));
         } else {
             checks.push(Check::fail(
                 "generative_llm",
@@ -1064,20 +1080,33 @@ mod tests {
     }
 
     #[test]
-    fn binding_the_daemon_on_cursor_oauth_is_a_warning() {
-        let check = http_port_check(Some("127.0.0.1:8788"));
-        assert_eq!(check.status, Status::Warn);
+    fn a_port_something_else_already_holds_is_a_warning_not_a_verdict_on_the_number() {
+        let taken = port_verdict("127.0.0.1:8787", false);
+        assert_eq!(taken.status, Status::Warn);
         assert!(
-            check.hint.as_deref().is_some_and(|h| h.contains("8787")),
-            "the hint has to name the port MemoryIndustry actually uses: {:?}",
-            check.hint
+            taken.detail.contains("8787"),
+            "the address has to be in the message: {}",
+            taken.detail
+        );
+        assert!(
+            taken
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("CUBA_HTTP_ADDR")),
+            "an operator who hits this needs the knob that moves the daemon: {:?}",
+            taken.hint
         );
     }
 
     #[test]
-    fn the_default_http_port_is_not_cursor_oauth() {
-        assert_eq!(http_port_check(None).status, Status::Ok);
-        assert_eq!(http_port_check(Some("127.0.0.1:8787")).status, Status::Ok);
+    fn a_free_port_is_fine_whatever_its_number_is() {
+        for addr in ["127.0.0.1:8787", "127.0.0.1:8788", "192.168.0.10:9999"] {
+            assert_eq!(
+                port_verdict(addr, true).status,
+                Status::Ok,
+                "{addr} is free, so there is nothing to report. This check used to warn on 8788 as a property of the product, which was one workstation's Cursor install written into the binary and backwards on the machine this ships to."
+            );
+        }
     }
 }
 

@@ -361,7 +361,48 @@ fn clear_config() -> Result<()> {
 }
 
 /// One-line summary for `doctor`.
-pub async fn doctor_line() -> (bool, String, String) {
+/// What `doctor` should say about the generative LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmVerdict {
+    /// A provider answered, or a host that can sample is attached.
+    Ready,
+    /// Configured to get its model through MCP sampling, inside a process that
+    /// structurally cannot ask for it.
+    SamplingUnreachable,
+    /// Nothing configured at all.
+    Missing,
+}
+
+/// Pure, because the interesting case is the one nobody can reproduce by hand.
+///
+/// Under the HTTP daemon `CLIENT_SUPPORTS_SAMPLING` is never set — protocol.rs
+/// leaves it false on purpose — and `request_sampling_max` needs the outgoing
+/// stdio channel that HTTP does not have. So a deployment that serves over
+/// HTTP and sets the judge to mcp_sampling has no generative model at all, and
+/// reporting one is a green over something that cannot work.
+pub fn llm_verdict(offline_ready: bool, judge_is_sampling: bool, in_daemon: bool) -> LlmVerdict {
+    if offline_ready {
+        return LlmVerdict::Ready;
+    }
+    match (judge_is_sampling, in_daemon) {
+        (true, false) => LlmVerdict::Ready,
+        (true, true) => LlmVerdict::SamplingUnreachable,
+        (false, _) => LlmVerdict::Missing,
+    }
+}
+
+/// Whether the judge is set to take its model from the MCP host.
+pub fn judge_is_sampling() -> bool {
+    let mode = std::env::var("MEMORY_INDUSTRY_JUDGE")
+        .or_else(|_| std::env::var("CUBA_JUDGE"))
+        .unwrap_or_default();
+    matches!(
+        mode.trim().to_ascii_lowercase().as_str(),
+        "mcp_sampling" | "sampling"
+    )
+}
+
+pub async fn doctor_line() -> (LlmVerdict, String, String) {
     load_saved_config_into_env();
     match resolve_offline_llm() {
         Some(j) => {
@@ -369,7 +410,7 @@ pub async fn doctor_line() -> (bool, String, String) {
                 let probe = OpenAiCompatJudge::from_env();
                 match probe.probe_health().await {
                     Ok(()) => (
-                        true,
+                        LlmVerdict::Ready,
                         format!(
                             "OK — {} ({})",
                             j.backend_name(),
@@ -378,14 +419,14 @@ pub async fn doctor_line() -> (bool, String, String) {
                         String::new(),
                     ),
                     Err(e) => (
-                        false,
+                        LlmVerdict::Missing,
                         format!("configured but unreachable: {e:#}"),
                         "memory-industry llm status".into(),
                     ),
                 }
             } else {
                 (
-                    true,
+                    LlmVerdict::Ready,
                     format!(
                         "OK — {} ({})",
                         j.backend_name(),
@@ -395,10 +436,52 @@ pub async fn doctor_line() -> (bool, String, String) {
                 )
             }
         }
-        None => (
-            false,
-            "no chat model configured".into(),
-            "memory-industry llm set ollama   # or: llm set deepseek --key …".into(),
-        ),
+        None => match llm_verdict(false, judge_is_sampling(), crate::session::daemon_mode()) {
+            LlmVerdict::SamplingUnreachable => (
+                LlmVerdict::SamplingUnreachable,
+                "el juez está en mcp_sampling y este proceso es el daemon HTTP: el muestreo MCP necesita el canal saliente de stdio, que HTTP no tiene, así que no hay modelo generativo".into(),
+                "configurá uno propio: memory-industry llm set ollama, o MEMORY_INDUSTRY_LLM_BASE_URL a cualquier /v1 compatible. Por stdio el host sí lo provee.".into(),
+            ),
+            verdict => (
+                verdict,
+                "no chat model configured".into(),
+                "memory-industry llm set ollama   # or: llm set deepseek --key …".into(),
+            ),
+        },
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+
+    #[test]
+    fn sampling_is_not_a_generative_llm_under_the_http_daemon() {
+        assert_eq!(
+            llm_verdict(false, true, true),
+            LlmVerdict::SamplingUnreachable,
+            "a 2026-09 deployment served over HTTP, set the judge to mcp_sampling, and its technical report recorded doctor saying OK. Under the daemon the sampling flag is never set and there is no server-to-client channel, so that OK was over a model that could not be reached. This is the exact patch that must not be ported."
+        );
+    }
+
+    #[test]
+    fn the_other_three_answers_stay_what_they_were() {
+        assert_eq!(
+            llm_verdict(false, true, false),
+            LlmVerdict::Ready,
+            "over stdio the host really does provide the model, and refusing it there would send an operator to configure a provider they do not need"
+        );
+        assert_eq!(
+            llm_verdict(true, false, true),
+            LlmVerdict::Ready,
+            "a configured provider works under the daemon like anywhere else"
+        );
+        assert_eq!(
+            llm_verdict(true, true, true),
+            LlmVerdict::Ready,
+            "an unreachable sampling setting does not matter when a provider answers"
+        );
+        assert_eq!(llm_verdict(false, false, true), LlmVerdict::Missing);
+        assert_eq!(llm_verdict(false, false, false), LlmVerdict::Missing);
     }
 }
