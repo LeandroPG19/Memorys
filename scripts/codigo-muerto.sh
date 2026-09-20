@@ -69,12 +69,15 @@ check_ci_exclusions_are_covered_locally() {
   echo "$uncovered"
 }
 
+# Anchored to the start of the line, so an attribute counts and a mention of
+# one does not. The first version of this counted any occurrence of the text
+# and went red on a doc comment that merely explained the attribute.
 count_ignores() {
-  grep -rn '#\[ignore' "$1" --include='*.rs' 2>/dev/null | wc -l | tr -d ' '
+  grep -rnE '^[[:space:]]*#\[ignore' "$1" --include='*.rs' 2>/dev/null | wc -l | tr -d ' '
 }
 
 count_ignores_without_reason() {
-  grep -rn '#\[ignore\]' "$1" --include='*.rs' 2>/dev/null | wc -l | tr -d ' '
+  grep -rnE '^[[:space:]]*#\[ignore\]' "$1" --include='*.rs' 2>/dev/null | wc -l | tr -d ' '
 }
 
 # --- self-test: every guard above gets a fixture that puts it in the red -----
@@ -94,9 +97,18 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$got" == "1" ]] || { echo "FAIL self-test: a CI exclusion covered nowhere was not caught (got $got)" >&2; exit 1; }
 
   mkdir -p "$tmp/src"
-  printf '#[ignore]\n#[ignore = "why"]\n' > "$tmp/src/a.rs"
-  [[ "$(count_ignores "$tmp/src")" == "2" ]] || { echo "FAIL self-test: the ignore count is not counting" >&2; exit 1; }
-  [[ "$(count_ignores_without_reason "$tmp/src")" == "1" ]] || { echo "FAIL self-test: the bare-ignore count is not counting" >&2; exit 1; }
+  # The comment line is the fixture that matters: the first version of this
+  # counted any occurrence of the text, so a doc comment that merely explained
+  # the attribute pushed the count over its ceiling and failed the gate.
+  {
+    printf '/// this guard once miscounted a #[ignore] written in prose\n'
+    printf '#[ignore]\n'
+    printf '#[ignore = "why"]\n'
+  } > "$tmp/src/a.rs"
+  got="$(count_ignores "$tmp/src")"
+  [[ "$got" == "2" ]] || { echo "FAIL self-test: the ignore count counts prose, not attributes (got $got)" >&2; exit 1; }
+  got="$(count_ignores_without_reason "$tmp/src")"
+  [[ "$got" == "1" ]] || { echo "FAIL self-test: the bare-ignore count is wrong (got $got)" >&2; exit 1; }
 
   echo "OK  self-test: every guard in this script failed against a fixture built to break it"
   exit 0
