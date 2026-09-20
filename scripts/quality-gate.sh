@@ -4,6 +4,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+BASELINE="$ROOT/scripts/lizard-baseline.txt"
 
 echo "=== quality-gate (MemoryIndustry — CRAP/lizard + mutación del diff) ==="
 echo "NO MIRA: SIL (fmt, clippy -D, tests --ignored, e2e, deny, audit, codigo-muerto, crap-gate floor, mutants-gate mmr/rrf/cache)."
@@ -44,26 +45,64 @@ rel_under() {
   done
 }
 
+
+# `key cc` per function over the ceiling, e.g. `src/protocol.rs::run_mcp 27`.
+lizard_warnings() {
+  local cwd="$1" cc_max="$2"
+  shift 2
+  (cd "$cwd" && lizard -C "$cc_max" -w "$@" 2>/dev/null) |
+    sed -nE 's|^(.*):[0-9]+: warning: ([A-Za-z0-9_:<>]+) has [0-9]+ NLOC, ([0-9]+) CCN.*|\1::\2 \3|p' |
+    sed 's|\\|/|g' | sort -u || true
+}
+
+if [[ "${1:-}" == "--update-lizard-baseline" ]]; then
+  cc_max="${LIZARD_CC_MAX:-8}"
+  mapfile -t all < <(cd rust && find src -name '*.rs' | sort)
+  {
+    echo "# Functions already over CC $cc_max when this line was drawn."
+    echo "# The gate fails a function that is NOT here, or one here that got worse."
+    echo "# Regenerate with: ./scripts/quality-gate.sh --update-lizard-baseline"
+    lizard_warnings rust "$cc_max" "${all[@]}"
+  } > "$BASELINE"
+  echo "wrote $BASELINE ($(grep -vc '^#' "$BASELINE") functions over CC $cc_max)"
+  exit 0
+fi
+
+
+# The ceiling alone is unusable on a repo that already has complex functions:
+# touching one line of a CC 30 function would fail the whole diff, and the
+# first thing anybody would do is put the `|| true` back. The baseline records
+# what is already over the line, so the gate only fails something that is new
+# or got worse. Regenerate deliberately: ./scripts/quality-gate.sh --update-lizard-baseline
 run_lizard() {
   local cwd="$1"
   shift
   if [[ "$#" -eq 0 ]]; then return 0; fi
-  # `|| true` plus no threshold meant lizard's exit code carried no
-  # information and the CRAP gate was a line of printed text. -C is the
-  # ceiling that makes it an exit code. This only ever looks at files in the
-  # diff, so it fails a new function that is too tangled rather than asking
-  # anybody to rewrite the tree.
   local cc_max="${LIZARD_CC_MAX:-8}"
-  if command -v lizard >/dev/null; then
-    (cd "$cwd" && lizard -C "$cc_max" -L 80 -a 6 "$@") || return 1
-    return 0
+
+  if ! command -v lizard >/dev/null && ! command -v python >/dev/null; then
+    echo "FALTA lizard (CRAP/cc). Puerta CRAP 6; CC <= 4 orienta."
+    return 2
   fi
-  if command -v python >/dev/null; then
-    (cd "$cwd" && python -m lizard -C "$cc_max" -L 80 -a 6 "$@") && return 0
-    return 1
-  fi
-  echo "FALTA lizard (CRAP/cc). Puerta CRAP 6; CC <= 4 orienta."
-  return 2
+
+  local worse=0 key cc base
+  while read -r key cc; do
+    [[ -z "$key" ]] && continue
+    base=$(awk -v k="$key" '$1 == k {print $2}' "$BASELINE" 2>/dev/null | head -1)
+    if [[ -z "$base" ]]; then
+      echo "CRAP: $key is at CC $cc, over the ceiling of $cc_max, and is not in the baseline." >&2
+      echo "      A function this tangled is new work. Split it, or explain it and update" >&2
+      echo "      the baseline on purpose." >&2
+      worse=$((worse + 1))
+    elif (( cc > base )); then
+      echo "CRAP: $key went from CC $base to $cc. It was already over the ceiling; making it" >&2
+      echo "      worse is the direction this gate exists to stop." >&2
+      worse=$((worse + 1))
+    fi
+  done < <(lizard_warnings "$cwd" "$cc_max" "$@")
+
+  (( worse == 0 )) || return 1
+  return 0
 }
 
 rs=()
@@ -125,9 +164,15 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           # --file alone mutates the whole file (2315 mutants on the 0.26 tree).
           # --in-diff keeps the second judge on the changed lines.
           diff_file="$(mktemp)"
-          git diff --relative=rust HEAD -- rust/src >"$diff_file" || true
-          if [[ ! -s "$diff_file" ]]; then
-            git diff --relative=rust --cached -- rust/src >"$diff_file" || true
+          # Same base as the file list above, or the two halves of this judge
+          # would disagree about what "the change" is.
+          if [[ -n "$base" ]]; then
+            git diff --relative=rust "$base...HEAD" -- rust/src >"$diff_file" || true
+          else
+            git diff --relative=rust HEAD -- rust/src >"$diff_file" || true
+            if [[ ! -s "$diff_file" ]]; then
+              git diff --relative=rust --cached -- rust/src >"$diff_file" || true
+            fi
           fi
           in_diff=()
           if [[ -s "$diff_file" ]]; then

@@ -368,3 +368,64 @@ fn git_bash() -> std::path::PathBuf {
     }
     std::path::PathBuf::from("bash")
 }
+
+/// One second judge, one implementation.
+///
+/// `quality-gate.ps1` used to be a parallel port of the `.sh`, and the two
+/// drifted precisely where nothing was looking: the `.sh` had a contract and
+/// the `.ps1` did not, so its lizard branch never checked its exit code and
+/// its CRAP gate could not fail. Windows is where this product gets installed,
+/// so that was the judge running on the machines that matter.
+#[test]
+fn the_windows_second_judge_is_a_wrapper_and_not_a_second_opinion() {
+    let ps = read("scripts/quality-gate.ps1");
+
+    assert!(
+        ps.contains("scripts/quality-gate.sh"),
+        "quality-gate.ps1 has to delegate to the shell script rather than reimplement it. Two judges that are supposed to agree only agree for as long as somebody keeps them in step."
+    );
+    assert!(
+        ps.contains("Git/bin/bash.exe"),
+        "it must resolve Git Bash explicitly: the bash on PATH under Windows is WSL's, which cannot translate a Windows drive path and exits without reading anything."
+    );
+    assert!(
+        ps.contains("exit $LASTEXITCODE"),
+        "a wrapper that swallows the exit code is worse than no wrapper: it reports green for whatever the real judge said."
+    );
+    for reimplemented in ["cargo mutants", "exclude-re", "lizard -C"] {
+        assert!(
+            !ps.contains(reimplemented),
+            "quality-gate.ps1 mentions {reimplemented}, so it is deciding something the .sh also decides. That is the drift this wrapper exists to make impossible."
+        );
+    }
+}
+
+/// The second judge has to be able to judge, and to fail.
+#[test]
+fn the_second_judge_can_look_at_a_branch_and_its_crap_gate_can_fail() {
+    let q = read("scripts/quality-gate.sh");
+
+    assert!(
+        q.contains("QG_BASE"),
+        "without a base ref this judges only uncommitted work: run it after committing the change it was meant to judge and it printed SIN DIFF and exited 0, which reads like a pass in a log."
+    );
+    assert!(
+        q.contains("--relative=rust \"$base...HEAD\""),
+        "the mutation half has to use the same base as the file list, or the two halves of this judge disagree about what the change is."
+    );
+    assert!(
+        !q.contains("lizard \"$@\") || true"),
+        "lizard used to run as (cd .. && lizard \"$@\") || true, with no ceiling, so its exit code carried no information either way and the CRAP gate was printed text."
+    );
+    assert!(
+        q.contains("LIZARD_CC_MAX") && q.contains("lizard -C"),
+        "lizard only returns a meaningful exit code when it is given a ceiling."
+    );
+
+    let baseline = read("scripts/lizard-baseline.txt");
+    let entries = baseline.lines().filter(|l| !l.starts_with('#')).count();
+    assert!(
+        entries > 50,
+        "the complexity baseline lists {entries} functions. Without it a ceiling is unusable on a tree that already has complex ones: touching a single line of a CC 30 function would fail the whole diff, and the first thing anybody would do is put the || true back."
+    );
+}
