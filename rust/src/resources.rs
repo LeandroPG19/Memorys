@@ -975,4 +975,30 @@ mod tests {
         let p = plan(&m);
         assert!(p.worker_threads >= 1, "{}", p.describe());
     }
+
+    #[test]
+    fn a_model_the_plan_left_out_is_pointed_at_the_disable_sentinel() {
+        let starved = plan(&container_512mb());
+        assert!(!starved.reranker && !starved.nli, "{}", starved.describe());
+
+        let env = plan_env(&starved);
+        for key in ["CUBA_RERANKER_PATH", "CUBA_NLI_PATH"] {
+            assert_eq!(
+                emitted(&env, key),
+                Some(disabled_model_path().as_str()),
+                "a machine with no room for a model has to say so where the loader reads it. Drop this and the plan decides the model is off, doctor reports it off, and the first search loads it anyway."
+            );
+        }
+
+        let roomy = plan(&desktop_16gb_with_gpu());
+        assert!(roomy.reranker && roomy.nli, "{}", roomy.describe());
+        let env = plan_env(&roomy);
+        for key in ["CUBA_RERANKER_PATH", "CUBA_NLI_PATH"] {
+            assert_eq!(
+                emitted(&env, key),
+                None,
+                "a machine that can run the model must not be handed the sentinel: that would disable it on every box with room for it"
+            );
+        }
+    }
 }

@@ -143,12 +143,20 @@ pub fn configure(builder: SessionBuilder, workload: Workload) -> Result<SessionB
 /// these machines have to keep working, which is the whole reason the
 /// precondition is checked here instead of by letting the provider
 /// registration fail.
+/// Whether landing on the CPU is worth a line in the log.
+///
+/// Asking for a device and not getting it is; not asking is the common case
+/// and saying so on every session would be noise nobody reads.
+fn worth_warning(reason: CpuReason) -> bool {
+    !matches!(reason, CpuReason::NotAskedFor)
+}
+
 fn fall_back_to_cpu(
     builder: SessionBuilder,
     workload: Workload,
     reason: CpuReason,
 ) -> Result<SessionBuilder> {
-    if !matches!(reason, CpuReason::NotAskedFor) {
+    if worth_warning(reason) {
         tracing::warn!(
             model = workload.label(),
             reason = ?reason,
@@ -379,5 +387,19 @@ mod placement_tests {
             Some(CpuReason::NoDevice),
             "a CUDA build shipped to a machine with no card must degrade, not die"
         );
+    }
+
+    #[test]
+    fn only_an_unmet_request_for_a_device_is_worth_a_log_line() {
+        assert!(
+            !worth_warning(CpuReason::NotAskedFor),
+            "not asking for a device is the common case; a warning on every session is noise nobody reads, and noise is how a real warning gets missed"
+        );
+        for unmet in [CpuReason::NoRuntimeProvider, CpuReason::NoDevice] {
+            assert!(
+                worth_warning(unmet),
+                "{unmet:?} means somebody configured a GPU and is not getting one. Silence there is how a deployment believes it is reranking on a card for months."
+            );
+        }
     }
 }

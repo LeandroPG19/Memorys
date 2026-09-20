@@ -69,7 +69,14 @@ pub fn status_resolved() -> bool {
 /// `None` means it loaded, or nobody has asked yet. Reading the resolved cell
 /// rather than forcing it keeps this callable from an async task.
 pub fn failure_reason() -> Option<String> {
-    match RERANKER_STATUS.get()? {
+    reason_of(RERANKER_STATUS.get()?)
+}
+
+/// Only a session that had a model and could not open it has a reason worth
+/// showing. "There is no model" is not a failure, and saying it here would put
+/// it in `doctor` as one.
+fn reason_of(status: &RerankerStatus) -> Option<String> {
+    match status {
         RerankerStatus::Loaded | RerankerStatus::Unavailable => None,
         RerankerStatus::Failed(reason) => Some(reason.clone()),
     }
@@ -674,5 +681,27 @@ mod tests {
         unsafe { std::env::remove_var("CUBA_RERANK_INTRA_THREADS") };
         let auto = intra_threads();
         assert!((1..=8).contains(&auto), "auto value out of range: {auto}");
+    }
+
+    #[test]
+    fn only_a_model_that_was_there_and_did_not_open_has_a_reason() {
+        assert_eq!(reason_of(&RerankerStatus::Loaded), None);
+        assert_eq!(
+            reason_of(&RerankerStatus::Unavailable),
+            None,
+            "no model installed is not a failure. Reporting one here would put it in doctor as a fault to chase instead of a model to install."
+        );
+
+        let arena = "load model: BFCArena::AllocateRawInternal";
+        assert_eq!(
+            reason_of(&RerankerStatus::Failed(arena.into())),
+            Some(arena.to_string()),
+            "the loader message has to come back word for word: doctor prints it verbatim, and the whole point is that it stopped guessing"
+        );
+        assert_ne!(
+            reason_of(&RerankerStatus::Failed(arena.into())),
+            Some(String::new()),
+            "an empty reason is worse than none: doctor would print a failure with nothing after the colon"
+        );
     }
 }

@@ -163,6 +163,25 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           unset CARGO_TARGET_DIR
           # --file alone mutates the whole file (2315 mutants on the 0.26 tree).
           # --in-diff keeps the second judge on the changed lines.
+          #
+          # The five entries added to --exclude-re below are not reachable by
+          # `cargo mutants -- --lib`, each for its own reason, and every one of
+          # them has its decision tested somewhere the mutation CAN reach:
+          #
+          #   serve_pool        binds a socket and serves forever. --lib never
+          #                     starts a daemon. Same class as the handlers.
+          #   gpu_availability  two cfg variants. On the gate's build wants_gpu
+          #                     is false, so configure short-circuits before
+          #                     reading it and nothing observes the answer.
+          #                     cpu_reason, which decides on it, has a table.
+          #   cuda_provider     #[cfg(feature = "cuda")]; not compiled here.
+          #   apply             writes the process-wide environment, which every
+          #                     other test in the binary reads. That is exactly
+          #                     why plan_env is pure and tested; what is left is
+          #                     three lines of set_if_absent.
+          #   failure_reason    reads a OnceLock that --lib cannot populate
+          #                     without loading 1.1 GB of model. reason_of, the
+          #                     half that decides, has a table.
           diff_file="$(mktemp)"
           # Same base as the file list above, or the two halves of this judge
           # would disagree about what "the change" is.
@@ -179,7 +198,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
             in_diff=(--in-diff "$diff_file")
           fi
           (cd rust && cargo mutants "${files[@]}" "${in_diff[@]}" \
-            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id' \
+            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason' \
             --timeout 90 --jobs 2 --gitignore=false -- --lib) || fail=1
           rm -f "$diff_file"
         fi
