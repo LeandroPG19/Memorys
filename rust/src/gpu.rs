@@ -54,8 +54,65 @@ pub fn wants_gpu(workload: Workload) -> bool {
     }
 }
 
+/// Why a workload is running on the CPU.
+///
+/// The distinction that matters is *precondition* versus *failure*. A machine
+/// with no card, or with a runtime that was installed without the execution
+/// provider libraries, is not broken — it just cannot use a GPU, and it must
+/// keep working. Only a machine that has both and still cannot open the
+/// provider has something wrong with it, and that one should be loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuReason {
+    /// The build has no GPU feature, or the device variable says `cpu`.
+    NotAskedFor,
+    /// No `onnxruntime_providers_*` beside the runtime library.
+    NoRuntimeProvider,
+    /// No driver and no `nvidia-smi`: there is no card to talk to.
+    NoDevice,
+}
+
+/// Pure so it can be checked on any machine, including the CI box that has no
+/// card and never will.
+pub fn cpu_reason(wants_gpu: bool, runtime_gpu: bool, device_present: bool) -> Option<CpuReason> {
+    if !wants_gpu {
+        return Some(CpuReason::NotAskedFor);
+    }
+    if !runtime_gpu {
+        return Some(CpuReason::NoRuntimeProvider);
+    }
+    if !device_present {
+        return Some(CpuReason::NoDevice);
+    }
+    None
+}
+
 pub fn configure(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {
-    if !wants_gpu(workload) {
+    #[cfg(any(feature = "cuda", feature = "directml"))]
+    let (runtime_gpu, device_present) = {
+        let provider = if cfg!(feature = "cuda") {
+            "cuda"
+        } else {
+            "directml"
+        };
+        (
+            runtime_has_gpu_provider(provider),
+            provider != "cuda" || nvidia_present(),
+        )
+    };
+    #[cfg(not(any(feature = "cuda", feature = "directml")))]
+    let (runtime_gpu, device_present) = (false, false);
+
+    if let Some(reason) = cpu_reason(wants_gpu(workload), runtime_gpu, device_present) {
+        // Wanting a GPU and not having one is worth saying once. It is not an
+        // error: these machines have to keep working, which is why the check
+        // happens here and not by letting the provider registration fail.
+        if !matches!(reason, CpuReason::NotAskedFor) {
+            tracing::warn!(
+                model = workload.label(),
+                reason = ?reason,
+                "se pidió GPU para este modelo y no está disponible — sigue en CPU"
+            );
+        }
         return configure_cpu(builder, workload);
     }
 
@@ -72,10 +129,14 @@ pub fn configure(builder: SessionBuilder, workload: Workload) -> Result<SessionB
         return configure_cpu(builder, workload);
     }
 
-    tracing::info!(model = workload.label(), "sesión ONNX en GPU");
-    builder
+    let configured = builder
         .with_execution_providers(providers)
-        .map_err(|e| anyhow::anyhow!("registrando execution providers GPU: {e}"))
+        .map_err(|e| anyhow::anyhow!("registrando execution providers GPU: {e}"))?;
+    // After the registration, not before. This line used to be emitted first,
+    // so a log could claim the session was on the GPU while ONNX Runtime had
+    // quietly fallen back to the CPU underneath it.
+    tracing::info!(model = workload.label(), "sesión ONNX en GPU");
+    Ok(configured)
 }
 
 fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {
@@ -103,6 +164,12 @@ fn cuda_provider() -> ort::ep::ExecutionProviderDispatch {
         .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
         .with_memory_limit(limit_mb * 1024 * 1024)
         .build()
+        // ORT defaults this to false and falls back to the CPU inside the
+        // session, which is how a daemon ends up reporting a GPU it is not
+        // using. Reaching here means the card and the provider libraries are
+        // both present, so a registration that still fails is a broken
+        // configuration somebody has to see.
+        .error_on_failure()
 }
 
 pub struct GpuStatus {
@@ -253,4 +320,45 @@ fn nvidia_present() -> bool {
     std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).any(|p| p.join(exe).exists()))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    /// Every combination, so the next person to touch this cannot quietly turn
+    /// a machine with no card into a hard error. Pure: it runs on the CI box.
+    #[test]
+    fn a_machine_with_no_gpu_says_cpu_and_a_broken_one_does_not_get_to_hide() {
+        // (asked for a GPU, provider libs present, device present) -> reason
+        let table = [
+            (false, false, false, Some(CpuReason::NotAskedFor)),
+            (false, true, true, Some(CpuReason::NotAskedFor)),
+            (true, false, false, Some(CpuReason::NoRuntimeProvider)),
+            (true, false, true, Some(CpuReason::NoRuntimeProvider)),
+            (true, true, false, Some(CpuReason::NoDevice)),
+            (true, true, true, None),
+        ];
+        for (wants, runtime, device, expected) in table {
+            assert_eq!(
+                cpu_reason(wants, runtime, device),
+                expected,
+                "wants_gpu={wants} runtime_provider={runtime} device={device}"
+            );
+        }
+    }
+
+    #[test]
+    fn asking_for_a_gpu_on_a_machine_without_one_is_not_a_failure() {
+        assert_eq!(
+            cpu_reason(true, false, false),
+            Some(CpuReason::NoRuntimeProvider),
+            "a runtime installed without the execution-provider libraries is the common              shape of `models runtime` run without --gpu. It has to keep working on the CPU:              once the provider registration starts erroring, a None here would turn every one              of those machines into a daemon that refuses to load its reranker at all"
+        );
+        assert_eq!(
+            cpu_reason(true, true, false),
+            Some(CpuReason::NoDevice),
+            "a CUDA build shipped to a machine with no card must degrade, not die"
+        );
+    }
 }

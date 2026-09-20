@@ -253,69 +253,84 @@ fn runtime_role_check(user: &str, is_super: bool, app_role_ready: bool) -> Check
     )
 }
 
+/// What the loader knows about the reranker right now.
+///
+/// These four facts used to travel as four separate booleans plus an optional
+/// string, and only some of the sixteen combinations mean anything. Naming the
+/// states makes the impossible ones unrepresentable, and keeps the check under
+/// clippy's argument ceiling without silencing the lint.
+enum RerankerLoad<'a> {
+    /// No model on disk, or the resource plan pointed the path at its sentinel.
+    NoModel,
+    /// A model is there and nothing has asked for it yet.
+    NotTried,
+    Loaded,
+    /// A model is there and the session did not open. `Some` carries the
+    /// loader's own message; `None` means even it does not know.
+    Failed(Option<&'a str>),
+}
+
+impl<'a> RerankerLoad<'a> {
+    fn observe(configured: bool, resolved: bool, enabled: bool, failure: Option<&'a str>) -> Self {
+        match (configured, resolved, enabled) {
+            (false, _, _) => Self::NoModel,
+            (true, false, _) => Self::NotTried,
+            (true, true, true) => Self::Loaded,
+            (true, true, false) => Self::Failed(failure),
+        }
+    }
+}
+
 fn reranker_check(
-    configured: bool,
-    resolved: bool,
-    enabled: bool,
+    load: RerankerLoad<'_>,
     disabled_by_resources: bool,
     ram_available_mb: u64,
     tier: &str,
     on_by_default: bool,
-    failure: Option<&str>,
 ) -> Check {
     if disabled_by_resources {
         return Check::warn(
             "reranker",
             format!(
-                "el modelo NO se cargó: al arrancar había {ram_available_mb} MiB de RAM \
-                 disponible y el plan de recursos salió en nivel «{tier}» — resources.rs \
-                 redirigió CUBA_RERANKER_PATH a un directorio que no existe, para toda la \
-                 vida de este proceso."
+                "el modelo NO se cargó: al arrancar había {ram_available_mb} MiB de RAM                  disponible y el plan de recursos salió en nivel «{tier}» — resources.rs                  redirigió CUBA_RERANKER_PATH a un directorio que no existe, para toda la                  vida de este proceso."
             ),
-            "esta decisión se toma UNA sola vez, al arrancar: subí el límite de memoria del \
-             contenedor o de la unidad de systemd y reiniciá el proceso — más RAM disponible \
-             ahora mismo no lo revive.",
+            "esta decisión se toma UNA sola vez, al arrancar: subí el límite de memoria del              contenedor o de la unidad de systemd y reiniciá el proceso — más RAM disponible              ahora mismo no lo revive.",
         );
     }
-    match (configured, resolved) {
-        (true, true) if enabled => Check::ok(
+    match load {
+        RerankerLoad::Loaded => Check::ok(
             "reranker",
             format!(
-                "cargado (bge-reranker-v2-m3) — reordena los candidatos por cross-encoder · \
-                 activo por defecto: {on_by_default} ({})",
+                "cargado (bge-reranker-v2-m3) — reordena los candidatos por cross-encoder ·                  activo por defecto: {on_by_default} ({})",
                 if on_by_default {
                     "modo completo, o GPU real detectada — ver el check «gpu»"
                 } else {
-                    "sin GPU real, ver el check «gpu» arriba — en CPU cuesta 60-110 s y ese \
-                     trabajo se tira; pedilo con rerank:true si igual lo querés"
+                    "sin GPU real, ver el check «gpu» arriba — en CPU cuesta 60-110 s y ese                      trabajo se tira; pedilo con rerank:true si igual lo querés"
                 }
             ),
         ),
-        (true, true) => match failure {
-            // The loader knows why. This is the only place the operator reads
-            // it, so pass it through instead of offering a likelier-sounding
-            // guess: on one deployment the guess named the wrong library while
-            // the real cause was a CUDA arena ceiling below the model's size.
-            Some(reason) => Check::fail(
-                "reranker",
-                format!("hay un modelo en disco y NO carga: {reason}"),
-                "el ranking se devuelve tal cual (RRF, sin reordenar). El mensaje de arriba                  viene del cargador: es la causa medida, no una conjetura.",
-            ),
-            None => Check::fail(
-                "reranker",
-                "hay un modelo en disco pero NO carga",
-                "el ranking se devuelve tal cual. Sin un motivo del cargador, lo más probable                  es libonnxruntime.so: comprobá ORT_DYLIB_PATH.",
-            ),
-        },
-        (true, false) => Check::ok(
+        // The loader knows why. This is the only place the operator reads it,
+        // so pass it through instead of offering a likelier-sounding guess: on
+        // one deployment the guess named the wrong library while the real cause
+        // was a CUDA arena ceiling below the model's size.
+        RerankerLoad::Failed(Some(reason)) => Check::fail(
+            "reranker",
+            format!("hay un modelo en disco y NO carga: {reason}"),
+            "el ranking se devuelve tal cual (RRF, sin reordenar). El mensaje de arriba viene              del cargador: es la causa medida, no una conjetura.",
+        ),
+        RerankerLoad::Failed(None) => Check::fail(
+            "reranker",
+            "hay un modelo en disco pero NO carga",
+            "el ranking se devuelve tal cual. Sin un motivo del cargador, lo más probable es              libonnxruntime.so: comprobá ORT_DYLIB_PATH.",
+        ),
+        RerankerLoad::NotTried => Check::ok(
             "reranker",
             "configurado — carga en su primer lote (no lo cargo aquí: son ~1,1 GB)",
         ),
-        (false, _) => Check::warn(
+        RerankerLoad::NoModel => Check::warn(
             "reranker",
             "no hay modelo en disco — el ranking se devuelve tal cual (RRF, sin reordenar)",
-            "es opcional, pero si querías reordenar y no pusiste el modelo, no está \
-             pasando nada. Instalalo: cuba-memorys models reranker",
+            "es opcional, pero si querías reordenar y no pusiste el modelo, no está pasando              nada. Instalalo: cuba-memorys models reranker",
         ),
     }
 }
@@ -516,15 +531,18 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     let rerank_enabled = rerank_resolved && crate::search::rerank::enabled();
     let rerank_disabled_by_resources = std::env::var("CUBA_RERANKER_PATH").ok().as_deref()
         == Some(crate::resources::disabled_model_path().as_str());
+    let rerank_failure = crate::search::rerank::failure_reason();
     checks.push(reranker_check(
-        rerank_configured,
-        rerank_resolved,
-        rerank_enabled,
+        RerankerLoad::observe(
+            rerank_configured,
+            rerank_resolved,
+            rerank_enabled,
+            rerank_failure.as_deref(),
+        ),
         rerank_disabled_by_resources,
         machine.ram_available_mb,
         resource_plan.tier.as_str(),
         mode.rerank_default(),
-        crate::search::rerank::failure_reason().as_deref(),
     ));
 
     if crate::cognitive::nli::available() {
@@ -1160,7 +1178,7 @@ mod reranker_tests {
 
     #[test]
     fn resources_disabling_it_for_ram_is_distinguished_from_no_model_at_all() {
-        let starved = reranker_check(false, false, false, true, 373, "minimal", false, None);
+        let starved = reranker_check(RerankerLoad::NoModel, true, 373, "minimal", false);
         assert_eq!(
             starved.status,
             Status::Warn,
@@ -1181,7 +1199,7 @@ mod reranker_tests {
              required, or raising the memory limit later looks like it should have worked"
         );
 
-        let never_installed = reranker_check(false, false, false, false, 8000, "full", false, None);
+        let never_installed = reranker_check(RerankerLoad::NoModel, false, 8000, "full", false);
         assert_ne!(
             starved.detail, never_installed.detail,
             "two different root causes collapsing into the same sentence is the exact bug \
@@ -1195,7 +1213,7 @@ mod reranker_tests {
         // The message ONNX Runtime actually produced on a 2026-09 deployment,
         // where the CUDA arena ceiling was too low for the cross-encoder.
         let arena = "load model: BFCArena::AllocateRawInternal: Available memory of 2423552                      is smaller than requested bytes of 4194304";
-        let check = reranker_check(true, true, false, false, 8000, "full", true, Some(arena));
+        let check = reranker_check(RerankerLoad::Failed(Some(arena)), false, 8000, "full", true);
 
         assert_eq!(check.status, Status::Fail);
         let said = format!("{} {}", check.detail, check.hint.as_deref().unwrap_or(""));
@@ -1209,7 +1227,7 @@ mod reranker_tests {
         );
 
         // With nothing known, the old advice is still the best available guess.
-        let unexplained = reranker_check(true, true, false, false, 8000, "full", true, None);
+        let unexplained = reranker_check(RerankerLoad::Failed(None), false, 8000, "full", true);
         assert_eq!(unexplained.status, Status::Fail);
         assert!(
             unexplained
@@ -1222,7 +1240,7 @@ mod reranker_tests {
 
     #[test]
     fn a_loaded_model_says_whether_it_is_reachable_by_default() {
-        let with_gpu = reranker_check(true, true, true, false, 8000, "full", true, None);
+        let with_gpu = reranker_check(RerankerLoad::Loaded, false, 8000, "full", true);
         assert_eq!(with_gpu.status, Status::Ok);
         assert!(
             with_gpu.detail.contains("activo por defecto: true"),
@@ -1230,7 +1248,7 @@ mod reranker_tests {
             with_gpu.detail
         );
 
-        let without_gpu = reranker_check(true, true, true, false, 8000, "full", false, None);
+        let without_gpu = reranker_check(RerankerLoad::Loaded, false, 8000, "full", false);
         assert_eq!(without_gpu.status, Status::Ok);
         assert!(
             without_gpu.detail.contains("activo por defecto: false"),
@@ -1248,14 +1266,14 @@ mod reranker_tests {
     #[test]
     fn a_model_on_disk_that_fails_to_load_is_still_a_failure() {
         assert_eq!(
-            reranker_check(true, true, false, false, 8000, "full", true, None).status,
+            reranker_check(RerankerLoad::Failed(None), false, 8000, "full", true).status,
             Status::Fail
         );
     }
 
     #[test]
     fn genuinely_no_model_on_disk_is_only_a_warning() {
-        let check = reranker_check(false, false, false, false, 8000, "full", false, None);
+        let check = reranker_check(RerankerLoad::NoModel, false, 8000, "full", false);
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("no hay modelo en disco"));
     }
