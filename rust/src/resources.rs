@@ -116,6 +116,8 @@ pub struct Plan {
     pub nli_intra_threads: usize,
     pub rerank_chunk: usize,
     pub gpu_mem_limit_mb: Option<u64>,
+    /// Below this the arena cannot hold the model at all.
+    pub gpu_mem_floor_mb: Option<u64>,
     pub worker_threads: usize,
     pub max_blocking_threads: usize,
     pub db_max_connections: u32,
@@ -155,9 +157,31 @@ impl Plan {
 /// This is an admission test, not a budget: it answers "does this model fit on
 /// this card", never "how big should the arena cap be".
 pub fn reranker_vram_required_mb(weights_mb: u64, chunk: usize) -> u64 {
-    weights_mb * WEIGHT_DEVICE_EXPANSION_PCT / 100
-        + CUDA_CONTEXT_MB
-        + ACTIVATION_MB_PER_PAIR * chunk as u64
+    reranker_arena_floor_mb(weights_mb, chunk) + CUDA_CONTEXT_MB
+}
+
+/// What ONNX Runtime itself has to allocate: the weights on the device plus
+/// the activations of one batch. The CUDA context is not in here — it lives
+/// outside the arena — which is why this, and not the full footprint, is the
+/// number an arena cap has to clear.
+pub fn reranker_arena_floor_mb(weights_mb: u64, chunk: usize) -> u64 {
+    weights_mb * WEIGHT_DEVICE_EXPANSION_PCT / 100 + ACTIVATION_MB_PER_PAIR * chunk as u64
+}
+
+/// The arena cap to publish.
+///
+/// An operator's value wins, as it does for every other knob — except below
+/// the floor the model demonstrably needs, where it is not a preference but an
+/// impossibility. A cap under the floor does not save VRAM: with
+/// SameAsRequested the arena only grows by what a call asks for, so the only
+/// thing a low cap buys is `BFCArena::AllocateRawInternal` partway through a
+/// load. The coherent way to ask for less is CUBA_RERANK_DEVICE=cpu.
+pub fn gpu_cap_with_floor(explicit: Option<u64>, planned: u64, floor: u64) -> (u64, bool) {
+    match explicit {
+        Some(value) if value < floor => (planned, true),
+        Some(value) => (value, false),
+        None => (planned, false),
+    }
 }
 
 pub fn plan(m: &Machine) -> Plan {
@@ -214,6 +238,12 @@ pub fn plan(m: &Machine) -> Plan {
     // matter how large the card, and the cross-encoder does not fit in 2048 —
     // so every GPU install failed until somebody raised the variable by hand.
     let gpu_mem_limit_mb = (reranker && reranker_on_gpu).then_some(vram_ceiling_mb);
+    let gpu_mem_floor_mb = (reranker && reranker_on_gpu)
+        .then(|| {
+            m.reranker_weights_mb
+                .map(|w| reranker_arena_floor_mb(w, rerank_chunk))
+        })
+        .flatten();
 
     let ood_fit_limit = ((budget_mb * MIB / OOD_BUDGET_DIVISOR) / OOD_BYTES_PER_SAMPLE)
         .min(MAX_OOD_FIT_LIMIT as u64) as i64;
@@ -229,6 +259,7 @@ pub fn plan(m: &Machine) -> Plan {
         nli_intra_threads: half_cores.min(MAX_NLI_INTRA_THREADS),
         rerank_chunk,
         gpu_mem_limit_mb,
+        gpu_mem_floor_mb,
         worker_threads: m
             .cores_logical
             .clamp(MIN_WORKER_THREADS, MAX_WORKER_THREADS),
@@ -373,6 +404,23 @@ pub fn plan_env(p: &Plan) -> Vec<(&'static str, String)> {
 }
 
 pub fn apply(p: &Plan) {
+    // Before the fill-in below, or a variable the plan is about to set would
+    // read back as though an operator had chosen it.
+    if let (Some(planned), Some(floor)) = (p.gpu_mem_limit_mb, p.gpu_mem_floor_mb) {
+        let explicit = std::env::var("CUBA_GPU_MEM_LIMIT_MB")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok());
+        let (cap, raised) = gpu_cap_with_floor(explicit, planned, floor);
+        if raised {
+            tracing::error!(
+                explicit = explicit.unwrap_or_default(),
+                floor_mb = floor,
+                raised_to_mb = cap,
+                "CUBA_GPU_MEM_LIMIT_MB was set below what this reranker needs on this card;                  leaving it there makes the session fail partway through the load. Raised.                  To use less VRAM set CUBA_RERANK_DEVICE=cpu instead."
+            );
+            unsafe { std::env::set_var("CUBA_GPU_MEM_LIMIT_MB", cap.to_string()) };
+        }
+    }
     for (key, value) in plan_env(p) {
         set_if_absent(key, &value);
     }
@@ -592,6 +640,35 @@ mod tests {
     }
 
     #[test]
+    fn a_ceiling_below_the_measured_floor_is_raised_and_said_out_loud() {
+        // The shipped FP16 at the narrow batch: 1750*110/100 + 48*8 = 2309 MiB
+        // of arena, on a card that leaves 5388.
+        let floor = reranker_arena_floor_mb(SHIPPED_FP16_WEIGHTS_MB, NARROW_GPU_RERANK_CHUNK);
+        let planned = 5388;
+
+        assert_eq!(
+            gpu_cap_with_floor(Some(2048), planned, floor),
+            (planned, true),
+            "2048 is the number a start-up script pinned on a machine where the model needed              {floor}. set_if_absent let it win, the plan never applied, and the session died              on BFCArena partway through the load. Below the floor is not a preference, it is              an impossibility — raise it and say so"
+        );
+        assert_eq!(
+            gpu_cap_with_floor(Some(6000), planned, floor),
+            (6000, false),
+            "above the floor the operator still decides: they may know something about the              card that the plan does not"
+        );
+        assert_eq!(
+            gpu_cap_with_floor(None, planned, floor),
+            (planned, false),
+            "with nothing set there is nothing to correct"
+        );
+        assert_eq!(
+            gpu_cap_with_floor(Some(floor), planned, floor),
+            (floor, false),
+            "exactly the floor is enough; this pins the boundary so a mutant cannot turn <              into <="
+        );
+    }
+
+    #[test]
     fn the_admission_test_is_checked_at_its_exact_boundary() {
         // 1000 MiB of weights need 1000*110/100 + 448 + 48*8 = 1932 MiB at the
         // narrow batch, so a 2444 MiB card clears it by exactly nothing.
@@ -615,6 +692,25 @@ mod tests {
             !plan(&one_short).reranker_on_gpu,
             "one mebibyte short is short. This pair exists so a mutant that flips <= to < or              drops the reserve cannot survive"
         );
+    }
+
+    #[test]
+    fn a_machine_that_is_not_using_its_card_has_no_floor_to_enforce() {
+        for (name, m) in every_machine() {
+            let p = plan(&m);
+            if !p.reranker_on_gpu || !p.reranker {
+                assert_eq!(
+                    p.gpu_mem_floor_mb, None,
+                    "{name}: a floor only means something for a model that is going on the                      card. Publishing one anywhere else would let apply() rewrite an arena cap                      on a machine that never opens a CUDA session"
+                );
+            } else {
+                let floor = p.gpu_mem_floor_mb.expect("a card in use has a floor");
+                assert!(
+                    floor <= p.gpu_mem_limit_mb.unwrap_or(0),
+                    "{name}: the plan admitted this card, so its own cap cannot sit below the                      floor it just computed"
+                );
+            }
+        }
     }
 
     #[test]
