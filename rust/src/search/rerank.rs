@@ -280,6 +280,11 @@ async fn permit_before(
     deadline: std::time::Instant,
 ) -> Result<tokio::sync::SemaphorePermit<'static>> {
     let wait = deadline.saturating_duration_since(std::time::Instant::now());
+    if wait.is_zero() {
+        return Err(anyhow::anyhow!(
+            "el presupuesto se consumió antes de llegar al reranker: en un proceso frío la carga del modelo se lo come, y subir CUBA_RERANK_TIMEOUT_SECS o precalentar con CUBA_WARM_RERANKER es lo que lo arregla"
+        ));
+    }
     match tokio::time::timeout(wait, semaphore().acquire()).await {
         Ok(permit) => permit.map_err(|_| anyhow::anyhow!("reranker semaphore closed")),
         Err(_) => Err(anyhow::anyhow!(

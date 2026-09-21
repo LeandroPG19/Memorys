@@ -79,9 +79,18 @@ async fn reranking_reorders_candidates_by_relevance() {
         "Docker multi-stage builds keep the final image small by discarding build tooling.",
     ];
 
-    let scored = memory_industry::search::rerank::rerank(query, &candidates)
-        .await
-        .expect("reranking");
+    // An explicit deadline, not the search budget. This test is about whether
+    // the cross-encoder ranks the right passage first; it is not about whether
+    // it can win the session permit inside 20 s while the warm-up test next to
+    // it holds that permit for a 50-candidate batch. On CPU that batch takes
+    // 45 seconds, and the two run in the same process.
+    let scored = memory_industry::search::rerank::rerank_within(
+        query,
+        &candidates,
+        std::time::Instant::now() + std::time::Duration::from_secs(600),
+    )
+    .await
+    .expect("reranking");
     assert_eq!(scored.len(), candidates.len());
     assert_eq!(
         scored[0].0,
