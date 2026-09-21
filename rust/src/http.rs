@@ -43,6 +43,14 @@ struct AppState {
     /// Failed bearer tokens, per address.
     auth_failures:
         Arc<std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, (u32, Instant)>>>,
+    /// Which resource plan this process started under.
+    ///
+    /// Read once at boot instead of per request: `resources::probe()` shells
+    /// out to `nvidia-smi` on a GPU build, and `/health` is what a monitor
+    /// polls every few seconds. The answer cannot change anyway — `main`
+    /// computes the plan once and `apply()` has already written it into the
+    /// environment by the time this daemon binds.
+    resource_tier: &'static str,
 }
 
 pub fn bind_addr() -> String {
@@ -107,7 +115,7 @@ fn ensure_tokens_differ() -> Result<()> {
 /// The shortest bearer token worth calling a secret on a routable address.
 /// 32 characters of base64 is 192 bits; the point is only that it is not in
 /// anybody's wordlist.
-const MIN_ROUTABLE_TOKEN_CHARS: usize = 32;
+pub(crate) const MIN_ROUTABLE_TOKEN_CHARS: usize = 32;
 
 /// Why this token is not good enough for this address, if it is not.
 ///
@@ -116,7 +124,10 @@ const MIN_ROUTABLE_TOKEN_CHARS: usize = 32;
 /// only thing between the graph and anyone who can route a packet to the port,
 /// and `same_secret` compares in constant time but nothing stops an attacker
 /// on the LAN trying tokens as fast as the daemon answers.
-fn token_too_weak(addr_is_loopback: bool, token: Option<&str>) -> Option<String> {
+/// `pub(crate)`, not `pub`: `service.rs` is in this crate and needs to agree
+/// with this rule token for token, and there is no reason to widen the public
+/// API for it.
+pub(crate) fn token_too_weak(addr_is_loopback: bool, token: Option<&str>) -> Option<String> {
     if addr_is_loopback {
         return None;
     }
@@ -207,6 +218,9 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         ready: ready.clone(),
         port: addr.port(),
         auth_failures: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        resource_tier: crate::resources::plan(&crate::resources::probe())
+            .tier
+            .as_str(),
     };
 
     let reaper_seen = state.seen.clone();
@@ -224,7 +238,6 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         .route("/health", get(health))
         .route("/", get(connect_page))
         .route("/connect", get(connect_page))
-        .route("/events", get(events_sse))
         .route("/events/ticket", post(events_ticket));
     if panel_route_enabled(
         addr.ip().is_loopback(),
@@ -240,7 +253,17 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         );
     }
     tracing::info!("connect page at http://{addr}/connect");
-    let app = app.layer(DefaultBodyLimit::max(MAX_BODY)).with_state(state);
+
+    // The timeout is attached here, before `/events` is merged in, because
+    // `Router::layer` only wraps the routes already registered. An SSE stream
+    // is a response that deliberately never ends: any budget on it is a
+    // guarantee that every subscriber is cut off at the budget, and the bell
+    // would look flaky instead of looking absent.
+    let app = app
+        .layer(axum::middleware::from_fn(bound_every_request))
+        .merge(Router::new().route("/events", get(events_sse)))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .with_state(state);
 
     let listener = bind_listener(addr).await?;
 
@@ -530,6 +553,49 @@ fn authorized(state: &AppState, headers: &HeaderMap) -> Option<Scope> {
 
 fn request_deadline() -> Duration {
     protocol::handler_timeout() * 4
+}
+
+/// The last resort for a request that stops making progress.
+///
+/// Strictly longer than `request_deadline()` on purpose. `/mcp` already bounds
+/// its own dispatch and answers with a JSON-RPC envelope that names what died;
+/// that answer is worth more than this one, so this layer must not fire first
+/// and take it away. What it covers is everything `/mcp` cannot: a request
+/// that never reaches a handler, and the routes that have no budget of their
+/// own (`/panel`, `/connect`, `/health`), which on a LAN bind are reachable by
+/// anything that can route a packet to the port.
+fn router_deadline() -> Duration {
+    request_deadline() * 2
+}
+
+/// Give up on a request that outlived its budget, and free the connection.
+///
+/// `/events` is deliberately not behind this — see where the layer is
+/// attached.
+async fn bound_every_request(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let budget = router_deadline();
+    let path = request.uri().path().to_string();
+    match tokio::time::timeout(budget, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => {
+            tracing::warn!(
+                path = %path,
+                secs = budget.as_secs(),
+                "request outlived the router deadline and was dropped"
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "this daemon gave up on the request after {}s and closed it",
+                    budget.as_secs()
+                ),
+            )
+                .into_response()
+        }
+    }
 }
 
 fn batch_items(payload: Value) -> Result<(Vec<Value>, bool), Value> {
@@ -1250,6 +1316,287 @@ fn graph_summary_for(full_scope: bool, summary: Value) -> Value {
 /// A monitor asks this every few seconds; it must answer or say why, never sit.
 const HEALTH_DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+// The three answers `/health` gives about the daemon as a whole, and the
+// vocabulary below for one model. These words are the wire contract, not
+// identifiers: a monitor matches on them, so they are written once here.
+const STATUS_OK: &str = "ok";
+const STATUS_STARTING: &str = "starting";
+const STATUS_DEGRADED: &str = "degraded";
+
+const STATE_LOADED: &str = "loaded";
+/// There is a model and it did not open. The only state that means *broken*.
+const STATE_FAILED: &str = "failed";
+/// A model is on disk and nothing has needed it yet.
+const STATE_CONFIGURED: &str = "configured";
+/// Still inside the warm-up that ran past its budget.
+const STATE_WARMING: &str = "warming";
+/// Loading was attempted and the code fell back to something weaker.
+const STATE_FALLBACK: &str = "fallback";
+/// The resource plan switched this model off on purpose.
+const STATE_OFF: &str = "off";
+/// Nothing on disk to load.
+const STATE_ABSENT: &str = "absent";
+
+/// Where one model is and why it is not simply running.
+///
+/// `reason` is a sentence for a human and is `None` when the state says
+/// everything. It never carries a filesystem path: a model path is inventory,
+/// and on Windows it has the operator's user name inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelState {
+    pub state: &'static str,
+    pub device: &'static str,
+    pub reason: Option<String>,
+}
+
+/// Everything `/health` can say about this process without asking anything
+/// outside it.
+///
+/// Built for every caller, served only to `Scope::Full`: the verdict in
+/// `status` is for the monitor, the inventory behind it is for the operator.
+/// That split is the whole point — a `last_error` naming an internal host went
+/// out to anonymous callers once already.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeReport {
+    pub mode: &'static str,
+    pub resource_tier: &'static str,
+    /// False while the models are still loading behind an already-open port.
+    pub ready: bool,
+    pub embedder: ModelState,
+    pub reranker: ModelState,
+    pub nli: ModelState,
+    /// The GPU provider this binary was compiled against, if any.
+    pub gpu_build: Option<&'static str>,
+    /// `gpu::status()` — asked for a device and not using one.
+    pub gpu_degraded: bool,
+    /// `embedder=… reranker=… nli=…`, as the placement path decided it.
+    pub gpu_placement: String,
+    pub llm: crate::llm_cli::LlmSummary,
+}
+
+/// The one verdict, from the facts, as a function that can be read and mutated.
+///
+/// Deliberately not inlined into the handler: `quality-gate.sh` runs
+/// `cargo mutants` over `rust/src`, and an async handler is exactly what it
+/// skips — logic living inside `health()` is logic no second judge ever tests.
+///
+/// The precedence is `degraded` over `starting` because they ask for different
+/// things from whoever reads them: `starting` will fix itself and wants
+/// patience, `degraded` will not and wants a person. When both are true the
+/// person is the one who is needed, and `ready` is in the same body for anyone
+/// who wants to know which.
+///
+/// `STATE_FALLBACK` on the embedder is deliberately *not* degraded. This
+/// daemon is supported on machines that never had an embedding model — that is
+/// what `Tier::Minimal` is — and reporting every one of those as degraded
+/// forever teaches the operator to ignore the field, which is the failure this
+/// endpoint exists to prevent. `resource_tier`, in the same block, says which
+/// models the plan expected.
+pub fn overall_status(db_ok: bool, runtime: &RuntimeReport) -> &'static str {
+    let a_model_is_broken = [&runtime.embedder, &runtime.reranker, &runtime.nli]
+        .into_iter()
+        .any(|model| model.state == STATE_FAILED);
+
+    if !db_ok || runtime.gpu_degraded || a_model_is_broken {
+        return STATUS_DEGRADED;
+    }
+    if !runtime.ready {
+        return STATUS_STARTING;
+    }
+    STATUS_OK
+}
+
+/// Where the placement path put this workload.
+fn device_of(workload: crate::gpu::Workload) -> &'static str {
+    if crate::gpu::wants_gpu(workload) {
+        "gpu"
+    } else {
+        "cpu"
+    }
+}
+
+/// The GPU provider compiled in, for the one field that has to name it.
+///
+/// This is the second reader of the feature flags after `gpu::compiled_provider`,
+/// which is private. It is read to print a word, never to choose a device: the
+/// placement decision stays in `gpu.rs` so there is still exactly one place
+/// that can send a tensor to the wrong processor.
+fn compiled_gpu_provider() -> Option<&'static str> {
+    if cfg!(feature = "cuda") {
+        Some("cuda")
+    } else if cfg!(feature = "directml") {
+        Some("directml")
+    } else {
+        None
+    }
+}
+
+/// The embedder, asked only once it is safe to ask.
+///
+/// `onnx::is_model_loaded()` resolves a `OnceLock` that loads the model, so on
+/// a cold process it is a multi-second call — inside `/health`, on the async
+/// executor. `ready` is the exact guard: it is set after `warm_models()`
+/// finished, and `warm_models()` is what resolves that cell. Before it flips,
+/// the honest answer is that the model is still loading, and asking would be
+/// the thing that makes a monitor's poll hang.
+fn embedder_state(ready: bool) -> ModelState {
+    let device = device_of(crate::gpu::Workload::Embedder);
+    if !ready {
+        return ModelState {
+            state: STATE_WARMING,
+            device,
+            reason: None,
+        };
+    }
+    if crate::embeddings::onnx::is_model_loaded() {
+        return ModelState {
+            state: STATE_LOADED,
+            device,
+            reason: None,
+        };
+    }
+    ModelState {
+        state: STATE_FALLBACK,
+        device: "cpu",
+        reason: Some(
+            "no ONNX embedder opened — vectors come from the hash fallback and search is \
+             lexical only"
+                .to_string(),
+        ),
+    }
+}
+
+/// The reranker, read from the cell rather than forced into it.
+///
+/// Every accessor used here answers without loading: `resolved_model_dir` and
+/// `is_configured` stat the disk, and `failure_reason` / `status_resolved` read
+/// a cell that is already decided or is not. `rerank::enabled()` would load
+/// 1,1 GB inside a health poll.
+fn reranker_state() -> ModelState {
+    let device = device_of(crate::gpu::Workload::Reranker);
+    if let Some(reason) = crate::search::rerank::failure_reason() {
+        return ModelState {
+            state: STATE_FAILED,
+            device,
+            reason: Some(reason),
+        };
+    }
+    if crate::search::rerank::resolved_model_dir().is_none() {
+        return ModelState {
+            state: STATE_OFF,
+            device,
+            reason: Some(
+                "the resource plan switched the reranker off on this machine; rankings come \
+                 back in RRF order"
+                    .to_string(),
+            ),
+        };
+    }
+    if !crate::search::rerank::is_configured() {
+        return ModelState {
+            state: STATE_ABSENT,
+            device,
+            reason: Some(
+                "no reranker model where this daemon looks — `memory-industry models reranker` \
+                 installs it"
+                    .to_string(),
+            ),
+        };
+    }
+    if crate::search::rerank::status_resolved() {
+        return ModelState {
+            state: STATE_LOADED,
+            device,
+            reason: None,
+        };
+    }
+    ModelState {
+        state: STATE_CONFIGURED,
+        device,
+        reason: Some("loads on its first batch".to_string()),
+    }
+}
+
+/// The NLI model, from the two questions that can be answered for free.
+///
+/// It can never report `loaded` or `failed` from here: `nli::enabled()` is the
+/// only thing that knows, and it is also what loads the model. Saying
+/// `configured` when it may in fact have failed is the lesser lie — the
+/// alternative is a `/health` that loads a gigabyte the first time a monitor
+/// polls it, which is the bug `doctor` was just fixed for.
+fn nli_state() -> ModelState {
+    let device = device_of(crate::gpu::Workload::Nli);
+    if crate::cognitive::nli::deferred_by_resource_plan() {
+        return ModelState {
+            state: STATE_OFF,
+            device,
+            reason: Some(
+                "the resource plan switched NLI off on this machine; contradictions fall back \
+                 to the judge"
+                    .to_string(),
+            ),
+        };
+    }
+    if !crate::cognitive::nli::available() {
+        return ModelState {
+            state: STATE_ABSENT,
+            device,
+            reason: Some("no NLI model where this daemon looks".to_string()),
+        };
+    }
+    ModelState {
+        state: STATE_CONFIGURED,
+        device,
+        reason: Some("loads on its first use; this endpoint does not force it".to_string()),
+    }
+}
+
+fn runtime_report(state: &AppState) -> RuntimeReport {
+    let ready = state.ready.load(Ordering::Relaxed);
+    let gpu = crate::gpu::status();
+    RuntimeReport {
+        mode: crate::mode::active().as_str(),
+        resource_tier: state.resource_tier,
+        ready,
+        embedder: embedder_state(ready),
+        reranker: reranker_state(),
+        nli: nli_state(),
+        gpu_build: compiled_gpu_provider(),
+        gpu_degraded: gpu.degraded,
+        gpu_placement: crate::gpu::placement_summary(),
+        llm: crate::llm_cli::configured_summary(),
+    }
+}
+
+fn model_json(model: &ModelState) -> Value {
+    serde_json::json!({
+        "state": model.state,
+        "device": model.device,
+        "reason": model.reason,
+    })
+}
+
+fn runtime_json(runtime: &RuntimeReport) -> Value {
+    serde_json::json!({
+        "mode": runtime.mode,
+        "resource_tier": runtime.resource_tier,
+        "embedder": model_json(&runtime.embedder),
+        "reranker": model_json(&runtime.reranker),
+        "nli": model_json(&runtime.nli),
+        "gpu": {
+            "build": runtime.gpu_build,
+            "degraded": runtime.gpu_degraded,
+            "placement": runtime.gpu_placement,
+        },
+        "llm": {
+            "configured": runtime.llm.configured,
+            "backend": runtime.llm.backend,
+            "model": runtime.llm.model,
+            "base_url": runtime.llm.base_url,
+        },
+    })
+}
+
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     // Bounded on purpose. A health endpoint that hangs because the database
     // hangs is worse than one that says the database is unreachable: the
@@ -1262,14 +1609,15 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     .is_ok_and(|r| r.is_ok());
 
     let full_scope = authorized(&state, &headers) == Some(Scope::Full);
+    let runtime = runtime_report(&state);
     let mut body = serde_json::json!({
-        "status": if db_ok { "ok" } else { "degraded" },
+        "status": overall_status(db_ok, &runtime),
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": state.started.elapsed().as_secs(),
         "requests_served": state.served.load(Ordering::Relaxed),
         "database": if db_ok { "up" } else { "unreachable" },
         "graph_db": graph_summary_for(full_scope, crate::graph_db::status_summary()),
-        "ready": state.ready.load(Ordering::Relaxed),
+        "ready": runtime.ready,
         "connect": "/connect",
         "events": "/events",
     });
@@ -1281,16 +1629,33 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
             .map(|g| g.keys().cloned().collect())
             .unwrap_or_default();
         body["clients"] = serde_json::json!(clients);
+        // Only here. The block is an inventory of the machine — which models,
+        // on which device, talking to which provider — and an anonymous caller
+        // gets the verdict in `status` without the list of what to attack.
+        body["runtime"] = runtime_json(&runtime);
     } else {
         body["clients_count"] = serde_json::json!(state.seen.read().map(|g| g.len()).unwrap_or(0));
     }
 
-    let code = if db_ok {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (code, axum::Json(body)).into_response()
+    // Always 200, including `degraded`, and there is no state that changes
+    // that.
+    //
+    // A 503 is read by every monitor and every proxy as "dead, take it out of
+    // rotation". This daemon answers lexical search, `cuba_decreto` reads and
+    // the whole graph surface from caches that do not need PostgreSQL, and it
+    // serves `/health` itself — so the 503 it used to return for an
+    // unreachable database removed a daemon that was still working, and the
+    // operator lost the one endpoint that could have told them what was wrong.
+    //
+    // `starting` does not earn one either: taking the only instance out of
+    // rotation while it warms is the ECONNREFUSED this release just stopped
+    // causing, one layer higher. There is also no rotation to be taken out of
+    // — this is a single daemon on a LAN, not one of N behind a balancer.
+    //
+    // The honest non-200 would be "this process cannot answer", and that is
+    // not a response this function can produce. Whoever needs to decide reads
+    // `status`.
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
 
 #[cfg(test)]
@@ -1689,6 +2054,7 @@ mod tests {
             served: Arc::new(AtomicU64::new(0)),
             seen: Arc::new(std::sync::RwLock::new(seen)),
             last_activity: Arc::new(Mutex::new(Instant::now())),
+            resource_tier: crate::resources::Tier::Minimal.as_str(),
         }
     }
 

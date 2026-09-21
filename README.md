@@ -92,9 +92,13 @@ cuba-memorys serve 127.0.0.1:9000       # or pick the address
 }
 ```
 
-`GET /health` reports uptime, database reachability and the clients seen so far. `CUBA_HTTP_ADDR` overrides the address; `CUBA_HTTP_TOKEN` requires `Authorization: Bearer`, and is mandatory if you bind anything other than loopback — the daemon serves the entire graph with no authentication by default.
+`GET /health` reports uptime, database reachability and how many clients have been seen. `status` is three-valued — `ok`, `starting`, `degraded` — and the code is always 200: a 503 would take out of rotation a daemon that still serves lexical search and still serves the one endpoint that can explain what is wrong. Alert on `status`, not on the code.
 
-Models load in the background *after* the port opens, so a client that connects during startup waits on its first search instead of timing out the connection. Under stdio that timeout was how you ended up with abandoned multi-GB processes: the client gives up at 30 s but never closes stdin, so the server sat there holding every model it had loaded. Stdio now exits if no handshake arrives within `CUBA_HANDSHAKE_TIMEOUT_SECS` (60 s, `0` disables).
+With `CUBA_HTTP_TOKEN` in an `Authorization: Bearer` header the answer also carries `runtime`: `mode`, `resource_tier`, `{state, device, reason}` for the embedder, reranker and NLI, `gpu{build, degraded, placement}` and `llm{configured, backend, model, base_url}` — which is how you find out where the reranker is actually running without reading the source. Without the token none of that is served, and neither is `graph_db.last_error`, which can name an internal host and port. No key, no `DATABASE_URL` and no model path is ever printed, with or without a token.
+
+The token is mandatory if you bind anything other than loopback — the daemon serves the entire graph with no authentication by default — and on a routable address it must be at least 32 characters.
+
+The port opens first, then the models load, and only then does the daemon announce itself and start serving. Binding first keeps the cheap diagnosis — a second daemon on the same port fails immediately instead of spending two minutes loading before it finds out — and connections that arrive during the load queue in the kernel backlog, so a client waits and gets a real answer rather than a refused connection. If the load overruns `MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS` (180 s) the daemon serves anyway, `/health` says `starting`, and every search asking for reranking comes back marked degraded. Under stdio a client that gives up at 30 s without closing stdin used to leave an abandoned multi-GB process holding every model it had loaded; stdio now exits if no handshake arrives within `CUBA_HANDSHAKE_TIMEOUT_SECS` (60 s, `0` disables).
 </details>
 
 <details>

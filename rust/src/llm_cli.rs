@@ -360,6 +360,66 @@ fn clear_config() -> Result<()> {
     Ok(())
 }
 
+/// What the generative model is configured as, with nothing asked of it.
+///
+/// `doctor_line()` cannot be reused for this: it calls `probe_health().await`
+/// against the provider. `/health` is polled every few seconds by monitors
+/// asking about *this daemon*, and one that waits on a stopped Ollama reports
+/// the daemon as slow when the daemon is fine — the same class of lie this
+/// release is removing from `doctor`, pointing the other way.
+///
+/// Nothing here can carry a secret: `backend` is a compile-time string,
+/// `model` is the model name an operator typed, and `base_url` is redacted.
+///
+/// It also does not call `load_saved_config_into_env()`, and must not: that
+/// function calls `set_var`, whose own safety note says it is sound only on
+/// single-threaded startup before the workers exist. `main` runs it there, so
+/// by the time anything asks this the saved config is already in the
+/// environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmSummary {
+    pub configured: bool,
+    pub backend: Option<&'static str>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+}
+
+pub fn configured_summary() -> LlmSummary {
+    match resolve_offline_llm() {
+        Some(judge) => LlmSummary {
+            configured: true,
+            backend: Some(judge.backend_name()),
+            model: judge.model_name(),
+            base_url: redacted_base_url(),
+        },
+        None => LlmSummary {
+            configured: false,
+            backend: None,
+            model: None,
+            base_url: None,
+        },
+    }
+}
+
+/// The provider URL with the credentials out — the ones `redact_url` knows
+/// about and the ones it does not.
+///
+/// `redact_url` strips `user:pass@`, which is where a DATABASE_URL hides a
+/// secret. A chat provider URL is typed by an operator and several vendors
+/// document the API key as a query parameter, so everything after `?` goes
+/// too. What is left — scheme, host, port, path — is the part that answers
+/// "which Ollama is this talking to", which is the question that sent an
+/// operator to read the source in the first place.
+fn redacted_base_url() -> Option<String> {
+    let raw = crate::envs::alias("MEMORY_INDUSTRY_LLM_BASE_URL", "CUBA_LLM_BASE_URL").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let without_query = raw.split_once('?').map_or(raw, |(head, _)| head);
+    Some(crate::doctor::redact_url(without_query))
+}
+
 /// One-line summary for `doctor`.
 /// What `doctor` should say about the generative LLM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
