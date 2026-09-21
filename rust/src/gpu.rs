@@ -122,7 +122,12 @@ fn gpu_availability() -> (bool, bool) {
 
 #[cfg(not(any(feature = "cuda", feature = "directml")))]
 fn gpu_availability() -> (bool, bool) {
-    (false, false)
+    // No provider library this build could load, whatever is on disk — so the
+    // first half is false by construction, not by measurement. The card is
+    // measured: a machine with a GPU running a CPU binary is the one thing
+    // worth saying from here, and `status()` used to probe it separately
+    // inside a `cfg` arm of its own.
+    (false, nvidia_driver_present())
 }
 
 /// Takes a factory rather than a builder: when the GPU provider refuses to
@@ -258,49 +263,40 @@ pub fn placement_summary() -> String {
         .join(" ")
 }
 
-pub fn status() -> GpuStatus {
-    #[cfg(any(feature = "cuda", feature = "directml"))]
-    {
-        let provider = if cfg!(feature = "cuda") {
-            "cuda"
-        } else {
-            "directml"
-        };
-        let runtime_gpu = runtime_has_gpu_provider(provider);
-        let gpu_device = provider != "cuda" || nvidia_present();
-
-        if runtime_gpu && gpu_device {
-            return GpuStatus {
-                degraded: false,
-                detail: format!(
-                    "{provider} — runtime GPU y GPU detectados · colocación: {}",
-                    placement_summary()
-                ),
-                hint: None,
-            };
-        }
-        if !runtime_gpu {
-            return GpuStatus {
-                degraded: true,
-                detail: format!(
-                    "compilado con {provider}, pero el runtime instalado es el de CPU → corriendo en CPU"
-                ),
-                hint: Some("cuba-memorys models runtime --gpu".to_string()),
-            };
-        }
-        GpuStatus {
-            degraded: true,
-            detail: format!(
-                "compilado con {provider}, pero no detecté GPU NVIDIA → corriendo en CPU"
-            ),
-            hint: Some(
-                "revisá el driver (nvidia-smi); sin GPU, esta build igual corre en CPU".to_string(),
-            ),
-        }
+/// The GPU provider this binary was built against, if any.
+///
+/// The only feature flag read on the placement path. Everything downstream
+/// takes it as a value, which is what lets the CI box — no card, and never
+/// will have one — execute the branches a CUDA build takes.
+fn compiled_provider() -> Option<&'static str> {
+    if cfg!(feature = "cuda") {
+        Some("cuda")
+    } else if cfg!(feature = "directml") {
+        Some("directml")
+    } else {
+        None
     }
-    #[cfg(all(not(feature = "cuda"), not(feature = "directml")))]
-    {
-        if nvidia_driver_present() {
+}
+
+/// What to tell the operator, given what the build is and what the machine has.
+///
+/// Split from `status()` so the *judgement* can be read anywhere: the failure
+/// this whole path exists for was never a kernel landing on the wrong device,
+/// it was a machine being told the wrong reason and the operator fixing the
+/// wrong thing. `compiled` carries the provider name rather than a bare flag
+/// because the name is in four of the six messages, and taking it as a value
+/// is what keeps `cfg!` out of here entirely.
+///
+/// The one thing it reads beyond its arguments is `placement_summary()`, on
+/// the single row where nothing is missing.
+pub fn status_from(compiled: Option<&str>, runtime_gpu: bool, device_present: bool) -> GpuStatus {
+    let Some(provider) = compiled else {
+        // `runtime_gpu` is deliberately unread here. A build with no GPU
+        // feature never looks for the provider libraries — the `cfg(not(..))`
+        // arm of `gpu_availability` reports them absent without checking — so
+        // `true` on this branch describes a machine this binary cannot
+        // observe, and a sentence about it would be a claim nothing measured.
+        if device_present {
             return GpuStatus {
                 degraded: true,
                 detail: "hay una GPU NVIDIA en esta máquina pero el binario se compiló sin \
@@ -309,12 +305,59 @@ pub fn status() -> GpuStatus {
                 hint: Some("./scripts/build-gpu.sh".to_string()),
             };
         }
-        GpuStatus {
+        return GpuStatus {
             degraded: false,
             detail: "cpu (compilado sin soporte GPU)".to_string(),
             hint: None,
-        }
+        };
+    };
+
+    match (runtime_gpu, device_present) {
+        (true, true) => GpuStatus {
+            degraded: false,
+            detail: format!(
+                "{provider} — runtime GPU y GPU detectados · colocación: {}",
+                placement_summary()
+            ),
+            hint: None,
+        },
+        (false, true) => GpuStatus {
+            degraded: true,
+            detail: format!(
+                "compilado con {provider}, pero el runtime instalado es el de CPU → corriendo en CPU"
+            ),
+            hint: Some("memory-industry models runtime --gpu".to_string()),
+        },
+        (true, false) => GpuStatus {
+            degraded: true,
+            detail: format!(
+                "compilado con {provider}, pero no detecté GPU NVIDIA → corriendo en CPU"
+            ),
+            hint: Some(
+                "revisá el driver (nvidia-smi); sin GPU, esta build igual corre en CPU".to_string(),
+            ),
+        },
+        // Missing both used to read exactly like missing the runtime alone:
+        // the operator downloaded a GPU runtime and only then found out there
+        // was no card to use it with. Two causes, one sentence, two trips.
+        (false, false) => GpuStatus {
+            degraded: true,
+            detail: format!(
+                "compilado con {provider}, pero no hay runtime GPU instalado ni GPU NVIDIA visible → corriendo en CPU"
+            ),
+            hint: Some(
+                "faltan las dos cosas: el runtime GPU (`memory-industry models runtime --gpu`) \
+                 y una tarjeta que nvidia-smi vea. Instalar solo el runtime no cambia nada en \
+                 esta máquina"
+                    .to_string(),
+            ),
+        },
     }
+}
+
+pub fn status() -> GpuStatus {
+    let (runtime_gpu, device_present) = gpu_availability();
+    status_from(compiled_provider(), runtime_gpu, device_present)
 }
 
 pub fn active_provider() -> String {
@@ -331,6 +374,9 @@ fn runtime_dir() -> Option<PathBuf> {
         .ok()?;
     let cache = PathBuf::from(home).join(".cache");
     let preferred = cache.join("memory-industry").join("onnxruntime");
+    // A directory that exists on operators' disks, not the binary's name: a
+    // rename sweep that greps for the old name has to leave this one alone or
+    // every runtime already downloaded is orphaned.
     let legacy = cache.join("cuba-memorys").join("onnxruntime");
     Some(if preferred.exists() || !legacy.exists() {
         preferred
@@ -394,6 +440,160 @@ fn nvidia_present() -> bool {
 #[cfg(test)]
 mod placement_tests {
     use super::*;
+    use crate::envs::ScopedEnv;
+
+    /// Whether this binary can place anything on a card at all.
+    ///
+    /// `wants_gpu` short-circuits on this before reading a single variable, so
+    /// the table below runs in two regimes: on a build without a GPU feature
+    /// it proves that the short circuit is there — delete it and every `gpu`
+    /// row turns red — and under `--features cuda` the same rows prove the
+    /// parsing. A green run on the CI box does *not* mean the parsing was
+    /// exercised, which is the whole reason this constant is named instead of
+    /// written inline.
+    const GPU_COMPILED: bool = cfg!(any(feature = "cuda", feature = "directml"));
+
+    /// Every device variable the crate reads, cleared before each row so a row
+    /// only ever says what it sets. `MEMORY_INDUSTRY_EMBED_DEVICE` is in the
+    /// list although nothing reads it: the last row asserts exactly that, and
+    /// it cannot assert it while the machine running the suite might have the
+    /// variable set.
+    const DEVICE_VARS: [&str; 5] = [
+        "MEMORY_INDUSTRY_RERANK_DEVICE",
+        "CUBA_RERANK_DEVICE",
+        "MEMORY_INDUSTRY_EMBED_DEVICE",
+        "CUBA_EMBED_DEVICE",
+        "CUBA_NLI_DEVICE",
+    ];
+
+    #[tokio::test]
+    async fn the_device_variable_decides_and_a_typo_falls_back_to_the_model_default() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        // (workload, what the environment says, wanted on a GPU build, why).
+        // Two fixed slots rather than a slice so every row has one type and the
+        // table needs no annotation to hold together.
+        let table = [
+            (
+                Workload::Reranker,
+                [None, None],
+                true,
+                "unset means the model's own default, and the reranker's is the card. Every                  installation in the field that never touched the variable expects that",
+            ),
+            (
+                Workload::Embedder,
+                [None, None],
+                false,
+                "the embedder's default is the CPU. One default shared by every model would                  put three sessions on one card and make the arena ceiling meaningless",
+            ),
+            (
+                Workload::Nli,
+                [None, None],
+                false,
+                "and NLI is the same: it runs once per candidate pair, not once per search",
+            ),
+            (
+                Workload::Reranker,
+                [Some(("CUBA_RERANK_DEVICE", "cpu")), None],
+                false,
+                "an explicit cpu has to beat the model default, or an operator cannot turn the                  card off after a bad night. It is also the row that catches a build that                  stopped reading the legacy name, or that read the reranker out of another                  model's variable",
+            ),
+            (
+                Workload::Reranker,
+                [Some(("CUBA_RERANK_DEVICE", "  CPU  ")), None],
+                false,
+                "an env file edited by hand carries the spaces and the capitals that were                  typed. On the reranker on purpose: its default is the card, so losing the                  trim or the lowercasing flips the answer instead of landing back on it",
+            ),
+            (
+                Workload::Embedder,
+                [Some(("CUBA_EMBED_DEVICE", "gpu")), None],
+                true,
+                "`gpu` on a model whose default is the CPU. The same row on the reranker                  would still pass with the word deleted from the match, because the fallback                  agrees with it",
+            ),
+            (
+                Workload::Embedder,
+                [Some(("CUBA_EMBED_DEVICE", "cuda")), None],
+                true,
+                "an operator who writes the provider name instead of `gpu` means the same thing",
+            ),
+            (
+                Workload::Embedder,
+                [Some(("CUBA_EMBED_DEVICE", "directml")), None],
+                true,
+                "and so does the Windows one, whichever provider this build carries",
+            ),
+            (
+                Workload::Nli,
+                [Some(("CUBA_NLI_DEVICE", "gpu")), None],
+                true,
+                "NLI answers to its own variable. Without this row the three placements could                  be read out of one shared name and nothing here would notice",
+            ),
+            (
+                Workload::Reranker,
+                [Some(("CUBA_RERANK_DEVICE", "gpuu")), None],
+                true,
+                "a value nobody recognises falls back to the model default — the card, here.                  Today the only trace of that decision is a warn! nothing reads, which is why                  nobody could say which way it fell",
+            ),
+            (
+                Workload::Embedder,
+                [Some(("CUBA_EMBED_DEVICE", "gpuu")), None],
+                false,
+                "the same typo on a model whose default is the CPU. With the row above it                  pins the fallback to the model rather than to a constant: a constant has to                  disagree with one of the two",
+            ),
+            (
+                Workload::Reranker,
+                [
+                    Some(("MEMORY_INDUSTRY_RERANK_DEVICE", "gpu")),
+                    Some(("CUBA_RERANK_DEVICE", "cpu")),
+                ],
+                true,
+                "the documented name beats the legacy line an operator forgot to delete from                  the unit file",
+            ),
+            (
+                Workload::Reranker,
+                [
+                    Some(("MEMORY_INDUSTRY_RERANK_DEVICE", "cpu")),
+                    Some(("CUBA_RERANK_DEVICE", "gpu")),
+                ],
+                false,
+                "and the other way round, or the precedence would only be pinned in the                  direction that happens to agree with the model default",
+            ),
+            (
+                Workload::Embedder,
+                [Some(("MEMORY_INDUSTRY_EMBED_DEVICE", "gpu")), None],
+                false,
+                "only the reranker was promoted to the new namespace, so this variable is                  read by nobody. Pinned because it looks like it should work: promoting the                  other two has to be an edit here, not a surprise in the field",
+            ),
+        ];
+
+        assert!(
+            table.iter().any(|(_, _, wanted, _)| *wanted)
+                && table.iter().any(|(_, _, wanted, _)| !*wanted),
+            "the table has to carry both answers. With every row expecting the same one, a \
+             build where GPU_COMPILED is false would be comparing a constant against itself \
+             and calling it a table"
+        );
+
+        for (workload, environment, wanted_on_a_gpu_build, why) in table {
+            let _cleared: Vec<ScopedEnv> = DEVICE_VARS
+                .iter()
+                .copied()
+                .map(ScopedEnv::cleared)
+                .collect();
+            let _set: Vec<ScopedEnv> = environment
+                .iter()
+                .flatten()
+                .map(|(name, value)| ScopedEnv::set(name, value))
+                .collect();
+
+            assert_eq!(
+                wants_gpu(workload),
+                GPU_COMPILED && wanted_on_a_gpu_build,
+                "{} with {environment:?}: {why}",
+                workload.label()
+            );
+        }
+    }
 
     /// Every combination, so the next person to touch this cannot quietly turn
     /// a machine with no card into a hard error. Pure: it runs on the CI box.

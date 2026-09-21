@@ -393,6 +393,7 @@ fn every_test_that_moves_a_process_wide_variable_serialises() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut offenders = Vec::new();
     let mut checked = 0;
+    let mut reached_without_the_cuba_prefix = 0;
 
     for entry in std::fs::read_dir(&dir)
         .expect("tests/ is readable")
@@ -402,17 +403,53 @@ fn every_test_that_moves_a_process_wide_variable_serialises() {
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
+        // The one file the scan cannot judge is the one it lives in: every
+        // marker below appears here as a string literal, so scanning itself
+        // would credit it for guards it never takes. Its single environment
+        // test is `model_tag_follows_the_environment`, and it takes
+        // `own_the_environment()` on its first line.
+        if path.ends_with("smoke_test.rs") {
+            continue;
+        }
         let body = std::fs::read_to_string(&path).expect("readable");
-        if !body.contains("std::env::set_var(\"CUBA_") {
+        // Any write to the process environment, whatever the variable is
+        // called. Matching `set_var("CUBA_` left two holes at once. The prefix:
+        // this release added the MEMORY_INDUSTRY_* namespace, so a file that
+        // only writes the new spelling was invisible here — v040_write_ahead.rs
+        // sets MEMORY_INDUSTRY_GRAPH_DB from three tests and this scan has
+        // never once looked at it. And the shape: reading the name out of the
+        // call means a file that sets the variable through a helper escapes,
+        // because the name is no longer on the same line as the call. Both
+        // holes are the same mistake — asking what is being set instead of
+        // whether anything is.
+        if !body.contains("env::set_var(") && !body.contains("env::remove_var(") {
             continue;
         }
         checked += 1;
+        if !body.contains("std::env::set_var(\"CUBA_") {
+            reached_without_the_cuba_prefix += 1;
+        }
         let tests = body.matches("#[tokio::test]").count() + body.matches("#[test]").count();
-        let taken = body.matches("pg_advisory_xact_lock").count()
-            + body.matches("ENV_GUARD.lock()").count()
-            + body.matches("own_the_environment()").count()
-            + body.matches("own_the_sync_dir(").count()
-            + body.matches("own_the_process(").count();
+        // Declarations do not count either, for the same reason the markers are
+        // takings: a file that defines `own_the_sync_dir` and never calls it
+        // used to score one and walk out.
+        let taken: usize = body
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                !line.starts_with("fn ")
+                    && !line.starts_with("async fn ")
+                    && !line.starts_with("pub fn ")
+                    && !line.starts_with("pub async fn ")
+            })
+            .map(|line| {
+                line.matches("pg_advisory_xact_lock").count()
+                    + line.matches("ENV_GUARD.lock()").count()
+                    + line.matches("own_the_environment(").count()
+                    + line.matches("own_the_sync_dir(").count()
+                    + line.matches("own_the_process(").count()
+            })
+            .sum();
         if tests > 1 && taken == 0 {
             offenders.push(
                 path.file_name()
@@ -424,9 +461,21 @@ fn every_test_that_moves_a_process_wide_variable_serialises() {
     }
 
     assert!(
-        checked >= 8,
-        "the scan found only {checked} file(s) that move CUBA_SYNC_DIR, and there are more than \
-         that. A green result from a scan that found almost nothing proves nothing"
+        checked >= 30,
+        "the scan is in scope for only {checked} test file(s) that write to the process \
+         environment, and there are more than that. A green result from a scan that found \
+         almost nothing proves nothing. The floor was 8 while the real number was 35, which is \
+         twenty-seven files of coverage this could have lost without a word — and losing \
+         coverage silently is exactly what it turned out to be doing. Measured 2026-09-21: 36"
+    );
+    assert!(
+        reached_without_the_cuba_prefix >= 1,
+        "all {checked} file(s) in scope write a `CUBA_` name inline, which is precisely what \
+         this scan saw back when it matched `set_var(\"CUBA_` and nothing else. If no file \
+         arrives by another route, the widening is decoration and the MEMORY_INDUSTRY_* \
+         namespace is unwatched again without anyone editing a line. Two arrive that way \
+         today: one writes only MEMORY_INDUSTRY_GRAPH_DB, the other sets its variables \
+         through a helper"
     );
     assert!(
         offenders.is_empty(),
@@ -444,6 +493,11 @@ fn every_test_that_moves_a_process_wide_variable_serialises() {
          exactly what happened — they passed locally under that flag and went red in the gate, \
          which does not pass it.\n\nOne test per file is exempt and that is not a loophole: \
          cargo gives every tests/*.rs its own process, so a lone test cannot collide with \
-         itself. The moment a second one lands in the same file they share the variable"
+         itself. The moment a second one lands in the same file they share the variable.\
+         \n\nThis scan got wider on 2026-09-21: it no longer asks for the `CUBA_` prefix, nor \
+         for the variable name to sit inside the call. A file that only writes \
+         MEMORY_INDUSTRY_* names, or that writes through a helper, is judged here for the \
+         first time — so a name appearing today is not new code, it is code this check was \
+         never able to see"
     );
 }

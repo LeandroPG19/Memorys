@@ -35,10 +35,61 @@ async fn cleanup(pool: &sqlx::PgPool, entity: &str) {
         .await;
 }
 
+const GRAPH_DB: &str = "MEMORY_INDUSTRY_GRAPH_DB";
+
+static ENV_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Forces the graph backend off for one test and puts the variable back the way
+/// it was found — panic or not.
+///
+/// Writing it is not belt-and-braces, even though `graph_db::backend()` already
+/// answers `Off` for a name that is not set: an operator with
+/// MEMORY_INDUSTRY_GRAPH_DB=falkor exported in their shell would send these
+/// three down the graph path, and what they measure is the SQL write landing
+/// before `add` returns. The preferred spelling alone is enough — `backend()`
+/// reads CUBA_GRAPH_DB only when this one is absent.
+///
+/// All three used to write it inline, with no guard and no restore. That was
+/// green for one reason: all three happened to write the same value. Luck, not
+/// design — and `set_var` is unsound against any thread reading the
+/// environment, not only against another thread writing it.
+struct GraphDbOff {
+    previous: Option<std::ffi::OsString>,
+    _serialised: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// A tokio mutex rather than a `std` one because the guard is held across every
+/// `.await` in the body, which is what serialising these three means: the
+/// variable has to stay `off` for as long as a handler might read it, not just
+/// while it is being written.
+async fn own_the_environment() -> GraphDbOff {
+    let serialised = ENV_GUARD.lock().await;
+    let previous = std::env::var_os(GRAPH_DB);
+    unsafe { std::env::set_var(GRAPH_DB, "off") };
+    GraphDbOff {
+        previous,
+        _serialised: serialised,
+    }
+}
+
+impl Drop for GraphDbOff {
+    fn drop(&mut self) {
+        // Absent is not the same as empty. `backend()` falls back to
+        // CUBA_GRAPH_DB only while this name is unset, so putting an empty
+        // string back would shadow the legacy spelling for whatever runs next.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(GRAPH_DB, value),
+                None => std::env::remove_var(GRAPH_DB),
+            }
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn add_returns_only_after_embedding_is_written_or_explicitly_pending() {
-    unsafe { std::env::set_var("MEMORY_INDUSTRY_GRAPH_DB", "off") };
+    let _graph_db = own_the_environment().await;
     let pool = pool().await;
     let entity = unique_name("write_through");
     let content = format!("write-through probe {entity}: puerto 5488 es el SoT de Postgres");
@@ -98,7 +149,7 @@ async fn add_returns_only_after_embedding_is_written_or_explicitly_pending() {
 #[tokio::test]
 #[ignore]
 async fn batch_add_of_long_text_writes_chunks_before_return() {
-    unsafe { std::env::set_var("MEMORY_INDUSTRY_GRAPH_DB", "off") };
+    let _graph_db = own_the_environment().await;
     let pool = pool().await;
     let entity = unique_name("batch_chunk");
     let content = format!(
@@ -159,7 +210,7 @@ async fn batch_add_of_long_text_writes_chunks_before_return() {
 #[tokio::test]
 #[ignore]
 async fn contexto_recall_includes_entity_from_this_session_write() {
-    unsafe { std::env::set_var("MEMORY_INDUSTRY_GRAPH_DB", "off") };
+    let _graph_db = own_the_environment().await;
     let pool = pool().await;
     let entity = unique_name("session_prefetch");
     let sid = Uuid::new_v4();

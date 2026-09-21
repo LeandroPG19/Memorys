@@ -115,9 +115,12 @@ const MODEL_OR_CLI_ONLY_REASONS: [(&str, &str); 7] = [
     ),
     (
         "v017_rerank_gpu",
-        "hard-asserts a reranker model on disk and runs --release (387s in debug); the \
-         runner has no reranker model. Locally: require_present \"reranker tests\" against \
-         $CUBA_RERANKER_PATH/model.onnx",
+        "two halves and the runner can do neither: the ignored tests hard-assert a reranker \
+         model on disk, and the rest run --release --features cuda (387s in debug) on a \
+         runner that has no model and no CUDA. Locally both halves run: an unguarded \
+         --release --features cuda call for the placement contracts, which need nothing on \
+         disk, and require_present \"reranker tests\" against $CUBA_RERANKER_PATH/model.onnx \
+         for the two that load the model",
     ),
     (
         "nli_entailment",

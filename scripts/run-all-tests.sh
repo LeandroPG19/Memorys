@@ -462,6 +462,40 @@ echo "=== release build (same feature set production runs) ==="
 # `cfg!(feature = "cuda")`, flipped them to the CPU answer and passed without
 # entering a single CUDA branch. Matching the two steps also stops the gate
 # linking release twice (3m06s + 3m03s, last measured run).
+# `-- --ignored` selects ONLY the ignored tests, so the four plain #[test]s in
+# that same file — the ones that say what decides the reranker's fixed batch
+# shape — still went out with the debug `cargo test` far above, without the
+# feature. There gpu::wants_gpu() returns false on the cfg! check before it ever
+# reads the device variable, so every assertion that names a device is true and
+# unable to fail. ba0bf97 made them COMPILE with cuda; this call is what makes
+# them run under it. Same feature set as build-gpu.sh, so nothing rebuilds.
+#
+# Not `--include-ignored` on the call below, which would look cheaper: that puts
+# is_configured_reports_whether_a_model_is_on_disk_without_loading_it, which
+# points CUBA_RERANKER_PATH at a directory with no model in it, in the same
+# process as the two tests that load the real one.
+#
+# Outside require_present on purpose: these four need nothing on disk, and a
+# machine with no reranker installed must still hear whether its placement
+# contracts hold. The model-bound ones stay behind the guard, where a missing
+# model is a FAIL and never a skip.
+echo "=== reranker placement contracts (GPU feature live, no model needed) ==="
+cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
+
+# The library half of the same hole. The cfg! that actually decides placement is
+# in gpu::wants_gpu, which returns false before reading the device variable when
+# no GPU feature is compiled in, and the table that judges it is
+# gpu::placement_tests — five tests that both `cargo test` calls above compile
+# without the feature, so the device knob is inert there and half of that table
+# is false == false for the same reason v017_rerank_gpu was.
+#
+# Release and not debug, for cost: build-gpu.sh above already built this
+# dependency graph with cuda, so the only thing compiled here is the lib test
+# unit itself. In debug it would be a third feature set (debug bare, release
+# cuda, debug cuda) and a full rebuild of everything under it.
+echo "=== placement table under the feature that changes it ==="
+cargo test --release --features cuda --lib gpu:: -- --nocapture
+
 require_present "reranker tests (release: 387s in debug, seconds here)" \
   "$CUBA_RERANKER_PATH/model.onnx" \
   cargo test --release --features cuda --test v017_rerank_gpu -- --ignored --nocapture
