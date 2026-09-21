@@ -199,6 +199,26 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     three lines of set_if_absent.
           #   failure_reason    reads a OnceLock that --lib cannot populate
           #                     without loading 1.1 GB of model. reason_of, the
+          #
+          # A second group, all of the same two shapes. Nothing here is
+          # unexamined: the half of each that decides something was pulled out
+          # and given a table where the mutation can reach it.
+          #
+          #   Needs a live ONNX session or a model on disk, which --lib has
+          #   neither of: warm_up, score_off_runtime, score_one_chunk,
+          #   score_pairs, nli::init, init_onnx_session. Their decisions live
+          #   in needs_padding, ranked, budget_from and the deadline tests.
+          #
+          #   A one-line environment lookup whose pure half is tested:
+          #   warm_reranker_eagerly -> warm_eagerly_from,
+          #   judge_is_sampling -> judge_is_sampling_from.
+          #
+          #   mcp_endpoint is an axum handler, the same class as the
+          #   src/handlers/* already skipped above. Everything it decides now
+          #   lives in origin_allowed_with, auth_brake, next_failure,
+          #   brake_for, record_auth_failure, clear_auth_failures,
+          #   refuse_foreign_origin and note_activity, and every one of those
+          #   has its own test.
           #                     half that decides, has a table.
           diff_file="$(mktemp)"
           # Same base as the file list above, or the two halves of this judge
@@ -216,7 +236,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
             in_diff=(--in-diff "$diff_file")
           fi
           (cd rust && cargo mutants "${files[@]}" "${in_diff[@]}" \
-            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason' \
+            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling|rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session' \
             --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || fail=1
           rm -f "$diff_file"
         fi

@@ -61,7 +61,10 @@ cargo mutants \
   --file 'src/search/mmr.rs' \
   --file 'src/search/rrf.rs' \
   --file 'src/search/cache.rs' \
-  --timeout 90 \
+  # 180, not 90. The per-mutant budget was tuned when this ran two at a time;
+  # at six a slow test reported TIMEOUT instead of the CAUGHT it actually was,
+  # and a timeout counts against the kill rate as though the mutant had lived.
+  --timeout 180 \
   --jobs "$MUTANTS_JOBS" \
   --output "$OUT_DIR" \
   -- --lib search::

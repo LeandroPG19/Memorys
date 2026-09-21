@@ -1282,11 +1282,11 @@ mod tests {
     use super::*;
 
     /// Every test in this module speaks for something on this machine.
-    fn local_peer() -> SocketAddr {
+    pub(super) fn local_peer() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 55555))
     }
 
-    fn headers_with(name: &'static str, value: &str) -> HeaderMap {
+    pub(super) fn headers_with(name: &'static str, value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(name, value.parse().unwrap());
         h
@@ -1658,7 +1658,7 @@ mod tests {
         );
     }
 
-    fn state_with_clients(token: Option<&str>, clients: &[&str]) -> AppState {
+    pub(super) fn state_with_clients(token: Option<&str>, clients: &[&str]) -> AppState {
         let seen = std::collections::HashMap::from_iter(
             clients.iter().map(|c| ((*c).to_string(), Instant::now())),
         );
@@ -1730,6 +1730,7 @@ mod tests {
 
 #[cfg(test)]
 mod lan_exposure_tests {
+    use super::tests::{headers_with, local_peer, state_with_clients};
     use super::*;
 
     #[test]
@@ -2069,6 +2070,87 @@ mod lan_exposure_tests {
         assert!(
             origin_allowed_with(Some(""), 8787, ""),
             "a blank Origin header is treated as absent, like every non-browser client"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_brake_counts_failures_and_a_good_token_clears_them() {
+        let state = state_with_clients(Some("tok"), &[]);
+        let who = local_peer().ip();
+
+        assert_eq!(
+            brake_for(&state, who),
+            None,
+            "an address nobody has heard of waits for nothing"
+        );
+
+        for _ in 0..MAX_AUTH_FAILURES {
+            record_auth_failure(&state, who);
+        }
+        let wait = brake_for(&state, who)
+            .expect("ten wrong tokens inside the window has to cost this address something");
+        assert!(
+            wait <= AUTH_FAILURE_WINDOW && !wait.is_zero(),
+            "the wait is what is left of the window, not zero and not more than all of it: {wait:?}"
+        );
+
+        clear_auth_failures(&state, who);
+        assert_eq!(
+            brake_for(&state, who),
+            None,
+            "a correct token clears the address. Without this an editor that reconnects after one bad config would stay throttled with nothing it could do about it."
+        );
+    }
+
+    #[test]
+    fn a_window_that_has_already_expired_starts_over() {
+        let stale = Instant::now()
+            .checked_sub(AUTH_FAILURE_WINDOW + std::time::Duration::from_secs(1))
+            .expect("the process started after the window length");
+
+        let (count, since) = next_failure(Some((9, stale)));
+        assert_eq!(
+            count, 1,
+            "the old window is spent, so this is the first failure of a new one. Carrying the count forward would let a bad afternoon a week ago decide today."
+        );
+        assert!(
+            since > stale,
+            "and the new window starts now, or the address would be judged against a clock that already ran out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_from_elsewhere_is_refused_and_a_client_with_no_origin_is_not() {
+        let state = state_with_clients(None, &[]);
+
+        assert!(
+            refuse_foreign_origin(&state, &HeaderMap::new()).is_none(),
+            "no Origin at all is every MCP client there is, and none of them is a browser"
+        );
+        assert!(
+            refuse_foreign_origin(&state, &headers_with("origin", "https://evil.example"))
+                .is_some(),
+            "this is the DNS-rebinding case: on loopback with no token, which is the documented default, any page the operator opens can reach the daemon"
+        );
+        assert!(
+            refuse_foreign_origin(&state, &headers_with("origin", "http://127.0.0.1:8787"))
+                .is_none(),
+            "the daemon own page has to keep working"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_is_remembered_for_the_reaper_and_for_health() {
+        let state = state_with_clients(None, &[]);
+        assert_eq!(state.seen.read().map(|g| g.len()).unwrap_or(9), 0);
+
+        note_activity(&state, "cursor::chat-a");
+        assert!(
+            state
+                .seen
+                .read()
+                .is_ok_and(|g| g.contains_key("cursor::chat-a")),
+            "the idle reaper purges what it has not seen, and /health counts it. A client that never registers is reaped while it is working."
         );
     }
 }

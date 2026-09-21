@@ -468,6 +468,16 @@ fn score_pairs(
     Ok(scores)
 }
 
+/// Whether this batch has to be padded before the session will take it.
+///
+/// Only under a fixed shape, and only when the batch is short — the last one
+/// of a run. Padding a full batch would add a candidate nobody asked about;
+/// not padding a short one under a fixed shape is a shape mismatch the session
+/// rejects.
+fn needs_padding(fixed_shape: bool, len: usize, chunk_size: usize) -> bool {
+    fixed_shape && len != chunk_size
+}
+
 /// One batch, padded to the fixed shape when the session demands one.
 ///
 /// Under `fixed_shape` every batch has to be the same size, so a short last
@@ -480,7 +490,7 @@ fn score_one_chunk(
     texts: &[String],
     chunk_size: usize,
 ) -> Result<Vec<f64>> {
-    if !fixed_shape() || texts.len() == chunk_size {
+    if !needs_padding(fixed_shape(), texts.len(), chunk_size) {
         return score_chunk(session, tokenizer, query, texts);
     }
     let mut padded = texts.to_vec();
@@ -874,6 +884,43 @@ mod tests {
         assert!(
             loop_start < check && check < first_work,
             "the deadline has to be consulted inside the loop and before the inference, or the check only runs once the work it was meant to stop is already done"
+        );
+    }
+
+    #[test]
+    fn only_a_short_batch_under_a_fixed_shape_is_padded() {
+        assert!(
+            needs_padding(true, 3, 16),
+            "the last batch of a run is short, and a fixed-shape session rejects the mismatch"
+        );
+        assert!(
+            !needs_padding(true, 16, 16),
+            "a full batch is already the right shape; padding it would add a candidate nobody asked about and then drop its score"
+        );
+        assert!(
+            !needs_padding(false, 3, 16),
+            "without a fixed shape a short batch is fine as it is, and padding it would be 13 forward passes of empty string per run"
+        );
+        assert!(!needs_padding(false, 16, 16));
+    }
+
+    #[test]
+    fn ranking_is_best_first_and_keeps_every_candidate() {
+        let out = ranked(vec![0.2, 0.9, 0.5]);
+        assert_eq!(
+            out,
+            vec![(1, 0.9), (2, 0.5), (0, 0.2)],
+            "the caller reads position 0 as the best answer, and the index has to survive the sort or the scores end up on the wrong documents"
+        );
+
+        assert_eq!(ranked(Vec::new()), Vec::new(), "no scores in, no pairs out");
+        assert_eq!(ranked(vec![0.4]), vec![(0, 0.4)]);
+
+        let with_nan = ranked(vec![0.1, f64::NAN, 0.9]);
+        assert_eq!(
+            with_nan.len(),
+            3,
+            "a NaN score means the model already failed; losing the other candidates over it would turn a bad ranking into no answer at all"
         );
     }
 }
