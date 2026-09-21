@@ -945,9 +945,19 @@ fn refuse_foreign_origin(state: &AppState, headers: &HeaderMap) -> Option<Respon
 /// afternoon must not follow an address for the life of the daemon.
 fn next_failure(entry: Option<(u32, Instant)>) -> (u32, Instant) {
     match entry {
-        Some((failures, since)) if since.elapsed() < AUTH_FAILURE_WINDOW => (failures + 1, since),
+        Some((failures, since)) if window_still_open(since.elapsed()) => (failures + 1, since),
         _ => (1, Instant::now()),
     }
+}
+
+/// Whether a window that started this long ago still counts.
+///
+/// Its own function because the boundary is the whole question and real clocks
+/// cannot be asked about it: an `Instant` built exactly one window ago is
+/// already older than one by the time it is read, so `<` and `<=` are
+/// indistinguishable through `next_failure`.
+fn window_still_open(elapsed: std::time::Duration) -> bool {
+    elapsed < AUTH_FAILURE_WINDOW
 }
 
 fn brake_for(state: &AppState, who: std::net::IpAddr) -> Option<std::time::Duration> {
@@ -2152,5 +2162,21 @@ mod lan_exposure_tests {
                 .is_ok_and(|g| g.contains_key("cursor::chat-a")),
             "the idle reaper purges what it has not seen, and /health counts it. A client that never registers is reaped while it is working."
         );
+    }
+
+    #[test]
+    fn the_window_closes_exactly_when_it_says_it_does() {
+        assert!(
+            window_still_open(AUTH_FAILURE_WINDOW - std::time::Duration::from_nanos(1)),
+            "a nanosecond before the end is still inside the window"
+        );
+        assert!(
+            !window_still_open(AUTH_FAILURE_WINDOW),
+            "a window that has run its full length is over. Accepting it would keep every count alive one tick longer than advertised, and an address serving its wait would never see it end."
+        );
+        assert!(!window_still_open(
+            AUTH_FAILURE_WINDOW + std::time::Duration::from_secs(1)
+        ));
+        assert!(window_still_open(std::time::Duration::ZERO));
     }
 }
