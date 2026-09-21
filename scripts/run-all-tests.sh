@@ -452,9 +452,19 @@ require_generative_llm "tests that need a generative LLM (extract / relation-sca
 echo "=== release build (same feature set production runs) ==="
 "$ROOT/scripts/build-gpu.sh"
 
+# --features cuda here too. The feature set is part of what cargo fingerprints,
+# so a second release call asking for a different one rebuilds this same target
+# directory and relinks the binary the E2E and the placement check below read.
+# It fires at COMPILE time, not at run time, which is what makes it invisible:
+# reproduced with `-- --list`, which executes no test at all, and doctor went
+# from `ok — cuda · reranker=gpu` to `warn — built without support`. The E2E
+# then drove a CPU binary, and this test, whose expectations are themselves
+# `cfg!(feature = "cuda")`, flipped them to the CPU answer and passed without
+# entering a single CUDA branch. Matching the two steps also stops the gate
+# linking release twice (3m06s + 3m03s, last measured run).
 require_present "reranker tests (release: 387s in debug, seconds here)" \
   "$CUBA_RERANKER_PATH/model.onnx" \
-  cargo test --release --test v017_rerank_gpu -- --ignored --nocapture
+  cargo test --release --features cuda --test v017_rerank_gpu -- --ignored --nocapture
 
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
 CUBA_BINARY_PATH="$(resolve_binary_path)"

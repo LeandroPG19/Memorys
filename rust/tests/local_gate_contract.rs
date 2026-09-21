@@ -690,3 +690,179 @@ fn every_path_the_gate_hands_to_another_process_is_absolute() {
          relative path"
     );
 }
+
+/// Every `cargo` call in a shell script, as the argument list that follows the
+/// word `cargo`.
+///
+/// Whole-line comments are dropped and backslash continuations joined before
+/// anything is read: the call this exists to judge is spread over three
+/// physical lines, and the paragraph directly above it names
+/// `cargo build --release` in prose, so a scan that looked at physical lines
+/// would both miss the call and invent one. Arguments stop at a bare `--`,
+/// because everything after it belongs to the test harness rather than to
+/// cargo, and at `&&`, `||`, `;` or `|`, because everything after those is a
+/// different command.
+fn cargo_invocations(script: &str) -> Vec<Vec<String>> {
+    let mut logical: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for line in script.lines() {
+        let trimmed = line.trim();
+        if pending.is_empty() && (trimmed.is_empty() || trimmed.starts_with('#')) {
+            continue;
+        }
+        if let Some(head) = trimmed.strip_suffix('\\') {
+            pending.push_str(head);
+            pending.push(' ');
+        } else {
+            pending.push_str(trimmed);
+            logical.push(std::mem::take(&mut pending));
+        }
+    }
+    if !pending.is_empty() {
+        logical.push(pending);
+    }
+
+    let mut calls: Vec<Vec<String>> = Vec::new();
+    for line in &logical {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            if tokens[i] != "cargo" {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            let mut args: Vec<String> = Vec::new();
+            while i < tokens.len() {
+                let token = tokens[i];
+                if matches!(token, "--" | "&&" | "||" | ";" | "|") {
+                    break;
+                }
+                args.push(token.to_string());
+                i += 1;
+            }
+            calls.push(args);
+        }
+    }
+    calls
+}
+
+/// The features a cargo call asks for, sorted so that two calls that ask for
+/// the same set compare equal whatever order they were typed in. Order does
+/// not change the fingerprint cargo computes, so it must not change the answer
+/// here either.
+fn features_asked_for(args: &[String]) -> Vec<String> {
+    let mut features: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let value = if let Some(rest) = args[i].strip_prefix("--features=") {
+            Some(rest)
+        } else if args[i] == "--features" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            for feature in value.split(',') {
+                let feature = feature.trim_matches('"');
+                if !feature.is_empty() {
+                    features.push(feature.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    features.sort();
+    features.dedup();
+    features
+}
+
+/// A release cargo call in the gate carries the features the release build
+/// used, or it silently replaces the binary every later step reads.
+///
+/// `scripts/build-gpu.sh` builds `--release --features cuda` and the E2E and
+/// the GPU placement check both run against what it leaves in
+/// `CARGO_TARGET_DIR`. Twelve lines under the comment that explains exactly
+/// this, the reranker step ran `cargo test --release` with no features at all,
+/// into that same directory: the feature set is part of what cargo
+/// fingerprints, so cargo saw a different build, rebuilt and relinked.
+///
+/// The effect lands while compiling, not while running, which is what made it
+/// invisible — it was reproduced with `-- --list`, which executes no test
+/// whatsoever, and `doctor` went from `ok — cuda · reranker=gpu` to
+/// `warn — built without support`. `v017_rerank_gpu` never noticed either: its
+/// own expectations are `cfg!(feature = "cuda")`, so they flipped to the CPU
+/// answer along with the build and it passed without entering a CUDA branch.
+///
+/// So each call is extracted and judged on its own, against the feature set
+/// build-gpu.sh actually uses rather than against a word hardcoded here. A
+/// `contains("--features cuda")` check would have passed on the string sitting
+/// in that very comment.
+#[test]
+fn a_release_cargo_call_in_the_gate_carries_the_features_the_release_build_used() {
+    let build = read("scripts/build-gpu.sh");
+    let built: Vec<Vec<String>> = cargo_invocations(&build)
+        .into_iter()
+        .filter(|args| args.iter().any(|arg| arg == "--release"))
+        .collect();
+    assert!(
+        !built.is_empty(),
+        "no --release cargo call found in scripts/build-gpu.sh, so there is no feature set \
+         to hold the rest of the gate to and every assertion below would be vacuous. Either \
+         the release build moved elsewhere or this extraction stopped matching the script"
+    );
+
+    let mut expected: Vec<String> = Vec::new();
+    for args in &built {
+        let features = features_asked_for(args);
+        assert!(
+            !features.is_empty(),
+            "scripts/build-gpu.sh builds release with no features: `cargo {}`. Without \
+             --features cuda gpu::wants_gpu() returns false unconditionally and the \
+             reranker runs on CPU at 58x the cost — that is the whole reason this script \
+             exists instead of a line in the README",
+            args.join(" ")
+        );
+        if expected.is_empty() {
+            expected = features;
+        } else {
+            assert_eq!(
+                expected, features,
+                "scripts/build-gpu.sh has one release branch under systemd-run and one \
+                 without, and they ask for different feature sets. Which binary the gate \
+                 gets would then depend on whether systemd is on the machine"
+            );
+        }
+    }
+
+    let suite = read("scripts/run-all-tests.sh");
+    let calls = cargo_invocations(&suite);
+    let total = calls.len();
+    let release: Vec<Vec<String>> = calls
+        .into_iter()
+        .filter(|args| args.iter().any(|arg| arg == "--release"))
+        .collect();
+    assert!(
+        !release.is_empty(),
+        "the scan read {total} cargo call(s) out of scripts/run-all-tests.sh and not one of \
+         them was --release. Either the gate stopped exercising the release profile — in \
+         which case the E2E and the placement check judge whatever binary was lying around \
+         — or this extraction no longer matches how the script is written. A guard that \
+         finds nothing to judge is a paragraph"
+    );
+
+    for args in &release {
+        let features = features_asked_for(args);
+        assert_eq!(
+            expected,
+            features,
+            "`cargo {}` runs the release profile asking for {features:?}, while \
+             scripts/build-gpu.sh filled the same target directory asking for {expected:?}. \
+             cargo fingerprints the feature set, so this call rebuilds and relinks that \
+             binary, and everything downstream then reads a build with no CUDA provider \
+             compiled in. It happens at compile time, so it happens even when no test runs",
+            args.join(" ")
+        );
+    }
+}
