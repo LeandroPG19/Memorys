@@ -13,7 +13,7 @@
 # Windows there is no systemd and `serve` binds the address itself.
 [Unit]
 Description=cuba-memorys daemon socket — brings the daemon up on the first MCP call
-Documentation=https://github.com/LeandroPG19/cuba-memorys
+Documentation=https://github.com/LeandroPG19/Memorys
 
 [Socket]
 ListenStream=127.0.0.1:8787

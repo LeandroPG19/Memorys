@@ -1,6 +1,6 @@
 [Unit]
 Description=cuba-memorys — shared MCP knowledge-graph daemon
-Documentation=https://github.com/LeandroPG19/cuba-memorys
+Documentation=https://github.com/LeandroPG19/Memorys
 # The brain lives in a Docker Postgres. If it is not up yet the daemon still
 # starts on a lazy pool and tools report the real error, so this is only a hint.
 After=network-online.target docker.service

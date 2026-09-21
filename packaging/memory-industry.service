@@ -1,0 +1,46 @@
+[Unit]
+Description=MemoryIndustry — shared MCP knowledge-graph daemon
+Documentation=https://github.com/LeandroPG19/Memorys
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/memory-industry serve 127.0.0.1:8787
+# Every knob lives in the env file, never here. A value pinned in a unit is a
+# second source of truth for the defaults, and that is how a hand-written GPU
+# ceiling beat the planner's measurement on every card this daemon ran on.
+EnvironmentFile=%h/.config/memory-industry/memory-industry.env
+# on-failure, not always: a clean idle shutdown exits 0, and Restart=always
+# would bounce the daemon straight back up and defeat it entirely.
+Restart=on-failure
+RestartSec=3
+
+# One process holds every ONNX model, so this is where the memory shows up.
+# MemoryHigh throttles and reclaims; MemoryMax OOM-kills, so Max is the last
+# line of defence only.
+MemoryHigh=4500M
+MemoryMax=6G
+OOMScoreAdjust=200
+Nice=5
+
+# What is here is what this daemon survives; what is missing is missing on
+# purpose. PrivateDevices would take away /dev/nvidia*, ProtectHome would take
+# away the model cache, ProtectSystem=strict would make the sync directory
+# read-only, and MemoryDenyWriteExecute breaks ONNX Runtime, which JITs its
+# kernels. ProtectControlGroups and ProtectKernelTunables stay read-only rather
+# than hidden: the resource planner reads /sys/fs/cgroup and /proc at startup.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+LimitNOFILE=4096
+
+[Install]
+WantedBy=default.target

@@ -39,6 +39,7 @@ pub mod rem_cli;
 pub mod resources;
 pub mod search;
 pub mod secure_cli;
+pub mod service;
 pub mod session;
 pub mod setup;
 pub mod setup_agent;

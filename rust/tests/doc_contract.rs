@@ -221,12 +221,18 @@ fn the_docs_do_not_promise_commands_the_binary_does_not_have() {
     );
 }
 
-const NOT_A_KNOB_AN_OPERATOR_SETS: [(&str, &str); 9] = [
+const NOT_A_KNOB_AN_OPERATOR_SETS: [(&str, &str); 11] = [
     (
         "HOME",
         "the OS sets it; the code only reads it to locate ~/.cache",
     ),
     ("USERPROFILE", "the Windows spelling of HOME, same use"),
+    (
+        "LOCALAPPDATA",
+        "Windows sets it, like USERPROFILE; the code only reads it to locate \
+         %LOCALAPPDATA%\\MemoryIndustry, and refuses to install rather than guess a \
+         directory when it is missing",
+    ),
     (
         "HOSTNAME",
         "read only as the fallback for CUBA_NODE_NAME, which is documented",
@@ -251,6 +257,15 @@ const NOT_A_KNOB_AN_OPERATOR_SETS: [(&str, &str); 9] = [
     (
         "CUBA_RESOURCES_TEST_KNOB",
         "invented inside a #[test] in resources.rs; it does not exist at runtime",
+    ),
+    (
+        "MEMORY_INDUSTRY_EMBED_DEVICE",
+        "nothing reads it: preferred_device_var() promoted only the reranker to the \
+         MEMORY_INDUSTRY_ namespace. The name reaches this scanner because the device table \
+         in gpu.rs names it to assert exactly that, and documenting it on that evidence would \
+         publish a knob an operator can set with no effect and no way to find out why. The day \
+         preferred_device_var() returns it, drop this row and give it a README row and an \
+         .env.example line instead",
     ),
 ];
 

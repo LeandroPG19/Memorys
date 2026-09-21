@@ -1,0 +1,20 @@
+# Socket activation: this unit owns the port, so the daemon does not have to be
+# running to keep it. The first connection starts memory-industry.service.
+#
+#   systemctl --user daemon-reload
+#   systemctl --user disable --now memory-industry.service
+#   systemctl --user enable  --now memory-industry.socket
+#
+# `serve` adopts the socket systemd passes as fd 3 (LISTEN_FDS), so no client
+# sees a refused connection while the daemon is down. Unix only — on Windows
+# there is no systemd and `serve` binds the address itself.
+[Unit]
+Description=MemoryIndustry daemon socket — brings the daemon up on the first MCP call
+Documentation=https://github.com/LeandroPG19/Memorys
+
+[Socket]
+ListenStream=127.0.0.1:8787
+Accept=no
+
+[Install]
+WantedBy=default.target

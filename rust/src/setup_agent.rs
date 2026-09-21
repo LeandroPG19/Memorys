@@ -344,6 +344,14 @@ fn run_write(target: &str, apply: bool) -> Result<()> {
 }
 
 pub fn run_cli(args: &[String]) -> Result<()> {
+    // Before the loop below, which would take every one of `service`'s own
+    // flags for a target. It stays a subcommand of `setup` rather than a new
+    // entry in `cli::COMMANDS`, because the README states that count and
+    // `cli_contract.rs` checks the two agree.
+    if args.first().is_some_and(|a| a == "service") {
+        return run_service(&args[1..]);
+    }
+
     let mut target: Option<String> = None;
     let mut apply = false;
 
@@ -352,11 +360,13 @@ pub fn run_cli(args: &[String]) -> Result<()> {
             "--apply" => apply = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: memory-industry setup <check | print | claude | mcp | cursor> [--apply]\n\n\
+                    "usage: memory-industry setup <check | print | service | claude | mcp | cursor> [--apply]\n\n\
                      check   audita las configs existentes: variables faltantes, rutas muertas,\n\
                              y divergencias entre clientes (el bug que mató el recall vectorial).\n\
                      print   imprime el bloque correcto para pegarlo donde haga falta.\n\
                      hook    instala un SessionStart que inyecta la memoria automáticamente.\n\
+                     service instala el daemon: unidad systemd o tarea de Windows, con el env\n\
+                             file que lleva el token. `setup service --help` para sus flags.\n\
                      claude  ~/.claude.json     mcp  ~/.mcp.json     cursor  ~/.cursor/mcp.json\n\n\
                      Sin --apply, solo muestra el plan. Con --apply, respalda el archivo y mergea."
                 );
@@ -380,6 +390,184 @@ pub fn run_cli(args: &[String]) -> Result<()> {
         }
         Some(t) => run_write(t, apply),
     }
+}
+
+const SERVICE_HELP: &str = "\
+usage: memory-industry setup service [--print | --apply | --uninstall]
+                                     [--linux | --windows]
+                                     [--profile loopback|lan]
+                                     [--token T] [--addr A] [--out DIR]
+
+Sin modo, --print: muestra el plan y no escribe nada.
+
+--out DIR    escribe el render canónico en DIR en vez de a stdout. Es como se
+             regeneran los ficheros de packaging/, y solo va con --print.
+--apply      instala. NO pisa un env file que ya exista: lleva el token y la
+             DATABASE_URL que tus clientes ya usan.
+--uninstall  retira lo que generó y deja el env file donde está.
+--profile lan exige --addr con la dirección concreta de la interfaz, y genera
+             un token si no le pasás uno.";
+
+/// The flag parsing for `setup service`.
+///
+/// It lives here and not in `service.rs` on purpose: `quality-gate.sh:164`
+/// excludes this file from `cargo mutants`, and an argument loop is glue that
+/// mutation cannot judge. Everything that decides something — the addresses it
+/// refuses, the token floor, what gets written and what is kept — is in
+/// `service.rs`, where the mutants are hunted.
+fn run_service(args: &[String]) -> Result<()> {
+    use crate::service::{self, Profile, Secrecy, Target, Unit, Wrote};
+
+    let mut mode: Option<&str> = None;
+    let mut target: Option<Target> = None;
+    let mut profile = Profile::Loopback;
+    let mut addr: Option<String> = None;
+    let mut token: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
+
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--print" | "--apply" | "--uninstall" => {
+                let asked = arg.trim_start_matches("--");
+                if let Some(already) = mode
+                    && already != asked
+                {
+                    bail!("--{already} y --{asked} son excluyentes: elegí uno");
+                }
+                mode = Some(asked);
+            }
+            "--linux" => target = Some(Target::Linux),
+            "--windows" => target = Some(Target::Windows),
+            "--profile" => {
+                let raw = rest.next().context("--profile necesita loopback o lan")?;
+                profile = Profile::parse(raw)?;
+            }
+            "--addr" => {
+                let raw = rest
+                    .next()
+                    .context("--addr necesita una dirección ip:puerto")?;
+                addr = Some(raw.clone());
+            }
+            "--token" => {
+                let raw = rest.next().context("--token necesita un valor")?;
+                token = Some(raw.clone());
+            }
+            "--out" => {
+                let raw = rest.next().context("--out necesita un directorio")?;
+                out = Some(PathBuf::from(raw));
+            }
+            "-h" | "--help" => {
+                eprintln!("{SERVICE_HELP}");
+                return Ok(());
+            }
+            other => bail!("opción desconocida para `setup service`: {other}"),
+        }
+    }
+
+    let target = target.unwrap_or_else(Target::host);
+    let mode = mode.unwrap_or("print");
+    if out.is_some() && mode != "print" {
+        bail!(
+            "--out solo va con --print: --apply y --uninstall trabajan en la raíz de \
+             instalación, no en un directorio que elijas"
+        );
+    }
+
+    match (mode, out) {
+        ("print", Some(dir)) => {
+            // The canonical render, never this machine's: a measurement or a
+            // `current_exe()` inside a versioned file is the very defect this
+            // command exists to close.
+            let unit = Unit::documented(profile, target);
+            let launcher = unit.exe.with_extension("cmd");
+            let files = service::rendered_files(&unit, target.is_windows(), &launcher);
+            for (relative, body) in files {
+                let path = dir.join(&relative);
+                service::write_one(&path, &body, Secrecy::Plain)?;
+                println!("{}", path.display());
+            }
+            Ok(())
+        }
+        ("print", None) => {
+            let unit = Unit::from_env(profile, target, addr.as_deref(), token.as_deref())?;
+            let root = install_root_of(&unit);
+            let launcher = root.join("memory-industry.cmd");
+            print!("{}", service::render_plan(&unit, target, &launcher));
+            Ok(())
+        }
+        ("apply", _) => {
+            let unit = Unit::from_env(profile, target, addr.as_deref(), token.as_deref())?;
+            let root = install_root_of(&unit);
+            for (path, wrote) in service::write_all(&unit, target, &root)? {
+                match wrote {
+                    Wrote::Created { restricted: true } => {
+                        println!("escrito     {} (0600: solo tu usuario)", path.display());
+                    }
+                    Wrote::Created { restricted: false } => {
+                        println!("escrito     {}", path.display());
+                    }
+                    Wrote::Kept => println!(
+                        "conservado  {} — lleva el token y la DATABASE_URL que tus clientes ya \
+                         usan; reescribirlo los rompe a todos de golpe",
+                        path.display()
+                    ),
+                }
+            }
+            println!();
+            println!(
+                "Habilitalo con:\n  {}",
+                service::enable_command(target, &root)
+            );
+            Ok(())
+        }
+        ("uninstall", _) => {
+            let home = crate::envs::home()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
+            let local_app_data = std::env::var("LOCALAPPDATA").ok();
+            let root = service::install_root(target, home.as_deref(), local_app_data.as_deref())?;
+
+            let unit = Unit::documented(profile, target);
+            let launcher = root.join("memory-industry.cmd");
+            for (relative, _) in service::rendered_files(&unit, target.is_windows(), &launcher) {
+                let name = relative.rsplit('/').next().unwrap_or(relative.as_str());
+                // The env file is deliberately out of this loop's reach: it is
+                // the one file here that cannot be regenerated.
+                if name.ends_with(".env.example") {
+                    continue;
+                }
+                let path = root.join(name);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => println!("borrado    {}", path.display()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        println!("no estaba  {}", path.display());
+                    }
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("no se pudo borrar {}", path.display()));
+                    }
+                }
+            }
+            println!();
+            println!(
+                "{} sigue ahí: lleva el token y la DATABASE_URL. Borrarlo es un acto aparte.",
+                root.join("memory-industry.env").display()
+            );
+            Ok(())
+        }
+        (other, _) => bail!("modo desconocido: {other}"),
+    }
+}
+
+/// Where this unit was resolved to install. `from_env` already put the env file
+/// under the install root, so asking it back beats resolving the root twice and
+/// risking two answers.
+fn install_root_of(unit: &crate::service::Unit) -> PathBuf {
+    unit.env_file
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf()
 }
 
 fn run_hook(apply: bool) -> Result<()> {

@@ -4,3 +4,13 @@
 AGENTS.md text eol=lf
 docs/gate.md text eol=lf
 *.mdc text eol=lf
+
+# `schtasks /Create /XML` reads the bytes, not the declaration: a UTF-8 task
+# file is refused at (1,40) — the column `encoding=` sits in — before it is ever
+# parsed. So the working tree has to hold UTF-16LE with a BOM, which is what
+# makes this file one an operator hands to the scheduler straight out of the
+# clone instead of converting first. `working-tree-encoding` keeps the blob git
+# stores as UTF-8, so the diff is still text in review. Needs git 2.18+; JGit
+# and libgit2 do not implement it, and a client without support would commit
+# the UTF-16 bytes as-is.
+packaging/windows/memory-industry-task.xml text eol=lf working-tree-encoding=UTF-16LE-BOM
