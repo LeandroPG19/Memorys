@@ -242,19 +242,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
     tracing::info!("connect page at http://{addr}/connect");
     let app = app.layer(DefaultBodyLimit::max(MAX_BODY)).with_state(state);
 
-    let listener = match systemd_listener() {
-        Some(std_listener) => {
-            let adopted = std_listener
-                .local_addr()
-                .context("cannot read the address of the systemd-activated socket")?;
-            ensure_adopted_loopback(&adopted)?;
-            tokio::net::TcpListener::from_std(std_listener)
-                .context("failed to adopt systemd-activated socket")?
-        }
-        None => tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("cannot bind {addr} — is another daemon already running?"))?,
-    };
+    let listener = bind_listener(addr).await?;
 
     // Bind first: a port already taken, a non-loopback address without a token
     // or a weak one all fail here, in a second, instead of after two minutes of
@@ -268,25 +256,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
     // Between bind and serve the kernel queues connections, so a client that
     // arrives early waits and then gets a real answer rather than a 200 with an
     // unreranked ranking in it.
-    let warming = tokio::spawn({
-        let ready = ready.clone();
-        async move {
-            let started = Instant::now();
-            warm_models().await;
-            ready.store(true, Ordering::Relaxed);
-            tracing::info!(secs = started.elapsed().as_secs_f32(), "models warm");
-        }
-    });
-    let warm_budget = warm_before_serve_budget();
-    if tokio::time::timeout(warm_budget, warming).await.is_err() {
-        // Dropping the handle detaches the task; it keeps loading and flips
-        // `ready` when it lands. Serving now is the lesser evil: a daemon that
-        // never opens its port cannot even be asked what it is doing.
-        tracing::warn!(
-            secs = warm_budget.as_secs(),
-            "los modelos no terminaron de calentar dentro del presupuesto — se sirve igual, /health dice ready:false y las búsquedas con rerank salen marcadas como degradadas"
-        );
-    }
+    warm_before_serving(ready.clone()).await;
 
     tracing::info!(
         %addr,
@@ -305,6 +275,57 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
 
     tracing::info!("daemon shut down");
     Ok(())
+}
+
+/// Remember that this client is alive, for the idle reaper and for /health.
+fn note_activity(state: &AppState, key: &str) {
+    if let Ok(mut guard) = state.seen.write() {
+        guard.insert(key.to_string(), Instant::now());
+    }
+    if let Ok(mut guard) = state.last_activity.lock() {
+        *guard = Instant::now();
+    }
+}
+
+/// The socket, either handed over by systemd or opened here.
+///
+/// Kept first in `serve_pool` on purpose: a port already taken, a routable
+/// address with no token and a token too weak to be one all fail here in a
+/// second, rather than after two minutes of loading models.
+async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    let Some(std_listener) = systemd_listener() else {
+        return tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("cannot bind {addr} — is another daemon already running?"));
+    };
+    let adopted = std_listener
+        .local_addr()
+        .context("cannot read the address of the systemd-activated socket")?;
+    ensure_adopted_loopback(&adopted)?;
+    tokio::net::TcpListener::from_std(std_listener)
+        .context("failed to adopt systemd-activated socket")
+}
+
+/// Load the models, but do not wait forever for them.
+///
+/// Dropping the handle on timeout detaches the task: it keeps loading and
+/// flips `ready` when it lands. Serving before it does is the lesser evil,
+/// because a daemon that never opens its port cannot even be asked what it is
+/// doing.
+async fn warm_before_serving(ready: Arc<std::sync::atomic::AtomicBool>) {
+    let warming = tokio::spawn(async move {
+        let started = Instant::now();
+        warm_models().await;
+        ready.store(true, Ordering::Relaxed);
+        tracing::info!(secs = started.elapsed().as_secs_f32(), "models warm");
+    });
+    let budget = warm_before_serve_budget();
+    if tokio::time::timeout(budget, warming).await.is_err() {
+        tracing::warn!(
+            secs = budget.as_secs(),
+            "los modelos no terminaron de calentar dentro del presupuesto — se sirve igual, /health dice ready:false y las búsquedas con rerank salen marcadas como degradadas"
+        );
+    }
 }
 
 async fn shutdown_signal(idle: Arc<tokio::sync::Notify>) {
@@ -349,10 +370,11 @@ fn warm_before_serve_budget() -> std::time::Duration {
 /// search that asks for reranking — a request with a 20 s budget paying for a
 /// 1.1 GB read. The daemon has time at startup and the search does not.
 fn warm_reranker_eagerly() -> bool {
-    !matches!(
-        std::env::var("CUBA_WARM_RERANKER").as_deref(),
-        Ok("0") | Ok("off") | Ok("false") | Ok("no")
-    )
+    warm_eagerly_from(std::env::var("CUBA_WARM_RERANKER").ok().as_deref())
+}
+
+fn warm_eagerly_from(raw: Option<&str>) -> bool {
+    !matches!(raw, Some("0") | Some("off") | Some("false") | Some("no"))
 }
 
 async fn warm_models() {
@@ -753,11 +775,8 @@ async fn events_sse(
 }
 
 async fn panel(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !origin_allowed(
-        headers.get("origin").and_then(|v| v.to_str().ok()),
-        state.port,
-    ) {
-        return (StatusCode::FORBIDDEN, "origen no permitido").into_response();
+    if let Some(refusal) = refuse_foreign_origin(&state, &headers) {
+        return refusal;
     }
     if came_through_a_proxy(&headers) && !panel_allows_forwarded() {
         return (
@@ -850,14 +869,24 @@ fn request_origin(peer: SocketAddr, headers: &HeaderMap) -> crate::session::Orig
 /// refuses the request on its own. Adding a permissive CORS layer would
 /// *remove* that protection.
 fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
+    origin_allowed_with(
+        origin,
+        port,
+        &std::env::var("CUBA_HTTP_ALLOWED_ORIGINS").unwrap_or_default(),
+    )
+}
+
+/// The allowlist is a parameter so it can be checked. Read straight from the
+/// environment it was the one branch here no test could reach, and three
+/// mutations of it survived the gate for exactly that reason.
+fn origin_allowed_with(origin: Option<&str>, port: u16, allowlist: &str) -> bool {
     let Some(origin) = origin.map(str::trim).filter(|o| !o.is_empty()) else {
         return true;
     };
     if origin == "null" {
         return false;
     }
-    let allowed = std::env::var("CUBA_HTTP_ALLOWED_ORIGINS").unwrap_or_default();
-    if allowed
+    if allowlist
         .split(',')
         .map(str::trim)
         .any(|o| !o.is_empty() && o == origin)
@@ -895,32 +924,63 @@ fn auth_brake(failures: u32, window_age: std::time::Duration) -> Option<std::tim
     Some(AUTH_FAILURE_WINDOW - window_age)
 }
 
+/// Refuse a browser page that is not the daemon's own, if that is what this is.
+fn refuse_foreign_origin(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+    if origin_allowed(origin, state.port) {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            "este endpoint no acepta peticiones de una página web de otro origen",
+        )
+            .into_response(),
+    )
+}
+
+/// The count this address should carry after one more wrong token.
+///
+/// A window older than the limit starts over rather than accumulating: one bad
+/// afternoon must not follow an address for the life of the daemon.
+fn next_failure(entry: Option<(u32, Instant)>) -> (u32, Instant) {
+    match entry {
+        Some((failures, since)) if since.elapsed() < AUTH_FAILURE_WINDOW => (failures + 1, since),
+        _ => (1, Instant::now()),
+    }
+}
+
+fn brake_for(state: &AppState, who: std::net::IpAddr) -> Option<std::time::Duration> {
+    let (failures, since) = state.auth_failures.read().ok()?.get(&who).copied()?;
+    auth_brake(failures, since.elapsed())
+}
+
+fn record_auth_failure(state: &AppState, who: std::net::IpAddr) {
+    if let Ok(mut failures) = state.auth_failures.write() {
+        let updated = next_failure(failures.get(&who).copied());
+        failures.insert(who, updated);
+    }
+}
+
+fn clear_auth_failures(state: &AppState, who: std::net::IpAddr) {
+    if let Ok(mut failures) = state.auth_failures.write() {
+        failures.remove(&who);
+    }
+}
+
 async fn mcp_endpoint(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !origin_allowed(
-        headers.get("origin").and_then(|v| v.to_str().ok()),
-        state.port,
-    ) {
-        return (
-            StatusCode::FORBIDDEN,
-            "este endpoint no acepta peticiones de una página web de otro origen",
-        )
-            .into_response();
+    if let Some(refusal) = refuse_foreign_origin(&state, &headers) {
+        return refusal;
     }
     let origin = request_origin(peer, &headers);
 
     let who = peer.ip();
-    if let Some(wait) = state
-        .auth_failures
-        .read()
-        .ok()
-        .and_then(|g| g.get(&who).copied())
-        .and_then(|(failures, since)| auth_brake(failures, since.elapsed()))
-    {
+    if let Some(wait) = brake_for(&state, who) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", wait.as_secs().max(1).to_string())],
@@ -934,22 +994,14 @@ async fn mcp_endpoint(
     }
 
     let Some(scope) = authorized(&state, &headers) else {
-        if let Ok(mut failures) = state.auth_failures.write() {
-            let entry = failures.entry(who).or_insert((0, Instant::now()));
-            if entry.1.elapsed() >= AUTH_FAILURE_WINDOW {
-                *entry = (0, Instant::now());
-            }
-            entry.0 += 1;
-        }
+        record_auth_failure(&state, who);
         return (
             StatusCode::UNAUTHORIZED,
             axum::Json(error_envelope(Value::Null, -32001, "invalid bearer token")),
         )
             .into_response();
     };
-    if let Ok(mut failures) = state.auth_failures.write() {
-        failures.remove(&who);
-    }
+    clear_auth_failures(&state, who);
 
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -969,12 +1021,7 @@ async fn mcp_endpoint(
     let (label, declared) = client_key(&headers, &payload);
     let mcp_sid = mcp_session_id(&headers);
     let key = crate::session::bind_key(&label, mcp_sid.as_deref(), &origin);
-    if let Ok(mut guard) = state.seen.write() {
-        guard.insert(key.clone(), Instant::now());
-    }
-    if let Ok(mut guard) = state.last_activity.lock() {
-        *guard = Instant::now();
-    }
+    note_activity(&state, &key);
 
     let (items, is_batch) = match batch_items(payload) {
         Ok(split) => split,
@@ -1793,10 +1840,8 @@ mod lan_exposure_tests {
             .expect("the function ends")
             .0;
 
-        let bind = body
-            .find("let listener = match systemd_listener()")
-            .expect("the bind");
-        let warm = body.find("warm_models().await").expect("the warm-up");
+        let bind = body.find("bind_listener(").expect("the bind");
+        let warm = body.find("warm_before_serving(").expect("the warm-up");
         let announce = body.find("daemon listening").expect("the announcement");
         let serve = body.find("axum::serve(").expect("the server");
 
@@ -1824,8 +1869,24 @@ mod lan_exposure_tests {
             )
             .expect("the function ends")
             .0;
+        // The bound lives in warm_before_serving now, which is what serve_pool
+        // calls; checking serve_pool's own text would only prove where a line
+        // happens to sit.
+        let warm_fn = source
+            .split_once("async fn warm_before_serving(")
+            .expect("warm_before_serving is in this file")
+            .1;
+        let warm_fn = warm_fn
+            .split_once(
+                "
+}",
+            )
+            .expect("the function ends")
+            .0;
         assert!(
-            body.contains("warm_before_serve_budget()") && body.contains("tokio::time::timeout("),
+            body.contains("warm_before_serving(")
+                && warm_fn.contains("warm_before_serve_budget()")
+                && warm_fn.contains("tokio::time::timeout("),
             "the wait for the models has to be bounded. Warming before the bind was the other obvious order and it is worse: a model that never loads leaves the daemon unbound, so nobody can even ask it what is wrong."
         );
     }
@@ -1941,6 +2002,73 @@ mod lan_exposure_tests {
             auth_brake(MAX_AUTH_FAILURES * 100, AUTH_FAILURE_WINDOW),
             None,
             "the window has to expire, or one burst would lock an address out for the life of the daemon"
+        );
+    }
+
+    #[test]
+    fn warming_is_on_unless_somebody_turns_it_off() {
+        assert!(
+            warm_eagerly_from(None),
+            "on by default: deferring the load does not save the cost, it moves it inside the first search that asks for reranking, which has a 20 s budget and a 1.1 GB read to pay for"
+        );
+        for off in ["0", "off", "false", "no"] {
+            assert!(!warm_eagerly_from(Some(off)), "{off} has to switch it off");
+        }
+        for on in ["1", "on", "true", "yes", "", "maybe"] {
+            assert!(
+                warm_eagerly_from(Some(on)),
+                "{on} is not one of the off words, and an unrecognised value must not silently defer the load"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_window_starts_the_count_over_instead_of_accumulating() {
+        let (count, _) = next_failure(None);
+        assert_eq!(count, 1, "the first wrong token is one, not zero");
+
+        let fresh = Instant::now();
+        let (count, since) = next_failure(Some((3, fresh)));
+        assert_eq!(count, 4);
+        assert_eq!(
+            since, fresh,
+            "the window keeps its start, or every failure would push the deadline and an address could never serve its wait"
+        );
+    }
+
+    #[test]
+    fn the_allowlist_matches_whole_origins_and_ignores_its_own_gaps() {
+        assert!(
+            origin_allowed_with(Some("https://ops.example"), 8787, "https://ops.example"),
+            "an origin somebody put on the list is allowed; that is what the list is for"
+        );
+        assert!(
+            origin_allowed_with(
+                Some("https://ops.example"),
+                8787,
+                "http://a.example, https://ops.example ,"
+            ),
+            "entries are trimmed and a trailing comma is not an entry"
+        );
+        assert!(
+            !origin_allowed_with(Some("https://evil.example"), 8787, "https://ops.example"),
+            "being on a list of one does not admit everyone else"
+        );
+        assert!(
+            !origin_allowed_with(
+                Some("https://ops.example.evil.test"),
+                8787,
+                "https://ops.example"
+            ),
+            "a prefix is not a match: a whole origin or nothing, or any attacker who can register a longer name gets in"
+        );
+        assert!(
+            !origin_allowed_with(Some("https://evil.example"), 8787, ""),
+            "an empty list is an empty list. Splitting it yields one empty entry, and matching that against an origin would admit everything the moment nobody configured anything - which is the default."
+        );
+        assert!(
+            origin_allowed_with(Some(""), 8787, ""),
+            "a blank Origin header is treated as absent, like every non-browser client"
         );
     }
 }

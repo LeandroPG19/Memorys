@@ -381,6 +381,68 @@ where
     }
 }
 
+/// The NLI check, loading the model first when `--deep` asks for it.
+async fn nli_check(deep: bool) -> Check {
+    if !crate::cognitive::nli::available() {
+        return Check::fail(
+            "nli_entailment",
+            "sin modelo NLI local",
+            "memory-industry models nli",
+        );
+    }
+    if crate::cognitive::nli::deferred_by_resource_plan() {
+        return Check::ok(
+            "nli_entailment",
+            "modelo en disco; resource plan difiere la carga hasta que haya RAM",
+        );
+    }
+    if !deep {
+        return Check::ok(
+            "nli_entailment",
+            "presente en disco - carga a su primer veredicto (no lo cargo aqui: son ~1 GB; `doctor --deep` lo comprueba de verdad)",
+        );
+    }
+    // Was `deep && nli::enabled()`, called straight from an async task: a
+    // gigabyte read on the runtime worker, which is the same defect 4d5dd76
+    // removed from the reranker path and left here for another release.
+    match resolve_under_budget(crate::cognitive::nli::enabled).await {
+        Ok(true) => Check::ok(
+            "nli_entailment",
+            "cargado (mDeBERTa-v3-xnli) - verify decide en ~50 ms, sin LLM",
+        ),
+        Ok(false) => Check::fail(
+            "nli_entailment",
+            "hay un modelo NLI en disco pero NO carga",
+            "verify se cae al juez LLM (~20 s por afirmacion) o al heuristico, que no decide nada. Suele ser libonnxruntime.so: comproba ORT_DYLIB_PATH.",
+        ),
+        Err(why) => Check::fail(
+            "nli_entailment",
+            format!("el modelo NLI esta en disco y {why}"),
+            "verify se cae al juez LLM o al heuristico. Si el disco es lento subi el presupuesto; si no vuelve nunca, el modelo esta corrupto.",
+        ),
+    }
+}
+
+/// What the reranker's status is, loading it first when asked to.
+///
+/// `--deep` promised to load this model and never did: the status was read
+/// through a guard that only fires once something else has already resolved
+/// it, so the flag changed nothing here.
+async fn resolve_reranker(load_it: bool) -> (bool, bool, Option<String>) {
+    if load_it {
+        return match resolve_under_budget(crate::search::rerank::enabled).await {
+            Ok(enabled) => (true, enabled, crate::search::rerank::failure_reason()),
+            Err(why) => (true, false, Some(why)),
+        };
+    }
+    let resolved = crate::search::rerank::status_resolved();
+    (
+        resolved,
+        resolved && crate::search::rerank::enabled(),
+        crate::search::rerank::failure_reason(),
+    )
+}
+
 pub async fn run_checks(pool: &PgPool, url: &str) -> Vec<Check> {
     run_checks_with(pool, url, false).await
 }
@@ -581,19 +643,7 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     // flag changed nothing for this model and the help text was a promise the
     // code did not keep.
     let (rerank_resolved, rerank_enabled, rerank_failure) =
-        if deep && rerank_configured && !rerank_disabled_by_resources {
-            match resolve_under_budget(crate::search::rerank::enabled).await {
-                Ok(enabled) => (true, enabled, crate::search::rerank::failure_reason()),
-                Err(why) => (true, false, Some(why)),
-            }
-        } else {
-            let resolved = crate::search::rerank::status_resolved();
-            (
-                resolved,
-                resolved && crate::search::rerank::enabled(),
-                crate::search::rerank::failure_reason(),
-            )
-        };
+        resolve_reranker(deep && rerank_configured && !rerank_disabled_by_resources).await;
     checks.push(reranker_check(
         RerankerLoad::observe(
             rerank_configured,
@@ -607,46 +657,7 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
         mode.rerank_default(),
     ));
 
-    if crate::cognitive::nli::available() {
-        if crate::cognitive::nli::deferred_by_resource_plan() {
-            checks.push(Check::ok(
-                "nli_entailment",
-                "modelo en disco; resource plan difiere la carga hasta que haya RAM",
-            ));
-        } else if deep {
-            // Was `deep && nli::enabled()`, called straight from this async
-            // task: a gigabyte read on the runtime worker, which is the same
-            // defect 4d5dd76 removed from the reranker path and left here.
-            let outcome = resolve_under_budget(crate::cognitive::nli::enabled).await;
-            checks.push(match outcome {
-                Ok(true) => Check::ok(
-                    "nli_entailment",
-                    "cargado (mDeBERTa-v3-xnli) - verify decide en ~50 ms, sin LLM",
-                ),
-                Ok(false) => Check::fail(
-                    "nli_entailment",
-                    "hay un modelo NLI en disco pero NO carga",
-                    "verify se cae al juez LLM (~20 s por afirmacion) o al heuristico, que no decide nada. Suele ser libonnxruntime.so: comproba ORT_DYLIB_PATH.",
-                ),
-                Err(why) => Check::fail(
-                    "nli_entailment",
-                    format!("el modelo NLI esta en disco y {why}"),
-                    "verify se cae al juez LLM o al heuristico. Si el disco es lento subi el presupuesto; si no vuelve nunca, el modelo esta corrupto.",
-                ),
-            });
-        } else {
-            checks.push(Check::ok(
-                "nli_entailment",
-                "presente en disco - carga a su primer veredicto (no lo cargo aqui: son ~1 GB; `doctor --deep` lo comprueba de verdad)",
-            ));
-        }
-    } else {
-        checks.push(Check::fail(
-            "nli_entailment",
-            "sin modelo NLI local",
-            "memory-industry models nli",
-        ));
-    }
+    checks.push(nli_check(deep).await);
 
     {
         use crate::llm_cli::LlmVerdict;
@@ -1407,30 +1418,23 @@ mod deep_tests {
         // promised it loaded, and the NLI branch called enabled() straight
         // from the async task, reading a gigabyte on the runtime worker.
         let source = include_str!("doctor.rs");
-        let body = source
-            .split_once("pub async fn run_checks_with(")
-            .expect("run_checks_with is in this file")
-            .1;
-        // Bounded to the function: a column-zero brace is where it ends. Left
-        // open, the slice runs to the end of the file and counts the mentions
-        // in this very test.
-        let body = body
-            .split_once(
-                "
-}
-",
-            )
-            .expect("the function ends")
-            .0;
-
+        // Counted by their call shape, not by slicing the file: doctor.rs has
+        // a `#[cfg(test)]` halfway up, so cutting at the first one stops before
+        // the code this is meant to watch.
+        // Assembled at run time so the needle does not match this very line:
+        // the first attempt counted three, and the third was itself.
+        let call = format!("{}{}", "resolve_under_budget", "(crate::");
         assert_eq!(
-            body.matches("resolve_under_budget(").count(),
+            source.matches(&call).count(),
             2,
-            "both the reranker and the NLI have to resolve through the budgeted, off-runtime helper. A direct enabled() here is a gigabyte read on the executor, and a missing one is a --deep that checks nothing."
+            "both the reranker and the NLI have to resolve through the budgeted, off-runtime helper. A direct enabled() is a gigabyte read on the executor, and a missing call is a --deep that checks nothing."
         );
         assert!(
-            !body.contains("deep && crate::cognitive::nli::enabled()"),
-            "that is the exact call that blocked the runtime"
+            !source.contains(&format!(
+                "{}{}",
+                "deep && crate::cognitive", "::nli::enabled()"
+            )),
+            "that is the exact call that blocked the runtime, and it is only absent while nobody has put it back"
         );
     }
 }

@@ -393,11 +393,20 @@ pub fn llm_verdict(offline_ready: bool, judge_is_sampling: bool, in_daemon: bool
 
 /// Whether the judge is set to take its model from the MCP host.
 pub fn judge_is_sampling() -> bool {
-    let mode = std::env::var("MEMORY_INDUSTRY_JUDGE")
-        .or_else(|_| std::env::var("CUBA_JUDGE"))
-        .unwrap_or_default();
+    judge_is_sampling_from(
+        std::env::var("MEMORY_INDUSTRY_JUDGE")
+            .or_else(|_| std::env::var("CUBA_JUDGE"))
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn judge_is_sampling_from(mode: Option<&str>) -> bool {
     matches!(
-        mode.trim().to_ascii_lowercase().as_str(),
+        mode.unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
         "mcp_sampling" | "sampling"
     )
 }
@@ -483,5 +492,30 @@ mod verdict_tests {
         );
         assert_eq!(llm_verdict(false, false, true), LlmVerdict::Missing);
         assert_eq!(llm_verdict(false, false, false), LlmVerdict::Missing);
+    }
+
+    #[test]
+    fn only_the_sampling_judge_counts_as_sampling() {
+        for yes in ["mcp_sampling", "sampling", " MCP_Sampling ", "SAMPLING"] {
+            assert!(judge_is_sampling_from(Some(yes)), "{yes:?}");
+        }
+        for no in [
+            "auto",
+            "heuristic",
+            "claude_cli",
+            "nli",
+            "",
+            "mcp",
+            "sampling_x",
+        ] {
+            assert!(
+                !judge_is_sampling_from(Some(no)),
+                "{no:?} is not the sampling judge, and reading it as one would make doctor warn about a deployment that is fine"
+            );
+        }
+        assert!(
+            !judge_is_sampling_from(None),
+            "no judge configured is not the sampling judge either"
+        );
     }
 }

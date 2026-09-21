@@ -6,6 +6,24 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 BASELINE="$ROOT/scripts/lizard-baseline.txt"
 
+# Same derivation as mutants-gate.sh: a number tuned on one machine and used
+# on every other one is the defect this release removed from the GPU path.
+qg_mutants_jobs() {
+  local cores ram half
+  cores=$(nproc 2>/dev/null || echo 4)
+  if [[ -r /proc/meminfo ]]; then
+    ram=$(awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo)
+  else
+    ram=8
+  fi
+  half=$(( cores / 2 ))
+  (( half < 1 )) && half=1
+  (( ram / 4 < half )) && half=$(( ram / 4 ))
+  (( half > 6 )) && half=6
+  (( half < 1 )) && half=1
+  echo "$half"
+}
+
 echo "=== quality-gate (MemoryIndustry — CRAP/lizard + mutación del diff) ==="
 echo "NO MIRA: SIL (fmt, clippy -D, tests --ignored, e2e, deny, audit, codigo-muerto, crap-gate floor, mutants-gate mmr/rrf/cache)."
 echo "NO CORRE: ./scripts/merge-gate.sh"
@@ -199,7 +217,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           fi
           (cd rust && cargo mutants "${files[@]}" "${in_diff[@]}" \
             --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason' \
-            --timeout 90 --jobs 2 --gitignore=false -- --lib) || fail=1
+            --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || fail=1
           rm -f "$diff_file"
         fi
       else

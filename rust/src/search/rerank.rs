@@ -271,6 +271,23 @@ pub async fn rerank(query: &str, candidates: &[&str]) -> Result<Vec<(usize, f64)
     rerank_within(query, candidates, std::time::Instant::now() + budget()).await
 }
 
+/// Wait for the one session permit, but not past the deadline.
+///
+/// `spawn_blocking` is not cancellable, so a batch whose caller already gave
+/// up keeps the permit and the session mutex until it finishes on its own.
+/// Without a bound here the next search waits on it forever.
+async fn permit_before(
+    deadline: std::time::Instant,
+) -> Result<tokio::sync::SemaphorePermit<'static>> {
+    let wait = deadline.saturating_duration_since(std::time::Instant::now());
+    match tokio::time::timeout(wait, semaphore().acquire()).await {
+        Ok(permit) => permit.map_err(|_| anyhow::anyhow!("reranker semaphore closed")),
+        Err(_) => Err(anyhow::anyhow!(
+            "el reranker sigue ocupado con un lote anterior y este agotó su presupuesto"
+        )),
+    }
+}
+
 /// One rerank, finished by `deadline` or not at all.
 ///
 /// The deadline covers resolving the model as well as the inference. It used
@@ -283,6 +300,13 @@ pub async fn rerank_within(
 ) -> Result<Vec<(usize, f64)>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Before anything, including the load. If the budget is already gone there
+    // is nothing worth starting, and checking here means every path below is
+    // reached with time left rather than discovering it halfway.
+    if std::time::Instant::now() >= deadline {
+        anyhow::bail!("el rerank no tenía presupuesto ya al empezar");
     }
 
     let n = candidates.len();
@@ -298,32 +322,38 @@ pub async fn rerank_within(
     if !loaded {
         return Ok(identity_pairs(n));
     }
-    if std::time::Instant::now() >= deadline {
-        anyhow::bail!("el modelo terminó de cargar pero ya no queda presupuesto para reordenar");
-    }
-
     let query_owned = query.to_string();
     let candidates_owned: Vec<String> = candidates.iter().map(|c| c.to_string()).collect();
 
-    let wait = deadline.saturating_duration_since(std::time::Instant::now());
-    let _permit = match tokio::time::timeout(wait, semaphore().acquire()).await {
-        Ok(permit) => permit.map_err(|_| anyhow::anyhow!("reranker semaphore closed"))?,
-        // spawn_blocking is not cancellable, so a batch whose caller gave up
-        // keeps the permit and the session mutex until it finishes. Without a
-        // bound here the next search waits on it forever.
-        Err(_) => anyhow::bail!(
-            "el reranker sigue ocupado con un lote anterior y este agotó su presupuesto"
-        ),
-    };
+    let _permit = permit_before(deadline).await?;
 
-    let scored =
-        tokio::task::spawn_blocking(move || score_pairs(&query_owned, &candidates_owned, deadline))
-            .await
-            .context("reranker task panicked")??;
+    Ok(ranked(
+        score_off_runtime(query_owned, candidates_owned, deadline).await?,
+    ))
+}
 
+/// The inference itself, on a blocking thread.
+///
+/// It holds the session mutex for as long as it runs, which is why it is the
+/// one thing here carrying the deadline rather than trusting the caller to
+/// cancel it: `spawn_blocking` cannot be cancelled from outside.
+async fn score_off_runtime(
+    query: String,
+    candidates: Vec<String>,
+    deadline: std::time::Instant,
+) -> Result<Vec<f64>> {
+    tokio::task::spawn_blocking(move || score_pairs(&query, &candidates, deadline))
+        .await
+        .context("reranker task panicked")?
+}
+
+/// Cross-encoder scores, best first. NaN sorts as equal rather than panicking:
+/// a model that emitted one has already failed, and taking the process down
+/// over the ordering of the evidence helps nobody.
+fn ranked(scored: Vec<f64>) -> Vec<(usize, f64)> {
     let mut indexed: Vec<(usize, f64)> = scored.into_iter().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(indexed)
+    indexed
 }
 
 const RERANK_CHUNK: usize = 16;
@@ -423,21 +453,35 @@ fn score_pairs(
         }
         let texts: Vec<String> = chunk.iter().map(|&i| candidates[i].clone()).collect();
 
-        let chunk_scores = if !fixed_shape() || texts.len() == chunk_size {
-            score_chunk(&mut session, tokenizer, query, &texts)?
-        } else {
-            let mut padded = texts.clone();
-            padded.resize(chunk_size, String::new());
-            let mut s = score_chunk(&mut session, tokenizer, query, &padded)?;
-            s.truncate(texts.len());
-            s
-        };
+        let chunk_scores = score_one_chunk(&mut session, tokenizer, query, &texts, chunk_size)?;
 
         for (pos, &original) in chunk.iter().enumerate() {
             scores[original] = chunk_scores[pos];
         }
         done += chunk.len();
     }
+    Ok(scores)
+}
+
+/// One batch, padded to the fixed shape when the session demands one.
+///
+/// Under `fixed_shape` every batch has to be the same size, so a short last
+/// chunk is padded with empty strings and their scores dropped again. Doing it
+/// here keeps the padding out of the loop that owns the deadline.
+fn score_one_chunk(
+    session: &mut Session,
+    tokenizer: &tokenizers::Tokenizer,
+    query: &str,
+    texts: &[String],
+    chunk_size: usize,
+) -> Result<Vec<f64>> {
+    if !fixed_shape() || texts.len() == chunk_size {
+        return score_chunk(session, tokenizer, query, texts);
+    }
+    let mut padded = texts.to_vec();
+    padded.resize(chunk_size, String::new());
+    let mut scores = score_chunk(session, tokenizer, query, &padded)?;
+    scores.truncate(texts.len());
     Ok(scores)
 }
 
@@ -816,7 +860,7 @@ mod tests {
         let loop_start = body
             .find("for chunk in order.chunks")
             .expect("the batch loop");
-        let first_work = body.find("score_chunk(").expect("the inference call");
+        let first_work = body.find("score_one_chunk(").expect("the inference call");
         // The check itself, not the word: `deadline` is also the parameter
         // name, which appears in the signature before the loop.
         let check = body
