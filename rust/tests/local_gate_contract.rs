@@ -17,6 +17,17 @@ fn read(rel: &str) -> String {
 }
 
 #[test]
+fn mutation_never_builds_into_a_target_somebody_else_uses() {
+    for script in ["scripts/mutants-gate.sh", "scripts/quality-gate.sh"] {
+        let body = read(script);
+        assert!(
+            body.contains("unset CARGO_TARGET_DIR"),
+            "{script} runs cargo mutants, which compiles a scratch copy per mutant. Pointed at a target directory anything else uses, it leaves artifacts behind and the next ordinary build fails tests on sources nobody edited - measured as four reds in rrf.rs and eval/datasets.rs after a green run."
+        );
+    }
+}
+
+#[test]
 fn merge_gate_is_the_local_judge_and_stays_strict() {
     let gate = read("scripts/merge-gate.sh");
     for needle in [

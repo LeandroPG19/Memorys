@@ -57,6 +57,15 @@ echo "=== cargo mutants (search cores with dense unit tests) ==="
 # --lib search:: keeps the unmutated baseline off contract tests that need
 # files outside rust/, and keeps each mutant's cargo test under a second.
 set +e
+# Each scratch copy must build into its own target/, so unset whatever points
+# at a shared one. quality-gate.sh has done this since it was written, and its
+# comment names the exact symptom: leftover mutant artifacts, rrf.rs among
+# them, make a later unmutated build fail tests that pass on a clean target.
+# This script never did it, so running inside the SIL it left its scratch
+# artifacts in the SIL's target and the *next* run started poisoned - four
+# tests red in rrf.rs and eval/datasets.rs, on sources nobody had touched.
+unset CARGO_TARGET_DIR
+
 # --timeout is 180, not 90. That budget was set when this ran two at a time;
 # at six, a slow test reported TIMEOUT instead of the CAUGHT it actually was,
 # and a timeout counts against the kill rate as though the mutant had lived.
