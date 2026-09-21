@@ -8,12 +8,19 @@ __pycache__/
 *.obj
 dist/
 build/
-rust/target/
+# Unanchored on purpose. `rust/target/` contains a slash, so git anchors it to
+# the repository root and it matches nothing deeper. Every cargo invocation in
+# the gate runs after a `cd` into `rust/` (merge-gate.sh:66, run-all-tests.sh:184,
+# crap-gate.sh:6, mutants-gate.sh:5), and CARGO_TARGET_DIR is resolved against
+# each process's own directory — so exporting a *relative* one lands the build
+# in `rust/rust/target-sil/`, which the anchored patterns did not cover. That
+# tree reached 11 GB untracked before anyone noticed it existed.
+target/
 # Scratch target dirs the gate scripts create so a run does not clobber the
 # locked live exe, plus cargo-mutants scratch. Never committed.
-rust/target-*/
-rust/mutants.out/
-rust/mutants.out.old/
+target-*/
+mutants.out/
+mutants.out.old/
 
 # Dependencies
 .venv/
@@ -32,6 +39,12 @@ npm/.bin/
 .env
 .env.local
 .env.*
+# `.env.*` only matches names that START with `.env.`, so the env file the
+# installer writes — `memory-industry.env`, which carries the bearer token for
+# the whole graph and the database URL — was not covered by any pattern here.
+# `*.env` is: no tracked file ends in `.env`, and the one this repo publishes as
+# an example ends in `.example`.
+*.env
 !.env.example
 
 # Editors

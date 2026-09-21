@@ -52,15 +52,24 @@ CUDA execution-provider libraries must sit **next to it** and be reachable on
 `PATH` (Windows) or `LD_LIBRARY_PATH` (Linux). `memory-industry models runtime
 --gpu` fetches the provider libraries as well as the main one.
 
-> **Known rough edge — the arena cap.** `CUBA_GPU_MEM_LIMIT_MB` defaults to
-> `2048`, and the resource planner never raises it above that number on any
-> machine. `bge-reranker-v2-m3` does not fit in 2048 MiB, so on a real card the
-> session fails to open with
-> `BFCArena::AllocateRawInternal: Available memory of N is smaller than
-> requested bytes of M`, and the daemon silently falls back to returning the
-> ranking unreordered. Until that is fixed, **set the cap yourself**: free VRAM
-> minus roughly 512 MiB of headroom. On an 8 GB card, `3072` is enough; more is
-> fine if the card is idle. Verify with `memory-industry doctor --deep`.
+**Do not set the arena cap by hand.** The planner measures it: the ceiling is
+all free VRAM minus the reserve, and what the model needs is read from the file
+on disk to decide whether it goes on the card at all and with which batch. An
+earlier version of this guide told you to set `3072` on an 8 GB card, because
+the ceiling used to be a 2048 MiB constant applied with `.min()` on every
+machine ever built, and `bge-reranker-v2-m3` does not fit in 2048 — so every GPU
+install failed with
+`BFCArena::AllocateRawInternal: Available memory of N is smaller than requested
+bytes of M` until somebody overrode it. That is fixed; a hand-picked number now
+only overrides a measured one.
+
+If you set `GPU_MEM_LIMIT_MB` anyway and it lands below what the model needs,
+the daemon raises it to the measured floor and logs an `ERROR` naming both
+numbers rather than failing at the first search. If you genuinely want the
+reranker off the card, the coherent way to say so is `RERANK_DEVICE=cpu` — a
+GPU with an impossible ceiling is not a configuration, it is a crash with extra
+steps. Verify either way with `memory-industry doctor --deep`, which now really
+does load the reranker.
 
 ## 4. The token
 

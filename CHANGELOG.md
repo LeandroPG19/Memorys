@@ -7,6 +7,32 @@ versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI
 
 ## [Unreleased]
 
+### Behaviour changes — read before deploying
+
+- **A narrow GPU may move to the CPU.** The CUDA arena ceiling was `DEFAULT_GPU_MEM_LIMIT_MB` (2048) applied with `.min()`, so it was 2048 on every machine regardless of the card, and `bge-reranker-v2-m3` does not fit in 2048. The ceiling is now all free VRAM minus the reserve, and what the model needs is measured from the file on disk. A card that today runs the reranker at 2048 and appears to work may now be placed on the CPU instead: an honest CPU beats an arena that bursts halfway through a batch. Override with `CUBA_RERANK_DEVICE`.
+- **Silent degradation becomes a visible error.** A CUDA provider that fails to register now drops to the CPU with an `ERROR` instead of a debug line, and a session that fails to commit is an error. Installs that believe they are on the GPU will find out that they are not. That is the point, but it will show up in logs on upgrade.
+- **An explicit GPU ceiling below the measured floor is raised**, with an `ERROR` naming both numbers. Every other knob still yields to whatever the operator set.
+- **`doctor` no longer reports `OK — mcp_sampling` under the HTTP daemon.** Sampling needs the stdio channel HTTP does not have, so it is a `warn` there, pointing at `memory-industry llm set ollama` or `MEMORY_INDUSTRY_LLM_BASE_URL`.
+- **Two machines no longer share one session.** `bind_key` takes the origin into account, so two PCs with the same `Mcp-Client-Id` and no `Mcp-Session-Id` stop sharing a jornada and a root project. Loopback stays a single bucket, so keys on existing single-machine installs are unchanged.
+- **The daemon announces its port after the models are warm**, not before. Start-up now blocks on the load (capped by `MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS`, default 180); connections queue in the kernel backlog rather than being served with an un-reranked answer. Binding still happens first, so a second daemon still fails fast.
+- **`/health` without a token no longer returns the runtime inventory**, including `graph_db.last_error`, which can carry a host and a port. With a token the full block is served, and the client list; without one, only its size.
+- **A token shorter than 32 characters is refused on a non-loopback bind**, and `/panel` is not published on one.
+
+### Fixed
+
+- The reranker's "disabled by the resource plan" sentinel now actually disables it instead of falling through to the model cache.
+- A search that asked for reranking and did not get it reports `reranker_degraded` in every case, with a distinct reason per cause — previously only on timeout or inference error, never on "there is no model".
+- `doctor --deep` loads the reranker, as its help text always claimed, and the NLI check no longer loads a gigabyte on the async executor (a live regression of `4d5dd76`).
+- The rerank budget covers the model load, and the permit is no longer held across it.
+- `doctor`'s port check reports real collisions instead of asserting that `:8788` belongs to Cursor's OAuth callback.
+
+### Gate
+
+- `quality-gate.sh` can judge a branch (`QG_BASE`); lizard lost `|| true` and gained a threshold plus `scripts/lizard-baseline.txt`; `quality-gate.ps1` is now a wrapper rather than a second opinion with its own exclusion list.
+- `codigo-muerto.sh` could not fail — every file hit `continue` before the counter. It now checks the test-exclusion lists and ships `--self-test`, which builds a tree with an orphan and asserts the scan is non-zero.
+- `#[ignore]` has a two-way ceiling; mutation no longer builds into the target directory the rest of the run uses.
+- `.gitignore`'s `target/` patterns are unanchored. They contained a slash, so git anchored them to the repository root, and a relative `CARGO_TARGET_DIR` under the gate's `cd rust` had put 11 GB in an untracked `rust/rust/target-sil/`.
+
 ## [0.26.0] — 2026-09-18
 
 ### rustls advisory
