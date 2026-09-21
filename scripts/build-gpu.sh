@@ -14,7 +14,38 @@ set -euo pipefail
 
 MEM_MAX="${CUBA_BUILD_MEM_MAX:-5G}"
 CPU_QUOTA="${CUBA_BUILD_CPU_QUOTA:-400%}"
-JOBS="${CUBA_BUILD_JOBS:-3}"
+
+# Parallelism derived from the machine, not pinned to a number.
+#
+# The values these replace were measured on a 14.9 GB laptop, and a constant
+# calibrated on one machine and then applied to every other one is exactly the
+# defect this release spent its time removing from the GPU path. The formula
+# below reproduces the old hand-tuned figure on the machine it was tuned for
+# (14.9 GB / 4 = 3) and scales from there.
+machine_cores() { nproc 2>/dev/null || echo 4; }
+
+machine_ram_gb() {
+  if [[ -r /proc/meminfo ]]; then
+    awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo
+    return
+  fi
+  powershell.exe -NoProfile -Command \
+    '[int]((Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize/1MB)' 2>/dev/null |
+    tr -d '\r' | grep -E '^[0-9]+$' || echo 8
+}
+# A release link with lto="fat" is the memory peak and it is single-threaded
+# anyway; the parallelism buys the several hundred dependency crates. Four GB
+# per lane is the headroom that keeps the peak from meeting the ceiling.
+default_build_jobs() {
+  local cores ram per_ram
+  cores=$(machine_cores)
+  ram=$(machine_ram_gb)
+  per_ram=$(( ram / 4 ))
+  (( per_ram < 1 )) && per_ram=1
+  (( cores < per_ram )) && { echo "$cores"; return; }
+  echo "$per_ram"
+}
+JOBS="${CUBA_BUILD_JOBS:-$(default_build_jobs)}"
 
 cd "$(dirname "$0")/../rust"
 

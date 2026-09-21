@@ -14,6 +14,42 @@ OUT_DIR="${TMPDIR:-/tmp}/memory-industry-mutants-out"
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
+
+# Parallelism derived from the machine, not pinned to a number.
+#
+# The values these replace were measured on a 14.9 GB laptop, and a constant
+# calibrated on one machine and then applied to every other one is exactly the
+# defect this release spent its time removing from the GPU path. The formula
+# below reproduces the old hand-tuned figure on the machine it was tuned for
+# (14.9 GB / 4 = 3) and scales from there.
+machine_cores() { nproc 2>/dev/null || echo 4; }
+
+machine_ram_gb() {
+  if [[ -r /proc/meminfo ]]; then
+    awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo
+    return
+  fi
+  powershell.exe -NoProfile -Command \
+    '[int]((Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize/1MB)' 2>/dev/null |
+    tr -d '\r' | grep -E '^[0-9]+$' || echo 8
+}
+# One mutant is a debug --lib build plus its tests: far lighter than a release
+# link, so this leans on cores. Capped at 6 because each run carries a 90 s
+# test timeout, and a saturated machine turns a caught mutant into a reported
+# TIMEOUT, which is a worse answer than a slower one.
+default_mutants_jobs() {
+  local half cap
+  half=$(( $(machine_cores) / 2 ))
+  cap=$(( $(machine_ram_gb) / 4 ))
+  (( half < 1 )) && half=1
+  (( cap < half )) && half=$cap
+  (( half > 6 )) && half=6
+  (( half < 1 )) && half=1
+  echo "$half"
+}
+MUTANTS_JOBS="${MUTANTS_JOBS:-$(default_mutants_jobs)}"
+echo "mutants jobs=$MUTANTS_JOBS (cores=$(machine_cores) ram=$(machine_ram_gb)GB)"
+
 echo "=== cargo mutants (search cores with dense unit tests) ==="
 # judge.rs / tools.rs / full search/* generate 655 mutants (~12h) and miss
 # almost every change in untested branches (LLM resolve, ONNX decode fallback).
@@ -26,7 +62,7 @@ cargo mutants \
   --file 'src/search/rrf.rs' \
   --file 'src/search/cache.rs' \
   --timeout 90 \
-  --jobs 2 \
+  --jobs "$MUTANTS_JOBS" \
   --output "$OUT_DIR" \
   -- --lib search::
 mutants_rc=$?
