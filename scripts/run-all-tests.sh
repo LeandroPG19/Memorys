@@ -7,6 +7,93 @@ RUST_DIR="$ROOT/rust"
 LIVE_DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
 export CUBA_JUDGE="${CUBA_JUDGE:-heuristic}"
 
+# Every path this gate hands to another process is absolute, and the resolution
+# happens here, once, before anything derives anything from it.
+#
+# A relative path survives every check that can be made from bash: `[[ -x ]]`
+# says yes, and so does Python's os.path.exists(). It then fails inside
+# subprocess.run() on Windows with `[WinError 2] cannot find the file`, forty
+# subprocesses later, in a message that names neither the path nor the cause.
+# Measured on this tree with CARGO_TARGET_DIR=rust/target-sil: all 25 E2E tool
+# calls died that way while the binary sat exactly where the banner said.
+abs_path() {
+  local path="$1" base="$2"
+  case "$path" in
+    /*|[A-Za-z]:/*|[A-Za-z]:\\*) printf '%s\n' "$path" ;;
+    *) printf '%s\n' "$base/$path" ;;
+  esac
+}
+
+# cargo resolves CARGO_TARGET_DIR against the cwd of each process that reads
+# it, and every cargo call in this gate runs after a `cd` into rust/
+# (merge-gate.sh, this script, crap-gate.sh, mutants-gate.sh). A relative value
+# therefore names two directories at once: cargo links into rust/rust/<value>
+# while every consumer reading the variable from the repository root looks in
+# <root>/<value>. Both existed on this machine, and the second one still held a
+# binary from an earlier run — the E2E was one step away from validating a
+# stale build in silence. The base is $ROOT and not the cwd of the moment,
+# because the cwd of the moment is the trap.
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  absolute_target_dir="$(abs_path "$CARGO_TARGET_DIR" "$ROOT")"
+  if [[ "$absolute_target_dir" != "$CARGO_TARGET_DIR" ]]; then
+    echo "note: CARGO_TARGET_DIR=$CARGO_TARGET_DIR is relative. This run uses" >&2
+    echo "      $absolute_target_dir, so cargo, bash and Python all mean the same" >&2
+    echo "      directory. Left relative, cargo would build in $ROOT/rust/$CARGO_TARGET_DIR" >&2
+    echo "      and everything else would read $ROOT/$CARGO_TARGET_DIR." >&2
+    export CARGO_TARGET_DIR="$absolute_target_dir"
+  fi
+fi
+
+# Honor CARGO_TARGET_DIR (Cursor sandbox points it off-tree).
+gate_target_dir() {
+  if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    printf '%s\n' "$CARGO_TARGET_DIR"
+  else
+    printf '%s\n' "$RUST_DIR/target"
+  fi
+}
+
+# The release binary the E2E drives, absolute whatever CUBA_BINARY_PATH held.
+# The base for a caller-supplied relative path is $RUST_DIR, which is the cwd
+# the E2E subprocess itself runs with.
+resolve_binary_path() {
+  local cand td
+  cand="${CUBA_BINARY_PATH:-}"
+  if [[ -z "$cand" ]]; then
+    td="$(gate_target_dir)"
+    cand="$td/release/memory-industry"
+  fi
+  cand="$(abs_path "$cand" "$RUST_DIR")"
+  # Prefer .exe even when Git Bash treats the extensionless name as existing
+  # (PATHEXT). Native Python Path.is_file() does not.
+  if [[ -f "${cand}.exe" ]]; then
+    printf '%s\n' "${cand}.exe"
+    return 0
+  fi
+  if [[ -f "$cand" ]]; then
+    printf '%s\n' "$cand"
+    return 0
+  fi
+  td="$(gate_target_dir)"
+  cand="$(abs_path "$td/release/cuba-memorys" "$RUST_DIR")"
+  if [[ -f "${cand}.exe" ]]; then
+    printf '%s\n' "${cand}.exe"
+    return 0
+  fi
+  printf '%s\n' "$cand"
+}
+
+# Answering this costs nothing and runs nothing, so a contract can drive the
+# real script with a relative CARGO_TARGET_DIR and read back what it resolved.
+# The test that was supposed to catch the bug above only asserted that this
+# file contains the string "CARGO_TARGET_DIR", which it did throughout.
+if [[ "${1:-}" == "--print-paths" ]]; then
+  printf 'CARGO_TARGET_DIR=%s\n' "${CARGO_TARGET_DIR:-$RUST_DIR/target}"
+  printf 'target_dir=%s\n' "$(gate_target_dir)"
+  printf 'binary=%s\n' "$(resolve_binary_path)"
+  exit 0
+fi
+
 CACHE_NEW="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry"
 CACHE_OLD="${XDG_CACHE_HOME:-$HOME/.cache}/cuba-memorys"
 # Prefer the cache that actually has the embedder. An empty memory-industry/
@@ -187,16 +274,9 @@ cd "$RUST_DIR"
 # whole budget recompiling and leave the throwaway DB with zero tables while
 # `|| true` hid the failure (exit 124).
 #
-# Honor CARGO_TARGET_DIR (Cursor sandbox points it off-tree). On Windows the
-# file is memory-industry.exe; `[[ -x memory-industry ]]` is false in Git Bash.
-gate_target_dir() {
-  if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-    printf '%s\n' "$CARGO_TARGET_DIR"
-  else
-    printf '%s\n' "$RUST_DIR/target"
-  fi
-}
-
+# gate_target_dir is defined at the top of this file, with the rest of the path
+# resolution. On Windows the file is memory-industry.exe; `[[ -x
+# memory-industry ]]` is false in Git Bash.
 gate_bin() {
   local td cand
   td="$(gate_target_dir)"
@@ -377,23 +457,9 @@ require_present "reranker tests (release: 387s in debug, seconds here)" \
   cargo test --release --test v017_rerank_gpu -- --ignored --nocapture
 
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
-if [[ -z "${CUBA_BINARY_PATH:-}" ]]; then
-  td="$(gate_target_dir)"
-  CUBA_BINARY_PATH="$td/release/memory-industry"
-fi
-# Prefer .exe even when Git Bash treats the extensionless name as existing
-# (PATHEXT). Native Python Path.is_file() does not.
-if [[ -f "${CUBA_BINARY_PATH}.exe" ]]; then
-  CUBA_BINARY_PATH="${CUBA_BINARY_PATH}.exe"
-fi
-if [[ ! -f "$CUBA_BINARY_PATH" ]]; then
-  td="$(gate_target_dir)"
-  CUBA_BINARY_PATH="$td/release/cuba-memorys"
-  if [[ -f "${CUBA_BINARY_PATH}.exe" ]]; then
-    CUBA_BINARY_PATH="${CUBA_BINARY_PATH}.exe"
-  fi
-fi
+CUBA_BINARY_PATH="$(resolve_binary_path)"
 export CUBA_BINARY_PATH
+echo "E2E binary: $CUBA_BINARY_PATH"
 # Prefer PYTHON_BIN (set by run-gate on Windows). Never use the Microsoft Store
 # python3.exe stub under WindowsApps — it prints install text and exits 49.
 resolve_python() {
@@ -418,6 +484,43 @@ echo "python=$PY"
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 "$PY" tests/e2e_all_tools.py
+
+# The gate has always built with --features cuda (build-gpu.sh, above) and then
+# asserted nothing about where the work landed. A CUDA build that degrades to
+# the CPU answers every call correctly and only costs 58x, so nothing about a
+# green run distinguishes it from one on a card.
+#
+# What is asserted here is the DECISION, not the kernel: no merge machine
+# without a GPU can show that a kernel executed on one. doctor's `gpu` check is
+# compared against what this machine independently says it has. A machine with
+# no card reporting CPU is the correct answer and stays green — if it did not,
+# nobody would keep the step.
+echo "=== GPU placement (doctor --json must agree with this machine) ==="
+if [[ ! -f "$CUBA_BINARY_PATH" ]]; then
+  echo "FAIL: no binary at $CUBA_BINARY_PATH, so there is nothing to ask about placement." >&2
+  echo "      This step reads the release build scripts/build-gpu.sh just produced" >&2
+  echo "      (--features cuda). Judging any other binary would report on a build that" >&2
+  echo "      never had GPU support compiled in and call the answer honest." >&2
+  exit 1
+fi
+doctor_json="$(mktemp)"
+doctor_err="$(mktemp)"
+doctor_exit=0
+DATABASE_URL="$GATE_DATABASE_URL" "$CUBA_BINARY_PATH" doctor --json \
+  >"$doctor_json" 2>"$doctor_err" || doctor_exit=$?
+if [[ ! -s "$doctor_json" ]]; then
+  echo "FAIL: $CUBA_BINARY_PATH doctor --json printed nothing (exit $doctor_exit)." >&2
+  echo "      Its stderr:" >&2
+  cat "$doctor_err" >&2
+  rm -f "$doctor_json" "$doctor_err"
+  exit 1
+fi
+# doctor exits 1 when ANY of its checks fails, and this step judges one check on
+# its own. The exit code is reported, not obeyed — and the JSON, not the code,
+# is what decides below.
+echo "doctor --json exited $doctor_exit ($(wc -c <"$doctor_json") bytes)"
+"$ROOT/scripts/gpu-placement-check.sh" "$doctor_json"
+rm -f "$doctor_json" "$doctor_err"
 
 echo "=== MCP live session (single process, initialize + tools/list + calls) ==="
 "$PY" "$ROOT/scripts/mcp_live_session_test.py"

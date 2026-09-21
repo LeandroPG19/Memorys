@@ -12,7 +12,7 @@ Second judge, chained, not a substitute: `./scripts/quality-gate.sh` (lizard + `
 |---|---|
 | Postgres :5488 | The cluster is up before anything mutates |
 | Optional backup | Live corpus is snapshotted unless `SKIP_BACKUP=1` |
-| `scripts/run-all-tests.sh` | fmt, clippy `-D warnings`, unit + ignored integration on throwaway `brain_gate` / peer, e2e MCP + live (no soft-skip), eval smoke |
+| `scripts/run-all-tests.sh` | fmt, clippy `-D warnings`, unit + ignored integration on throwaway `brain_gate` / peer, e2e MCP + live (no soft-skip), GPU placement vs `doctor --json`, eval smoke |
 | `--features docs` | clippy + tests of the docs feature |
 | `cargo deny` | licenses, bans, sources |
 | npm wrapper smoke | `npm/install.test.js` |
@@ -29,7 +29,7 @@ Oracles and fixtures decide green — not an AI opinion.
 Read this before trusting a green run (copied from the gate banner):
 
 - **Reranker in E2E.** `e2e_all_tools.py` points `CUBA_RERANKER_PATH` at an empty dir so calls exercise the identity fallback. `mcp_live_session_test.py` inherits your shell and **does** use the real reranker. Both suites must stay.
-- **GPU placement.** A CUDA build can still run work on CPU; nothing fails if it does.
+- **GPU placement.** Only the *decision*, not the kernel. After the E2E, `scripts/gpu-placement-check.sh` reads `doctor --json` and fails when the `gpu` check disagrees with this machine: a fallback to CPU where an NVIDIA device **and** the ONNX Runtime provider libraries are both present, or a check that never names the CPU on a machine that has neither. That a kernel really executed on the GPU cannot be proven without a card — there is none in CI — and is still not covered here.
 - **Retrieval quality.** Eval is a smoke run. It proves the harness executes; it asserts no nDCG threshold.
 - **Other platforms.** The judge runs on the merge machine (typically Linux x64).
 - **Migrations on old DBs.** The throwaway database is created from scratch. A migration that only works on an existing schema is still not covered.

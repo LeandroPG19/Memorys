@@ -47,7 +47,26 @@ default_build_jobs() {
 }
 JOBS="${CUBA_BUILD_JOBS:-$(default_build_jobs)}"
 
-cd "$(dirname "$0")/../rust"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT/rust"
+
+# cargo resolves CARGO_TARGET_DIR against the cwd of whatever process reads it,
+# and this script reads it from rust/ while its callers read it from the
+# repository root. Left relative, the two disagree: the link lands in
+# rust/<value> and the caller looks in <root>/<value>. The path printed at the
+# bottom is also handed to a human and to an MCP client config, and a relative
+# one cannot be executed at all on Windows — subprocess.run answers WinError 2
+# while os.path.exists() on the same string says yes. Same base as
+# run-all-tests.sh, or the two scripts would still mean different directories.
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  case "$CARGO_TARGET_DIR" in
+    /*|[A-Za-z]:/*|[A-Za-z]:\\*) ;;
+    *)
+      echo "note: CARGO_TARGET_DIR=$CARGO_TARGET_DIR is relative; this build uses $ROOT/$CARGO_TARGET_DIR" >&2
+      export CARGO_TARGET_DIR="$ROOT/$CARGO_TARGET_DIR"
+      ;;
+  esac
+fi
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     echo "warning: no nvidia-smi on PATH — building with the cuda feature anyway."
@@ -67,7 +86,8 @@ fi
 
 # cargo writes here when Cursor/sandbox sets CARGO_TARGET_DIR. A hardcoded
 # rust/target/release then 127s on `cuba-memorys` after a six-minute link.
-td="${CARGO_TARGET_DIR:-target}"
+# Absolute either way: the value below is printed for somebody to paste.
+td="${CARGO_TARGET_DIR:-$ROOT/rust/target}"
 BIN=""
 for cand in \
   "$td/release/memory-industry.exe" \

@@ -2,6 +2,7 @@
 //! If someone removes require_present / deny / docs / codigo-muerto from the
 //! scripts, this fails before a soft gate can look green again.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 fn repo_root() -> std::path::PathBuf {
@@ -438,5 +439,254 @@ fn the_second_judge_can_look_at_a_branch_and_its_crap_gate_can_fail() {
     assert!(
         entries > 50,
         "the complexity baseline lists {entries} functions. Without it a ceiling is unusable on a tree that already has complex ones: touching a single line of a CC 30 function would fail the whole diff, and the first thing anybody would do is put the || true back."
+    );
+}
+
+/// The banner the gate prints and the doc a reader opens are the same
+/// paragraph in two files, and the doc says so in as many words ("copied from
+/// the gate banner"). Two copies with nothing holding them together drift the
+/// moment one of them is right: somebody makes the gate check something new,
+/// updates the banner they can see scrolling past, and the doc keeps promising
+/// the old hole to everybody who reads it instead of running it.
+fn banner_does_not_check_block() -> String {
+    let gate = read("scripts/merge-gate.sh");
+    let start = gate
+        .find("WHAT THIS GATE DOES NOT CHECK")
+        .expect("merge-gate.sh must keep printing what a green run does not prove");
+    let rest = &gate[start..];
+    let end = rest
+        .find("WHAT IT REQUIRES")
+        .expect("the not-checked list ends where the requirements begin");
+    rest[..end].to_string()
+}
+
+fn doc_does_not_check_section() -> String {
+    const HEADING: &str = "## What it does **not** check";
+    let doc = read("docs/gate.md");
+    let start = doc
+        .find(HEADING)
+        .unwrap_or_else(|| panic!("docs/gate.md must keep the `{HEADING}` section"));
+    let rest = &doc[start + HEADING.len()..];
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+#[test]
+fn the_gate_banner_and_the_gate_doc_do_not_disagree() {
+    let banner = banner_does_not_check_block();
+    let section = doc_does_not_check_section();
+
+    let banner_bullets = banner.lines().filter(|line| line.contains('·')).count();
+    let doc_titles: Vec<String> = section
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- **"))
+        .filter_map(|line| line.split("**").next())
+        .map(|title| title.trim_end_matches('.').to_lowercase())
+        .collect();
+
+    assert!(
+        banner_bullets > 0 && !doc_titles.is_empty(),
+        "the scan found {banner_bullets} banner bullet(s) and {} doc bullet(s). A green \
+         result from a scan that found nothing proves nothing, and every assertion below \
+         would be vacuous",
+        doc_titles.len()
+    );
+    assert_eq!(
+        banner_bullets,
+        doc_titles.len(),
+        "merge-gate.sh lists {banner_bullets} thing(s) it does not check and docs/gate.md \
+         lists {}: {doc_titles:?}. The doc says it is copied from the banner, so the two \
+         move in the same edit or the copy starts lying — and the copy is the one people \
+         read instead of running the gate",
+        doc_titles.len()
+    );
+
+    let banner_lower = banner.to_lowercase();
+    for title in &doc_titles {
+        assert!(
+            banner_lower.contains(title.as_str()),
+            "docs/gate.md warns about `{title}` and the gate banner never mentions it. \
+             Whichever of the two is right, the other one is telling somebody the gate \
+             covers something it does not"
+        );
+    }
+    assert!(
+        section.contains("copied from the gate banner"),
+        "the doc has to keep pointing at the banner as its source, or the next reader has \
+         no way to know there is a second copy at all"
+    );
+}
+
+/// The hole this doc used to have was an omission, which is the kind nobody
+/// notices: "GPU placement — a CUDA build can still run work on CPU; nothing
+/// fails if it does" said what was not checked and never said that a machine
+/// without a card cannot check it, so the sentence read like laziness rather
+/// than a limit. Now that the gate does assert the decision, both copies have
+/// to say which half they cover, and the step has to exist.
+#[test]
+fn the_gpu_hole_is_declared_and_the_half_that_can_be_checked_is_checked() {
+    let suite = read("scripts/run-all-tests.sh");
+    let e2e = suite
+        .find("tests/e2e_all_tools.py")
+        .expect("run-all-tests.sh runs the E2E suite");
+    let placement = suite.find("scripts/gpu-placement-check.sh").expect(
+        "run-all-tests.sh must run scripts/gpu-placement-check.sh. Without it both the \
+         banner and the doc below describe an assertion nobody makes, which is worse than \
+         the omission they replaced",
+    );
+    assert!(
+        placement > e2e,
+        "the placement check has to run after the E2E: it reads the release binary the E2E \
+         drives, and running it first would judge whatever build happened to be lying around"
+    );
+
+    for (which, text) in [
+        ("scripts/merge-gate.sh", banner_does_not_check_block()),
+        ("docs/gate.md", doc_does_not_check_section()),
+    ] {
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("doctor --json"),
+            "{which} has to name what now asserts GPU placement — `doctor --json` — or the \
+             claim cannot be checked by the person reading it"
+        );
+        assert!(
+            lower.contains("kernel") && lower.contains("without a card"),
+            "{which} has to say which half is still uncovered: that a kernel really executed \
+             on the GPU is unprovable without a card, and there is none in CI. An omission is \
+             the kind of hole nobody argues with"
+        );
+        assert!(
+            !lower.contains("nothing fails if it does") && !lower.contains("no assertion fails"),
+            "{which} still says nothing fails when a CUDA build lands on the CPU. Something \
+             does now, and a gate description that undersells itself gets deleted by the next \
+             person who checks it"
+        );
+    }
+}
+
+/// The guard that has to be able to fail.
+///
+/// `gpu-placement-check.sh` decides from two independent readings of the same
+/// machine, and on a machine with no card the honest answer is "CPU" — which
+/// means the common case is green and a checker that had quietly stopped
+/// deciding anything would look exactly the same. Its `--self-test` puts a
+/// machine and a doctor answer side by side that contradict each other, one
+/// per guard, and reports whether each one was refused.
+#[test]
+fn the_gpu_placement_check_can_actually_fail() {
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/gpu-placement-check.sh", "--self-test"])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "gpu-placement-check.sh --self-test did not pass, so at least one of its guards no \
+         longer refuses a contradiction. stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("every guard in gpu-placement-check failed against a fixture"),
+        "the self-test exited 0 without saying it ran. An exit code alone is what let \
+         codigo-muerto.sh pass for months while doing nothing. stdout: {stdout}"
+    );
+}
+
+fn looks_absolute(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+}
+
+fn print_paths(env: &[(&str, &str)]) -> (HashMap<String, String>, String) {
+    let mut cmd = std::process::Command::new(git_bash());
+    cmd.args(["scripts/run-all-tests.sh", "--print-paths"])
+        .current_dir(repo_root())
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CUBA_BINARY_PATH");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "run-all-tests.sh --print-paths exited {:?}. It resolves paths and exits before it \
+         runs anything, so a failure here is the resolution itself.\nstdout: {stdout}\n\
+         stderr: {stderr}",
+        out.status.code()
+    );
+
+    let paths = stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    (paths, stderr)
+}
+
+/// Every path this gate hands to another process is absolute, and the test
+/// that was meant to guarantee it was a paragraph.
+///
+/// `gate_bin_finds_the_binary_under_cargo_target_dir` asserts that
+/// run-all-tests.sh *contains the string* "CARGO_TARGET_DIR". It did, all
+/// along, while the script passed a relative value straight through: cargo
+/// resolves that variable against each process's cwd and every cargo call in
+/// the gate runs from rust/, so `rust/target-sil` meant `rust/rust/target-sil`
+/// for the build (11 GB of it, measured) and `<root>/rust/target-sil` for
+/// everything that read it from the repository root. Both existed here and the
+/// second one held an older binary.
+///
+/// The failure it produced names nothing: `[[ -x ]]` accepts a relative path,
+/// Python's `os.path.exists()` accepts the same string, and then
+/// `subprocess.run()` on Windows refuses to start it with `WinError 2` — forty
+/// subprocesses into the E2E. So this drives the real script and reads back
+/// what it resolved, rather than looking for a word in its source.
+#[test]
+fn every_path_the_gate_hands_to_another_process_is_absolute() {
+    let (paths, stderr) = print_paths(&[("CARGO_TARGET_DIR", "rust/target-sil")]);
+    assert_eq!(
+        paths.len(),
+        3,
+        "--print-paths must answer with CARGO_TARGET_DIR, target_dir and binary. It answered \
+         {paths:?}, and a scan that found nothing would pass the loop below without looking \
+         at a single path"
+    );
+    for (key, value) in &paths {
+        assert!(
+            looks_absolute(value),
+            "with CARGO_TARGET_DIR=rust/target-sil the gate resolved {key} to `{value}`. A \
+             relative path survives every check bash and Python can make and then cannot be \
+             executed at all on Windows, forty subprocesses later.\nstderr: {stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("is relative"),
+        "a run that silently relocates somebody's build directory is the other half of this \
+         bug: whoever set CARGO_TARGET_DIR is entitled to read where it ended up. stderr was: \
+         {stderr}"
+    );
+
+    let (paths, _) = print_paths(&[("CUBA_BINARY_PATH", "target/release/memory-industry")]);
+    let binary = paths
+        .get("binary")
+        .expect("--print-paths answers with the binary it would hand to the E2E");
+    assert!(
+        looks_absolute(binary),
+        "a caller who exported CUBA_BINARY_PATH by hand got `{binary}` back. The E2E launches \
+         that string with subprocess.run(), which is the one caller that cannot cope with a \
+         relative path"
     );
 }

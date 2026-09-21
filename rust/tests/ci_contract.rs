@@ -86,6 +86,131 @@ fn the_integration_step_discovers_tests_by_glob_not_by_a_hand_written_list() {
     );
 }
 
+/// Why each file in `MODEL_OR_CLI_ONLY` is out of the GitHub job, one sentence
+/// each, and what runs it instead.
+///
+/// The list and the reasons move together on purpose. An exclusion list is how
+/// coverage leaves a workflow without anybody deciding to let it: one name
+/// appended in a hurry and that file stops running on every push, with the job
+/// still green over the commit that stopped it — which is exactly what
+/// happened to the `--test` flags this discovery loop replaced. Pairing each
+/// name with the thing the runner does not have makes growing the list an
+/// edit somebody has to mean.
+const MODEL_OR_CLI_ONLY_REASONS: [(&str, &str); 7] = [
+    (
+        "v016_chunking",
+        "hard-asserts embeddings::onnx::is_model_loaded(); the runner has no ONNX embedder \
+         (ONNX_MODEL_PATH is unset there). Locally: require_present \"tests that need the \
+         embedding model\" in run-all-tests.sh",
+    ),
+    (
+        "v016_extract_without_sampling",
+        "hard-asserts judge::resolve_offline_llm().is_some(); the runner has no generative \
+         LLM and no authenticated claude/gemini. Locally: require_generative_llm",
+    ),
+    (
+        "v017_relation_scan",
+        "the relation scan drives a local LLM subprocess and hard-asserts the same \
+         resolve_offline_llm(). Locally: require_generative_llm",
+    ),
+    (
+        "v017_rerank_gpu",
+        "hard-asserts a reranker model on disk and runs --release (387s in debug); the \
+         runner has no reranker model. Locally: require_present \"reranker tests\" against \
+         $CUBA_RERANKER_PATH/model.onnx",
+    ),
+    (
+        "nli_entailment",
+        "hard-asserts nli::available() && nli::enabled(); the runner has no NLI model. It \
+         used to self-skip through nli::available() and now refuses to, because the local \
+         gate forbids a soft skip. Locally: require_present \"tests that need the NLI model\"",
+    ),
+    (
+        "nli_cost",
+        "same NLI model hard-assert; it is a measurement of cost by premise length, which \
+         says nothing at all without the model. Locally: the same require_present",
+    ),
+    (
+        "nli_probe",
+        "same NLI model hard-assert, and it reads tokenizer.json out of the model directory \
+         directly. Locally: the same require_present",
+    ),
+];
+
+/// Growing the exclusion list has to be a deliberate edit, and the reason has
+/// to arrive with the name.
+///
+/// Two-sided on purpose, as everything with a baseline in this repo is: this
+/// fails when the list grows AND when it shrinks without the table being
+/// updated, because a name silently dropped from the workflow while its reason
+/// stays here is the same drift pointing the other way.
+#[test]
+fn the_exclusion_list_grows_only_by_a_deliberate_edit_that_says_why() {
+    let yaml = ci_yaml();
+    let excluded = bash_array(&yaml, "MODEL_OR_CLI_ONLY");
+
+    assert!(
+        !excluded.is_empty(),
+        "MODEL_OR_CLI_ONLY parsed as empty. A green result from a scan that found nothing \
+         proves nothing, and every assertion below would be vacuous"
+    );
+
+    let reason_for = |name: &str| -> Option<&'static str> {
+        MODEL_OR_CLI_ONLY_REASONS
+            .iter()
+            .find(|entry| entry.0 == name)
+            .map(|entry| entry.1)
+    };
+
+    let paste_ready: String = excluded
+        .iter()
+        .map(|name| {
+            let reason = reason_for(name.as_str())
+                .unwrap_or("WHAT does the runner not have that this file hard-asserts?");
+            format!("    (\n        \"{name}\",\n        \"{reason}\",\n    ),\n")
+        })
+        .collect();
+    let paste_ready = format!(
+        "const MODEL_OR_CLI_ONLY_REASONS: [(&str, &str); {}] = [\n{paste_ready}];",
+        excluded.len()
+    );
+
+    assert_eq!(
+        excluded.len(),
+        MODEL_OR_CLI_ONLY_REASONS.len(),
+        "ci.yml excludes {} test file(s) from the GitHub job and this table explains {}. \
+         Paste this over MODEL_OR_CLI_ONLY_REASONS in rust/tests/ci_contract.rs and write \
+         the missing sentence(s):\n\n{paste_ready}\n",
+        excluded.len(),
+        MODEL_OR_CLI_ONLY_REASONS.len()
+    );
+
+    for name in &excluded {
+        let reason = reason_for(name.as_str()).unwrap_or_else(|| {
+            panic!(
+                "ci.yml excludes `{name}` from the GitHub job and nothing here says what the \
+                 runner is missing. Add it with its reason:\n\n{paste_ready}\n"
+            )
+        });
+        assert!(
+            reason.len() > 30,
+            "`{name}` is excluded with `{reason}` beside it. A placeholder is the same list \
+             with extra ceremony: say which model or CLI the runner does not have, and name \
+             the guard in run-all-tests.sh that runs the file locally instead"
+        );
+    }
+
+    for entry in MODEL_OR_CLI_ONLY_REASONS {
+        assert!(
+            excluded.iter().any(|actual| actual.as_str() == entry.0),
+            "this table explains why `{}` is out of the GitHub job, and ci.yml no longer \
+             excludes it. Either it runs there now — delete the entry in the same edit — or \
+             somebody dropped it from the list and the reason outlived the fact",
+            entry.0
+        );
+    }
+}
+
 #[test]
 fn every_excluded_test_file_actually_exists() {
     let yaml = ci_yaml();
