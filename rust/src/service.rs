@@ -243,8 +243,10 @@ fn read_or_empty(name: &str) -> String {
 pub fn planner_keys() -> Vec<String> {
     use crate::resources::{Plan, Tier};
 
-    // The numbers are placeholders: only which keys come out depends on the
-    // booleans and on `gpu_mem_limit_mb` being present.
+    // The numbers are placeholders, and so is `reranker_on_gpu`: `plan_env`
+    // pushes CUBA_RERANK_DEVICE either way and that flag only picks its value.
+    // Which keys come out depends on `reranker`, `nli` and on whether
+    // `gpu_mem_limit_mb` is present, so those are the three the off plan flips.
     let everything_on = Plan {
         tier: Tier::Full,
         embedder: true,
@@ -266,10 +268,8 @@ pub fn planner_keys() -> Vec<String> {
     };
     let everything_off = Plan {
         reranker: false,
-        reranker_on_gpu: false,
         nli: false,
         gpu_mem_limit_mb: None,
-        gpu_mem_floor_mb: None,
         ..everything_on.clone()
     };
 
@@ -780,20 +780,30 @@ pub fn write_one(path: &Path, contents: &str, secrecy: Secrecy) -> Result<Wrote>
     Ok(Wrote::Created { restricted })
 }
 
-#[cfg(unix)]
+/// Whether the installer actually took the file away from the other accounts on
+/// the box.
+///
+/// On unix that is `chmod 0600`. Elsewhere it is nothing: AppData is per user
+/// and there is no portable chmod. What we do NOT do comes back as a value,
+/// because a silent omission cannot be told apart from an oversight.
+///
+/// One function with the `cfg` inside, never two `cfg`-split ones: a body the
+/// gate's platform never compiles is a mutant the mutation run still reports
+/// and no test on that platform can kill.
 fn restrict(path: &Path) -> Result<bool> {
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
 
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("no se pudo restringir {}", path.display()))?;
-    Ok(true)
-}
-
-/// AppData is per user and there is no portable chmod. What we do NOT do comes
-/// back as a value: a silent omission cannot be told apart from an oversight.
-#[cfg(windows)]
-fn restrict(_path: &Path) -> Result<bool> {
-    Ok(false)
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("no se pudo restringir {}", path.display()))?;
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(false)
+    }
 }
 
 pub fn write_all(u: &Unit, target: Target, root: &Path) -> Result<Vec<(PathBuf, Wrote)>> {
@@ -908,6 +918,23 @@ mod tests {
         } else {
             "/home/operador/.local/bin/memory-industry"
         })
+    }
+
+    /// Pins the two variables `Unit::from_env` resolves the install root from.
+    ///
+    /// Without them a `--windows` row fails for want of LOCALAPPDATA on a unix
+    /// host and a `--linux` row for want of HOME under a Windows service
+    /// account, and a row that ends in an error has stopped testing whatever it
+    /// was written for.
+    ///
+    /// Take `session::GLOBAL_STATE_GUARD` before calling: `set_var` is unsound
+    /// while another thread may be reading the environment.
+    fn pinned_install_root(scratch: &Scratch) -> [crate::envs::ScopedEnv; 2] {
+        let root = scratch.0.display().to_string();
+        [
+            crate::envs::ScopedEnv::set("HOME", &root),
+            crate::envs::ScopedEnv::set("LOCALAPPDATA", &root),
+        ]
     }
 
     /// Reads a file this module wrote, whichever encoding it went out in.
@@ -1210,6 +1237,156 @@ mod tests {
         );
     }
 
+    // --- from_env: this machine and these flags, not the goldens ----------------
+
+    #[tokio::test]
+    async fn a_token_is_generated_exactly_when_the_address_can_be_reached() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("token-when-routable");
+        let _pinned = pinned_install_root(&scratch);
+
+        // The guard on that arm is the whole difference between an install
+        // nobody else can reach and one anybody on the subnet can. Always
+        // taken, a LAN install comes back with no token and the daemon
+        // publishes the graph; never taken, a loopback install carries a bearer
+        // token nobody asked for and every client has to be told about it.
+        for (profile, given_addr, expects_token) in [
+            (Profile::Loopback, None, false),
+            (Profile::Loopback, Some(DEFAULT_LOOPBACK_ADDR), false),
+            (Profile::Lan, Some(ROUTABLE), true),
+        ] {
+            for target in [Target::Linux, Target::Windows] {
+                let unit = match Unit::from_env(profile, target, given_addr, None) {
+                    Ok(unit) => unit,
+                    Err(e) => panic!(
+                        "--profile {} --addr {given_addr:?} is a supported install and it was \
+                         refused: {e}",
+                        profile.label()
+                    ),
+                };
+
+                assert_eq!(
+                    unit.token.is_some(),
+                    expects_token,
+                    "--profile {} on {} must {}come back with a token",
+                    profile.label(),
+                    unit.addr,
+                    if expects_token { "" } else { "NOT " }
+                );
+
+                if let Some(token) = unit.token.as_deref() {
+                    assert_eq!(
+                        refuse_unsafe(profile, &unit.addr, Some(token)),
+                        None,
+                        "the installer generated a token its own check rejects, so `--apply` \
+                         fails on a machine where nothing is wrong"
+                    );
+                }
+            }
+        }
+
+        // The arm above the guard: a token the operator passed is the one
+        // installed, or `--token` is a flag that quietly does nothing and the
+        // clients they already configured stop being able to talk.
+        let given = "d".repeat(64);
+        let unit = Unit::from_env(
+            Profile::Lan,
+            Target::Linux,
+            Some(ROUTABLE),
+            Some(given.as_str()),
+        )
+        .expect("a routable address with a long token is the supported LAN install");
+        assert_eq!(unit.token.as_deref(), Some(given.as_str()));
+    }
+
+    #[tokio::test]
+    async fn what_the_operator_already_set_travels_into_the_env_file_verbatim() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("chosen-from-env");
+        let _pinned = pinned_install_root(&scratch);
+
+        // A real mode rather than an invented word: `mode::active()` reads this
+        // same variable, and leaving nonsense in it while the guard is held
+        // would show every other reader in this binary a mode that is not one.
+        let _mode = crate::envs::ScopedEnv::set("CUBA_MODE", "red");
+        let _db = crate::envs::ScopedEnv::cleared("DATABASE_URL");
+
+        let unit = Unit::from_env(Profile::Loopback, Target::Linux, None, None)
+            .expect("a loopback install needs nothing but a home directory");
+
+        assert_eq!(
+            unit.chosen
+                .iter()
+                .find(|(key, _)| key.as_str() == "CUBA_MODE")
+                .map(|(_, value)| value.as_str()),
+            Some("red"),
+            "the file has to carry the mode this machine is already running. A render that \
+             ignores what is set hands the operator a file that moves them back to «local» the \
+             next time the daemon starts, and nothing says so"
+        );
+        assert_eq!(
+            unit.chosen
+                .iter()
+                .find(|(key, _)| key.as_str() == "DATABASE_URL")
+                .map(|(_, value)| value.as_str()),
+            Some(""),
+            "a variable nobody set has to come out empty. Anything else is written into the \
+             file as though the operator had chosen it, and `resources::set_if_absent` then \
+             leaves that invention in charge for good"
+        );
+
+        let body = render_env_file(&unit);
+        assert!(
+            body.lines().any(|l| l == "CUBA_MODE=red"),
+            "what from_env read has to reach the file uncommented, or it is not what the daemon \
+             will start with:\n{body}"
+        );
+        assert!(
+            body.lines().any(|l| l == "DATABASE_URL="),
+            "the empty line is the prompt the operator fills in; an invented value is a \
+             connection string that fails at the first query:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_measurement_is_annotated_on_the_key_it_was_measured_for() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("annotations");
+        let _pinned = pinned_install_root(&scratch);
+
+        let unit = Unit::from_env(Profile::Loopback, Target::Linux, None, None)
+            .expect("a loopback install needs nothing but a home directory");
+
+        // Anchor before absence: an empty `computed` would satisfy any search
+        // below while proving nothing.
+        assert!(
+            unit.computed.len() >= 5,
+            "from_env offered {} planner keys, so nothing below this can fail",
+            unit.computed.len()
+        );
+
+        // Pairing a key with its own measurement is the whole job of that
+        // lookup, and looking it up by «any key but this one» still finds
+        // something — the first pair whose key is a different one. The operator
+        // then reads a thread count where the placement of the reranker should
+        // be. CUBA_RERANK_DEVICE is the one key whose values are words, so it
+        // is the one that tells the two lookups apart on any machine.
+        let device = unit
+            .computed
+            .iter()
+            .find(|(key, _)| key.as_str() == "CUBA_RERANK_DEVICE")
+            .map(|(_, measured)| measured.clone())
+            .expect("CUBA_RERANK_DEVICE is a key `resources::plan_env` always emits");
+
+        assert!(
+            matches!(device.as_deref(), Some("gpu" | "cpu")),
+            "this machine's CUBA_RERANK_DEVICE is annotated {device:?}, which is not a place a \
+             model can run. That line is what the operator reads to find out whether the \
+             reranker landed on the card, and anything else there is another key's measurement \
+             wearing this key's name"
+        );
+    }
+
     // --- What the rendered files may and may not contain ------------------------
 
     #[test]
@@ -1368,6 +1545,189 @@ mod tests {
             with_card, without,
             "a machine with a card and one without must not render the same explanation, or the \
              explanation is a constant and says nothing about this machine"
+        );
+    }
+
+    // --- Each render names THIS unit, not a template ----------------------------
+    //
+    // `rust/tests/packaging_contract.rs` pins the fixed text of these files
+    // against the tree under `packaging/`, and it can only do that for the one
+    // `Unit` the goldens were rendered from — `documented()`, with no
+    // measurement and no token. What varies per install, which is the binary,
+    // the address and the env file, has no golden and is asserted here.
+
+    #[test]
+    fn the_unit_starts_this_binary_on_this_address_and_takes_its_knobs_from_the_env_file() {
+        let unit = lan_unit(Target::Linux, &"a".repeat(64));
+        let systemd = render_systemd(&unit);
+
+        let Some(exec) = systemd.lines().find(|l| l.starts_with("ExecStart=")) else {
+            panic!("a unit with no ExecStart starts nothing:\n{systemd}");
+        };
+        assert!(
+            exec.contains(&unit.exe.display().to_string()),
+            "ExecStart has to name the binary this install resolved, not one a golden rendered \
+             on somebody else's machine: {exec}"
+        );
+        assert!(
+            exec.contains(&unit.addr.to_string()),
+            "and the address this install chose, or systemd brings the daemon up on a port no \
+             client was told about: {exec}"
+        );
+
+        let Some(env_line) = systemd.lines().find(|l| l.starts_with("EnvironmentFile=")) else {
+            panic!(
+                "with no EnvironmentFile the daemon starts with no DATABASE_URL and no token, \
+                 and systemd reports it as running:\n{systemd}"
+            );
+        };
+        assert!(
+            env_line.contains(&unit.env_file.display().to_string()),
+            "the unit has to read the file --apply actually writes: {env_line}"
+        );
+        assert!(
+            !systemd.lines().any(|l| l.starts_with("Environment=")),
+            "a value pinned in the unit is a second source of truth for the defaults, and \
+             `resources::set_if_absent` lets an already-set variable win — which is exactly how \
+             a hand-written GPU ceiling beat the planner on every card this daemon ran \
+             on:\n{systemd}"
+        );
+        assert!(
+            systemd.contains(REPO_URL),
+            "Documentation= pointed at a repository that does not exist for a whole release, \
+             and the operator who follows it is the one already lost:\n{systemd}"
+        );
+    }
+
+    #[test]
+    fn the_socket_holds_the_port_the_service_is_told_to_serve() {
+        let unit = lan_unit(Target::Linux, &"a".repeat(64));
+        let socket = render_socket(&unit);
+
+        let Some(listen) = socket.lines().find(|l| l.starts_with("ListenStream=")) else {
+            panic!(
+                "a .socket with no ListenStream holds no port, so nothing starts the daemon on \
+                 the first MCP call and the client sees a refused connection:\n{socket}"
+            );
+        };
+        assert_eq!(
+            listen,
+            format!("ListenStream={}", unit.addr),
+            "the socket unit listens on the address this install chose, or it hands `serve` an \
+             fd for a port nobody dials — and the daemon is then up and unreachable at once"
+        );
+        assert!(
+            render_systemd(&unit).contains(&format!("serve {}", unit.addr)),
+            "which is the same address the service is told to serve. Two addresses here is \
+             socket activation handing over the wrong port, and neither file says so"
+        );
+        assert!(
+            socket.contains(REPO_URL),
+            "the socket is the file the operator finds first when the port is taken, so it has \
+             to point somewhere real:\n{socket}"
+        );
+    }
+
+    #[test]
+    fn the_plan_names_every_file_it_would_write_and_writes_none_of_them() {
+        for target in [Target::Linux, Target::Windows] {
+            let unit = lan_unit(target, &"a".repeat(64));
+            let root = PathBuf::from("install-root");
+            let plan = render_plan(&unit, target, &root.join(LAUNCHER_BASENAME));
+
+            let Some(header) = plan.lines().next() else {
+                panic!("an empty plan says nothing about what --apply is about to do");
+            };
+            assert!(
+                header.contains(unit.profile.label()),
+                "the plan has to say which profile it is about: `loopback` and `lan` differ by \
+                 whether the daemon is reachable from other machines: {header}"
+            );
+            assert!(
+                header.contains(&unit.exe.display().to_string()),
+                "and which binary it would install, or a second copy on the same box is \
+                 indistinguishable from the one the operator meant: {header}"
+            );
+            let rendered_for = if target.is_windows() {
+                "windows"
+            } else {
+                "linux"
+            };
+            assert!(
+                header.contains(rendered_for),
+                "and which target was rendered. A plan that ignores --windows/--linux prints a \
+                 systemd install on a machine that has no systemd: {header}"
+            );
+            assert!(
+                plan.contains(&unit.env_file.display().to_string()),
+                "the env file is the one destination that does NOT sit beside the others, and \
+                 it is the one carrying the token. A plan that hides it is a plan the operator \
+                 cannot check before running --apply:\n{plan}"
+            );
+
+            let beside_the_launcher = if target.is_windows() {
+                [LAUNCHER_BASENAME, "memory-industry-task.xml"]
+            } else {
+                ["memory-industry.service", "memory-industry.socket"]
+            };
+            for name in beside_the_launcher {
+                assert!(
+                    plan.contains(&root.join(name).display().to_string()),
+                    "--print is the only look at {name} the operator gets before --apply writes \
+                     it:\n{plan}"
+                );
+            }
+
+            assert!(
+                plan.contains("--apply"),
+                "a plan that does not name the flag that carries it out leaves the operator \
+                 guessing, and the guess is usually to run the same command again:\n{plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabling_the_daemon_names_the_supervisor_each_target_actually_has() {
+        let root = Path::new("install-root");
+        let linux = enable_command(Target::Linux, root);
+        let windows = enable_command(Target::Windows, root);
+
+        assert!(
+            linux.contains("systemctl --user enable --now memory-industry.service"),
+            "the files on disk do nothing until this runs, so the command has to be the one \
+             that starts THIS unit: {linux}"
+        );
+        assert!(
+            linux.contains("daemon-reload"),
+            "systemd does not see a unit file it has not reloaded, so enabling before the \
+             reload fails on the very first install: {linux}"
+        );
+        assert!(
+            !linux.contains("schtasks"),
+            "there is no Task Scheduler on linux: {linux}"
+        );
+
+        assert!(
+            windows.contains("schtasks /Create /XML"),
+            "and there is no systemd on windows: {windows}"
+        );
+        assert!(
+            windows.contains(&root.join("memory-industry-task.xml").display().to_string()),
+            "the command has to point at the XML --apply just wrote. Anywhere else registers \
+             nothing, `schtasks` says so once, and the daemon never comes up at logon: {windows}"
+        );
+        assert!(
+            !windows.contains("systemctl"),
+            "there is no systemd on windows: {windows}"
+        );
+
+        // One expression, printed: a plan that described the command in its own
+        // words could drift from the command, and the operator would be running
+        // the description.
+        let unit = lan_unit(Target::Windows, &"a".repeat(64));
+        assert!(
+            render_plan(&unit, Target::Windows, &root.join(LAUNCHER_BASENAME)).contains(&windows),
+            "the plan must print the command it is telling the operator to run"
         );
     }
 

@@ -182,16 +182,17 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           # --file alone mutates the whole file (2315 mutants on the 0.26 tree).
           # --in-diff keeps the second judge on the changed lines.
           #
-          # The five entries added to --exclude-re below are not reachable by
+          # The entries added to --exclude-re below are not reachable by
           # `cargo mutants -- --lib`, each for its own reason, and every one of
           # them has its decision tested somewhere the mutation CAN reach:
           #
           #   serve_pool        binds a socket and serves forever. --lib never
           #                     starts a daemon. Same class as the handlers.
-          #   gpu_availability  two cfg variants. On the gate's build wants_gpu
-          #                     is false, so configure short-circuits before
-          #                     reading it and nothing observes the answer.
-          #                     cpu_reason, which decides on it, has a table.
+          #   gpu_availability  two cfg variants. configure does call it, but on
+          #                     the gate's build wants_gpu is false and
+          #                     cpu_reason discards its other two arguments in
+          #                     that first branch, so nothing observes the
+          #                     answer. cpu_reason itself has a table.
           #   cuda_provider     #[cfg(feature = "cuda")]; not compiled here.
           #   apply             writes the process-wide environment, which every
           #                     other test in the binary reads. That is exactly
@@ -199,6 +200,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     three lines of set_if_absent.
           #   failure_reason    reads a OnceLock that --lib cannot populate
           #                     without loading 1.1 GB of model. reason_of, the
+          #                     half that decides, has a table.
           #
           # A second group, all of the same two shapes. Nothing here is
           # unexamined: the half of each that decides something was pulled out
@@ -214,12 +216,66 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #   judge_is_sampling -> judge_is_sampling_from.
           #
           #   mcp_endpoint and panel are axum handlers, the same class as the
-          #   src/handlers/* already skipped above. Everything it decides now
+          #   src/handlers/* already skipped above. Everything they decide now
           #   lives in origin_allowed_with, auth_brake, next_failure,
           #   brake_for, record_auth_failure, clear_auth_failures,
-          #   refuse_foreign_origin and note_activity, and every one of those
-          #   has its own test.
-          #                     half that decides, has a table.
+          #   refuse_foreign_origin, note_activity and panel_route_enabled, and
+          #   every one of those has its own test.
+          #
+          #   The trailing space on `replace panel `, `judge_is_sampling ` and
+          #   `replace init ` is load-bearing. --exclude-re matches by
+          #   substring, so a bare name also hides every longer name that
+          #   starts with it: `panel` hid panel_enabled, panel_route_enabled
+          #   and panel_allows_forwarded, and `judge_is_sampling` hid
+          #   judge_is_sampling_from — the pure half named above as the reason
+          #   that exclusion is honest. Nobody chose either cover, and
+          #   panel_route_enabled, which draws the line between a panel on
+          #   loopback and one served to the whole LAN, sat outside the judge
+          #   from the day it was written. A name that is a prefix of another
+          #   name needs the space.
+          #
+          # A third group, every one of them from the same line of this build.
+          # The gate compiles without --features cuda, and gpu.rs:48 returns
+          # before anything below it is reached:
+          #     if !cfg!(any(feature = "cuda", feature = "directml")) { return false; }
+          # Owner: endurecedor 0.27. Expires: 2027-03-21.
+          #
+          #   gpu.rs.*replace wants_gpu -> bool with false
+          #                     without the feature the function IS the constant
+          #                     false, so this mutant is the same program. The
+          #                     tail is load-bearing: the bare name would also
+          #                     hide `with true`, which dies today and has to
+          #                     stay under judgement.
+          #   gpu.rs.*preferred_device_var
+          #                     its only caller is gpu.rs:51, after that return.
+          #                     Nothing in this build ever executes it.
+          #   gpu.rs.*compiled_provider.*with None
+          #                     without the feature the original already returns
+          #                     None. The `.*with None` tail is load-bearing:
+          #                     the bare name would also hide Some("") and
+          #                     Some("xyzzy"), which
+          #                     status_reports_the_provider_this_binary_was_compiled_with
+          #                     kills. Delete that test and those two go red.
+          #   gpu.rs.*runtime_dir
+          #                     carries #[cfg(any(feature = "cuda", feature =
+          #                     "directml"))], so it is not compiled here at
+          #                     all. It entered the diff only because this
+          #                     release added a comment inside it.
+          #   http.rs.*compiled_gpu_provider.*with None
+          #                     the same case in the other file, and the tail is
+          #                     load-bearing for the same reason: its two
+          #                     siblings die in
+          #                     the_gpu_build_field_names_a_provider_or_says_nothing.
+          #
+          # Where those decisions ARE judged: scripts/run-all-tests.sh runs
+          #     cargo test --release --features cuda --lib gpu::
+          # which executes gpu::placement_tests with the feature alive — the
+          # device table, including the MEMORY_INDUSTRY_/CUBA_ precedence rows,
+          # status_reports_the_provider_this_binary_was_compiled_with and
+          # a_runtime_downloaded_under_the_old_name_survives_the_rename. If that
+          # line ever leaves run-all-tests.sh, every exclusion in this group
+          # stops being an exclusion and becomes a cover: delete them the same
+          # day.
           diff_file="$(mktemp)"
           # Same base as the file list above, or the two halves of this judge
           # would disagree about what "the change" is.
@@ -236,7 +292,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
             in_diff=(--in-diff "$diff_file")
           fi
           (cd rust && cargo mutants "${files[@]}" "${in_diff[@]}" \
-            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel|http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling|rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session' \
+            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|gpu.rs.*runtime_dir|http.rs.*compiled_gpu_provider.*with None' \
             --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || fail=1
           rm -f "$diff_file"
         fi

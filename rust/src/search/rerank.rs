@@ -68,6 +68,12 @@ pub fn status_resolved() -> bool {
 ///
 /// `None` means it loaded, or nobody has asked yet. Reading the resolved cell
 /// rather than forcing it keeps this callable from an async task.
+///
+/// The sentence is whatever `init_session` or ONNX Runtime said, model
+/// directory included, so it is written for a caller standing on the machine:
+/// `doctor` prints it whole. A caller that answers over a socket puts it
+/// through `http::reason_without_a_model_path` first, because that directory
+/// is inventory and on Windows it has the operator's user name inside it.
 pub fn failure_reason() -> Option<String> {
     reason_of(RERANKER_STATUS.get()?)
 }

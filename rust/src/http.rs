@@ -1341,7 +1341,10 @@ const STATE_ABSENT: &str = "absent";
 ///
 /// `reason` is a sentence for a human and is `None` when the state says
 /// everything. It never carries a filesystem path: a model path is inventory,
-/// and on Windows it has the operator's user name inside it.
+/// and on Windows it has the operator's user name inside it. Every reason here
+/// is a literal except one — the reranker's load failure, which comes from
+/// ONNX Runtime — and that one goes through `reason_without_a_model_path`
+/// first. Before it did, this paragraph was a promise the code did not keep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelState {
     pub state: &'static str,
@@ -1472,16 +1475,44 @@ fn embedder_state(ready: bool) -> ModelState {
 /// `is_configured` stat the disk, and `failure_reason` / `status_resolved` read
 /// a cell that is already decided or is not. `rerank::enabled()` would load
 /// 1,1 GB inside a health poll.
+///
+/// All four facts are read before the decision instead of on the way through
+/// it. Short-circuiting saved two `stat` calls and cost the decision its only
+/// judge: the first branch turns on a process-wide `OnceLock` that another
+/// test in this binary resolves, so which branch a test even reached was
+/// decided by the order libtest happened to schedule them in — and a test that
+/// asserted here would go red on an unmutated tree half the time.
 fn reranker_state() -> ModelState {
-    let device = device_of(crate::gpu::Workload::Reranker);
-    if let Some(reason) = crate::search::rerank::failure_reason() {
+    reranker_state_from(
+        crate::search::rerank::failure_reason(),
+        device_of(crate::gpu::Workload::Reranker),
+        crate::search::rerank::resolved_model_dir().is_some(),
+        crate::search::rerank::is_configured(),
+        crate::search::rerank::status_resolved(),
+    )
+}
+
+/// The reranker's state, from the four facts that decide it and nothing else.
+///
+/// `dir_resolved` is whether there is a directory to look in at all — the
+/// resource plan switches the model off by naming one it never creates.
+/// `configured` is a model file inside it, and `status_resolved` is whether
+/// something already tried to open a session.
+fn reranker_state_from(
+    failure: Option<String>,
+    device: &'static str,
+    dir_resolved: bool,
+    configured: bool,
+    status_resolved: bool,
+) -> ModelState {
+    if let Some(reason) = failure {
         return ModelState {
             state: STATE_FAILED,
             device,
-            reason: Some(reason),
+            reason: Some(reason_without_a_model_path(&reason)),
         };
     }
-    if crate::search::rerank::resolved_model_dir().is_none() {
+    if !dir_resolved {
         return ModelState {
             state: STATE_OFF,
             device,
@@ -1492,7 +1523,7 @@ fn reranker_state() -> ModelState {
             ),
         };
     }
-    if !crate::search::rerank::is_configured() {
+    if !configured {
         return ModelState {
             state: STATE_ABSENT,
             device,
@@ -1503,7 +1534,7 @@ fn reranker_state() -> ModelState {
             ),
         };
     }
-    if crate::search::rerank::status_resolved() {
+    if status_resolved {
         return ModelState {
             state: STATE_LOADED,
             device,
@@ -1515,6 +1546,39 @@ fn reranker_state() -> ModelState {
         device,
         reason: Some("loads on its first batch".to_string()),
     }
+}
+
+/// What a model directory becomes in `/health`: the variable that sets it,
+/// never the directory it resolved to.
+const MODEL_DIR_INSTEAD_OF_A_PATH: &str = "the reranker directory (see CUBA_RERANKER_PATH)";
+
+/// A load failure with the path taken out and the variable that names it put
+/// in its place.
+///
+/// The sentence comes from `init_session`, which formats the directory it
+/// looked in, and from ONNX Runtime, which formats the file it could not open.
+/// Either one is inventory, and on Windows either one carries the operator's
+/// user name, which is what `C:\Users\…\.cache` is made of. `doctor` still
+/// prints the sentence whole, and should: it runs on the machine the operator
+/// is already standing on, while this one goes out over a socket that a LAN
+/// bind makes reachable.
+///
+/// A word is a path when it has a separator with a name around it, which
+/// leaves the actionable half of the sentence alone: the file names it looked
+/// for, `model.onnx` and `model_quantized.onnx`, and the bare `/` between
+/// them.
+fn reason_without_a_model_path(reason: &str) -> String {
+    reason
+        .split_whitespace()
+        .map(|word| {
+            if word.contains(['/', '\\']) && word.chars().any(char::is_alphanumeric) {
+                MODEL_DIR_INSTEAD_OF_A_PATH
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<&str>>()
+        .join(" ")
 }
 
 /// The NLI model, from the two questions that can be answered for free.
@@ -2003,6 +2067,60 @@ mod tests {
             request_deadline() > protocol::handler_timeout(),
             "the POST budget must exceed one call's budget, or a single tools/call that \
              uses its allowance dies of the request deadline instead"
+        );
+    }
+
+    #[test]
+    fn the_router_deadline_fires_after_the_one_that_can_name_what_died() {
+        // The relation, not a number: the budget is read from the environment,
+        // and an assertion on seconds would pass a layer that had stopped
+        // depending on the handler timeout at all.
+        assert!(
+            router_deadline() > request_deadline(),
+            "`/mcp` answers a blown budget with a JSON-RPC envelope naming the call that died, \
+             and this layer can only close the socket. Firing first takes the better answer \
+             away from every client that asked for one"
+        );
+    }
+
+    /// The timeout layer hands back what the handler said, when the handler
+    /// said it in time.
+    ///
+    /// Only the happy path is driven here. Making the deadline *fire* needs a
+    /// handler that hangs for longer than `router_deadline()` — four minutes on
+    /// the default budget — and the clock cannot be paused, because the layer
+    /// is reached through a real socket. What this pins is the half that runs
+    /// on every request there has ever been.
+    #[tokio::test]
+    async fn a_request_answered_inside_the_budget_is_handed_back_untouched() {
+        let app = Router::new()
+            .route(
+                "/answers",
+                get(|| async { (StatusCode::IM_A_TEAPOT, "the handler's answer") }),
+            )
+            .layer(axum::middleware::from_fn(bound_every_request));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free loopback port");
+        let port = listener.local_addr().expect("the bound address").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let answer = reqwest::get(format!("http://127.0.0.1:{port}/answers"))
+            .await
+            .expect("the layered router answers");
+        assert_eq!(
+            answer.status().as_u16(),
+            418,
+            "a last resort is not a rewriter. A status this layer invented would be the daemon \
+             reporting something its own handler never decided"
+        );
+        assert_eq!(
+            answer.text().await.expect("a body"),
+            "the handler's answer",
+            "and the body has to survive with it: an empty 200 reads as success to every \
+             monitor and as a blank page to every operator"
         );
     }
 
@@ -2584,5 +2702,363 @@ mod lan_exposure_tests {
             AUTH_FAILURE_WINDOW + std::time::Duration::from_secs(1)
         ));
         assert!(window_still_open(std::time::Duration::ZERO));
+    }
+}
+
+/// The `/health` verdict and the block it is computed from, where the second
+/// judge can reach them.
+///
+/// `quality-gate.sh` runs `cargo mutants -- --lib`, which executes only the
+/// `#[cfg(test)]` modules that live inside `rust/src`. The same truth table is
+/// asserted from outside in `rust/tests/v042_health_says_what_degraded.rs`,
+/// over the public API and against a live daemon: that file is the contract a
+/// reader should start from, and this one is the copy the mutation judge
+/// actually runs. They have to stay identical. A `||` quietly turned into `&&`
+/// here — "every subsystem is broken" instead of "any of them is" — survives a
+/// green integration suite, because the mutation never reaches `rust/tests`.
+#[cfg(test)]
+mod health_report_tests {
+    use super::*;
+
+    /// A report carrying nothing but the facts a row varies.
+    fn report(ready: bool, gpu_degraded: bool, states: [&'static str; 3]) -> RuntimeReport {
+        let at = |state: &'static str| ModelState {
+            state,
+            device: "cpu",
+            reason: None,
+        };
+        RuntimeReport {
+            mode: "local",
+            resource_tier: "full",
+            ready,
+            embedder: at(states[0]),
+            reranker: at(states[1]),
+            nli: at(states[2]),
+            gpu_build: None,
+            gpu_degraded,
+            gpu_placement: "embedder=cpu reranker=cpu nli=cpu".to_string(),
+            llm: crate::llm_cli::LlmSummary {
+                configured: false,
+                backend: None,
+                model: None,
+                base_url: None,
+            },
+        }
+    }
+
+    #[test]
+    fn degraded_when_any_subsystem_is() {
+        // (database answers, models warm, gpu asked for and missing, reranker
+        //  state) -> the one word a monitor matches on.
+        //
+        // Written out rather than computed: an expectation derived from the
+        // same condition the function uses is a tautology, and this table is
+        // the whole thing standing between «degraded» and a word that quietly
+        // changes. The words are the wire contract, so they are literals here
+        // and not the constants the function returns.
+        let table: [(bool, bool, bool, &'static str, &'static str); 16] = [
+            (true, true, false, "loaded", "ok"),
+            (true, false, false, "loaded", "starting"),
+            (true, true, true, "loaded", "degraded"),
+            (true, false, true, "loaded", "degraded"),
+            (true, true, false, "failed", "degraded"),
+            (true, false, false, "failed", "degraded"),
+            (true, true, true, "failed", "degraded"),
+            (true, false, true, "failed", "degraded"),
+            (false, true, false, "loaded", "degraded"),
+            (false, false, false, "loaded", "degraded"),
+            (false, true, true, "loaded", "degraded"),
+            (false, false, true, "loaded", "degraded"),
+            (false, true, false, "failed", "degraded"),
+            (false, false, false, "failed", "degraded"),
+            (false, true, true, "failed", "degraded"),
+            (false, false, true, "failed", "degraded"),
+        ];
+
+        for (db_ok, ready, gpu_degraded, reranker, expected) in table {
+            let runtime = report(ready, gpu_degraded, ["loaded", reranker, "loaded"]);
+            assert_eq!(
+                overall_status(db_ok, &runtime),
+                expected,
+                "db_ok={db_ok} ready={ready} gpu_degraded={gpu_degraded} reranker={reranker}"
+            );
+        }
+
+        assert_eq!(
+            overall_status(true, &report(true, false, ["loaded", "loaded", "failed"])),
+            "degraded",
+            "the NLI model is in the same list as the other two. A check that looked at the \
+             reranker alone would pass every row of the table above and still miss a model \
+             that is on disk and will not open"
+        );
+
+        assert_eq!(
+            overall_status(true, &report(true, false, ["fallback", "loaded", "loaded"])),
+            "ok",
+            "a machine that never had an embedding model is Tier::Minimal, not a fault, and \
+             this daemon is supported there. Reporting every one of them as degraded forever \
+             is how a field stops being read — which is the failure this endpoint exists to \
+             prevent"
+        );
+    }
+
+    #[test]
+    fn the_gpu_build_field_names_a_provider_or_says_nothing() {
+        // The vocabulary, not the `cfg!` chain: an expectation assembled from
+        // the same flags the function reads would agree with any word it put
+        // there.
+        assert!(
+            matches!(
+                compiled_gpu_provider(),
+                None | Some("cuda") | Some("directml")
+            ),
+            "an operator reads `gpu.build` to learn which provider this binary was compiled \
+             against. A word ONNX Runtime has never heard of sends them hunting for a driver \
+             that was never the problem"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_device_word_is_the_one_the_placement_path_chose() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        {
+            let _asked_for_cpu = crate::envs::ScopedEnv::set("CUBA_EMBED_DEVICE", "cpu");
+            assert_eq!(
+                device_of(crate::gpu::Workload::Embedder),
+                "cpu",
+                "this is the word `/health` prints, and the question it answers is the one an \
+                 operator reconstructed by reading the source: where is this model running"
+            );
+        }
+        {
+            let _asked_for_gpu = crate::envs::ScopedEnv::set("CUBA_EMBED_DEVICE", "gpu");
+            // `wants_gpu` returns false before it ever reads the variable on a
+            // build with no execution provider compiled in, which is the build
+            // the gate runs. Under `--features cuda` this row is the one that
+            // proves the other word exists.
+            let compiled_with_a_gpu = cfg!(any(feature = "cuda", feature = "directml"));
+            assert_eq!(
+                device_of(crate::gpu::Workload::Embedder),
+                if compiled_with_a_gpu { "gpu" } else { "cpu" },
+                "a field that said `gpu` on a CPU-only binary would be the placement summary \
+                 disagreeing with the placement"
+            );
+        }
+    }
+
+    #[test]
+    fn the_embedder_is_warming_while_the_models_are_still_loading() {
+        assert_eq!(
+            embedder_state(false).state,
+            "warming",
+            "`ready` is the guard that keeps `/health` from calling `is_model_loaded()`, which \
+             resolves the cell that loads the model. Asking before the warm-up finished is the \
+             thing that makes a monitor's poll hang for seconds on a cold process"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_nli_model_is_absent_only_when_there_is_nothing_to_load() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        // `nli::available()` answers from `$HOME/.cache`, so this developer's
+        // disk and the gate box would otherwise run different branches of the
+        // function. Both names move: the lookup tries HOME and falls back to
+        // USERPROFILE.
+        let root =
+            std::env::temp_dir().join(format!("memory-industry-http-nli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the temp dir is writable");
+        let home = root.display().to_string();
+        let _home = crate::envs::ScopedEnv::set("HOME", &home);
+        let _userprofile = crate::envs::ScopedEnv::set("USERPROFILE", &home);
+        let _plan = crate::envs::ScopedEnv::cleared("CUBA_NLI_PATH");
+
+        assert_eq!(
+            nli_state().state,
+            "absent",
+            "nothing on disk is not the same as a model waiting to be opened, and only the \
+             first of those tells an operator to go and install something"
+        );
+
+        let installed = root
+            .join(".cache")
+            .join("memory-industry")
+            .join("models-nli");
+        std::fs::create_dir_all(&installed).expect("the temp dir is writable");
+        std::fs::write(installed.join("model.onnx"), b"not a real graph")
+            .expect("the temp dir is writable");
+        assert_eq!(
+            nli_state().state,
+            "configured",
+            "and with a model in the cache the answer has to change. Both rows are here \
+             because either one alone passes on an `nli_state` that never looks at the disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_model_block_carries_its_state_its_device_and_its_reason() {
+        let broken = ModelState {
+            state: "failed",
+            device: "gpu",
+            reason: Some("the session did not open".to_string()),
+        };
+        let json = model_json(&broken);
+        assert_eq!(json["state"], "failed");
+        assert_eq!(json["device"], "gpu");
+        assert_eq!(
+            json["reason"], "the session did not open",
+            "the reason is why this block exists at all: `doctor` used to guess at it, and \
+             guessed wrong"
+        );
+
+        let quiet = ModelState {
+            state: "loaded",
+            device: "cpu",
+            reason: None,
+        };
+        assert_eq!(
+            model_json(&quiet)["reason"],
+            Value::Null,
+            "a model that is simply running says nothing, and the key stays so a reader never \
+             has to tell «no reason» from «this daemon is too old to report one»"
+        );
+    }
+
+    #[test]
+    fn the_runtime_block_names_every_subsystem_it_was_built_from() {
+        let json = runtime_json(&report(true, true, ["loaded", "off", "absent"]));
+
+        assert_eq!(json["mode"], "local");
+        assert_eq!(json["resource_tier"], "full");
+        assert_eq!(json["embedder"]["state"], "loaded");
+        assert_eq!(
+            json["reranker"]["state"], "off",
+            "the three models are named separately on purpose: «something is degraded» with \
+             no subject is the answer that sent an operator to read the source"
+        );
+        assert_eq!(json["nli"]["state"], "absent");
+        assert_eq!(json["gpu"]["build"], Value::Null);
+        assert_eq!(
+            json["gpu"]["degraded"], true,
+            "asked for a card and not using one is the state a placement summary alone does \
+             not distinguish from never having asked for one"
+        );
+        assert_eq!(
+            json["gpu"]["placement"],
+            "embedder=cpu reranker=cpu nli=cpu"
+        );
+        assert_eq!(json["llm"]["configured"], false);
+        assert_eq!(json["llm"]["backend"], Value::Null);
+        assert_eq!(json["llm"]["base_url"], Value::Null);
+    }
+
+    #[test]
+    fn four_facts_decide_what_health_says_about_the_reranker() {
+        // (a load failure, a directory to look in, a model inside it, a
+        //  session already attempted) -> the word `/health` prints.
+        //
+        // Written out rather than derived, and the whole reason the decision
+        // was pulled out of the accessors: it used to read `failure_reason()`
+        // itself, which is a process-wide `OnceLock` that another test in this
+        // binary resolves. Whether a test here reached the second branch at
+        // all depended on the order libtest happened to schedule them in.
+        //
+        // Two rows are combinations no machine produces — a model «inside» a
+        // directory that did not resolve — and they are here on purpose: they
+        // pin which check wins instead of leaving the order to whoever reads
+        // the function next.
+        let table: [(Option<&str>, bool, bool, bool, &'static str); 8] = [
+            (Some("the session did not open"), true, true, true, "failed"),
+            (
+                Some("the session did not open"),
+                false,
+                false,
+                false,
+                "failed",
+            ),
+            (None, false, false, false, "off"),
+            (None, false, true, true, "off"),
+            (None, true, false, false, "absent"),
+            (None, true, false, true, "absent"),
+            (None, true, true, false, "configured"),
+            (None, true, true, true, "loaded"),
+        ];
+
+        for (failure, dir_resolved, configured, status_resolved, expected) in table {
+            let state = reranker_state_from(
+                failure.map(String::from),
+                "cpu",
+                dir_resolved,
+                configured,
+                status_resolved,
+            );
+            assert_eq!(
+                state.state, expected,
+                "failure={failure:?} dir_resolved={dir_resolved} configured={configured} \
+                 status_resolved={status_resolved}"
+            );
+            assert_eq!(
+                state.device, "cpu",
+                "whichever branch answers, the device word is the one the placement path chose \
+                 — that is the question an operator came to this endpoint with"
+            );
+        }
+
+        assert_eq!(
+            reranker_state_from(None, "cpu", true, true, true).reason,
+            None,
+            "a reranker that is loaded says nothing more. «loads on its first batch» on a model \
+             that already loaded leaves someone waiting for a load that has happened"
+        );
+    }
+
+    #[test]
+    fn a_model_path_never_reaches_the_runtime_block() {
+        const CANARY_USER: &str = "canaryoperator";
+        let dir = std::path::PathBuf::from(format!(
+            "C:\\Users\\{CANARY_USER}\\.cache\\memory-industry\\reranker"
+        ));
+        // `{model_dir:?}` is how `init_session` writes it, quotes and all.
+        let failure = format!("no model.onnx / model_quantized.onnx found in {dir:?}");
+
+        // Positive control. Without it «the canary is not in the body» also
+        // passes on a body that never carried a reason at all.
+        assert!(
+            failure.contains(CANARY_USER),
+            "the fixture is broken: the sentence this test scrubs never had a path in it"
+        );
+
+        let mut runtime = report(true, false, ["loaded", "failed", "loaded"]);
+        runtime.reranker = reranker_state_from(Some(failure), "cpu", true, true, false);
+
+        assert_eq!(
+            runtime.reranker.reason.as_deref(),
+            Some(
+                "no model.onnx / model_quantized.onnx found in the reranker directory (see \
+                 CUBA_RERANKER_PATH)"
+            ),
+            "the path goes and the rest stays. The two file names it looked for and the \
+             variable that sets the directory are what an operator can act on; a sentence cut \
+             down to «no model found» would keep the promise and lose the operator"
+        );
+
+        let served = runtime_json(&runtime).to_string();
+        assert!(
+            served.contains("model.onnx"),
+            "positive control: the reason has to reach the block at all, or every canary below \
+             passes on a block that says nothing: {served}"
+        );
+        for canary in [CANARY_USER, ".cache"] {
+            assert!(
+                !served.contains(canary),
+                "{canary:?} was served in the runtime block. A model path is inventory, and on \
+                 Windows it carries the operator's user name; the sentence with the path in it \
+                 belongs to `doctor`, which runs on their machine: {served}"
+            );
+        }
     }
 }

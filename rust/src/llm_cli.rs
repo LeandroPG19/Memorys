@@ -579,3 +579,103 @@ mod verdict_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    use crate::envs::ScopedEnv;
+
+    /// Both names every time, because `alias` falls back to the legacy one: a
+    /// developer box with `CUBA_LLM_BASE_URL` exported would otherwise be the
+    /// thing deciding what these assert.
+    fn only_base_url(value: Option<&str>) -> [ScopedEnv; 2] {
+        [
+            match value {
+                Some(v) => ScopedEnv::set("MEMORY_INDUSTRY_LLM_BASE_URL", v),
+                None => ScopedEnv::cleared("MEMORY_INDUSTRY_LLM_BASE_URL"),
+            },
+            ScopedEnv::cleared("CUBA_LLM_BASE_URL"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn the_password_in_a_provider_url_does_not_survive_the_trip_to_health() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _env = only_base_url(Some("http://canaryuser:canarypass-llm@127.0.0.1:11434/v1"));
+
+        let said = redacted_base_url()
+            .expect("a configured provider URL is what the operator asked /health about");
+
+        assert!(
+            !said.contains("canarypass-llm"),
+            "`/health` answers anyone who can route a packet to the port, and this string is \
+             served inside the runtime block: {said}"
+        );
+        assert_eq!(
+            said, "http://canaryuser:***@127.0.0.1:11434/v1",
+            "the host and port are the answer to «which Ollama is this talking to», which is \
+             the question that sent an operator to read the source. Redacting them away passes \
+             the secret canaries and still fails the operator"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_api_key_in_the_query_string_is_still_an_api_key() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _env = only_base_url(Some(
+            "https://api.deepseek.com/v1?api_key=sk-canary-inquery&stream=false",
+        ));
+
+        let said = redacted_base_url().expect("a configured provider URL is reported");
+
+        assert!(
+            !said.contains("sk-canary-inquery"),
+            "`redact_url` only knows about `user:pass@`. Several vendors document the key as a \
+             query parameter, so a URL that never had userinfo walks straight through it: {said}"
+        );
+        assert_eq!(
+            said, "https://api.deepseek.com/v1",
+            "the whole query goes, not just the parameter spelled `api_key` — the next vendor \
+             calls it `token` and an allowlist of names is a list nobody updates"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_url_with_nothing_to_hide_is_reported_whole() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _env = only_base_url(Some("  http://127.0.0.1:11434/v1  "));
+
+        assert_eq!(
+            redacted_base_url().as_deref(),
+            Some("http://127.0.0.1:11434/v1"),
+            "the ordinary case — a local Ollama, no credentials anywhere — must arrive intact \
+             and trimmed. Without this row, hiding everything would satisfy every other \
+             assertion in this module"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_configured_says_nothing_rather_than_saying_empty() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        {
+            let _env = only_base_url(None);
+            assert_eq!(
+                redacted_base_url(),
+                None,
+                "`configured: false` and `base_url: \"\"` are different reports. The second one \
+                 tells an operator a provider is set to the empty string, which is a machine \
+                 state that does not exist"
+            );
+        }
+        {
+            let _env = only_base_url(Some("   "));
+            assert_eq!(
+                redacted_base_url(),
+                None,
+                "a unit file with `MEMORY_INDUSTRY_LLM_BASE_URL=` and a trailing space is not a \
+                 configured provider, and `<unparseable>` is what `redact_url` would answer"
+            );
+        }
+    }
+}

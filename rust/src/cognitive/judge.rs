@@ -1044,15 +1044,16 @@ mod tests {
         assert_eq!(j.verdict, "unknown");
     }
 
-    #[test]
-    fn test_default_max_pairs_respects_env() {
-        unsafe {
-            env::set_var("CUBA_JUEZ_MAX_PAIRS", "11");
-        }
+    /// The bare `set_var` this used to do leaked `CUBA_JUEZ_MAX_PAIRS` into the
+    /// rest of the binary whenever the assertion fired, and ran with no guard
+    /// beside tests that read the same environment.
+    #[tokio::test]
+    async fn test_default_max_pairs_respects_env() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _preferred = crate::envs::ScopedEnv::cleared("MEMORY_INDUSTRY_LLM_MAX_PAIRS");
+        let _legacy = crate::envs::ScopedEnv::set("CUBA_JUEZ_MAX_PAIRS", "11");
+
         assert_eq!(default_max_pairs(), 11);
-        unsafe {
-            env::remove_var("CUBA_JUEZ_MAX_PAIRS");
-        }
     }
 
     #[test]
@@ -1080,21 +1081,240 @@ mod tests {
         assert!(llm_provider_ids().len() >= 15);
     }
 
-    #[test]
-    fn provider_env_resolves_deepseek_without_explicit_base_url() {
-        unsafe {
-            env::remove_var("MEMORY_INDUSTRY_LLM_BASE_URL");
-            env::remove_var("CUBA_LLM_BASE_URL");
-            env::set_var("MEMORY_INDUSTRY_LLM_PROVIDER", "deepseek");
-            env::remove_var("MEMORY_INDUSTRY_LLM_MODEL");
-            env::remove_var("CUBA_JUEZ_MODEL");
-        }
+    /// Same repair as above, and worse: the five variables this removed were
+    /// never put back, so a developer's `MEMORY_INDUSTRY_LLM_BASE_URL` stopped
+    /// existing for every test that ran after it in this binary.
+    #[tokio::test]
+    async fn provider_env_resolves_deepseek_without_explicit_base_url() {
+        use crate::envs::ScopedEnv;
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _url = ScopedEnv::cleared("MEMORY_INDUSTRY_LLM_BASE_URL");
+        let _legacy_url = ScopedEnv::cleared("CUBA_LLM_BASE_URL");
+        let _provider = ScopedEnv::set("MEMORY_INDUSTRY_LLM_PROVIDER", "deepseek");
+        let _legacy_provider = ScopedEnv::cleared("CUBA_LLM_PROVIDER");
+        let _model = ScopedEnv::cleared("MEMORY_INDUSTRY_LLM_MODEL");
+        let _legacy_model = ScopedEnv::cleared("CUBA_JUEZ_MODEL");
+
         let j = OpenAiCompatJudge::from_env();
         assert_eq!(j.provider, "deepseek");
         assert!(j.base_url.contains("deepseek.com"));
         assert_eq!(j.model, "deepseek-chat");
-        unsafe {
-            env::remove_var("MEMORY_INDUSTRY_LLM_PROVIDER");
+    }
+}
+
+/// The three env lookups that decide whether the judge can work at all, and
+/// what it sends when it does.
+///
+/// None of these needs a provider, a model or a socket: `from_env` only parses
+/// the environment, and the first branch of `resolve_offline_llm_within`
+/// returns before anything is dialled.
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+    use crate::envs::ScopedEnv;
+
+    /// Every name that can answer for a key, so a developer box with
+    /// `OPENAI_API_KEY` exported is not the thing deciding these.
+    const KEY_NAMES: [&str; 4] = [
+        "MEMORY_INDUSTRY_LLM_API_KEY",
+        "CUBA_LLM_API_KEY",
+        "OPENAI_API_KEY",
+        "DEEPSEEK_API_KEY",
+    ];
+
+    fn no_key_anywhere() -> Vec<ScopedEnv> {
+        KEY_NAMES.iter().copied().map(ScopedEnv::cleared).collect()
+    }
+
+    fn set_or_clear(name: &str, value: Option<&str>) -> ScopedEnv {
+        match value {
+            Some(v) => ScopedEnv::set(name, v),
+            None => ScopedEnv::cleared(name),
+        }
+    }
+
+    fn timeout_env(preferred: Option<&str>, legacy: Option<&str>) -> [ScopedEnv; 2] {
+        [
+            set_or_clear("MEMORY_INDUSTRY_LLM_TIMEOUT_SECS", preferred),
+            set_or_clear("CUBA_JUEZ_TIMEOUT_SECS", legacy),
+        ]
+    }
+
+    fn deepseek() -> Option<&'static LlmProviderPreset> {
+        Some(llm_provider_preset("deepseek").expect("deepseek is a shipped preset"))
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_judge_waits_the_default_budget() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _env = timeout_env(None, None);
+
+        assert_eq!(
+            judge_timeout_secs(),
+            JUEZ_DEFAULT_TIMEOUT_SECS,
+            "this is the budget on every machine that never touched the knob. A judge handed 0 \
+             is one whose `tokio::time::timeout` is already elapsed before the provider has \
+             read the request, so every prompt aborts and the cognitive layer answers «unknown» \
+             on a deployment that is configured correctly"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_configured_budget_is_the_one_all_three_judges_wait_with() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _env = timeout_env(Some("7"), None);
+
+        assert_eq!(judge_timeout_secs(), 7);
+        for (name, got) in [
+            ("claude_cli", ClaudeCodeJudge::from_env().timeout),
+            ("gemini_cli", GeminiCliJudge::from_env().timeout),
+            ("openai_compat", OpenAiCompatJudge::from_env().timeout),
+        ] {
+            assert_eq!(
+                got,
+                Duration::from_secs(7),
+                "{name} built its own `Duration` instead of reading the knob, so raising the \
+                 budget for a slow local model would move two backends and quietly leave the \
+                 third on the default"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_legacy_name_answers_and_a_typo_falls_to_the_default() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        {
+            let _env = timeout_env(None, Some("45"));
+            assert_eq!(
+                judge_timeout_secs(),
+                45,
+                "every unit file in the field sets CUBA_JUEZ_TIMEOUT_SECS. Ignoring it would \
+                 shorten a budget an operator raised on purpose for a slow local model"
+            );
+        }
+        {
+            let _env = timeout_env(Some("treinta"), Some("45"));
+            assert_eq!(
+                judge_timeout_secs(),
+                JUEZ_DEFAULT_TIMEOUT_SECS,
+                "an unparseable preferred value takes the default, not the legacy value and \
+                 not zero: reading a typo as «no budget» turns one bad character into a judge \
+                 that never returns a verdict again"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_operators_key_wins_over_the_vendor_variable() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _clear = no_key_anywhere();
+        let _preferred = ScopedEnv::set("MEMORY_INDUSTRY_LLM_API_KEY", "sk-from-the-operator");
+        let _vendor = ScopedEnv::set("DEEPSEEK_API_KEY", "sk-from-the-vendor-env");
+
+        assert_eq!(
+            resolve_api_key(deepseek()).as_deref(),
+            Some("sk-from-the-operator"),
+            "`llm set deepseek --key …` writes the first one. An operator who rotates a key \
+             through the documented variable and gets the stale vendor one sent instead has no \
+             way to see which key the daemon is using"
+        );
+    }
+
+    /// On Windows `SetEnvironmentVariableW(name, "")` removes the variable
+    /// instead of storing an empty one, so there this row is the «not set»
+    /// case and the `!k.is_empty()` guard is pinned on Unix only. The
+    /// assertion is the same answer either way, which is why it is one test
+    /// and not two.
+    #[tokio::test]
+    async fn an_empty_key_is_no_key_and_falls_through() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _clear = no_key_anywhere();
+        let _empty = ScopedEnv::set("MEMORY_INDUSTRY_LLM_API_KEY", "");
+        let _vendor = ScopedEnv::set("DEEPSEEK_API_KEY", "sk-from-the-vendor-env");
+
+        assert_eq!(
+            resolve_api_key(deepseek()).as_deref(),
+            Some("sk-from-the-vendor-env"),
+            "a line with nothing after the `=` is what a half-finished install leaves behind. \
+             Reading it as a key sends an empty bearer, the vendor answers 401, and the \
+             operator goes looking at the vendor variable that was right all along"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_legacy_and_generic_names_still_answer() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        {
+            let _clear = no_key_anywhere();
+            let _legacy = ScopedEnv::set("CUBA_LLM_API_KEY", "sk-legacy");
+            assert_eq!(
+                resolve_api_key(None).as_deref(),
+                Some("sk-legacy"),
+                "every install in the field is set up with the CUBA_* names"
+            );
+        }
+        {
+            let _clear = no_key_anywhere();
+            let _generic = ScopedEnv::set("OPENAI_API_KEY", "sk-generic");
+            assert_eq!(
+                resolve_api_key(deepseek()).as_deref(),
+                Some("sk-generic"),
+                "the generic fallthrough is last and it is deliberate: a box that already \
+                 exports OPENAI_API_KEY for some other tool works without a second variable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_key_anywhere_is_none_and_never_an_empty_string() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _clear = no_key_anywhere();
+
+        assert_eq!(
+            resolve_api_key(deepseek()),
+            None,
+            "`None` and `Some(\"\")` are different requests on the wire: with no key the judge \
+             sends bearer `local`, which is what a local Ollama or LM Studio expects, and with \
+             an empty one it sends an empty Authorization header, which they do not"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_url_or_a_provider_alone_resolves_a_backend() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _legacy_url = ScopedEnv::cleared("CUBA_LLM_BASE_URL");
+        let _legacy_provider = ScopedEnv::cleared("CUBA_LLM_PROVIDER");
+        let _legacy_model = ScopedEnv::cleared("CUBA_JUEZ_MODEL");
+
+        {
+            let _url = ScopedEnv::set("MEMORY_INDUSTRY_LLM_BASE_URL", "http://127.0.0.1:11434/v1");
+            let _provider = ScopedEnv::set("MEMORY_INDUSTRY_LLM_PROVIDER", "ollama");
+            let _model = ScopedEnv::set("MEMORY_INDUSTRY_LLM_MODEL", "llama3.2");
+
+            let judge = resolve_offline_llm_within(Some(Duration::from_secs(3))).expect(
+                "an operator who set MEMORY_INDUSTRY_LLM_BASE_URL configured a backend. \
+                 Answering `None` here drops the whole cognitive layer to the heuristic judge, \
+                 which reports «unknown» for every claim and looks like a model that disagrees \
+                 rather than one that was never asked",
+            );
+            assert_eq!(judge.backend_name(), "openai_compat");
+            assert_eq!(judge.model_name().as_deref(), Some("ollama:llama3.2"));
+        }
+        {
+            let _url = ScopedEnv::cleared("MEMORY_INDUSTRY_LLM_BASE_URL");
+            let _provider = ScopedEnv::set("MEMORY_INDUSTRY_LLM_PROVIDER", "deepseek");
+            let _model = ScopedEnv::cleared("MEMORY_INDUSTRY_LLM_MODEL");
+
+            let judge = resolve_offline_llm_within(None)
+                .expect("`llm set deepseek` writes a provider and no URL — that is the easy path");
+            assert_eq!(
+                judge.model_name().as_deref(),
+                Some("deepseek:deepseek-chat"),
+                "a provider with no URL has to pick up the preset's base_url and default model, \
+                 or the easy path resolves a judge pointed at the local Ollama default"
+            );
         }
     }
 }

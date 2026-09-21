@@ -453,6 +453,19 @@ mod placement_tests {
     /// written inline.
     const GPU_COMPILED: bool = cfg!(any(feature = "cuda", feature = "directml"));
 
+    /// The same fact with the provider's name on it, which is what `status()`
+    /// hands to the judging half. Spelled out rather than taken from
+    /// `compiled_provider()`: a test that asks the function under test for the
+    /// expectation it is checking agrees with every answer that function can
+    /// give, including a wrong one.
+    const COMPILED_PROVIDER: Option<&str> = if cfg!(feature = "cuda") {
+        Some("cuda")
+    } else if cfg!(feature = "directml") {
+        Some("directml")
+    } else {
+        None
+    };
+
     /// Every device variable the crate reads, cleared before each row so a row
     /// only ever says what it sets. `MEMORY_INDUSTRY_EMBED_DEVICE` is in the
     /// list although nothing reads it: the last row asserts exactly that, and
@@ -643,6 +656,95 @@ mod placement_tests {
                 "{unmet:?} means somebody configured a GPU and is not getting one. Silence there is how a deployment believes it is reranking on a card for months."
             );
         }
+    }
+
+    /// `status_from` is judged row by row elsewhere; this is the seam that
+    /// feeds it. A wrong argument there changes no message and no measurement,
+    /// and is the one failure this whole path exists to stop: a CUDA build that
+    /// reports itself as compiled without support sends the operator to build
+    /// what is already built, and a CPU build that claims a provider sends them
+    /// to a driver that would not have helped.
+    ///
+    /// Judged against every sentence this build could honestly produce rather
+    /// than against one, so it asserts nothing about what this machine has: the
+    /// CI box with no card, a developer box with one, and a box with the
+    /// runtime half installed take different rows and all three are right.
+    #[tokio::test]
+    async fn status_reports_the_provider_this_binary_was_compiled_with() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let said = status().detail;
+        let honest: Vec<String> = [(false, false), (false, true), (true, false), (true, true)]
+            .into_iter()
+            .map(|(runtime_gpu, device_present)| {
+                status_from(COMPILED_PROVIDER, runtime_gpu, device_present).detail
+            })
+            .collect();
+
+        assert!(
+            honest.contains(&said),
+            "status() said «{said}», which no build compiled with {COMPILED_PROVIDER:?} can \
+             say about any machine. The four it could say are {honest:?}. What is wrong here \
+             is not the measurement — it is the provider handed to status_from"
+        );
+    }
+
+    /// Compiled out with the rest of the provider probe when no GPU feature is
+    /// on, so the mutation gate — which builds without one — cannot observe
+    /// this decision at all. It runs under
+    /// `cargo test --release --features cuda --lib gpu::`.
+    #[cfg(any(feature = "cuda", feature = "directml"))]
+    #[tokio::test]
+    async fn a_runtime_downloaded_under_the_old_name_survives_the_rename() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let home = std::env::temp_dir().join(format!(
+            "memory-industry-runtime-dir-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = home.join(".cache");
+        let preferred = cache.join("memory-industry").join("onnxruntime");
+        let legacy = cache.join("cuba-memorys").join("onnxruntime");
+
+        let _no_override = ScopedEnv::cleared("ORT_DYLIB_PATH");
+        let _home = ScopedEnv::set("HOME", &home.display().to_string());
+        let _windows_home = ScopedEnv::set("USERPROFILE", &home.display().to_string());
+
+        assert_eq!(
+            runtime_dir().as_ref(),
+            Some(&preferred),
+            "with nothing downloaded yet the answer has to be the documented directory, or \
+             `models runtime` writes one path and the loader looks in another"
+        );
+
+        std::fs::create_dir_all(&legacy).expect("the test owns this directory");
+        assert_eq!(
+            runtime_dir().as_ref(),
+            Some(&legacy),
+            "every machine that downloaded a runtime before the rename has it under \
+             cuba-memorys. Preferring the new path when only the old one is on disk orphans \
+             that download and the daemon drops to the CPU without saying why"
+        );
+
+        std::fs::create_dir_all(&preferred).expect("the test owns this directory");
+        assert_eq!(
+            runtime_dir().as_ref(),
+            Some(&preferred),
+            "and once the documented one exists it wins, or a machine that re-downloaded \
+             under the new name would go on loading the stale copy for ever"
+        );
+
+        let beside_the_library = home.join("elsewhere");
+        let by_hand = beside_the_library.join("onnxruntime.dll");
+        let _explicit = ScopedEnv::set("ORT_DYLIB_PATH", &by_hand.display().to_string());
+        assert_eq!(
+            runtime_dir().as_ref(),
+            Some(&beside_the_library),
+            "an operator who points at a runtime by hand has the provider libraries beside \
+             that file, not in the cache this crate manages"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
