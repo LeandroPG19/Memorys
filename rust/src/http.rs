@@ -40,6 +40,9 @@ struct AppState {
     ready: Arc<std::sync::atomic::AtomicBool>,
     /// The port this daemon bound, so an Origin can be checked against it.
     port: u16,
+    /// Failed bearer tokens, per address.
+    auth_failures:
+        Arc<std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, (u32, Instant)>>>,
 }
 
 pub fn bind_addr() -> String {
@@ -203,6 +206,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         last_activity: Arc::new(Mutex::new(Instant::now())),
         ready: ready.clone(),
         port: addr.port(),
+        auth_failures: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     let reaper_seen = state.seen.clone();
@@ -869,6 +873,28 @@ fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
     local && (declared_port.is_empty() || declared_port == port.to_string())
 }
 
+/// How many wrong tokens from one address before it has to wait, and for how
+/// long the count is remembered.
+const MAX_AUTH_FAILURES: u32 = 10;
+const AUTH_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long this address must wait, if at all.
+///
+/// `same_secret` compares in constant time, so there is no timing to leak —
+/// but nothing was slowing an attacker on the LAN down between attempts, and
+/// they could try tokens exactly as fast as the daemon could answer.
+///
+/// Only failures are counted. A successful call clears the address, so an
+/// editor that batches `tools/call` is never throttled: rate-limiting real
+/// traffic would make the daemon look broken to the one client that is
+/// behaving.
+fn auth_brake(failures: u32, window_age: std::time::Duration) -> Option<std::time::Duration> {
+    if window_age >= AUTH_FAILURE_WINDOW || failures < MAX_AUTH_FAILURES {
+        return None;
+    }
+    Some(AUTH_FAILURE_WINDOW - window_age)
+}
+
 async fn mcp_endpoint(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
@@ -886,13 +912,44 @@ async fn mcp_endpoint(
             .into_response();
     }
     let origin = request_origin(peer, &headers);
+
+    let who = peer.ip();
+    if let Some(wait) = state
+        .auth_failures
+        .read()
+        .ok()
+        .and_then(|g| g.get(&who).copied())
+        .and_then(|(failures, since)| auth_brake(failures, since.elapsed()))
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", wait.as_secs().max(1).to_string())],
+            axum::Json(error_envelope(
+                Value::Null,
+                -32001,
+                "demasiados tokens inválidos desde esta dirección",
+            )),
+        )
+            .into_response();
+    }
+
     let Some(scope) = authorized(&state, &headers) else {
+        if let Ok(mut failures) = state.auth_failures.write() {
+            let entry = failures.entry(who).or_insert((0, Instant::now()));
+            if entry.1.elapsed() >= AUTH_FAILURE_WINDOW {
+                *entry = (0, Instant::now());
+            }
+            entry.0 += 1;
+        }
         return (
             StatusCode::UNAUTHORIZED,
             axum::Json(error_envelope(Value::Null, -32001, "invalid bearer token")),
         )
             .into_response();
     };
+    if let Ok(mut failures) = state.auth_failures.write() {
+        failures.remove(&who);
+    }
 
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1127,11 +1184,19 @@ fn graph_summary_for(full_scope: bool, summary: Value) -> Value {
     })
 }
 
+/// A monitor asks this every few seconds; it must answer or say why, never sit.
+const HEALTH_DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&state.pool)
-        .await
-        .is_ok();
+    // Bounded on purpose. A health endpoint that hangs because the database
+    // hangs is worse than one that says the database is unreachable: the
+    // monitor polling it holds a connection open and learns nothing.
+    let db_ok = tokio::time::timeout(
+        HEALTH_DB_TIMEOUT,
+        sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&state.pool),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok());
 
     let full_scope = authorized(&state, &headers) == Some(Scope::Full);
     let mut body = serde_json::json!({
@@ -1553,6 +1618,7 @@ mod tests {
         AppState {
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             port: 8787,
+            auth_failures: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             pool: crate::db::create_lazy_pool("postgres://unused/unused"),
             token: token.map(|t| Arc::new(t.to_string())),
             peer_token: None,
@@ -1846,5 +1912,35 @@ mod lan_exposure_tests {
                 "{forbidden} reached http.rs. Nothing here needs CORS: no browser page is supposed to call this daemon except its own, and those are same-origin."
             );
         }
+    }
+
+    #[test]
+    fn a_wrong_token_is_not_free_to_retry_forever() {
+        use std::time::Duration;
+
+        assert_eq!(
+            auth_brake(0, Duration::from_secs(0)),
+            None,
+            "an address that has done nothing wrong waits for nothing"
+        );
+        assert_eq!(
+            auth_brake(MAX_AUTH_FAILURES - 1, Duration::from_secs(1)),
+            None,
+            "a handful of wrong tokens is a misconfigured client, not an attack"
+        );
+
+        let wait = auth_brake(MAX_AUTH_FAILURES, Duration::from_secs(10))
+            .expect("ten wrong tokens inside the window has to cost something");
+        assert_eq!(
+            wait,
+            AUTH_FAILURE_WINDOW - Duration::from_secs(10),
+            "the wait is what is left of the window: same_secret compares in constant time so there is no timing to leak, but nothing was slowing an attacker on the LAN between attempts"
+        );
+
+        assert_eq!(
+            auth_brake(MAX_AUTH_FAILURES * 100, AUTH_FAILURE_WINDOW),
+            None,
+            "the window has to expire, or one burst would lock an address out for the life of the daemon"
+        );
     }
 }

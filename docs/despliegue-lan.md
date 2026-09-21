@@ -98,7 +98,13 @@ another one. Pick a free port and put it in the client config too.
 ## 6. Firewall
 
 Allow inbound TCP on the chosen port **from the client addresses only**. Do not
-open the whole subnet. On Windows this needs an administrator; if the account
+open the whole subnet.
+
+The daemon does what it can on its side: ten wrong bearer tokens from one
+address inside a minute and that address has to wait, so a token cannot be
+guessed at the speed the daemon answers. A successful call clears the count, so
+an editor batching real work is never slowed down. The firewall is still the
+first line — this is the second. On Windows this needs an administrator; if the account
 installing the daemon is not one, the daemon will run and answer locally while
 remote clients time out — that symptom is a missing firewall rule, not a broken
 daemon.
