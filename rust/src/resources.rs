@@ -50,6 +50,11 @@ const OOD_BUDGET_DIVISOR: u64 = 20;
 
 const DISABLED_MODEL_DIR: &str = "cuba-memorys-disabled-by-resource-plan";
 
+/// The arena cap. Named once because `apply` reads the pair and has to write
+/// back to the half of it the session resolves first.
+const GPU_CAP_PREFERRED: &str = "MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB";
+const GPU_CAP_LEGACY: &str = "CUBA_GPU_MEM_LIMIT_MB";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Machine {
     pub ram_total_mb: u64,
@@ -399,7 +404,7 @@ pub fn plan_env(p: &Plan) -> Vec<(&'static str, String)> {
     ];
 
     if let Some(limit) = p.gpu_mem_limit_mb {
-        env.push(("CUBA_GPU_MEM_LIMIT_MB", limit.to_string()));
+        env.push((GPU_CAP_LEGACY, limit.to_string()));
     }
     if !p.reranker {
         env.push(("CUBA_RERANKER_PATH", disabled_model_path()));
@@ -414,7 +419,7 @@ pub fn apply(p: &Plan) {
     // Before the fill-in below, or a variable the plan is about to set would
     // read back as though an operator had chosen it.
     if let (Some(planned), Some(floor)) = (p.gpu_mem_limit_mb, p.gpu_mem_floor_mb) {
-        let explicit = std::env::var("CUBA_GPU_MEM_LIMIT_MB")
+        let explicit = crate::envs::alias(GPU_CAP_PREFERRED, GPU_CAP_LEGACY)
             .ok()
             .and_then(|raw| raw.trim().parse::<u64>().ok());
         let (cap, raised) = gpu_cap_with_floor(explicit, planned, floor);
@@ -423,9 +428,13 @@ pub fn apply(p: &Plan) {
                 explicit = explicit.unwrap_or_default(),
                 floor_mb = floor,
                 raised_to_mb = cap,
-                "CUBA_GPU_MEM_LIMIT_MB was set below what this reranker needs on this card;                  leaving it there makes the session fail partway through the load. Raised.                  To use less VRAM set CUBA_RERANK_DEVICE=cpu instead."
+                "MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB / CUBA_GPU_MEM_LIMIT_MB was set below what                  this reranker needs on this card; leaving it there makes the session fail                  partway through the load. Raised. To use less VRAM set RERANK_DEVICE=cpu                  instead."
             );
-            unsafe { std::env::set_var("CUBA_GPU_MEM_LIMIT_MB", cap.to_string()) };
+            // The preferred name, because that is the one the session resolves
+            // first: writing the legacy one would leave an impossible
+            // MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB in charge of the arena and the
+            // raise would be announced without taking effect.
+            unsafe { std::env::set_var(GPU_CAP_PREFERRED, cap.to_string()) };
         }
     }
     for (key, value) in plan_env(p) {
@@ -696,6 +705,35 @@ mod tests {
             gpu_cap_with_floor(Some(floor), planned, floor),
             (floor, false),
             "exactly the floor is enough; this pins the boundary so a mutant cannot turn <              into <="
+        );
+    }
+
+    /// The negative control F4 runs on the company machine, executed here: with
+    /// the cap pinned under the floor by the documented name, `apply` has to
+    /// raise it *where the session looks*. This is the one test that calls
+    /// `apply`, hence the guard and the restore of every name it writes.
+    #[tokio::test]
+    async fn a_ceiling_pinned_under_the_preferred_name_is_raised_where_the_session_reads_it() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let p = plan(&desktop_16gb_with_gpu());
+        let floor = p.gpu_mem_floor_mb.expect("a card in use has a floor");
+        let planned = p.gpu_mem_limit_mb.expect("this card has a cap");
+
+        let _restore: Vec<crate::envs::ScopedEnv> = plan_env(&p)
+            .iter()
+            .map(|(key, _)| crate::envs::ScopedEnv::cleared(key))
+            .collect();
+        let _pinned = crate::envs::ScopedEnv::set(GPU_CAP_PREFERRED, "512");
+
+        apply(&p);
+
+        assert_eq!(
+            crate::envs::alias(GPU_CAP_PREFERRED, GPU_CAP_LEGACY).ok(),
+            Some(planned.to_string()),
+            "512 MiB is under the {floor} MiB this reranker needs, so apply() raises it. The \
+             raise has to land on the name the session resolves first: writing only the legacy \
+             one leaves the impossible value in charge, and the daemon logs a correction that \
+             never happened"
         );
     }
 

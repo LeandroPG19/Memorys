@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 use crate::constants::{JUEZ_DEFAULT_MAX_PAIRS, JUEZ_DEFAULT_TIMEOUT_SECS};
+use crate::envs::alias;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Judgment {
@@ -46,20 +47,15 @@ pub trait ContradictionJudge: Send + Sync {
     }
 }
 
-/// Prefer MemoryIndustry env names; fall back to legacy `CUBA_*` for one release.
-fn env_alias(new_key: &str, legacy_key: &str) -> Result<String, env::VarError> {
-    env::var(new_key).or_else(|_| env::var(legacy_key))
-}
-
 fn judge_timeout_secs() -> u64 {
-    env_alias("MEMORY_INDUSTRY_LLM_TIMEOUT_SECS", "CUBA_JUEZ_TIMEOUT_SECS")
+    alias("MEMORY_INDUSTRY_LLM_TIMEOUT_SECS", "CUBA_JUEZ_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(JUEZ_DEFAULT_TIMEOUT_SECS)
 }
 
 pub fn resolve_judge() -> Box<dyn ContradictionJudge> {
-    let mode = env_alias("MEMORY_INDUSTRY_JUDGE", "CUBA_JUDGE")
+    let mode = alias("MEMORY_INDUSTRY_JUDGE", "CUBA_JUDGE")
         .unwrap_or_else(|_| "auto".to_string())
         .to_lowercase();
     match mode.as_str() {
@@ -106,7 +102,7 @@ pub fn resolve_offline_llm() -> Option<Box<dyn ContradictionJudge>> {
 pub fn resolve_offline_llm_within(
     timeout: Option<Duration>,
 ) -> Option<Box<dyn ContradictionJudge>> {
-    let has_url = env_alias("MEMORY_INDUSTRY_LLM_BASE_URL", "CUBA_LLM_BASE_URL")
+    let has_url = alias("MEMORY_INDUSTRY_LLM_BASE_URL", "CUBA_LLM_BASE_URL")
         .map(|u| !u.trim().is_empty())
         .unwrap_or(false);
     let has_provider = env::var("MEMORY_INDUSTRY_LLM_PROVIDER")
@@ -121,7 +117,7 @@ pub fn resolve_offline_llm_within(
         return Some(Box::new(judge));
     }
 
-    if let Ok(cli) = env_alias("MEMORY_INDUSTRY_LLM_CLI", "CUBA_JUEZ_CLI")
+    if let Ok(cli) = alias("MEMORY_INDUSTRY_LLM_CLI", "CUBA_JUEZ_CLI")
         && which_in_path(&cli)
     {
         return Some(cli_judge_for_bin(&cli, timeout));
@@ -170,7 +166,7 @@ pub fn unwrap_cli_reply(raw: &str) -> String {
 }
 
 pub fn default_max_pairs() -> usize {
-    env_alias("MEMORY_INDUSTRY_LLM_MAX_PAIRS", "CUBA_JUEZ_MAX_PAIRS")
+    alias("MEMORY_INDUSTRY_LLM_MAX_PAIRS", "CUBA_JUEZ_MAX_PAIRS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(JUEZ_DEFAULT_MAX_PAIRS)
@@ -184,9 +180,9 @@ pub struct ClaudeCodeJudge {
 
 impl ClaudeCodeJudge {
     pub fn from_env() -> Self {
-        let cli = env_alias("MEMORY_INDUSTRY_LLM_CLI", "CUBA_JUEZ_CLI")
+        let cli = alias("MEMORY_INDUSTRY_LLM_CLI", "CUBA_JUEZ_CLI")
             .unwrap_or_else(|_| "claude".to_string());
-        let model = env_alias("MEMORY_INDUSTRY_LLM_MODEL", "CUBA_JUEZ_MODEL")
+        let model = alias("MEMORY_INDUSTRY_LLM_MODEL", "CUBA_JUEZ_MODEL")
             .unwrap_or_else(|_| "claude-haiku-4-5".to_string());
         Self {
             cli,
@@ -254,9 +250,9 @@ pub struct GeminiCliJudge {
 
 impl GeminiCliJudge {
     pub fn from_env() -> Self {
-        let cli = env_alias("MEMORY_INDUSTRY_LLM_CLI", "CUBA_JUEZ_CLI")
+        let cli = alias("MEMORY_INDUSTRY_LLM_CLI", "CUBA_JUEZ_CLI")
             .unwrap_or_else(|_| "gemini".to_string());
-        let model = env_alias("MEMORY_INDUSTRY_LLM_MODEL", "CUBA_JUEZ_MODEL")
+        let model = alias("MEMORY_INDUSTRY_LLM_MODEL", "CUBA_JUEZ_MODEL")
             .unwrap_or_else(|_| "gemini-2.0-flash".to_string());
         Self {
             cli,
@@ -456,7 +452,7 @@ pub fn llm_provider_ids() -> Vec<&'static str> {
 }
 
 fn resolve_api_key(preset: Option<&LlmProviderPreset>) -> Option<String> {
-    if let Ok(k) = env_alias("MEMORY_INDUSTRY_LLM_API_KEY", "CUBA_LLM_API_KEY")
+    if let Ok(k) = alias("MEMORY_INDUSTRY_LLM_API_KEY", "CUBA_LLM_API_KEY")
         && !k.is_empty()
     {
         return Some(k);
@@ -483,7 +479,7 @@ impl OpenAiCompatJudge {
             .to_ascii_lowercase();
         let preset = llm_provider_preset(&provider);
 
-        let base_url = env_alias("MEMORY_INDUSTRY_LLM_BASE_URL", "CUBA_LLM_BASE_URL")
+        let base_url = alias("MEMORY_INDUSTRY_LLM_BASE_URL", "CUBA_LLM_BASE_URL")
             .ok()
             .filter(|u| !u.trim().is_empty())
             .or_else(|| preset.map(|p| p.base_url.to_string()))
@@ -491,7 +487,7 @@ impl OpenAiCompatJudge {
             .trim_end_matches('/')
             .to_string();
 
-        let model = env_alias("MEMORY_INDUSTRY_LLM_MODEL", "CUBA_JUEZ_MODEL")
+        let model = alias("MEMORY_INDUSTRY_LLM_MODEL", "CUBA_JUEZ_MODEL")
             .ok()
             .filter(|m| !m.trim().is_empty())
             .or_else(|| preset.map(|p| p.default_model.to_string()))
@@ -649,7 +645,7 @@ pub struct NliJudge {
 
 impl NliJudge {
     pub fn new(inner: Box<dyn ContradictionJudge>) -> Self {
-        let escalate_undecided = env_alias("MEMORY_INDUSTRY_NLI_ESCALATE", "CUBA_NLI_ESCALATE")
+        let escalate_undecided = alias("MEMORY_INDUSTRY_NLI_ESCALATE", "CUBA_NLI_ESCALATE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         Self {

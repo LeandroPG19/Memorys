@@ -32,24 +32,21 @@ pub const COMMANDS: [&str; 25] = [
     "project",
 ];
 
-fn undo_dir() -> std::path::PathBuf {
-    std::env::var("CUBA_UNDO_DIR").map_or_else(
-        |_| {
-            let cache = dirs_home().join(".cache");
-            let preferred = cache.join("memory-industry").join("undo");
-            let legacy = cache.join("cuba-memorys").join("undo");
-            if preferred.exists() || !legacy.exists() {
-                preferred
-            } else {
-                legacy
-            }
-        },
-        std::path::PathBuf::from,
-    )
-}
+fn undo_dir() -> Result<std::path::PathBuf> {
+    // Checked before the home, so an operator who points this somewhere
+    // explicit keeps working with neither variable defined.
+    if let Ok(dir) = std::env::var("CUBA_UNDO_DIR") {
+        return Ok(std::path::PathBuf::from(dir));
+    }
 
-fn dirs_home() -> std::path::PathBuf {
-    std::env::var("HOME").map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from)
+    let cache = crate::envs::home()?.join(".cache");
+    let preferred = cache.join("memory-industry").join("undo");
+    let legacy = cache.join("cuba-memorys").join("undo");
+    Ok(if preferred.exists() || !legacy.exists() {
+        preferred
+    } else {
+        legacy
+    })
 }
 
 async fn pool() -> Result<PgPool> {
@@ -323,7 +320,7 @@ pub async fn run_delete(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let dir = undo_dir();
+    let dir = undo_dir()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("no se pudo crear el directorio de undo {}", dir.display()))?;
 
@@ -379,5 +376,54 @@ pub async fn run_project(args: &[String]) -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envs::ScopedEnv;
+
+    #[tokio::test]
+    async fn the_undo_dir_hangs_off_the_home_not_off_wherever_the_operator_stood() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = std::env::temp_dir().join(format!(
+            "memory-industry-undo-{}-resolved",
+            std::process::id()
+        ));
+        let _explicit = ScopedEnv::cleared("CUBA_UNDO_DIR");
+        let _h = ScopedEnv::cleared("HOME");
+        let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+
+        let dir = undo_dir().expect("USERPROFILE answers when HOME does not");
+
+        assert!(
+            dir.starts_with(&root),
+            "`delete --apply` writes the only copy of the deleted row here. Under `.` \
+             it lands wherever the operator was standing, which is not where the next \
+             session looks for it: got {}, expected it under {}",
+            dir.display(),
+            root.display()
+        );
+        assert!(dir.ends_with("undo"), "{}", dir.display());
+    }
+
+    #[tokio::test]
+    async fn an_explicit_undo_dir_does_not_need_a_home() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let chosen = std::env::temp_dir().join(format!(
+            "memory-industry-undo-{}-explicit",
+            std::process::id()
+        ));
+        let _explicit = ScopedEnv::set("CUBA_UNDO_DIR", &chosen.display().to_string());
+        let _h = ScopedEnv::cleared("HOME");
+        let _u = ScopedEnv::cleared("USERPROFILE");
+
+        assert_eq!(
+            undo_dir().expect("an explicit directory needs no home to be resolved"),
+            chosen,
+            "README:366 documents this variable. Making the home mandatory for everyone \
+             would break the operator who already answered the question"
+        );
     }
 }

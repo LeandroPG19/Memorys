@@ -603,12 +603,14 @@ fn identity_pairs(n: usize) -> Vec<(usize, f64)> {
 mod tests {
     use super::*;
 
-    /// These tests move HOME and CUBA_RERANKER_PATH, which every other test in
-    /// this process reads. Serialise them.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A throwaway HOME whose cache holds a plausible reranker, so the tests
     /// below never depend on what this machine happens to have installed.
+    ///
+    /// Every test that builds one takes `session::GLOBAL_STATE_GUARD` first.
+    /// This used to serialise on a mutex private to this module, which reads
+    /// the same but is not: `set_var` is unsound against *any* thread reading
+    /// the environment, and the forty-odd tests elsewhere in this binary that
+    /// move HOME or a `CUBA_*` name serialise on the crate-wide one.
     struct FakeHome {
         root: PathBuf,
         home: Option<String>,
@@ -655,9 +657,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_path_the_plan_disabled_does_not_fall_through_to_the_cache() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    #[tokio::test]
+    async fn the_path_the_plan_disabled_does_not_fall_through_to_the_cache() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         let _home = FakeHome::with_a_model_in_the_cache("disabled");
 
         // Positive control first: without the sentinel the fixture resolves, so
@@ -690,6 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn identity_when_disabled() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         force_fallback_if_unresolved();
         assert!(
             !enabled(),
@@ -703,9 +706,9 @@ mod tests {
         assert!(pairs[0].1 > pairs[1].1);
     }
 
-    #[test]
-    fn both_answers_about_the_reranker_come_from_the_same_rule() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    #[tokio::test]
+    async fn both_answers_about_the_reranker_come_from_the_same_rule() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         let home = FakeHome::with_a_model_in_the_cache("same-rule");
 
         let empty = home.root.join("empty");
@@ -746,9 +749,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_plan_sizes_the_file_the_session_will_actually_open() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    #[tokio::test]
+    async fn the_plan_sizes_the_file_the_session_will_actually_open() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         let home = FakeHome::with_a_model_in_the_cache("weights");
 
         let dir = home.root.join("weighed");
@@ -798,9 +801,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn intra_threads_is_configurable_and_never_zero() {
-        unsafe { std::env::set_var("CUBA_RERANK_INTRA_THREADS", "6") };
+    #[tokio::test]
+    async fn intra_threads_is_configurable_and_never_zero() {
+        // Under the guard because `resources::apply` publishes this same name
+        // from the measured plan: without it, the two tests take turns
+        // deciding what the third assertion below is even looking at.
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _knob = crate::envs::ScopedEnv::set("CUBA_RERANK_INTRA_THREADS", "6");
         assert_eq!(intra_threads(), 6);
 
         unsafe { std::env::set_var("CUBA_RERANK_INTRA_THREADS", "0") };

@@ -348,8 +348,7 @@ fn reranker_check(
 /// How long `--deep` will wait for one model to open before calling it a
 /// failure. Generous: a cold cross-encoder off a slow disk is minutes.
 fn deep_load_budget() -> std::time::Duration {
-    let secs = std::env::var("MEMORY_INDUSTRY_DOCTOR_DEEP_SECS")
-        .or_else(|_| std::env::var("CUBA_DOCTOR_DEEP_SECS"))
+    let secs = crate::envs::alias("MEMORY_INDUSTRY_DOCTOR_DEEP_SECS", "CUBA_DOCTOR_DEEP_SECS")
         .ok()
         .and_then(|raw| raw.trim().parse().ok())
         .unwrap_or(300);
@@ -1383,7 +1382,13 @@ mod deep_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_load_that_never_finishes_fails_instead_of_hanging() {
-        unsafe { std::env::set_var("MEMORY_INDUSTRY_DOCTOR_DEEP_SECS", "1") };
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        // RAII, because the expect_err below panics when this check regresses,
+        // and the old `remove_var` sat after it: the run that found the bug
+        // would also leave a 1 s budget behind for every other test in the
+        // process, so the first failure would be followed by a cascade of
+        // unrelated ones.
+        let _budget = crate::envs::ScopedEnv::set("MEMORY_INDUSTRY_DOCTOR_DEEP_SECS", "1");
         let started = std::time::Instant::now();
 
         let answer = resolve_under_budget(|| {
@@ -1392,7 +1397,6 @@ mod deep_tests {
         })
         .await;
 
-        unsafe { std::env::remove_var("MEMORY_INDUSTRY_DOCTOR_DEEP_SECS") };
         let why = answer.expect_err("a 4 s load under a 1 s budget has to give up");
         assert!(
             why.contains("1s"),

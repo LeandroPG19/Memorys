@@ -12,6 +12,7 @@ pub mod db;
 pub mod dedupe_cli;
 pub mod doctor;
 pub mod embeddings;
+pub mod envs;
 pub mod eval;
 pub mod events;
 pub mod export;

@@ -3,26 +3,26 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::envs::home;
+
 const REQUIRED_ENV: [&str; 3] = ["DATABASE_URL", "ONNX_MODEL_PATH", "ORT_DYLIB_PATH"];
 
 const MUST_AGREE: [&str; 2] = ["CUBA_EMBEDDING_DIM", "CUBA_EMBED_MODEL"];
 
-fn home() -> PathBuf {
-    std::env::var("HOME").map_or_else(|_| PathBuf::from("."), PathBuf::from)
+fn known_targets() -> Result<Vec<(&'static str, PathBuf)>> {
+    let home = home()?;
+    Ok(vec![
+        ("claude", home.join(".claude.json")),
+        ("mcp", home.join(".mcp.json")),
+        ("cursor", home.join(".cursor").join("mcp.json")),
+        ("warp", home.join(".warp").join(".mcp.json")),
+    ])
 }
 
-fn known_targets() -> Vec<(&'static str, PathBuf)> {
-    vec![
-        ("claude", home().join(".claude.json")),
-        ("mcp", home().join(".mcp.json")),
-        ("cursor", home().join(".cursor").join("mcp.json")),
-        ("warp", home().join(".warp").join(".mcp.json")),
-    ]
-}
-
-fn project_configs() -> Vec<(String, PathBuf)> {
+fn project_configs() -> Result<Vec<(String, PathBuf)>> {
+    let home = home()?;
     let mut out = Vec::new();
-    let roots = [home().join("proyectos"), home().join("projects")];
+    let roots = [home.join("proyectos"), home.join("projects")];
 
     for root in roots.iter().filter(|r| r.is_dir()) {
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -52,21 +52,24 @@ fn project_configs() -> Vec<(String, PathBuf)> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn desired_config() -> Result<Value> {
     let exe = std::env::current_exe().context("no se pudo resolver la ruta del binario")?;
 
     let db = std::env::var("DATABASE_URL").unwrap_or_default();
-    let onnx = std::env::var("ONNX_MODEL_PATH")
-        .unwrap_or_else(|_| prefer_cache_subdir("models").display().to_string());
-    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| {
-        prefer_cache_subdir("onnxruntime")
+    let onnx = match std::env::var("ONNX_MODEL_PATH") {
+        Ok(v) => v,
+        Err(_) => prefer_cache_subdir("models")?.display().to_string(),
+    };
+    let ort = match std::env::var("ORT_DYLIB_PATH") {
+        Ok(v) => v,
+        Err(_) => prefer_cache_subdir("onnxruntime")?
             .join("libonnxruntime.so")
             .display()
-            .to_string()
-    });
+            .to_string(),
+    };
 
     let mut env = json!({
         "DATABASE_URL": db,
@@ -99,15 +102,15 @@ fn workspace_client_id() -> Option<String> {
     Some(name.to_string())
 }
 
-fn prefer_cache_subdir(subdir: &str) -> PathBuf {
-    let home = home();
+fn prefer_cache_subdir(subdir: &str) -> Result<PathBuf> {
+    let home = home()?;
     let preferred = home.join(".cache/memory-industry").join(subdir);
     let legacy = home.join(".cache/cuba-memorys").join(subdir);
-    if preferred.exists() || !legacy.exists() {
+    Ok(if preferred.exists() || !legacy.exists() {
         preferred
     } else {
         legacy
-    }
+    })
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -154,10 +157,10 @@ fn run_check() -> Result<()> {
     let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
 
-    let targets: Vec<(String, PathBuf)> = known_targets()
+    let targets: Vec<(String, PathBuf)> = known_targets()?
         .into_iter()
         .map(|(n, p)| (n.to_string(), p))
-        .chain(project_configs())
+        .chain(project_configs()?)
         .collect();
 
     for (name, path) in targets {
@@ -267,7 +270,7 @@ fn run_check() -> Result<()> {
 }
 
 fn run_write(target: &str, apply: bool) -> Result<()> {
-    let path = known_targets()
+    let path = known_targets()?
         .into_iter()
         .find(|(n, _)| *n == target)
         .map(|(_, p)| p)
@@ -381,7 +384,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
 
 fn run_hook(apply: bool) -> Result<()> {
     let exe = std::env::current_exe().context("no se pudo resolver la ruta del binario")?;
-    let path = home().join(".claude").join("settings.json");
+    let path = home()?.join(".claude").join("settings.json");
 
     let command = format!("{} recall --quiet", exe.display());
     let hook = json!({
@@ -457,9 +460,41 @@ fn run_hook(apply: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envs::ScopedEnv;
 
-    #[test]
-    fn the_config_carries_the_vars_whose_absence_is_silent() {
+    #[tokio::test]
+    async fn the_claude_config_goes_under_the_resolved_home_not_beside_the_operator() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        // A `C:\…` literal would make the `is_absolute` assertion below vacuous
+        // on the Linux runner; `temp_dir` is absolute on both. Never created:
+        // `known_targets` only joins.
+        let root = std::env::temp_dir().join(format!("memory-industry-{}", std::process::id()));
+        let _h = ScopedEnv::cleared("HOME");
+        let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+
+        let (_, claude) = known_targets()
+            .expect("USERPROFILE answers")
+            .into_iter()
+            .find(|(n, _)| *n == "claude")
+            .expect("claude is one of the known targets");
+
+        assert_eq!(
+            claude,
+            root.join(".claude.json"),
+            "this is the path `setup claude --apply` writes. Relative to the working \
+             directory it is a file the client never reads"
+        );
+        assert!(
+            claude.is_absolute(),
+            "a relative target means the config lands wherever the operator was standing"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_config_carries_the_vars_whose_absence_is_silent() {
+        // Takes the guard because `desired_config` now resolves the home, and
+        // the `envs` home tests clear HOME and USERPROFILE for the whole process.
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         let cfg = desired_config().expect("current_exe resolves under test");
         let env = cfg
             .get("env")

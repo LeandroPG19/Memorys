@@ -356,11 +356,13 @@ async fn shutdown_signal(idle: Arc<tokio::sync::Notify>) {
 /// anyway. Long enough for a cold cross-encoder, short enough that a broken
 /// model does not leave the port shut with nobody able to ask why.
 fn warm_before_serve_budget() -> std::time::Duration {
-    let secs = std::env::var("MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS")
-        .or_else(|_| std::env::var("CUBA_WARM_BEFORE_SERVE_SECS"))
-        .ok()
-        .and_then(|raw| raw.trim().parse().ok())
-        .unwrap_or(180);
+    let secs = crate::envs::alias(
+        "MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS",
+        "CUBA_WARM_BEFORE_SERVE_SECS",
+    )
+    .ok()
+    .and_then(|raw| raw.trim().parse().ok())
+    .unwrap_or(180);
     std::time::Duration::from_secs(secs)
 }
 
@@ -370,7 +372,11 @@ fn warm_before_serve_budget() -> std::time::Duration {
 /// search that asks for reranking — a request with a 20 s budget paying for a
 /// 1.1 GB read. The daemon has time at startup and the search does not.
 fn warm_reranker_eagerly() -> bool {
-    warm_eagerly_from(std::env::var("CUBA_WARM_RERANKER").ok().as_deref())
+    warm_eagerly_from(
+        crate::envs::alias("MEMORY_INDUSTRY_WARM_RERANKER", "CUBA_WARM_RERANKER")
+            .ok()
+            .as_deref(),
+    )
 }
 
 fn warm_eagerly_from(raw: Option<&str>) -> bool {
@@ -2014,6 +2020,40 @@ mod lan_exposure_tests {
             None,
             "the window has to expire, or one burst would lock an address out for the life of the daemon"
         );
+    }
+
+    #[tokio::test]
+    async fn the_warm_up_is_deferred_under_either_spelling_of_the_knob() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        {
+            let _preferred = crate::envs::ScopedEnv::cleared("MEMORY_INDUSTRY_WARM_RERANKER");
+            let _legacy = crate::envs::ScopedEnv::set("CUBA_WARM_RERANKER", "0");
+            assert!(
+                !warm_reranker_eagerly(),
+                "every machine in the field is configured with the legacy name; reading the \
+                 new one first must not stop the old one from working"
+            );
+        }
+        {
+            let _preferred = crate::envs::ScopedEnv::set("MEMORY_INDUSTRY_WARM_RERANKER", "0");
+            let _legacy = crate::envs::ScopedEnv::cleared("CUBA_WARM_RERANKER");
+            assert!(
+                !warm_reranker_eagerly(),
+                "this knob answered only to CUBA_WARM_RERANKER while README.md and \
+                 .env.example offered the MEMORY_INDUSTRY_ name, so an operator deferring the \
+                 load with the documented name got a daemon that loaded anyway"
+            );
+        }
+        {
+            let _preferred = crate::envs::ScopedEnv::set("MEMORY_INDUSTRY_WARM_RERANKER", "1");
+            let _legacy = crate::envs::ScopedEnv::set("CUBA_WARM_RERANKER", "0");
+            assert!(
+                warm_reranker_eagerly(),
+                "with both set the preferred name decides, or a stale line in a unit file \
+                 would quietly override the one the operator edited"
+            );
+        }
     }
 
     #[test]

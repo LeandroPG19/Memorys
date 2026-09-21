@@ -19,6 +19,18 @@ impl Workload {
         }
     }
 
+    /// The `MEMORY_INDUSTRY_*` spelling, where there is one. Only the reranker
+    /// has been promoted: it is the placement an operator actually sets, and
+    /// the one this release documents under the new namespace. Promoting the
+    /// other two would add two knobs to `.env.example` that nobody has ever
+    /// had to touch.
+    fn preferred_device_var(self) -> Option<&'static str> {
+        match self {
+            Self::Reranker => Some("MEMORY_INDUSTRY_RERANK_DEVICE"),
+            Self::Embedder | Self::Nli => None,
+        }
+    }
+
     fn gpu_by_default(self) -> bool {
         matches!(self, Self::Reranker)
     }
@@ -36,7 +48,11 @@ pub fn wants_gpu(workload: Workload) -> bool {
     if !cfg!(any(feature = "cuda", feature = "directml")) {
         return false;
     }
-    match std::env::var(workload.device_var()) {
+    let configured = match workload.preferred_device_var() {
+        Some(preferred) => crate::envs::alias(preferred, workload.device_var()),
+        None => std::env::var(workload.device_var()),
+    };
+    match configured {
         Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
             "gpu" | "cuda" | "directml" => true,
             "cpu" => false,
@@ -207,10 +223,11 @@ fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionB
 
 #[cfg(feature = "cuda")]
 fn cuda_provider() -> ort::ep::ExecutionProviderDispatch {
-    let limit_mb: usize = std::env::var("CUBA_GPU_MEM_LIMIT_MB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2048);
+    let limit_mb: usize =
+        crate::envs::alias("MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB", "CUBA_GPU_MEM_LIMIT_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
 
     ort::ep::CUDA::default()
         .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
