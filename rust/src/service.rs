@@ -266,11 +266,30 @@ pub fn planner_keys() -> Vec<String> {
         budget_mb: 1,
         committed_mb: 1,
     };
+    // Spelled out field by field instead of `..everything_on.clone()`: a
+    // functional update makes cargo-mutants emit "delete field X from struct
+    // Plan expression" mutants, and `--exclude-re` does not match those
+    // (27.1.0), so a survivor there cannot be filtered out of the gate. Only
+    // `reranker`, `nli` and `gpu_mem_limit_mb` differ from the plan above —
+    // the three the off plan flips — and repeating the rest is what that costs.
     let everything_off = Plan {
+        tier: Tier::Full,
+        embedder: true,
         reranker: false,
+        reranker_on_gpu: true,
         nli: false,
+        embed_intra_threads: 1,
+        rerank_intra_threads: 1,
+        nli_intra_threads: 1,
+        rerank_chunk: 1,
         gpu_mem_limit_mb: None,
-        ..everything_on.clone()
+        gpu_mem_floor_mb: Some(1),
+        worker_threads: 1,
+        max_blocking_threads: 1,
+        db_max_connections: 1,
+        ood_fit_limit: 1,
+        budget_mb: 1,
+        committed_mb: 1,
     };
 
     let mut keys: Vec<String> = Vec::new();

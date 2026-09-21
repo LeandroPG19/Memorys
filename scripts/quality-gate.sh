@@ -232,11 +232,23 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #   panel_route_enabled, which draws the line between a panel on
           #   loopback and one served to the whole LAN, sat outside the judge
           #   from the day it was written. A name that is a prefix of another
-          #   name needs the space. The two service.rs entries in the fourth
-          #   group below obey the same rule by other means: planner_keys is
-          #   nobody's prefix, and `replace restrict` keeps its signature and
-          #   its `Ok.false` tail, so it can cover neither a future restrict_*
-          #   nor the `Ok(true)` sibling that dies today.
+          #   name needs the space. The service.rs entry in the fourth group
+          #   below obeys the same rule by other means: `replace restrict`
+          #   keeps its signature and its `Ok.false` tail, so it can cover
+          #   neither a future restrict_* nor the `Ok(true)` sibling that
+          #   dies today.
+          #
+          #   The opposite trap of this same argument is a pattern that
+          #   covers nothing. --exclude-re (27.1.0) does not match `delete
+          #   field X from struct Y expression` mutants at all — not by
+          #   field name, not by struct name, not by file name — so a
+          #   pattern aimed at one of those is dead the day it is written,
+          #   and reads like a cover where there is none. A survivor of that
+          #   shape is not answered with a better pattern: it is answered by
+          #   deleting the `..base` functional update that makes
+          #   cargo-mutants emit it, which is what src/service.rs did. The
+          #   note lives there, next to the literal someone would fold back
+          #   up.
           #
           # A third group, every one of them from the same line of this build.
           # The gate compiles without --features cuda, and gpu.rs:48 returns
@@ -281,39 +293,10 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           # stops being an exclusion and becomes a cover: delete them the same
           # day.
           #
-          # A fourth group, and neither of these is about a feature flag: one is
-          # the platform this judge runs on, the other is how the function is
-          # built. Owner: endurecedor 0.27. Expires: 2027-03-21.
+          # A fourth group of one, and it is not about a feature flag: it is
+          # the platform this judge runs on. Owner: endurecedor 0.27.
+          # Expires: 2027-03-21.
           #
-          #   service.rs.*delete field gpu_mem_limit_mb.*planner_keys
-          #                     planner_keys builds an everything_on plan and an
-          #                     everything_off one that inherits the rest from
-          #                     it, and returns the UNION of the keys plan_env
-          #                     would emit for each. Deleting
-          #                     `gpu_mem_limit_mb: None` makes the off plan
-          #                     inherit Some(1), so it emits
-          #                     CUBA_GPU_MEM_LIMIT_MB too — but the on plan
-          #                     already contributed that key and the dedup loop
-          #                     drops the repeat. Same Vec<String>, same order:
-          #                     no behaviour test can tell the two apart.
-          #                     The field stays anyway, and this is why, because
-          #                     otherwise the next reader deletes it: of the
-          #                     three fields the off plan flips, it is the only
-          #                     one whose OPTIONALITY branches plan_env (`if let
-          #                     Some(limit)`). While it is there the two plans
-          #                     between them walk both sides of that branch, and
-          #                     the function meets its contract — the union of
-          #                     everything the planner can emit — by
-          #                     construction instead of by accident. Delete it
-          #                     and the day plan_env emits a key only when there
-          #                     is NO cap, that key drops out of the union in
-          #                     silence. The other two fields that literal used
-          #                     to carry, reranker_on_gpu and gpu_mem_floor_mb,
-          #                     held no branch at all — plan_env pushes
-          #                     CUBA_RERANK_DEVICE either way and never reads
-          #                     the floor — so they were deleted in the previous
-          #                     commit instead of excluded here. That is the
-          #                     difference between those two and this one.
           #   service.rs.*replace restrict -> Result<bool> with Ok.false
           #                     one function with the cfg inside the body: on
           #                     unix it chmods 0600 and returns Ok(true),
@@ -351,7 +334,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
             in_diff=(--in-diff "$diff_file")
           fi
           (cd rust && cargo mutants "${files[@]}" "${in_diff[@]}" \
-            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|gpu.rs.*runtime_dir|http.rs.*compiled_gpu_provider.*with None|service.rs.*delete field gpu_mem_limit_mb.*planner_keys|service.rs.*replace restrict -> Result<bool> with Ok.false' \
+            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|gpu.rs.*runtime_dir|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false' \
             --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || fail=1
           rm -f "$diff_file"
         fi
