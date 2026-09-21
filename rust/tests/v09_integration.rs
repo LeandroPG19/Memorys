@@ -228,7 +228,12 @@ async fn test_v09_all() {
             json!({
                 "action": "add",
                 "entity_name": entity_a,
-                "content": "An observation written while CUBA_EMBED_MODEL says something specific",
+                // Unique, like the entity names above. A fixed sentence here
+                // lets cronica's near-duplicate check reinforce an existing
+                // observation instead of creating one, and then this test
+                // fails on a missing id for a reason that has nothing to do
+                // with what it is checking. Seen once in the gate.
+                "content": format!("An observation written while CUBA_EMBED_MODEL says {tag}"),
                 "observation_type": "fact"
             }),
         )

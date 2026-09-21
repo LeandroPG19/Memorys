@@ -57,13 +57,18 @@ echo "=== cargo mutants (search cores with dense unit tests) ==="
 # --lib search:: keeps the unmutated baseline off contract tests that need
 # files outside rust/, and keeps each mutant's cargo test under a second.
 set +e
+# --timeout is 180, not 90. That budget was set when this ran two at a time;
+# at six, a slow test reported TIMEOUT instead of the CAUGHT it actually was,
+# and a timeout counts against the kill rate as though the mutant had lived.
+#
+# The comment lives here and not inside the invocation below: a comment line
+# between two backslash continuations ends the command, and the shell then
+# tries to run `--timeout` as a program. That is rc=127, and it is how this
+# script failed the gate once already.
 cargo mutants \
   --file 'src/search/mmr.rs' \
   --file 'src/search/rrf.rs' \
   --file 'src/search/cache.rs' \
-  # 180, not 90. The per-mutant budget was tuned when this ran two at a time;
-  # at six a slow test reported TIMEOUT instead of the CAUGHT it actually was,
-  # and a timeout counts against the kill rate as though the mutant had lived.
   --timeout 180 \
   --jobs "$MUTANTS_JOBS" \
   --output "$OUT_DIR" \
