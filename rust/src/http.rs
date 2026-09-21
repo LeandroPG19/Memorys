@@ -38,6 +38,8 @@ struct AppState {
     /// False until the models finished loading. The port opens before that is
     /// true only when warming ran past its budget, and `/health` says so.
     ready: Arc<std::sync::atomic::AtomicBool>,
+    /// The port this daemon bound, so an Origin can be checked against it.
+    port: u16,
 }
 
 pub fn bind_addr() -> String {
@@ -200,6 +202,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         seen: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         last_activity: Arc::new(Mutex::new(Instant::now())),
         ready: ready.clone(),
+        port: addr.port(),
     };
 
     let reaper_seen = state.seen.clone();
@@ -219,9 +222,18 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         .route("/connect", get(connect_page))
         .route("/events", get(events_sse))
         .route("/events/ticket", post(events_ticket));
-    if panel_enabled() {
+    if panel_route_enabled(
+        addr.ip().is_loopback(),
+        panel_enabled(),
+        panel_allows_forwarded(),
+    ) {
         tracing::info!("control panel at http://{addr}/panel");
         app = app.route("/panel", get(panel));
+    } else if panel_enabled() {
+        tracing::warn!(
+            %addr,
+            "CUBA_PANEL=1 pero esta dirección es alcanzable desde otras máquinas: /panel NO se registra. El panel muestra estado, clientes conectados y llamadas recientes. Si de verdad lo querés publicado, CUBA_PANEL_PUBLIC=1"
+        );
     }
     tracing::info!("connect page at http://{addr}/connect");
     let app = app.layer(DefaultBodyLimit::max(MAX_BODY)).with_state(state);
@@ -557,6 +569,22 @@ fn panel_enabled() -> bool {
     std::env::var("CUBA_PANEL").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Whether to register `/panel` at all, given where the daemon is listening.
+///
+/// The panel has one existing guard, `came_through_a_proxy`, and its own
+/// documentation says what it does not catch: a raw TCP forward adds no header
+/// and looks exactly like a local request. A LAN bind is not a proxy either.
+/// So on a routable address, `CUBA_PANEL=1` alone published a page that reads
+/// the daemon's state, its connected clients and its recent calls to anybody
+/// who could reach the port.
+///
+/// It is not registered there unless somebody says out loud that they meant
+/// it. Refusing to serve a route is stronger than refusing a request: there is
+/// no header to forge and no check to get wrong.
+fn panel_route_enabled(addr_is_loopback: bool, enabled: bool, public: bool) -> bool {
+    enabled && (addr_is_loopback || public)
+}
+
 fn panel_allows_forwarded() -> bool {
     std::env::var("CUBA_PANEL_PUBLIC").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
@@ -720,7 +748,13 @@ async fn events_sse(
         .into_response()
 }
 
-async fn panel(headers: HeaderMap) -> Response {
+async fn panel(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !origin_allowed(
+        headers.get("origin").and_then(|v| v.to_str().ok()),
+        state.port,
+    ) {
+        return (StatusCode::FORBIDDEN, "origen no permitido").into_response();
+    }
     if came_through_a_proxy(&headers) && !panel_allows_forwarded() {
         return (
             StatusCode::FORBIDDEN,
@@ -794,12 +828,63 @@ fn request_origin(peer: SocketAddr, headers: &HeaderMap) -> crate::session::Orig
     origin_of(peer.ip().is_loopback(), machine, &peer.ip().to_string())
 }
 
+/// Whether a browser origin may talk to this daemon.
+///
+/// Requests without an `Origin` pass: that is every MCP client there is, and
+/// none of them is a browser. A request *with* one came from a page, and the
+/// only pages that have any business here are the daemon's own.
+///
+/// This matters most where it looks least necessary. On a routable bind the
+/// bearer token already stands in the way. On loopback with no token — the
+/// documented default — any page the operator happens to open can reach
+/// `127.0.0.1:8787`, and DNS rebinding turns "any page" into "any site". The
+/// token is not there to stop it because the daemon is local; the Origin is
+/// the only thing that distinguishes the operator's own panel from a tab.
+///
+/// Deliberately no CORS headers anywhere: `Content-Type: application/json`
+/// already forces a preflight, and with nothing answering it the browser
+/// refuses the request on its own. Adding a permissive CORS layer would
+/// *remove* that protection.
+fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
+    let Some(origin) = origin.map(str::trim).filter(|o| !o.is_empty()) else {
+        return true;
+    };
+    if origin == "null" {
+        return false;
+    }
+    let allowed = std::env::var("CUBA_HTTP_ALLOWED_ORIGINS").unwrap_or_default();
+    if allowed
+        .split(',')
+        .map(str::trim)
+        .any(|o| !o.is_empty() && o == origin)
+    {
+        return true;
+    }
+    let host = origin
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(origin);
+    let (name, declared_port) = host.rsplit_once(':').unwrap_or((host, ""));
+    let local = matches!(name, "localhost" | "127.0.0.1" | "[::1]" | "::1");
+    local && (declared_port.is_empty() || declared_port == port.to_string())
+}
+
 async fn mcp_endpoint(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !origin_allowed(
+        headers.get("origin").and_then(|v| v.to_str().ok()),
+        state.port,
+    ) {
+        return (
+            StatusCode::FORBIDDEN,
+            "este endpoint no acepta peticiones de una página web de otro origen",
+        )
+            .into_response();
+    }
     let origin = request_origin(peer, &headers);
     let Some(scope) = authorized(&state, &headers) else {
         return (
@@ -1467,6 +1552,7 @@ mod tests {
         );
         AppState {
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            port: 8787,
             pool: crate::db::create_lazy_pool("postgres://unused/unused"),
             token: token.map(|t| Arc::new(t.to_string())),
             peer_token: None,
@@ -1685,5 +1771,80 @@ mod lan_exposure_tests {
             std::time::Duration::from_secs(180),
             "the default has to leave room for a cold cross-encoder"
         );
+    }
+
+    #[test]
+    fn the_panel_is_not_published_on_an_address_other_machines_can_reach() {
+        assert!(
+            panel_route_enabled(true, true, false),
+            "on loopback CUBA_PANEL=1 is enough: whoever can reach it already has the machine"
+        );
+        assert!(
+            !panel_route_enabled(false, true, false),
+            "CUBA_PANEL=1 on a routable bind used to publish a page showing the daemon state, the connected clients and the recent calls to anyone who could route a packet. came_through_a_proxy does not help: a LAN bind is not a proxy, and its own docs say a raw TCP forward carries no header either."
+        );
+        assert!(
+            panel_route_enabled(false, true, true),
+            "CUBA_PANEL_PUBLIC=1 is somebody saying out loud that they meant it"
+        );
+        assert!(
+            !panel_route_enabled(true, false, true),
+            "public does not turn the panel on by itself; it only lifts the address restriction"
+        );
+        assert!(!panel_route_enabled(false, false, false));
+    }
+
+    #[test]
+    fn a_page_from_somewhere_else_does_not_get_to_talk_to_the_daemon() {
+        assert!(
+            origin_allowed(None, 8787),
+            "every MCP client there is sends no Origin at all; refusing those would break all of them and protect nobody"
+        );
+        assert!(origin_allowed(Some("http://127.0.0.1:8787"), 8787));
+        assert!(origin_allowed(Some("http://localhost:8787"), 8787));
+        assert!(
+            origin_allowed(Some("http://localhost"), 8787),
+            "a bare localhost origin is still the machine itself"
+        );
+
+        assert!(
+            !origin_allowed(Some("https://evil.example"), 8787),
+            "this is the DNS-rebinding case, and it matters most on the documented default: loopback with no token. Any page the operator opens can reach 127.0.0.1:8787, and the token is not there to stop it because the daemon is local."
+        );
+        assert!(
+            !origin_allowed(Some("null"), 8787),
+            "a sandboxed iframe sends Origin: null; treating that as local would hand it the daemon"
+        );
+        assert!(
+            !origin_allowed(Some("http://localhost:3000"), 8787),
+            "another local service is not this one: a dev server on the same machine should not be able to drive the brain"
+        );
+    }
+
+    #[test]
+    fn no_cors_headers_are_ever_emitted() {
+        // A fence, not a check. `Content-Type: application/json` already forces
+        // a preflight, and with nothing answering it the browser refuses the
+        // request by itself. Adding a permissive CORS layer to "fix" a blocked
+        // fetch would remove the protection doing the work and leave only the
+        // Origin check above.
+        //
+        // The needles are assembled at run time so this test does not match its
+        // own source: the first attempt sliced at `#[cfg(test)]` to avoid that,
+        // and there is one of those halfway up the file, so the slice stopped
+        // before the handlers and the fence caught nothing at all.
+        let source = include_str!("http.rs");
+        for forbidden in [
+            format!("{}{}", "access-control-", "allow-origin"),
+            format!("{}{}", "Cors", "Layer"),
+            format!("{}{}", "tower_http::", "cors"),
+        ] {
+            assert!(
+                !source
+                    .to_ascii_lowercase()
+                    .contains(&forbidden.to_ascii_lowercase()),
+                "{forbidden} reached http.rs. Nothing here needs CORS: no browser page is supposed to call this daemon except its own, and those are same-origin."
+            );
+        }
     }
 }
