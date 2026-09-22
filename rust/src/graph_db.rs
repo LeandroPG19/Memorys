@@ -48,16 +48,13 @@ impl RespVal {
 }
 
 pub fn config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
+    // `.ok()?`: `load_saved_config_into_env` returns on None without a word,
+    // and a graph nobody configured is the default on every install.
+    let home = crate::envs::home().ok()?;
     #[cfg(windows)]
-    let base = PathBuf::from(&home)
-        .join("AppData")
-        .join("Roaming")
-        .join("memory-industry");
+    let base = home.join("AppData").join("Roaming").join("memory-industry");
     #[cfg(not(windows))]
-    let base = PathBuf::from(&home).join(".config").join("memory-industry");
+    let base = home.join(".config").join("memory-industry");
     Some(base.join("graph.env"))
 }
 

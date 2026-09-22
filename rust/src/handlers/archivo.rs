@@ -24,19 +24,19 @@ pub fn audit_key() -> Option<Vec<u8>> {
             return Some(raw.as_bytes().to_vec());
         }
     }
-    let path = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .map(|h| {
-            let cache = std::path::PathBuf::from(h).join(".cache");
-            let preferred = cache.join("memory-industry").join("audit_key");
-            let legacy = cache.join("cuba-memorys").join("audit_key");
-            if preferred.exists() || !legacy.exists() {
-                preferred
-            } else {
-                legacy
-            }
-        })?;
+    // `.ok().map(…)?`: no home is «no key», and `compute_hash` reads that as
+    // the unkeyed SHA-256 chain, which is the documented default. Propagating
+    // the error would stop every append on a machine that defined neither name.
+    let path = crate::envs::home().ok().map(|home| {
+        let cache = home.join(".cache");
+        let preferred = cache.join("memory-industry").join("audit_key");
+        let legacy = cache.join("cuba-memorys").join("audit_key");
+        if preferred.exists() || !legacy.exists() {
+            preferred
+        } else {
+            legacy
+        }
+    })?;
     let key = std::fs::read_to_string(path).ok()?;
     let key = key.trim();
     (!key.is_empty()).then(|| key.as_bytes().to_vec())

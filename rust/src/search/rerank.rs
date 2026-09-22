@@ -93,10 +93,10 @@ pub fn is_configured() -> bool {
 }
 
 fn default_reranker_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    let cache = PathBuf::from(home).join(".cache");
+    // `.ok()?`: `is_configured` reads None as «no reranker» and `reason_of`
+    // deliberately does not call that a failure. An error here would put every
+    // install that never downloaded one into `/health` as degraded.
+    let cache = crate::envs::home().ok()?.join(".cache");
     let preferred = cache.join("memory-industry").join("reranker");
     let legacy = cache.join("cuba-memorys").join("reranker");
     Some(if preferred.exists() || !legacy.exists() {

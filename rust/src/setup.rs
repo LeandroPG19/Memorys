@@ -158,10 +158,10 @@ pub fn listen_address() -> String {
 }
 
 fn password_file() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    let cache = std::path::PathBuf::from(home).join(".cache");
+    // `.ok()?`: `resolve_password` reads None as «use the compiled-in
+    // constant». An error here would stop `setup` on a machine that has simply
+    // never defined either name.
+    let cache = crate::envs::home().ok()?.join(".cache");
     let preferred = cache.join("memory-industry").join("pgpass");
     let legacy = cache.join("cuba-memorys").join("pgpass");
     if preferred.exists() || !legacy.exists() {

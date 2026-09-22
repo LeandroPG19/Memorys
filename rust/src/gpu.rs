@@ -403,10 +403,10 @@ fn runtime_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
         return PathBuf::from(p).parent().map(|p| p.to_path_buf());
     }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    let cache = PathBuf::from(home).join(".cache");
+    // `.ok()?`: `runtime_has_gpu_provider` reads None as «nothing downloaded»
+    // and drops to the CPU, which is right for a machine that never ran
+    // `models runtime` — not a fault to report.
+    let cache = crate::envs::home().ok()?.join(".cache");
     let preferred = cache.join("memory-industry").join("onnxruntime");
     // A directory that exists on operators' disks, not the binary's name: a
     // rename sweep that greps for the old name has to leave this one alone or

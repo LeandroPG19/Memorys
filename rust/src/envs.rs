@@ -30,7 +30,14 @@ pub fn alias(new_key: &str, legacy_key: &str) -> Result<String, std::env::VarErr
 /// HOMEDRIVE+HOMEPATH is deliberately not a third try: on a domain-joined
 /// machine that pair comes from the AD home-directory attribute and can point
 /// at a share that is not mounted, which is this same defect with a longer
-/// path. The other ten sites in this crate read exactly HOME then USERPROFILE.
+/// path.
+///
+/// The ten sites that used to read the two variables by hand now come through
+/// here. Eight of them take `.ok()` rather than `?`, and that is not laziness:
+/// their answer to «no home» is a quiet None that a caller reads as «nothing
+/// installed / nothing configured», which is a supported machine. Turning any
+/// of those into a propagated error would report an unconfigured install as a
+/// broken one.
 pub fn home() -> Result<PathBuf> {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))

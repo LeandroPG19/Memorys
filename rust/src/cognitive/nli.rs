@@ -84,10 +84,9 @@ fn model_dir() -> Option<PathBuf> {
 
 /// Cache install path, ignoring a resource-plan disable sentinel.
 pub fn cache_model_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    let cache = PathBuf::from(home).join(".cache");
+    // `.ok()?` and not `?`: with neither variable set this answers None, and
+    // `available()` reads that as «no model installed» — a supported machine.
+    let cache = crate::envs::home().ok()?.join(".cache");
     let preferred = cache.join("memory-industry").join("models-nli");
     let legacy = cache.join("cuba-memorys").join("models-nli");
     if preferred.join("model.onnx").exists() || preferred.join("model_quantized.onnx").exists() {

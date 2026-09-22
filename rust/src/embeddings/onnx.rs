@@ -95,19 +95,20 @@ pub(crate) fn locate_onnxruntime() -> Option<PathBuf> {
         "libonnxruntime.so"
     };
 
-    let cache_lib = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .map(|h| {
-            let cache = PathBuf::from(h).join(".cache");
-            let preferred = cache.join("memory-industry").join("onnxruntime");
-            let legacy = cache.join("cuba-memorys").join("onnxruntime");
-            if preferred.exists() || !legacy.exists() {
-                preferred
-            } else {
-                legacy
-            }
-        });
+    // `.ok().map(…)` and not `?`: this is not a result, it is the first
+    // candidate of the chain below. With no home the candidate drops out and
+    // the search goes on to LD_LIBRARY_PATH and the system directories, which
+    // is how a machine with the runtime in /usr/lib and no HOME still loads it.
+    let cache_lib = crate::envs::home().ok().map(|home| {
+        let cache = home.join(".cache");
+        let preferred = cache.join("memory-industry").join("onnxruntime");
+        let legacy = cache.join("cuba-memorys").join("onnxruntime");
+        if preferred.exists() || !legacy.exists() {
+            preferred
+        } else {
+            legacy
+        }
+    });
 
     let search: Vec<PathBuf> = cache_lib
         .into_iter()
@@ -144,13 +145,13 @@ pub(crate) fn locate_onnxruntime() -> Option<PathBuf> {
 }
 
 fn cache_roots() -> Vec<PathBuf> {
-    let Some(home) = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-    else {
+    // An empty list and not an error: every caller reads it as «no cache to
+    // look in» and falls through to the hash embedder, which is Tier::Minimal
+    // and a supported machine.
+    let Ok(home) = crate::envs::home() else {
         return Vec::new();
     };
-    let cache = PathBuf::from(home).join(".cache");
+    let cache = home.join(".cache");
     let preferred = cache.join("memory-industry");
     let legacy = cache.join("cuba-memorys");
     if preferred.exists() {

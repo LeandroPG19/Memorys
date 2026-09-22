@@ -8,7 +8,7 @@
 //!
 //! Saves ~/.config/memory-industry/llm.env and auto-loads it on every start.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -19,16 +19,14 @@ use crate::cognitive::judge::{
 };
 
 pub fn config_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context("no HOME/USERPROFILE")?;
+    // No context of its own any more: «no HOME/USERPROFILE» named the two
+    // variables and stopped there, while `envs::home()` also says what to do
+    // and why writing into the working directory would not help.
+    let home = crate::envs::home()?;
     #[cfg(windows)]
-    let base = PathBuf::from(&home)
-        .join("AppData")
-        .join("Roaming")
-        .join("memory-industry");
+    let base = home.join("AppData").join("Roaming").join("memory-industry");
     #[cfg(not(windows))]
-    let base = PathBuf::from(&home).join(".config").join("memory-industry");
+    let base = home.join(".config").join("memory-industry");
     Ok(base.join("llm.env"))
 }
 

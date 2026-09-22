@@ -51,10 +51,13 @@ fn spec(name: &str) -> Option<ModelSpec> {
 }
 
 fn cache_root() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context("no HOME/USERPROFILE — no sé dónde está la caché")?;
-    let cache = PathBuf::from(home).join(".cache");
+    // The outer context stays. `envs::home()` names both variables and talks
+    // about where an MCP client looks for a config, which does not say WHAT
+    // could not be located here; without this line the operator gets an error
+    // that only blames the environment.
+    let cache = crate::envs::home()
+        .context("no sé dónde está la caché")?
+        .join(".cache");
     let preferred = cache.join("memory-industry");
     let legacy = cache.join("cuba-memorys");
     if preferred.exists() || !legacy.exists() {
