@@ -681,6 +681,111 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A stand-in for a repo root. `install()` writes `.gitattributes` at the git
+    /// top level, and `sync export` resolves its own directory against the working
+    /// directory, which git sets to that same top level when it runs a hook. So a
+    /// single directory is both halves of the question these three tests ask.
+    fn scratch_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cuba-attrs-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The directory a `.gitattributes` line actually hands to the merge driver,
+    /// read the way git reads the pattern: relative to the file's own directory.
+    ///
+    /// The shape is checked here rather than asserted on, because it is load-bearing
+    /// in the other direction too: `remove_gitattributes_line` uninstalls by dropping
+    /// every line that ends in `/** merge=cuba-memorys`, so a line written in any
+    /// other shape is a line `hook uninstall` leaves behind for ever.
+    fn directory_covered_by(line: &str, root: &Path) -> PathBuf {
+        let suffix = format!(" merge={MERGE_DRIVER_NAME}");
+        let pattern = line.strip_suffix(&suffix).unwrap_or_else(|| {
+            panic!("the line must end in `{suffix}`, or uninstall cannot find it again: {line}")
+        });
+        let dir = pattern.strip_suffix("/**").unwrap_or_else(|| {
+            panic!("the pattern must cover a whole directory, `<dir>/**`: {pattern}")
+        });
+        root.join(dir)
+    }
+
+    #[test]
+    fn a_fresh_repo_gets_the_driver_on_the_directory_sync_actually_writes_to() {
+        let root = scratch_root("fresh");
+
+        let covered = directory_covered_by(&gitattributes_line(&root, None), &root);
+
+        assert_eq!(
+            covered,
+            crate::sync::paths::default_sync_dir(&root),
+            "the two halves of `hook install` have to name one directory. `sync export` \
+             asks sync::paths where to write, and the merge driver only ever reaches the \
+             files the `.gitattributes` pattern names. The pattern was built from a second, \
+             hand-written copy of that fallback, so on a repo where neither directory \
+             exists yet sync writes one and the driver guards the other: install still \
+             prints `installed`, and the first time two machines merge the same graph git \
+             resolves it with a text merge over JSON instead of the union by id that this \
+             whole command exists to arrange. The oracle is sync::paths, not the literal \
+             that happens to be right today — a test spelling out the current default goes \
+             green again the next time the default moves, which is exactly how this got here"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_repo_that_already_has_the_legacy_directory_is_still_covered() {
+        let legacy = scratch_root("legacy");
+        std::fs::create_dir_all(legacy.join(".cuba-memorys")).unwrap();
+        let fresh = scratch_root("fresh-beside-legacy");
+
+        let covered_legacy = directory_covered_by(&gitattributes_line(&legacy, None), &legacy);
+        let covered_fresh = directory_covered_by(&gitattributes_line(&fresh, None), &fresh);
+
+        assert_eq!(
+            covered_legacy,
+            crate::sync::paths::default_sync_dir(&legacy),
+            "sync keeps writing into a legacy directory that is already on disk, so the \
+             pattern has to keep naming it. This is the case that makes the answer NOT \
+             `swap the literal for the new name`: that repairs the fresh repo and silently \
+             unhooks every installation that works today"
+        );
+        assert_ne!(
+            covered_legacy.file_name(),
+            covered_fresh.file_name(),
+            "and the answer has to depend on the repo it is run in. sync::paths takes the \
+             legacy directory only when it is there and the preferred one is not, so no \
+             single constant can be right for both of these roots: whichever one is \
+             written, the other repo gets a pattern matching nothing it writes. Legacy \
+             covered {covered_legacy:?}, fresh covered {covered_fresh:?}"
+        );
+
+        std::fs::remove_dir_all(&legacy).ok();
+        std::fs::remove_dir_all(&fresh).ok();
+    }
+
+    #[test]
+    fn a_configured_sync_root_beats_both_the_default_and_the_legacy_directory() {
+        let root = scratch_root("configured");
+        std::fs::create_dir_all(root.join(".cuba-memorys")).unwrap();
+        std::fs::create_dir_all(root.join(".memory-industry")).unwrap();
+        let configured = root.join("graph-sync");
+        std::fs::create_dir_all(&configured).unwrap();
+
+        let covered = directory_covered_by(&gitattributes_line(&root, Some(&configured)), &root);
+
+        assert_eq!(
+            covered, configured,
+            "CUBA_SYNC_DIR is where sync puts the graph, full stop: sync::paths takes it as \
+             the root and does not nest a default underneath it, so neither of the two \
+             directories sitting in this repo is the one being written. Both of them were \
+             created here on purpose, so that an implementation which looks at the disk \
+             instead of at the configured root is caught rather than flattered"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn remove_hook_block_deletes_the_file_when_our_block_was_the_only_content() {
         let dir = std::env::temp_dir().join(format!("cuba-hook-test-{}", Uuid::new_v4()));
