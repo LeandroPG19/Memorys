@@ -38,6 +38,16 @@ Read this before trusting a green run (copied from the gate banner):
 
 - Mutating tests write only to throwaway databases (`brain_gate` / peer). Never the live corpus.
 - Eval smoke may read the live corpus **read-only**.
+- Tests with no `#[ignore]` that need a server create and drop their own database, and never write into the one `DATABASE_URL` points at. A developer with `DATABASE_URL` exported towards their real memory would otherwise seed it by running `cargo test`.
+
+## One gate at a time
+
+Two gates on one machine share `brain_gate`, the ports and cargo's lock, and each one's exit used to drop the database the other was testing against. That happened: a gate left orphaned by a dead session fired its `trap` in the middle of the next run, and the failure read `database "brain_gate" does not exist` with nothing in it that pointed at the cause.
+
+- `merge-gate.sh` takes the lock (`scripts/gate-lock.sh`) before anything else and holds it for the whole run. `run-all-tests.sh` inherits it only from its own live parent.
+- A second gate refuses at once, before it sweeps, drops or builds anything, and names the first: pid, start time, command, and the `kill` that stops it.
+- A lock whose owner died is taken over; one whose pid was reused is recognised by its start time. A lock from another host is refused, not guessed at.
+- Every database the gate creates carries its run's record as a comment, and an exit drops only the ones still carrying its own.
 - Published migrations through **0060** are frozen (SHA-384). Wrong shipped SQL gets a **new** migration. Do not edit `0017`–`0060`.
 
 ## Required machine
