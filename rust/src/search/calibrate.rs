@@ -208,7 +208,7 @@ pub async fn load_ood_threshold(pool: &PgPool, dim: usize) -> Option<f64> {
         tracing::warn!(
             stored_dim,
             current_dim = dim,
-            "calibrated OOD threshold was measured for a different embedding dimension — ignoring it; re-run `cuba-memorys calibrate`"
+            "calibrated OOD threshold was measured for a different embedding dimension — ignoring it; re-run `memory-industry calibrate`"
         );
         return None;
     }

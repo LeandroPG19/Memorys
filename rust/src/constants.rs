@@ -127,7 +127,7 @@ pub fn tool_definitions() -> &'static Vec<Value> {
                     "abstain_ood": {"type": "boolean", "description": "Abstain (return empty results with abstain_reason) when the query is out-of-distribution via Mahalanobis distance. Default false."},
                     "ood_threshold": {"type": "number", "description": "Mahalanobis distance threshold for abstention. Defaults to sqrt(chi2_0.99(d)), which scales with the embedding dimension (~21.25 for d=384). Override only if you calibrated on your own corpus."},
                     "enable_bm25": {"type": "boolean", "description": "Enable BM25 (ts_rank_cd) as third RRF signal alongside text + vector. Catches queries with rare terms that dense embeddings miss. Default true."},
-                    "rerank": {"type": "boolean", "description": "Cross-encoder rerank top-50 → top-K with bge-reranker-v2-m3. Auto-enabled when CUBA_MODE=completo, or when this build has a real GPU provider active (CUDA/DirectML compiled in AND a working device). Off by default everywhere else, even with the model on disk: on CPU it costs 60-110s and blows the search budget. Explicit true/false always wins; run `cuba-memorys doctor` to see which reason applies here."},
+                    "rerank": {"type": "boolean", "description": "Cross-encoder rerank top-50 → top-K with bge-reranker-v2-m3. Auto-enabled when CUBA_MODE=completo, or when this build has a real GPU provider active (CUDA/DirectML compiled in AND a working device). Off by default everywhere else, even with the model on disk: on CPU it costs 60-110s and blows the search budget. Explicit true/false always wins; run `memory-industry doctor` to see which reason applies here."},
                     "associative": {"type": "boolean", "description": "Multi-hop expansion: seeds spreading activation from query-matched entities and pulls in observations on graph-connected entities that no lexical/vector signal surfaced. Additive — never lowers a base hit. Default false."},
                     "include_unscoped": {"type": "boolean", "description": "When a project is active, rows with project_id NULL are hidden. Set true to include that leftover corpus. Default false."}
                 },
@@ -574,7 +574,7 @@ fn meta_tool_defs() -> Vec<Value> {
     vec![
         tool_def(
             "cuba_tools",
-            "Find cuba-memorys tools and load their schemas ON DEMAND. The server exposes 31 tools; \
+            "Find MemoryIndustry tools and load their schemas ON DEMAND. The server exposes 31 tools; \
              under CUBA_TOOL_PROFILE=lean only the everyday core is pre-loaded and the rest live here. \
              Search by capability ('audit', 'decay', 'contradiction', 'session'), then call what you \
              find with cuba_call. detail='names' is cheapest, 'full' returns the exact argument schema.",
@@ -588,7 +588,7 @@ fn meta_tool_defs() -> Vec<Value> {
         ),
         tool_def(
             "cuba_call",
-            "Invoke any cuba-memorys tool by name — including the ones not pre-loaded in this session. \
+            "Invoke any MemoryIndustry tool by name — including the ones not pre-loaded in this session. \
              Discover them first with cuba_tools (use detail='full' to see the exact arguments). \
              Goes through the same dispatcher as a direct call, so behaviour is identical.",
             serde_json::json!({

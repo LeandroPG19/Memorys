@@ -57,7 +57,7 @@ fn resolve(library: &str) -> Result<String> {
 pub async fn handle(args: &Value) -> Result<Value> {
     if !enabled() {
         anyhow::bail!(
-            "cuba_docs está apagado. Es la única parte de cuba-memorys que sale a \
+            "cuba_docs está apagado. Es la única parte de MemoryIndustry que sale a \
              internet, así que no se enciende sola: exportá CUBA_DOCS=1 en el entorno \
              del servidor MCP."
         );

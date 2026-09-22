@@ -68,7 +68,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             "--format" => format = it.next().cloned().context("--format needs a value")?,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys export <dir> [--obsidian]\n\n\
+                    "usage: memory-industry export <dir> [--obsidian]\n\n\
                      Escribe el grafo como un vault de Obsidian: una nota por entidad, con\n\
                      wikilinks que reflejan las relaciones reales, y comunidad + centralidad\n\
                      en el frontmatter. Solo lectura sobre la base."
@@ -83,7 +83,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         bail!("formato no soportado: {format} (solo 'obsidian' por ahora)");
     }
     let Some(dir) = dir else {
-        bail!("falta el directorio — uso: cuba-memorys export <dir> [--obsidian]");
+        bail!("falta el directorio — uso: memory-industry export <dir> [--obsidian]");
     };
 
     let url = crate::setup::resolve_database_url().await;
@@ -273,7 +273,7 @@ pub async fn export_obsidian(pool: &PgPool, dir: &Path) -> Result<usize> {
     }
 
     let mut idx = String::new();
-    idx.push_str("# Cerebro (cuba-memorys)\n\n");
+    idx.push_str("# Cerebro (MemoryIndustry)\n\n");
     idx.push_str(&format!(
         "{} entidades · {} relaciones · {} observaciones\n\n",
         entities.len(),

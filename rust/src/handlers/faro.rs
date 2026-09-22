@@ -305,7 +305,7 @@ fn annotate_degradation(
         response["degraded"] = serde_json::json!(true);
         response["degraded_reason"] = serde_json::json!(format!(
             "La búsqueda vectorial no se ejecutó: estos resultados son SOLO léxicos y el \
-             recall está degradado. Causa: {reason}. Diagnosticá con `cuba-memorys doctor`."
+             recall está degradado. Causa: {reason}. Diagnosticá con `memory-industry doctor`."
         ));
     }
     if bm25_failed {
@@ -486,7 +486,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
                     error = %format!("{e:#}"),
                     "BM25 SEARCH FAILED — hybrid retrieval lost its lexical half. \
                      Usually a query that cuba_or_tsquery could not parse, a missing GIN \
-                     index, or the pool timing out. Run `cuba-memorys doctor`."
+                     index, or the pool timing out. Run `memory-industry doctor`."
                 );
                 Vec::new()
             }
@@ -1655,7 +1655,7 @@ async fn vector_search(
                 error = %e,
                 "EPISODE VECTOR SEARCH FAILED — the semantic half of the ranking carries \
                  observations only. Usual cause is the same as for observations: the episode \
-                 embedding column disagrees with the model's dimension. Run `cuba-memorys doctor`."
+                 embedding column disagrees with the model's dimension. Run `memory-industry doctor`."
             );
             Vec::new()
         })

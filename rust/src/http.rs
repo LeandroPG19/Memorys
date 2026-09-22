@@ -166,7 +166,7 @@ fn ensure_adopted_loopback(addr: &SocketAddr) -> Result<()> {
          CUBA_HTTP_TOKEN is unset, so the whole brain would be readable and writable \
          from every interface. With socket activation the .socket unit picks the \
          address and CUBA_HTTP_ADDR is ignored — set ListenStream=127.0.0.1:8787 in \
-         cuba-memorys.socket, or set CUBA_HTTP_TOKEN in the service unit"
+         memory-industry.socket, or set CUBA_HTTP_TOKEN in the service unit"
     )
 }
 

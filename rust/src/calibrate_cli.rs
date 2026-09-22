@@ -71,7 +71,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     let parsed = parse_args(args)?;
     if parsed.help {
         eprintln!(
-            "usage: cuba-memorys calibrate --dataset PATH.jsonl [--alpha 0.05] [--samples N] [--json] [--apply]\n\n\
+            "usage: memory-industry calibrate --dataset PATH.jsonl [--alpha 0.05] [--samples N] [--json] [--apply]\n\n\
              Diagnoses the OOD abstention threshold and computes a conformal one.\n\
              The theoretical χ² cutoff assumes Gaussian embeddings and a well-estimated\n\
              covariance; e5 normalizes to the unit sphere and the covariance is fitted\n\
@@ -176,7 +176,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             } else {
                 println!("\n  Esto fue un diagnóstico — no se guardó nada.");
                 println!(
-                    "  Para que el servidor lo use:  cuba-memorys calibrate --dataset ... --apply"
+                    "  Para que el servidor lo use:  memory-industry calibrate --dataset ... --apply"
                 );
             }
         }

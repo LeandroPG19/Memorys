@@ -21,11 +21,11 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             "--quiet" => quiet = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys recall [--project NAME] [--max-tokens 900] [--quiet]\n\n\
+                    "usage: memory-industry recall [--project NAME] [--max-tokens 900] [--quiet]\n\n\
                      Prints the memory an agent should start a session with: the last session,\n\
                      unresolved errors, recent decisions, and the entities that matter here.\n\n\
                      Meant for a SessionStart hook — a hook cannot forget to call it, which is\n\
-                     the whole point. Install it with: cuba-memorys setup hook"
+                     the whole point. Install it with: memory-industry setup hook"
                 );
                 return Ok(());
             }
@@ -49,7 +49,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     let text = build(&pool, project.as_deref(), budget).await?;
     if text.trim().is_empty() {
         if !quiet {
-            println!("(cuba-memorys: sin memoria previa de este proyecto)");
+            println!("(MemoryIndustry: sin memoria previa de este proyecto)");
         }
         return Ok(());
     }
@@ -79,7 +79,7 @@ async fn build(pool: &PgPool, project: Option<&str>, budget: usize) -> Result<St
     let mut out = String::new();
     let mut spent = 0usize;
 
-    out.push_str("## Memoria de cuba-memorys\n");
+    out.push_str("## Memoria de MemoryIndustry\n");
 
     if let Ok(Some(row)) = sqlx::query(
         "SELECT session_name AS name, summary, outcome, ended_at::date::text AS d

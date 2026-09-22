@@ -1830,7 +1830,7 @@ async fn import(
                  {local_dim}. Writing them would either abort the whole import on the first \
                  UPDATE or, if the record size happened to divide evenly, fill the index with \
                  vectors from a space these queries do not live in. Re-export without \
-                 embeddings and run `cuba-memorys reembed` here, which is cheaper than it \
+                 embeddings and run `memory-industry reembed` here, which is cheaper than it \
                  sounds and correct by construction."
             );
         }

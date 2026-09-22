@@ -109,7 +109,7 @@ pub async fn resolve_database_url() -> String {
 }
 
 fn log(msg: &str) {
-    eprintln!("[memory-industry] {msg}");
+    eprintln!("[MemoryIndustry] {msg}");
 }
 
 fn build_url() -> String {

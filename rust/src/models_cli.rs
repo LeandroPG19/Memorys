@@ -111,7 +111,7 @@ fn print_help() {
         "memory-industry models <embed|nli|reranker|runtime|all|llm>\n\n\
          Descarga los modelos ONNX y el runtime a ~/.cache/memory-industry/ (o la caché\n\
          legado ~/.cache/cuba-memorys/ si ya existe), en cualquier sistema.\n\
-         memory-industry los encuentra ahí solo — no hace falta setear env vars.\n\n\
+         MemoryIndustry los encuentra ahí solo — no hace falta setear env vars.\n\n\
            embed      multilingual-e5-small (384-d) — búsqueda semántica. ~113 MB\n\
            nli        mDeBERTa-v3-xnli — verify sin LLM. ~1.1 GB\n\
            reranker   bge-reranker-v2-m3 — reordena candidatos. ~4.5 GB (onnx + onnx_data)\n\
@@ -204,7 +204,7 @@ async fn download_model(spec: &ModelSpec) -> Result<()> {
         println!("{mb} MB");
     }
     println!(
-        "  listo. memory-industry lo encuentra en {} (o {}=<ruta>)",
+        "  listo. MemoryIndustry lo encuentra en {} (o {}=<ruta>)",
         dir.display(),
         spec.env_hint
     );
@@ -296,7 +296,7 @@ async fn download_runtime(gpu: bool) -> Result<()> {
         println!("     {name}");
     }
     println!(
-        "  listo. memory-industry lo encuentra en {} (o ORT_DYLIB_PATH=<ruta>)",
+        "  listo. MemoryIndustry lo encuentra en {} (o ORT_DYLIB_PATH=<ruta>)",
         lib_dest.display()
     );
     if gpu {

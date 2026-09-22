@@ -84,7 +84,7 @@ pub async fn run_search(args: &[String]) -> Result<()> {
             "--associative" => associative = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys search <query> [--limit N] [--associative] [--json]\n\n\
+                    "usage: memory-industry search <query> [--limit N] [--associative] [--json]\n\n\
                      Hybrid retrieval (text + vector + BM25, RRF-fused) — the same engine\n\
                      cuba_faro serves to the agent.\n\n\
                      Nota: `--format` no existe aquí. El CLI renderiza para un humano;\n\
@@ -111,7 +111,7 @@ pub async fn run_search(args: &[String]) -> Result<()> {
     }
 
     let Some(q) = query else {
-        bail!("falta la query — uso: cuba-memorys search \"texto a buscar\"");
+        bail!("falta la query — uso: memory-industry search \"texto a buscar\"");
     };
 
     let pool = pool().await?;
@@ -140,7 +140,9 @@ pub async fn run_search(args: &[String]) -> Result<()> {
 
     if results.is_empty() {
         println!("Sin resultados para «{q}».");
-        println!("\nSi esperabas resultados, corré `cuba-memorys doctor`: el recall puede estar");
+        println!(
+            "\nSi esperabas resultados, corré `memory-industry doctor`: el recall puede estar"
+        );
         println!("degradado en silencio (modelo ONNX no cargado, o falta cuba_or_tsquery).");
         return Ok(());
     }
@@ -197,7 +199,7 @@ pub async fn run_save(args: &[String]) -> Result<()> {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys save <entidad> <contenido> [--type TIPO]\n\n\
+                    "usage: memory-industry save <entidad> <contenido> [--type TIPO]\n\n\
                      TIPO: fact (default) | decision | lesson | preference | context |\n\
                            tool_usage | error | solution\n\n\
                      Pasa por el mismo pipeline que cuba_cronica: dedup, embedding y tags\n\
@@ -213,7 +215,7 @@ pub async fn run_save(args: &[String]) -> Result<()> {
     }
 
     if positional.len() < 2 {
-        bail!("uso: cuba-memorys save <entidad> \"<contenido>\" [--type TIPO]");
+        bail!("uso: memory-industry save <entidad> \"<contenido>\" [--type TIPO]");
     }
     let entity = positional.remove(0);
     let content = positional.join(" ");
@@ -264,7 +266,7 @@ pub async fn run_delete(args: &[String]) -> Result<()> {
             "--apply" => apply = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys delete <observation-id> [--apply]\n\n\
+                    "usage: memory-industry delete <observation-id> [--apply]\n\n\
                      Sin --apply solo muestra qué borraría (plan). Con --apply escribe primero\n\
                      un archivo de undo con la fila completa, y después borra."
                 );
@@ -278,7 +280,7 @@ pub async fn run_delete(args: &[String]) -> Result<()> {
     }
 
     let Some(id) = id else {
-        bail!("falta el id — uso: cuba-memorys delete <observation-id> [--apply]");
+        bail!("falta el id — uso: memory-industry delete <observation-id> [--apply]");
     };
     let uuid = uuid::Uuid::parse_str(&id).context("el id no es un UUID válido")?;
 
@@ -316,7 +318,7 @@ pub async fn run_delete(args: &[String]) -> Result<()> {
 
     if !apply {
         println!("Esto fue un plan — no se borró nada.");
-        println!("Para aplicarlo de verdad:  cuba-memorys delete {id} --apply");
+        println!("Para aplicarlo de verdad:  memory-industry delete {id} --apply");
         return Ok(());
     }
 

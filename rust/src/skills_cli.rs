@@ -73,7 +73,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys skills <dir> [--min-reliability 0.0]\n\n\
+                    "usage: memory-industry skills <dir> [--min-reliability 0.0]\n\n\
                      Exports procedural memory as Claude Code Skills — one folder with a\n\
                      SKILL.md each. The agent loads them lazily: it sees the name and the\n\
                      description, and reads the body only when the task matches.\n\n\
@@ -86,7 +86,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         }
     }
     let Some(dir) = dir else {
-        anyhow::bail!("falta el directorio — uso: cuba-memorys skills ~/.claude/skills");
+        anyhow::bail!("falta el directorio — uso: memory-industry skills ~/.claude/skills");
     };
 
     let url = crate::setup::resolve_database_url().await;
@@ -157,7 +157,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             body.push_str(&format!("## Cómo saber que funcionó\n\n{verification}\n\n"));
         }
         body.push_str(
-            "---\n_Generado desde la memoria procedimental de cuba-memorys. \
+            "---\n_Generado desde la memoria procedimental de MemoryIndustry. \
              Después de ejecutarlo, reportá el resultado con `cuba_receta action=outcome` — \
              si no, la memoria no aprende nada._\n",
         );

@@ -293,7 +293,7 @@ fn runtime_role_check(user: &str, is_super: bool, app_role_ready: bool) -> Check
         "runtime_role",
         format!("la app corre como '{user}' (SUPERUSER)"),
         "un superuser ignora RLS y puede alterar el audit_log: el aislamiento por proyecto y la \
-         trazabilidad append-only son decorativos. Ejecutá `cuba-memorys secure` y apuntá el \
+         trazabilidad append-only son decorativos. Ejecutá `memory-industry secure` y apuntá el \
          runtime a cuba_app.",
     )
 }
@@ -375,7 +375,7 @@ fn reranker_check(
         RerankerLoad::NoModel => Check::warn(
             "reranker",
             "no hay modelo en disco — el ranking se devuelve tal cual (RRF, sin reordenar)",
-            "es opcional, pero si querías reordenar y no pusiste el modelo, no está pasando              nada. Instalalo: cuba-memorys models reranker",
+            "es opcional, pero si querías reordenar y no pusiste el modelo, no está pasando              nada. Instalalo: memory-industry models reranker",
         ),
     }
 }
@@ -1062,7 +1062,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     let deep = args.iter().any(|a| a == "--deep");
     if args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
-            "usage: cuba-memorys doctor [--json] [--check-updates] [--deep]\n\n\
+            "usage: memory-industry doctor [--json] [--check-updates] [--deep]\n\n\
              Read-only health check: asserts the invariants whose violation is silent\n\
              (zero recall, dead vector branch, dimension drift, inert RLS, decay anchor,\n\
              stale binary in a live MCP process). Exits 1 if any check fails.\n\n\
@@ -1112,7 +1112,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             })
         );
     } else {
-        println!("cuba-memorys doctor — v{}\n", env!("CARGO_PKG_VERSION"));
+        println!("MemoryIndustry doctor — v{}\n", env!("CARGO_PKG_VERSION"));
         for c in &checks {
             println!("[{}] {:<20} {}", c.status.glyph(), c.name, c.detail);
             if let Some(h) = &c.hint {

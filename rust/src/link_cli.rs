@@ -32,7 +32,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             "--apply" => apply = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys link [--threshold 0.3] [--min-sessions 2] [--apply]\n\n\
+                    "usage: memory-industry link [--threshold 0.3] [--min-sessions 2] [--apply]\n\n\
                      Proposes `related_to` edges between entities that co-occur in working\n\
                      sessions MORE THAN CHANCE PREDICTS, scored by normalized pointwise mutual\n\
                      information. A raw co-occurrence count would just wire the graph to\n\
@@ -75,7 +75,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
 
     if !apply {
         println!("Esto fue un plan — no se creó ninguna arista.");
-        println!("Para aplicarlo:  cuba-memorys link --apply");
+        println!("Para aplicarlo:  memory-industry link --apply");
         return Ok(());
     }
 

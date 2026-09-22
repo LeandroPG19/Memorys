@@ -24,7 +24,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         Some("merge-driver") => merge_driver(&args[1..]),
         Some("-h") | Some("--help") | None => {
             eprintln!(
-                "usage: cuba-memorys hook <install|uninstall> [--with-codegraph]\n\n\
+                "usage: memory-industry hook <install|uninstall> [--with-codegraph]\n\n\
                  Wires this repo's git so the knowledge graph under .cuba-memorys/\n\
                  (or $CUBA_SYNC_DIR) stays in sync automatically:\n\
                  \x20 - post-commit  runs `sync export` after every commit\n\
@@ -250,7 +250,7 @@ fn install(with_codegraph: bool) -> Result<()> {
     println!(
         "\nNOTE: both hooks are a no-op until this repo's database is set explicitly.\n\
          They deliberately do NOT fall back to auto-detecting a running container —\n\
-         on a machine with more than one cuba-memorys database, that guess can export\n\
+         on a machine with more than one MemoryIndustry database, that guess can export\n\
          from, or import into, the wrong one. Set it once, it persists in .git/config:\n\
          \x20 git config --local cuba-memorys.database-url \"postgresql://...\"\n\
          (DATABASE_URL in the environment also works as a fallback.)"

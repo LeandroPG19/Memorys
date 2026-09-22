@@ -66,7 +66,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         match a.as_str() {
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys dedupe [--apply] [--judge]\n\n\
+                    "usage: memory-industry dedupe [--apply] [--judge]\n\n\
                      Finds entities that are the same thing under different names.\n\n\
                      Sin flags:  solo muestra lo que haría (dry-run).\n\
                      --apply     fusiona los EXACTOS (idénticos al normalizar mayúsculas\n\
@@ -267,7 +267,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     println!("\n{merged} entidades fusionadas, {moved} observaciones reubicadas.");
     println!("Los nombres viejos quedan como alias — nada se pierde.");
     println!("\nEl grafo cambió. Recalculá las métricas:");
-    println!("  cuba_zafra action=pagerank   ·   cuba-memorys link");
+    println!("  cuba_zafra action=pagerank   ·   memory-industry link");
     Ok(())
 }
 
@@ -324,7 +324,7 @@ async fn merge_by_name(pool: &PgPool, from: &str, into: &str, apply: bool) -> Re
         loser.name, loser.obs, winner.name
     );
     println!("\nEl grafo cambió. Recalculá las métricas:");
-    println!("  cuba_zafra action=pagerank   ·   cuba-memorys link");
+    println!("  cuba_zafra action=pagerank   ·   memory-industry link");
     Ok(())
 }
 

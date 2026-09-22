@@ -334,7 +334,7 @@ pub async fn assert_embedding_dim(pool: &PgPool) -> Result<()> {
              {}\n\n\
              El servidor NO arranca así: las escrituras a esas tablas fallarían, y la búsqueda\n\
              vectorial devolvería resultados solo léxicos sin avisar de nada.\n\n\
-             Si cambiaste de modelo:  scripts/migrate-embedding-dim.sh {runtime_dim}  y después  cuba-memorys reembed\n\
+             Si cambiaste de modelo:  scripts/migrate-embedding-dim.sh {runtime_dim}  y después  memory-industry reembed\n\
              Si no querías cambiarlo: revisá CUBA_EMBEDDING_DIM y ONNX_MODEL_PATH en la config del cliente MCP.",
             mismatched.join("\n")
         );

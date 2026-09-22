@@ -34,7 +34,7 @@ pub async fn run_cli(_args: &[String]) -> Result<()> {
     println!("  export CUBA_SKIP_MIGRATIONS=1");
     println!();
     println!("Las migraciones ya corrieron como admin; el runtime como cuba_app no las necesita.");
-    println!("Verificá con: cuba-memorys doctor");
+    println!("Verificá con: memory-industry doctor");
     Ok(())
 }
 

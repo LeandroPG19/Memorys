@@ -9,7 +9,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         match a.as_str() {
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys reembed [--all] [--batch N]\n\n\
+                    "usage: memory-industry reembed [--all] [--batch N]\n\n\
                      Re-encodes the observations that need it: missing a vector, or tagged\n\
                      with a model other than the one currently loaded. Run it after changing\n\
                      CUBA_EMBED_MODEL / CUBA_EMBEDDING_DIM / ONNX_MODEL_PATH — and after\n\
@@ -40,7 +40,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         anyhow::bail!(
             "no hay modelo ONNX cargado. Reembeber con el fallback de hash reemplazaría \
              los vectores por ruido sin que nada lo avise.\n\
-             Comprobá ONNX_MODEL_PATH y ORT_DYLIB_PATH (cuba-memorys doctor lo diagnostica)."
+             Comprobá ONNX_MODEL_PATH y ORT_DYLIB_PATH (memory-industry doctor lo diagnostica)."
         );
     }
 
@@ -117,7 +117,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         println!(
             "\nEl umbral de abstención estaba calibrado para el modelo anterior y ya no vale:"
         );
-        println!("  cuba-memorys calibrate --dataset <dataset.jsonl> --apply");
+        println!("  memory-industry calibrate --dataset <dataset.jsonl> --apply");
     }
     Ok(())
 }

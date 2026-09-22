@@ -200,7 +200,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys eval [--dataset PATH.jsonl] [--k N]\n\
+                    "usage: memory-industry eval [--dataset PATH.jsonl] [--k N]\n\
                      \x20                        [--associative] [--abstain] [--rerank]\n\
                      \x20                        [--format verbose|compact] [--max-tokens N] [--json]\n\n\
                      --associative  multi-hop expansion (v0.11)\n\

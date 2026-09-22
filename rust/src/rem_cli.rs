@@ -4,7 +4,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     if let Some(a) = args.first() {
         if matches!(a.as_str(), "-h" | "--help") {
             eprintln!(
-                "usage: cuba-memorys rem\n\n\
+                "usage: memory-industry rem\n\n\
                  Runs one consolidation cycle now instead of waiting for the server's\n\
                  4-hour timer: stratified decay, episode decay, NPMI autolink, embedding\n\
                  backfill, chunking, relation scan, auto-extraction, halfvec quantisation,\n\

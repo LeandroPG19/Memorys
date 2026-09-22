@@ -63,7 +63,7 @@ fn spawn_handshake_watchdog() {
             secs = limit.as_secs(),
             "no MCP handshake — the client gave up before the models finished loading. \
              Exiting instead of holding them for nobody (set CUBA_HANDSHAKE_TIMEOUT_SECS=0 \
-             to disable, or run `cuba-memorys serve` so the models load once and stay warm)"
+             to disable, or run `memory-industry serve` so the models load once and stay warm)"
         );
         std::process::exit(1);
     });
@@ -865,7 +865,7 @@ async fn run_rem_consolidation_locked(pool: &PgPool) -> Result<()> {
     let duplicate_candidates = rem_count_duplicate_candidates(pool).await;
     tracing::info!(
         duplicate_candidates,
-        "duplicate entity candidates awaiting `cuba-memorys dedupe`"
+        "duplicate entity candidates awaiting `memory-industry dedupe`"
     );
 
     record_rem_cycle(

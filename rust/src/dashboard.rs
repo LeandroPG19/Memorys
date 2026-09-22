@@ -17,7 +17,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         match a.as_str() {
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys dashboard [salida.html]\n\n\
+                    "usage: memory-industry dashboard [salida.html]\n\n\
                      Genera un HTML autocontenido (sin servidor, sin red) con la salud del\n\
                      sistema y la forma del corpus. Por defecto: cuba-dashboard.html"
                 );
@@ -144,7 +144,7 @@ async fn render(pool: &PgPool, url: &str) -> Result<String> {
     Ok(format!(
         r#"<!doctype html>
 <meta charset=utf-8>
-<title>cuba-memorys — estado del cerebro</title>
+<title>MemoryIndustry — estado del cerebro</title>
 <style>
   :root {{ --bg:#0f1115; --panel:#171a21; --line:#252a34; --fg:#e6e9ef; --muted:#8b94a7;
            --ok:#3fb950; --warn:#d29922; --fail:#f85149; --accent:#58a6ff; }}
@@ -195,7 +195,7 @@ async fn render(pool: &PgPool, url: &str) -> Result<String> {
   footer {{ color:var(--muted); font-size:.8rem; text-align:center; margin-top:2rem; }}
 </style>
 <div class=wrap>
-  <h1>cuba-memorys <span class="verdict {vcls}">{vtext}</span></h1>
+  <h1>MemoryIndustry <span class="verdict {vcls}">{vtext}</span></h1>
   <div class=sub>Generado desde la base, solo lectura. {failed} fallo(s), {warned} aviso(s).</div>
 
   <div class=cards>
@@ -232,7 +232,7 @@ async fn render(pool: &PgPool, url: &str) -> Result<String> {
     <ul id=hits></ul>
   </section>
 
-  <footer>cuba-memorys v{version} · sin servidor, sin red, sin dependencias</footer>
+  <footer>MemoryIndustry v{version} · sin servidor, sin red, sin dependencias</footer>
 </div>
 <script type="application/json" id=data>{payload}</script>
 <script>

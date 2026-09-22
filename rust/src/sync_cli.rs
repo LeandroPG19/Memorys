@@ -28,7 +28,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             "--json" => json = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys sync <export|import|diff|status> [--dir PATH]\n\
+                    "usage: memory-industry sync <export|import|diff|status> [--dir PATH]\n\
                      \x20                          [--scope project|all] [--conflict merge|skip|overwrite]\n\
                      \x20                          [--confirm]\n\n\
                      --confirm  a bundle whose tombstones would delete more than 10% of the\n\
@@ -36,7 +36,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
                      \x20          this. Read what the refusal says before passing it.\n\
                      \x20                          [--with-embeddings] [--json]\n\n\
                      Git-friendly export/import of the knowledge graph — same engine as the\n\
-                     cuba_sync MCP tool. Meant to be driven by `cuba-memorys hook install`."
+                     cuba_sync MCP tool. Meant to be driven by `memory-industry hook install`."
                 );
                 return Ok(());
             }

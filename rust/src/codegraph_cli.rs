@@ -23,7 +23,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             "--json" => json = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: cuba-memorys codegraph build [--path DIR] [--lang rust,python] [--project NAME] [--dry-run] [--json]\n\n\
+                    "usage: memory-industry codegraph build [--path DIR] [--lang rust,python] [--project NAME] [--dry-run] [--json]\n\n\
                      Parses source with tree-sitter (deterministic, no LLM, nothing leaves\n\
                      this process) and folds it into the SAME knowledge graph cuba_puente\n\
                      and cuba_faro already use: functions/structs/classes become\n\
