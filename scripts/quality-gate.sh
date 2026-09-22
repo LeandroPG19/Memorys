@@ -466,6 +466,123 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     #[cfg(unix)]. The day this judge also runs on
           #                     Linux, this stops being an exclusion and becomes
           #                     a cover: delete it then.
+          #
+          # A fifth group: the 41 survivors of QG_BASE=73da2d8 (the 0.28 work)
+          # that no --lib test can kill. Owner: endurecedor 0.28. Expires:
+          # 2027-03-22. Every pattern starts at `src/` and names the file in
+          # full: `db.rs` alone also matches src/graph_db.rs. Every function
+          # pattern carries ` -> ` or ` with ` after the name, for the prefix
+          # rule above, and ends in the replacement that survived, so the
+          # mutants inside each body and the siblings that die today stay
+          # judged. Where a pattern names a line:col it is a claim about one
+          # expression: when the line moves the pattern stops matching and
+          # the mutant comes back as MISSED, which is the loud direction.
+          # "Judged by" names the test that kills the mutant in the SIL
+          # (scripts/run-all-tests.sh). "Judged nowhere" is a hole this
+          # exclusion does not close; it only stops the hole reading as new.
+          #
+          #   Equivalent, with the proof:
+          #   src/redact.rs:110:63 `at_sign > *end` to `>=`
+          #                     at_sign is the index of a '@' and end the index
+          #                     of the ':' that starts "://". One byte cannot be
+          #                     both, so the two are never equal and >= decides
+          #                     exactly what > does.
+          #   src/redact.rs:130:58 `*sep > 0` to `>=`
+          #                     the only new case is sep == 0, where the key is
+          #                     "" and secret_field_pattern("") ends_with none of
+          #                     SECRET_FIELD_NAMES, so the next `?` returns the
+          #                     same None the filter did.
+          #   src/redact.rs:136:51 `sep + 1` to `sep * 1` in the value slice
+          #                     the slice gains one char, always the separator
+          #                     ('=' or ':'), and value_is_opaque starts with
+          #                     trim_matches(|c| !c.is_alphanumeric()), which
+          #                     strips it before counting. The line:col is
+          #                     load-bearing: the `sep + 1` on line 133 is a
+          #                     different mutant and is not equivalent.
+          #
+          #   A process-wide OnceLock that --lib cannot put in a known state
+          #   without depending on test order, and that loads a model on a
+          #   machine that has one (precedent: rerank failure_reason, nli init):
+          #   nli.rs enabled (true, false)
+          #                     judged by tests/nli_entailment.rs in the NLI
+          #                     section: `with false` fails require_nli_model,
+          #                     `with true` skips the load and entails() errs on
+          #                     "sesión NLI no inicializada".
+          #   nli.rs status_resolved with false, nli.rs failure_reason with None,
+          #   onnx.rs failure_reason with None
+          #                     judged NOWHERE through the live cell. The pure
+          #                     halves are tabled: nli_state_from, reason_of in
+          #                     both files, embedder_state_from. No SIL test
+          #                     reads /health with a model loaded or failed:
+          #                     v042_health_says_what_degraded points every
+          #                     model at nothing on purpose.
+          #   onnx.rs compute_embedding (the four vec! values)
+          #                     a one-line wrapper over compute_embedding_with,
+          #                     which is tabled. Judged by
+          #                     v016_chunking::a_long_observation_becomes_reachable_past_the_truncation_limit:
+          #                     any of the four vectors fails the UPDATE into
+          #                     vector(384).
+          #   http.rs:1462:24 `ready && is_model_loaded()` to `||`
+          #                     a REAL mutant, not an equivalent: the doc comment
+          #                     over embedder_state says that && is the guard
+          #                     that keeps /health from loading the model. With
+          #                     || the_embedder_is_warming_while_the_models_are_still_loading
+          #                     still reads "warming" and only pays the load.
+          #                     Judged NOWHERE. The line:col is load-bearing:
+          #                     `in embedder_state` is a prefix of
+          #                     `in embedder_state_from`.
+          #
+          #   CLI entry points (precedent: serve_pool and the handlers). The
+          #   only thing that runs these binaries is
+          #   cli_contract::every_listed_command_is_actually_dispatched, which
+          #   calls `<cmd> --help` and asserts exit != 2: a body replaced by
+          #   Ok(()) passes it. So:
+          #   run_cli in calibrate_cli, dashboard, export, link_cli, reembed_cli,
+          #   rem_cli, secure_cli, skills_cli, sync_cli
+          #                     judged NOWHERE.
+          #   eval/mod.rs run_cli
+          #                     executed by the eval smoke of the SIL, which
+          #                     checks the exit code only: judged NOWHERE.
+          #   dedupe_cli.rs run_cli
+          #                     judged by the #[ignore] lib tests
+          #                     a_hand_verified_merge_moves_everything_and_leaves_an_alias
+          #                     and merge_without_into_refuses_instead_of_guessing.
+          #   models_cli.rs print_help, setup.rs log
+          #                     text on a terminal. `models --help` runs the
+          #                     first and nobody reads what it prints: judged
+          #                     NOWHERE.
+          #
+          #   Needs a database, which --lib has no pool for (precedent:
+          #   fetch_adjacency, upsert_symbol, backfill_unscoped):
+          #   dedupe_cli.rs merge_by_name
+          #                     judged by a_hand_verified_merge_moves_everything_and_leaves_an_alias.
+          #   protocol.rs run_rem_consolidation_locked
+          #                     judged by v031_rem_wiring::community_detection_assigns_every_entity_a_community_after_one_rem_cycle
+          #                     and v037_a_cycle_that_dies_is_recorded_by_the_wrapper.
+          #   dashboard.rs render, export.rs export_obsidian,
+          #   search/calibrate.rs load_ood_threshold, db.rs assert_embedding_dim
+          #                     judged NOWHERE. No test reads a brain_calibration
+          #                     row, renders the dashboard, writes a vault or
+          #                     starts on a vector column of the wrong width.
+          #
+          #   Network or a live process:
+          #   models_cli.rs download_model, download_runtime
+          #                     download from the internet: judged NOWHERE.
+          #   protocol.rs spawn_handshake_watchdog
+          #                     sleeps 60 s and then calls process::exit, which
+          #                     would end the test binary. Judged NOWHERE.
+          #
+          #   The timeout:
+          #   onnx.rs locate_onnxruntime with Some(Default::default())
+          #                     the mutant builds a state the function cannot
+          #                     reach: it only returns a path it saw exist(), and
+          #                     "" never does. The three locate tests in
+          #                     onnx.rs would reject it; the run hangs instead,
+          #                     for 90 s. That an impossible "" hangs instead of
+          #                     failing is a robustness finding and a separate
+          #                     follow-up; it is not hidden here, and a test
+          #                     could not change the result, since libtest waits
+          #                     for the test that hangs.
           diff_file="$(mktemp)"
           # Same base as the file list above, or the two halves of this judge
           # would disagree about what "the change" is.
@@ -482,7 +599,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
             in_diff=(--in-diff "$diff_file")
           fi
           (cd rust && cargo mutants "${files[@]}" "${in_diff[@]}" \
-            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false' \
+            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false|src/redact\.rs:110:63: replace > with >= in credentials_in_url|src/redact\.rs:130:58: replace > with >= in secret_field|src/redact\.rs:136:51: replace \+ with \* in secret_field|src/cognitive/nli\.rs:.*replace enabled -> bool with |src/cognitive/nli\.rs:.*replace status_resolved -> bool with false|src/cognitive/nli\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace compute_embedding -> Result<Vec<f32>> with Ok\(vec!|src/http\.rs:1462:24: replace && with \|\| in embedder_state|src/(calibrate_cli|dashboard|dedupe_cli|export|link_cli|reembed_cli|rem_cli|secure_cli|skills_cli|sync_cli|eval/mod)\.rs:.*replace run_cli -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace print_help with \(\)|src/setup\.rs:.*replace log with \(\)|src/dashboard\.rs:.*replace render -> Result<String> with |src/search/calibrate\.rs:.*replace load_ood_threshold -> Option<f64> with |src/export\.rs:.*replace export_obsidian -> Result<usize> with |src/db\.rs:.*replace assert_embedding_dim -> Result<\(\)> with Ok\(\(\)\)|src/dedupe_cli\.rs:.*replace merge_by_name -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace run_rem_consolidation_locked -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace download_(model|runtime) -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace spawn_handshake_watchdog with \(\)|src/embeddings/onnx\.rs:.*replace locate_onnxruntime -> Option<PathBuf> with Some\(Default::default\(\)\)' \
             --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || fail=1
           rm -f "$diff_file"
         fi
