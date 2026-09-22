@@ -248,6 +248,38 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_key_still_names_the_field_whose_value_must_go() {
+        let context = serde_json::json!({"api_key": "canary-9f3a1b2c5d"});
+        let pretty = serde_json::to_string_pretty(&context).expect("a Value always serialises");
+        assert!(
+            pretty.contains("canary-9f3a1b2c5d"),
+            "the canary has to be in the text first, or `it is gone afterwards` proves \
+             nothing: {pretty}"
+        );
+
+        assert_eq!(
+            looks_like_secret(&pretty),
+            Some("api key field"),
+            "in a JSON log context the field name arrives quoted, so what the scan hands over \
+             is `\"api_key\"`, not `api_key`. `ends_with` ignores whatever sits in FRONT of \
+             the name, so the TRAILING quote is the whole problem: trim it and this is an api \
+             key field, keep it and the key is a word ending in a quote that matches nothing \
+             and the value walks. The value here carries no provider prefix on purpose — this \
+             branch is all that stands between it and the prompt"
+        );
+
+        let clean = redact_secrets(&pretty);
+        assert!(
+            !clean.contains("canary-9f3a1b2c5d"),
+            "the value of a quoted secret key went out whole: {clean}"
+        );
+        assert!(
+            clean.contains("\"api_key\": ***"),
+            "and the key has to stay, or the reader cannot tell what was removed: {clean}"
+        );
+    }
+
+    #[test]
     fn the_detector_says_which_pattern_it_matched() {
         assert_eq!(
             looks_like_secret("el deploy usa ghp_abcdefghijklmnop"),
