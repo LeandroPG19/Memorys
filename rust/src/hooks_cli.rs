@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::sync::chunk::{EntityFile, EpisodeFile, ErrorFile, ProjectRow, RelationRow};
+use crate::sync::paths;
 
 const MARKER: &str = "# cuba-memorys hook — installed by `cuba-memorys hook install`";
 const MERGE_DRIVER_NAME: &str = "cuba-memorys";
@@ -113,6 +114,32 @@ fn set_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The `.gitattributes` line that puts the merge driver on the files `sync`
+/// actually writes.
+///
+/// The directory is NOT decided here. `sync export` asks `sync::paths` where to
+/// write, and this file used to keep a second, hand-written copy of that rule
+/// with the older name still in it: on a repo where neither directory existed
+/// yet, sync wrote `.memory-industry/` while the driver was installed on
+/// `.cuba-memorys/**`. It never reached one file sync touched, `install` printed
+/// `installed` all the same, and the first time two machines reconciled one
+/// graph it was resolved as text over JSON.
+///
+/// The pattern is made relative to the root because that is what git reads a
+/// `.gitattributes` pattern against, and `default_sync_dir` hands back a path
+/// under the root: leaving it absolute would trade this defect for a pattern
+/// that matches nothing at all. A configured root outside the repo has no
+/// relative form and is left exactly as it was — it cannot be covered from here
+/// either way, which is a separate question and not this one.
+fn gitattributes_line(root: &Path, configured_sync_root: Option<&Path>) -> String {
+    let dir = match configured_sync_root {
+        Some(configured) => configured.to_path_buf(),
+        None => paths::default_sync_dir(root),
+    };
+    let pattern = dir.strip_prefix(root).unwrap_or(&dir);
+    format!("{}/** merge={MERGE_DRIVER_NAME}", pattern.display())
+}
+
 fn append_gitattributes_line(root: &Path, line: &str) -> Result<bool> {
     let path = root.join(".gitattributes");
     let existing = read_existing_or_empty(&path)?;
@@ -210,8 +237,7 @@ fn install(with_codegraph: bool) -> Result<()> {
         &format!("\"{exe}\" hook merge-driver %O %A %B %P"),
     )?;
 
-    let sync_dir = std::env::var("CUBA_SYNC_DIR").unwrap_or_else(|_| ".cuba-memorys".to_string());
-    let attr_line = format!("{sync_dir}/** merge={MERGE_DRIVER_NAME}");
+    let attr_line = gitattributes_line(&root, paths::configured_root().as_deref());
     let attrs_changed = append_gitattributes_line(&root, &attr_line)?;
 
     println!(

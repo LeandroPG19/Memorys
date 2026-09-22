@@ -5,7 +5,9 @@ const ENV_VAR: &str = "CUBA_SYNC_DIR";
 const DEFAULT_DIR: &str = ".memory-industry";
 const LEGACY_DIR: &str = ".cuba-memorys";
 
-fn configured_root() -> Option<PathBuf> {
+// `pub(crate)` for hooks_cli::gitattributes_line: the environment rule, trim and
+// empty-string filter included, is written once and read from there.
+pub(crate) fn configured_root() -> Option<PathBuf> {
     std::env::var(ENV_VAR)
         .ok()
         .map(|v| v.trim().to_string())
@@ -13,7 +15,10 @@ fn configured_root() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn default_sync_dir(root: &Path) -> PathBuf {
+// `pub(crate)` for hooks_cli::gitattributes_line: `hook install` has to name the
+// directory sync resolves, and a second hand-written copy of this rule over
+// there is the defect this widening closes.
+pub(crate) fn default_sync_dir(root: &Path) -> PathBuf {
     let preferred = root.join(DEFAULT_DIR);
     let legacy = root.join(LEGACY_DIR);
     if preferred.exists() || !legacy.exists() {
