@@ -374,6 +374,7 @@ fn classify(premise: &str, hypothesis: &str) -> Result<([f64; 3], bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envs::ScopedEnv;
 
     #[test]
     fn real_distributions_get_the_right_verdict() {
@@ -467,5 +468,69 @@ mod tests {
             "neutral must map to `unrelated`: it counts for NEITHER side, which is the \
              whole repair — being on-topic is not support"
         );
+    }
+
+    /// What this answers about the home, pinned before it moves to
+    /// `envs::home()`.
+    ///
+    /// Nothing in the repository fixed it until now: the only home resolution
+    /// under test was `envs::home()` itself. `available()` and
+    /// `deferred_by_resource_plan()` both derive from this, so a site that
+    /// read a different variable — or the same two in the other order — would
+    /// have `models nli` write into one directory and the loader look in
+    /// another.
+    #[tokio::test]
+    async fn the_nli_cache_is_looked_for_under_the_home_and_nowhere_else() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let root =
+            std::env::temp_dir().join(format!("memory-industry-nli-home-{}", uuid::Uuid::new_v4()));
+        let installed = root
+            .join(".cache")
+            .join("memory-industry")
+            .join("models-nli");
+        std::fs::create_dir_all(&installed).expect("the test owns this directory");
+        std::fs::write(installed.join("model.onnx"), b"not a real graph")
+            .expect("temp dir is writable");
+        // Never created: if USERPROFILE were read first, the block below would
+        // find no model under it and say None.
+        let never_created = root.join("userprofile-only");
+
+        {
+            let _h = ScopedEnv::set("HOME", &root.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &never_created.display().to_string());
+            assert_eq!(
+                cache_model_dir().as_ref(),
+                Some(&installed),
+                "HOME is the one an operator sets on purpose, and the one `models nli` wrote \
+                 under. Preferring USERPROFILE would install into one directory and load from \
+                 another"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+            assert_eq!(
+                cache_model_dir().as_ref(),
+                Some(&installed),
+                "PowerShell and cmd.exe define USERPROFILE and not HOME. Losing this fallback \
+                 makes every Windows operator who did not start from Git Bash look like a \
+                 machine with no NLI model installed"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            assert_eq!(
+                cache_model_dir(),
+                None,
+                "with neither name set this says None and nothing else. `available()` reads \
+                 that as «no model installed», which is a supported machine: making it an \
+                 error would turn NLI's absence into a fault in `/health` on every box that \
+                 never defined either name"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

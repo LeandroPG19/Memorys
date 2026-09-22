@@ -771,6 +771,71 @@ mod placement_tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The half its neighbour above cannot see.
+    ///
+    /// That test points HOME and USERPROFILE at the same directory, so it pins
+    /// neither which of the two is read nor what happens when neither is — and
+    /// until now nothing else in the repository pinned it either. Both are
+    /// contract: `runtime_has_gpu_provider` reads `None` as «nothing
+    /// downloaded» and drops to the CPU, which is the right answer for a
+    /// machine that never ran `models runtime`.
+    #[tokio::test]
+    async fn the_runtime_dir_prefers_home_and_gives_up_when_neither_name_is_set() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _no_override = ScopedEnv::cleared("ORT_DYLIB_PATH");
+
+        let chosen = std::env::temp_dir().join(format!(
+            "memory-industry-runtime-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let inherited = std::env::temp_dir().join(format!(
+            "memory-industry-runtime-userprofile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let under_chosen = chosen
+            .join(".cache")
+            .join("memory-industry")
+            .join("onnxruntime");
+        let under_inherited = inherited
+            .join(".cache")
+            .join("memory-industry")
+            .join("onnxruntime");
+
+        {
+            let _h = ScopedEnv::set("HOME", &chosen.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &inherited.display().to_string());
+            assert_eq!(
+                runtime_dir().as_ref(),
+                Some(&under_chosen),
+                "HOME is the one an operator exports on purpose; USERPROFILE is the one the \
+                 system exports for them. `models runtime` writes under the first of the two \
+                 that answers, so reading them the other way round downloads into one \
+                 directory and loads from another"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::set("USERPROFILE", &inherited.display().to_string());
+            assert_eq!(
+                runtime_dir().as_ref(),
+                Some(&under_inherited),
+                "PowerShell and cmd.exe define only USERPROFILE, which is every Windows \
+                 operator who did not start from Git Bash"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            assert_eq!(
+                runtime_dir(),
+                None,
+                "neither name set is «there is no runtime to find», said quietly. An error \
+                 here would report a machine that simply never downloaded a runtime as a \
+                 broken one, and the CPU path it is supposed to take is the supported one"
+            );
+        }
+    }
+
     /// The half of the availability probe that is a filesystem question.
     ///
     /// It decides whether an operator is sent to download a runtime they

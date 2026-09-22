@@ -349,3 +349,73 @@ async fn tail(pool: &PgPool, args: &Value) -> Result<Value> {
         .collect();
     Ok(serde_json::json!({"action": "tail", "entries": entries.clone(), "count": entries.len()}))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envs::ScopedEnv;
+
+    /// Where the HMAC key of the audit chain is looked for, pinned before this
+    /// home resolution moves to `envs::home()`.
+    ///
+    /// Resolving a different root does not fail: `compute_hash` falls back to
+    /// an unkeyed SHA-256 chain, so an install with a key on disk would
+    /// quietly start writing unkeyed hashes and `verify` would stop
+    /// reproducing the rows written before. The two positive rows come first
+    /// on purpose — without them the `None` row would also pass against a
+    /// reader that had stopped finding anything at all.
+    #[tokio::test]
+    async fn the_audit_key_comes_from_the_home_cache_and_is_absent_without_a_home() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        // Read before the home, so it has to be out of the way or this test
+        // measures whatever the developer happens to have exported.
+        let _explicit = ScopedEnv::cleared("CUBA_AUDIT_KEY");
+
+        let root = std::env::temp_dir().join(format!(
+            "memory-industry-audit-key-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = root.join(".cache").join("memory-industry");
+        std::fs::create_dir_all(&cache).expect("the test owns this directory");
+        std::fs::write(cache.join("audit_key"), "canary-audit-key\n")
+            .expect("temp dir is writable");
+        // Never created: if USERPROFILE were read first the block below would
+        // find no key under it and answer None.
+        let never_created = root.join("userprofile-only");
+        let stored = Some(b"canary-audit-key".to_vec());
+
+        {
+            let _h = ScopedEnv::set("HOME", &root.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &never_created.display().to_string());
+            assert_eq!(
+                audit_key(),
+                stored,
+                "HOME is read first, and the key `secure` wrote lives under it. Resolved \
+                 anywhere else the chain drops to unkeyed hashes without a word"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+            assert_eq!(
+                audit_key(),
+                stored,
+                "on Windows the key is under USERPROFILE, the only one of the two names a \
+                 service ever has"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            assert_eq!(
+                audit_key(),
+                None,
+                "no home is «no key», and `compute_hash` reads that as the unkeyed SHA-256 \
+                 chain, which is the documented default. An error here would stop every \
+                 append on a machine that never defined either name"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

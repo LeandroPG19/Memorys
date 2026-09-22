@@ -396,6 +396,7 @@ async fn wait_for_healthy(timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envs::ScopedEnv;
 
     #[test]
     fn container_status_is_read_correctly() {
@@ -429,5 +430,71 @@ mod tests {
             matches!(parse_container_status("  \n"), ContainerState::NotFound),
             "solo espacios = ninguna fila"
         );
+    }
+
+    /// Where the generated Postgres password is kept, pinned before this home
+    /// resolution moves to `envs::home()`.
+    ///
+    /// `resolve_password` falls back to the compiled-in constant on `None`, so
+    /// a site that resolved a different root would not fail: it would generate
+    /// a second password, store it somewhere else, and leave the operator with
+    /// a container that no longer accepts the URL the daemon builds.
+    #[tokio::test]
+    async fn the_postgres_password_file_hangs_off_the_home_and_is_none_without_one() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let root =
+            std::env::temp_dir().join(format!("memory-industry-pgpass-{}", uuid::Uuid::new_v4()));
+        let cache = root.join(".cache");
+        let preferred = cache.join("memory-industry").join("pgpass");
+        let legacy = cache.join("cuba-memorys").join("pgpass");
+        // Never created: if USERPROFILE were read first the block below would
+        // resolve under it instead, and the assertion would name that path.
+        let never_created = root.join("userprofile-only");
+
+        {
+            let _h = ScopedEnv::set("HOME", &root.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &never_created.display().to_string());
+            assert_eq!(
+                password_file().as_ref(),
+                Some(&preferred),
+                "HOME is read first, and with nothing stored yet the answer is the documented \
+                 path"
+            );
+
+            std::fs::create_dir_all(cache.join("cuba-memorys"))
+                .expect("the test owns this directory");
+            std::fs::write(&legacy, "stored-before-the-rename").expect("temp dir is writable");
+            assert_eq!(
+                password_file().as_ref(),
+                Some(&legacy),
+                "the password an install generated before the rename is the one its container \
+                 was created with. Preferring the new path here stores a second password the \
+                 running Postgres does not accept"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+            assert_eq!(
+                password_file().as_ref(),
+                Some(&legacy),
+                "the same answer from USERPROFILE, which is the only one of the two a Windows \
+                 service ever has"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            assert_eq!(
+                password_file(),
+                None,
+                "no home is «nowhere to keep it», and `resolve_password` reads that as «use \
+                 the compiled-in constant». An error here would stop `setup` on a machine that \
+                 has simply never defined either name"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

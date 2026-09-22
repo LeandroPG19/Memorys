@@ -565,6 +565,7 @@ pub fn is_model_loaded() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envs::ScopedEnv;
 
     #[test]
     fn test_embedding_dimension() {
@@ -710,5 +711,139 @@ mod tests {
         assert_eq!(embed_concurrency(), 1, "0 must fall through to the default");
 
         unsafe { std::env::remove_var("CUBA_EMBED_CONCURRENCY") };
+    }
+
+    /// What `locate_onnxruntime` does with the home, pinned before it moves to
+    /// `envs::home()`.
+    ///
+    /// The home is not a result here, it is the first candidate of a chain:
+    /// LD_LIBRARY_PATH and the system directories follow it. So «neither
+    /// variable set» is not a failure and must not become one — a machine with
+    /// the runtime in /usr/lib and no HOME still loads it, which is the row the
+    /// last block fixes.
+    #[tokio::test]
+    async fn the_runtime_in_the_home_cache_leads_the_chain_and_its_absence_is_silent() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let lib = if cfg!(target_os = "macos") {
+            "libonnxruntime.dylib"
+        } else if cfg!(target_os = "windows") {
+            "onnxruntime.dll"
+        } else {
+            "libonnxruntime.so"
+        };
+        let root =
+            std::env::temp_dir().join(format!("memory-industry-ort-home-{}", uuid::Uuid::new_v4()));
+        let installed = root
+            .join(".cache")
+            .join("memory-industry")
+            .join("onnxruntime");
+        std::fs::create_dir_all(&installed).expect("the test owns this directory");
+        let in_the_cache = installed.join(lib);
+        std::fs::write(&in_the_cache, b"not a real library").expect("temp dir is writable");
+        let never_created = root.join("userprofile-only");
+
+        // A fresh guard per block: a call that finds something *writes*
+        // ORT_DYLIB_PATH, so the next call would short-circuit on what this
+        // test itself caused instead of resolving the home again.
+        {
+            let _explicit = ScopedEnv::cleared("ORT_DYLIB_PATH");
+            let _h = ScopedEnv::set("HOME", &root.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &never_created.display().to_string());
+            assert_eq!(
+                locate_onnxruntime().as_ref(),
+                Some(&in_the_cache),
+                "the runtime `models runtime` downloaded under HOME has to win over any system \
+                 copy, or the daemon loads a different build of ONNX Runtime than the one whose \
+                 provider libraries were installed beside it"
+            );
+        }
+        {
+            let _explicit = ScopedEnv::cleared("ORT_DYLIB_PATH");
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+            assert_eq!(
+                locate_onnxruntime().as_ref(),
+                Some(&in_the_cache),
+                "on Windows that download went under USERPROFILE, the only one of the two \
+                 names PowerShell defines"
+            );
+        }
+        {
+            let _explicit = ScopedEnv::cleared("ORT_DYLIB_PATH");
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            assert_ne!(
+                locate_onnxruntime().as_ref(),
+                Some(&in_the_cache),
+                "with neither name set the cache candidate drops out of the chain and the \
+                 search goes on to LD_LIBRARY_PATH and the system directories. Whatever it \
+                 finds there, it cannot be the directory it was just told nothing about"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `cache_roots` answers with an empty vector when there is no home, and
+    /// every caller reads that as «no cache to look in».
+    ///
+    /// Pinned before the migration because an error here would stop
+    /// `resolve_model_dir` cold on a machine that is merely unconfigured.
+    #[tokio::test]
+    async fn without_a_home_the_cache_roots_are_empty_rather_than_guessed() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let root = std::env::temp_dir().join(format!(
+            "memory-industry-cache-roots-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = root.join(".cache");
+        let preferred = cache.join("memory-industry");
+        let legacy = cache.join("cuba-memorys");
+        let never_created = root.join("userprofile-only");
+
+        {
+            let _h = ScopedEnv::set("HOME", &root.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &never_created.display().to_string());
+            assert_eq!(
+                cache_roots(),
+                vec![preferred.clone(), legacy.clone()],
+                "nothing downloaded yet: the documented name is looked at first and the legacy \
+                 one stays in the list, so a pre-rename install is still found"
+            );
+
+            std::fs::create_dir_all(&legacy).expect("the test owns this directory");
+            assert_eq!(
+                cache_roots(),
+                vec![legacy.clone(), preferred.clone()],
+                "a machine that downloaded before the rename keeps its models under \
+                 cuba-memorys, and looking at the empty new directory first would report no \
+                 model on a machine that has one"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+            assert_eq!(
+                cache_roots(),
+                vec![legacy.clone(), preferred.clone()],
+                "the same answer from USERPROFILE, which is the only one of the two a Windows \
+                 service ever has"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            assert_eq!(
+                cache_roots(),
+                Vec::<PathBuf>::new(),
+                "no home means no cache to search, said as an empty list. `resolve_model_dir` \
+                 walks it and falls through to the hash embedder, which is the supported \
+                 Tier::Minimal machine — an error here would take that machine down instead"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

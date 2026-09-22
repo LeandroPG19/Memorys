@@ -679,3 +679,79 @@ mod redaction_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod config_path_tests {
+    use super::*;
+    use crate::envs::ScopedEnv;
+
+    /// Where `llm set` writes and `load_saved_config_into_env` reads, pinned
+    /// before this home resolution moves to `envs::home()`.
+    ///
+    /// The other of the two sites of the ten that already fail loudly. The
+    /// last block asserts that the error names both variables rather than
+    /// freezing the sentence: an operator needs to know which name to define,
+    /// and the wording is what a shared helper is allowed to improve.
+    #[tokio::test]
+    async fn the_llm_config_hangs_off_the_home_and_the_error_names_both_names() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let chosen =
+            std::env::temp_dir().join(format!("memory-industry-llm-home-{}", uuid::Uuid::new_v4()));
+        let inherited = std::env::temp_dir().join(format!(
+            "memory-industry-llm-userprofile-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        {
+            let _h = ScopedEnv::set("HOME", &chosen.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &inherited.display().to_string());
+            // Only the root is asserted: what sits between it and the file
+            // differs by platform (AppData\Roaming against .config) and that
+            // choice is not what this test is about.
+            let path = config_path().expect("HOME answers");
+            assert!(
+                path.starts_with(&chosen),
+                "`llm set deepseek --key …` writes this file and every later start reads it \
+                 back. Written under one root and read under another, the key an operator \
+                 typed is simply never found again: {}",
+                path.display()
+            );
+            assert!(path.ends_with("llm.env"), "{}", path.display());
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::set("USERPROFILE", &inherited.display().to_string());
+            let path = config_path().expect("USERPROFILE answers when HOME does not");
+            assert!(
+                path.starts_with(&inherited),
+                "PowerShell and cmd.exe define only USERPROFILE: {}",
+                path.display()
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            match config_path() {
+                Ok(guessed) => panic!(
+                    "resolved to {} with neither name set. A key written to a guessed \
+                     directory is a secret left where the operator will not think to delete \
+                     it, and no later start reads it",
+                    guessed.display()
+                ),
+                Err(e) => {
+                    let said = format!("{e:#}");
+                    assert!(
+                        said.contains("HOME"),
+                        "the message has to name the variable to define: {said}"
+                    );
+                    assert!(
+                        said.contains("USERPROFILE"),
+                        "naming only HOME sends a Windows operator to define the one name \
+                         their shell does not use: {said}"
+                    );
+                }
+            }
+        }
+    }
+}

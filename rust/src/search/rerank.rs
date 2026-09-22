@@ -608,6 +608,7 @@ fn identity_pairs(n: usize) -> Vec<(usize, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envs::ScopedEnv;
 
     /// A throwaway HOME whose cache holds a plausible reranker, so the tests
     /// below never depend on what this machine happens to have installed.
@@ -619,8 +620,19 @@ mod tests {
     /// move HOME or a `CUBA_*` name serialise on the crate-wide one.
     struct FakeHome {
         root: PathBuf,
-        home: Option<String>,
-        userprofile: Option<String>,
+        /// The half `envs::ScopedEnv` already covers: the two names, restored
+        /// through a panic — which the hand-rolled fields did not do, so an
+        /// assertion that fired left this whole process with a HOME pointing
+        /// at a temp directory the same `Drop` had just deleted — and kept as
+        /// `OsString`, so a home that is not valid UTF-8 comes back as it was
+        /// instead of being dropped on the way in.
+        ///
+        /// The other half stays below and is deliberately not replaced: the
+        /// temp directory with a plausible model in it, the `root` the tests
+        /// read, and the unconditional `CUBA_RERANKER_PATH` removal are not
+        /// environment save-and-restore.
+        _home: ScopedEnv,
+        _userprofile: ScopedEnv,
     }
 
     impl FakeHome {
@@ -633,30 +645,26 @@ mod tests {
             std::fs::create_dir_all(&cache).expect("temp dir is writable");
             std::fs::write(cache.join("model.onnx"), b"not a real graph").expect("writable");
 
-            let me = Self {
-                home: std::env::var("HOME").ok(),
-                userprofile: std::env::var("USERPROFILE").ok(),
+            let as_text = root.display().to_string();
+            Self {
                 root,
-            };
-            unsafe {
-                std::env::set_var("HOME", &me.root);
-                std::env::set_var("USERPROFILE", &me.root);
+                _home: ScopedEnv::set("HOME", &as_text),
+                _userprofile: ScopedEnv::set("USERPROFILE", &as_text),
             }
-            me
         }
     }
 
     impl Drop for FakeHome {
         fn drop(&mut self) {
+            // Not save-and-restore, which is why it did not move to
+            // `ScopedEnv`: nothing here ever sets this name and several tests
+            // below do, so it is cleared unconditionally on the way out.
+            //
+            // SAFETY: every test that builds a `FakeHome` holds
+            // `session::GLOBAL_STATE_GUARD`, so no other thread is reading the
+            // environment. The two fields above are restored after this runs,
+            // when they drop in declaration order.
             unsafe {
-                match &self.home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-                match &self.userprofile {
-                    Some(v) => std::env::set_var("USERPROFILE", v),
-                    None => std::env::remove_var("USERPROFILE"),
-                }
                 std::env::remove_var("CUBA_RERANKER_PATH");
             }
             let _ = std::fs::remove_dir_all(&self.root);
@@ -935,5 +943,67 @@ mod tests {
             3,
             "a NaN score means the model already failed; losing the other candidates over it would turn a bad ranking into no answer at all"
         );
+    }
+
+    /// Where the reranker is looked for when nothing points at it, pinned
+    /// before this home resolution moves to `envs::home()`.
+    ///
+    /// `resolved_model_dir` falls through to this whenever
+    /// `CUBA_RERANKER_PATH` is unset, which is every install that took the
+    /// default. `None` is read as «no reranker configured», and `reason_of`
+    /// deliberately does not call that a failure, so it must not become one.
+    #[tokio::test]
+    async fn the_default_reranker_dir_comes_from_the_home_and_is_none_without_one() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let chosen = std::env::temp_dir().join(format!(
+            "memory-industry-rerank-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let inherited = std::env::temp_dir().join(format!(
+            "memory-industry-rerank-userprofile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let under_chosen = chosen
+            .join(".cache")
+            .join("memory-industry")
+            .join("reranker");
+        let under_inherited = inherited
+            .join(".cache")
+            .join("memory-industry")
+            .join("reranker");
+
+        {
+            let _h = ScopedEnv::set("HOME", &chosen.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &inherited.display().to_string());
+            assert_eq!(
+                default_reranker_dir().as_ref(),
+                Some(&under_chosen),
+                "HOME is where `models reranker` wrote. Reading USERPROFILE first would look \
+                 in a directory the download never touched and report no reranker on a machine \
+                 that has one"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::set("USERPROFILE", &inherited.display().to_string());
+            assert_eq!(
+                default_reranker_dir().as_ref(),
+                Some(&under_inherited),
+                "PowerShell and cmd.exe define only USERPROFILE, which is every Windows \
+                 operator who did not start from Git Bash"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            assert_eq!(
+                default_reranker_dir(),
+                None,
+                "no home is «no default directory», which `is_configured` reads as no \
+                 reranker. An error here would put every install that never downloaded one \
+                 into `/health` as a fault instead of as a model to install"
+            );
+        }
     }
 }

@@ -438,3 +438,88 @@ async fn download_to(url: &str, dest: &Path) -> Result<()> {
     std::fs::rename(&tmp, dest)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envs::ScopedEnv;
+
+    /// Which cache root `models …` downloads into, pinned before this home
+    /// resolution moves to `envs::home()`.
+    ///
+    /// One of only two sites of the ten that already fail loudly rather than
+    /// answering `None`. The last block asserts that the message names the two
+    /// variables, not the sentence it names them in: what an operator needs is
+    /// which name to define, and the wording is what a shared helper is
+    /// allowed to improve.
+    #[tokio::test]
+    async fn the_model_cache_hangs_off_the_home_and_the_error_names_both_names() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let root = std::env::temp_dir().join(format!(
+            "memory-industry-model-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = root.join(".cache");
+        let preferred = cache.join("memory-industry");
+        let legacy = cache.join("cuba-memorys");
+        // Never created: if USERPROFILE were read first the block below would
+        // resolve under it and the assertion would name that path.
+        let never_created = root.join("userprofile-only");
+
+        {
+            let _h = ScopedEnv::set("HOME", &root.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &never_created.display().to_string());
+            assert_eq!(
+                cache_root().expect("HOME answers"),
+                preferred,
+                "HOME is read first, and with nothing downloaded yet the answer is the \
+                 documented directory"
+            );
+
+            std::fs::create_dir_all(&legacy).expect("the test owns this directory");
+            assert_eq!(
+                cache_root().expect("HOME answers"),
+                legacy,
+                "a machine that downloaded before the rename keeps its models under \
+                 cuba-memorys. Writing the next one under the new name leaves two \
+                 half-populated caches and re-downloads a gigabyte"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+            assert_eq!(
+                cache_root().expect("USERPROFILE answers when HOME does not"),
+                legacy,
+                "PowerShell and cmd.exe define only USERPROFILE, which is every Windows \
+                 operator who did not start from Git Bash"
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            match cache_root() {
+                Ok(guessed) => panic!(
+                    "resolved to {} with neither name set. A gigabyte downloaded into a \
+                     guessed directory is worse than a refusal: nothing ever reads it again",
+                    guessed.display()
+                ),
+                Err(e) => {
+                    let said = format!("{e:#}");
+                    assert!(
+                        said.contains("HOME"),
+                        "the message has to name the variable to define: {said}"
+                    );
+                    assert!(
+                        said.contains("USERPROFILE"),
+                        "naming only HOME sends a Windows operator to define the one name \
+                         their shell does not use: {said}"
+                    );
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

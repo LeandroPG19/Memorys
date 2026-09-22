@@ -930,6 +930,7 @@ pub async fn reconcile_stub(pool: &sqlx::PgPool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envs::ScopedEnv;
 
     #[test]
     fn cypher_escape_quotes() {
@@ -1012,5 +1013,63 @@ mod tests {
         let pos = |n: &str| ranked.iter().position(|x| x.name == n).unwrap();
         assert!(pos("A") < pos("C"));
         assert!(ranked[0].score > ranked[2].score);
+    }
+
+    /// Where the saved graph configuration is looked for, pinned before this
+    /// home resolution moves to `envs::home()`.
+    ///
+    /// `load_saved_config_into_env` returns on `None` without a word, so a
+    /// change of variable here fails nowhere visible: the daemon comes up with
+    /// no FalkorDB endpoint configured and reports the graph as absent, which
+    /// is exactly what an install that never configured one looks like.
+    #[tokio::test]
+    async fn the_graph_config_hangs_off_the_home_and_is_none_without_one() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let chosen = std::env::temp_dir().join(format!(
+            "memory-industry-graph-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let inherited = std::env::temp_dir().join(format!(
+            "memory-industry-graph-userprofile-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        {
+            let _h = ScopedEnv::set("HOME", &chosen.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &inherited.display().to_string());
+            // Only the root is asserted: what sits between it and the file
+            // differs by platform (AppData\Roaming against .config) and that
+            // choice is not what this test is about.
+            let path = config_path().expect("HOME answers");
+            assert!(
+                path.starts_with(&chosen),
+                "the file `graph save` wrote lives under HOME. Resolved anywhere else the \
+                 daemon starts with no graph endpoint and calls the graph absent: {}",
+                path.display()
+            );
+            assert!(path.ends_with("graph.env"), "{}", path.display());
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::set("USERPROFILE", &inherited.display().to_string());
+            let path = config_path().expect("USERPROFILE answers when HOME does not");
+            assert!(
+                path.starts_with(&inherited),
+                "Windows defines USERPROFILE and not HOME: {}",
+                path.display()
+            );
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            assert_eq!(
+                config_path(),
+                None,
+                "with neither name set there is no file to read, and the loader returns \
+                 without a word. An error here would turn an unconfigured graph — the default \
+                 on every install — into a fault"
+            );
+        }
     }
 }
