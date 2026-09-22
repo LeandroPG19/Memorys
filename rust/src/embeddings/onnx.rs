@@ -714,6 +714,23 @@ mod tests {
         unsafe { std::env::remove_var("CUBA_EMBED_CONCURRENCY") };
     }
 
+    /// The file name `locate_onnxruntime` searches for, written once for the
+    /// fixtures instead of once per test.
+    ///
+    /// A copy that drifts from the production chain cannot make a test pass
+    /// for the wrong reason: the fixture would be written under a name the
+    /// search never asks for, and every assertion that expects to find it
+    /// goes red.
+    fn runtime_library_filename() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "libonnxruntime.dylib"
+        } else if cfg!(target_os = "windows") {
+            "onnxruntime.dll"
+        } else {
+            "libonnxruntime.so"
+        }
+    }
+
     /// What `locate_onnxruntime` does with the home, pinned before it moves to
     /// `envs::home()`.
     ///
@@ -726,13 +743,7 @@ mod tests {
     async fn the_runtime_in_the_home_cache_leads_the_chain_and_its_absence_is_silent() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
 
-        let lib = if cfg!(target_os = "macos") {
-            "libonnxruntime.dylib"
-        } else if cfg!(target_os = "windows") {
-            "onnxruntime.dll"
-        } else {
-            "libonnxruntime.so"
-        };
+        let lib = runtime_library_filename();
         let root = scratch_root("ort-home");
         let installed = root
             .join(".cache")
@@ -901,5 +912,76 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A real directory named in LD_LIBRARY_PATH is a candidate of the search;
+    /// the empty segments beside it are not.
+    ///
+    /// `.filter(|s| !s.is_empty())` reads like tidiness and is not. Delete the
+    /// `!` and the chain keeps only the empty segments and throws the real
+    /// directories away: the machine that keeps its ONNX Runtime in
+    /// LD_LIBRARY_PATH stops finding it and drops to the hash embedder without
+    /// saying anything. `cargo mutants` had that deletion alive on that line.
+    ///
+    /// The fixture directory is relative to the process directory, and that is
+    /// not laziness either: the split is on `':'` on every platform, so a
+    /// Windows absolute path — `std::env::temp_dir()` is a path under
+    /// `C:\Users\...\AppData\Local\Temp` there — is cut at its drive letter
+    /// into two segments that are neither empty nor real, and the fixture
+    /// would fail as if the code were broken. A relative segment means the
+    /// same thing on both platforms and is resolved against the same directory
+    /// when this test writes the library and when the search looks for it.
+    /// It goes under `target/` so an interrupted run leaves its scratch where
+    /// git already ignores it.
+    #[tokio::test]
+    async fn a_real_directory_in_ld_library_path_is_searched_and_an_empty_segment_is_not() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let lib = runtime_library_filename();
+        // `scratch_root` for its uuid and not for its path: two runs of this
+        // test must not share a directory that each of them deletes.
+        let unique = scratch_root("ort-ld");
+        let in_the_path = PathBuf::from("target").join(
+            unique
+                .file_name()
+                .expect("scratch_root always ends in a uuid-suffixed name"),
+        );
+        std::fs::create_dir_all(&in_the_path).expect("the process directory is writable");
+        let installed = in_the_path.join(lib);
+        std::fs::write(&installed, b"not a real library")
+            .expect("the process directory is writable");
+
+        // Positive control, before the assertion that matters: without it, a
+        // process directory this test cannot write to — or one that moved
+        // between the write and the search — would read as the search having
+        // rejected a real candidate.
+        assert!(
+            installed.exists(),
+            "the fixture is broken: the library was written but does not resolve back from the \
+             relative path the search will use"
+        );
+
+        // A home with nothing under it, so the first candidate of the chain
+        // drops out and what is measured is the LD_LIBRARY_PATH segment.
+        let no_cache = scratch_root("ort-ld-home");
+        // The empty segments the filter exists to throw away: a `:` too many
+        // at the front and one at the end is what a shell leaves behind after
+        // `LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/ort` on an unset variable.
+        let with_empty_segments = format!(":{}:", in_the_path.display());
+
+        let _explicit = ScopedEnv::cleared("ORT_DYLIB_PATH");
+        let _h = ScopedEnv::set("HOME", &no_cache.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &no_cache.display().to_string());
+        let _ld = ScopedEnv::set("LD_LIBRARY_PATH", &with_empty_segments);
+        assert_eq!(
+            locate_onnxruntime().as_ref(),
+            Some(&installed),
+            "the directory the operator put in LD_LIBRARY_PATH has to be the answer, named. \
+             Asserting merely that something was found would pass on a host that keeps a \
+             runtime in /usr/lib, and asserting nothing was found would pass on a host that \
+             keeps none — both of which are the host answering, not this code"
+        );
+
+        let _ = std::fs::remove_dir_all(&in_the_path);
     }
 }
