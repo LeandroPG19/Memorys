@@ -109,6 +109,47 @@ fn parse_vector_dim(col_type: &str) -> Option<i64> {
         .ok()
 }
 
+/// The names an install made from this repo can actually be running under.
+///
+/// `rust/Cargo.toml` builds `src/main.rs` twice, as `memory-industry` and as
+/// `cuba-memorys`; `packaging/memory-industry.service:9` starts
+/// `memory-industry`; `packaging/cuba-memorys.service:11` starts
+/// `cuba-memorys-daemon`; `package.json` publishes both npm bins. AGENTS.md
+/// keeps the legacy alias for one more release, so all three are ours and none
+/// is retired here.
+///
+/// This was the single literal `cuba-memorys` until 0.27, which is the one name
+/// no unit this repo packages produces. It discarded every process it ever saw,
+/// so `binary_freshness` answered `ok` on every systemd install that came out of
+/// here and the warning below has never once been able to fire.
+const OUR_BINARY_NAMES: &[&str] = &["memory-industry", "cuba-memorys", "cuba-memorys-daemon"];
+
+/// Whether a `/proc/<pid>/exe` link points at one of our binaries, and whether
+/// the image it points at is already gone.
+///
+/// The ` (deleted)` suffix comes off the path that is handed back, because the
+/// caller stats that path and `…/memory-industry (deleted)` is not a file on
+/// disk. Deletion travels beside it instead, since it is the one case that
+/// settles staleness with no stat at all: the running image is a file that no
+/// longer exists.
+///
+/// The name is matched whole. `cuba-memorys-daemon` is a prefix extension of
+/// `cuba-memorys`, so a loose match widened to take the daemon would also take
+/// anything that merely starts the same and tell an operator to restart a
+/// process that is not ours.
+fn our_binary_from_exe_link(raw: &str) -> Option<(std::path::PathBuf, bool)> {
+    let (path, deleted) = match raw.strip_suffix(" (deleted)") {
+        Some(p) => (std::path::PathBuf::from(p), true),
+        None => (std::path::PathBuf::from(raw), false),
+    };
+
+    let name = path.file_name()?.to_str()?;
+    if !OUR_BINARY_NAMES.contains(&name) {
+        return None;
+    }
+    Some((path, deleted))
+}
+
 fn stale_processes() -> Vec<u32> {
     let mut stale = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -120,24 +161,18 @@ fn stale_processes() -> Vec<u32> {
             continue;
         };
         let exe_link = entry.path().join("exe");
-        let Ok(exe) = std::fs::read_link(&exe_link) else {
+        let Ok(link) = std::fs::read_link(&exe_link) else {
             continue;
         };
 
-        let raw = exe.to_string_lossy();
-        let (path, deleted) = match raw.strip_suffix(" (deleted)") {
-            Some(p) => (std::path::PathBuf::from(p), true),
-            None => (exe.clone(), false),
-        };
-        if path.file_name().and_then(|n| n.to_str()) != Some("cuba-memorys") {
+        let Some((exe, deleted)) = our_binary_from_exe_link(&link.to_string_lossy()) else {
             continue;
-        }
+        };
 
         if deleted {
             stale.push(pid);
             continue;
         }
-        let exe = path;
 
         let (Ok(bin_meta), Ok(proc_meta)) =
             (std::fs::metadata(&exe), std::fs::metadata(entry.path()))
