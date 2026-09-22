@@ -866,3 +866,46 @@ fn a_release_cargo_call_in_the_gate_carries_the_features_the_release_build_used(
         );
     }
 }
+
+/// The half of the second judge that has to be able to fail.
+///
+/// The CRAP half decides by absence: on a diff that made nothing worse it
+/// prints no violation and exits 0, which is also exactly what a filter that
+/// stopped filtering looks like — right up to the day it prints a verdict
+/// contradicting itself in its own sentence, which is how this was found:
+///
+/// ```text
+/// CRAP: src/service.rs::keys_offered is at CC 6, over the ceiling of 8
+/// ```
+///
+/// Six is not over eight. `lizard -w` also warns on length and on NLOC, and
+/// every warning a CCN could be parsed out of was counted as a complexity
+/// violation. Its `--self-test` sends one fixture of each kind through the
+/// filter — a 1014-line function whose CC is 1, which has to come out as
+/// nothing at all, and a CC 13 one, which has to come out with its number and
+/// fail the gate — and reports whether both directions held.
+#[test]
+fn the_crap_half_of_the_second_judge_can_actually_fail() {
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/quality-gate.sh", "--self-test"])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "quality-gate.sh --self-test exited {:?}, so the CRAP half no longer reports CC \
+         violations and only CC violations. Exit 2 is its own answer for a missing lizard, \
+         which AGENTS.md already counts as a judge that cannot close: install it rather than \
+         skip this.\nstdout: {stdout}\nstderr: {stderr}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("self-test: the CRAP half reports CC violations, and only CC violations"),
+        "the self-test exited 0 without saying it ran. An exit code alone is what let \
+         codigo-muerto.sh pass for months while doing nothing, and a script that cannot find \
+         its own fixtures exits 0 too. stdout: {stdout}"
+    );
+}

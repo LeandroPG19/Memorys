@@ -35,7 +35,11 @@ struct Scan {
 }
 
 fn secret_field_pattern(key: &str) -> Option<&'static str> {
-    let key = key.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+    // `'\u{5f}'` is `'_'`: lizard's Rust reader reads a plain `'_'` as the
+    // lifetime `'_` and measures nothing to the next apostrophe. That is where
+    // the CC 23 in lizard-baseline.txt came from: the lost region, not this
+    // body. Long version in service.rs::keys_offered.
+    let key = key.trim_matches(|c: char| !c.is_alphanumeric() && c != '\u{5f}');
     let lower = key.to_lowercase();
     SECRET_FIELD_NAMES
         .iter()

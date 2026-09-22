@@ -65,11 +65,25 @@ rel_under() {
 
 
 # `key cc` per function over the ceiling, e.g. `src/protocol.rs::run_mcp 27`.
+#
+# The awk is the whole point of the word "over". `lizard -w` warns on
+# `length > 1000` and on `nloc` too, not only on CC, and this function used to
+# forward every warning it could parse a CCN out of. That is how the gate
+# printed, on a real run:
+#     CRAP: src/service.rs::keys_offered is at CC 6, over the ceiling of 8,
+#           and is not in the baseline.
+# A verdict that contradicts itself in its own sentence, about a function whose
+# complexity was never the problem (it was 13 lines; lizard's Rust tokenizer had
+# lost its place and thought it ran to the end of the file). Whoever read that
+# line had two ways to make it go away and only one of them was true. The test
+# is `> cc_max` and nothing else, which is also lizard's own criterion for `-C`:
+# it warns when CCN is strictly over the ceiling, so the two halves agree.
 lizard_warnings() {
   local cwd="$1" cc_max="$2"
   shift 2
   (cd "$cwd" && lizard -C "$cc_max" -w "$@" 2>/dev/null) |
     sed -nE 's|^(.*):[0-9]+: warning: ([A-Za-z0-9_:<>]+) has [0-9]+ NLOC, ([0-9]+) CCN.*|\1::\2 \3|p' |
+    awk -v max="$cc_max" '($2 + 0) > (max + 0)' |
     sed 's|\\|/|g' | sort -u || true
 }
 
@@ -122,6 +136,70 @@ run_lizard() {
   (( worse == 0 )) || return 1
   return 0
 }
+
+# --- self-test: the CRAP filter gets a fixture that puts it in the red -------
+# A guard nobody can watch fail is a paragraph. Both directions are here,
+# because absence proves nothing without a presence anchor beside it: a warning
+# that is NOT about complexity must come out of `lizard_warnings` as nothing at
+# all, and one that IS must still come out with its number.
+#   ./scripts/quality-gate.sh --self-test
+if [[ "${1:-}" == "--self-test" ]]; then
+  if ! command -v lizard >/dev/null; then
+    echo "FALTA lizard: el self-test del filtro CRAP no puede correr." >&2
+    exit 2
+  fi
+  # The fixtures below are built around a ceiling of 8, so this one does not
+  # read the environment: an exported LIZARD_CC_MAX would move the line the
+  # fixtures were cut to and fail the self-test for the wrong reason.
+  LIZARD_CC_MAX=8
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  mkdir -p "$tmp/src"
+
+  # 1014 lines, one statement each: lizard measures it at CCN 1 and warns all
+  # the same, because `lizard -w` also fires on `length > 1000`. Before the awk in
+  # lizard_warnings this printed `src/only_long.rs::only_long 1` and run_lizard
+  # turned it into "is at CC 1, over the ceiling of 8".
+  {
+    echo 'fn only_long(n: u32) -> u32 {'
+    echo '    let mut t = n;'
+    for _ in $(seq 1010); do echo '    t = t + 1;'; done
+    echo '    t'
+    echo '}'
+  } > "$tmp/src/only_long.rs"
+  got="$(lizard_warnings "$tmp" 8 src/only_long.rs)"
+  if [[ -n "$got" ]]; then
+    echo "FAIL self-test: a length warning was reported as a CC violation ($got)" >&2
+    exit 1
+  fi
+  if ! run_lizard "$tmp" src/only_long.rs; then
+    echo "FAIL self-test: run_lizard failed a function whose CC is 1" >&2
+    exit 1
+  fi
+
+  # The presence anchor: twelve `if`s, so CCN 13, five over the ceiling. This
+  # one has to survive the filter with its number intact and has to fail
+  # run_lizard, since no fixture is ever in the baseline.
+  {
+    echo 'fn tangled(n: u32) -> u32 {'
+    echo '    let mut t = 0;'
+    for i in $(seq 12); do echo "    if n == $i { t += $i; }"; done
+    echo '    t'
+    echo '}'
+  } > "$tmp/src/tangled.rs"
+  got="$(lizard_warnings "$tmp" 8 src/tangled.rs)"
+  if [[ "$got" != "src/tangled.rs::tangled 13" ]]; then
+    echo "FAIL self-test: the filter lost a CC 13 function (got '$got')" >&2
+    exit 1
+  fi
+  if run_lizard "$tmp" src/tangled.rs 2>/dev/null; then
+    echo "FAIL self-test: run_lizard passed a CC 13 function that is not in the baseline" >&2
+    exit 1
+  fi
+
+  echo "OK  self-test: the CRAP half reports CC violations, and only CC violations"
+  exit 0
+fi
 
 rs=()
 py=()

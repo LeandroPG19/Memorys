@@ -71,7 +71,10 @@ pub fn slug(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut last_dash = false;
     for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+        // `'\u{5f}'` is `'_'`: lizard's Rust reader reads a plain `'_'` as the
+        // lifetime `'_` and measures nothing to the next apostrophe, which left
+        // four fns of this file unmeasured. Long version in service.rs::keys_offered.
+        if ch.is_ascii_alphanumeric() || ch == '\u{5f}' || ch == '-' {
             out.push(ch.to_ascii_lowercase());
             last_dash = false;
         } else if !last_dash {
@@ -117,7 +120,10 @@ fn for_containment(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let raw = path.to_string_lossy();
-        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        // `"\\\\?\\"` is the raw `r"\\?\"` written with escapes:
+        // lizard's Rust reader has no raw strings, so it reads the closing `\"` as an
+        // escape, runs past it, and left twelve fns of this file unmeasured.
+        if let Some(rest) = raw.strip_prefix("\\\\?\\") {
             if let Some(unc) = rest.strip_prefix("UNC\\") {
                 return PathBuf::from(format!(r"\\{unc}"));
             }

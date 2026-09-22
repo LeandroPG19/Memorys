@@ -115,7 +115,10 @@ pub fn graph_name() -> String {
         .unwrap_or_else(|_| DEFAULT_GRAPH_NAME.into());
     let cleaned: String = raw
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        // `'\u{5f}'` is `'_'`: lizard's Rust reader reads a plain `'_'` as the
+        // lifetime `'_` and measures nothing to the next apostrophe, which left
+        // two fns of this file unmeasured. Long version in service.rs::keys_offered.
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '\u{5f}')
         .collect();
     if cleaned.is_empty() {
         DEFAULT_GRAPH_NAME.into()

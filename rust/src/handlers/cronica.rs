@@ -1013,7 +1013,10 @@ fn extract_tags(content: &str) -> Vec<String> {
 
     let words: Vec<String> = content
         .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        // `'\u{5f}'` is `'_'`: lizard's Rust reader reads a plain `'_'` as the
+        // lifetime `'_` and measures nothing to the next apostrophe, which left
+        // six fns of this file unmeasured. Long version in service.rs::keys_offered.
+        .split(|c: char| !c.is_alphanumeric() && c != '\u{5f}' && c != '-')
         .filter(|w| w.len() > 2 && !STOPWORDS.contains(&&**w))
         .map(String::from)
         .collect();

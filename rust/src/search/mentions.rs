@@ -5,7 +5,10 @@ pub fn normalize_mention(s: &str) -> String {
     s.to_lowercase()
         .chars()
         .map(|c| match c {
-            '-' | '_' | '/' | '.' => ' ',
+            // `'\u{5f}'` is `'_'`: lizard's Rust reader reads a plain `'_'` as the lifetime
+            // `'_` and measures nothing to the next apostrophe, which left three
+            // of the six fns here unmeasured. Long version in service.rs::keys_offered.
+            '-' | '\u{5f}' | '/' | '.' => ' ',
             other => other,
         })
         .collect::<String>()

@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::envs::home;
+use crate::service::{self, Asked, Mode, Request, Secrecy, Unit};
 
 const REQUIRED_ENV: [&str; 3] = ["DATABASE_URL", "ONNX_MODEL_PATH", "ORT_DYLIB_PATH"];
 
@@ -408,162 +409,114 @@ Sin modo, --print: muestra el plan y no escribe nada.
 --profile lan exige --addr con la dirección concreta de la interfaz, y genera
              un token si no le pasás uno.";
 
-/// The flag parsing for `setup service`.
+/// `setup service`: the flags say what, and the four functions below do it.
 ///
-/// It lives here and not in `service.rs` on purpose: `quality-gate.sh:164`
-/// excludes this file from `cargo mutants`, and an argument loop is glue that
-/// mutation cannot judge. Everything that decides something — the addresses it
-/// refuses, the token floor, what gets written and what is kept — is in
-/// `service.rs`, where the mutants are hunted.
+/// The deciding half — which flags are exclusive, what each refusal says, what
+/// gets written and what is kept — is in `service.rs`, because
+/// `quality-gate.sh:164` keeps this file out of `cargo mutants` and a decision
+/// here has no judge. What is left here is the printing and the filesystem.
 fn run_service(args: &[String]) -> Result<()> {
-    use crate::service::{self, Profile, Secrecy, Target, Unit, Wrote};
+    let request = match service::parse_request(args)? {
+        Asked::Help => {
+            eprintln!("{SERVICE_HELP}");
+            return Ok(());
+        }
+        Asked::Run(request) => request,
+    };
 
-    let mut mode: Option<&str> = None;
-    let mut target: Option<Target> = None;
-    let mut profile = Profile::Loopback;
-    let mut addr: Option<String> = None;
-    let mut token: Option<String> = None;
-    let mut out: Option<PathBuf> = None;
+    // `--out` reaches here only with `--print`, because `parse_request` refuses
+    // the other two pairs. There is no fifth arm for a mode nothing produces.
+    match (request.mode, request.out.as_deref()) {
+        (Mode::Print, Some(dir)) => write_canonical_render(&request, dir),
+        (Mode::Print, None) => print_plan(&request),
+        (Mode::Apply, _) => install(&request),
+        (Mode::Uninstall, _) => uninstall(&request),
+    }
+}
 
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        match arg.as_str() {
-            "--print" | "--apply" | "--uninstall" => {
-                let asked = arg.trim_start_matches("--");
-                if let Some(already) = mode
-                    && already != asked
-                {
-                    bail!("--{already} y --{asked} son excluyentes: elegí uno");
-                }
-                mode = Some(asked);
+/// This machine and these flags, which is what `--print` and `--apply` install.
+fn unit_from(request: &Request) -> Result<Unit> {
+    Unit::from_env(
+        request.profile,
+        request.target,
+        request.addr.as_deref(),
+        request.token.as_deref(),
+    )
+}
+
+/// `--print --out DIR`: the canonical render, never this machine's. A
+/// measurement or a `current_exe()` inside a versioned file is the very defect
+/// this command exists to close.
+fn write_canonical_render(request: &Request, dir: &Path) -> Result<()> {
+    let unit = Unit::documented(request.profile, request.target);
+    let launcher = unit.exe.with_extension("cmd");
+    for (relative, body) in service::rendered_files(&unit, request.target.is_windows(), &launcher) {
+        let path = dir.join(&relative);
+        service::write_one(&path, &body, Secrecy::Plain)?;
+        println!("{}", path.display());
+    }
+    Ok(())
+}
+
+fn print_plan(request: &Request) -> Result<()> {
+    let unit = unit_from(request)?;
+    let root = install_root_of(&unit);
+    let launcher = root.join(service::LAUNCHER_BASENAME);
+    print!("{}", service::render_plan(&unit, request.target, &launcher));
+    Ok(())
+}
+
+/// `--apply`. Named for what the help text calls it («--apply instala»), and
+/// not `apply`: `run_write` and `run_hook` both take an `apply: bool`, and a
+/// function with that name would be shadowed by the parameter inside them.
+fn install(request: &Request) -> Result<()> {
+    let unit = unit_from(request)?;
+    let root = install_root_of(&unit);
+    for (path, wrote) in service::write_all(&unit, request.target, &root)? {
+        println!("{}", service::wrote_line(&path, wrote));
+    }
+    println!();
+    println!(
+        "Habilitalo con:\n  {}",
+        service::enable_command(request.target, &root)
+    );
+    Ok(())
+}
+
+fn uninstall(request: &Request) -> Result<()> {
+    let home = crate::envs::home()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let local_app_data = std::env::var("LOCALAPPDATA").ok();
+    let root = service::install_root(request.target, home.as_deref(), local_app_data.as_deref())?;
+
+    let unit = Unit::documented(request.profile, request.target);
+    for path in service::removable_files(&unit, request.target, &root) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("borrado    {}", path.display()),
+            // A file that was never there is not a failure: `--uninstall` after
+            // a plan is the operator checking, and an error would read as
+            // though the install were damaged.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("no estaba  {}", path.display());
             }
-            "--linux" => target = Some(Target::Linux),
-            "--windows" => target = Some(Target::Windows),
-            "--profile" => {
-                let raw = rest.next().context("--profile necesita loopback o lan")?;
-                profile = Profile::parse(raw)?;
+            Err(e) => {
+                return Err(e).with_context(|| format!("no se pudo borrar {}", path.display()));
             }
-            "--addr" => {
-                let raw = rest
-                    .next()
-                    .context("--addr necesita una dirección ip:puerto")?;
-                addr = Some(raw.clone());
-            }
-            "--token" => {
-                let raw = rest.next().context("--token necesita un valor")?;
-                token = Some(raw.clone());
-            }
-            "--out" => {
-                let raw = rest.next().context("--out necesita un directorio")?;
-                out = Some(PathBuf::from(raw));
-            }
-            "-h" | "--help" => {
-                eprintln!("{SERVICE_HELP}");
-                return Ok(());
-            }
-            other => bail!("opción desconocida para `setup service`: {other}"),
         }
     }
-
-    let target = target.unwrap_or_else(Target::host);
-    let mode = mode.unwrap_or("print");
-    if out.is_some() && mode != "print" {
-        bail!(
-            "--out solo va con --print: --apply y --uninstall trabajan en la raíz de \
-             instalación, no en un directorio que elijas"
-        );
-    }
-
-    match (mode, out) {
-        ("print", Some(dir)) => {
-            // The canonical render, never this machine's: a measurement or a
-            // `current_exe()` inside a versioned file is the very defect this
-            // command exists to close.
-            let unit = Unit::documented(profile, target);
-            let launcher = unit.exe.with_extension("cmd");
-            let files = service::rendered_files(&unit, target.is_windows(), &launcher);
-            for (relative, body) in files {
-                let path = dir.join(&relative);
-                service::write_one(&path, &body, Secrecy::Plain)?;
-                println!("{}", path.display());
-            }
-            Ok(())
-        }
-        ("print", None) => {
-            let unit = Unit::from_env(profile, target, addr.as_deref(), token.as_deref())?;
-            let root = install_root_of(&unit);
-            let launcher = root.join("memory-industry.cmd");
-            print!("{}", service::render_plan(&unit, target, &launcher));
-            Ok(())
-        }
-        ("apply", _) => {
-            let unit = Unit::from_env(profile, target, addr.as_deref(), token.as_deref())?;
-            let root = install_root_of(&unit);
-            for (path, wrote) in service::write_all(&unit, target, &root)? {
-                match wrote {
-                    Wrote::Created { restricted: true } => {
-                        println!("escrito     {} (0600: solo tu usuario)", path.display());
-                    }
-                    Wrote::Created { restricted: false } => {
-                        println!("escrito     {}", path.display());
-                    }
-                    Wrote::Kept => println!(
-                        "conservado  {} — lleva el token y la DATABASE_URL que tus clientes ya \
-                         usan; reescribirlo los rompe a todos de golpe",
-                        path.display()
-                    ),
-                }
-            }
-            println!();
-            println!(
-                "Habilitalo con:\n  {}",
-                service::enable_command(target, &root)
-            );
-            Ok(())
-        }
-        ("uninstall", _) => {
-            let home = crate::envs::home()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned());
-            let local_app_data = std::env::var("LOCALAPPDATA").ok();
-            let root = service::install_root(target, home.as_deref(), local_app_data.as_deref())?;
-
-            let unit = Unit::documented(profile, target);
-            let launcher = root.join("memory-industry.cmd");
-            for (relative, _) in service::rendered_files(&unit, target.is_windows(), &launcher) {
-                let name = relative.rsplit('/').next().unwrap_or(relative.as_str());
-                // The env file is deliberately out of this loop's reach: it is
-                // the one file here that cannot be regenerated.
-                if name.ends_with(".env.example") {
-                    continue;
-                }
-                let path = root.join(name);
-                match std::fs::remove_file(&path) {
-                    Ok(()) => println!("borrado    {}", path.display()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        println!("no estaba  {}", path.display());
-                    }
-                    Err(e) => {
-                        return Err(e)
-                            .with_context(|| format!("no se pudo borrar {}", path.display()));
-                    }
-                }
-            }
-            println!();
-            println!(
-                "{} sigue ahí: lleva el token y la DATABASE_URL. Borrarlo es un acto aparte.",
-                root.join("memory-industry.env").display()
-            );
-            Ok(())
-        }
-        (other, _) => bail!("modo desconocido: {other}"),
-    }
+    println!();
+    println!(
+        "{} sigue ahí: lleva el token y la DATABASE_URL. Borrarlo es un acto aparte.",
+        root.join(service::ENV_BASENAME).display()
+    );
+    Ok(())
 }
 
 /// Where this unit was resolved to install. `from_env` already put the env file
 /// under the install root, so asking it back beats resolving the root twice and
 /// risking two answers.
-fn install_root_of(unit: &crate::service::Unit) -> PathBuf {
+fn install_root_of(unit: &Unit) -> PathBuf {
     unit.env_file
         .parent()
         .unwrap_or(Path::new("."))

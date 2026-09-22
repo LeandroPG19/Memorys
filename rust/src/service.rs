@@ -46,13 +46,17 @@ const DOCUMENTED_WHY: &str =
 /// The basename every render writes the operator's variables to. The example
 /// beside it ends in `.env.example`; this one ends in `.env` and `.gitignore`
 /// covers it, because it carries the bearer token for the whole graph.
-const ENV_BASENAME: &str = "memory-industry.env";
+///
+/// Public because `--uninstall` names this file in the line that tells the
+/// operator it was left behind. A second literal there could name a file that
+/// is not the one kept.
+pub const ENV_BASENAME: &str = "memory-industry.env";
 
 /// The launcher basename, used by `write_all` and by `--out` alike. One
 /// expression, never two: if the XML's `<Command>` and the file `--apply` puts
 /// on disk could disagree, the installer itself could ship a task pointing at a
 /// `.cmd` that is not there — and on Windows nothing reports that.
-const LAUNCHER_BASENAME: &str = "memory-industry.cmd";
+pub const LAUNCHER_BASENAME: &str = "memory-industry.cmd";
 
 fn joined(lines: Vec<String>) -> String {
     let mut out = lines.join("\n");
@@ -105,6 +109,167 @@ impl Target {
     pub fn is_windows(self) -> bool {
         matches!(self, Target::Windows)
     }
+}
+
+/// Which of the three things `setup service` was asked to do.
+///
+/// A type and not the flag's own text: with a `&str` the dispatch in
+/// `setup_agent.rs` needed a fourth arm for a mode nothing could produce, and a
+/// branch no input reaches is a branch no test can cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Print,
+    Apply,
+    Uninstall,
+}
+
+impl Mode {
+    /// The flag that asks for it, without the dashes. The exclusivity refusal
+    /// prints it, so the message names the flags the operator actually typed.
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Print => "print",
+            Mode::Apply => "apply",
+            Mode::Uninstall => "uninstall",
+        }
+    }
+
+    fn from_flag(flag: &str) -> Option<Self> {
+        match flag {
+            "--print" => Some(Mode::Print),
+            "--apply" => Some(Mode::Apply),
+            "--uninstall" => Some(Mode::Uninstall),
+            _ => None,
+        }
+    }
+}
+
+/// What the flags add up to, with nothing left to decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    pub mode: Mode,
+    pub target: Target,
+    pub profile: Profile,
+    pub addr: Option<String>,
+    pub token: Option<String>,
+    pub out: Option<PathBuf>,
+}
+
+/// `--help` answers before anything else is decided, so it is not a fourth
+/// mode: somebody who writes `--print --help` is asking what the flags are, and
+/// refusing that pair as «two modes at once» answers a question they did not
+/// ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Asked {
+    Help,
+    Run(Request),
+}
+
+/// The flags as they arrive. Every field is optional because the defaults are
+/// `into_request`'s job: whether `--windows` was typed is not the same question
+/// as which target this render is for.
+#[derive(Debug, Default)]
+struct Flags {
+    mode: Option<Mode>,
+    target: Option<Target>,
+    profile: Option<Profile>,
+    addr: Option<String>,
+    token: Option<String>,
+    out: Option<PathBuf>,
+}
+
+impl Flags {
+    /// One argument, plus the iterator the flags that take a word read it from.
+    fn take<'a>(&mut self, flag: &str, rest: &mut impl Iterator<Item = &'a String>) -> Result<()> {
+        if let Some(asked) = Mode::from_flag(flag) {
+            return self.set_mode(asked);
+        }
+        match flag {
+            "--linux" => self.target = Some(Target::Linux),
+            "--windows" => self.target = Some(Target::Windows),
+            "--profile" | "--addr" | "--token" | "--out" => self.set_value(flag, rest.next())?,
+            other => bail!("opción desconocida para `setup service`: {other}"),
+        }
+        Ok(())
+    }
+
+    /// The three modes are exclusive, and the refusal names both of them: an
+    /// operator who wrote `--print --apply` meant one, and cannot tell from an
+    /// install which one won. The same flag twice is not a conflict.
+    fn set_mode(&mut self, asked: Mode) -> Result<()> {
+        if let Some(already) = self.mode
+            && already != asked
+        {
+            bail!(
+                "--{} y --{} son excluyentes: elegí uno",
+                already.label(),
+                asked.label()
+            );
+        }
+        self.mode = Some(asked);
+        Ok(())
+    }
+
+    /// The word after a flag that takes one.
+    ///
+    /// One table, so each flag's refusal says what it needed. `--addr necesita
+    /// un valor` sends the operator to `--help` for the one thing the message
+    /// could have told them. `--profile` is parsed here rather than at the end
+    /// on purpose: an unknown profile is refused where it was typed, and not
+    /// behind whatever the next flag turns out to be wrong about.
+    fn set_value(&mut self, flag: &str, raw: Option<&String>) -> Result<()> {
+        match flag {
+            "--profile" => {
+                let raw = raw.context("--profile necesita loopback o lan")?;
+                self.profile = Some(Profile::parse(raw)?);
+            }
+            "--addr" => {
+                self.addr = Some(
+                    raw.context("--addr necesita una dirección ip:puerto")?
+                        .clone(),
+                );
+            }
+            "--token" => self.token = Some(raw.context("--token necesita un valor")?.clone()),
+            _ => self.out = Some(PathBuf::from(raw.context("--out necesita un directorio")?)),
+        }
+        Ok(())
+    }
+
+    /// The defaults, and the one combination that is refused.
+    fn into_request(self) -> Result<Request> {
+        let mode = self.mode.unwrap_or(Mode::Print);
+        if self.out.is_some() && mode != Mode::Print {
+            bail!(
+                "--out solo va con --print: --apply y --uninstall trabajan en la raíz de \
+                 instalación, no en un directorio que elijas"
+            );
+        }
+        Ok(Request {
+            mode,
+            target: self.target.unwrap_or_else(Target::host),
+            profile: self.profile.unwrap_or(Profile::Loopback),
+            addr: self.addr,
+            token: self.token,
+            out: self.out,
+        })
+    }
+}
+
+/// `setup service`'s flags, turned into the one thing it was asked for.
+///
+/// Here and not beside the `println!`s in `setup_agent.rs`, because
+/// `quality-gate.sh:164` keeps that file out of `cargo mutants`: a decision
+/// that lives there has no judge. What stays there is the printing.
+pub fn parse_request(args: &[String]) -> Result<Asked> {
+    let mut flags = Flags::default();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if matches!(arg.as_str(), "-h" | "--help") {
+            return Ok(Asked::Help);
+        }
+        flags.take(arg, &mut rest)?;
+    }
+    Ok(Asked::Run(flags.into_request()?))
 }
 
 #[derive(Debug, Clone)]
@@ -678,7 +843,7 @@ pub fn render_plan(u: &Unit, target: Target, launcher_path: &Path) -> String {
     lines.push("Escribiría:".to_string());
     for (relative, _) in rendered_files(u, target.is_windows(), launcher_path) {
         let name = basename(&relative);
-        let destination = if name.ends_with(".env.example") {
+        let destination = if is_env_example(name) {
             u.env_file.clone()
         } else {
             root.join(name)
@@ -710,6 +875,17 @@ pub fn enable_command(target: Target, root: &Path) -> String {
 
 fn basename(relative: &str) -> &str {
     relative.rsplit('/').next().unwrap_or(relative)
+}
+
+/// Whether this rendered file is the operator's variables.
+///
+/// ONE expression for a rule three places read: the plan says where it would
+/// land, `write_all` gives it the name and the secrecy an install needs, and
+/// `removable_files` keeps `--uninstall` away from it. Three copies of
+/// `.env.example` is three chances for the installer to write the token to one
+/// path and delete another.
+fn is_env_example(name: &str) -> bool {
+    name.ends_with(".env.example")
 }
 
 /// ONE answer to "what does this profile produce". `--print`, `--out`,
@@ -758,6 +934,26 @@ pub enum Secrecy {
 pub enum Wrote {
     Created { restricted: bool },
     Kept,
+}
+
+/// What `--apply` reports for one file it touched.
+///
+/// A line rather than a `println!`, and in this file rather than beside the
+/// one: `conservado` is the only signal the operator gets that the token their
+/// clients are already configured with survived a second `--apply`, and
+/// `setup_agent.rs` is outside the mutation judge (`quality-gate.sh:164`).
+pub fn wrote_line(path: &Path, wrote: Wrote) -> String {
+    match wrote {
+        Wrote::Created { restricted: true } => {
+            format!("escrito     {} (0600: solo tu usuario)", path.display())
+        }
+        Wrote::Created { restricted: false } => format!("escrito     {}", path.display()),
+        Wrote::Kept => format!(
+            "conservado  {} — lleva el token y la DATABASE_URL que tus clientes ya usan; \
+             reescribirlo los rompe a todos de golpe",
+            path.display()
+        ),
+    }
 }
 
 /// The bytes that go on disk, which are not always the UTF-8 of the render.
@@ -834,7 +1030,7 @@ pub fn write_all(u: &Unit, target: Target, root: &Path) -> Result<Vec<(PathBuf, 
         // The example is what the repository publishes; what an install gets is
         // the real env file, and it is the one that must survive a second
         // --apply.
-        let (path, secrecy) = if name.ends_with(".env.example") {
+        let (path, secrecy) = if is_env_example(name) {
             (root.join(ENV_BASENAME), Secrecy::Secret)
         } else {
             (root.join(name), Secrecy::Plain)
@@ -843,6 +1039,25 @@ pub fn write_all(u: &Unit, target: Target, root: &Path) -> Result<Vec<(PathBuf, 
         written.push((path, wrote));
     }
     Ok(written)
+}
+
+/// The files `--uninstall` may take away, under the install root.
+///
+/// The env file is not among them, and the filter is what keeps it that way: it
+/// is the one artifact here that cannot be regenerated, because it carries the
+/// token and the DATABASE_URL every client is already configured with.
+///
+/// Derived from `rendered_files`, never listed: a hand-kept list is how a
+/// fourth artifact gets written by `--apply` and left behind by `--uninstall`,
+/// with nothing saying so.
+pub fn removable_files(u: &Unit, target: Target, root: &Path) -> Vec<PathBuf> {
+    let launcher = root.join(LAUNCHER_BASENAME);
+    rendered_files(u, target.is_windows(), &launcher)
+        .into_iter()
+        .map(|(relative, _)| basename(&relative).to_string())
+        .filter(|name| !is_env_example(name))
+        .map(|name| root.join(name))
+        .collect()
 }
 
 /// The mutation surface of `setup service`.
@@ -990,10 +1205,19 @@ mod tests {
             .map(|l| l.trim_start().trim_start_matches('#').trim())
             .filter_map(|l| l.split('=').next())
             .filter(|w| {
+                // `'\u{5f}'` is the underscore, spelled as the escape on purpose.
+                // lizard's Rust reader adds `'\w+\b` for lifetimes, so it takes a
+                // plain `'_'` for the lifetime `'_` followed by a lone quote that
+                // opens a literal nothing closes, and everything from there to the
+                // next apostrophe in the file stops existing for the CRAP half of
+                // scripts/quality-gate.sh. Measured 2026-09-21: this function was
+                // reported at 225 NLOC and 1370 length, and the seven tests between
+                // it and the `daemon's` in the comment below were not measured at
+                // all. `b'_'` blinds it the same way; `'\u{5f}'` does not.
                 !w.is_empty()
                     && w.starts_with(|c: char| c.is_ascii_uppercase())
                     && w.chars()
-                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '\u{5f}')
             })
             .map(str::to_string)
             .collect()
@@ -2054,5 +2278,304 @@ mod tests {
             !xml.contains("HighestAvailable"),
             "nothing here needs elevation:\n{xml}"
         );
+    }
+
+    // --- The flags: what `setup service` was asked for --------------------------
+
+    /// `parse_request` over a literal command line. The real caller hands it the
+    /// slice `main` collected, so the owned `Vec` is not an accident of the test.
+    fn parse(args: &[&str]) -> Result<Asked> {
+        let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        parse_request(&owned)
+    }
+
+    fn request(args: &[&str]) -> Request {
+        let line = args.join(" ");
+        match parse(args)
+            .unwrap_or_else(|e| panic!("`setup service {line}` is a supported command line: {e}"))
+        {
+            Asked::Run(request) => request,
+            Asked::Help => panic!("`setup service {line}` is not a request for the usage"),
+        }
+    }
+
+    fn refusal(args: &[&str]) -> String {
+        let line = args.join(" ");
+        match parse(args) {
+            Err(e) => e.to_string(),
+            Ok(taken) => {
+                panic!("`setup service {line}` had to be refused, and came back as {taken:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_after_the_command_is_a_plan_for_this_machine_on_loopback() {
+        assert_eq!(
+            request(&[]),
+            Request {
+                mode: Mode::Print,
+                target: Target::host(),
+                profile: Profile::Loopback,
+                addr: None,
+                token: None,
+                out: None,
+            },
+            "`setup service` with nothing after it is the plan. A default of --apply installs a \
+             daemon for somebody who was asking what it would do, and a default of --uninstall \
+             takes one away"
+        );
+    }
+
+    #[test]
+    fn every_mode_flag_asks_for_the_mode_it_names() {
+        for (flag, expected) in [
+            ("--print", Mode::Print),
+            ("--apply", Mode::Apply),
+            ("--uninstall", Mode::Uninstall),
+        ] {
+            assert_eq!(
+                request(&[flag]).mode,
+                expected,
+                "`{flag}` came back as another mode. The three do opposite things to a machine \
+                 that is already installed, and nothing between the flag and the filesystem \
+                 would say so"
+            );
+        }
+    }
+
+    #[test]
+    fn two_modes_at_once_are_refused_naming_both_and_the_same_one_twice_is_not() {
+        let said = refusal(&["--print", "--apply"]);
+        for expected in ["--print", "--apply"] {
+            assert!(
+                said.contains(expected),
+                "the refusal has to name both flags: whoever typed them meant one of the two and \
+                 cannot tell from the outcome which one won: {said}"
+            );
+        }
+        assert!(
+            refusal(&["--apply", "--uninstall"]).contains("excluyentes"),
+            "install and remove is the pair that matters most, and it is the same rule"
+        );
+
+        assert_eq!(
+            request(&["--apply", "--apply"]).mode,
+            Mode::Apply,
+            "the same flag twice is not a conflict: a wrapper that appends --apply to a line \
+             that already had it asked for one thing, and refusing it stops an install where \
+             nothing is wrong"
+        );
+    }
+
+    #[test]
+    fn help_answers_before_anything_else_is_decided() {
+        for flag in ["-h", "--help"] {
+            assert_eq!(
+                parse(&[flag]).expect("asking for the usage is not an error"),
+                Asked::Help,
+                "`{flag}` has to come back as the usage and nothing else: as a mode it would go \
+                 through the exclusivity check, and `--print --help` would be refused as two \
+                 modes"
+            );
+        }
+
+        assert_eq!(
+            parse(&["-h", "--nonsense"]).expect("-h answers first"),
+            Asked::Help,
+            "somebody asking what the flags are has, by definition, not got them right yet: \
+             refusing the rest of their line answers nothing"
+        );
+        assert!(
+            refusal(&["--nonsense", "-h"]).contains("--nonsense"),
+            "and what comes before it is still read, or a trailing -h makes every typo silent"
+        );
+    }
+
+    #[test]
+    fn a_flag_with_nothing_after_it_says_what_it_needed() {
+        for (flag, expected) in [
+            ("--profile", "loopback"),
+            ("--addr", "ip:puerto"),
+            ("--token", "valor"),
+            ("--out", "directorio"),
+        ] {
+            let said = refusal(&[flag]);
+            assert!(
+                said.contains(flag) && said.contains(expected),
+                "`{flag}` with nothing after it has to say what it needed. One message for all \
+                 four sends the operator to --help for the only thing it could have told them: \
+                 {said}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_word_after_each_flag_lands_in_the_field_the_render_reads() {
+        let token = "b".repeat(64);
+        assert_eq!(
+            request(&[
+                "--windows",
+                "--profile",
+                "lan",
+                "--addr",
+                ROUTABLE,
+                "--token",
+                token.as_str(),
+                "--out",
+                "packaging",
+            ]),
+            Request {
+                mode: Mode::Print,
+                target: Target::Windows,
+                profile: Profile::Lan,
+                addr: Some(ROUTABLE.to_string()),
+                token: Some(token.clone()),
+                out: Some(PathBuf::from("packaging")),
+            },
+            "a word that lands in the wrong field is an install nobody asked for: the address \
+             taken as the token is a daemon behind 17 characters the daemon itself refuses, and \
+             the token taken as the address fails naming the flag that was right"
+        );
+
+        assert_eq!(
+            request(&["--linux"]).target,
+            Target::Linux,
+            "`--linux` on a Windows host is how packaging/ gets its systemd unit; taken as the \
+             host it would render the Task Scheduler XML instead"
+        );
+    }
+
+    #[test]
+    fn an_unknown_flag_is_quoted_back_instead_of_ignored() {
+        assert!(
+            refusal(&["--profil", "lan"]).contains("--profil"),
+            "a flag this command does not have has to be named. Ignored, `--profil lan` installs \
+             the loopback default and reports success, and the operator finds out when the other \
+             machines cannot reach it"
+        );
+    }
+
+    #[test]
+    fn a_profile_is_refused_where_it_was_typed() {
+        let said = refusal(&["--profile", "lanparty", "--nonsense"]);
+        assert!(
+            said.contains("lanparty"),
+            "the first thing wrong on the line is the one to answer. Parsing the profile only \
+             after the whole line is read blames a flag that came later, and the operator goes \
+             and fixes the wrong one: {said}"
+        );
+    }
+
+    #[test]
+    fn an_out_directory_only_goes_with_the_plan() {
+        for args in [
+            ["--apply", "--out", "packaging"],
+            ["--uninstall", "--out", "packaging"],
+            // Whichever order they were typed in: it is the pair that is
+            // refused, not the sequence.
+            ["--out", "packaging", "--apply"],
+        ] {
+            let said = refusal(&args);
+            assert!(
+                said.contains("--out") && said.contains("--print"),
+                "--apply and --uninstall work in the install root. A --out they accepted and \
+                 ignored leaves the operator reading a directory nothing was installed into: \
+                 {said}"
+            );
+        }
+
+        assert_eq!(
+            request(&["--print", "--out", "packaging"]).out,
+            Some(PathBuf::from("packaging")),
+            "with --print it is the supported pair: it is how the files under packaging/ are \
+             regenerated"
+        );
+    }
+
+    // --- What --apply and --uninstall report and touch ---------------------------
+
+    #[test]
+    fn what_apply_reports_tells_a_kept_secret_from_a_written_file() {
+        let path = PathBuf::from("/srv/mi/memory-industry.env");
+
+        let restricted = wrote_line(&path, Wrote::Created { restricted: true });
+        assert!(
+            restricted.contains("escrito") && restricted.contains("0600"),
+            "the installer took this file away from every other account on the box; not saying \
+             so makes the operator go and check by hand: {restricted}"
+        );
+
+        let plain = wrote_line(&path, Wrote::Created { restricted: false });
+        assert!(
+            plain.contains("escrito") && !plain.contains("0600"),
+            "and claiming 0600 where nothing was restricted is worse than saying nothing at all: \
+             {plain}"
+        );
+
+        let kept = wrote_line(&path, Wrote::Kept);
+        assert!(
+            kept.contains("conservado") && kept.contains("token") && kept.contains("DATABASE_URL"),
+            "«conservado» is the only signal that the token every client is already configured \
+             with survived a second --apply. Reported as «escrito», the operator goes looking \
+             for a rotation that never happened: {kept}"
+        );
+
+        for line in [restricted, plain, kept] {
+            assert!(
+                line.contains("memory-industry.env"),
+                "every line has to name the file it is about, or a run over four files is four \
+                 verdicts with nothing attached to them: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_takes_away_what_apply_wrote_except_the_file_that_carries_the_token() {
+        let scratch = Scratch::new("removable");
+
+        for target in [Target::Linux, Target::Windows] {
+            let unit = lan_unit(target, &"c".repeat(64));
+            let root = scratch.join(if matches!(target, Target::Windows) {
+                "win"
+            } else {
+                "linux"
+            });
+
+            let written: Vec<PathBuf> = write_all(&unit, target, &root)
+                .expect("write_all writes into a scratch root")
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect();
+            let removable = removable_files(&unit, target, &root);
+
+            assert!(
+                !removable.is_empty(),
+                "an --uninstall that removes nothing leaves the unit and the task pointing at a \
+                 binary the operator was told had been taken away"
+            );
+
+            let env_file = root.join(ENV_BASENAME);
+            let left: Vec<&PathBuf> = written
+                .iter()
+                .filter(|path| !removable.contains(path))
+                .collect();
+            assert_eq!(
+                left,
+                vec![&env_file],
+                "--apply writes N files and --uninstall has to take away N-1. The one left is the \
+                 env file, and it is the only artifact here that cannot be regenerated: it \
+                 carries the token and the DATABASE_URL every client already uses"
+            );
+
+            for path in &removable {
+                assert!(
+                    written.contains(path),
+                    "{} is removed by --uninstall and written by nothing, so what --uninstall \
+                     deletes is a file some other install put there",
+                    path.display()
+                );
+            }
+        }
     }
 }
