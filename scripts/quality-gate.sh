@@ -468,9 +468,12 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #
           # The entries of MUTANTS_EXCLUDE_RE (top of this file) are not reachable by
           # `cargo mutants -- --lib`, each for its own reason, and every one of
-          # them has its decision tested somewhere the mutation CAN reach:
+          # them has its decision tested somewhere the mutation CAN reach.
+          # This first group of five came in with b4db21c, after 11cdc57 set the
+          # version to 0.26.0, so it is 0.27 work, like the third group below.
+          # Owner: endurecedor 0.27 (b4db21c). Expires: 2027-03-22.
           #
-          #   serve_pool        binds a socket and serves forever. --lib never
+          #   serve_pool       binds a socket and serves forever. --lib never
           #                     starts a daemon. Same class as the handlers.
           #   gpu_availability  two cfg variants, and this build now calls it from
           #                     both configure and status. Neither observes the
@@ -506,7 +509,10 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #
           # A second group, all of the same two shapes. Nothing here is
           # unexamined: the half of each that decides something was pulled out
-          # and given a table where the mutation can reach it.
+          # and given a table where the mutation can reach it. All of it came in
+          # with a6dffbb except `panel`, which caeadc7 added beside mcp_endpoint;
+          # 7475681 gave `panel` and `judge_is_sampling` their trailing space.
+          # Owner: endurecedor 0.27 (a6dffbb, caeadc7). Expires: 2027-03-22.
           #
           #   Needs a live ONNX session or a model on disk, which --lib has
           #   neither of: warm_up, score_off_runtime, score_one_chunk,
@@ -721,11 +727,37 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #   protocol.rs run_rem_consolidation_locked
           #                     judged by v031_rem_wiring::community_detection_assigns_every_entity_a_community_after_one_rem_cycle
           #                     and v037_a_cycle_that_dies_is_recorded_by_the_wrapper.
-          #   dashboard.rs render, export.rs export_obsidian,
-          #   search/calibrate.rs load_ood_threshold, db.rs assert_embedding_dim
-          #                     judged NOWHERE. No test reads a brain_calibration
-          #                     row, renders the dashboard, writes a vault or
-          #                     starts on a vector column of the wrong width.
+          #   The next four were judged nowhere until 54dd63b. Their tests carry
+          #   no #[ignore] and each creates and drops its own database, so they
+          #   run in the plain `DATABASE_URL="$GATE_DATABASE_URL" cargo test` of
+          #   the SIL (scripts/run-all-tests.sh), with the model paths exported.
+          #   This judge runs `cargo mutants -- --lib`, which never builds a
+          #   file under rust/tests/: the kill happens in the SIL, out of the
+          #   mutation's sight, and that is why the exclusions stay.
+          #   dashboard.rs render
+          #                     judged by v043_the_dashboard_reads_the_base_it_is_pointed_at,
+          #                     its one test. run_cli writes whatever render
+          #                     returns, and neither "" nor "xyzzy" carries the
+          #                     observation and the entity it seeded just before.
+          #   export.rs export_obsidian
+          #                     judged by v043_calibration_and_export_read_what_was_written::the_obsidian_export_reports_the_notes_it_actually_wrote.
+          #                     The mutant writes no note. Ok(1) then disagrees
+          #                     with the empty directory; Ok(0) agrees with it,
+          #                     and dies on the first of the two seeded entities,
+          #                     whose note is not there to read.
+          #   search/calibrate.rs load_ood_threshold
+          #                     judged by the_calibrated_threshold_comes_back_only_for_the_dimension_it_was_measured_on,
+          #                     same file. It wants None before anything is stored,
+          #                     which kills Some(0.0), Some(1.0) and Some(-1.0), and
+          #                     exactly Some(0.4375) after, which kills None too.
+          #   db.rs assert_embedding_dim
+          #                     judged by v043_a_model_of_another_width_does_not_start,
+          #                     which wants an Err for a vector column twice the
+          #                     model's width, and gets Ok(()) from the mutant.
+          #                     Only with the ONNX embedder loaded: without one
+          #                     the original returns Ok(()) before reading any
+          #                     column, which is why that test asserts the model
+          #                     is loaded before anything else.
           #
           #   Network or a live process:
           #   models_cli.rs download_model, download_runtime

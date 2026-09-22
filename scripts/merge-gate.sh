@@ -4,6 +4,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# One gate at a time, for the whole of this one: run-all-tests.sh is only its
+# first half, and everything after it (clippy and tests under --features docs,
+# deny, audit, codigo-muerto, crap-gate, mutants-gate) builds in the same target
+# directory under the same cargo lock. Taken before anything else happens, so
+# a second gate is refused before it has checked, backed up or built anything.
+# run-all-tests.sh, launched below, is this gate's own child and inherits the
+# lock through CUBA_GATE_LOCK_OWNER instead of refusing it.
+#   ./scripts/run-all-tests.sh --self-test   (its fixtures drive this script too)
+# shellcheck source=scripts/gate-lock.sh
+source "$ROOT/scripts/gate-lock.sh"
+acquire_gate_lock "$GATE_LOCK" || exit 1
+trap release_gate_lock EXIT
+export CUBA_GATE_LOCK_OWNER="$GATE_OWNER"
+
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  CUBA-MEMORYS MERGE GATE (local CI — sole merge judge)   ║"
 echo "╚══════════════════════════════════════════════════════════╝"

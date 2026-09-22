@@ -69,6 +69,41 @@ check_ci_exclusions_are_covered_locally() {
   echo "$uncovered"
 }
 
+# The second exclusion list of ci.yml, NEEDS_A_SERVER, holds globs on the file
+# stem, quoted in the workflow: 'v043_*'.
+server_only_patterns() {
+  sed -n 's/.*NEEDS_A_SERVER=(\(.*\)).*/\1/p' "$1" | head -1 | tr -d "'\"" |
+    tr ' ' '\n' | grep -v '^$' || true
+}
+
+# Those files carry no #[ignore], so no section of run-all-tests.sh names them:
+# they run in its plain `cargo test` against the throwaway database, and that
+# line is the whole of the promise. A glob that matches no file excludes
+# nothing and reads like a cover, and the date on the exclusion is read like
+# every other exclusion date in this repo: past it, red.
+check_server_only_tests_run_locally() {
+  local ci="$1" gate="$2" tests="$3" today="$4" uncovered=0 pattern expired
+  local plain='^DATABASE_URL="\$GATE_DATABASE_URL" cargo test$'
+  while read -r pattern; do
+    [[ -z "$pattern" ]] && continue
+    if [[ -z "$(compgen -G "$tests/$pattern.rs" || true)" ]]; then
+      echo "FAIL: ci.yml keeps $pattern out of the check job and no file in $tests matches it" >&2
+      uncovered=$((uncovered + 1))
+    fi
+    if ! grep -q "$plain" "$gate"; then
+      echo "FAIL: ci.yml keeps $pattern out of the check job because run-all-tests.sh runs it in" >&2
+      echo "      its plain cargo test against GATE_DATABASE_URL, and that line is gone" >&2
+      uncovered=$((uncovered + 1))
+    fi
+  done < <(server_only_patterns "$ci")
+  while read -r expired; do
+    [[ -z "$expired" ]] && continue
+    echo "FAIL: an exclusion in ci.yml expired on $expired. Renew it with a reason that is still true, or drop it" >&2
+    uncovered=$((uncovered + 1))
+  done < <(sed -nE 's/^[[:space:]]*#.*Expires: ([0-9]{4}-[0-9]{2}-[0-9]{2}).*/\1/p' "$ci" | awk -v t="$today" '$1 < t')
+  echo "$uncovered"
+}
+
 # Anchored to the start of the line, so an attribute counts and a mention of
 # one does not. The first version of this counted any occurrence of the text
 # and went red on a doc comment that merely explained the attribute.
@@ -96,6 +131,21 @@ if [[ "${1:-}" == "--self-test" ]]; then
   got="$(check_ci_exclusions_are_covered_locally "$tmp/ci.yml" "$tmp/gate2.sh" 2>/dev/null | tail -1)"
   [[ "$got" == "1" ]] || { echo "FAIL self-test: a CI exclusion covered nowhere was not caught (got $got)" >&2; exit 1; }
 
+  # NEEDS_A_SERVER: one glob that matches a file and one that matches none,
+  # then the same list against a gate whose cargo test is no longer plain, then
+  # the day after the exclusion's date.
+  mkdir -p "$tmp/tests"
+  : >"$tmp/tests/present_a.rs"
+  printf '%s\n' "NEEDS_A_SERVER=('present_*' 'gone_*')" '# Owner: x. Expires: 2026-09-22.' > "$tmp/ci3.yml"
+  printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" cargo test' > "$tmp/gate3.sh"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "1" ]] || { echo "FAIL self-test: a server-only glob that matches no file was not caught, or one that does was (got $got)" >&2; exit 1; }
+  printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" cargo test --lib' > "$tmp/gate4.sh"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate4.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "3" ]] || { echo "FAIL self-test: server-only files with no plain cargo test left to run them were not caught (got $got)" >&2; exit 1; }
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-23 2>/dev/null | tail -1)"
+  [[ "$got" == "2" ]] || { echo "FAIL self-test: a CI exclusion past its date was not caught (got $got)" >&2; exit 1; }
+
   mkdir -p "$tmp/src"
   # The comment line is the fixture that matters: the first version of this
   # counted any occurrence of the text, so a doc comment that merely explained
@@ -121,11 +171,14 @@ done
 
 orphans="$(check_deferred_are_run_by_name "$GATE" | tail -1)"
 uncovered="$(check_ci_exclusions_are_covered_locally "$CI" "$GATE" | tail -1)"
-if (( orphans > 0 || uncovered > 0 )); then
-  echo "FAIL: $orphans deferred test(s) and $uncovered CI-excluded test(s) have no path in the local gate" >&2
+server_only="$(check_server_only_tests_run_locally "$CI" "$GATE" "$RUST_DIR/tests" "$(date +%F)" | tail -1)"
+if (( orphans > 0 || uncovered > 0 || server_only > 0 )); then
+  echo "FAIL: $orphans deferred test(s), $uncovered CI-excluded test(s) and $server_only server-only" >&2
+  echo "      exclusion problem(s): a test with no path in the local gate, or a cover" >&2
   exit 1
 fi
-echo "OK  every deferred and CI-excluded test file is run by name in run-all-tests.sh"
+echo "OK  every deferred and CI-excluded test file is run by name in run-all-tests.sh, and"
+echo "    every server-only file ($(server_only_patterns "$CI" | tr '\n' ' ')) runs in its plain cargo test"
 
 echo "=== codigo-muerto: the ignore ceiling ==="
 ignores="$(count_ignores "$RUST_DIR")"

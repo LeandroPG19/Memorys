@@ -94,45 +94,13 @@ if [[ "${1:-}" == "--print-paths" ]]; then
   exit 0
 fi
 
-# --- one gate at a time ------------------------------------------------------
-# On 2026-09-22 a SIL run went red with `database "brain_gate" does not exist`
-# in tests/integration.rs, minutes after "OK throwaway database brain_gate
-# ready". An earlier run had lost the session that launched it; its bash lived
-# on as an orphan, and when it finished, its EXIT trap dropped brain_gate out
-# from under the run that had just created it again. Relaunched with no orphan
-# around, the same tree passed. The code was never the cause: the gate was, and
-# nothing in "does not exist" leads from the symptom to "another gate is alive".
-#
-# Two guards, because either can be bypassed on its own:
-#   the lock   a second run refuses at once, naming the first, before it has
-#              swept, dropped or built anything. It does not wait and does not
-#              retry: a gate queued behind another for twenty minutes is how an
-#              orphan stays invisible.
-#   ownership  every database this run creates carries this run's record as
-#              its COMMENT, and the EXIT trap drops only databases whose comment
-#              is still that record. A run that bypassed the lock (another HOME,
-#              an older copy of this script) can therefore not tear down what
-#              somebody else created, and provisioning refuses to drop a
-#              database whose creator is still running.
-#
-# The lock is a directory that appears whole, by rename, with its owner record
-# already inside it: mkdir-then-write leaves a window in which a crash makes a
-# lock with no owner that nobody can judge. flock(1) would be the usual tool,
-# and Git Bash does not ship it (measured on this machine: no flock, lockfile
-# or setlock; mkdir, mv -T and /proc are there).
-#
-# A dead run's lock is recognised, not waited out. The record holds the pid AND
-# that process's start time (/proc/<pid>/stat, field 22): a pid alone would go
-# on looking alive once the number is reused, and a timeout would either
-# expire under a gate that is still running (they take 20 minutes and more) or
-# block for its whole length after one that died. On Git Bash, /proc lists the
-# MSYS processes of every session on the machine, so an orphan left by another
-# terminal is seen. A record from another host or another MSYS installation
-# cannot be looked up from here, and is refused with the path to remove by hand
-# rather than guessed at.
-GATE_LOCK="$HOME/.cache/cuba-gate/lock"
-GATE_LOCK_HELD=""
-GATE_OWNER=""
+# One gate at a time: the lock, its owner record and the rules for a dead or
+# foreign holder are in gate-lock.sh, which merge-gate.sh sources too so that
+# it can hold the lock for its whole run. What stays here is the half that is
+# about databases: every one this run creates carries GATE_OWNER as its
+# COMMENT, and the exit drops only those still carrying it.
+# shellcheck source=scripts/gate-lock.sh
+source "$ROOT/scripts/gate-lock.sh"
 GATE_OWNED_DBS=()
 
 # The exit code is written here before anything else can overwrite $?. A 20-minute
@@ -144,124 +112,6 @@ GATE_OWNED_DBS=()
 # something the caller has to remember. A run refused by the lock never touches
 # it: the file belongs to the run that is still going.
 EXIT_FILE="${CUBA_GATE_EXIT_FILE:-$HOME/.cache/cuba-gate/run.exit}"
-
-# Field 22 of /proc/<pid>/stat, read after the last ')' because field 2 is the
-# command name in parentheses and may hold spaces. Prints nothing for a pid that
-# is gone. Measured on Git Bash: both this and /proc/<pid>/winpid change when a
-# process execs, which the gate never does.
-proc_start() {
-  local stat fields
-  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
-  read -ra fields <<<"${stat##*) }"
-  printf '%s\n' "${fields[19]:-}"
-}
-
-gate_where() {
-  local root
-  root="$(cygpath -m / 2>/dev/null || echo /)"
-  printf '%s:%s\n' "$HOSTNAME" "${root// /_}"
-}
-
-owner_record() {
-  printf 'pid=%s start=%s where=%s since=%s token=%s\n' "$1" "$(proc_start "$1")" \
-    "$(gate_where)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2"
-}
-
-record_field() {
-  local key="$1" word words
-  read -ra words <<<"$2"
-  for word in "${words[@]}"; do
-    if [[ "$word" == "$key="* ]]; then
-      printf '%s\n' "${word#*=}"
-      return 0
-    fi
-  done
-}
-
-# 0 alive, 1 gone, 2 cannot be judged from this machine.
-owner_alive() {
-  local record="$1" pid start
-  [[ "$(record_field where "$record")" == "$(gate_where)" ]] || return 2
-  pid="$(record_field pid "$record")"
-  start="$(record_field start "$record")"
-  [[ -n "$pid" && -n "$start" && "$(proc_start "$pid")" == "$start" ]] && return 0
-  return 1
-}
-
-describe_owner() {
-  local pid cmd
-  pid="$(record_field pid "$1")"
-  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-  cmd="${cmd:0:160}"
-  printf 'pid %s, running since %s%s' "$pid" "$(record_field since "$1")" "${cmd:+: $cmd}"
-}
-
-acquire_gate_lock() {
-  local lock="$1" staging stale holder verdict
-  GATE_OWNER="$(owner_record "$$" "$$-$RANDOM$RANDOM")"
-  if [[ -z "$(record_field start "$GATE_OWNER")" ]]; then
-    echo "FAIL: /proc/$$/stat gives no start time, so this run cannot name itself in a" >&2
-    echo "      lock that the next run could judge. One gate at a time is not enforceable" >&2
-    echo "      here, and running without it is how a gate drops another gate's database." >&2
-    return 1
-  fi
-  mkdir -p "$(dirname "$lock")"
-  staging="$lock.new.$$"
-  rm -rf "$staging"
-  mkdir "$staging"
-  printf '%s\n' "$GATE_OWNER" >"$staging/owner"
-  for _ in 1 2 3; do
-    if mv -T "$staging" "$lock" 2>/dev/null; then
-      GATE_LOCK_HELD="$lock"
-      return 0
-    fi
-    holder="$(cat "$lock/owner" 2>/dev/null || true)"
-    verdict=1
-    if [[ -n "$holder" ]]; then
-      verdict=0
-      owner_alive "$holder" || verdict=$?
-    fi
-    if (( verdict == 0 )); then
-      rm -rf "$staging"
-      echo "FAIL: another gate is running: $(describe_owner "$holder")" >&2
-      echo "      Two gates on one machine share brain_gate, the ports and cargo's lock, and" >&2
-      echo "      each one's exit drops the database the other is testing against. This run" >&2
-      echo "      has swept, dropped and built nothing. Wait for that one, or stop it:" >&2
-      echo "      kill $(record_field pid "$holder")    (lock: $lock)" >&2
-      return 1
-    fi
-    if (( verdict == 2 )); then
-      rm -rf "$staging"
-      echo "FAIL: the gate lock was taken on $(record_field where "$holder")," >&2
-      echo "      and this is $(gate_where). Its process cannot be looked up from here." >&2
-      echo "      If that gate is not running, remove the lock by hand: rm -r $lock" >&2
-      return 1
-    fi
-    stale="$lock.stale.$$"
-    rm -rf "$stale"
-    if mv -T "$lock" "$stale" 2>/dev/null; then
-      if [[ "$(cat "$stale/owner" 2>/dev/null || true)" != "$holder" ]]; then
-        # Another run reclaimed the same dead lock between the read and the
-        # rename, so what moved is its live lock. Give it back and look again.
-        mv -T "$stale" "$lock" 2>/dev/null || true
-        continue
-      fi
-      rm -rf "$stale"
-      echo "note: took over the lock of a gate that is no longer running (${holder:-no owner record})"
-    fi
-  done
-  rm -rf "$staging"
-  echo "FAIL: the gate lock at $lock changed hands three times while this run was" >&2
-  echo "      taking it. Another gate is starting right now; run this one after it." >&2
-  return 1
-}
-
-release_gate_lock() {
-  if [[ -n "$GATE_LOCK_HELD" && "$(cat "$GATE_LOCK_HELD/owner" 2>/dev/null || true)" == "$GATE_OWNER" ]]; then
-    rm -rf "$GATE_LOCK_HELD"
-  fi
-  return 0
-}
 
 # The admin connection and psql_url are defined further down; these three only
 # run after them. They are the whole of what the ownership rule says to the
@@ -367,7 +217,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ -z "$(compgen -G "$lock.new.*" || true)" ]] || self_fail "a refused run left its staging directory behind"
 
   GATE_LOCK_HELD="$lock"
-  release_gate_lock
+  release_gate_lock 2>/dev/null
   [[ -e "$lock" ]] || self_fail "a run released a lock that another gate holds"
   GATE_LOCK_HELD=""
 
@@ -430,11 +280,15 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "${drops[*]}" == "brain_gate_peer" ]] \
     || self_fail "an exiting run dropped '${drops[*]}', not only the database that was still its own"
 
-  # The whole script, launched as a second gate while the first is alive.
+  # The whole script, launched as a second gate while the first is alive. It is
+  # handed the live gate's record in CUBA_GATE_LOCK_OWNER as well, the way
+  # every descendant of merge-gate.sh is: the variable alone must not be a
+  # pass, because the live gate is not this run's parent.
   mkdir -p "$tmp/home/.cache/cuba-gate/lock"
   printf '%s\n' "$live_record" >"$tmp/home/.cache/cuba-gate/lock/owner"
   second_exit=0
   env -u CUBA_GATE_EXIT_FILE HOME="$tmp/home" PATH="/usr/bin:/bin" \
+      CUBA_GATE_LOCK_OWNER="$live_record" \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$ROOT/scripts/run-all-tests.sh" >"$tmp/second.out" 2>&1 || second_exit=$?
   grep -q "another gate is running: pid $live" "$tmp/second.out" \
@@ -443,13 +297,59 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ ! -e "$tmp/home/.cache/cuba-gate/run.exit" ]] \
     || self_fail "a refused second gate wrote the exit file that belongs to the first"
 
-  echo "OK  self-test: a second gate refuses at once and names the first; a dead or"
-  echo "    reused-pid lock is taken over, a foreign one is not; an exit drops only the"
-  echo "    databases whose record is still its own"
+  # merge-gate.sh as the second gate: refused before it has checked, backed
+  # up or built anything.
+  second_exit=0
+  env -u CUBA_GATE_LOCK_OWNER HOME="$tmp/home" PATH="/usr/bin:/bin" \
+      "$BASH" "$ROOT/scripts/merge-gate.sh" >"$tmp/merge-second.out" 2>&1 || second_exit=$?
+  grep -q "another gate is running: pid $live" "$tmp/merge-second.out" \
+    || self_fail "a second merge-gate did not refuse at once, naming the first (exit $second_exit): $(cat "$tmp/merge-second.out")"
+  (( second_exit == 1 )) || self_fail "a refused second merge-gate exited $second_exit, not 1"
+  if grep -q "Postgres" "$tmp/merge-second.out"; then
+    self_fail "a refused second merge-gate went on to check Postgres: $(cat "$tmp/merge-second.out")"
+  fi
+
+  # merge-gate.sh holding the lock, and the run-all-tests.sh it launches going
+  # past it instead of refusing its own parent. pg_isready, psql and cargo are
+  # stand-ins: the first two let both scripts reach their first cargo call,
+  # and the cargo one reports, from inside the child's work, whether the lock
+  # is still the one merge-gate.sh took. It then fails, which ends both.
+  mkdir -p "$tmp/home2" "$tmp/bin"
+  printf '#!/bin/sh\nexit 0\n' >"$tmp/bin/pg_isready"
+  printf '#!/bin/sh\nexit 1\n' >"$tmp/bin/psql"
+  printf '%s\n' '#!/bin/sh' \
+    'if [ -n "$CUBA_GATE_LOCK_OWNER" ] && [ "$(cat "$HOME/.cache/cuba-gate/lock/owner" 2>/dev/null)" = "$CUBA_GATE_LOCK_OWNER" ]; then' \
+    '  echo "stand-in cargo: the lock is still the one merge-gate took"' \
+    'fi' \
+    'exit 1' >"$tmp/bin/cargo"
+  chmod +x "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin/cargo"
+  held_exit=0
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home2" \
+      PATH="$tmp/bin:/usr/bin:/bin" SKIP_BACKUP=1 \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      "$BASH" "$ROOT/scripts/merge-gate.sh" >"$tmp/merge-held.out" 2>&1 || held_exit=$?
+  if grep -q "another gate is running" "$tmp/merge-held.out"; then
+    self_fail "run-all-tests.sh refused the merge-gate that launched it: $(cat "$tmp/merge-held.out")"
+  fi
+  grep -q "running under the gate that holds the lock" "$tmp/merge-held.out" \
+    || self_fail "run-all-tests.sh under merge-gate did not inherit its lock (exit $held_exit): $(cat "$tmp/merge-held.out")"
+  grep -q "stand-in cargo: the lock is still the one merge-gate took" "$tmp/merge-held.out" \
+    || self_fail "while run-all-tests.sh worked, the lock was not merge-gate's: $(cat "$tmp/merge-held.out")"
+  (( held_exit == 1 )) || self_fail "merge-gate exited $held_exit where the stand-in cargo fails it with 1"
+  [[ ! -e "$tmp/home2/.cache/cuba-gate/lock" ]] || self_fail "merge-gate exited and left its lock behind"
+  if grep -q "stopped naming this run" "$tmp/merge-held.out"; then
+    self_fail "the lock was released or taken from under merge-gate while it ran: $(cat "$tmp/merge-held.out")"
+  fi
+
+  echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
+  echo "    included, and the variable its children inherit is no pass for anyone"
+  echo "    else; the run-all-tests.sh merge-gate launches works under its lock; a"
+  echo "    dead or reused-pid lock is taken over, a foreign one is not; an exit"
+  echo "    drops only the databases whose record is still its own"
   exit 0
 fi
 
-acquire_gate_lock "$GATE_LOCK" || exit 1
+inherit_gate_lock "$GATE_LOCK" || acquire_gate_lock "$GATE_LOCK" || exit 1
 rm -f "$EXIT_FILE"
 trap on_exit EXIT
 
@@ -505,7 +405,7 @@ SWEEP_OLDER_THAN_DAYS="${CUBA_GATE_SWEEP_DAYS:-7}"
 free_gb() { df --output=avail -BG "$RUST_DIR" | tail -1 | tr -dc '0-9'; }
 
 sweep_stale_artifacts() {
-  local before afte
+  local before after
   before="$(free_gb)"
   echo "disk: ${before}G free — sweeping build artifacts older than ${SWEEP_OLDER_THAN_DAYS}d"
   rm -rf "$RUST_DIR/target/debug/incremental" 2>/dev/null || true

@@ -52,8 +52,41 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # NEEDS_A_SERVER is a second exclusion list, and not the same kind as
+      # MODEL_OR_CLI_ONLY in the e2e job below. That one only filters the
+      # `-- --ignored` discovery loop, so it reaches #[ignore] tests and nothing
+      # else. The files named here carry no #[ignore] at all — every test in
+      # them runs in a plain `cargo test` — and each creates and drops its own
+      # database on the server DATABASE_URL names; one also hard-asserts the
+      # ONNX embedder. This job has neither a server nor a model, so here they
+      # would fail on every push. The local gate runs them where both exist: the
+      # plain `cargo test` step of scripts/run-all-tests.sh, against the
+      # throwaway database, with the model paths exported.
+      # scripts/codigo-muerto.sh fails if a pattern here matches no file in
+      # rust/tests/, or if that step stops being a plain `cargo test`.
+      # Patterns are globs on the file stem, quoted so the shell leaves them be.
+      # Owner: implementador 0.28 (tajada R2). Expires: 2027-03-22.
+      - name: Select the test targets this job can run
+        run: |
+          NEEDS_A_SERVER=('v043_*')
+          : >"$RUNNER_TEMP/test-targets"
+          for file in tests/*.rs; do
+            name="$(basename "$file" .rs)"
+            for pattern in "${NEEDS_A_SERVER[@]}"; do
+              # shellcheck disable=SC2053 # the pattern is a glob on purpose
+              [[ "$name" == $pattern ]] && continue 2
+            done
+            printf '%s\n' --test "$name" >>"$RUNNER_TEMP/test-targets"
+          done
+
+      # Naming the targets drops the doctests from the run, so they get their
+      # own call. Examples are not tested by a plain `cargo test` either; the
+      # clippy --all-targets step above is what compiles them.
       - name: cargo test
-        run: cargo test
+        run: |
+          mapfile -t targets <"$RUNNER_TEMP/test-targets"
+          cargo test --lib --bins "${targets[@]}"
+          cargo test --doc
 
       # The `docs` feature ships in the release binaries, so it has to be tested like
       # the release binaries. It was not, and cuba_docs shipped to nobody for a whole
@@ -63,7 +96,10 @@ jobs:
         run: cargo clippy --all-targets --features docs -- -D warnings
 
       - name: cargo test (--features docs)
-        run: cargo test --features docs
+        run: |
+          mapfile -t targets <"$RUNNER_TEMP/test-targets"
+          cargo test --features docs --lib --bins "${targets[@]}"
+          cargo test --features docs --doc
 
       - name: cargo audit
         run: |
