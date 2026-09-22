@@ -569,29 +569,96 @@ fn the_gate_writes_its_own_exit_code_where_a_reader_can_find_it() {
     );
 }
 
+const UNIT_TESTS_ON_THE_GATE_DB: &str = "DATABASE_URL=\"$GATE_DATABASE_URL\" cargo test";
+
+/// A line that runs `provision_gate_db`, as opposed to the one that defines it
+/// (`provision_gate_db() {`) or a comment that names it.
+fn calls_provision_gate_db(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("provision_gate_db") && !line.contains("()")
+}
+
+fn runs_the_unit_tests_on_the_gate_db(line: &str) -> bool {
+    let line = line.trim_start();
+    !line.starts_with('#') && line.contains(UNIT_TESTS_ON_THE_GATE_DB)
+}
+
+/// Line-based, not a substring search. The first version split the script at
+/// `trap on_exit EXIT` and looked for `\nprovision_gate_db` after it, which
+/// only found the call while the trap sat between the definition and the call.
+/// db8490d moved the trap above the definition, the search started landing on
+/// `provision_gate_db() {`, and the contract stayed green over a script whose
+/// call it had stopped reading.
+fn provisioning_precedes_the_unit_tests(gate: &str) -> Result<(), String> {
+    let lines: Vec<&str> = gate.lines().collect();
+    let call = lines
+        .iter()
+        .position(|l| calls_provision_gate_db(l))
+        .ok_or("the gate never calls provision_gate_db")?;
+    let unit_tests = lines
+        .iter()
+        .position(|l| runs_the_unit_tests_on_the_gate_db(l))
+        .ok_or("the gate never runs `cargo test` against $GATE_DATABASE_URL")?;
+    if call < unit_tests {
+        Ok(())
+    } else {
+        Err(format!(
+            "provision_gate_db is called on line {} and the unit tests run against its database \
+             on line {}",
+            call + 1,
+            unit_tests + 1
+        ))
+    }
+}
+
 #[test]
 fn the_gate_creates_the_database_it_points_the_unit_tests_at_before_running_them() {
     let gate = read("scripts/run-all-tests.sh");
-    let body = gate
-        .split_once("trap on_exit EXIT")
-        .expect("the gate provisions a throwaway database and drops it on exit")
-        .1;
-    let provision = body
-        .find("\nprovision_gate_db")
-        .expect("the gate calls provision_gate_db");
-    let unit_tests = body
-        .find("DATABASE_URL=\"$GATE_DATABASE_URL\" cargo test")
-        .expect("the gate runs the unit tests against the throwaway database");
+    if let Err(why) = provisioning_precedes_the_unit_tests(&gate) {
+        panic!(
+            "{why}. The gate pointed `cargo test` at $GATE_DATABASE_URL and only created that \
+             database on the next line. It passed for months because no unit test in src/ ever \
+             opened a real connection — every one of them builds a pool that cannot connect on \
+             purpose. The first one that did open a connection died with `database \
+             \"brain_gate\" does not exist`, which reads like a broken test rather than a gate \
+             that runs its steps out of order. Provision first: a step that needs a database it \
+             was told to use must not be the step that proves it was missing"
+        );
+    }
+}
 
+#[test]
+fn the_provisioning_contract_rejects_the_call_moved_behind_the_unit_tests() {
+    let gate = read("scripts/run-all-tests.sh");
+    let mut lines: Vec<&str> = gate.lines().collect();
+    let call = lines
+        .iter()
+        .position(|l| calls_provision_gate_db(l))
+        .expect("the gate calls provision_gate_db, so there is a call to move");
+    let moved_call = lines.remove(call);
+    let unit_tests = lines
+        .iter()
+        .position(|l| runs_the_unit_tests_on_the_gate_db(l))
+        .expect("the gate runs the unit tests against the throwaway database");
+    lines.insert(unit_tests + 1, moved_call);
+    let sabotaged = lines.join("\n");
+
+    let definition = sabotaged
+        .find("\nprovision_gate_db() {")
+        .expect("the sabotaged script still defines provision_gate_db");
+    let unit_tests_at = sabotaged
+        .find(UNIT_TESTS_ON_THE_GATE_DB)
+        .expect("the sabotaged script still runs the unit tests");
     assert!(
-        provision < unit_tests,
-        "the gate pointed `cargo test` at $GATE_DATABASE_URL and only created that database on \
-         the next line. It passed for months because no unit test in src/ ever opened a real \
-         connection — every one of them builds a pool that cannot connect on purpose. The first \
-         one that did open a connection died with `database \"brain_gate\" does not exist`, which \
-         reads like a broken test rather than a gate that runs its steps out of order. Provision \
-         first: a step that needs a database it was told to use must not be the step that proves \
-         it was missing"
+        definition < unit_tests_at,
+        "this sabotage is only the one the old substring search missed if the definition still \
+         sits above `cargo test`, where that search found it and took it for the call"
+    );
+    assert!(
+        provisioning_precedes_the_unit_tests(&sabotaged).is_err(),
+        "the call to provision_gate_db was moved behind `cargo test` and the contract still \
+         accepted the script, so it is reading the definition, a comment or nothing at all. A \
+         contract that cannot see the one move it exists to catch is a paragraph"
     );
 }
 
