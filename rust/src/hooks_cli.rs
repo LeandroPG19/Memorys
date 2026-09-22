@@ -855,6 +855,162 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Runs the real `install()` inside a throwaway repo at `root` and hands the
+    /// environment back the way it found it.
+    ///
+    /// `install()` finds its repo with `git rev-parse --show-toplevel` and no
+    /// `current_dir`, so it answers from the process working directory — which is
+    /// this crate's checkout, and a test must not install hooks there. Moving the
+    /// working directory would move it for every test thread that resolves a
+    /// relative path; GIT_DIR and GIT_WORK_TREE move only what git reads, and git
+    /// is the only thing that reads them. They are still process-wide, so the
+    /// caller holds `GLOBAL_STATE_GUARD`, and so does every other test in this
+    /// module that spawns git.
+    ///
+    /// The global and system git configs are cut off because `hooks_dir` reads
+    /// `core.hooksPath` without `--local`: on a machine whose global config sets
+    /// one, install would write its hook blocks into the operator's own hooks
+    /// directory, outside this repo, and the assertions below would read a file
+    /// install never touched. CUBA_SYNC_DIR is cleared because it replaces the
+    /// directory under test outright.
+    fn install_into_scratch_repo(root: &Path) {
+        let empty_config = root.join("empty-gitconfig");
+        std::fs::write(&empty_config, "").unwrap();
+        let _no_system = crate::envs::ScopedEnv::set("GIT_CONFIG_NOSYSTEM", "1");
+        let _no_global =
+            crate::envs::ScopedEnv::set("GIT_CONFIG_GLOBAL", empty_config.to_str().unwrap());
+        let _default_dir = crate::envs::ScopedEnv::cleared("CUBA_SYNC_DIR");
+
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .status()
+            .unwrap();
+        assert!(init.success(), "control: the scratch repo has to exist");
+
+        let _repo = crate::envs::ScopedEnv::set("GIT_DIR", root.join(".git").to_str().unwrap());
+        let _work_tree = crate::envs::ScopedEnv::set("GIT_WORK_TREE", root.to_str().unwrap());
+        install(false).expect("install into a fresh scratch repo");
+    }
+
+    fn local_git_config(root: &Path, key: &str) -> String {
+        let out = Command::new("git")
+            .args(["config", "--local", "--get", key])
+            .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{key} is not set in {root:?}");
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .trim_end()
+            .to_string()
+    }
+
+    /// The single `.gitattributes` line `install()` left at `root`.
+    fn the_one_attribute_line(root: &Path) -> String {
+        let written = std::fs::read_to_string(root.join(".gitattributes")).unwrap_or_else(|e| {
+            panic!(
+                "install() reported success and left no .gitattributes at {root:?} ({e}): the \
+                 merge driver is configured and guards no file at all"
+            )
+        });
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "a fresh repo gets exactly one line: {written:?}"
+        );
+        lines[0].to_string()
+    }
+
+    #[tokio::test]
+    async fn install_wires_the_driver_onto_the_directory_sync_writes_in_a_real_repo() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = scratch_root("install-fresh");
+
+        install_into_scratch_repo(&root);
+
+        let line = the_one_attribute_line(&root);
+        let named = directory_named_by(&line);
+        assert!(
+            Path::new(named).is_relative(),
+            "git has no syntax for an absolute pattern: {line}"
+        );
+        assert_eq!(
+            root.join(named),
+            crate::sync::paths::default_sync_dir(&root),
+            "this is 7383106 end to end. The tests above hold gitattributes_line, the decision; \
+             nothing held install(), the wiring, so an install that computed the right line and \
+             wrote another, or asked about a different root, or wrote nothing and printed \
+             `installed`, left the suite green. On a repo where neither directory exists yet, the \
+             line install() actually leaves on disk has to name the directory sync::paths \
+             resolves for that same root, or the first merge of two machines' graphs is a text \
+             merge over JSON: {line}"
+        );
+
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(
+            local_git_config(&root, &format!("merge.{MERGE_DRIVER_NAME}.driver")),
+            format!("\"{}\" hook merge-driver %O %A %B %P", exe.display()),
+            "the attribute names a driver by name; without this entry in .git/config git has \
+             nothing to run for it and falls back to its text merge"
+        );
+        assert_eq!(
+            local_git_config(&root, &format!("merge.{MERGE_DRIVER_NAME}.name")),
+            "cuba-memorys structural merge (union by id)"
+        );
+
+        let hooks = root.join(".git").join("hooks");
+        let post_commit = std::fs::read_to_string(hooks.join("post-commit")).unwrap();
+        assert!(
+            post_commit.contains(MARKER) && post_commit.contains("sync export --scope all"),
+            "post-commit is what keeps the graph on disk current: {post_commit}"
+        );
+        assert!(
+            !post_commit.contains("codegraph build"),
+            "codegraph on commit is opt-in and was not asked for: {post_commit}"
+        );
+        let post_checkout = std::fs::read_to_string(hooks.join("post-checkout")).unwrap();
+        assert!(
+            post_checkout.contains(MARKER)
+                && post_checkout.contains("sync import --conflict merge"),
+            "post-checkout is what pulls a switched branch's graph back in: {post_checkout}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn install_in_a_repo_with_the_legacy_directory_keeps_guarding_it() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = scratch_root("install-legacy");
+        std::fs::create_dir_all(root.join(".cuba-memorys")).unwrap();
+
+        install_into_scratch_repo(&root);
+
+        let line = the_one_attribute_line(&root);
+        assert_eq!(
+            root.join(directory_named_by(&line)),
+            crate::sync::paths::default_sync_dir(&root),
+            "the fresh-repo test cannot tell which root install() asked about: every root \
+             without a legacy directory resolves to the same relative name, so an install that \
+             consulted the process working directory instead of the repo it found would pass \
+             it. Here the answer depends on what is on disk in THIS repo: {line}"
+        );
+        assert_eq!(
+            crate::sync::paths::default_sync_dir(&root).file_name(),
+            Some(std::ffi::OsStr::new(".cuba-memorys")),
+            "control: sync::paths has to see the legacy directory here, or this test is the \
+             fresh one twice"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn remove_hook_block_deletes_the_file_when_our_block_was_the_only_content() {
         let dir = std::env::temp_dir().join(format!("cuba-hook-test-{}", Uuid::new_v4()));
@@ -976,8 +1132,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn git_config_returns_err_when_the_git_process_exits_non_zero() {
+    #[tokio::test]
+    async fn git_config_returns_err_when_the_git_process_exits_non_zero() {
+        // The guard is for `install_into_scratch_repo`: while it holds GIT_DIR, a
+        // `git init` or `git config` spawned here would act on that repo instead.
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         // Do NOT rely on chmod 555 of `.git`: the merge gate often runs as root in WSL,
         // and root bypasses directory mode bits, so that setup falsely stays green.
         // Replacing `.git/config` with a directory makes `git config --local` exit

@@ -745,6 +745,95 @@ mod tests {
         );
     }
 
+    /// The shortest and the longest row of PROVIDER_PREFIXES. `prefix.len()` is
+    /// inside the length guard, so a test that only ever uses `sk-` says nothing
+    /// about the minimum a `github_pat_` token has to reach.
+    const SHORTEST_AND_LONGEST: [(&str, &str); 2] =
+        [("sk-", "provider api key"), ("github_pat_", "github token")];
+
+    #[test]
+    fn a_prefix_needs_more_than_eight_characters_after_it_to_be_a_key() {
+        for (prefix, pattern) in SHORTEST_AND_LONGEST {
+            let at_the_edge = format!("{prefix}abcd1234");
+            let one_past = format!("{prefix}abcd12345");
+            assert_eq!(
+                (at_the_edge.len(), one_past.len()),
+                (prefix.len() + 8, prefix.len() + 9),
+                "this test is only about which side of `prefix.len() + 8` each run falls on"
+            );
+
+            let edge_text = format!("clave {at_the_edge} fin");
+            assert_eq!(
+                looks_like_secret(&edge_text),
+                None,
+                "the guard is `bare.len() - at > prefix.len() + 8`, strictly greater: a run of \
+                 exactly prefix + 8 characters is the size of `sk-1` with padding, not a key. \
+                 Widened to `>=`, this run is refused and nothing else in the suite notices, \
+                 because every other token here is far past the edge: {edge_text}"
+            );
+            assert_eq!(
+                redact_secrets(&edge_text),
+                edge_text,
+                "and the redactor has to leave it whole too: {edge_text}"
+            );
+
+            let past_text = format!("clave {one_past} fin");
+            assert_eq!(
+                looks_like_secret(&past_text),
+                Some(pattern),
+                "one character further it is a key, or the edge above passes on a guard that \
+                 never matches anything: {past_text}"
+            );
+            assert_eq!(redact_secrets(&past_text), "clave *** fin");
+        }
+    }
+
+    #[test]
+    fn the_minimum_is_counted_from_where_the_prefix_starts_not_from_the_start_of_the_run() {
+        // The guard measures the tail `bare.len() - at`. With the prefix at the start
+        // of the run `at` is 0 and `-` and `+` agree, which is every other case in this
+        // file. Glued behind `usa-` (at = 4), `bare.len() + at` overstates the tail by
+        // 2·at = 8, and that is the whole margin between these runs and the minimum:
+        //
+        //   usa-sk-abcd123           len 14, tail 10:  10 > 11 no,  mutant 18 > 11 yes
+        //   usa-github_pat_abcd123   len 22, tail 18:  18 > 19 no,  mutant 26 > 19 yes
+        //
+        // Each tail sits one BELOW the edge, so `>=` does not flip them either and this
+        // test answers for the subtraction alone.
+        for (prefix, pattern) in SHORTEST_AND_LONGEST {
+            let short_tail = format!("usa-{prefix}abcd123");
+            assert_eq!(
+                (short_tail.len() - 4, short_tail.len() + 4),
+                (prefix.len() + 7, prefix.len() + 15),
+                "the counts in the comment above, for {prefix}"
+            );
+
+            let short_text = format!("el deploy {short_tail} fin");
+            assert_eq!(
+                looks_like_secret(&short_text),
+                None,
+                "seven characters after the prefix is under the minimum wherever the prefix \
+                 sits. Adding the prose in front to the tail instead of taking it away turns \
+                 every short word glued behind a hyphen into a refused write: {short_text}"
+            );
+            assert_eq!(
+                redact_secrets(&short_text),
+                short_text,
+                "and turns it into `usa-***` on the way to the LLM: {short_text}"
+            );
+
+            let long_text = format!("el deploy usa-{prefix}abcd12345 fin");
+            assert_eq!(
+                looks_like_secret(&long_text),
+                Some(pattern),
+                "control: glued behind the same prose with a tail past the edge it is found, \
+                 so the None above is the guard deciding and not the embedded search failing \
+                 to look: {long_text}"
+            );
+            assert_eq!(redact_secrets(&long_text), "el deploy usa-*** fin");
+        }
+    }
+
     #[test]
     fn an_at_sign_before_the_scheme_is_not_userinfo() {
         assert_eq!(
