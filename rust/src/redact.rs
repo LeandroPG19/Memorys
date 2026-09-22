@@ -35,10 +35,14 @@ struct Scan {
 }
 
 fn secret_field_pattern(key: &str) -> Option<&'static str> {
-    // `'\u{5f}'` is `'_'`: lizard's Rust reader reads a plain `'_'` as the
-    // lifetime `'_` and measures nothing to the next apostrophe. That is where
-    // the CC 23 in lizard-baseline.txt came from: the lost region, not this
-    // body. Long version in service.rs::keys_offered.
+    // `'\u{5f}'` is `'_'`, and the escape is load-bearing: lizard's Rust reader
+    // takes a plain `'_'` for the lifetime `'_` and measures nothing from there
+    // to the next apostrophe. With that region lost, this file once measured as
+    // one welded function and reached lizard-baseline.txt as
+    // `secret_field_pattern 23` — a number that was never about this body.
+    // Nothing there would catch it coming back: redact.rs has no line in that
+    // file any more, because 0.27 split `scan` into pure detectors and its
+    // entry went with it. Long version in service.rs::keys_offered.
     let key = key.trim_matches(|c: char| !c.is_alphanumeric() && c != '\u{5f}');
     let lower = key.to_lowercase();
     SECRET_FIELD_NAMES
@@ -706,6 +710,68 @@ mod tests {
             "the contrast that makes the rule readable: a secret field name with no separator \
              after it announces nothing, so the next word is prose and stays. The separator is \
              what arms the replacement, not the field name: {no_announcement}"
+        );
+    }
+
+    #[test]
+    fn the_prose_in_front_of_a_glued_token_is_not_part_of_the_token() {
+        assert_eq!(
+            redact_secrets("usa-ghp_abcdefghijklmnop-aqui"),
+            "usa-***",
+            "the run is cut at the prefix and everything from there on goes, but what came \
+             BEFORE it is prose and stays. provider_tokens_and_jwts_are_stripped already feeds \
+             this exact string to the redactor and asserts only that the token is gone, which \
+             a `***` that ate the `usa-` too satisfies just as well: half of this detector — \
+             the half that decides what is NOT the credential — was pinned by nothing"
+        );
+
+        let logged = "el header (\"usa-ghp_abcdefghijklmnop\") fin";
+        assert!(
+            logged.contains("ghp_abcdefghijklmnop"),
+            "control: with the token missing from the line, `it is gone afterwards` would also \
+             pass on a scan that does nothing at all: {logged}"
+        );
+        assert_eq!(
+            redact_secrets(logged),
+            "el header (\"usa-*** fin",
+            "two separate pieces survive here and neither had a test. The `(\"` is the \
+             non-alphanumeric head that `bare` trimmed off before going looking for the prefix, \
+             and the `usa-` is what sat between that head and the credential inside the same \
+             run. Blank either one and the token is still gone, so an assertion about absence \
+             stays green while the reader loses where the credential was and what the line \
+             around it said. This is also where the closing `\")` goes: the cut runs from the \
+             prefix to the end of the run, deliberately, because a credential is not over \
+             until the whitespace is: {logged}"
+        );
+    }
+
+    #[test]
+    fn an_at_sign_before_the_scheme_is_not_userinfo() {
+        assert_eq!(
+            redact_secrets("postgresql://cuba:hunter2-fake@127.0.0.1:5488/brain"),
+            "postgresql://cuba:***@127.0.0.1:5488/brain",
+            "control: the url detector has to be running at all, or what follows proves only \
+             that it never looks at either string"
+        );
+
+        let a_link_after_an_address = "leandro@example.invalid,https://docs.example.invalid/guia";
+        assert_eq!(
+            redact_secrets(a_link_after_an_address),
+            a_link_after_an_address,
+            "the `@` comes BEFORE the `://` here, so what precedes it is an address and not \
+             userinfo, and there is nothing in this run to hide. The guard that says so is the \
+             only thing between this shape and a PANIC: without it the detector takes the \
+             credentials to be `scheme_end + 3 .. at_sign`, which in this string is 32..7, and \
+             a backwards range is not a wrong answer but a dead handler — on prose whose only \
+             sin is gluing an address to a link with a comma. Nothing reached that guard, so \
+             deleting it left the whole suite green: {a_link_after_an_address}"
+        );
+        assert_eq!(
+            looks_like_secret(a_link_after_an_address),
+            None,
+            "and the write gate must not refuse it either: an address next to a link is an \
+             ordinary observation, and refusing it loses the memory the user believed they had \
+             stored"
         );
     }
 }
