@@ -381,6 +381,14 @@ pub async fn run_project(args: &[String]) -> Result<()> {
     }
 }
 
+/// `serve` and `secure` ask the same question of their first argument before
+/// they touch the database, and ask it here so the two answers cannot drift.
+/// Only an exact flag counts: `serve` binds its first argument as the listen
+/// address, and `secure` refuses anything it does not recognise.
+pub fn asks_for_help(arg: Option<&str>) -> bool {
+    matches!(arg, Some("-h" | "--help"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +435,27 @@ mod tests {
             "README:366 documents this variable. Making the home mandatory for everyone \
              would break the operator who already answered the question"
         );
+    }
+
+    #[test]
+    fn only_an_exact_help_flag_asks_for_help() {
+        for (arg, want) in [
+            (Some("-h"), true),
+            (Some("--help"), true),
+            (None, false),
+            (Some("127.0.0.1:8787"), false),
+            (Some("--helpme"), false),
+            (Some("-help"), false),
+            (Some("help"), false),
+        ] {
+            assert_eq!(
+                asks_for_help(arg),
+                want,
+                "asks_for_help({arg:?}). A missed flag sends `serve --help` on to connect, \
+                 migrate and bind `--help` as its address; a loose match (starts_with, \
+                 contains) turns an argument `secure` must refuse into its help, and \
+                 changes which address `serve` listens on"
+            );
+        }
     }
 }

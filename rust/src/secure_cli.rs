@@ -7,11 +7,10 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     // This command runs DDL as a superuser, so an argument it does not
     // understand is refused instead of ignored: ignoring them is how
     // `secure --help` used to create the role.
-    match args.first().map(String::as_str) {
-        None => {}
-        Some("-h" | "--help") => {
-            eprintln!(
-                "usage: memory-industry secure\n\n\
+    let first = args.first().map(String::as_str);
+    if crate::cli::asks_for_help(first) {
+        eprintln!(
+            "usage: memory-industry secure\n\n\
                      Crea el rol de app para que RLS y el audit append-only apliquen de verdad.\n\
                      No acepta argumentos: actúa sobre DATABASE_URL, que tiene que ser de un\n\
                      rol superuser (el owner, cuba); con otro rol se niega sin tocar nada.\n\n\
@@ -24,13 +23,14 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
                      \x20   funciones. Ni DDL ni ownership.\n\
                      \x20 - los mismos privilegios por defecto sobre lo que cuba cree después.\n\n\
                      Al terminar imprime el DATABASE_URL de cuba_app para el runtime."
-            );
-            return Ok(());
-        }
-        Some(other) => anyhow::bail!(
+        );
+        return Ok(());
+    }
+    if let Some(other) = first {
+        anyhow::bail!(
             "argumento desconocido `{other}`: `secure` no acepta argumentos y no \
              ejecuta nada si recibe uno (probá --help)"
-        ),
+        );
     }
 
     let admin_url = crate::setup::resolve_database_url().await;

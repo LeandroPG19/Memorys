@@ -290,23 +290,9 @@ async fn async_main() {
             return;
         }
         Some("serve") => {
-            // Before the address is read: `--help` used to become the listen
-            // address, after `http::serve` had already connected and migrated.
-            if argv.get(2).is_some_and(|a| a == "-h" || a == "--help") {
-                eprintln!(
-                    "usage: memory-industry serve [addr]\n\n\
-                     Runs one shared MCP daemon over HTTP for every client, so the ONNX\n\
-                     models load once. addr defaults to CUBA_HTTP_ADDR, else 127.0.0.1:8787.\n\
-                     CUBA_HTTP_TOKEN requires a bearer token; without one only a loopback\n\
-                     address is accepted. On start it connects to DATABASE_URL and applies\n\
-                     pending migrations unless CUBA_SKIP_MIGRATIONS=1."
-                );
+            let Some(addr) = serve_addr(argv.get(2).map(String::as_str)) else {
                 return;
-            }
-            let addr = argv
-                .get(2)
-                .cloned()
-                .unwrap_or_else(memory_industry::http::bind_addr);
+            };
             let outcome = memory_industry::http::serve(&addr).await;
             drain_background_tasks().await;
             if let Err(e) = outcome {
@@ -391,4 +377,26 @@ async fn async_main() {
     }
 
     drain_background_tasks().await;
+}
+
+/// The address `serve` listens on, or None once its help is printed.
+///
+/// Decided before the address is read: `--help` used to become the listen
+/// address, after `http::serve` had already connected and migrated. The call
+/// to `http::serve`, the drain and the exit stay in the `serve` arm, where
+/// cli_contract::nothing_can_exit_a_draining_command_without_draining_first
+/// reads them.
+fn serve_addr(arg: Option<&str>) -> Option<String> {
+    if memory_industry::cli::asks_for_help(arg) {
+        eprintln!(
+            "usage: memory-industry serve [addr]\n\n\
+             Runs one shared MCP daemon over HTTP for every client, so the ONNX\n\
+             models load once. addr defaults to CUBA_HTTP_ADDR, else 127.0.0.1:8787.\n\
+             CUBA_HTTP_TOKEN requires a bearer token; without one only a loopback\n\
+             address is accepted. On start it connects to DATABASE_URL and applies\n\
+             pending migrations unless CUBA_SKIP_MIGRATIONS=1."
+        );
+        return None;
+    }
+    Some(arg.map_or_else(memory_industry::http::bind_addr, str::to_string))
 }
