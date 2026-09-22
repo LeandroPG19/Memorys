@@ -64,7 +64,17 @@ rel_under() {
 }
 
 
-# `key cc` per function over the ceiling, e.g. `src/protocol.rs::run_mcp 27`.
+# `key cc` per function over the ceiling, e.g. `src/protocol.rs::run_mcp:281 27`.
+#
+# The key carries the start line lizard already prints, and it is not decoration.
+# Without it the key was `file::name`; judge.rs holds two `run_prompt`, and the
+# baseline lookup below takes the first match in file order: the CC 9 one was
+# judged against the CC 10 ceiling of the other and could gain a point in
+# silence, which is the one failure a ratchet must not have. With the start line
+# the key is unique by construction, since two functions cannot begin on the same
+# line of the same file. The cost is that moving a function invalidates its key
+# and the gate then calls it new work — wrong, but wrong out loud, which is the
+# trade this made on purpose.
 #
 # The awk is the whole point of the word "over". `lizard -w` warns on
 # `length > 1000` and on `nloc` too, not only on CC, and this function used to
@@ -82,7 +92,7 @@ lizard_warnings() {
   local cwd="$1" cc_max="$2"
   shift 2
   (cd "$cwd" && lizard -C "$cc_max" -w "$@" 2>/dev/null) |
-    sed -nE 's|^(.*):[0-9]+: warning: ([A-Za-z0-9_:<>]+) has [0-9]+ NLOC, ([0-9]+) CCN.*|\1::\2 \3|p' |
+    sed -nE 's|^(.*):([0-9]+): warning: ([A-Za-z0-9_:<>]+) has [0-9]+ NLOC, ([0-9]+) CCN.*|\1::\3:\2 \4|p' |
     awk -v max="$cc_max" '($2 + 0) > (max + 0)' |
     sed 's|\\|/|g' | sort -u || true
 }
@@ -93,6 +103,16 @@ if [[ "${1:-}" == "--update-lizard-baseline" ]]; then
   {
     echo "# Functions already over CC $cc_max when this line was drawn."
     echo "# The gate fails a function that is NOT here, or one here that got worse."
+    echo "# The key is path::function:start-line. The start line is what makes it"
+    echo "# unique: judge.rs holds two run_prompt, the lookup took the first one in"
+    echo "# file order, and so the CC 9 one sat behind the CC 10 ceiling of the other"
+    echo "# and could gain a point with nobody saying anything."
+    echo "# The price, accepted: moving a function changes its key, and the gate then"
+    echo "# says it is not in the baseline. That verdict is loud and obviously wrong,"
+    echo "# which is the trade for the one it replaces: silent and invisibly wrong."
+    echo "# Regenerating REWRITES this file whole, so every comment below - each one"
+    echo "# carrying the reason and the owner of a deliberate deviation - is dropped."
+    echo "# Put them back, or the next reader inherits the numbers without the why."
     echo "# Regenerate with: ./scripts/quality-gate.sh --update-lizard-baseline"
     lizard_warnings rust "$cc_max" "${all[@]}"
   } > "$BASELINE"
@@ -124,7 +144,9 @@ run_lizard() {
     if [[ -z "$base" ]]; then
       echo "CRAP: $key is at CC $cc, over the ceiling of $cc_max, and is not in the baseline." >&2
       echo "      A function this tangled is new work. Split it, or explain it and update" >&2
-      echo "      the baseline on purpose." >&2
+      echo "      the baseline on purpose. If instead it only MOVED, its key moved with" >&2
+      echo "      it — the baseline is keyed by start line — and regenerating is the" >&2
+      echo "      answer, not splitting a function that was already accounted for." >&2
       worse=$((worse + 1))
     elif (( cc > base )); then
       echo "CRAP: $key went from CC $base to $cc. It was already over the ceiling; making it" >&2
@@ -158,7 +180,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
 
   # 1014 lines, one statement each: lizard measures it at CCN 1 and warns all
   # the same, because `lizard -w` also fires on `length > 1000`. Before the awk in
-  # lizard_warnings this printed `src/only_long.rs::only_long 1` and run_lizard
+  # lizard_warnings this forwarded only_long with a CCN of 1 and run_lizard
   # turned it into "is at CC 1, over the ceiling of 8".
   {
     echo 'fn only_long(n: u32) -> u32 {'
@@ -188,7 +210,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     echo '}'
   } > "$tmp/src/tangled.rs"
   got="$(lizard_warnings "$tmp" 8 src/tangled.rs)"
-  if [[ "$got" != "src/tangled.rs::tangled 13" ]]; then
+  if [[ "$got" != "src/tangled.rs::tangled:1 13" ]]; then
     echo "FAIL self-test: the filter lost a CC 13 function (got '$got')" >&2
     exit 1
   fi
@@ -197,7 +219,42 @@ if [[ "${1:-}" == "--self-test" ]]; then
     exit 1
   fi
 
-  echo "OK  self-test: the CRAP half reports CC violations, and only CC violations"
+  # The fixture for the reason the key carries a start line, in the shape the
+  # real defect had: judge.rs holds two `run_prompt`, one per judge, and until
+  # this release both collapsed onto `src/cognitive/judge.rs::run_prompt`. The
+  # lookup in run_lizard takes the first match in file order, so the CC 9 one
+  # was ratcheted against the CC 10 ceiling of the other and could gain a point
+  # with the gate still green. Two functions cannot begin on the same line of
+  # the same file, so the start line is what makes a key unique.
+  {
+    echo 'struct Cli;'
+    echo 'struct Http;'
+    echo 'impl Cli {'
+    echo '    fn run_prompt(&self, n: u32) -> u32 {'
+    echo '        let mut t = 0;'
+    for i in $(seq 8); do echo "        if n == $i { t += $i; }"; done
+    echo '        t'
+    echo '    }'
+    echo '}'
+    echo 'impl Http {'
+    echo '    fn run_prompt(&self, n: u32) -> u32 {'
+    echo '        let mut t = 0;'
+    for i in $(seq 9); do echo "        if n == $i { t += $i; }"; done
+    echo '        t'
+    echo '    }'
+    echo '}'
+  } > "$tmp/src/twins.rs"
+  got="$(lizard_warnings "$tmp" 8 src/twins.rs)"
+  twins=$(printf '%s\n' "$got" | wc -l)
+  keys=$(printf '%s\n' "$got" | cut -d' ' -f1 | sort -u | wc -l)
+  if (( twins != 2 )) || (( keys != 2 )); then
+    echo "FAIL self-test: two same-named functions in one file came out as $twins line(s)" >&2
+    echo "                on $keys key(s); the baseline needs one key each (got '$got')" >&2
+    exit 1
+  fi
+
+  echo "OK  self-test: the CRAP half reports CC violations, only CC violations, and"
+  echo "    keeps two same-named functions in one file on two separate keys"
   exit 0
 fi
 

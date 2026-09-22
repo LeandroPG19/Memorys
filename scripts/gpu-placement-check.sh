@@ -232,7 +232,7 @@ must_fail() {
   local out rc=0
   out="$(verdict "$@")" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
-    echo "SELF-TEST FAIL: $what — the checker accepted it." >&2
+    echo "FAIL self-test: $what — the checker accepted it." >&2
     return 1
   fi
   echo "  red, as it must be: $what"
@@ -246,7 +246,7 @@ must_pass() {
   local out rc=0
   out="$(verdict "$@")" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    echo "SELF-TEST FAIL: $what — the checker rejected an honest machine:" >&2
+    echo "FAIL self-test: $what — the checker rejected an honest machine:" >&2
     printf '%s\n' "$out" >&2
     return 1
   fi
@@ -280,11 +280,15 @@ self_test() {
     1 gpu ok "$gpu_live" "" || bad=1
 
   if [[ "$bad" -ne 0 ]]; then
-    echo "SELF-TEST FAILED: at least one guard no longer decides anything." >&2
+    echo "FAIL self-test: at least one guard no longer decides anything." >&2
     return 1
   fi
-  echo "OK  every guard in gpu-placement-check failed against a fixture built to break it,"
-  echo "    and every honest machine passed"
+  # The contract anchors on this label, not on the sentence: a verdict that names
+  # its fixtures is rewritten every time one is added, which is what put the same
+  # assert on the CRAP half in the red over a script that had passed. `self-test:`
+  # is the flag's own name, so renaming the mode forces the edit in the test too.
+  echo "OK  self-test: every guard in gpu-placement-check failed against a fixture built to"
+  echo "    break it, and every honest machine passed"
   return 0
 }
 

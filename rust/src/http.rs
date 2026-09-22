@@ -2086,11 +2086,11 @@ mod tests {
     /// The timeout layer hands back what the handler said, when the handler
     /// said it in time.
     ///
-    /// Only the happy path is driven here. Making the deadline *fire* needs a
-    /// handler that hangs for longer than `router_deadline()` — four minutes on
-    /// the default budget — and the clock cannot be paused, because the layer
-    /// is reached through a real socket. What this pins is the half that runs
-    /// on every request there has ever been.
+    /// This is the half that runs on every request there has ever been. The
+    /// other half — the deadline actually firing — is the test below, and the
+    /// two are a pair on purpose: they mount the same minimal router and demand
+    /// different statuses from it, so a router assembled without the layer, or
+    /// with it swallowing what the handler decided, cannot pass both.
     #[tokio::test]
     async fn a_request_answered_inside_the_budget_is_handed_back_untouched() {
         let app = Router::new()
@@ -2121,6 +2121,87 @@ mod tests {
             "the handler's answer",
             "and the body has to survive with it: an empty 200 reads as success to every \
              monitor and as a blank page to every operator"
+        );
+    }
+
+    /// A handler that stops making progress becomes a 504 that says how long
+    /// the daemon waited.
+    ///
+    /// The budget is shrunk through `CUBA_HANDLER_TIMEOUT_SECS`, which
+    /// `protocol::handler_timeout()` already reads and the README already
+    /// documents — no second knob had to exist so that a test could go faster.
+    /// At `1` the chain leaves eight seconds (×4 for the request, ×2 for the
+    /// router), and that is the floor: `handler_timeout()` filters zero out.
+    /// Eight seconds of wall clock is what this test costs, and it is the price
+    /// of the only branch of this layer that had never been driven.
+    ///
+    /// Setting the variable here is enough because `bound_every_request` reads
+    /// the budget per request, not when the router is built.
+    #[tokio::test]
+    async fn a_request_that_outlives_the_budget_is_closed_with_a_504_naming_the_seconds() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _shrunk = crate::envs::ScopedEnv::set("CUBA_HANDLER_TIMEOUT_SECS", "1");
+
+        // Read before anything hangs. If the variable ever stopped reaching
+        // this layer the budget would be back to four minutes, and the only
+        // symptom would be a suite that got slower — which no failure reports.
+        let budget = router_deadline();
+        assert!(
+            budget <= Duration::from_secs(10),
+            "CUBA_HANDLER_TIMEOUT_SECS has to reach this layer through \
+             protocol::handler_timeout(), and it left the budget at {budget:?}"
+        );
+
+        let app = Router::new()
+            .route(
+                "/hangs",
+                get(move || async move {
+                    tokio::time::sleep(budget * 4).await;
+                    (
+                        StatusCode::IM_A_TEAPOT,
+                        "an answer nobody is still waiting for",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(bound_every_request));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free loopback port");
+        let port = listener.local_addr().expect("the bound address").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // The client outlasts the router deliberately: with the two budgets the
+        // other way round, a layer that never fired would be cut by this
+        // client's own clock and read as the layer working.
+        let client = reqwest::Client::builder()
+            .timeout(budget * 2)
+            .build()
+            .expect("a client that outlasts the router's budget");
+        let answer = client
+            .get(format!("http://127.0.0.1:{port}/hangs"))
+            .send()
+            .await
+            .expect(
+                "nothing came back before this client gave up, which is what a request held \
+                 open by a layer that never fired looks like from the outside",
+            );
+
+        assert_eq!(
+            answer.status().as_u16(),
+            504,
+            "a handler that stopped making progress has to become a status. A socket held open \
+             until the client tires of it tells a monitor nothing, and on a LAN bind the routes \
+             with no budget of their own are reachable by anything that can route a packet here"
+        );
+        let said = answer.text().await.expect("a body");
+        assert!(
+            said.contains(&format!("{}s", budget.as_secs())),
+            "the sentence has to name the budget that actually expired ({budget:?}): whoever \
+             reads it is about to go and tune CUBA_HANDLER_TIMEOUT_SECS, and a body carrying the \
+             handler's budget, or milliseconds read as seconds, sends them after the wrong knob. \
+             It said: {said}"
         );
     }
 

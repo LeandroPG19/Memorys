@@ -355,8 +355,13 @@ fn codigo_muerto_can_actually_fail() {
         "codigo-muerto.sh --self-test did not pass, so at least one of its guards no longer          fails when it should. stdout: {stdout}
 stderr: {stderr}"
     );
+    // Anchored on the mode's label, not on its sentence: that line names the
+    // fixtures it ran, so adding one rewrites it — which is how the twin of this
+    // assert over `quality-gate.sh` went red over a script that had passed.
+    // `self-test:` is the flag this test passes, so renaming the mode forces the
+    // `args` above to change with it, and no other line of the script prints it.
     assert!(
-        stdout.contains("every guard in this script failed against a fixture built to break it"),
+        stdout.contains("self-test:"),
         "the self-test exited 0 without saying it ran. An exit code alone is what let the          original guard pass while doing nothing. stdout: {stdout}"
     );
 }
@@ -588,8 +593,13 @@ fn the_gpu_placement_check_can_actually_fail() {
         "gpu-placement-check.sh --self-test did not pass, so at least one of its guards no \
          longer refuses a contradiction. stdout: {stdout}\nstderr: {stderr}"
     );
+    // Anchored on the mode's label, not on its sentence: that verdict ends in a
+    // comma and carries on over a second line, so half of it was never matched
+    // anyway and the half that was is free prose. The script had no label on its
+    // success path until this test needed one; it has the same `self-test:` the
+    // other two gate scripts print, which is the flag passed in `args` above.
     assert!(
-        stdout.contains("every guard in gpu-placement-check failed against a fixture"),
+        stdout.contains("self-test:"),
         "the self-test exited 0 without saying it ran. An exit code alone is what let \
          codigo-muerto.sh pass for months while doing nothing. stdout: {stdout}"
     );
@@ -880,10 +890,11 @@ fn a_release_cargo_call_in_the_gate_carries_the_features_the_release_build_used(
 ///
 /// Six is not over eight. `lizard -w` also warns on length and on NLOC, and
 /// every warning a CCN could be parsed out of was counted as a complexity
-/// violation. Its `--self-test` sends one fixture of each kind through the
-/// filter — a 1014-line function whose CC is 1, which has to come out as
-/// nothing at all, and a CC 13 one, which has to come out with its number and
-/// fail the gate — and reports whether both directions held.
+/// violation. Its `--self-test` runs a fixture for each shape the filter has to
+/// tell apart — the warnings it must swallow whole, the violations it must
+/// report with their number — and says whether every direction held. Which
+/// fixtures those are is the script's business: counting them here is the same
+/// drift the assert below is anchored against.
 #[test]
 fn the_crap_half_of_the_second_judge_can_actually_fail() {
     let out = std::process::Command::new(git_bash())
@@ -902,8 +913,13 @@ fn the_crap_half_of_the_second_judge_can_actually_fail() {
          skip this.\nstdout: {stdout}\nstderr: {stderr}",
         out.status.code()
     );
+    // Anchored on the mode's label, not on its sentence: that last line names the
+    // fixtures it ran, so adding one rewrites it — the third fixture landed today,
+    // the line wrapped in two, and this assert went red over a script that had
+    // passed. Every verdict of this mode, OK or FAIL, carries `self-test:`, and
+    // nothing on the normal diff path prints that label.
     assert!(
-        stdout.contains("self-test: the CRAP half reports CC violations, and only CC violations"),
+        stdout.contains("self-test:"),
         "the self-test exited 0 without saying it ran. An exit code alone is what let \
          codigo-muerto.sh pass for months while doing nothing, and a script that cannot find \
          its own fixtures exits 0 too. stdout: {stdout}"

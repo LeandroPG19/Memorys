@@ -1,137 +1,147 @@
 # Functions already over CC 8 when this line was drawn.
 # The gate fails a function that is NOT here, or one here that got worse.
+# The key is path::function:start-line. The start line is what makes it
+# unique: judge.rs holds two run_prompt, the lookup took the first one in
+# file order, and so the CC 9 one sat behind the CC 10 ceiling of the other
+# and could gain a point with nobody saying anything.
+# The price, accepted: moving a function changes its key, and the gate then
+# says it is not in the baseline. That verdict is loud and obviously wrong,
+# which is the trade for the one it replaces: silent and invisibly wrong.
+# Regenerating REWRITES this file whole, so every comment below - each one
+# carrying the reason and the owner of a deliberate deviation - is dropped.
+# Put them back, or the next reader inherits the numbers without the why.
 # Regenerate with: ./scripts/quality-gate.sh --update-lizard-baseline
-src/calibrate_cli.rs::run_cli 20
+src/calibrate_cli.rs::run_cli:70 20
 # +1: `undo_dir()?`. It used to answer `.` when HOME was not set, so `recall
 # --undo` wrote its journal wherever the operator happened to be standing and
 # the next run could not find it. Propagating instead of guessing is a branch.
 # Same cause as the four setup_agent.rs entries further down. Exact number, no
 # margin: the ratchet has to fail the next increase too.
 # Owner: mejorador 0.27.
-src/cli.rs::run_delete 15
-src/cli.rs::run_save 10
-src/cli.rs::run_search 15
-src/codegraph/mod.rs::walk 14
-src/codegraph/python_lang.rs::walk 11
-src/codegraph_cli.rs::run_cli 30
-src/cognitive/judge.rs::probe_health 9
-src/cognitive/judge.rs::resolve_judge 9
-src/cognitive/judge.rs::run_prompt 10
-src/cognitive/judge.rs::run_prompt 9
-src/cognitive/judge.rs::which_in_path 18
-src/cognitive/nli.rs::classify 14
-src/cognitive/nli.rs::init 16
-src/dashboard.rs::render 12
-src/db.rs::init_schema 9
-src/dedupe_cli.rs::judge_likely 9
-src/dedupe_cli.rs::merge_entity 13
-src/dedupe_cli.rs::run_cli 30
-src/doctor.rs::run_checks_with 46
-src/doctor.rs::run_cli 13
-src/embeddings/onnx.rs::compute_onnx_embedding 19
-src/embeddings/onnx.rs::init_onnx_session 14
-src/eval/datasets.rs::load_jsonl_dataset 14
-src/eval/harness.rs::run_faro_eval 21
-src/eval/mod.rs::compare_runs 15
-src/eval/mod.rs::run_cli 17
-src/eval/mod.rs::run_coverage 9
-src/export.rs::export_obsidian 38
-src/graph/centrality.rs::compute_bridges 19
-src/graph/community.rs::detect 11
-src/graph/community.rs::detect_and_persist 11
-src/graph/community.rs::louvain_local_move 11
-src/graph/community.rs::refine_communities 13
-src/graph/kcore.rs::compute_in_memory 13
-src/graph/pagerank.rs::compute_and_store 18
-src/graph/pagerank.rs::personalized 14
-src/graph_cli.rs::run_cli 12
-src/graph_cli.rs::set_backend 10
-src/graph_db.rs::explain_falkor 9
-src/graph_db.rs::parse_resp 18
-src/graph_db.rs::ppr_around_seeds 15
-src/graph_db.rs::reconcile 15
-src/handlers/alarma.rs::handle 12
-src/handlers/alma.rs::create 9
-src/handlers/alma.rs::get 9
-src/handlers/archivo.rs::append 15
-src/handlers/artefacto.rs::lock 10
-src/handlers/artefacto.rs::patch 10
-src/handlers/artefacto.rs::put 22
-src/handlers/artefacto.rs::unlock 10
-src/handlers/calibrar.rs::resolve 11
-src/handlers/cronica.rs::add 16
-src/handlers/cronica.rs::batch_add 21
-src/handlers/cronica.rs::check_dedup 11
-src/handlers/cronica.rs::episode_add 11
-src/handlers/decreto.rs::handle 9
-src/handlers/docs.rs::handle 12
-src/handlers/eco.rs::correct 10
-src/handlers/eco.rs::negative 9
-src/handlers/eco.rs::positive 9
-src/handlers/eco.rs::set_trust 14
-src/handlers/expediente.rs::handle 9
-src/handlers/faro.rs::check_ood 14
-src/handlers/faro.rs::enrich_graphrag 9
-src/handlers/faro.rs::handle 12
-src/handlers/faro.rs::hybrid_search 80
-src/handlers/faro.rs::text_search 11
-src/handlers/faro.rs::verify_claim 12
-src/handlers/forget.rs::handle 9
-src/handlers/ingesta.rs::auto_extract 16
-src/handlers/ingesta.rs::classify_paragraph 16
-src/handlers/ingesta.rs::ingest 14
-src/handlers/jornada.rs::handle 25
-src/handlers/mod.rs::dispatch 10
-src/handlers/proyecto.rs::merge 11
-src/handlers/proyecto.rs::stats 11
-src/handlers/puente.rs::create 11
-src/handlers/puente.rs::predict_links 14
-src/handlers/puente.rs::traverse 9
-src/handlers/receta.rs::add 9
-src/handlers/reflexion.rs::analyze 10
-src/handlers/remedio.rs::handle 9
-src/handlers/sync.rs::apply_tombstones 26
-src/handlers/sync.rs::ask_peer 11
-src/handlers/sync.rs::diff 11
-src/handlers/sync.rs::drain_peer 25
-src/handlers/sync.rs::export_into 64
-src/handlers/sync.rs::fetch 16
-src/handlers/sync.rs::import 139
-src/handlers/sync.rs::prune_stale_episode_files 14
-src/handlers/sync.rs::prune_stale_files 10
-src/handlers/sync.rs::pull_from_staging 10
-src/handlers/sync.rs::recompute_digest 11
-src/handlers/sync.rs::resolve_conflict 14
-src/handlers/sync.rs::validate_bundle 36
-src/handlers/vigia.rs::health 12
-src/handlers/zafra.rs::handle 35
-src/hooks_cli.rs::install 14
-src/hooks_cli.rs::merge_driver 18
-src/hooks_cli.rs::merge_episode_file 9
-src/hooks_cli.rs::remove_gitattributes_line 9
-src/hooks_cli.rs::remove_hook_block 9
-src/http.rs::dispatch_one 12
-src/http.rs::mcp_endpoint 13
-src/http.rs::serve_pool 15
-src/link_cli.rs::run_cli 13
-src/llm_cli.rs::print_status 13
-src/llm_cli.rs::set_provider 28
-src/main.rs::async_main 24
-src/models_cli.rs::download_model 12
-src/models_cli.rs::download_runtime 15
-src/models_cli.rs::download_to 13
-src/models_cli.rs::extract_runtime 29
-src/models_cli.rs::wanted_runtime_lib 9
-src/net/fetch.rs::get 13
-src/net/guard.rs::check 10
-src/net/guard.rs::is_forbidden 18
-src/protocol.rs::handle_request 11
-src/protocol.rs::read_resource 30
-src/protocol.rs::request_sampling_max 9
-src/protocol.rs::run_mcp 27
-src/protocol.rs::run_rem_consolidation_locked 15
-src/recall_cli.rs::build 18
-src/recall_cli.rs::run_cli 9
+src/cli.rs::run_delete:258 15
+src/cli.rs::run_save:188 10
+src/cli.rs::run_search:68 15
+src/codegraph/mod.rs::walk:88 14
+src/codegraph/python_lang.rs::walk:27 11
+src/codegraph_cli.rs::run_cli:5 30
+src/cognitive/judge.rs::probe_health:511 9
+src/cognitive/judge.rs::resolve_judge:57 9
+src/cognitive/judge.rs::run_prompt:203 9
+src/cognitive/judge.rs::run_prompt:571 10
+src/cognitive/judge.rs::which_in_path:949 18
+src/cognitive/nli.rs::classify:242 14
+src/cognitive/nli.rs::init:112 16
+src/dashboard.rs::render:44 12
+src/db.rs::init_schema:227 9
+src/dedupe_cli.rs::judge_likely:633 9
+src/dedupe_cli.rs::merge_entity:331 13
+src/dedupe_cli.rs::run_cli:47 30
+src/doctor.rs::run_checks_with:449 43
+src/doctor.rs::run_cli:1024 13
+src/embeddings/onnx.rs::compute_onnx_embedding:357 19
+src/embeddings/onnx.rs::init_onnx_session:236 14
+src/eval/datasets.rs::load_jsonl_dataset:91 14
+src/eval/harness.rs::run_faro_eval:135 21
+src/eval/mod.rs::compare_runs:45 15
+src/eval/mod.rs::run_cli:158 17
+src/eval/mod.rs::run_coverage:117 9
+src/export.rs::export_obsidian:131 38
+src/graph/centrality.rs::compute_bridges:5 19
+src/graph/community.rs::detect:8 11
+src/graph/community.rs::detect_and_persist:79 11
+src/graph/community.rs::louvain_local_move:124 11
+src/graph/community.rs::refine_communities:200 13
+src/graph/kcore.rs::compute_in_memory:6 13
+src/graph/pagerank.rs::compute_and_store:9 18
+src/graph/pagerank.rs::personalized:145 14
+src/graph_cli.rs::run_cli:7 12
+src/graph_cli.rs::set_backend:105 10
+src/graph_db.rs::explain_falkor:745 9
+src/graph_db.rs::parse_resp:169 18
+src/graph_db.rs::ppr_around_seeds:629 15
+src/graph_db.rs::reconcile:788 15
+src/handlers/alarma.rs::handle:7 12
+src/handlers/alma.rs::create:20 9
+src/handlers/alma.rs::get:141 9
+src/handlers/archivo.rs::append:131 15
+src/handlers/artefacto.rs::lock:359 10
+src/handlers/artefacto.rs::patch:313 10
+src/handlers/artefacto.rs::put:160 22
+src/handlers/artefacto.rs::unlock:424 10
+src/handlers/calibrar.rs::resolve:229 11
+src/handlers/cronica.rs::add:90 16
+src/handlers/cronica.rs::batch_add:376 21
+src/handlers/cronica.rs::check_dedup:689 11
+src/handlers/cronica.rs::episode_add:834 11
+src/handlers/decreto.rs::handle:5 9
+src/handlers/docs.rs::handle:57 12
+src/handlers/eco.rs::correct:398 10
+src/handlers/eco.rs::negative:345 9
+src/handlers/eco.rs::positive:290 9
+src/handlers/eco.rs::set_trust:119 14
+src/handlers/expediente.rs::handle:32 9
+src/handlers/faro.rs::check_ood:2020 14
+src/handlers/faro.rs::enrich_graphrag:1871 9
+src/handlers/faro.rs::handle:25 12
+src/handlers/faro.rs::hybrid_search:324 80
+src/handlers/faro.rs::text_search:1355 11
+src/handlers/faro.rs::verify_claim:1161 12
+src/handlers/forget.rs::handle:5 9
+src/handlers/ingesta.rs::auto_extract:23 16
+src/handlers/ingesta.rs::classify_paragraph:906 16
+src/handlers/ingesta.rs::ingest:775 14
+src/handlers/jornada.rs::handle:5 25
+src/handlers/mod.rs::dispatch:94 10
+src/handlers/proyecto.rs::merge:224 11
+src/handlers/proyecto.rs::stats:149 11
+src/handlers/puente.rs::create:19 11
+src/handlers/puente.rs::predict_links:348 14
+src/handlers/puente.rs::traverse:136 9
+src/handlers/receta.rs::add:74 9
+src/handlers/reflexion.rs::analyze:16 10
+src/handlers/remedio.rs::handle:7 9
+src/handlers/sync.rs::apply_tombstones:1530 26
+src/handlers/sync.rs::ask_peer:957 11
+src/handlers/sync.rs::diff:2718 11
+src/handlers/sync.rs::drain_peer:1173 25
+src/handlers/sync.rs::export_into:266 64
+src/handlers/sync.rs::fetch:1037 16
+src/handlers/sync.rs::import:1775 139
+src/handlers/sync.rs::prune_stale_episode_files:125 14
+src/handlers/sync.rs::prune_stale_files:109 10
+src/handlers/sync.rs::pull_from_staging:1390 10
+src/handlers/sync.rs::recompute_digest:1443 11
+src/handlers/sync.rs::resolve_conflict:843 14
+src/handlers/sync.rs::validate_bundle:1659 36
+src/handlers/vigia.rs::health:100 12
+src/handlers/zafra.rs::handle:76 35
+src/hooks_cli.rs::install:167 14
+src/hooks_cli.rs::merge_driver:356 18
+src/hooks_cli.rs::merge_episode_file:453 9
+src/hooks_cli.rs::remove_gitattributes_line:132 9
+src/hooks_cli.rs::remove_hook_block:261 9
+src/http.rs::dispatch_one:1194 12
+src/http.rs::mcp_endpoint:1053 13
+src/http.rs::serve_pool:191 11
+src/link_cli.rs::run_cli:5 13
+src/llm_cli.rs::print_status:156 13
+src/llm_cli.rs::set_provider:248 28
+src/main.rs::async_main:126 24
+src/models_cli.rs::download_model:174 12
+src/models_cli.rs::download_runtime:257 15
+src/models_cli.rs::download_to:411 13
+src/models_cli.rs::extract_runtime:336 29
+src/models_cli.rs::wanted_runtime_lib:308 9
+src/net/fetch.rs::get:12 13
+src/net/guard.rs::check:38 10
+src/net/guard.rs::is_forbidden:5 18
+src/protocol.rs::handle_request:468 11
+src/protocol.rs::read_resource:1337 30
+src/protocol.rs::request_sampling_max:149 9
+src/protocol.rs::run_mcp:281 27
+src/protocol.rs::run_rem_consolidation_locked:701 15
+src/recall_cli.rs::build:60 18
+src/recall_cli.rs::run_cli:6 9
 # src/redact.rs::scan is NOT new work: it predates this branch and not a line of
 # it changed. What changed is that lizard can see it again. The `'_'` literal on
 # the old line 38 made its Rust reader take that apostrophe for the start of an
@@ -148,22 +158,22 @@ src/recall_cli.rs::run_cli 9
 # is the function that decides whether a secret leaves in a log, and a blind
 # refactor here leaks a credential, which is exactly what verificacion.md
 # forbids. Owner: endurecedor 0.27.
-src/redact.rs::scan 22
-src/reembed_cli.rs::run_cli 19
-src/resources.rs::plan 11
-src/search/bm25.rs::bm25_search 10
-src/search/ood.rs::fit 17
-src/search/rerank.rs::init_session 13
-src/search/rerank.rs::score_chunk 16
-src/search/rerank.rs::score_pairs 12
+src/redact.rs::scan:57 22
+src/reembed_cli.rs::run_cli:3 19
+src/resources.rs::plan:207 11
+src/search/bm25.rs::bm25_search:6 10
+src/search/ood.rs::fit:12 17
+src/search/rerank.rs::init_session:225 13
+src/search/rerank.rs::score_chunk:509 16
+src/search/rerank.rs::score_pairs:429 10
 # One job in 18 lines: create the parent, keep a secret that is already there,
 # write, restrict. Split, "the file that carries the token" and "the file
 # we do not clobber" become two lists that have to agree, and the day they
 # disagree the installer rotates a live token under every client already
 # configured. The 11 is `?` and `&&`, which lizard counts each. Owner:
 # mejorador 0.27.
-src/service.rs::write_one 11
-src/setup.rs::resolve_database_url 11
+src/service.rs::write_one:978 11
+src/setup.rs::resolve_database_url:13 11
 # The four below each went up by the `?` of `envs::home()` returning a Result
 # (run_check by two: it calls both known_targets and project_configs). It used
 # to be `std::env::var("HOME").map_or_else(|_| PathBuf::from("."), ..)`: with
@@ -172,11 +182,11 @@ src/setup.rs::resolve_database_url 11
 # be standing in. Propagating instead of guessing is a branch per call site, and
 # that is what these +1s and +2s buy. Exact numbers, no margin: the ratchet has
 # to fail the next increase too. Owner: mejorador 0.27.
-src/setup_agent.rs::project_configs 12
-src/setup_agent.rs::run_check 24
-src/setup_agent.rs::run_hook 21
-src/setup_agent.rs::run_write 22
-src/skills_cli.rs::run_cli 19
-src/sync/paths.rs::resolve_dir 11
-src/sync_cli.rs::run_cli 11
-src/tunnel_cli.rs::run_cli 11
+src/setup_agent.rs::project_configs:23 12
+src/setup_agent.rs::run_check:153 24
+src/setup_agent.rs::run_hook:526 21
+src/setup_agent.rs::run_write:273 22
+src/skills_cli.rs::run_cli:61 19
+src/sync/paths.rs::resolve_dir:49 11
+src/sync_cli.rs::run_cli:3 11
+src/tunnel_cli.rs::run_cli:109 11

@@ -4,6 +4,12 @@
 AGENTS.md text eol=lf
 docs/gate.md text eol=lf
 *.mdc text eol=lf
+# The CRAP ratchet reads this with awk '$1 == k {print $2}' and then compares
+# arithmetically. With CRLF the key still matches but the number carries the
+# CR, (( cc > base )) dies on a syntax error, and the elif is taken as false —
+# the ratchet stops guarding and says nothing. core.autocrlf hands a fresh
+# clone CRLF unless this line is here.
+scripts/lizard-baseline.txt text eol=lf
 
 # `schtasks /Create /XML` reads the bytes, not the declaration: a UTF-8 task
 # file is refused at (1,40) — the column `encoding=` sits in — before it is ever

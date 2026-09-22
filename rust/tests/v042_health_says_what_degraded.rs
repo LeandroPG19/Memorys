@@ -16,7 +16,7 @@
 //! that needed a database could not go.
 
 use std::ffi::OsString;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use memory_industry::http::{ModelState, RuntimeReport, overall_status};
 use memory_industry::llm_cli::LlmSummary;
@@ -28,6 +28,44 @@ const DEAD_DB: &str = "postgresql://cuba:canarypass-db@127.0.0.1:1/nowhere";
 /// Long enough to be a real bearer token, so nothing in the bind guard has an
 /// opinion about it and the assertions are about `/health` alone.
 const TOKEN: &str = "canary-token-3f8a1c77b204e95d6ab0f1c2";
+
+/// The daemon's own ceiling on loading models before it opens for business.
+///
+/// The number the wait below is a wait for, so it lives next to it rather than
+/// as a literal in `quiet_machine()`, where nothing tied it to the budget that
+/// has to outlast it. Past the ceiling `serve_pool` detaches the warm-up and
+/// serves with `ready:false`, which is a state this file reads on purpose.
+const WARM_CEILING: Duration = Duration::from_secs(10);
+
+/// How long a test here waits for its daemon to open the port.
+///
+/// `serve_pool` binds the port, *then* warms the models, and only then serves.
+/// A connection that arrives in between is accepted by the kernel and parked in
+/// the backlog, so "the port took my connection" does not mean "something is
+/// answering".
+const OPEN_BUDGET: Duration = Duration::from_secs(30);
+
+// The invariant, as a build failure rather than as a sentence somebody can read
+// past: the daemon is guaranteed to open within its warm ceiling, so a budget
+// below that ceiling fails a daemon which did exactly what it was told. The two
+// halves used to be a coincidence — a literal "10" in the environment and a
+// hundred sleeps of ten milliseconds down here — and a coincidence is not an
+// invariant: either number could move alone. Now the smaller one does not
+// compile.
+const _: () = assert!(
+    OPEN_BUDGET.as_secs() > WARM_CEILING.as_secs(),
+    "the probe budget must outlast the warm ceiling, or the daemon is failed for opening on time"
+);
+
+/// Per probe, so a request parked in the backlog is cut and retried instead of
+/// swallowing the whole budget in one silent wait. `/connect` is a page
+/// compiled into the binary and answers as fast as the socket allows, so this
+/// budget only ever cuts a connection that nothing is serving yet.
+const PROBE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Between probes: short enough to add nothing visible to a fast start, long
+/// enough not to spin against a socket nobody is serving yet.
+const PROBE_EVERY: Duration = Duration::from_millis(250);
 
 /// Process-global environment, one test at a time.
 static ENV_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -86,6 +124,7 @@ impl Drop for Env {
 /// directory that does not exist makes both machines answer the same.
 fn quiet_machine() -> Vec<Env> {
     let nowhere = std::env::temp_dir().join("v042-health-no-such-model");
+    let ceiling = WARM_CEILING.as_secs().to_string();
     vec![
         Env::set("CUBA_HTTP_TOKEN", TOKEN),
         Env::cleared("CUBA_PEER_TOKEN"),
@@ -96,11 +135,25 @@ fn quiet_machine() -> Vec<Env> {
         // The preferred name, because it is the one that wins: leaving the
         // 180 s default in place would let one unexpected model on this
         // developer's disk hold the whole file for three minutes.
-        Env::set("MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS", "10"),
+        Env::set("MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS", &ceiling),
         Env::cleared("CUBA_PANEL"),
         Env::cleared("CUBA_IDLE_SHUTDOWN_SECS"),
         Env::cleared("CUBA_HTTP_ALLOWED_ORIGINS"),
     ]
+}
+
+/// One `GET /connect`: `Ok` when something served the port, `Err` with why
+/// nothing did.
+///
+/// Whatever came back settles it, status code and body included: the question
+/// this probe asks is only whether the port is *served*.
+async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
+    client
+        .get(url)
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("no answer at all: {e}"))
 }
 
 /// Start a daemon and wait until it answers, or fail saying it never did.
@@ -109,23 +162,62 @@ fn quiet_machine() -> Vec<Env> {
 /// database that is deliberately not there and spends its five-second budget
 /// finding out, and paying that once per test to learn something `/connect`
 /// answers instantly would be five seconds of gate time for nothing.
+///
+/// Polling rather than sleeping a fixed number: any number is right on an idle
+/// machine and wrong on the busy one that actually failed. The condition is
+/// that the port *answers*, not that the daemon is `ready`: past
+/// `WARM_CEILING` it serves with `ready:false` for as long as the models take,
+/// so a wait on that flag could outlive a daemon that was working — and two of
+/// the tests below are written against exactly that daemon.
 async fn daemon(port: u16) {
     let pool = memory_industry::db::create_lazy_pool(DEAD_DB);
     let addr = format!("127.0.0.1:{port}");
-    tokio::spawn(async move {
-        let _ = memory_industry::http::serve_pool(&addr, pool, false).await;
+    let serve_task = tokio::spawn(async move {
+        // Printed rather than dropped: when it is the bind that failed, the
+        // wait below only ever sees a connection nobody answers, and the
+        // sentence naming the cause lives in this Err and nowhere else.
+        if let Err(why) = memory_industry::http::serve_pool(&addr, pool, false).await {
+            eprintln!("the daemon on 127.0.0.1:{port} stopped: {why:#}");
+        }
     });
 
-    for _ in 0..100 {
-        if reqwest::get(format!("http://127.0.0.1:{port}/connect"))
-            .await
-            .is_ok()
-        {
-            return;
+    let url = format!("http://127.0.0.1:{port}/connect");
+    let client = reqwest::Client::builder()
+        .timeout(PROBE_BUDGET)
+        .build()
+        .expect("a probe client with a bounded attempt");
+    let deadline = Instant::now() + OPEN_BUDGET;
+    let mut probes = 0u32;
+    let mut last = String::from(
+        "it never answered: the port was bound, so the connection was queued rather than \
+         refused, and nothing ever served it",
+    );
+
+    while Instant::now() < deadline {
+        assert!(
+            !serve_task.is_finished(),
+            "the daemon on 127.0.0.1:{port} ended before it served anything, so nothing below \
+             can run. serve_pool printed why it stopped — with --nocapture that line is just \
+             above this one; the port still held by an earlier run is the usual reason"
+        );
+
+        probes += 1;
+        match probe(&client, &url).await {
+            Ok(()) => return,
+            Err(why) => last = why,
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(PROBE_EVERY).await;
     }
-    panic!("the daemon on {port} never answered");
+
+    panic!(
+        "the daemon at {url} never answered within {}s, over {probes} probe(s). Last: {last}. \
+         serve_pool binds the port before it loads its models, so the kernel queues the \
+         connection instead of refusing it, and an accepted connection says nothing about \
+         whether anything is serving. This daemon is pinned to open within {}s of warm-up, so \
+         overrunning the budget means it never opened at all",
+        OPEN_BUDGET.as_secs(),
+        WARM_CEILING.as_secs()
+    );
 }
 
 async fn health(port: u16, token: Option<&str>) -> (u16, Value) {
