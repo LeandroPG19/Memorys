@@ -1,5 +1,5 @@
 ---
-description: Handoff YAML estricto — un script valida; malformado no es entrega
+description: Handoff YAML estricto — un script lo valida, y desde 0.28 comprueba el protocolo de dos pasadas
 alwaysApply: true
 ---
 
@@ -12,5 +12,24 @@ Cada entrega entre roles es un fichero `.cursor/handoffs/*.yml` con exactamente:
 - `task`: una línea
 - `commit`: hash o `none` (solo `note`)
 - `evidence`: comando corrido + resultado (o `none` en specifier)
+- `tests`: `written` | `frozen` — **obligatorio cuando `commit` no es `none`, y prohibido cuando lo es**
+
+## El campo `tests`
+
+Declara qué hizo esta pasada con los tests, y el guardia lo comprueba comparando las regiones
+`#[cfg(test)]` de `rust/src` —y los ficheros de `rust/tests/` enteros— contra ese commit:
+
+- `written`: esta pasada **escribió** tests. Falla si ninguna región cambió, porque una pasada roja
+  que no movió un test no escribió nada que pueda ponerse rojo.
+- `frozen`: esta pasada **no tocó** ningún test. Falla si alguna cambió, que es la pasada verde
+  ajustando un test para que encaje con el código — lo único que las dos pasadas existen para impedir.
+
+Es de dos sentidos a propósito, como los techos del gate: declarar mal cualquiera de los dos da rojo,
+así que omitir el campo no es una salida. Si un test de la pasada roja parece incorrecto, se para y se
+devuelve un handoff `type: note`; **no se edita**.
+
+Hasta 0.27 el campo `commit` solo tenía que *parecer* hexadecimal: nadie comprobaba que existiera y
+nada comparaba los tests contra él. El protocolo dependía de la honestidad del agente en vez de un
+guardia, y dos ciclos de dos pasadas pasaron por ahí sin que nada los mirara.
 
 El receptor no avanza si `scripts/validar-handoff.sh` falla. No hay entrega «de palabra».
