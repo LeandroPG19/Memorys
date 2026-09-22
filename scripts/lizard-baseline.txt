@@ -29,8 +29,8 @@ src/cognitive/judge.rs::resolve_judge:57 9
 src/cognitive/judge.rs::run_prompt:203 9
 src/cognitive/judge.rs::run_prompt:571 10
 src/cognitive/judge.rs::which_in_path:949 18
-src/cognitive/nli.rs::classify:242 14
-src/cognitive/nli.rs::init:112 16
+src/cognitive/nli.rs::classify:295 14
+src/cognitive/nli.rs::init:165 16
 src/dashboard.rs::render:44 12
 src/db.rs::init_schema:227 9
 src/dedupe_cli.rs::judge_likely:633 9
@@ -38,8 +38,8 @@ src/dedupe_cli.rs::merge_entity:331 13
 src/dedupe_cli.rs::run_cli:47 30
 src/doctor.rs::run_checks_with:449 43
 src/doctor.rs::run_cli:1024 13
-src/embeddings/onnx.rs::compute_onnx_embedding:357 19
-src/embeddings/onnx.rs::init_onnx_session:236 14
+src/embeddings/onnx.rs::compute_onnx_embedding:424 19
+src/embeddings/onnx.rs::init_onnx_session:281 14
 src/eval/datasets.rs::load_jsonl_dataset:91 14
 src/eval/harness.rs::run_faro_eval:135 21
 src/eval/mod.rs::compare_runs:45 15

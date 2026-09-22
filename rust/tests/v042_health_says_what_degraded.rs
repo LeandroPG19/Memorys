@@ -455,6 +455,16 @@ fn degraded_when_any_subsystem_is() {
     );
 
     assert_eq!(
+        overall_status(true, &report(true, false, ["failed", "loaded", "loaded"])),
+        "degraded",
+        "and the other half of that same distinction: an embedder whose model was there and \
+         whose session would not open is a fault. Until `failed` existed for this model the row \
+         above was the only answer either machine could get, so the two were indistinguishable \
+         from outside — which is what made the supported one look broken and the broken one \
+         look supported"
+    );
+
+    assert_eq!(
         overall_status(true, &report(false, false, ["loaded", "loaded", "loaded"])),
         "starting",
         "and «still loading» is not «broken». It fixes itself; degraded does not, and the two \

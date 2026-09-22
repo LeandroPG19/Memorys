@@ -1342,9 +1342,11 @@ const STATE_ABSENT: &str = "absent";
 /// `reason` is a sentence for a human and is `None` when the state says
 /// everything. It never carries a filesystem path: a model path is inventory,
 /// and on Windows it has the operator's user name inside it. Every reason here
-/// is a literal except one — the reranker's load failure, which comes from
-/// ONNX Runtime — and that one goes through `reason_without_a_model_path`
-/// first. Before it did, this paragraph was a promise the code did not keep.
+/// is a literal except three — the load failure of each model, which comes
+/// from its loader and from ONNX Runtime — and each of those goes through
+/// `reason_without_a_model_path` first, with the variable that names *its*
+/// directory. Before it did, this paragraph was a promise the code did not
+/// keep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelState {
     pub state: &'static str,
@@ -1395,6 +1397,12 @@ pub struct RuntimeReport {
 /// forever teaches the operator to ignore the field, which is the failure this
 /// endpoint exists to prevent. `resource_tier`, in the same block, says which
 /// models the plan expected.
+///
+/// `STATE_FAILED` on that same embedder *is* degraded, and the two must not be
+/// folded back together: `fallback` is "there was nothing to load", `failed`
+/// is "everything was there and the session would not open". For two releases
+/// the embedder could only say the first, so a broken machine and a supported
+/// one were the same word here.
 pub fn overall_status(db_ok: bool, runtime: &RuntimeReport) -> &'static str {
     let a_model_is_broken = [&runtime.embedder, &runtime.reranker, &runtime.nli]
         .into_iter()
@@ -1441,9 +1449,55 @@ fn compiled_gpu_provider() -> Option<&'static str> {
 /// executor. `ready` is the exact guard: it is set after `warm_models()`
 /// finished, and `warm_models()` is what resolves that cell. Before it flips,
 /// the honest answer is that the model is still loading, and asking would be
-/// the thing that makes a monitor's poll hang.
+/// the thing that makes a monitor's poll hang. That `&&` is the guard itself
+/// and not an optimisation — it is the one short circuit in this block that
+/// has to stay.
+///
+/// `failure_reason()` is read *after* `loaded`, and the order is load-bearing:
+/// past the guard `is_model_loaded()` is what settled the cell, so asking it
+/// first would read an unresolved cell and report `fallback` on a machine
+/// whose session had actually failed.
 fn embedder_state(ready: bool) -> ModelState {
     let device = device_of(crate::gpu::Workload::Embedder);
+    let loaded = ready && crate::embeddings::onnx::is_model_loaded();
+    embedder_state_from(
+        crate::embeddings::onnx::failure_reason(),
+        device,
+        ready,
+        loaded,
+    )
+}
+
+/// The embedder's state, from the three facts that decide it and nothing else.
+///
+/// `fallback` and `failed` are the whole point of this function existing. A
+/// machine that never had an embedding model is `Tier::Minimal` and is
+/// supported — `overall_status` deliberately does not call it degraded. A
+/// machine whose model file was there, whose runtime was there, and whose
+/// session still would not open is a fault, and until this split existed
+/// `/health` reported both of them with the same word.
+///
+/// The failure wins over `warming` for the same reason `overall_status` puts
+/// `degraded` over `starting`: past the warm ceiling `serve_pool` detaches the
+/// warm-up and serves with `ready:false`, so a session that already failed
+/// would otherwise hide behind "still loading" for as long as the process
+/// lives.
+fn embedder_state_from(
+    failure: Option<String>,
+    device: &'static str,
+    ready: bool,
+    loaded: bool,
+) -> ModelState {
+    if let Some(reason) = failure {
+        return ModelState {
+            state: STATE_FAILED,
+            device,
+            reason: Some(reason_without_a_model_path(
+                &reason,
+                EMBEDDER_DIR_INSTEAD_OF_A_PATH,
+            )),
+        };
+    }
     if !ready {
         return ModelState {
             state: STATE_WARMING,
@@ -1451,7 +1505,7 @@ fn embedder_state(ready: bool) -> ModelState {
             reason: None,
         };
     }
-    if crate::embeddings::onnx::is_model_loaded() {
+    if loaded {
         return ModelState {
             state: STATE_LOADED,
             device,
@@ -1460,6 +1514,8 @@ fn embedder_state(ready: bool) -> ModelState {
     }
     ModelState {
         state: STATE_FALLBACK,
+        // The hash fallback runs on this CPU whatever the placement path was
+        // asked for, and `device` is where the model *would* have gone.
         device: "cpu",
         reason: Some(
             "no ONNX embedder opened — vectors come from the hash fallback and search is \
@@ -1509,7 +1565,10 @@ fn reranker_state_from(
         return ModelState {
             state: STATE_FAILED,
             device,
-            reason: Some(reason_without_a_model_path(&reason)),
+            reason: Some(reason_without_a_model_path(
+                &reason,
+                RERANKER_DIR_INSTEAD_OF_A_PATH,
+            )),
         };
     }
     if !dir_resolved {
@@ -1550,7 +1609,13 @@ fn reranker_state_from(
 
 /// What a model directory becomes in `/health`: the variable that sets it,
 /// never the directory it resolved to.
-const MODEL_DIR_INSTEAD_OF_A_PATH: &str = "the reranker directory (see CUBA_RERANKER_PATH)";
+///
+/// One per model, because the sentence is the operator's next move. A failed
+/// NLI load that came back pointing at `CUBA_RERANKER_PATH` would send them to
+/// change the wrong variable, which is worse than saying nothing.
+const RERANKER_DIR_INSTEAD_OF_A_PATH: &str = "the reranker directory (see CUBA_RERANKER_PATH)";
+const NLI_DIR_INSTEAD_OF_A_PATH: &str = "the NLI directory (see CUBA_NLI_PATH)";
+const EMBEDDER_DIR_INSTEAD_OF_A_PATH: &str = "the embedder directory (see ONNX_MODEL_PATH)";
 
 /// A load failure with the path taken out and the variable that names it put
 /// in its place.
@@ -1567,12 +1632,12 @@ const MODEL_DIR_INSTEAD_OF_A_PATH: &str = "the reranker directory (see CUBA_RERA
 /// leaves the actionable half of the sentence alone: the file names it looked
 /// for, `model.onnx` and `model_quantized.onnx`, and the bare `/` between
 /// them.
-fn reason_without_a_model_path(reason: &str) -> String {
+fn reason_without_a_model_path(reason: &str, instead: &'static str) -> String {
     reason
         .split_whitespace()
         .map(|word| {
             if word.contains(['/', '\\']) && word.chars().any(char::is_alphanumeric) {
-                MODEL_DIR_INSTEAD_OF_A_PATH
+                instead
             } else {
                 word
             }
@@ -1581,16 +1646,54 @@ fn reason_without_a_model_path(reason: &str) -> String {
         .join(" ")
 }
 
-/// The NLI model, from the two questions that can be answered for free.
+/// The NLI model, read from the cell rather than forced into it.
 ///
-/// It can never report `loaded` or `failed` from here: `nli::enabled()` is the
-/// only thing that knows, and it is also what loads the model. Saying
-/// `configured` when it may in fact have failed is the lesser lie — the
-/// alternative is a `/health` that loads a gigabyte the first time a monitor
-/// polls it, which is the bug `doctor` was just fixed for.
+/// Every accessor here answers without loading: `deferred_by_resource_plan`
+/// and `available` stat the disk, and `failure_reason` / `status_resolved`
+/// read a cell that is already decided or is not. `nli::enabled()` would load
+/// ~1 GB inside a health poll, which is the bug `doctor` was fixed for — and
+/// for two releases it was also the reason this block could say nothing but
+/// `configured` about a model that had already failed to open.
+///
+/// All four facts are read before the decision instead of on the way through
+/// it, for the reason written out over `reranker_state`: the first branch of a
+/// short-circuited version turns on a process-wide `OnceLock` that another
+/// test in this binary resolves.
 fn nli_state() -> ModelState {
-    let device = device_of(crate::gpu::Workload::Nli);
-    if crate::cognitive::nli::deferred_by_resource_plan() {
+    nli_state_from(
+        crate::cognitive::nli::failure_reason(),
+        device_of(crate::gpu::Workload::Nli),
+        crate::cognitive::nli::deferred_by_resource_plan(),
+        crate::cognitive::nli::available(),
+        crate::cognitive::nli::status_resolved(),
+    )
+}
+
+/// The NLI model's state, from the four facts that decide it and nothing else.
+///
+/// `deferred` is the resource plan switching the model off by pointing the
+/// path at a sentinel it never creates; `available` is a model file in the
+/// cache; and `status_resolved` is whether something already tried to open a
+/// session — which is what tells `loaded` from `configured` without opening
+/// one here.
+fn nli_state_from(
+    failure: Option<String>,
+    device: &'static str,
+    deferred: bool,
+    available: bool,
+    status_resolved: bool,
+) -> ModelState {
+    if let Some(reason) = failure {
+        return ModelState {
+            state: STATE_FAILED,
+            device,
+            reason: Some(reason_without_a_model_path(
+                &reason,
+                NLI_DIR_INSTEAD_OF_A_PATH,
+            )),
+        };
+    }
+    if deferred {
         return ModelState {
             state: STATE_OFF,
             device,
@@ -1601,11 +1704,18 @@ fn nli_state() -> ModelState {
             ),
         };
     }
-    if !crate::cognitive::nli::available() {
+    if !available {
         return ModelState {
             state: STATE_ABSENT,
             device,
             reason: Some("no NLI model where this daemon looks".to_string()),
+        };
+    }
+    if status_resolved {
+        return ModelState {
+            state: STATE_LOADED,
+            device,
+            reason: None,
         };
     }
     ModelState {
@@ -2881,6 +2991,23 @@ mod health_report_tests {
              is how a field stops being read — which is the failure this endpoint exists to \
              prevent"
         );
+
+        assert_eq!(
+            overall_status(true, &report(true, false, ["failed", "loaded", "loaded"])),
+            "degraded",
+            "and the other half of that same distinction: an embedder whose model was there \
+             and whose session would not open is a fault. Until `failed` existed for this \
+             model the row above was the only answer either machine could get, so the two were \
+             indistinguishable from outside — which is what made the supported one look broken \
+             and the broken one look supported"
+        );
+
+        assert_eq!(
+            overall_status(true, &report(false, false, ["loaded", "loaded", "loaded"])),
+            "starting",
+            "and «still loading» is not «broken». It fixes itself; degraded does not, and the \
+             two ask different things of whoever is reading"
+        );
     }
 
     #[test]
@@ -3095,6 +3222,182 @@ mod health_report_tests {
             "a reranker that is loaded says nothing more. «loads on its first batch» on a model \
              that already loaded leaves someone waiting for a load that has happened"
         );
+    }
+
+    #[test]
+    fn four_facts_decide_what_health_says_about_the_nli_model() {
+        // (a load failure, the resource plan deferring it, a model in the
+        //  cache, a session already attempted) -> the word `/health` prints.
+        //
+        // The same shape as the reranker table above and for the same reason:
+        // `nli::status_resolved()` is a process-wide `OnceLock`, so a test
+        // that reached the live accessors would be asserting against whatever
+        // order libtest scheduled this binary in.
+        //
+        // The two failure rows are combinations no machine produces: a reason
+        // only exists once a session was attempted and found a model, so it
+        // cannot arrive with the plan having deferred the load, nor with the
+        // cell unresolved. They are here on purpose — they pin that a failure
+        // outranks every other answer instead of leaving the order to whoever
+        // reads the function next.
+        let table: [(Option<&str>, bool, bool, bool, &'static str); 8] = [
+            (Some("the session did not open"), true, true, true, "failed"),
+            (
+                Some("the session did not open"),
+                false,
+                false,
+                false,
+                "failed",
+            ),
+            (None, true, true, false, "off"),
+            (None, true, true, true, "off"),
+            (None, false, false, false, "absent"),
+            (None, false, false, true, "absent"),
+            (None, false, true, false, "configured"),
+            (None, false, true, true, "loaded"),
+        ];
+
+        for (failure, deferred, available, status_resolved, expected) in table {
+            let state = nli_state_from(
+                failure.map(String::from),
+                "cpu",
+                deferred,
+                available,
+                status_resolved,
+            );
+            assert_eq!(
+                state.state, expected,
+                "failure={failure:?} deferred={deferred} available={available} \
+                 status_resolved={status_resolved}"
+            );
+            assert_eq!(
+                state.device, "cpu",
+                "whichever branch answers, the device word is the one the placement path chose"
+            );
+        }
+
+        assert_eq!(
+            nli_state_from(None, "cpu", false, true, true).reason,
+            None,
+            "an NLI model that already loaded says nothing more. «loads on its first use» on a \
+             model that has loaded leaves someone waiting for a load that has happened"
+        );
+    }
+
+    #[test]
+    fn three_facts_decide_what_health_says_about_the_embedder() {
+        // (a load failure, the warm-up has finished, the session is open) ->
+        // the word `/health` prints.
+        //
+        // `loaded` is `ready && is_model_loaded()` at the call site, so the
+        // two rows with `ready:false, loaded:true` are combinations no machine
+        // produces. They are here to pin that «still loading» wins over a flag
+        // that cannot yet mean anything, rather than leaving the order to the
+        // next reader.
+        let table: [(Option<&str>, bool, bool, &'static str); 8] = [
+            (Some("the session did not open"), true, true, "failed"),
+            (Some("the session did not open"), true, false, "failed"),
+            (Some("the session did not open"), false, true, "failed"),
+            (Some("the session did not open"), false, false, "failed"),
+            (None, false, false, "warming"),
+            (None, false, true, "warming"),
+            (None, true, true, "loaded"),
+            (None, true, false, "fallback"),
+        ];
+
+        for (failure, ready, loaded, expected) in table {
+            let state = embedder_state_from(failure.map(String::from), "gpu", ready, loaded);
+            assert_eq!(
+                state.state, expected,
+                "failure={failure:?} ready={ready} loaded={loaded}"
+            );
+            assert_eq!(
+                state.device,
+                if expected == "fallback" { "cpu" } else { "gpu" },
+                "the hash fallback runs on this CPU whatever the placement path was asked for, \
+                 and every other branch reports where the model went: failure={failure:?} \
+                 ready={ready} loaded={loaded}"
+            );
+        }
+
+        assert_eq!(
+            embedder_state_from(None, "gpu", true, true).reason,
+            None,
+            "an embedder that is running says nothing more"
+        );
+        assert!(
+            embedder_state_from(None, "gpu", true, false)
+                .reason
+                .is_some_and(|why| why.contains("hash fallback")),
+            "and a machine on the hash fallback has to say so: «search is lexical only» is the \
+             sentence that explains results an operator would otherwise file as a ranking bug"
+        );
+        assert_eq!(
+            embedder_state_from(None, "gpu", false, false).reason,
+            None,
+            "«warming» says everything there is to say; a reason here would be a sentence that \
+             stops being true a second later"
+        );
+    }
+
+    #[test]
+    fn a_failed_nli_or_embedder_never_carries_its_path_either() {
+        const CANARY_USER: &str = "canaryoperator";
+        let nli_dir =
+            std::path::PathBuf::from(format!("C:\\Users\\{CANARY_USER}\\.cache\\models-nli"));
+        // `{dir:?}` is how `nli::init` writes it, quotes and all.
+        let nli_failure = format!("no hay model.onnx ni model_quantized.onnx en {nli_dir:?}");
+        let embedder_failure = format!(
+            "tokenizer.json not found at C:\\Users\\{CANARY_USER}\\.cache\\models\\tokenizer.json"
+        );
+
+        // Positive controls. Without them «the canary is not in the body» also
+        // passes on a body that never carried a reason at all.
+        for fixture in [&nli_failure, &embedder_failure] {
+            assert!(
+                fixture.contains(CANARY_USER),
+                "the fixture is broken: {fixture:?} never had a path in it"
+            );
+        }
+
+        let mut runtime = report(true, false, ["failed", "loaded", "failed"]);
+        runtime.nli = nli_state_from(Some(nli_failure), "cpu", false, true, true);
+        runtime.embedder = embedder_state_from(Some(embedder_failure), "cpu", true, false);
+
+        assert_eq!(
+            runtime.nli.reason.as_deref(),
+            Some(
+                "no hay model.onnx ni model_quantized.onnx en the NLI directory (see \
+                 CUBA_NLI_PATH)"
+            ),
+            "the path goes and the actionable half stays — and the variable it names is the \
+             NLI one. A failed NLI that came back pointing at CUBA_RERANKER_PATH would send the \
+             operator to change the wrong knob, which is worse than saying nothing"
+        );
+        assert!(
+            runtime
+                .embedder
+                .reason
+                .as_deref()
+                .is_some_and(|why| why.contains("ONNX_MODEL_PATH")),
+            "and the embedder names the variable that sets *its* directory: {:?}",
+            runtime.embedder.reason
+        );
+
+        let served = runtime_json(&runtime).to_string();
+        assert!(
+            served.contains("model.onnx") && served.contains("tokenizer.json"),
+            "positive control: both reasons have to reach the block at all, or every canary \
+             below passes on a block that says nothing: {served}"
+        );
+        for canary in [CANARY_USER, ".cache"] {
+            assert!(
+                !served.contains(canary),
+                "{canary:?} was served in the runtime block. A model path is inventory, and on \
+                 Windows it carries the operator's user name; the sentence with the path in it \
+                 belongs to `doctor`, which runs on their machine: {served}"
+            );
+        }
     }
 
     #[test]

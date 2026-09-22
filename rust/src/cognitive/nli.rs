@@ -6,9 +6,26 @@ use std::sync::OnceLock;
 
 static NLI_SESSION: OnceLock<std::sync::Mutex<Session>> = OnceLock::new();
 static NLI_TOKENIZER: OnceLock<tokenizers::Tokenizer> = OnceLock::new();
-static NLI_STATUS: OnceLock<bool> = OnceLock::new();
+static NLI_STATUS: OnceLock<NliStatus> = OnceLock::new();
 static NLI_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
 static WANTS_TYPE_IDS: OnceLock<bool> = OnceLock::new();
+
+/// Why NLI is or is not answering, in the three states that ask for three
+/// different things from whoever reads them.
+///
+/// This was a `bool`, and a `bool` collapsed "there was no model to load" with
+/// "there was a model and it did not open" — which is the one distinction that
+/// matters, because the first is a machine to leave alone and the second is a
+/// machine to go and fix. `/health` could only ever say `configured`.
+enum NliStatus {
+    Loaded,
+    /// No model to load: nothing is wrong, `verify` falls back to the judge.
+    Unavailable,
+    /// A model is on disk and the session did not open. The reason is kept
+    /// rather than logged and forgotten: the log line is on the machine, and
+    /// whoever is reading `/health` is not.
+    Failed(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entailment {
@@ -94,18 +111,54 @@ pub fn deferred_by_resource_plan() -> bool {
 }
 
 pub fn enabled() -> bool {
-    *NLI_STATUS.get_or_init(|| match model_dir() {
+    matches!(get_status(), NliStatus::Loaded)
+}
+
+/// Whether something already tried to open a session.
+///
+/// Reading the cell instead of forcing it is the whole point: `enabled()` is
+/// also what loads ~1 GB, so a caller answering a health poll cannot use it.
+pub fn status_resolved() -> bool {
+    NLI_STATUS.get().is_some()
+}
+
+/// Why NLI is not loaded, when something already tried to load it.
+///
+/// `None` means it loaded, or nobody has asked yet.
+///
+/// The sentence is whatever `init` or ONNX Runtime said, model directory
+/// included, so it is written for a caller standing on the machine. A caller
+/// that answers over a socket puts it through
+/// `http::reason_without_a_model_path` first, because that directory is
+/// inventory and on Windows it has the operator's user name inside it.
+pub fn failure_reason() -> Option<String> {
+    reason_of(NLI_STATUS.get()?)
+}
+
+/// Only a session that had a model and could not open it has a reason worth
+/// showing. "There is no model" is not a failure, and saying it here would put
+/// it in `/health` as one.
+fn reason_of(status: &NliStatus) -> Option<String> {
+    match status {
+        NliStatus::Loaded | NliStatus::Unavailable => None,
+        NliStatus::Failed(reason) => Some(reason.clone()),
+    }
+}
+
+fn get_status() -> &'static NliStatus {
+    NLI_STATUS.get_or_init(|| match model_dir() {
         Some(dir) => match init(&dir) {
             Ok(()) => {
                 tracing::info!(path = %dir.display(), "NLI (mDeBERTa-xnli) cargado — entailment local");
-                true
+                NliStatus::Loaded
             }
             Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "NLI no pudo cargarse — se usará el juez LLM");
-                false
+                let reason = format!("{e:#}");
+                tracing::warn!(error = %reason, "NLI no pudo cargarse — se usará el juez LLM");
+                NliStatus::Failed(reason)
             }
         },
-        None => false,
+        None => NliStatus::Unavailable,
     })
 }
 
@@ -357,6 +410,51 @@ mod tests {
         let genuine = decide([0.952, 0.036, 0.011]);
         assert_eq!(genuine.label, Entailment::Supports);
         assert!(genuine.decisive);
+    }
+
+    #[test]
+    fn only_a_model_that_was_there_and_did_not_open_has_a_reason() {
+        assert_eq!(reason_of(&NliStatus::Loaded), None);
+        assert_eq!(
+            reason_of(&NliStatus::Unavailable),
+            None,
+            "no NLI model installed is not a failure. Reporting one here would put `/health` \
+             into degraded on every machine that never downloaded the gigabyte, and a field \
+             that is red forever stops being read"
+        );
+
+        let missing_runtime = "hay un modelo NLI en \"/models/nli\" pero no encuentro \
+                               libonnxruntime.so";
+        assert_eq!(
+            reason_of(&NliStatus::Failed(missing_runtime.into())),
+            Some(missing_runtime.to_string()),
+            "the loader message has to come back word for word: it is the whole reason the cell \
+             stopped being a bool, and `doctor` prints it verbatim"
+        );
+        assert_ne!(
+            reason_of(&NliStatus::Failed(missing_runtime.into())),
+            Some(String::new()),
+            "an empty reason is worse than none: the reader gets a failure with nothing after \
+             the colon"
+        );
+    }
+
+    #[test]
+    fn nothing_that_reads_the_status_can_load_the_model() {
+        // `status_resolved` and `failure_reason` are the two accessors
+        // `/health` calls on every poll, and `/health` may not force a load —
+        // that is why it could only ever say `configured`. Nothing in this
+        // binary calls `enabled()`, so the cell is still unresolved here and
+        // both of these have to say so rather than resolving it themselves.
+        let resolved_before = status_resolved();
+        let _ = failure_reason();
+        assert_eq!(
+            status_resolved(),
+            resolved_before,
+            "reading why NLI failed resolved the cell that loads it. A `get_or_init` here is a \
+             gigabyte read inside a monitor's poll, which is the defect this whole state exists \
+             to remove"
+        );
     }
 
     #[test]

@@ -59,9 +59,22 @@ static ONNX_SESSION: OnceLock<std::sync::Mutex<Session>> = OnceLock::new();
 
 static TOKENIZER: OnceLock<tokenizers::Tokenizer> = OnceLock::new();
 
+/// What happened the one time this process tried to open the embedder.
+///
+/// `Fallback` and `Failed` are not the same machine and must not read as the
+/// same machine. Three of the four ways the load stops short are "there was
+/// nothing to load" — no model directory, no ONNX Runtime library, no model
+/// file where one was named — and on those the hash fallback is the supported
+/// answer, `Tier::Minimal`. Only a model file that was there, with a runtime
+/// that was there, and a session that still would not open, is a fault worth
+/// sending somebody to look at.
 enum ModelStatus {
     Loaded,
     Fallback,
+    /// The session did not open on a machine that had everything it needed.
+    /// The reason is kept rather than logged and forgotten: the log line is on
+    /// the machine, and whoever is reading `/health` is not.
+    Failed(String),
 }
 
 fn get_cache() -> &'static std::sync::Mutex<TtlLruCache<Vec<f32>>> {
@@ -213,11 +226,43 @@ fn get_model_status() -> &'static ModelStatus {
                 ModelStatus::Loaded
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to load ONNX model — using fallback");
-                ModelStatus::Fallback
+                // The only one of the four branches above that is a fault:
+                // everything this needed was on the machine and the session
+                // still did not open. `{e:#}` rather than `{e}` because the
+                // useful half is usually in the context `init_onnx_session`
+                // attached — which tokenizer, which builder step — and not in
+                // the outermost line.
+                let reason = format!("{e:#}");
+                tracing::warn!(error = %reason, "Failed to load ONNX model — using fallback");
+                ModelStatus::Failed(reason)
             }
         }
     })
+}
+
+/// Why the embedder is not loaded, when something already tried to load it.
+///
+/// `None` means it loaded, or there was nothing to load, or nobody has asked
+/// yet. Reading the resolved cell rather than forcing it is what makes this
+/// callable from `/health`: `is_model_loaded()` resolves the cell that loads
+/// the model, and on a cold process that is a multi-second call.
+///
+/// The sentence names the model file and the tokenizer path, so a caller that
+/// answers over a socket puts it through `http::reason_without_a_model_path`
+/// first.
+pub fn failure_reason() -> Option<String> {
+    reason_of(MODEL_STATUS.get()?)
+}
+
+/// Only a session that had everything and would not open has a reason worth
+/// showing. A machine with no embedding model is a supported tier, and
+/// reporting it as broken is how `/health` teaches an operator to stop reading
+/// the field.
+fn reason_of(status: &ModelStatus) -> Option<String> {
+    match status {
+        ModelStatus::Loaded | ModelStatus::Fallback => None,
+        ModelStatus::Failed(reason) => Some(reason.clone()),
+    }
 }
 
 fn intra_threads() -> usize {
@@ -348,9 +393,31 @@ async fn embed_with_prefix(text: &str, prefix: &str) -> Result<Vec<f32>> {
 }
 
 fn compute_embedding(text: &str) -> Result<Vec<f32>> {
-    match get_model_status() {
+    compute_embedding_with(get_model_status(), text)
+}
+
+/// Which routine produces the vector, with the status as an argument rather
+/// than as the process-wide cell.
+///
+/// Split off for the same reason `reranker_state_from` was: `get_model_status`
+/// resolves a `OnceLock` that loads the model, so a test calling the routing
+/// through it would be asserting against whatever that cell happened to
+/// settle on first.
+///
+/// The arms are written out and there is no `_ =>` on purpose. A wildcard is
+/// exactly what would have swallowed `Failed` the day it was added, and it
+/// would swallow the next variant just as quietly; the compiler refusing to
+/// build is the only thing that makes this decision deliberate.
+fn compute_embedding_with(status: &ModelStatus, text: &str) -> Result<Vec<f32>> {
+    match status {
         ModelStatus::Loaded => compute_onnx_embedding(text),
         ModelStatus::Fallback => compute_hash_embedding(text),
+        // A session that did not open still has to produce a vector, and it
+        // produces the same one `Fallback` does. The reason it failed travels
+        // to `/health`; it never reaches the vector. Reporting a broken model
+        // was the change; refusing to embed on it would be a search outage on
+        // the machine that most needs search to keep working.
+        ModelStatus::Failed(_) => compute_hash_embedding(text),
     }
 }
 
@@ -541,6 +608,88 @@ mod tests {
     fn test_fallback_mode() {
         let emb = compute_hash_embedding("test").unwrap();
         assert_eq!(emb.len(), embedding_dim());
+    }
+
+    #[test]
+    fn a_machine_with_no_model_is_not_a_machine_that_is_broken() {
+        assert_eq!(reason_of(&ModelStatus::Loaded), None);
+        assert_eq!(
+            reason_of(&ModelStatus::Fallback),
+            None,
+            "three of the four ways the load stops short are «there was nothing to load» — no \
+             model directory, no ONNX Runtime, no model file. That machine is Tier::Minimal and \
+             this daemon is supported on it; a reason here would put every one of them into \
+             `/health` as degraded forever, which is how a field stops being read"
+        );
+
+        let tokenizer = "load model: BFCArena::AllocateRawInternal: tokenizer.json not found";
+        assert_eq!(
+            reason_of(&ModelStatus::Failed(tokenizer.into())),
+            Some(tokenizer.to_string()),
+            "and the fourth way — everything was there and the session still would not open — \
+             is the one an operator has to be sent to look at, word for word, because `doctor` \
+             used to guess at this and guessed wrong"
+        );
+        assert_ne!(
+            reason_of(&ModelStatus::Failed(tokenizer.into())),
+            Some(String::new()),
+            "an empty reason is worse than none: the reader gets a failure with nothing after \
+             the colon"
+        );
+    }
+
+    #[test]
+    fn a_model_that_failed_to_open_still_returns_a_vector() {
+        const TEXT: &str = "the retrieval pipeline fuses lexical and vector signals";
+        let hash = compute_hash_embedding(TEXT).expect("the hash fallback always answers");
+
+        // Positive control. Without it every assertion below would also pass
+        // on a fallback that had quietly started returning nothing.
+        assert_eq!(
+            hash.len(),
+            embedding_dim(),
+            "the fixture is broken: the hash fallback is not producing a vector at all"
+        );
+
+        let broken = compute_embedding_with(
+            &ModelStatus::Failed("load model: BFCArena::AllocateRawInternal".to_string()),
+            TEXT,
+        )
+        .expect(
+            "a model that would not open must still embed. This whole state was a change to \
+             what `/health` SAYS, not to what the embedder DOES — routing this arm to an error \
+             would take search down on exactly the machine whose model is already broken",
+        );
+
+        assert_eq!(
+            broken, hash,
+            "and it has to be the same vector the fallback produces, not a different weaker \
+             one: two embedding spaces in one index is a ranking bug nobody would trace back \
+             to a health field"
+        );
+        assert_eq!(
+            compute_embedding_with(&ModelStatus::Fallback, TEXT)
+                .expect("the fallback arm is the one that never changed"),
+            hash,
+            "the arm this one was cloned from, asserted beside it: if the fallback ever stops \
+             going through compute_hash_embedding, the row above stops meaning what it says"
+        );
+    }
+
+    #[test]
+    fn asking_why_the_embedder_failed_does_not_load_the_embedder() {
+        // `/health` calls this on every poll and may not force a load:
+        // `is_model_loaded()` resolves the cell that reads the model off disk,
+        // which on a cold process is seconds inside a monitor's request.
+        let resolved_before = MODEL_STATUS.get().is_some();
+        let _ = failure_reason();
+        assert_eq!(
+            MODEL_STATUS.get().is_some(),
+            resolved_before,
+            "reading why the embedder failed resolved the cell that loads it. A `get_or_init` \
+             here turns a health poll into a model load, which is the defect this accessor \
+             exists to avoid"
+        );
     }
 
     #[test]
