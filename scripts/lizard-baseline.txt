@@ -18,8 +18,8 @@ src/calibrate_cli.rs::run_cli:70 20
 # Same cause as the four setup_agent.rs entries further down. Exact number, no
 # margin: the ratchet has to fail the next increase too.
 # Owner: mejorador 0.27.
-src/cli.rs::run_delete:258 15
-src/cli.rs::run_save:188 10
+src/cli.rs::run_delete:260 15
+src/cli.rs::run_save:190 10
 src/cli.rs::run_search:68 15
 src/codegraph/mod.rs::walk:88 14
 src/codegraph/python_lang.rs::walk:27 11
@@ -115,11 +115,11 @@ src/handlers/sync.rs::resolve_conflict:843 14
 src/handlers/sync.rs::validate_bundle:1659 36
 src/handlers/vigia.rs::health:100 12
 src/handlers/zafra.rs::handle:76 35
-src/hooks_cli.rs::install:167 14
-src/hooks_cli.rs::merge_driver:356 18
-src/hooks_cli.rs::merge_episode_file:453 9
-src/hooks_cli.rs::remove_gitattributes_line:132 9
-src/hooks_cli.rs::remove_hook_block:261 9
+src/hooks_cli.rs::install:195 14
+src/hooks_cli.rs::merge_driver:383 18
+src/hooks_cli.rs::merge_episode_file:480 9
+src/hooks_cli.rs::remove_gitattributes_line:160 9
+src/hooks_cli.rs::remove_hook_block:288 9
 src/http.rs::dispatch_one:1194 12
 src/http.rs::mcp_endpoint:1053 13
 src/http.rs::serve_pool:191 11
@@ -170,6 +170,6 @@ src/setup_agent.rs::run_check:153 24
 src/setup_agent.rs::run_hook:526 21
 src/setup_agent.rs::run_write:273 22
 src/skills_cli.rs::run_cli:61 19
-src/sync/paths.rs::resolve_dir:49 11
+src/sync/paths.rs::resolve_dir:54 11
 src/sync_cli.rs::run_cli:3 11
 src/tunnel_cli.rs::run_cli:109 11

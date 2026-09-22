@@ -368,7 +368,7 @@ Named after Cuban culture. `cuba-memorys` advertises all of them, or set `CUBA_T
 | `CUBA_REM_SCAN_TIMEOUT_SECS` | `90` | Budget for one entity's relation scan |
 | `CUBA_REM_EXTRACTION_BATCH` | `5` | Observations the REM cycle runs `cuba_ingesta auto_extract` over per pass, right after the relation scan. `0` skips it. What it finds is written `trust=quarantined`, always — this is the graph's only fully unattended writer, so nothing it produces is visible to `cuba_faro` until `cuba_eco action=promote` clears it by hand |
 | `CUBA_REM_BACKFILL_LIMIT` | `100` | Observations without an embedding that the REM cycle backfills per pass. `0` disables the backfill; a negative value leaves the default |
-| `CUBA_SYNC_DIR` | unset → `.cuba-memorys` under the working directory | Root for `cuba_sync` export/import. It is also the confinement boundary: a `--dir` outside this root is refused, so setting it is how you sync somewhere else instead of escaping with `../` |
+| `CUBA_SYNC_DIR` | unset → `.memory-industry` under the working directory, or `.cuba-memorys` when that one already exists and the preferred one does not | Root for `cuba_sync` export/import. It is also the confinement boundary: a `--dir` outside this root is refused, so setting it is how you sync somewhere else instead of escaping with `../` |
 | `CUBA_UNDO_DIR` | `~/.cache/memory-industry/undo`, or `~/.cache/cuba-memorys/undo` when that one already exists | Where destructive CLI commands write their undo snapshots. Set explicitly, it is read before the home directory is resolved, so it keeps working on a machine where neither `HOME` nor `USERPROFILE` is defined |
 
 ---

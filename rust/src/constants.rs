@@ -406,7 +406,7 @@ pub fn tool_definitions() -> &'static Vec<Value> {
         ),
         tool_def(
             "cuba_sync",
-            "Git-friendly export/import of the knowledge graph between machines that share no database. export/import/diff/status work on a local directory (default ./.cuba-memorys/); pull/notify/fetch/conflicts/resolve talk to a peer over HTTP with CUBA_PEER_TOKEN.",
+            "Git-friendly export/import of the knowledge graph between machines that share no database. export/import/diff/status work on a local directory, ./.memory-industry/ by default and otherwise as the dir parameter describes; pull/notify/fetch/conflicts/resolve talk to a peer over HTTP with CUBA_PEER_TOKEN.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -421,7 +421,7 @@ pub fn tool_definitions() -> &'static Vec<Value> {
                     "manifest_hash": {"type": "string", "description": "notify only: the bundle hash this notice refers to"},
                     "limit": {"type": "integer", "description": "pull only: max files per page"},
                     "offset": {"type": "integer", "description": "pull only: index of the first bundle file to return"},
-                    "dir": {"type": "string", "description": "Directory override (default $CUBA_SYNC_DIR or ./.cuba-memorys/)"},
+                    "dir": {"type": "string", "description": "Directory override. Without it: $CUBA_SYNC_DIR if set, else ./.memory-industry/ — or ./.cuba-memorys/ on a repo that already has that older directory"},
                     "scope": {"type": "string", "enum": ["project", "all"], "description": "Export scope: active project only (default) or all data"},
                     "with_embeddings": {"type": "boolean", "description": "Include embeddings (default false on export, true on pull)"},
                     "conflict": {"type": "string", "enum": ["merge", "skip", "overwrite"], "description": "How to resolve a row that exists on both sides (default merge; merge and skip keep local content, overwrite takes the incoming version)"},

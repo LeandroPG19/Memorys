@@ -26,8 +26,9 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         Some("-h") | Some("--help") | None => {
             eprintln!(
                 "usage: memory-industry hook <install|uninstall> [--with-codegraph]\n\n\
-                 Wires this repo's git so the knowledge graph under .cuba-memorys/\n\
-                 (or $CUBA_SYNC_DIR) stays in sync automatically:\n\
+                 Wires this repo's git so the knowledge graph stays in sync automatically.\n\
+                 It lives in .memory-industry/, or in .cuba-memorys/ on a repo that already\n\
+                 has that older directory; $CUBA_SYNC_DIR overrides both:\n\
                  \x20 - post-commit  runs `sync export` after every commit\n\
                  \x20 - post-checkout runs `sync import` after checkout/branch switch\n\
                  \x20 - a git merge driver that unions observations/relations/entities\n\
@@ -710,29 +711,39 @@ mod tests {
     /// A stand-in for a repo root. `install()` writes `.gitattributes` at the git
     /// top level, and `sync export` resolves its own directory against the working
     /// directory, which git sets to that same top level when it runs a hook. So a
-    /// single directory is both halves of the question these three tests ask.
+    /// single directory is both halves of the question these tests ask.
     fn scratch_root(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cuba-attrs-{label}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    /// The directory a `.gitattributes` line actually hands to the merge driver,
-    /// read the way git reads the pattern: relative to the file's own directory.
+    /// The directory a `.gitattributes` line names, spelled exactly as the line
+    /// spells it.
     ///
     /// The shape is checked here rather than asserted on, because it is load-bearing
     /// in the other direction too: `remove_gitattributes_line` uninstalls by dropping
     /// every line that ends in `/** merge=cuba-memorys`, so a line written in any
     /// other shape is a line `hook uninstall` leaves behind for ever.
-    fn directory_covered_by(line: &str, root: &Path) -> PathBuf {
+    fn directory_named_by(line: &str) -> &str {
         let suffix = format!(" merge={MERGE_DRIVER_NAME}");
         let pattern = line.strip_suffix(&suffix).unwrap_or_else(|| {
             panic!("the line must end in `{suffix}`, or uninstall cannot find it again: {line}")
         });
-        let dir = pattern.strip_suffix("/**").unwrap_or_else(|| {
+        pattern.strip_suffix("/**").unwrap_or_else(|| {
             panic!("the pattern must cover a whole directory, `<dir>/**`: {pattern}")
-        });
-        root.join(dir)
+        })
+    }
+
+    /// The directory a `.gitattributes` line actually hands to the merge driver,
+    /// read the way git reads the pattern: relative to the file's own directory.
+    ///
+    /// Resolving against the root answers *which* directory and deliberately cannot
+    /// answer *how it was written*, because `Path::join` drops the base when what it
+    /// is handed is already absolute. That second question has its own test, on
+    /// `directory_named_by` directly.
+    fn directory_covered_by(line: &str, root: &Path) -> PathBuf {
+        root.join(directory_named_by(line))
     }
 
     #[test]
@@ -807,6 +818,38 @@ mod tests {
              directories sitting in this repo is the one being written. Both of them were \
              created here on purpose, so that an implementation which looks at the disk \
              instead of at the configured root is caught rather than flattered"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_pattern_is_written_relative_the_only_way_git_can_read_one() {
+        let root = scratch_root("relative");
+
+        let line = gitattributes_line(&root, None);
+        let named = directory_named_by(&line);
+
+        assert!(
+            Path::new(named).is_relative(),
+            "git matches a `.gitattributes` pattern against paths relative to the directory \
+             the file sits in, and has no syntax for an absolute one: a pattern starting at \
+             the filesystem root matches nothing the repo contains. `default_sync_dir` hands \
+             back `root.join(..)`, so the directory arrives here absolute and the only thing \
+             between it and a pattern that covers no file at all is stripping the root back \
+             off. The three tests above cannot see this, and that is not an oversight in them \
+             — they resolve the pattern with `root.join`, which throws the base away when it \
+             is handed something already absolute, so both spellings come back as the same \
+             directory and both look right. Asserting on the absence of a drive letter or of \
+             a leading slash would only name whichever shape this machine's temp dir happens \
+             to take; `is_relative` is the one question that means the same thing on Windows \
+             and on Linux. Got `{named}` for root {root:?}"
+        );
+        assert_eq!(
+            root.join(named),
+            crate::sync::paths::default_sync_dir(&root),
+            "and read back against the root it must still land on the directory sync writes \
+             to: relative is only half the contract, a pattern can be relative and wrong"
         );
 
         std::fs::remove_dir_all(&root).ok();
