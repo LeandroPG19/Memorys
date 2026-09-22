@@ -44,12 +44,6 @@ fn every_machine_state() -> Vec<(Option<&'static str>, bool, bool, GpuStatus)> {
     rows
 }
 
-/// A build with no GPU feature never looks for the provider libraries, so two
-/// of the eight rows describe a machine no binary can observe.
-fn observable(compiled: Option<&str>, runtime_gpu: bool) -> bool {
-    compiled.is_some() || !runtime_gpu
-}
-
 fn read(relative: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -60,23 +54,19 @@ fn read(relative: &str) -> String {
 }
 
 #[test]
-fn every_machine_state_a_binary_can_measure_reads_differently_from_the_others() {
+fn every_machine_state_reads_differently_from_every_other() {
     let rows = every_machine_state();
-    let measurable: Vec<_> = rows
-        .iter()
-        .filter(|(compiled, runtime_gpu, _, _)| observable(*compiled, *runtime_gpu))
-        .collect();
     assert_eq!(
-        measurable.len(),
-        6,
-        "eight combinations, two of them unobservable — if that count moved, the measurement \
-         changed and the pair below is no longer the one being excused"
+        rows.len(),
+        8,
+        "eight combinations and no exceptions left. Two of them used to be excused as \
+         unobservable, because a build with no GPU feature reported the provider libraries \
+         absent without looking; it looks now, so a count under eight here means a row was \
+         dropped rather than answered"
     );
 
-    for (index, (compiled, runtime_gpu, device_present, status)) in measurable.iter().enumerate() {
-        for (other_compiled, other_runtime, other_device, other) in
-            measurable.iter().skip(index + 1)
-        {
+    for (index, (compiled, runtime_gpu, device_present, status)) in rows.iter().enumerate() {
+        for (other_compiled, other_runtime, other_device, other) in rows.iter().skip(index + 1) {
             assert_ne!(
                 status.detail, other.detail,
                 "two machines that need different fixes say the same sentence: \
@@ -92,17 +82,35 @@ fn every_machine_state_a_binary_can_measure_reads_differently_from_the_others() 
 }
 
 #[test]
-fn a_build_without_gpu_support_says_nothing_about_a_runtime_it_never_looks_for() {
-    for device_present in [false, true] {
-        assert_eq!(
-            status_from(None, true, device_present).detail,
-            status_from(None, false, device_present).detail,
-            "a binary compiled without a GPU feature cannot load a provider library whatever \
-             is on disk, and it does not go looking. Making these two read differently would \
-             put a claim about the runtime in front of an operator that nothing in this \
-             process measured — the exact shape of the bug the rest of this file forbids"
-        );
-    }
+fn a_build_without_gpu_support_says_whether_the_runtime_is_already_on_disk() {
+    let only_the_build_left = status_from(None, true, true);
+    let both_still_missing = status_from(None, false, true);
+
+    assert_ne!(
+        only_the_build_left.detail, both_still_missing.detail,
+        "these two read identically until this release, because the arm that answers them \
+         never looked for the provider libraries. An operator with a card could not tell \
+         whether `build-gpu.sh` was the last step or the first of two, and the only way to \
+         find out was to do both"
+    );
+    assert!(
+        only_the_build_left.detail.contains("runtime GPU"),
+        "the row where the runtime is already down has to say so, or the sentences differ \
+         without the difference being the one that saves the trip: {}",
+        only_the_build_left.detail
+    );
+    assert!(
+        !both_still_missing.detail.contains("runtime"),
+        "and the row where it is not must not mention it, or both sentences claim the same \
+         thing about disk and the operator is back to guessing: {}",
+        both_still_missing.detail
+    );
+    assert_eq!(
+        only_the_build_left.hint.as_deref(),
+        Some("./scripts/build-gpu.sh"),
+        "a better diagnosis with no exit is worse than the collapsed one. The build is still \
+         what this machine is missing, and the hint is still where the operator goes"
+    );
 }
 
 #[test]
@@ -137,6 +145,15 @@ fn degraded_is_true_exactly_when_the_machine_cannot_do_what_the_binary_was_built
             // CPU machine reporting degraded would light up `doctor` on every
             // install that never wanted a GPU, and a warning everybody has
             // learned to ignore is how the real one gets missed.
+            //
+            // `runtime_gpu` is measured on this branch now and still does not
+            // enter: provider libraries on disk with no card are unused bytes,
+            // not a degradation. The exit `doctor` would offer is
+            // `./scripts/build-gpu.sh`, which builds --features cuda, so
+            // sending a machine nvidia-smi cannot see there is the wrong trip
+            // in the other direction. It changes the *sentence*, which is what
+            // the operator reads, and not the flag, which is what `doctor`,
+            // `/health` and `mode::rerank_gpu_active` branch on.
             None => device_present,
         };
         assert_eq!(
@@ -174,11 +191,15 @@ fn every_answer_that_is_not_the_card_names_the_cpu_the_work_landed_on() {
 fn the_gate_step_self_tests_against_sentences_this_code_still_produces() {
     let script = read("scripts/gpu-placement-check.sh");
 
-    // The whole sentence, for the three the script pins verbatim.
+    // The whole sentence, for the four the script pins verbatim. The last one
+    // is the state the script could not see before: its `machine_can_gpu` fused
+    // the provider libraries and the card into one bit, so a machine with the
+    // runtime down and no card was indistinguishable from one with neither.
     for produced in [
         status_from(Some(PROVIDER), true, false).detail,
         status_from(Some(PROVIDER), false, true).detail,
         status_from(None, false, false).detail,
+        status_from(None, true, false).detail,
     ] {
         assert!(
             script.contains(&produced),

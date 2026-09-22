@@ -323,11 +323,29 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #
           #   serve_pool        binds a socket and serves forever. --lib never
           #                     starts a daemon. Same class as the handlers.
-          #   gpu_availability  two cfg variants. configure does call it, but on
-          #                     the gate's build wants_gpu is false and
-          #                     cpu_reason discards its other two arguments in
-          #                     that first branch, so nothing observes the
-          #                     answer. cpu_reason itself has a table.
+          #   gpu_availability  two cfg variants, and this build now calls it from
+          #                     both configure and status. Neither observes the
+          #                     answer. In configure, wants_gpu is false here, so
+          #                     cpu_reason returns on its first branch and discards
+          #                     the other two arguments. In status, every value of
+          #                     the pair yields one of the four sentences
+          #                     status_from can honestly produce, and
+          #                     status_reports_the_provider_this_binary_was_compiled_with
+          #                     accepts all four on purpose: it judges the provider
+          #                     argument, not the measurement. The two halves it
+          #                     composes are judged apart, which is what this
+          #                     release changed. runtime_has_gpu_provider is
+          #                     compiled in this build now and has
+          #                     a_provider_library_beside_the_runtime_is_what_makes_it_a_gpu_runtime,
+          #                     which puts a provider library on disk and takes it
+          #                     away. nvidia_driver_present has nothing under --lib:
+          #                     it reads PATH and /proc, and a test that moved PATH
+          #                     would move it for every other test in the binary,
+          #                     including the ones that spawn git. It is judged by
+          #                     scripts/gpu-placement-check.sh, which reads the same
+          #                     two places on the same machine and fails the gate on
+          #                     the contradiction — a real judge, but not one the
+          #                     mutation build can reach. Declared, not covered.
           #   cuda_provider     #[cfg(feature = "cuda")]; not compiled here.
           #   apply             writes the process-wide environment, which every
           #                     other test in the binary reads. That is exactly
@@ -407,11 +425,6 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     Some("xyzzy"), which
           #                     status_reports_the_provider_this_binary_was_compiled_with
           #                     kills. Delete that test and those two go red.
-          #   gpu.rs.*runtime_dir
-          #                     carries #[cfg(any(feature = "cuda", feature =
-          #                     "directml"))], so it is not compiled here at
-          #                     all. It entered the diff only because this
-          #                     release added a comment inside it.
           #   http.rs.*compiled_gpu_provider.*with None
           #                     the same case in the other file, and the tail is
           #                     load-bearing for the same reason: its two
@@ -469,7 +482,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
             in_diff=(--in-diff "$diff_file")
           fi
           (cd rust && cargo mutants "${files[@]}" "${in_diff[@]}" \
-            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|gpu.rs.*runtime_dir|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false' \
+            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false' \
             --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || fail=1
           rm -f "$diff_file"
         fi

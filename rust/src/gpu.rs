@@ -1,6 +1,5 @@
 use anyhow::Result;
 use ort::session::builder::SessionBuilder;
-#[cfg(any(feature = "cuda", feature = "directml"))]
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,18 +115,22 @@ fn gpu_availability() -> (bool, bool) {
     };
     (
         runtime_has_gpu_provider(provider),
-        provider != "cuda" || nvidia_present(),
+        provider != "cuda" || nvidia_driver_present(),
     )
 }
 
 #[cfg(not(any(feature = "cuda", feature = "directml")))]
 fn gpu_availability() -> (bool, bool) {
-    // No provider library this build could load, whatever is on disk — so the
-    // first half is false by construction, not by measurement. The card is
-    // measured: a machine with a GPU running a CPU binary is the one thing
-    // worth saying from here, and `status()` used to probe it separately
-    // inside a `cfg` arm of its own.
-    (false, nvidia_driver_present())
+    // Both halves measured, including the one this build cannot use. It could
+    // not load either provider library, but it can see whether they are on
+    // disk, and that is the difference between an operator who still has to
+    // download the runtime and one who only has to build — two trips or one.
+    // The probe costs two `Path::exists` calls and no dependency: `ort` is
+    // linked unconditionally and neither function below touches it.
+    (
+        runtime_has_gpu_provider("cuda") || runtime_has_gpu_provider("directml"),
+        nvidia_driver_present(),
+    )
 }
 
 /// Takes a factory rather than a builder: when the GPU provider refuses to
@@ -284,32 +287,14 @@ fn compiled_provider() -> Option<&'static str> {
 /// this whole path exists for was never a kernel landing on the wrong device,
 /// it was a machine being told the wrong reason and the operator fixing the
 /// wrong thing. `compiled` carries the provider name rather than a bare flag
-/// because the name is in four of the six messages, and taking it as a value
+/// because the name is in half of the eight messages, and taking it as a value
 /// is what keeps `cfg!` out of here entirely.
 ///
 /// The one thing it reads beyond its arguments is `placement_summary()`, on
 /// the single row where nothing is missing.
 pub fn status_from(compiled: Option<&str>, runtime_gpu: bool, device_present: bool) -> GpuStatus {
     let Some(provider) = compiled else {
-        // `runtime_gpu` is deliberately unread here. A build with no GPU
-        // feature never looks for the provider libraries — the `cfg(not(..))`
-        // arm of `gpu_availability` reports them absent without checking — so
-        // `true` on this branch describes a machine this binary cannot
-        // observe, and a sentence about it would be a claim nothing measured.
-        if device_present {
-            return GpuStatus {
-                degraded: true,
-                detail: "hay una GPU NVIDIA en esta máquina pero el binario se compiló sin \
-                         soporte — el embebedor corre en CPU y cada búsqueda cuesta ~9x más"
-                    .to_string(),
-                hint: Some("./scripts/build-gpu.sh".to_string()),
-            };
-        }
-        return GpuStatus {
-            degraded: false,
-            detail: "cpu (compilado sin soporte GPU)".to_string(),
-            hint: None,
-        };
+        return status_without_a_gpu_build(runtime_gpu, device_present);
     };
 
     match (runtime_gpu, device_present) {
@@ -355,6 +340,56 @@ pub fn status_from(compiled: Option<&str>, runtime_gpu: bool, device_present: bo
     }
 }
 
+/// The four machines a binary built without any GPU feature can find itself on.
+///
+/// `runtime_gpu` is a measurement here, not the constant it used to be: this
+/// build cannot load a provider library, but looking for one costs a
+/// `Path::exists` and tells the operator which half of the work is left. While
+/// the two rows collapsed, a machine with the runtime already downloaded read
+/// exactly like one with nothing at all, and the only way to find out which
+/// was to do both steps.
+///
+/// Kept out of `status_from` because it answers a different question — what a
+/// CPU build can say — and inlining it put six arms and a let-else in one
+/// function for no reader's benefit.
+fn status_without_a_gpu_build(runtime_gpu: bool, device_present: bool) -> GpuStatus {
+    match (runtime_gpu, device_present) {
+        (true, true) => GpuStatus {
+            degraded: true,
+            detail: "hay una GPU NVIDIA y el runtime GPU ya instalado, pero el binario se \
+                     compiló sin soporte — solo falta la build: el embebedor corre en CPU y \
+                     cada búsqueda cuesta ~9x más"
+                .to_string(),
+            hint: Some("./scripts/build-gpu.sh".to_string()),
+        },
+        (false, true) => GpuStatus {
+            degraded: true,
+            detail: "hay una GPU NVIDIA en esta máquina pero el binario se compiló sin \
+                     soporte — el embebedor corre en CPU y cada búsqueda cuesta ~9x más"
+                .to_string(),
+            hint: Some("./scripts/build-gpu.sh".to_string()),
+        },
+        // Not degraded and no hint, on purpose. Nothing is being wasted here —
+        // there is no card — and the one exit this repo has, `build-gpu.sh`,
+        // builds `--features cuda`, so pointing a machine nvidia-smi cannot see
+        // at it is the wrong trip in the other direction. The sentence still
+        // reports what is on disk, because that is what nobody could see
+        // before.
+        (true, false) => GpuStatus {
+            degraded: false,
+            detail: "cpu — el runtime GPU está instalado pero no hay GPU NVIDIA visible, y \
+                     este binario tampoco se compiló con soporte"
+                .to_string(),
+            hint: None,
+        },
+        (false, false) => GpuStatus {
+            degraded: false,
+            detail: "cpu (compilado sin soporte GPU)".to_string(),
+            hint: None,
+        },
+    }
+}
+
 pub fn status() -> GpuStatus {
     let (runtime_gpu, device_present) = gpu_availability();
     status_from(compiled_provider(), runtime_gpu, device_present)
@@ -364,7 +399,6 @@ pub fn active_provider() -> String {
     status().detail
 }
 
-#[cfg(any(feature = "cuda", feature = "directml"))]
 fn runtime_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
         return PathBuf::from(p).parent().map(|p| p.to_path_buf());
@@ -385,7 +419,6 @@ fn runtime_dir() -> Option<PathBuf> {
     })
 }
 
-#[cfg(any(feature = "cuda", feature = "directml"))]
 fn runtime_has_gpu_provider(provider: &str) -> bool {
     let Some(dir) = runtime_dir() else {
         return false;
@@ -407,23 +440,13 @@ fn runtime_has_gpu_provider(provider: &str) -> bool {
     candidates.iter().any(|name| dir.join(name).exists())
 }
 
-#[cfg_attr(any(feature = "cuda", feature = "directml"), allow(dead_code))]
+/// Is there a card to talk to: the driver's own file, or `nvidia-smi` on PATH.
+///
+/// One function, called from both arms of `gpu_availability`. It used to be two
+/// byte-identical twins under opposite `cfg`s, which meant neither could ever
+/// be told apart from the other by a test or by a mutant — the same argument
+/// that collapsed `restrict` into one body in 0.27.
 fn nvidia_driver_present() -> bool {
-    if std::path::Path::new("/proc/driver/nvidia/version").exists() {
-        return true;
-    }
-    let exe = if cfg!(windows) {
-        "nvidia-smi.exe"
-    } else {
-        "nvidia-smi"
-    };
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|p| p.join(exe).exists()))
-        .unwrap_or(false)
-}
-
-#[cfg(feature = "cuda")]
-fn nvidia_present() -> bool {
     if std::path::Path::new("/proc/driver/nvidia/version").exists() {
         return true;
     }
@@ -689,11 +712,12 @@ mod placement_tests {
         );
     }
 
-    /// Compiled out with the rest of the provider probe when no GPU feature is
-    /// on, so the mutation gate — which builds without one — cannot observe
-    /// this decision at all. It runs under
-    /// `cargo test --release --features cuda --lib gpu::`.
-    #[cfg(any(feature = "cuda", feature = "directml"))]
+    /// It used to be compiled out with the rest of the provider probe when no
+    /// GPU feature was on, so the mutation gate — which builds without one —
+    /// could not observe this decision at all, and `gpu.rs.*runtime_dir` sat in
+    /// the exclusions of `quality-gate.sh` saying exactly that. The probe is
+    /// measured in every build now, so this runs in every build, and that
+    /// exclusion was deleted the same day.
     #[tokio::test]
     async fn a_runtime_downloaded_under_the_old_name_survives_the_rename() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
@@ -745,6 +769,70 @@ mod placement_tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The half of the availability probe that is a filesystem question.
+    ///
+    /// It decides whether an operator is sent to download a runtime they
+    /// already have, and since this release a build with no GPU feature asks it
+    /// too — which is the only reason the two `compiled = None` rows stopped
+    /// reading the same. `cargo mutants -- --lib` builds exactly that build, so
+    /// `replace runtime_has_gpu_provider -> bool with true` had nothing to kill
+    /// it until this existed.
+    ///
+    /// `ORT_DYLIB_PATH` rather than `HOME`: it is the branch `run-all-tests.sh`
+    /// takes, and it pins the directory without depending on which of the two
+    /// cache names happens to exist on the machine running the suite.
+    #[tokio::test]
+    async fn a_provider_library_beside_the_runtime_is_what_makes_it_a_gpu_runtime() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let dir = std::env::temp_dir().join(format!(
+            "memory-industry-provider-lib-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("the test owns this directory");
+        let _explicit = ScopedEnv::set(
+            "ORT_DYLIB_PATH",
+            &dir.join("onnxruntime.dll").display().to_string(),
+        );
+
+        assert!(
+            !runtime_has_gpu_provider("cuda"),
+            "an ONNX Runtime unpacked without --gpu is the library and nothing beside it. \
+             Answering true there is how a machine is told its runtime is the GPU one and \
+             then runs every search on the CPU"
+        );
+        assert!(
+            !runtime_has_gpu_provider("directml"),
+            "and the same for the other provider, or an empty directory would answer yes to \
+             one of the two questions and the emptiness would never be the reason"
+        );
+
+        // One of the four names, not four: the loader needs one, and a check
+        // that wanted all of them would report absent on every real install.
+        std::fs::write(dir.join("onnxruntime_providers_cuda.dll"), b"")
+            .expect("the test owns this file");
+        assert!(
+            runtime_has_gpu_provider("cuda"),
+            "one provider library is what the loader opens; the four names are that same \
+             library spelled for four platforms"
+        );
+        assert!(
+            !runtime_has_gpu_provider("directml"),
+            "the two lists have to stay apart. Merged, a CUDA-only runtime would report \
+             DirectML present, and a Windows box would be told it has a provider it cannot \
+             load"
+        );
+
+        std::fs::write(dir.join("DirectML.dll"), b"").expect("the test owns this file");
+        assert!(
+            runtime_has_gpu_provider("directml"),
+            "DirectML ships its own library instead of an onnxruntime_providers_* one, which \
+             is the whole reason that name is in the list"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

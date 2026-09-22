@@ -130,22 +130,39 @@ nvidia_device_present() {
   return 1
 }
 
-# Same shape as gpu_availability() in rust/src/gpu.rs, for both feature sets:
-# CUDA needs the provider libraries and a card, DirectML needs only its own.
+# The eight names of rust/src/gpu.rs, one list per provider. Split out of
+# machine_can_gpu because gpu_availability() stopped fusing its two halves: a
+# build with no GPU feature reports the libraries and the card separately now,
+# so a machine that downloaded the runtime and has no card is no longer the
+# same answer as a machine with neither.
+cuda_provider_lib_present() {
+  provider_lib_present libonnxruntime_providers_cuda.so \
+                       onnxruntime_providers_cuda.dll \
+                       libonnxruntime_providers_cuda.dylib \
+                       onnxruntime_providers_cuda.so
+}
+
+dml_provider_lib_present() {
+  provider_lib_present onnxruntime_providers_dml.dll \
+                       DirectML.dll \
+                       libonnxruntime_providers_dml.so \
+                       onnxruntime_providers_dml.so
+}
+
+# Could a kernel actually land on a card here: CUDA needs both halves, DirectML
+# needs only its own libraries.
+#
+# `verdict` still takes this one fused bit, and that is the honest shape for it.
+# Judging the library half on its own from here would mean knowing which
+# provider the binary was built against — the crate looks for one, not both —
+# and a CUDA build on a box holding only the DirectML libraries would read as a
+# contradiction that is not one. This script sees the answer, never the build.
 machine_can_gpu() {
-  if provider_lib_present libonnxruntime_providers_cuda.so \
-                          onnxruntime_providers_cuda.dll \
-                          libonnxruntime_providers_cuda.dylib \
-                          onnxruntime_providers_cuda.so; then
-    if nvidia_device_present; then
-      printf '1\n'
-      return 0
-    fi
+  if cuda_provider_lib_present && nvidia_device_present; then
+    printf '1\n'
+    return 0
   fi
-  if provider_lib_present onnxruntime_providers_dml.dll \
-                          DirectML.dll \
-                          libonnxruntime_providers_dml.so \
-                          onnxruntime_providers_dml.so; then
+  if dml_provider_lib_present; then
     printf '1\n'
     return 0
   fi
@@ -260,6 +277,7 @@ self_test() {
   local no_card="compilado con cuda, pero no detecté GPU NVIDIA → corriendo en CPU"
   local no_runtime="compilado con cuda, pero el runtime instalado es el de CPU → corriendo en CPU"
   local cpu_build="cpu (compilado sin soporte GPU)"
+  local runtime_no_card="cpu — el runtime GPU está instalado pero no hay GPU NVIDIA visible, y este binario tampoco se compiló con soporte"
 
   echo "=== gpu-placement-check --self-test ==="
 
@@ -274,6 +292,8 @@ self_test() {
 
   must_pass "a machine with no card, on a build without GPU support, reporting CPU" \
     0 unset ok "$cpu_build" "" || bad=1
+  must_pass "a machine that downloaded the GPU runtime and has no card to use it with" \
+    0 unset ok "$runtime_no_card" "" || bad=1
   must_pass "a CUDA build on a machine whose runtime was installed without the providers" \
     0 gpu warn "$no_runtime" "memory-industry models runtime --gpu" || bad=1
   must_pass "a real GPU machine placing the reranker where it was asked to" \
