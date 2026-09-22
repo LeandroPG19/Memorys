@@ -605,6 +605,41 @@ fn the_gpu_placement_check_can_actually_fail() {
     );
 }
 
+/// One gate at a time, held by something that can refuse.
+///
+/// On 2026-09-22 the SIL went red with `database "brain_gate" does not exist`
+/// in tests/integration.rs, minutes after the gate had created it. An orphaned
+/// earlier run had finished and its EXIT trap dropped the database from under
+/// the new one. The rule "one gate at a time" was a sentence; a second run is
+/// now refused by a lock that names the first, and an exit drops only the
+/// databases that still carry its own record. The `--self-test` builds each
+/// case with real processes, and ends by launching the script itself as a
+/// second gate against a live one.
+#[test]
+fn a_second_gate_is_refused_and_an_exit_drops_only_its_own_databases() {
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/run-all-tests.sh", "--self-test"])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "run-all-tests.sh --self-test did not pass, so a second gate can start next to a \
+         live one again, or an exiting gate can drop a database it did not create. \
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Same anchor as the other self-tests: the mode's label, which only its
+    // verdicts print.
+    assert!(
+        stdout.contains("self-test:"),
+        "the self-test exited 0 without saying it ran. Without the mode, this script \
+         ignores the flag and starts a whole gate. stdout: {stdout}"
+    );
+}
+
 fn looks_absolute(path: &str) -> bool {
     if path.starts_with('/') {
         return true;

@@ -24,6 +24,11 @@ qg_mutants_jobs() {
   echo "$half"
 }
 
+# Every --exclude-re entry of the mutation step, in one place so that the
+# exclusion checks below read exactly what the mutation run is handed. Each
+# entry's reason, owner and expiry date are in the comment over that step.
+MUTANTS_EXCLUDE_RE='fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false|src/redact\.rs:110:63: replace > with >= in credentials_in_url|src/redact\.rs:130:58: replace > with >= in secret_field|src/redact\.rs:136:51: replace \+ with \* in secret_field|src/cognitive/nli\.rs:.*replace enabled -> bool with |src/cognitive/nli\.rs:.*replace status_resolved -> bool with false|src/cognitive/nli\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace compute_embedding -> Result<Vec<f32>> with Ok\(vec!|src/http\.rs:1462:24: replace && with \|\| in embedder_state|src/(calibrate_cli|dashboard|dedupe_cli|export|link_cli|reembed_cli|rem_cli|secure_cli|skills_cli|sync_cli|eval/mod)\.rs:.*replace run_cli -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace print_help with \(\)|src/setup\.rs:.*replace log with \(\)|src/dashboard\.rs:.*replace render -> Result<String> with |src/search/calibrate\.rs:.*replace load_ood_threshold -> Option<f64> with |src/export\.rs:.*replace export_obsidian -> Result<usize> with |src/db\.rs:.*replace assert_embedding_dim -> Result<\(\)> with Ok\(\(\)\)|src/dedupe_cli\.rs:.*replace merge_by_name -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace run_rem_consolidation_locked -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace download_(model|runtime) -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace spawn_handshake_watchdog with \(\)|src/embeddings/onnx\.rs:.*replace locate_onnxruntime -> Option<PathBuf> with Some\(Default::default\(\)\)'
+
 echo "=== quality-gate (MemoryIndustry — CRAP/lizard + mutación del diff) ==="
 echo "NO MIRA: SIL (fmt, clippy -D, tests --ignored, e2e, deny, audit, codigo-muerto, crap-gate floor, mutants-gate mmr/rrf/cache)."
 echo "NO CORRE: ./scripts/merge-gate.sh"
@@ -159,6 +164,65 @@ run_lizard() {
   return 0
 }
 
+# --- the exclusions judge themselves ------------------------------------------
+# verificacion.md: every exception carries a reason, an owner and an expiry
+# date, and goes red when it expires or stops being used. The dates were in the
+# comments over the mutation step from 0.27 on, and nothing read them: the day
+# one passed, nothing would have happened.
+#
+# A comment line that names an owner has to carry the date on that same line.
+# One group had the date wrapped onto the next line, and a reader that only
+# looks for dates would walk straight past a group whose date got lost. So a
+# missing date is a finding, not a line to skip. Expiring today is still valid.
+exclusion_expiry_problems() {
+  local file="$1" today="$2"
+  awk -v today="$today" '
+    /^[[:space:]]*#/ && /Owner:|Expires:/ {
+      text = $0
+      sub(/^[[:space:]]*#[[:space:]]*/, "", text)
+      if (match($0, /Expires: [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/)) {
+        date = substr($0, RSTART + 9, 10)
+        if (date < today) printf "%s:%d: expired on %s: %s\n", FILENAME, FNR, date, text
+      } else {
+        printf "%s:%d: no YYYY-MM-DD expiry date on this line: %s\n", FILENAME, FNR, text
+      }
+    }' "$file"
+}
+
+# One alternative per line, split at the top-level `|` only: the `|` inside
+# (model|runtime) and the escaped one in \|\| belong to their alternative.
+# The regex reaches awk through the environment, because `awk -v` would
+# process its backslashes first and turn \| into |.
+exclusion_alternatives() {
+  EXCLUDE_RE="$1" awk 'BEGIN {
+    re = ENVIRON["EXCLUDE_RE"]; depth = 0; in_class = 0; cur = ""
+    for (i = 1; i <= length(re); i++) {
+      c = substr(re, i, 1)
+      if (c == "\\") { cur = cur c substr(re, i + 1, 1); i++; continue }
+      if (in_class) { if (c == "]") in_class = 0 }
+      else if (c == "[") in_class = 1
+      else if (c == "(") depth++
+      else if (c == ")") depth--
+      else if (c == "|" && depth == 0) { print cur; cur = ""; continue }
+      cur = cur c
+    }
+    print cur
+  }'
+}
+
+# The other half of the rule: an exclusion that matches no mutant any more is
+# not excluding anything, and it reads like a cover. A pattern anchored on a
+# line:col goes this way the day its line moves. `cargo mutants --list` names
+# every mutant of the crate without building anything, so this costs seconds.
+# grep -P is the closest thing in bash to the regex crate cargo-mutants uses:
+# both search, unanchored, with the same escapes for every entry here.
+unused_exclusions() {
+  local re="$1" list="$2" alt
+  while IFS= read -r alt; do
+    grep -qP -e "$alt" "$list" || printf '%s\n' "$alt"
+  done < <(exclusion_alternatives "$re")
+}
+
 # --- self-test: the CRAP filter gets a fixture that puts it in the red -------
 # A guard nobody can watch fail is a paragraph. Both directions are here,
 # because absence proves nothing without a presence anchor beside it: a warning
@@ -253,9 +317,94 @@ if [[ "${1:-}" == "--self-test" ]]; then
     exit 1
   fi
 
+  # The expiry reader, judged as if today were 2026-09-22. One line per shape
+  # it has to tell apart: expired yesterday (red), expires today (still valid),
+  # a date wrapped onto the next line (red, on the line that lost it), a line
+  # that is only that wrapped date (nothing to judge), an owner with no date
+  # at all (red), and a string in code that only looks like one (ignored).
+  printf '%s\n' \
+    '# Owner: a. Expires: 2026-09-21.' \
+    '  # Owner: b. Expires: 2026-09-22.' \
+    '# Owner: c. Expires:' \
+    '# 2099-01-01.' \
+    '# Owner: d.' \
+    'echo "# Owner: e. Expires: 2020-01-01."' > "$tmp/expiry.sh"
+  got="$(exclusion_expiry_problems "$tmp/expiry.sh" 2026-09-22)"
+  flagged="$(printf '%s\n' "$got" | sed -nE 's|.*expiry\.sh:([0-9]+):.*|\1|p' | tr '\n' ' ')"
+  if [[ "$flagged" != "1 3 5 " ]]; then
+    echo "FAIL self-test: the expiry reader flagged lines '$flagged', not '1 3 5 ' (got '$got')" >&2
+    exit 1
+  fi
+  if [[ "$got" != *"expired on 2026-09-21: Owner: a."* ]]; then
+    echo "FAIL self-test: an expired exclusion was reported without its date and owner (got '$got')" >&2
+    exit 1
+  fi
+  if [[ "$got" != *"no YYYY-MM-DD expiry date on this line: Owner: c. Expires:"* ]]; then
+    echo "FAIL self-test: a date wrapped onto the next line was not reported as missing (got '$got')" >&2
+    exit 1
+  fi
+
+  # The unused-pattern check. The list is three mutants in the shape
+  # `cargo mutants --list` prints them; the regex has five alternatives, two of
+  # which match nothing: one whose line moved (4:9 against the mutant at 3:9)
+  # and one whose function is gone. The other three carry the two kinds of `|`
+  # that must not split an alternative, a group and an escape.
+  printf '%s\n' \
+    'src/a.rs:10:5: replace f -> bool with false' \
+    'src/b.rs:3:9: replace && with || in g' \
+    'src/c.rs:1:1: replace download_model -> Result<()> with Ok(())' > "$tmp/mutants.txt"
+  re='src/a\.rs:.*replace f -> bool with false|src/b\.rs:3:9: replace && with \|\| in g|src/c\.rs:.*replace download_(model|runtime) -> Result<\(\)> with Ok\(\(\)\)|src/b\.rs:4:9: replace && with \|\| in g|gone_function'
+  alternatives=$(exclusion_alternatives "$re" | wc -l)
+  if (( alternatives != 5 )); then
+    echo "FAIL self-test: a five-entry --exclude-re split into $alternatives alternative(s)" >&2
+    exit 1
+  fi
+  got="$(unused_exclusions "$re" "$tmp/mutants.txt")"
+  want="$(printf '%s\n' 'src/b\.rs:4:9: replace && with \|\| in g' 'gone_function')"
+  if [[ "$got" != "$want" ]]; then
+    echo "FAIL self-test: the unused-exclusion check reported '$got', not the two dead entries" >&2
+    exit 1
+  fi
+
   echo "OK  self-test: the CRAP half reports CC violations, only CC violations, and"
-  echo "    keeps two same-named functions in one file on two separate keys"
+  echo "    keeps two same-named functions in one file on two separate keys; an"
+  echo "    exclusion goes red when it expires, loses its date, or matches no mutant"
   exit 0
+fi
+
+# Before the diff, and whatever the diff holds: an exclusion expires by the
+# calendar, not because somebody touched the file it covers.
+echo "=== exclusions of the mutation step: expiry dates and patterns still in use ==="
+expiry="$(exclusion_expiry_problems "${BASH_SOURCE[0]}" "$(date +%F)")"
+if [[ -n "$expiry" ]]; then
+  echo "FAIL: an exclusion of the mutation step expired, or its date cannot be read:" >&2
+  printf '      %s\n' "$expiry" >&2
+  echo "      Renew it with a reason that is still true today, or delete the pattern." >&2
+  fail=1
+else
+  echo "OK  no exclusion past its date ($(date +%F))"
+fi
+if command -v cargo-mutants >/dev/null || (cd rust && cargo mutants --version >/dev/null 2>&1); then
+  mutant_list="$(mktemp)"
+  if (cd rust && cargo mutants --list) >"$mutant_list" 2>/dev/null && [[ -s "$mutant_list" ]]; then
+    unused="$(unused_exclusions "$MUTANTS_EXCLUDE_RE" "$mutant_list")"
+    if [[ -n "$unused" ]]; then
+      echo "FAIL: these --exclude-re entries match none of the $(wc -l <"$mutant_list") mutants of the crate:" >&2
+      printf '      %s\n' "$unused" >&2
+      echo "      An exclusion that excludes nothing reads like a cover. If its line moved," >&2
+      echo "      re-anchor it; if its function is gone, delete it with its reason." >&2
+      fail=1
+    else
+      echo "OK  every exclusion matches at least one of the $(wc -l <"$mutant_list") mutants of the crate"
+    fi
+  else
+    echo "FAIL: cargo mutants --list printed nothing, so nobody can say which exclusions still match." >&2
+    fail=1
+  fi
+  rm -f "$mutant_list"
+else
+  echo "FALTA cargo-mutants: no se puede saber si cada exclusión sigue casando con algún mutante."
+  [[ $fail -eq 0 ]] && fail=2
 fi
 
 rs=()
@@ -317,7 +466,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           # --file alone mutates the whole file (2315 mutants on the 0.26 tree).
           # --in-diff keeps the second judge on the changed lines.
           #
-          # The entries added to --exclude-re below are not reachable by
+          # The entries of MUTANTS_EXCLUDE_RE (top of this file) are not reachable by
           # `cargo mutants -- --lib`, each for its own reason, and every one of
           # them has its decision tested somewhere the mutation CAN reach:
           #
@@ -442,8 +591,8 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           # day.
           #
           # A fourth group of one, and it is not about a feature flag: it is
-          # the platform this judge runs on. Owner: endurecedor 0.27.
-          # Expires: 2027-03-21.
+          # the platform this judge runs on.
+          # Owner: endurecedor 0.27. Expires: 2027-03-21.
           #
           #   service.rs.*replace restrict -> Result<bool> with Ok.false
           #                     one function with the cfg inside the body: on
@@ -468,8 +617,9 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     a cover: delete it then.
           #
           # A fifth group: the 41 survivors of QG_BASE=73da2d8 (the 0.28 work)
-          # that no --lib test can kill. Owner: endurecedor 0.28. Expires:
-          # 2027-03-22. Every pattern starts at `src/` and names the file in
+          # that no --lib test can kill.
+          # Owner: endurecedor 0.28. Expires: 2027-03-22.
+          # Every pattern starts at `src/` and names the file in
           # full: `db.rs` alone also matches src/graph_db.rs. Every function
           # pattern carries ` -> ` or ` with ` after the name, for the prefix
           # rule above, and ends in the replacement that survived, so the
@@ -532,25 +682,37 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     `in embedder_state` is a prefix of
           #                     `in embedder_state_from`.
           #
-          #   CLI entry points (precedent: serve_pool and the handlers). The
-          #   only thing that runs these binaries is
-          #   cli_contract::every_listed_command_is_actually_dispatched, which
-          #   calls `<cmd> --help` and asserts exit != 2: a body replaced by
-          #   Ok(()) passes it. So:
+          #   CLI entry points (precedent: serve_pool and the handlers). What
+          #   runs these is cli_contract::every_listed_command_is_actually_dispatched,
+          #   in the plain `cargo test` of the SIL (scripts/run-all-tests.sh).
+          #   Since 38e8894 it asks every command in cli::COMMANDS for
+          #   `<cmd> --help` and wants exit 0, a line that starts with
+          #   `memory-industry <cmd>`, and no connection to PostgreSQL. It is an
+          #   integration test that spawns the binary, and this judge runs
+          #   `cargo mutants -- --lib`, so the kill happens where the mutation
+          #   cannot see it. Read in the code at 2b61223, one by one: main.rs
+          #   hands `<cmd> --help` straight to the excluded body, and the usage
+          #   line is printed from inside that body, so a body replaced by
+          #   Ok(()) prints nothing and fails the contract:
           #   run_cli in calibrate_cli, dashboard, export, link_cli, reembed_cli,
-          #   rem_cli, secure_cli, skills_cli, sync_cli
-          #                     judged NOWHERE.
-          #   eval/mod.rs run_cli
-          #                     executed by the eval smoke of the SIL, which
-          #                     checks the exit code only: judged NOWHERE.
+          #   rem_cli, secure_cli, skills_cli, sync_cli, eval/mod
+          #                     judged by that contract. The eval smoke of the
+          #                     SIL also runs eval/mod.rs run_cli, but reads
+          #                     only its exit code, which Ok(()) keeps.
           #   dedupe_cli.rs run_cli
-          #                     judged by the #[ignore] lib tests
+          #                     judged by that contract too, and by the #[ignore]
+          #                     lib tests
           #                     a_hand_verified_merge_moves_everything_and_leaves_an_alias
           #                     and merge_without_into_refuses_instead_of_guessing.
-          #   models_cli.rs print_help, setup.rs log
-          #                     text on a terminal. `models --help` runs the
-          #                     first and nobody reads what it prints: judged
-          #                     NOWHERE.
+          #   models_cli.rs print_help
+          #                     `models --help` reaches it through the
+          #                     "" | "-h" | "--help" | "help" arm of run_cli, and
+          #                     it prints the only line that starts with
+          #                     `memory-industry models`: judged by that contract.
+          #   setup.rs log
+          #                     not the help of any command: it prints the setup
+          #                     messages of resolve_database_url, which the
+          #                     contract forbids --help to reach. Judged NOWHERE.
           #
           #   Needs a database, which --lib has no pool for (precedent:
           #   fetch_adjacency, upsert_symbol, backfill_unscoped):
@@ -599,7 +761,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
             in_diff=(--in-diff "$diff_file")
           fi
           (cd rust && cargo mutants "${files[@]}" "${in_diff[@]}" \
-            --exclude-re 'fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false|src/redact\.rs:110:63: replace > with >= in credentials_in_url|src/redact\.rs:130:58: replace > with >= in secret_field|src/redact\.rs:136:51: replace \+ with \* in secret_field|src/cognitive/nli\.rs:.*replace enabled -> bool with |src/cognitive/nli\.rs:.*replace status_resolved -> bool with false|src/cognitive/nli\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace compute_embedding -> Result<Vec<f32>> with Ok\(vec!|src/http\.rs:1462:24: replace && with \|\| in embedder_state|src/(calibrate_cli|dashboard|dedupe_cli|export|link_cli|reembed_cli|rem_cli|secure_cli|skills_cli|sync_cli|eval/mod)\.rs:.*replace run_cli -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace print_help with \(\)|src/setup\.rs:.*replace log with \(\)|src/dashboard\.rs:.*replace render -> Result<String> with |src/search/calibrate\.rs:.*replace load_ood_threshold -> Option<f64> with |src/export\.rs:.*replace export_obsidian -> Result<usize> with |src/db\.rs:.*replace assert_embedding_dim -> Result<\(\)> with Ok\(\(\)\)|src/dedupe_cli\.rs:.*replace merge_by_name -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace run_rem_consolidation_locked -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace download_(model|runtime) -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace spawn_handshake_watchdog with \(\)|src/embeddings/onnx\.rs:.*replace locate_onnxruntime -> Option<PathBuf> with Some\(Default::default\(\)\)' \
+            --exclude-re "$MUTANTS_EXCLUDE_RE" \
             --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || fail=1
           rm -f "$diff_file"
         fi
