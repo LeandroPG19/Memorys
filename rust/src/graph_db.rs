@@ -927,7 +927,7 @@ pub async fn reconcile_stub(pool: &sqlx::PgPool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envs::ScopedEnv;
+    use crate::envs::{ScopedEnv, scratch_root};
 
     #[test]
     fn cypher_escape_quotes() {
@@ -1023,14 +1023,8 @@ mod tests {
     async fn the_graph_config_hangs_off_the_home_and_is_none_without_one() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
 
-        let chosen = std::env::temp_dir().join(format!(
-            "memory-industry-graph-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let inherited = std::env::temp_dir().join(format!(
-            "memory-industry-graph-userprofile-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let chosen = scratch_root("graph-home");
+        let inherited = scratch_root("graph-userprofile");
 
         {
             let _h = ScopedEnv::set("HOME", &chosen.display().to_string());

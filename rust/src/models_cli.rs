@@ -445,7 +445,7 @@ async fn download_to(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envs::ScopedEnv;
+    use crate::envs::{ScopedEnv, scratch_root};
 
     /// Which cache root `models …` downloads into, pinned before this home
     /// resolution moves to `envs::home()`.
@@ -459,10 +459,7 @@ mod tests {
     async fn the_model_cache_hangs_off_the_home_and_the_error_names_both_names() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
 
-        let root = std::env::temp_dir().join(format!(
-            "memory-industry-model-cache-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = scratch_root("model-cache");
         let cache = root.join(".cache");
         let preferred = cache.join("memory-industry");
         let legacy = cache.join("cuba-memorys");

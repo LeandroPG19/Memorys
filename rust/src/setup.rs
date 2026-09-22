@@ -396,7 +396,7 @@ async fn wait_for_healthy(timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envs::ScopedEnv;
+    use crate::envs::{ScopedEnv, scratch_root};
 
     #[test]
     fn container_status_is_read_correctly() {
@@ -443,8 +443,7 @@ mod tests {
     async fn the_postgres_password_file_hangs_off_the_home_and_is_none_without_one() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
 
-        let root =
-            std::env::temp_dir().join(format!("memory-industry-pgpass-{}", uuid::Uuid::new_v4()));
+        let root = scratch_root("pgpass");
         let cache = root.join(".cache");
         let preferred = cache.join("memory-industry").join("pgpass");
         let legacy = cache.join("cuba-memorys").join("pgpass");

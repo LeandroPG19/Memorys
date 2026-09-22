@@ -681,7 +681,7 @@ mod redaction_tests {
 #[cfg(test)]
 mod config_path_tests {
     use super::*;
-    use crate::envs::ScopedEnv;
+    use crate::envs::{ScopedEnv, scratch_root};
 
     /// Where `llm set` writes and `load_saved_config_into_env` reads, pinned
     /// before this home resolution moves to `envs::home()`.
@@ -694,12 +694,8 @@ mod config_path_tests {
     async fn the_llm_config_hangs_off_the_home_and_the_error_names_both_names() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
 
-        let chosen =
-            std::env::temp_dir().join(format!("memory-industry-llm-home-{}", uuid::Uuid::new_v4()));
-        let inherited = std::env::temp_dir().join(format!(
-            "memory-industry-llm-userprofile-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let chosen = scratch_root("llm-home");
+        let inherited = scratch_root("llm-userprofile");
 
         {
             let _h = ScopedEnv::set("HOME", &chosen.display().to_string());

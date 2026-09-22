@@ -101,6 +101,22 @@ impl Drop for ScopedEnv {
     }
 }
 
+/// A temp path this run owns, for a test that points HOME or USERPROFILE at it.
+///
+/// Nothing is created here, and that is the point: several callers need the
+/// path to stay missing, which is how they prove a reversed HOME/USERPROFILE
+/// order resolves where nothing is. `handlers::sync`'s `scratch` creates, so
+/// it is the wrong helper for them.
+///
+/// The uuid is not decoration. These tests move HOME process-wide and several
+/// end in `remove_dir_all`, so two of them sharing a path would have one
+/// deleting the other's fixture mid-run — and the loser would read as a broken
+/// home resolution rather than as the collision it is.
+#[cfg(test)]
+pub fn scratch_root(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("memory-industry-{tag}-{}", uuid::Uuid::new_v4()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,9 +265,10 @@ mod tests {
             home().expect("HOME answers"),
             PathBuf::from("/home/elegido"),
             "HOME is the one an operator sets on purpose; USERPROFILE is the one the \
-             system sets for them. The other ten sites in this crate order them this \
-             way, and a config written under a different root than the cache is a \
-             second defect"
+             system sets for them. Every site in this crate that needs a home now asks \
+             here, so this order is the only one there is — reverse it and a config \
+             written under a different root than the cache is a second defect, on all \
+             of them at once"
         );
     }
 

@@ -373,7 +373,7 @@ fn classify(premise: &str, hypothesis: &str) -> Result<([f64; 3], bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envs::ScopedEnv;
+    use crate::envs::{ScopedEnv, scratch_root};
 
     #[test]
     fn real_distributions_get_the_right_verdict() {
@@ -482,8 +482,7 @@ mod tests {
     async fn the_nli_cache_is_looked_for_under_the_home_and_nowhere_else() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
 
-        let root =
-            std::env::temp_dir().join(format!("memory-industry-nli-home-{}", uuid::Uuid::new_v4()));
+        let root = scratch_root("nli-home");
         let installed = root
             .join(".cache")
             .join("memory-industry")

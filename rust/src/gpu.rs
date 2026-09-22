@@ -463,7 +463,7 @@ fn nvidia_driver_present() -> bool {
 #[cfg(test)]
 mod placement_tests {
     use super::*;
-    use crate::envs::ScopedEnv;
+    use crate::envs::{ScopedEnv, scratch_root};
 
     /// Whether this binary can place anything on a card at all.
     ///
@@ -722,10 +722,7 @@ mod placement_tests {
     async fn a_runtime_downloaded_under_the_old_name_survives_the_rename() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
 
-        let home = std::env::temp_dir().join(format!(
-            "memory-industry-runtime-dir-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let home = scratch_root("runtime-dir");
         let cache = home.join(".cache");
         let preferred = cache.join("memory-industry").join("onnxruntime");
         let legacy = cache.join("cuba-memorys").join("onnxruntime");
@@ -784,14 +781,8 @@ mod placement_tests {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         let _no_override = ScopedEnv::cleared("ORT_DYLIB_PATH");
 
-        let chosen = std::env::temp_dir().join(format!(
-            "memory-industry-runtime-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let inherited = std::env::temp_dir().join(format!(
-            "memory-industry-runtime-userprofile-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let chosen = scratch_root("runtime-home");
+        let inherited = scratch_root("runtime-userprofile");
         let under_chosen = chosen
             .join(".cache")
             .join("memory-industry")

@@ -353,7 +353,7 @@ async fn tail(pool: &PgPool, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envs::ScopedEnv;
+    use crate::envs::{ScopedEnv, scratch_root};
 
     /// Where the HMAC key of the audit chain is looked for, pinned before this
     /// home resolution moves to `envs::home()`.
@@ -371,10 +371,7 @@ mod tests {
         // measures whatever the developer happens to have exported.
         let _explicit = ScopedEnv::cleared("CUBA_AUDIT_KEY");
 
-        let root = std::env::temp_dir().join(format!(
-            "memory-industry-audit-key-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = scratch_root("audit-key");
         let cache = root.join(".cache").join("memory-industry");
         std::fs::create_dir_all(&cache).expect("the test owns this directory");
         std::fs::write(cache.join("audit_key"), "canary-audit-key\n")
@@ -393,7 +390,51 @@ mod tests {
                 "HOME is read first, and the key `secure` wrote lives under it. Resolved \
                  anywhere else the chain drops to unkeyed hashes without a word"
             );
+
+            // The second state of `preferred.exists() || !legacy.exists()`.
+            // With only the preferred file there, as above, both sides of the
+            // `||` are true, so the criterion answers the same however it is
+            // read and the assertion above pins the path and not the rule.
+            let pre_rename = root.join(".cache").join("cuba-memorys");
+            std::fs::create_dir_all(&pre_rename).expect("the test owns this directory");
+            std::fs::write(pre_rename.join("audit_key"), "key-from-before-the-rename\n")
+                .expect("temp dir is writable");
+            assert_eq!(
+                audit_key(),
+                stored,
+                "with a key under both names the documented one wins: it is the one `secure` \
+                 writes today and the one the rows already in the chain were signed with. \
+                 Reading the pre-rename file here verifies an untampered archive against the \
+                 wrong key and reports it as broken"
+            );
         }
+
+        // A root of its own for «the old key there and the new one not»: the
+        // root above cannot be brought back to that state without undoing what
+        // the block before it just measured.
+        let only_legacy_root = scratch_root("audit-key-pre-rename");
+        let only_legacy_cache = only_legacy_root.join(".cache").join("cuba-memorys");
+        std::fs::create_dir_all(&only_legacy_cache).expect("the test owns this directory");
+        std::fs::write(
+            only_legacy_cache.join("audit_key"),
+            "key-from-before-the-rename\n",
+        )
+        .expect("temp dir is writable");
+        let nothing_under_it = only_legacy_root.join("userprofile-only");
+
+        {
+            let _h = ScopedEnv::set("HOME", &only_legacy_root.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &nothing_under_it.display().to_string());
+            assert_eq!(
+                audit_key(),
+                Some(b"key-from-before-the-rename".to_vec()),
+                "an install that ran `secure` before the rename keeps its key under \
+                 cuba-memorys and has nothing under the new name. Looking only at the \
+                 documented path answers None, `compute_hash` drops to the unkeyed SHA-256 \
+                 chain, and every row appended from then on fails against the ones before it"
+            );
+        }
+
         {
             let _h = ScopedEnv::cleared("HOME");
             let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
@@ -417,5 +458,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&only_legacy_root);
     }
 }

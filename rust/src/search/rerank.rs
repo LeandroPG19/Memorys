@@ -608,7 +608,7 @@ fn identity_pairs(n: usize) -> Vec<(usize, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envs::ScopedEnv;
+    use crate::envs::{ScopedEnv, scratch_root};
 
     /// A throwaway HOME whose cache holds a plausible reranker, so the tests
     /// below never depend on what this machine happens to have installed.
@@ -956,14 +956,8 @@ mod tests {
     async fn the_default_reranker_dir_comes_from_the_home_and_is_none_without_one() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
 
-        let chosen = std::env::temp_dir().join(format!(
-            "memory-industry-rerank-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let inherited = std::env::temp_dir().join(format!(
-            "memory-industry-rerank-userprofile-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let chosen = scratch_root("rerank-home");
+        let inherited = scratch_root("rerank-userprofile");
         let under_chosen = chosen
             .join(".cache")
             .join("memory-industry")

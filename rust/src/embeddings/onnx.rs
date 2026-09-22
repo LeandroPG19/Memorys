@@ -566,7 +566,7 @@ pub fn is_model_loaded() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envs::ScopedEnv;
+    use crate::envs::{ScopedEnv, scratch_root};
 
     #[test]
     fn test_embedding_dimension() {
@@ -733,8 +733,7 @@ mod tests {
         } else {
             "libonnxruntime.so"
         };
-        let root =
-            std::env::temp_dir().join(format!("memory-industry-ort-home-{}", uuid::Uuid::new_v4()));
+        let root = scratch_root("ort-home");
         let installed = root
             .join(".cache")
             .join("memory-industry")
@@ -759,6 +758,64 @@ mod tests {
                  provider libraries were installed beside it"
             );
         }
+
+        // The other two states of `preferred.exists() || !legacy.exists()`.
+        // With only the preferred directory there, as above, both sides of the
+        // `||` are true, so the criterion answers the same however it is read
+        // and the block above pins the path and not the rule. These two pin
+        // the rule.
+        //
+        // A runtime in the legacy directory too, rather than an empty one: a
+        // wrong pick then resolves to a concrete wrong file instead of falling
+        // through to whatever this machine happens to keep in /usr/lib, which
+        // would make the assertion depend on the host.
+        let pre_rename = root.join(".cache").join("cuba-memorys").join("onnxruntime");
+        std::fs::create_dir_all(&pre_rename).expect("the test owns this directory");
+        let in_the_legacy_cache = pre_rename.join(lib);
+        std::fs::write(&in_the_legacy_cache, b"not the library either")
+            .expect("temp dir is writable");
+
+        {
+            let _explicit = ScopedEnv::cleared("ORT_DYLIB_PATH");
+            let _h = ScopedEnv::set("HOME", &root.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &never_created.display().to_string());
+            assert_eq!(
+                locate_onnxruntime().as_ref(),
+                Some(&in_the_cache),
+                "with a runtime under both names the documented one wins, because it is the \
+                 one `models runtime` writes today and the one whose provider libraries were \
+                 installed beside it. Loading the pre-rename copy here mixes a build with \
+                 providers it was never shipped with"
+            );
+        }
+
+        // A root of its own for «the old directory there and the new one not»:
+        // the root above cannot be brought back to that state without undoing
+        // what the two blocks before it just measured.
+        let only_legacy_root = scratch_root("ort-home-pre-rename");
+        let only_legacy = only_legacy_root
+            .join(".cache")
+            .join("cuba-memorys")
+            .join("onnxruntime");
+        std::fs::create_dir_all(&only_legacy).expect("the test owns this directory");
+        let in_the_only_cache = only_legacy.join(lib);
+        std::fs::write(&in_the_only_cache, b"not a real library").expect("temp dir is writable");
+        let nothing_under_it = only_legacy_root.join("userprofile-only");
+
+        {
+            let _explicit = ScopedEnv::cleared("ORT_DYLIB_PATH");
+            let _h = ScopedEnv::set("HOME", &only_legacy_root.display().to_string());
+            let _u = ScopedEnv::set("USERPROFILE", &nothing_under_it.display().to_string());
+            assert_eq!(
+                locate_onnxruntime().as_ref(),
+                Some(&in_the_only_cache),
+                "an install that downloaded before the rename has its runtime under \
+                 cuba-memorys and nothing under the new name. Looking only at the documented \
+                 directory drops the candidate out of the chain, and the daemon loads a \
+                 system copy — or reports no runtime on a machine that has one"
+            );
+        }
+
         {
             let _explicit = ScopedEnv::cleared("ORT_DYLIB_PATH");
             let _h = ScopedEnv::cleared("HOME");
@@ -784,6 +841,7 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&only_legacy_root);
     }
 
     /// `cache_roots` answers with an empty vector when there is no home, and
@@ -795,10 +853,7 @@ mod tests {
     async fn without_a_home_the_cache_roots_are_empty_rather_than_guessed() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
 
-        let root = std::env::temp_dir().join(format!(
-            "memory-industry-cache-roots-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = scratch_root("cache-roots");
         let cache = root.join(".cache");
         let preferred = cache.join("memory-industry");
         let legacy = cache.join("cuba-memorys");
