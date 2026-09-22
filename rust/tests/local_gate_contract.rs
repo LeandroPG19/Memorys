@@ -925,3 +925,48 @@ fn the_crap_half_of_the_second_judge_can_actually_fail() {
          its own fixtures exits 0 too. stdout: {stdout}"
     );
 }
+
+/// The guard that could not fail, and for the longest of all.
+///
+/// `swarm-forge.md` says of the green pass: "El codigo, sin tocar los tests:
+/// `validar-handoff` compara contra el commit rojo". It did not. Until 0.28
+/// this script checked the *shape* of the YAML and nothing else: `commit` only
+/// had to look hexadecimal, nobody checked it existed, and nothing compared a
+/// single line of test against it. The two-pass protocol rested on the agent
+/// being honest rather than on a guard, and two full cycles ran on this branch
+/// (dcb97ad->94ff39c and d624f2f->...) without it holding either of them.
+///
+/// Why this cannot be a text assertion over the script: "you did not touch the
+/// tests" is not answerable from git path names here. The crate keeps 112
+/// `#[cfg(test)]` blocks inside production files and zero sibling `tests.rs`,
+/// so the guard has to extract regions, and an extractor is exactly the kind of
+/// thing that keeps returning an empty answer while looking green. Its
+/// `--self-test` builds throwaway git repos - a frozen handoff that edited a
+/// test, a written one that edited none, a sha that does not exist, a CRLF tree
+/// whose blobs are LF - and reports whether each was refused.
+#[test]
+fn the_two_pass_guard_can_actually_fail() {
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/validar-handoff.sh", "--self-test"])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "validar-handoff.sh --self-test did not pass, so at least one of its guards no \
+         longer refuses a handoff that lies about its tests. stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Anchored on the mode's label, not on its sentence: the other three asserts
+    // of this shape were anchored on prose that named the fixtures, and every one
+    // of them went red the day a fixture was added to a script that still passed.
+    // `self-test:` is the flag named in `args` above, so renaming the mode forces
+    // this test to change with it, and no other line of the script prints it.
+    assert!(
+        stdout.contains("self-test:"),
+        "the self-test exited 0 without saying it ran. An exit code alone is what let \
+         codigo-muerto.sh pass for months while doing nothing. stdout: {stdout}"
+    );
+}

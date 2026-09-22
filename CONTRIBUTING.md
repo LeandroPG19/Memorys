@@ -113,7 +113,7 @@ cargo clippy -- -D warnings
 7. Push → Open PR with template below
 ```
 
-Behaviour changes use the six-pack in [AGENTS.md](AGENTS.md). Handoffs: `.cursor/handoffs/*.yml` via `scripts/validar-handoff.sh`.
+Behaviour changes use the six-pack in [AGENTS.md](AGENTS.md). Handoffs: `.cursor/handoffs/*.yml` via `scripts/validar-handoff.sh`, which judges the shape and the two-pass protocol: `commit` must exist, and `tests: written|frozen` (required when `commit != none`) is checked against the `#[cfg(test)]` regions at that commit — `written` fails if step 2 wrote no test, `frozen` fails if step 3 edited one.
 
 ### PR Template
 

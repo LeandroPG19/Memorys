@@ -4,3 +4,33 @@ type: git_handoff
 task: "una línea: qué se entrega"
 commit: none
 evidence: none
+
+# Campos: from, to, type, task, commit, evidence — y `tests` cuando commit != none.
+#
+# `commit` tiene que EXISTIR en el repo, no solo parecer hexadecimal.
+#
+# `tests` es de dos sentidos, como los techos del gate, y lo comprueba
+# scripts/validar-handoff.sh comparando las regiones de test contra `commit`:
+#
+#   tests: written   la pasada ROJA. Falla si NINGUNA región de test cambió
+#                    desde `commit`. Una pasada roja que no movió un test no
+#                    escribió nada que pueda ponerse rojo.
+#
+#   tests: frozen    la pasada VERDE. Falla si ALGUNA cambió. Es el ajuste que
+#                    las dos pasadas existen para impedir. Si un test parece
+#                    incorrecto se para y se devuelve un `type: note`; no se
+#                    edita, ni se salta, ni se debilita.
+#
+# Obligatorio cuando commit != none y prohibido cuando commit == none (un
+# handoff de especificador no entrega código y declararía sobre la nada).
+# Omitir el campo NO es una salida: esa era justo la fuga que 0.28 cerró.
+#
+# Así queda la pasada verde de un implementador:
+#
+#   from: implementador
+#   to: mejorador
+#   type: git_handoff
+#   task: "tajada N, pasada 2 de 2: el código"
+#   commit: d624f2f
+#   tests: frozen
+#   evidence: "qué tiene que correr el orquestador, y qué se pone rojo sin esto"

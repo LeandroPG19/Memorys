@@ -67,4 +67,4 @@ E2E asserts `cuba_decreto` query `count >= 1` after record. That used to pass wi
 
 Versioned under `.cursor/rules/` (never a junction to `~/.cursor/rules`). Six-pack + TDD + two judges. Comments stay. Plant rules (Playwright, React Query, guardian-planta) are not copied here.
 
-Handoffs: `.cursor/handoffs/*.yml`, validated by `scripts/validar-handoff.sh`.
+Handoffs: `.cursor/handoffs/*.yml`, validated by `scripts/validar-handoff.sh` — shape, plus the two-pass protocol: `commit` has to exist in the repo and `tests: written|frozen` (required when `commit != none`) is checked by extracting the `#[cfg(test)]` regions at that commit and in the tree. `written` fails when none moved, `frozen` when one did. `scripts/validar-handoff.sh --self-test` runs a fixture against each guard.

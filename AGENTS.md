@@ -23,7 +23,9 @@ GitHub Actions is **not** the merge judge. A green badge is not mergeable. That 
 
 Behaviour change: **especificador → implementador → mejorador → arquitecto → endurecedor → qa**.
 
-Handoffs: `.cursor/handoffs/*.yml`. Shape judge: `./scripts/validar-handoff.sh`. Example: `.cursor/handoffs/handoff.example.yml`.
+Handoffs: `.cursor/handoffs/*.yml`. Judge: `./scripts/validar-handoff.sh`. Example: `.cursor/handoffs/handoff.example.yml`.
+
+It judges shape **and the two-pass protocol**. `commit` must exist, not just look hexadecimal, and `tests: written|frozen` is required whenever `commit != none`: `written` fails if no `#[cfg(test)]` region moved since that commit, `frozen` fails if one did. `./scripts/validar-handoff.sh --self-test` proves each guard still refuses its fixture. Until 0.28 this checked shape only, so the green pass rested on the agent being honest.
 
 The parent dispatches. The parent **may** write product code when Mapupita asked this chat to implement, or when there is no `Task`. Rules, gate scripts, and `AGENTS.md` are always in-parent.
 
