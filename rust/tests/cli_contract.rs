@@ -176,8 +176,9 @@ fn every_file_that_holds_a_version_agrees() {
 
 #[test]
 fn every_listed_command_is_actually_dispatched() {
+    let mut no_help = Vec::new();
     for cmd in memory_industry::cli::COMMANDS {
-        let (_, stderr, code) = run(&[cmd, "--help"]);
+        let (stdout, stderr, code) = run(&[cmd, "--help"]);
         assert_ne!(
             code, 2,
             "`{cmd}` is in COMMANDS but the dispatcher does not know it: {stderr}"
@@ -186,7 +187,37 @@ fn every_listed_command_is_actually_dispatched() {
             !stderr.contains("unknown command"),
             "`{cmd}` reached the unknown-command arm: {stderr}"
         );
+
+        // `models` and `llm` print their help to stdout without a `usage:`
+        // prefix; `graph` prints `usage: memory-industry graph` to stdout and
+        // the rest print it to stderr. The line that starts with the command's own invocation is
+        // what all of them share, and what a body replaced by `Ok(())` lacks.
+        let invocation = format!("memory-industry {cmd}");
+        let prints_its_usage = stdout.lines().chain(stderr.lines()).any(|line| {
+            let line = line.trim_start();
+            line.strip_prefix("usage: ")
+                .unwrap_or(line)
+                .starts_with(&invocation)
+        });
+        let touched_the_database =
+            stderr.contains("connect to PostgreSQL") || stderr.contains("connected to PostgreSQL");
+        if code != 0 || !prints_its_usage || touched_the_database {
+            no_help.push(format!(
+                "`{cmd} --help`: exit {code}, usage line {prints_its_usage}, \
+                 reached PostgreSQL {touched_the_database}\n  stderr: {}",
+                stderr.lines().last().unwrap_or("")
+            ));
+        }
     }
+    assert!(
+        no_help.is_empty(),
+        "these commands do not answer --help with their help: they try to do their work \
+         instead.\n{}\n\nA non-2 exit was all this contract used to ask, and a failed \
+         connection to the dead DATABASE_URL satisfies that. So `secure --help` could run \
+         create-app-role.sql against a real database (it creates cuba_app with a fixed \
+         password) and a run_cli replaced by Ok(()) passed as well",
+        no_help.join("\n")
+    );
 }
 
 #[test]
