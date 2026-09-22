@@ -1123,21 +1123,119 @@ mod tests {
         );
     }
 
+    /// The three names an install made from this repo can actually run under.
+    ///
+    /// `rust/Cargo.toml` builds `src/main.rs` twice, as `memory-industry` and
+    /// as `cuba-memorys`; `packaging/memory-industry.service:9` starts
+    /// `memory-industry`; `packaging/cuba-memorys.service:11` starts
+    /// `cuba-memorys-daemon`; `package.json` publishes both npm bins. AGENTS.md
+    /// keeps the legacy alias for one more release, so all three are ours and
+    /// none is retired here.
+    ///
+    /// This list is written out here on purpose instead of being imported from
+    /// production. A test that reads the same table the function reads shrinks
+    /// whenever the table shrinks, and would have stayed green through exactly
+    /// the defect these tests exist to catch.
+    const NAMES_AN_INSTALL_FROM_THIS_REPO_RUNS: [&str; 3] =
+        ["memory-industry", "cuba-memorys", "cuba-memorys-daemon"];
+
+    #[test]
+    fn every_binary_this_repo_installs_is_recognized_as_ours() {
+        for name in NAMES_AN_INSTALL_FROM_THIS_REPO_RUNS {
+            let raw = format!("/home/x/.local/bin/{name}");
+            assert_eq!(
+                our_binary_from_exe_link(&raw),
+                Some((std::path::PathBuf::from(&raw), false)),
+                "{name} is a name this repo ships, so a process running it is one of ours. The \
+                 filter used to demand the literal `cuba-memorys`, and no unit this repo \
+                 packages produces a file by that name: the new one runs `memory-industry` and \
+                 the legacy one runs `cuba-memorys-daemon`. So binary_freshness answered `ok` on \
+                 every systemd install that came out of here, and the warning that tells an \
+                 operator the daemon is still serving the binary they replaced has never once \
+                 been able to fire."
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_merely_contains_ours_is_not_ours() {
+        for (ours, stranger) in [
+            ("memory-industry", "memory-industry-helper"),
+            ("memory-industry", "not-memory-industry"),
+            ("cuba-memorys", "micuba-memorys"),
+            ("cuba-memorys", "cuba-memorysd"),
+            ("cuba-memorys-daemon", "cuba-memorys-daemonizer"),
+        ] {
+            // Anchor before absence: if the accepted name is not accepted, the
+            // rejection below proves nothing about how the name is matched.
+            let ours_link = format!("/home/x/.local/bin/{ours}");
+            assert!(
+                our_binary_from_exe_link(&ours_link).is_some(),
+                "{ours} has to be recognized before its rejection of {stranger} means anything"
+            );
+
+            let stranger_link = format!("/home/x/.local/bin/{stranger}");
+            assert_eq!(
+                our_binary_from_exe_link(&stranger_link),
+                None,
+                "{stranger} is somebody else's process. The match is on the whole file name, \
+                 not on `contains`, `starts_with` or `ends_with`: widening it would have \
+                 `doctor` tell an operator to restart a daemon that is not ours, and \
+                 `cuba-memorys-daemon` being a prefix extension of `cuba-memorys` makes a loose \
+                 match the likely way in."
+            );
+        }
+    }
+
     #[test]
     fn a_replaced_binary_is_recognized_despite_the_deleted_suffix() {
-        let raw = "/home/x/rust/target/release/cuba-memorys (deleted)";
-        let (path, deleted) = match raw.strip_suffix(" (deleted)") {
-            Some(p) => (std::path::PathBuf::from(p), true),
-            None => (std::path::PathBuf::from(raw), false),
-        };
-        assert!(deleted);
+        // This test used to re-implement `strip_suffix(" (deleted)")` in its
+        // own body and assert on that local copy, so it never called the code
+        // it was named after: deleting the name filter, or the suffix handling,
+        // left it green. It calls production now.
+        let live = "/home/x/.local/bin/memory-industry";
+        let replaced = "/home/x/.local/bin/memory-industry (deleted)";
+
         assert_eq!(
-            path.file_name().and_then(|n| n.to_str()),
-            Some("cuba-memorys")
+            our_binary_from_exe_link(replaced),
+            Some((std::path::PathBuf::from(live), true)),
+            "an exe link carrying ` (deleted)` is the one case stale_processes settles with no \
+             stat at all: the running image is a file that is gone. The suffix has to come off \
+             both answers, ours and deleted, because the caller stats the path it gets back and \
+             `/home/x/.local/bin/memory-industry (deleted)` is not a file on disk."
         );
 
-        let live = "/home/x/rust/target/release/cuba-memorys";
-        assert!(live.strip_suffix(" (deleted)").is_none());
+        assert_eq!(
+            our_binary_from_exe_link(live),
+            Some((std::path::PathBuf::from(live), false)),
+            "a live binary is ours and is not deleted; whether it is stale is then decided by \
+             the mtimes, not here"
+        );
+    }
+
+    #[test]
+    fn the_deleted_suffix_does_not_turn_a_stranger_into_one_of_ours() {
+        // Anchor before absence: the deleted branch has to recognize something,
+        // or the three rejections below pass on a function that answers `None`
+        // to every path that ends in ` (deleted)`.
+        assert!(
+            our_binary_from_exe_link("/home/x/.local/bin/cuba-memorys-daemon (deleted)").is_some(),
+            "a replaced legacy daemon is still ours: without this the rejections below are vacuous"
+        );
+
+        for stranger in [
+            "/usr/bin/curl (deleted)",
+            "/home/x/.local/bin/memory-industry-helper (deleted)",
+            "/home/x/notas (deleted)",
+        ] {
+            assert_eq!(
+                our_binary_from_exe_link(stranger),
+                None,
+                "{stranger} is not ours, and a file that genuinely ends in ` (deleted)` does \
+                 not become ours by being replaced. The name decides; the suffix only says \
+                 whether the image on disk is still there."
+            );
+        }
     }
 
     #[test]
