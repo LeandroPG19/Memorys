@@ -54,10 +54,162 @@ fn value_is_opaque(value: &str) -> bool {
         && (value.chars().any(|c| c.is_ascii_digit()) || chars >= MIN_ALL_LETTER_VALUE_CHARS)
 }
 
+/// What one detector decided about one token.
+///
+/// The detectors are pure: each reads a token and answers with this. Who owns
+/// the output string, the character offsets and the first-hit rule is the
+/// tokenizer, and only the tokenizer.
+struct Redaction {
+    /// What goes out in place of the token. The token's trailing whitespace is
+    /// not in here: it belongs to the tokenizer, which puts it back.
+    replacement: String,
+    /// The pattern name when the write gate must refuse this token too; `None`
+    /// when the redactor scrubs and the gate stays quiet. The two views are
+    /// asymmetric on purpose, and the direction is pinned by
+    /// `the_redactor_scrubs_more_than_the_write_gate_refuses`.
+    pattern: Option<&'static str>,
+    /// The value this token names but does not carry: it is the NEXT token.
+    /// Only `secret_field` fills it and only `pending_value` reads it.
+    announces: Option<&'static str>,
+}
+
+/// D1 — the value `secret_field` announced one token earlier.
+///
+/// This is the one detector that cannot decide from its own token: `password:`
+/// ends a token and its value is the next one, so the pattern name has to cross
+/// the gap. The tokenizer carries it (`announced` in `scan`) instead of a
+/// detector reading ahead, which is what keeps the other four pure — and the
+/// coupling is load-bearing: lose it and `password: hunter2` stops being
+/// redacted while every other case still works.
+///
+/// The replacement is unconditional and the refusal is not. A separator
+/// announces a value, so whatever word arrives is scrubbed on the way to the
+/// LLM, while the gate refuses only a word opaque enough to be a credential.
+fn pending_value(trimmed: &str, announced: &'static str) -> Redaction {
+    Redaction {
+        replacement: String::from("***"),
+        pattern: value_is_opaque(trimmed).then_some(announced),
+        announces: None,
+    }
+}
+
+/// D2 — `scheme://user:password@host`.
+///
+/// The user survives and only what follows the colon goes: it is the one part
+/// of the url that says which account. Userinfo with no colon carries no
+/// password, so this answers `None` and the token falls through to D3 whole —
+/// `user@host` is the shape a git remote has.
+fn credentials_in_url(trimmed: &str) -> Option<Redaction> {
+    let at_sign = trimmed.find('@')?;
+    // The `://` has to come FIRST, or what follows is not userinfo and the
+    // slice below would run backwards.
+    let scheme_end = trimmed.find("://").filter(|end| at_sign > *end)?;
+    let creds = &trimmed[scheme_end + 3..at_sign];
+    let colon = creds.find(':')?;
+    Some(Redaction {
+        replacement: format!(
+            "{}***{}",
+            &trimmed[..scheme_end + 3 + colon + 1],
+            &trimmed[at_sign..]
+        ),
+        pattern: Some("credentials in a url"),
+        announces: None,
+    })
+}
+
+/// D3 — `secret_field=value` or `secret_field: value`.
+///
+/// The key stays and the value goes, or the reader cannot tell what was
+/// removed. When nothing follows the separator the value is in the next token,
+/// and that is what `announces` is for.
+fn secret_field(trimmed: &str) -> Option<Redaction> {
+    let sep = trimmed.find(['=', ':']).filter(|sep| *sep > 0)?;
+    let pattern = secret_field_pattern(&trimmed[..sep])?;
+    let key = &trimmed[..=sep];
+    if sep + 1 < trimmed.len() {
+        Some(Redaction {
+            replacement: format!("{key}***"),
+            pattern: value_is_opaque(&trimmed[sep + 1..]).then_some(pattern),
+            announces: None,
+        })
+    } else {
+        Some(Redaction {
+            replacement: String::from(key),
+            pattern: None,
+            announces: Some(pattern),
+        })
+    }
+}
+
+/// D4 — a provider prefix anywhere inside the run, and where it starts.
+///
+/// Looking INSIDE the run rather than only at its start is what sees
+/// `Authorization:ghp_…` and a token inside compact JSON. The length guard is
+/// what keeps `sk-1` from being a key. The earliest match wins, so the run is
+/// cut at the first credential it carries.
+fn provider_prefix(bare: &str) -> Option<(usize, &'static str)> {
+    PROVIDER_PREFIXES
+        .iter()
+        .filter_map(|(prefix, pattern)| bare.find(prefix).map(|at| (at, *prefix, *pattern)))
+        .filter(|(at, prefix, _)| bare.len() - at > prefix.len() + 8)
+        .min_by_key(|(at, _, _)| *at)
+        .map(|(at, _, pattern)| (at, pattern))
+}
+
+/// D5 — a JWS compact serialization: `eyJ…` and exactly two dots.
+///
+/// Exactly two: one dot is a truncated paste and three is not a JWS. Both are
+/// base64ish words, and a gate that refuses every base64ish word is a gate the
+/// user turns off.
+fn jwt_bearer(bare: &str) -> Option<&'static str> {
+    (bare.starts_with("eyJ") && bare.matches('.').count() == 2).then_some("jwt bearer token")
+}
+
+/// What D4 and D5 share: both cut the run at the credential and keep what came
+/// before it. A provider prefix wins over a JWT shape when somehow both match.
+fn embedded_credential(trimmed: &str) -> Option<Redaction> {
+    let bare = trimmed.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let provider = provider_prefix(bare);
+    let pattern = provider
+        .map(|(_, pattern)| pattern)
+        .or_else(|| jwt_bearer(bare))?;
+    // What precedes the credential inside the run is kept (`usa-` in
+    // `usa-ghp_…`). A prefix that starts the run keeps nothing, and `&bare[..0]`
+    // is already `""` — the same nothing the JWT case wants — so there is no
+    // second case to write here.
+    let keep = provider.map_or("", |(at, _)| &bare[..at]);
+    // The non-alphanumeric head that `bare` trimmed off is not part of the
+    // credential: a quote or a bracket in front of it goes back out.
+    let untrimmed = trimmed.len() - bare.len();
+    Some(Redaction {
+        replacement: format!("{}{keep}***", &trimmed[..untrimmed]),
+        pattern: Some(pattern),
+        announces: None,
+    })
+}
+
+/// The order of the detectors, which is behaviour and not detail: an announced
+/// value is a value whatever it looks like, a url is read as a url before its
+/// scheme can be taken for a field name, and a field name beats the provider
+/// prefix its value may carry — that is what makes `DISCORD_TOKEN=ghp_…` a
+/// "token field" and not a "github token" in the refusal.
+fn redaction_for(trimmed: &str, announced: Option<&'static str>) -> Option<Redaction> {
+    announced
+        .map(|pattern| pending_value(trimmed, pattern))
+        .or_else(|| credentials_in_url(trimmed))
+        .or_else(|| secret_field(trimmed))
+        .or_else(|| embedded_credential(trimmed))
+}
+
 fn scan(s: &str) -> Scan {
     let mut out = String::with_capacity(s.len());
     let mut hit: Option<Hit> = None;
-    let mut expecting_value: Option<&'static str> = None;
+    // The only state the detectors share. D3 can end a token with the separator
+    // and no value; the value it names arrives in the NEXT token, where D1
+    // collects it. It lives here, in the tokenizer, because a whitespace-only
+    // token must not consume it: `password:  hunter2` has two spaces and the
+    // announcement has to survive the one in the middle.
+    let mut announced: Option<&'static str> = None;
     let mut char_offset = 0usize;
 
     for token in s.split_inclusive(char::is_whitespace) {
@@ -72,88 +224,24 @@ fn scan(s: &str) -> Scan {
             continue;
         }
 
-        if let Some(pattern) = expecting_value.take() {
-            out.push_str("***");
-            out.push_str(trailing);
-            if hit.is_none() && value_is_opaque(trimmed) {
-                hit = Some(Hit {
-                    pattern,
-                    char_offset: at,
-                });
-            }
+        let Some(found) = redaction_for(trimmed, announced.take()) else {
+            out.push_str(token);
             continue;
-        }
+        };
 
-        if let Some(at_sign) = trimmed.find('@')
-            && let Some(scheme_end) = trimmed.find("://")
-            && at_sign > scheme_end
+        out.push_str(&found.replacement);
+        out.push_str(trailing);
+        announced = found.announces;
+        // The first hit wins: the offset in the refusal points at the first
+        // thing that looked like a credential, not at the last one.
+        if hit.is_none()
+            && let Some(pattern) = found.pattern
         {
-            let creds = &trimmed[scheme_end + 3..at_sign];
-            if let Some(colon) = creds.find(':') {
-                out.push_str(&trimmed[..scheme_end + 3 + colon + 1]);
-                out.push_str("***");
-                out.push_str(&trimmed[at_sign..]);
-                out.push_str(trailing);
-                if hit.is_none() {
-                    hit = Some(Hit {
-                        pattern: "credentials in a url",
-                        char_offset: at,
-                    });
-                }
-                continue;
-            }
+            hit = Some(Hit {
+                pattern,
+                char_offset: at,
+            });
         }
-
-        if let Some(sep) = trimmed.find(['=', ':'])
-            && sep > 0
-            && let Some(pattern) = secret_field_pattern(&trimmed[..sep])
-        {
-            out.push_str(&trimmed[..=sep]);
-            if sep + 1 < trimmed.len() {
-                out.push_str("***");
-                if hit.is_none() && value_is_opaque(&trimmed[sep + 1..]) {
-                    hit = Some(Hit {
-                        pattern,
-                        char_offset: at,
-                    });
-                }
-            } else {
-                expecting_value = Some(pattern);
-            }
-            out.push_str(trailing);
-            continue;
-        }
-
-        let bare = trimmed.trim_start_matches(|c: char| !c.is_alphanumeric());
-        let embedded = PROVIDER_PREFIXES
-            .iter()
-            .filter_map(|(prefix, pattern)| bare.find(prefix).map(|at| (at, *prefix, *pattern)))
-            .filter(|(at, prefix, _)| bare.len() - at > prefix.len() + 8)
-            .min_by_key(|(at, _, _)| *at);
-        let provider = embedded.map(|(_, _, pattern)| pattern);
-        let jwt = (bare.starts_with("eyJ") && bare.matches('.').count() == 2)
-            .then_some("jwt bearer token");
-
-        if let Some(pattern) = provider.or(jwt) {
-            let keep = match embedded {
-                Some((at, _, _)) if at > 0 => &bare[..at],
-                _ => "",
-            };
-            let prefix_len = trimmed.len() - bare.len();
-            out.push_str(&trimmed[..prefix_len]);
-            out.push_str(keep);
-            out.push_str("***");
-            out.push_str(trailing);
-            if hit.is_none() {
-                hit = Some(Hit {
-                    pattern,
-                    char_offset: at,
-                });
-            }
-            continue;
-        }
-
-        out.push_str(token);
     }
 
     Scan { redacted: out, hit }

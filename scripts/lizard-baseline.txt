@@ -142,23 +142,6 @@ src/protocol.rs::run_mcp:281 27
 src/protocol.rs::run_rem_consolidation_locked:701 15
 src/recall_cli.rs::build:60 18
 src/recall_cli.rs::run_cli:6 9
-# src/redact.rs::scan is NOT new work: it predates this branch and not a line of
-# it changed. What changed is that lizard can see it again. The `'_'` literal on
-# the old line 38 made its Rust reader take that apostrophe for the start of an
-# unterminated literal and swallow the rest of the file, so this slot carried
-# `secret_field_pattern 23`: one number measured over three functions welded
-# together. Measured 2026-09-21 with the tokenizer fixed, secret_field_pattern is
-# CC 2 and needs no entry, and scan is CC 22 over 94 NLOC (lines 57-160) that no
-# ratchet had ever seen. Exact 22, no margin: this is a two-way ratchet, and
-# slack in it is slack in the direction that matters.
-# Not split now, deliberately: it is a one-pass secret redactor with five
-# detectors (spaces, pending value, credentials in a URL, key=value, provider
-# prefix or JWT), each with nested conditions, so the CC is the sum of those five
-# and not an accidental tangle. Splitting it is its own slice, tests first: this
-# is the function that decides whether a secret leaves in a log, and a blind
-# refactor here leaks a credential, which is exactly what verificacion.md
-# forbids. Owner: endurecedor 0.27.
-src/redact.rs::scan:57 22
 src/reembed_cli.rs::run_cli:3 19
 src/resources.rs::plan:207 11
 src/search/bm25.rs::bm25_search:6 10
