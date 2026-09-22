@@ -433,4 +433,191 @@ mod tests {
              disable the gate silently"
         );
     }
+
+    #[test]
+    fn every_provider_prefix_the_table_lists_is_one_the_scan_actually_matches() {
+        for (canary, pattern) in [
+            ("gho_canary0123456789", "github token"),
+            ("github_pat_canary0123456789", "github token"),
+            ("xoxb-canary0123456789", "slack token"),
+            ("xoxp-canary0123456789", "slack token"),
+        ] {
+            let text = format!("el deploy usa {canary} fin");
+            assert!(
+                text.contains(canary),
+                "control: with the canary missing from the text, `the token is gone afterwards` \
+                 would also pass on a scan that does nothing at all: {text}"
+            );
+            assert_eq!(
+                looks_like_secret(&text),
+                Some(pattern),
+                "four of the seven PROVIDER_PREFIXES had no test reaching them: gho_, \
+                 github_pat_, xoxb- and xoxp-. While only sk-, ghp_ and AKIA were exercised, a \
+                 typo in one of those rows, a dropped row, or a pattern name pasted from the \
+                 row above was invisible, and a prefix that matches nothing is the write gate \
+                 storing the token: {text}"
+            );
+            assert_eq!(
+                redact_secrets(&text),
+                "el deploy usa *** fin",
+                "and the same row has to scrub on the way to the LLM, not only refuse on the \
+                 way in: both views read this one table and both have to reach it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_with_no_digits_has_to_be_long_before_it_counts_as_a_secret() {
+        let long_enough = "canaryallletters";
+        let one_char_short = "canaryallletter";
+        assert_eq!(
+            (long_enough.chars().count(), one_char_short.chars().count()),
+            (16, 15),
+            "this test is only about which side of MIN_ALL_LETTER_VALUE_CHARS each value falls \
+             on, so a miscounted literal would quietly assert the opposite of what it reads"
+        );
+
+        let opaque = format!("api_key={long_enough}");
+        assert_eq!(
+            looks_like_secret(&opaque),
+            Some("api key field"),
+            "every other value in this module carries a digit, so the second half of \
+             value_is_opaque decided nothing and deleting it left the suite green. An \
+             all-letter value at the threshold -- a passphrase, a word-list key -- is the one \
+             shape that reaches the write gate through that clause alone: {opaque}"
+        );
+        assert_eq!(redact_secrets(&opaque), "api_key=***");
+
+        let too_short = format!("api_key={one_char_short}");
+        assert!(
+            too_short.contains(one_char_short),
+            "control: the value has to be in the text before None means the gate looked and \
+             declined, rather than the interpolation having eaten it"
+        );
+        assert_eq!(
+            looks_like_secret(&too_short),
+            None,
+            "and one character below the threshold it has to be let through, or the constant is \
+             decorative in the other direction too: a word that short is prose far more often \
+             than it is a credential, and refusing prose loses the observation the user \
+             believed they had stored: {too_short}"
+        );
+        assert_eq!(
+            redact_secrets(&too_short),
+            "api_key=***",
+            "the redactor never asks value_is_opaque whether to print ***, only whether to \
+             refuse: a named secret field loses its value either way. Same asymmetry as \
+             the_redactor_scrubs_more_than_the_write_gate_refuses, one detector down"
+        );
+    }
+
+    #[test]
+    fn a_url_with_a_user_and_no_password_keeps_the_user() {
+        let with_password = "https://canary-user:canary-pass-9f@example.invalid/ruta";
+        assert_eq!(
+            looks_like_secret(with_password),
+            Some("credentials in a url"),
+            "control: the sibling that does carry a password has to be caught here, or what \
+             follows proves only that the url detector never runs on either of them"
+        );
+        assert_eq!(
+            redact_secrets(with_password),
+            "https://canary-user:***@example.invalid/ruta",
+            "the user survives and only what follows the colon goes: a redaction that ate the \
+             user too would cost the reader the one part of the url that says which account"
+        );
+
+        let user_only = "https://canary-user@example.invalid/ruta";
+        assert_eq!(
+            redact_secrets(user_only),
+            user_only,
+            "userinfo with no colon carries no password, so there is nothing to hide and the \
+             url is left whole. This is the branch of the url detector that falls through to \
+             the detectors below instead of rewriting, and nothing pinned it: a search for the \
+             colon widened from the credentials to the whole token would splice this url at \
+             the scheme and hand the reader something that is no longer a url: {user_only}"
+        );
+        assert_eq!(
+            looks_like_secret(user_only),
+            None,
+            "and it must not be refused either: user@host with no password is the shape a git \
+             remote and a docs link have, and a gate that rejects those teaches the user to \
+             pass allow_secret by reflex on the writes that really do carry one"
+        );
+    }
+
+    #[test]
+    fn a_jwt_is_exactly_two_dots_and_a_near_miss_is_left_alone() {
+        assert_eq!(
+            redact_secrets("bearer eyJhbG.eyJzdWI.SflKxw"),
+            "bearer ***",
+            "control: three segments still go, so what the loop below shows is the dot count \
+             deciding, not the eyJ prefix having quietly stopped matching"
+        );
+        for near_miss in ["eyJhbG.eyJzdWI", "eyJhbG.eyJzdWI.SflKxw.extra"] {
+            let text = format!("bearer {near_miss}");
+            assert_eq!(
+                looks_like_secret(&text),
+                None,
+                "the dot count was only ever tested at 2, so the comparison could widen to >= \
+                 or drift by one and nothing would notice. One dot is a truncated paste and \
+                 three is not a JWS: both are base64ish words, and a gate that refuses every \
+                 base64ish word is a gate the user turns off: {text}"
+            );
+            assert_eq!(
+                redact_secrets(&text),
+                text,
+                "and neither view may touch it, or the two have drifted apart: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_redactor_scrubs_more_than_the_write_gate_refuses() {
+        for (prose, scrubbed) in [
+            ("password: canary", "password: ***"),
+            (
+                "password: sin definir todavía",
+                "password: *** definir todavía",
+            ),
+            (
+                "el token: temporal, caduca en 15 minutos",
+                "el token: *** caduca en 15 minutos",
+            ),
+        ] {
+            assert_eq!(
+                looks_like_secret(prose),
+                None,
+                "the write gate stays conservative: a separator announces a value, but it only \
+                 refuses when the word that arrives is opaque enough to be a credential, \
+                 because refusing prose loses a memory the user believed they had stored: \
+                 {prose:?}"
+            );
+            assert_eq!(
+                redact_secrets(prose),
+                scrubbed,
+                "the two views are asymmetric on purpose, and this is the direction. The \
+                 separator announces a value, so the redactor replaces the next word whatever \
+                 it turns out to be, while the gate refuses only the opaque ones. Each side \
+                 fails safe where its own mistake is paid: a scrubbed word costs one word of \
+                 prose inside a prompt, a refused write costs the observation. The first row \
+                 is why the redactor cannot be made conditional to match the gate: six letters \
+                 and no digit is not opaque, so the gate lets that password in, and the \
+                 redactor is all that stands between it and the LLM. \
+                 the_two_views_of_the_detector_cannot_drift_apart holds the implication that \
+                 matters, refused implies redacted; this holds that the converse is NOT held, \
+                 so nobody tidies the gap into a leak. Prose: {prose:?}"
+            );
+        }
+
+        let no_announcement = "la doc dice que api_key es obligatorio";
+        assert_eq!(looks_like_secret(no_announcement), None);
+        assert_eq!(
+            redact_secrets(no_announcement),
+            no_announcement,
+            "the contrast that makes the rule readable: a secret field name with no separator \
+             after it announces nothing, so the next word is prose and stays. The separator is \
+             what arms the replacement, not the field name: {no_announcement}"
+        );
+    }
 }
