@@ -290,6 +290,19 @@ async fn async_main() {
             return;
         }
         Some("serve") => {
+            // Before the address is read: `--help` used to become the listen
+            // address, after `http::serve` had already connected and migrated.
+            if argv.get(2).is_some_and(|a| a == "-h" || a == "--help") {
+                eprintln!(
+                    "usage: memory-industry serve [addr]\n\n\
+                     Runs one shared MCP daemon over HTTP for every client, so the ONNX\n\
+                     models load once. addr defaults to CUBA_HTTP_ADDR, else 127.0.0.1:8787.\n\
+                     CUBA_HTTP_TOKEN requires a bearer token; without one only a loopback\n\
+                     address is accepted. On start it connects to DATABASE_URL and applies\n\
+                     pending migrations unless CUBA_SKIP_MIGRATIONS=1."
+                );
+                return;
+            }
             let addr = argv
                 .get(2)
                 .cloned()
