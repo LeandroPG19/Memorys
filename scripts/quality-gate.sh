@@ -812,18 +812,19 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #
           #   Needs a database (precedent: assert_embedding_dim, merge_by_name):
           #   db.rs bind_app_role with Ok(())
-          #                     judged by both tests of
+          #                     judged by two tests of
           #                     v044_a_new_app_role_does_not_get_a_published_password.
           #                     Without the two settings the DO block of
-          #                     create-app-role.sql falls back to cuba_app. Where
-          #                     cuba_app does not exist it raises «app_password is
-          #                     not set» and ensure_app_role errs; where it does,
-          #                     the block reimposes attributes on cuba_app instead
-          #                     of the probe role, so
+          #                     create-app-role.sql raises «memory_industry.app_role
+          #                     is not set» before it reads or touches any role
+          #                     (a060438 took away its cuba_app default), so
+          #                     ensure_app_role errs and
           #                     a_role_created_by_secure_does_not_open_with_the_password_in_the_repo
-          #                     finds no probe role in pg_roles and
+          #                     fails creating the probe role and
           #                     a_role_that_already_exists_keeps_the_password_its_daemon_uses
-          #                     finds CREATEDB still on it. Red on both servers.
+          #                     fails running the setup over it. Red whether or
+          #                     not the server has a cuba_app, and that role is
+          #                     left alone either way.
           #   db.rs init_schema with Ok(())
           #                     judged by
           #                     v043_the_dashboard_reads_the_base_it_is_pointed_at::the_dashboard_shows_an_observation_it_read_from_the_base:
