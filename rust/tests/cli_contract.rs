@@ -336,3 +336,91 @@ fn nothing_can_exit_a_draining_command_without_draining_first() {
          only ever covers what somebody remembered"
     );
 }
+
+/// Runs `serve <arg>` against DEAD_DB and kills it if it is still alive after
+/// `budget`: a serve that got past its checks listens forever, and a contract
+/// that hangs the suite reports nothing.
+fn run_serve(arg: &str, budget: std::time::Duration) -> (String, Option<i32>) {
+    use std::io::Read;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cuba-memorys"))
+        .args(["serve", arg])
+        .env("DATABASE_URL", DEAD_DB)
+        .env_remove("CUBA_HTTP_TOKEN")
+        .env_remove("CUBA_PEER_TOKEN")
+        .env_remove("LISTEN_FDS")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("binary runs");
+    let mut pipe = child.stderr.take().expect("stderr is piped");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        pipe.read_to_string(&mut s).ok();
+        s
+    });
+
+    let deadline = std::time::Instant::now() + budget;
+    let code = loop {
+        if let Some(status) = child.try_wait().expect("child can be polled") {
+            break status.code();
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    (reader.join().expect("stderr reader"), code)
+}
+
+#[test]
+fn serve_refuses_an_address_it_cannot_read_before_it_touches_postgres() {
+    let budget = std::time::Duration::from_secs(60);
+
+    // Presence anchor. A port this test already holds is a valid address that
+    // gets through every check before the bind and then fails at the bind, so
+    // serve does all its pre-listen work — including the connection attempt
+    // to DEAD_DB — and still exits instead of listening forever.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
+    let valid = taken.local_addr().expect("bound address").to_string();
+    let (stderr, code) = run_serve(&valid, budget);
+    drop(taken);
+    assert!(
+        code.is_some(),
+        "`serve {valid}` on a port already taken was still running after {budget:?}: it \
+         bound anyway, so this anchor no longer ends by itself.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("connect to PostgreSQL") || stderr.contains("connected to PostgreSQL"),
+        "`serve {valid}` with a valid address must reach PostgreSQL. Without this, the \
+         refusals below would pass just as well for a serve that no longer does anything.\n\
+         exit {code:?}\nstderr: {stderr}"
+    );
+
+    for bad in ["--verbose", "not-an-address", "127.0.0.1:99999"] {
+        let (stderr, code) = run_serve(bad, budget);
+        assert_eq!(
+            code,
+            Some(2),
+            "`serve {bad}` must exit 2 (usage error), like an unknown command: a script \
+             that tells a wrong call from a failed run must not need to know which command \
+             it called (None = still running after {budget:?}).\nstderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("connect to PostgreSQL")
+                && !stderr.contains("connected to PostgreSQL"),
+            "`serve {bad}` reached PostgreSQL before noticing `{bad}` is not an address. \
+             http::serve resolves DATABASE_URL, connects and applies migrations, and only \
+             then parses the address, so a typo or a flag it does not know migrates a real \
+             database and fails afterwards — the same class of defect `serve --help` had \
+             before 2b61223.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(bad),
+            "the error for `serve {bad}` must name `{bad}`, so the mistake is obvious.\n\
+             stderr: {stderr}"
+        );
+    }
+}
