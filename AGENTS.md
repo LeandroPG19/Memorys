@@ -56,7 +56,7 @@ Encode models (embed / NLI / reranker) stay ONNX via `memory-industry models all
 
 - E2E must cover tools without soft-skip
 - `scripts/crap-gate.sh` — coverage floor (inside the SIL)
-- `scripts/mutants-gate.sh` — kill-rate floor on mmr/rrf/cache (inside the SIL)
+- `scripts/mutants-gate.sh` — kill-rate floor on mmr/rrf/cache (inside the SIL). An unviable mutant counts only if rustc refused it with a diagnostic; a build the machine killed fails the run (`--check-builds`, also used by `quality-gate.sh`)
 - Oracles / fixtures decide green — not an AI opinion
 
 ## Immutable fixtures

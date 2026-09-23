@@ -878,9 +878,23 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           if [[ -s "$diff_file" ]]; then
             in_diff=(--in-diff "$diff_file")
           fi
+          # cargo mutants exits 0 when every mutant it could not build is
+          # unviable, whatever stopped the build, and a machine out of memory
+          # stops all of them (0xC0000142 on Windows, 44 of 51 on 2026-09-23).
+          # Its outcomes go to a fresh directory, so what gets judged is this
+          # run and never a mutants.out left behind by an earlier one, and then
+          # to the same check the SIL uses: the rule and its --self-test live in
+          # mutants-gate.sh, not in a copy here.
+          qg_mutants_out="$(mktemp -d)"
           (cd rust && cargo mutants "${files[@]}" "${in_diff[@]}" \
-            --exclude-re "$MUTANTS_EXCLUDE_RE" \
+            --exclude-re "$MUTANTS_EXCLUDE_RE" --output "$qg_mutants_out" \
             --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || fail=1
+          if [[ -f "$qg_mutants_out/mutants.out/outcomes.json" ]]; then
+            "$ROOT/scripts/mutants-gate.sh" --check-builds "$qg_mutants_out/mutants.out/outcomes.json" || fail=1
+          else
+            echo "no outcomes.json: cargo mutants built no mutant, so there is no build to judge"
+          fi
+          rm -rf "$qg_mutants_out"
           rm -f "$diff_file"
         fi
       else

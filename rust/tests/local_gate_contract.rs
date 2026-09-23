@@ -640,6 +640,79 @@ fn a_second_gate_is_refused_and_an_exit_drops_only_its_own_databases() {
     );
 }
 
+/// A broken machine scored a perfect kill rate.
+///
+/// On 2026-09-23 `mutants-gate.sh` printed `3 caught, 51 unviable ...
+/// kill_rate=1.000` and the SIL said `MERGE GATE PASSED`. The good run of the
+/// same commit was 53 caught, 1 unviable. 44 of those 51 builds never reached
+/// the compiler: `cargo.exe` ended with `Failure(-1073741502)`, which is
+/// `0xC0000142 STATUS_DLL_INIT_FAILED` — the process could not start under
+/// memory pressure. The kill rate excludes unviable mutants, so every mutant
+/// the machine could not build left the denominator, and the fewer mutants it
+/// managed to judge the better the score looked.
+///
+/// The other 7 exited 101, like a compile error, and their logs hold no rustc
+/// diagnostic: the rustc or link.exe child died of the same status. So the
+/// check reads each unviable mutant's build status out of `outcomes.json` and
+/// its log, and counts it only when the build exited 1..255 and rustc said why
+/// inside the build phase. Its `--self-test` feeds it genuine compile errors,
+/// which must pass, and an NTSTATUS, a signal, a timeout, a silent 101, a
+/// linker-only 101, a diagnostic outside the build phase, a missing log and a
+/// miscounted file, which must not.
+#[test]
+fn a_build_the_machine_killed_is_not_an_unviable_mutant() {
+    // Checked before the script is launched, not after: without the mode the
+    // script ignores the flag and starts a real mutation run, which takes 26
+    // minutes on the machine this was measured on before it goes red.
+    let gate = read("scripts/mutants-gate.sh");
+    assert!(
+        gate.contains("\"--self-test\"") && gate.contains("\"--check-builds\""),
+        "mutants-gate.sh has no --self-test / --check-builds mode, so nothing can judge an \
+         outcomes.json without running cargo mutants, and nothing proves the unviable-build \
+         check can go red"
+    );
+
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/mutants-gate.sh", "--self-test"])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "mutants-gate.sh --self-test did not pass, so a mutant whose build the machine killed \
+         can be counted as unviable again and leave the kill rate's denominator. \
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Same anchor as the other self-tests: the mode's label.
+    assert!(
+        stdout.contains("self-test:"),
+        "the self-test exited 0 without saying it ran. An exit code alone is what let \
+         codigo-muerto.sh pass for months while doing nothing. stdout: {stdout}"
+    );
+}
+
+/// The second judge's mutation step has the same hole: `cargo mutants` exits 0
+/// when every mutant it could not build is unviable, whatever stopped the
+/// build. It has to hand its outcomes to the same check, not to a copy of it.
+#[test]
+fn the_second_judge_hands_its_mutation_outcomes_to_the_same_build_check() {
+    let q = read("scripts/quality-gate.sh");
+    assert!(
+        q.contains("scripts/mutants-gate.sh\" --check-builds"),
+        "quality-gate.sh runs cargo mutants without judging why its unviable builds failed. \
+         A machine out of memory makes every mutant unviable, cargo mutants exits 0 on that, \
+         and the diff judge closes over mutants nobody built"
+    );
+    assert!(
+        !q.contains("process_status"),
+        "quality-gate.sh reads process_status itself. The rule lives in mutants-gate.sh, whose \
+         --self-test proves it can fail; a second copy is the drift quality-gate.ps1 was"
+    );
+}
+
 fn looks_absolute(path: &str) -> bool {
     if path.starts_with('/') {
         return true;

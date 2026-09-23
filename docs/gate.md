@@ -19,7 +19,7 @@ Second judge, chained, not a substitute: `./scripts/quality-gate.sh` (lizard + `
 | `cargo audit` | known Rust advisories |
 | `codigo-muerto` | dead code / unused deps |
 | `scripts/crap-gate.sh` | coverage floor (`CRAP_MIN_LINE_COV`, default 15%) |
-| `scripts/mutants-gate.sh` | kill-rate floor on `src/search/{mmr,rrf,cache}.rs` |
+| `scripts/mutants-gate.sh` | kill-rate floor on `src/search/{mmr,rrf,cache}.rs`; fails first if any unviable mutant was not refused by the compiler: its build must exit 1..255 and its log must show a rustc diagnostic in the build phase, not only cargo's `could not compile` or a linker failure. Unviable mutants leave the kill rate's denominator, so a machine out of memory would otherwise score high (`--self-test` runs the fixtures) |
 | `scripts/quality-gate.sh` | **not** in the SIL — second judge: lizard + mutants of the `rust/src` diff |
 
 Oracles and fixtures decide green — not an AI opinion.
