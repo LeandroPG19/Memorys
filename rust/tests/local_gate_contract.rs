@@ -978,7 +978,10 @@ fn publish_jobs() -> Vec<(String, Vec<String>)> {
         let trimmed = line.trim_start();
         let depth = line.len() - trimmed.len();
         if depth == 2 && !trimmed.starts_with('#') && trimmed.trim_end().ends_with(':') {
-            jobs.push((trimmed.trim_end().trim_end_matches(':').to_string(), Vec::new()));
+            jobs.push((
+                trimmed.trim_end().trim_end_matches(':').to_string(),
+                Vec::new(),
+            ));
         } else if depth == 4 && trimmed.starts_with("needs:") {
             let value = trimmed["needs:".len()..].trim();
             let needs = value

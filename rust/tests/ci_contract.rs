@@ -131,7 +131,8 @@ fn ci_yml_runs_only_when_dispatched_by_hand() {
 
 #[test]
 fn the_trigger_reader_sees_push_in_both_yaml_forms() {
-    let block = "name: CI\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\njobs:\n  a:\n";
+    let block =
+        "name: CI\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\njobs:\n  a:\n";
     assert_eq!(triggers(block), vec!["push", "workflow_dispatch"]);
     assert_eq!(
         triggers("on: [push, workflow_dispatch]\njobs:\n"),
