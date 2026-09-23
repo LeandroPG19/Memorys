@@ -138,9 +138,9 @@ pub(crate) fn locate_onnxruntime() -> Option<PathBuf> {
         .map(|d| d.join(lib))
         .find(|p| p.exists())?;
 
-    if std::env::var("ORT_DYLIB_PATH").is_err() {
-        unsafe { std::env::set_var("ORT_DYLIB_PATH", &found) };
-    }
+    // Not written back into ORT_DYLIB_PATH: this runs on any tokio worker and
+    // a set_var while another thread reads the environment is undefined
+    // behaviour. `gpu::configure` hands the path to `ort::init_from` instead.
     Some(found)
 }
 
@@ -561,6 +561,34 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 pub fn is_model_loaded() -> bool {
     matches!(get_model_status(), ModelStatus::Loaded)
+}
+
+/// Loads ONNX Runtime from `path` before any session opens.
+///
+/// The empty path is refused here because nothing downstream refuses it:
+/// `ort` reads an empty path as none and loads the bare `onnxruntime.dll`,
+/// which on Windows is the Windows ML build in System32, and `ort::init_from`
+/// answers `Ok` for any path once some library is loaded.
+pub(crate) fn load_onnxruntime(path: &std::path::Path) -> Result<()> {
+    anyhow::ensure!(
+        !path.as_os_str().is_empty(),
+        "the ONNX Runtime library path is empty: point ORT_DYLIB_PATH at the library file or \
+         unset it and run `memory-industry models runtime`"
+    );
+    ort::init_from(path)
+        .map(drop)
+        .map_err(|e| anyhow::anyhow!("loading ONNX Runtime from {}: {e}", path.display()))
+}
+
+/// The runtime `locate_onnxruntime` found, loaded. `ort` keeps the first
+/// library it loads for the life of the process, so the calls after the first
+/// cost a search and nothing else.
+pub(crate) fn load_located_onnxruntime() -> Result<()> {
+    let runtime = locate_onnxruntime().context(
+        "no ONNX Runtime library found: run `memory-industry models runtime` or point \
+         ORT_DYLIB_PATH at the library",
+    )?;
+    load_onnxruntime(&runtime)
 }
 
 #[cfg(test)]

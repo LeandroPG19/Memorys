@@ -136,10 +136,17 @@ fn gpu_availability() -> (bool, bool) {
 /// Takes a factory rather than a builder: when the GPU provider refuses to
 /// start we need a second, clean builder for the CPU path, and a
 /// `SessionBuilder` is consumed by the attempt.
+///
+/// It is also the one door the embedder, NLI and the reranker all pass
+/// before `Session::builder()`, so the runtime is loaded here, from the path
+/// `locate_onnxruntime` found. Left to `ort`, whichever model opened first
+/// decided: the reranker, which never searched, got the bare
+/// `onnxruntime.dll` — on Windows the Windows ML 1.17 in System32.
 pub fn configure<F>(make_builder: F, workload: Workload) -> Result<SessionBuilder>
 where
     F: Fn() -> Result<SessionBuilder>,
 {
+    crate::embeddings::onnx::load_located_onnxruntime()?;
     let builder = make_builder()?;
     let (runtime_gpu, device_present) = gpu_availability();
 
