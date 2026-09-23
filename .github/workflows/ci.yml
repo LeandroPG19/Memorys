@@ -58,17 +58,22 @@ jobs:
       # else. The files named here carry no #[ignore] at all — every test in
       # them runs in a plain `cargo test` — and each creates and drops its own
       # database on the server DATABASE_URL names; one also hard-asserts the
-      # ONNX embedder. This job has neither a server nor a model, so here they
+      # ONNX embedder, and v044_* creates and drops login roles, so it needs a
+      # superuser on a server that checks passwords (scram-sha-256). v044_*
+      # also holds one test that needs no server; it runs locally with the rest
+      # of its file. This job has neither a server nor a model, so here they
       # would fail on every push. The local gate runs them where both exist: the
       # plain `cargo test` step of scripts/run-all-tests.sh, against the
       # throwaway database, with the model paths exported.
       # scripts/codigo-muerto.sh fails if a pattern here matches no file in
       # rust/tests/, or if that step stops being a plain `cargo test`.
-      # Patterns are globs on the file stem, quoted so the shell leaves them be.
+      # Patterns are globs on the file stem, quoted so the shell leaves them be,
+      # all on the one line: the guard reads this list from that line, and
+      # fails if it reads no pattern at all.
       # Owner: implementador 0.28 (tajada R2). Expires: 2027-03-22.
       - name: Select the test targets this job can run
         run: |
-          NEEDS_A_SERVER=('v043_*')
+          NEEDS_A_SERVER=('v043_*' 'v044_*')
           : >"$RUNNER_TEMP/test-targets"
           for file in tests/*.rs; do
             name="$(basename "$file" .rs)"

@@ -84,6 +84,13 @@ server_only_patterns() {
 check_server_only_tests_run_locally() {
   local ci="$1" gate="$2" tests="$3" today="$4" uncovered=0 pattern expired
   local plain='^DATABASE_URL="\$GATE_DATABASE_URL" cargo test$'
+  # Every check below runs once per pattern read, so a list this cannot read
+  # (split over several lines, or emptied) would check nothing and print OK.
+  if grep -q 'NEEDS_A_SERVER=(' "$ci" && [[ -z "$(server_only_patterns "$ci")" ]]; then
+    echo "FAIL: ci.yml declares NEEDS_A_SERVER and no pattern could be read from it. Keep the" >&2
+    echo "      quoted globs on the one line NEEDS_A_SERVER=( opens, or drop the list" >&2
+    uncovered=$((uncovered + 1))
+  fi
   while read -r pattern; do
     [[ -z "$pattern" ]] && continue
     if [[ -z "$(compgen -G "$tests/$pattern.rs" || true)" ]]; then
@@ -145,6 +152,15 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$got" == "3" ]] || { echo "FAIL self-test: server-only files with no plain cargo test left to run them were not caught (got $got)" >&2; exit 1; }
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-23 2>/dev/null | tail -1)"
   [[ "$got" == "2" ]] || { echo "FAIL self-test: a CI exclusion past its date was not caught (got $got)" >&2; exit 1; }
+  # The glob that stops matching is not always the last one: with 'v043_*'
+  # 'v044_*', either can be the one whose files were renamed away.
+  printf '%s\n' "NEEDS_A_SERVER=('gone_*' 'present_*')" > "$tmp/ci5.yml"
+  got="$(check_server_only_tests_run_locally "$tmp/ci5.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "1" ]] || { echo "FAIL self-test: a server-only glob ahead of one that matches was not checked (got $got)" >&2; exit 1; }
+  # The same list split over lines reads as no patterns, and no patterns used to mean no checks.
+  printf '%s\n' 'NEEDS_A_SERVER=(' "  'gone_*'" ')' > "$tmp/ci6.yml"
+  got="$(check_server_only_tests_run_locally "$tmp/ci6.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "1" ]] || { echo "FAIL self-test: a NEEDS_A_SERVER list the guard cannot read passed as checked (got $got)" >&2; exit 1; }
 
   mkdir -p "$tmp/src"
   # The comment line is the fixture that matters: the first version of this
