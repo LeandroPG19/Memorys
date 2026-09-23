@@ -27,7 +27,7 @@ qg_mutants_jobs() {
 # Every --exclude-re entry of the mutation step, in one place so that the
 # exclusion checks below read exactly what the mutation run is handed. Each
 # entry's reason, owner and expiry date are in the comment over that step.
-MUTANTS_EXCLUDE_RE='fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false|src/redact\.rs:110:63: replace > with >= in credentials_in_url|src/redact\.rs:130:58: replace > with >= in secret_field|src/redact\.rs:136:51: replace \+ with \* in secret_field|src/cognitive/nli\.rs:.*replace enabled -> bool with |src/cognitive/nli\.rs:.*replace status_resolved -> bool with false|src/cognitive/nli\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace compute_embedding -> Result<Vec<f32>> with Ok\(vec!|src/http\.rs:1462:24: replace && with \|\| in embedder_state|src/(calibrate_cli|dashboard|dedupe_cli|export|link_cli|reembed_cli|rem_cli|secure_cli|skills_cli|sync_cli|eval/mod)\.rs:.*replace run_cli -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace print_help with \(\)|src/setup\.rs:.*replace log with \(\)|src/dashboard\.rs:.*replace render -> Result<String> with |src/search/calibrate\.rs:.*replace load_ood_threshold -> Option<f64> with |src/export\.rs:.*replace export_obsidian -> Result<usize> with |src/db\.rs:.*replace assert_embedding_dim -> Result<\(\)> with Ok\(\(\)\)|src/dedupe_cli\.rs:.*replace merge_by_name -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace run_rem_consolidation_locked -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace download_(model|runtime) -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace spawn_handshake_watchdog with \(\)|src/embeddings/onnx\.rs:.*replace locate_onnxruntime -> Option<PathBuf> with Some\(Default::default\(\)\)|src/main\.rs:.*replace async_main with \(\)'
+MUTANTS_EXCLUDE_RE='fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false|src/redact\.rs:110:63: replace > with >= in credentials_in_url|src/redact\.rs:130:58: replace > with >= in secret_field|src/redact\.rs:136:51: replace \+ with \* in secret_field|src/cognitive/nli\.rs:.*replace enabled -> bool with |src/cognitive/nli\.rs:.*replace status_resolved -> bool with false|src/cognitive/nli\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace compute_embedding -> Result<Vec<f32>> with Ok\(vec!|src/http\.rs:1462:24: replace && with \|\| in embedder_state|src/(calibrate_cli|dashboard|dedupe_cli|export|link_cli|reembed_cli|rem_cli|secure_cli|skills_cli|sync_cli|eval/mod)\.rs:.*replace run_cli -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace print_help with \(\)|src/setup\.rs:.*replace log with \(\)|src/dashboard\.rs:.*replace render -> Result<String> with |src/search/calibrate\.rs:.*replace load_ood_threshold -> Option<f64> with |src/export\.rs:.*replace export_obsidian -> Result<usize> with |src/db\.rs:.*replace assert_embedding_dim -> Result<\(\)> with Ok\(\(\)\)|src/dedupe_cli\.rs:.*replace merge_by_name -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace run_rem_consolidation_locked -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace download_(model|runtime) -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace spawn_handshake_watchdog with \(\)|src/embeddings/onnx\.rs:.*replace locate_onnxruntime -> Option<PathBuf> with Some\(Default::default\(\)\)|src/main\.rs:.*replace async_main with \(\)|src/db\.rs:.*replace bind_app_role -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace init_schema -> Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace provision_app_role with \(\)|src/db\.rs:.*replace write_app_role_password -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/embeddings/onnx\.rs:.*replace load_onnxruntime -> Result<\(\)> with Ok\(\(\)\)|src/embeddings/onnx\.rs:.*replace load_located_onnxruntime -> Result<\(\)> with Ok\(\(\)\)'
 
 echo "=== quality-gate (MemoryIndustry — CRAP/lizard + mutación del diff) ==="
 echo "NO MIRA: SIL (fmt, clippy -D, tests --ignored, e2e, deny, audit, codigo-muerto, crap-gate floor, mutants-gate mmr/rrf/cache)."
@@ -801,6 +801,67 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     starts to matter the day that skip goes; it is
           #                     written now so that day does not arrive with
           #                     the reason missing.
+          #
+          # A seventh group: the survivors of the head of 0.27
+          # (feat/0.27-despliegue-y-trinquetes at c34dd07) that no --lib test
+          # can kill. Same shape as the fifth: file in full, ending in the
+          # replacement, so the siblings and the mutants inside each body stay
+          # judged. The four of secure_cli.rs that were MISSED there (summary
+          # and derive_app_url) are not here: they die in its mod tests.
+          # Owner: endurecedor 0.27 (c34dd07). Expires: 2027-03-22.
+          #
+          #   Needs a database (precedent: assert_embedding_dim, merge_by_name):
+          #   db.rs bind_app_role with Ok(())
+          #                     judged by both tests of
+          #                     v044_a_new_app_role_does_not_get_a_published_password.
+          #                     Without the two settings the DO block of
+          #                     create-app-role.sql falls back to cuba_app. Where
+          #                     cuba_app does not exist it raises «app_password is
+          #                     not set» and ensure_app_role errs; where it does,
+          #                     the block reimposes attributes on cuba_app instead
+          #                     of the probe role, so
+          #                     a_role_created_by_secure_does_not_open_with_the_password_in_the_repo
+          #                     finds no probe role in pg_roles and
+          #                     a_role_that_already_exists_keeps_the_password_its_daemon_uses
+          #                     finds CREATEDB still on it. Red on both servers.
+          #   db.rs init_schema with Ok(())
+          #                     judged by
+          #                     v043_the_dashboard_reads_the_base_it_is_pointed_at::the_dashboard_shows_an_observation_it_read_from_the_base:
+          #                     its scratch database starts empty, create_pool is
+          #                     what migrates it, and without the migrator the
+          #                     cuba_cronica seed finds no table.
+          #   db.rs provision_app_role with (), write_app_role_password with Ok(())
+          #                     the rotation of the cuba_app password to
+          #                     pgpass_app when the daemon starts as admin.
+          #                     Judged NOWHERE. v020_role_separation sets that
+          #                     password itself with ALTER ROLE before connecting,
+          #                     v021_audit_append_under_app_role never asks which
+          #                     role its pool ended up as (create_pool stays on
+          #                     the admin connection in silence when the login
+          #                     fails), v044 avoids create_pool on purpose because
+          #                     the rotation rewrites the server-wide role, and
+          #                     run-all-tests.sh runs several suites with
+          #                     CUBA_APP_ROLE=0. The password on the gate's server
+          #                     is whatever an earlier run left there, so the
+          #                     rotation not happening is invisible to all of them.
+          #
+          #   Detected, and then the run cannot finish on this platform:
+          #   onnx.rs load_onnxruntime with Ok(()), load_located_onnxruntime with Ok(())
+          #                     both are caught: the first by
+          #                     an_empty_runtime_path_is_refused_by_name_and_never_handed_to_ort,
+          #                     the second by
+          #                     with_no_runtime_anywhere_loading_the_located_one_says_how_to_get_it.
+          #                     But with `ort` never initialised, the first later
+          #                     test that opens a session loads the default
+          #                     onnxruntime.dll, which on this Windows machine is
+          #                     the Windows ML 1.17 build in C:\Windows\System32,
+          #                     and hangs loading it; every test waiting on
+          #                     GLOBAL_STATE_GUARD queues behind it and the mutant
+          #                     ends as TIMEOUT, not CAUGHT. Measured in the
+          #                     mutants.out logs of the directed run over c34dd07.
+          #                     On Linux the same mutant should fail fast: the day
+          #                     this judge runs there, re-measure and delete both
+          #                     patterns if they come back CAUGHT.
           diff_file="$(mktemp)"
           # Same base as the file list above, or the two halves of this judge
           # would disagree about what "the change" is.

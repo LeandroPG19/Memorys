@@ -1103,4 +1103,56 @@ mod tests {
              .env reads their own mistake and not a loader message: {reason}"
         );
     }
+
+    /// With no runtime anywhere in the chain, loading the located runtime is
+    /// an error that tells the operator how to get one — never `Ok`.
+    ///
+    /// An `Ok` here is the hang described at `get_model_status`: `ort` stays
+    /// uninitialised, and the first session that opens loads whatever bare
+    /// `onnxruntime.dll` the platform loader finds. `cargo mutants` had
+    /// `load_located_onnxruntime -> Ok(())` with no test of its own.
+    ///
+    /// Every candidate of `locate_onnxruntime` is taken out: ORT_DYLIB_PATH
+    /// cleared (the gate exports it at the real runtime), a home with no cache
+    /// under it, LD_LIBRARY_PATH cleared. The system directories are fixed in
+    /// production and cannot be moved from a test, so the positive control
+    /// below fails by name on a host that keeps a runtime there, instead of
+    /// letting this test hand a real library to `ort`.
+    #[tokio::test]
+    async fn with_no_runtime_anywhere_loading_the_located_one_says_how_to_get_it() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let empty_home = scratch_root("ort-none");
+        let _explicit = ScopedEnv::cleared("ORT_DYLIB_PATH");
+        let _h = ScopedEnv::set("HOME", &empty_home.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &empty_home.display().to_string());
+        let _ld = ScopedEnv::cleared("LD_LIBRARY_PATH");
+
+        assert_eq!(
+            locate_onnxruntime(),
+            None,
+            "the fixture is broken: with ORT_DYLIB_PATH and LD_LIBRARY_PATH cleared and an empty \
+             home, the search still found a runtime, so this host keeps one in a system \
+             directory (/usr/lib, /usr/local/lib, /usr/lib/x86_64-linux-gnu, /usr/lib64, \
+             /opt/homebrew/lib). This test cannot measure the missing-runtime answer here"
+        );
+
+        let reason = load_located_onnxruntime()
+            .map_err(|e| format!("{e:#}"))
+            .expect_err(
+                "no runtime anywhere in the chain and the load answered Ok. `ort` is left \
+                 uninitialised and the first session loads whatever onnxruntime the platform \
+                 loader finds — on Windows the Windows ML build in System32, which hangs",
+            );
+        assert!(
+            reason.contains("no ONNX Runtime library found"),
+            "the error has to say the runtime is missing: {reason}"
+        );
+        assert!(
+            reason.contains("memory-industry models runtime") && reason.contains("ORT_DYLIB_PATH"),
+            "and it has to name both ways out, the download and the variable: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(&empty_home);
+    }
 }

@@ -126,3 +126,57 @@ fn derive_app_url(admin_url: &str, password: &str) -> String {
     }
     format!("postgresql://{role}:{password}@127.0.0.1:5488/brain")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `secure` prints first. The two sentences are not decoration: the
+    /// second one is the only place an operator who re-runs `secure` on an
+    /// upgraded install is told that the password was left alone on purpose.
+    #[test]
+    fn each_outcome_tells_the_operator_what_happened_to_the_role() {
+        assert_eq!(
+            AppRole::Created.summary(),
+            "Rol cuba_app creado (NOSUPERUSER, NOBYPASSRLS) con permisos de lectura/escritura \
+             y la contraseña de pgpass_app.",
+            "a created role has to say where its password came from, or the operator goes \
+             looking for one that was never printed"
+        );
+        assert_eq!(
+            AppRole::AlreadyExisted.summary(),
+            "Rol cuba_app ya existía: se le reimpusieron NOSUPERUSER y NOBYPASSRLS y los \
+             permisos. secure no cambia su contraseña: la de pgpass_app se la pone el daemon \
+             cuando arranca como admin y migra.",
+            "an existing role has to say its password was NOT changed: the daemon of an install \
+             that upgrades is connecting with the old one"
+        );
+        assert_ne!(
+            AppRole::Created.summary(),
+            AppRole::AlreadyExisted.summary(),
+            "the two outcomes answer differently about the password, so they cannot print the \
+             same line"
+        );
+    }
+
+    /// The URL `secure` prints for the runtime: the admin's host, port and
+    /// database, with the application role and its password in place of the
+    /// admin's credentials.
+    #[test]
+    fn the_runtime_url_keeps_the_admin_host_and_database_and_swaps_only_the_credentials() {
+        assert_eq!(
+            derive_app_url(
+                "postgresql://cuba:admin-secret@db.planta.local:5433/brain_prod",
+                "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+            ),
+            "postgresql://cuba_app:9f8e7d6c5b4a39281706f5e4d3c2b1a0@db.planta.local:5433/brain_prod",
+            "the printed URL has to reach the same server and database the admin did, as \
+             cuba_app with the pgpass_app password, and carry nothing of the admin's secret"
+        );
+        assert_eq!(
+            derive_app_url("postgres://cuba:x@127.0.0.1:5488/brain", "0123abcd"),
+            "postgres://cuba_app:0123abcd@127.0.0.1:5488/brain",
+            "the scheme the operator wrote is kept as written: `postgres://` stays `postgres://`"
+        );
+    }
+}
