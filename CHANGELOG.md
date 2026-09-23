@@ -9,6 +9,8 @@ versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI
 
 ### Behaviour changes — read before deploying
 
+- **A release no longer asks GitHub whether it is green.** `publish.yml` used to wait for `ci.yml` to pass on the tagged commit, which made the badge the judge of a release. The judge is the local `merge-gate.sh`: `scripts/release.sh vX.Y.Z` runs it and writes its verdict into the annotated tag, and `publish.yml` refuses any tag without that receipt for its commit. A tag pushed by hand no longer publishes. `ci.yml` runs only when dispatched.
+
 - **A narrow GPU may move to the CPU.** The CUDA arena ceiling was `DEFAULT_GPU_MEM_LIMIT_MB` (2048) applied with `.min()`, so it was 2048 on every machine regardless of the card, and `bge-reranker-v2-m3` does not fit in 2048. The ceiling is now all free VRAM minus the reserve, and what the model needs is measured from the file on disk. A card that today runs the reranker at 2048 and appears to work may now be placed on the CPU instead: an honest CPU beats an arena that bursts halfway through a batch. Override with `CUBA_RERANK_DEVICE`.
 - **Silent degradation becomes a visible error.** A CUDA provider that fails to register now drops to the CPU with an `ERROR` instead of a debug line, and a session that fails to commit is an error. Installs that believe they are on the GPU will find out that they are not. That is the point, but it will show up in logs on upgrade.
 - **An explicit GPU ceiling below the measured floor is raised**, with an `ERROR` naming both numbers. Every other knob still yields to whatever the operator set.

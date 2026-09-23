@@ -8,7 +8,9 @@ Mergeable means **`./scripts/merge-gate.sh`** exited 0 in this turn with a clean
 
 Aliases of the same SIL: `./scripts/como-el-ci.sh todo`, `./scripts/como-el-ci.sh extra`, `./scripts/memory-industry-test.sh all`.
 
-GitHub Actions is **not** the merge judge. A green badge is not mergeable. That workflow excludes `MODEL_OR_CLI_ONLY` and has no ONNX / NLI / reranker / generative LLM.
+GitHub Actions is **not** the merge judge. A green badge is not mergeable. That workflow excludes `MODEL_OR_CLI_ONLY` and has no ONNX / NLI / reranker / generative LLM. `ci.yml` runs only when dispatched by hand.
+
+Publishing is **`./scripts/release.sh vX.Y.Z`** and nothing else: it runs `merge-gate.sh` on `origin/main`, and only on a clean exit 0 pushes an annotated tag carrying `local-gate: MERGE GATE PASSED <sha>`. `publish.yml` reads that line and asks GitHub's CI nothing.
 
 ## Two judges, chained
 

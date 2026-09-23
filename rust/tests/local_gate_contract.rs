@@ -961,6 +961,128 @@ fn the_crap_half_of_the_second_judge_can_actually_fail() {
     );
 }
 
+/// Each job of publish.yml and the jobs it `needs:`, read off the two-space
+/// indented keys under `jobs:`.
+fn publish_jobs() -> Vec<(String, Vec<String>)> {
+    let yaml = read(".github/workflows/publish.yml");
+    let mut jobs: Vec<(String, Vec<String>)> = Vec::new();
+    let mut in_jobs = false;
+    for line in yaml.lines() {
+        if line.starts_with("jobs:") {
+            in_jobs = true;
+            continue;
+        }
+        if !in_jobs {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let depth = line.len() - trimmed.len();
+        if depth == 2 && !trimmed.starts_with('#') && trimmed.trim_end().ends_with(':') {
+            jobs.push((trimmed.trim_end().trim_end_matches(':').to_string(), Vec::new()));
+        } else if depth == 4 && trimmed.starts_with("needs:") {
+            let value = trimmed["needs:".len()..].trim();
+            let needs = value
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty());
+            if let Some(job) = jobs.last_mut() {
+                job.1.extend(needs);
+            }
+        }
+    }
+    jobs
+}
+
+/// Publishing depends on the local gate, not on GitHub.
+///
+/// publish.yml used to open with `ci-was-green`, which ran `gh run list
+/// --workflow=ci.yml` and refused to publish unless GitHub's CI had passed on
+/// the commit: the badge AGENTS.md says is not the judge was the judge of every
+/// release. scripts/release.sh now runs merge-gate.sh on the commit main holds
+/// and writes `local-gate: MERGE GATE PASSED <sha>` into the annotated tag it
+/// pushes; publish.yml reads that line back through the same script. Every
+/// other job has to reach that check through `needs:`, or it publishes
+/// whatever the tag points at.
+#[test]
+fn publishing_is_gated_by_the_local_receipt_and_not_by_github_ci() {
+    let yaml = read(".github/workflows/publish.yml");
+    assert!(
+        !yaml.contains("gh run list") && !yaml.contains("ci.yml"),
+        "publish.yml asks GitHub about ci.yml again. The release is judged by \
+         ./scripts/merge-gate.sh locally, and its receipt travels in the tag"
+    );
+    assert!(
+        yaml.contains("bash scripts/release.sh --verify-receipt \"$TAG\" \"$SHA\""),
+        "publish.yml must check the receipt with scripts/release.sh --verify-receipt, the same \
+         code whose --self-test proves it accepts what release.sh writes and nothing else"
+    );
+    assert!(
+        yaml.contains("git fetch --no-tags --force origin \"refs/tags/$TAG:refs/tags/$TAG\""),
+        "actions/checkout leaves the tag as a lightweight ref on the commit \
+         (actions/checkout#290), so the receipt is not in the clone until the annotated tag \
+         object is fetched over it with --force"
+    );
+
+    let jobs = publish_jobs();
+    let gate = "local-gate-receipt";
+    assert!(
+        jobs.len() > 1 && jobs.iter().any(|(name, _)| name == gate),
+        "publish.yml parsed into {jobs:?}. Without the `{gate}` job, or without any job to hold \
+         to it, the loop below judges nothing"
+    );
+    for (name, _) in jobs.iter().filter(|(name, _)| name != gate) {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut stack: Vec<&str> = vec![name.as_str()];
+        while let Some(job) = stack.pop() {
+            if seen.contains(&job) {
+                continue;
+            }
+            seen.push(job);
+            if let Some((_, needs)) = jobs.iter().find(|(n, _)| n == job) {
+                stack.extend(needs.iter().map(String::as_str));
+            }
+        }
+        assert!(
+            seen.contains(&gate),
+            "publish.yml job `{name}` does not reach `{gate}` through needs:, so it runs whether \
+             or not the tag carries the local gate's receipt"
+        );
+    }
+}
+
+/// The release script's guards have to be able to fail.
+///
+/// Its `--self-test` builds a throwaway origin and clone with a stand-in
+/// merge-gate.sh, and drives the real script into each refusal: a dirty tree, a
+/// HEAD ahead of or behind origin/main, a tag already taken here or on origin, a
+/// version rust/Cargo.toml does not declare, a red gate and an exit 0 over
+/// SKIPPED or a failed test run. It then checks that the receipt a green run
+/// writes is the one `--verify-receipt` accepts, and that a lightweight tag,
+/// another commit and a hand-made annotated tag are refused.
+#[test]
+fn the_release_script_refuses_what_it_should_and_its_receipt_is_the_one_publish_reads() {
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/release.sh", "--self-test"])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "release.sh --self-test did not pass, so a release can be tagged past one of its guards \
+         or publish.yml cannot read the receipt it writes. stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Same anchor as the other self-tests: the mode's label.
+    assert!(
+        stdout.contains("self-test:"),
+        "the self-test exited 0 without saying it ran. An exit code alone is what let \
+         codigo-muerto.sh pass for months while doing nothing. stdout: {stdout}"
+    );
+}
+
 /// The guard that could not fail, and for the longest of all.
 ///
 /// `swarm-forge.md` says of the green pass: "El codigo, sin tocar los tests:

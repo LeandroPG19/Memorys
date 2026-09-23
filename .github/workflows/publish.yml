@@ -22,58 +22,48 @@ permissions:
 
 # ── 1. Build native binaries ─────────────────────────────────────────────────
 jobs:
-  # A tag published whatever compiled. Nothing checked that the commit it points at
-  # had ever passed its tests — the release pipeline runs no tests of its own, so
-  # between `git tag` and npm there was no point at which a red suite could stop
-  # anything. Tagging the wrong commit, or tagging before CI finished, shipped it.
-  ci-was-green:
-    name: CI was green on this commit
+  # The release pipeline runs no tests of its own, so this job is the only thing
+  # between a red suite and npm, PyPI and five binaries. It used to ask GitHub
+  # whether its own CI workflow had passed on the commit, which made the badge
+  # the judge of a release. The judge is ./scripts/merge-gate.sh on the merge machine, and
+  # scripts/release.sh writes its verdict into the annotated tag it pushes:
+  #   local-gate: MERGE GATE PASSED <sha>
+  # This job reads that line back and refuses any tag without it for this commit.
+  local-gate-receipt:
+    name: The tag carries the local gate's receipt
     runs-on: ubuntu-latest
     steps:
-      - name: The tagged commit must have a passing CI run
+      - uses: actions/checkout@v4
+
+      - name: The tag must be annotated and name this commit as gated
         env:
-          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
           SHA: ${{ github.sha }}
-          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # Waiting rather than failing outright: tagging straight after a push is
-          # normal, and CI takes ~15 min. Refusing a tag that arrives two minutes
-          # early would teach everyone to dispatch the workflow manually instead.
-          deadline=$(( SECONDS + 2700 ))
-          while :; do
-            runs=$(gh run list --repo "$REPO" --workflow=ci.yml --commit="$SHA" \
-                     --json status,conclusion,databaseId --limit 20)
-            done_runs=$(echo "$runs" | jq '[.[] | select(.status == "completed")]')
-            if [ "$(echo "$done_runs" | jq 'length')" -gt 0 ]; then
-              if [ "$(echo "$done_runs" | jq '[.[] | select(.conclusion == "success")] | length')" -gt 0 ]; then
-                echo "OK  CI passed on $SHA"
-                exit 0
-              fi
-              echo "REFUSING TO PUBLISH: CI ran on $SHA and did not pass." >&2
-              echo "$done_runs" | jq -r '.[] | "  run \(.databaseId): \(.conclusion)"' >&2
-              echo "" >&2
-              echo "The release pipeline runs no tests of its own, so this is the only" >&2
-              echo "thing standing between a red suite and npm, PyPI and five binaries." >&2
-              echo "Fix main, move the tag, and push it again." >&2
-              exit 1
-            fi
-            if [ "$(echo "$runs" | jq 'length')" -eq 0 ]; then
-              echo "REFUSING TO PUBLISH: no CI run exists for $SHA." >&2
-              echo "A tag on a commit CI never saw is a release nothing verified." >&2
-              exit 1
-            fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "REFUSING TO PUBLISH: CI on $SHA is still running after 45 minutes." >&2
-              exit 1
-            fi
-            echo "CI still running on $SHA — waiting 60s"
-            sleep 60
-          done
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            TAG="$GITHUB_REF_NAME"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "REFUSING TO PUBLISH: no tag. Push one, or dispatch with the tag input." >&2
+            echo "The only way to publish is ./scripts/release.sh vX.Y.Z." >&2
+            exit 1
+          fi
+          # actions/checkout fetches a tag as `+<sha>:refs/tags/<tag>`, which
+          # leaves a lightweight ref on the commit and drops the annotation
+          # (actions/checkout#290). --force replaces that ref with the real
+          # annotated tag object, whose message is the receipt.
+          if ! git fetch --no-tags --force origin "refs/tags/$TAG:refs/tags/$TAG"; then
+            echo "REFUSING TO PUBLISH: tag $TAG does not exist on origin." >&2
+            echo "The only way to publish is ./scripts/release.sh vX.Y.Z." >&2
+            exit 1
+          fi
+          bash scripts/release.sh --verify-receipt "$TAG" "$SHA"
 
   build-binaries:
     name: Binary — ${{ matrix.target }}
-    needs: ci-was-green
+    needs: local-gate-receipt
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

@@ -1,10 +1,11 @@
 name: CI
 
+# By hand only. The judge is ./scripts/merge-gate.sh on the merge machine, and
+# a run on every push made the badge look like one. Publishing does not ask
+# this workflow anything either: publish.yml reads the local gate's receipt
+# from the annotated tag scripts/release.sh writes.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

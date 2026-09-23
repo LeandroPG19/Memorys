@@ -73,6 +73,27 @@ Missing any of these is **FAIL**, never `SKIPPED`:
 
 E2E asserts `cuba_decreto` query `count >= 1` after record. That used to pass with count 0.
 
+## Publishing
+
+```bash
+./scripts/release.sh v0.28.0            # gate, tag, push the tag
+./scripts/release.sh --dry-run v0.28.0  # gate, print the tag message, create nothing
+```
+
+The only way to publish. In order, and any failure stops it before anything is created:
+
+1. The tree is clean (untracked files count: the DB step discovers `rust/tests/*.rs` by glob), `HEAD` equals `origin/main` after a fetch, and the tag exists neither here nor on origin.
+2. The tag's version is the one `rust/Cargo.toml` declares.
+3. `./scripts/merge-gate.sh` runs on that `HEAD`. It has to exit 0 **and** leave a clean log: no `SKIPPED` other than the banner's own "never SKIPPED", no `test result: FAILED`, a `MERGE GATE PASSED` line and a `kill_rate=` line. The log stays in `~/.cache/cuba-gate/release-<tag>.log`.
+4. An annotated tag is created whose message carries the receipt, one exact line `local-gate: MERGE GATE PASSED <40-char sha>`, plus the date and those two summary lines. Nothing from the environment goes in it.
+5. Only that tag is pushed.
+
+`publish.yml` no longer asks GitHub whether `ci.yml` passed. Its first job fetches the annotated tag (`actions/checkout` leaves a lightweight ref in its place, [actions/checkout#290](https://github.com/actions/checkout/issues/290)) and runs `scripts/release.sh --verify-receipt <tag> <sha>`: the tag must be annotated, point at the commit being built, and carry the receipt line for that commit. Every other job needs it. A tag pushed by hand is refused, so the only way a release reaches npm, PyPI and the binaries is through a green local gate.
+
+`ci.yml` runs only by `workflow_dispatch`. Its `release-matrix` job, which compiles the five published targets, no longer runs on its own: the local gate does not check other platforms, so dispatch it by hand before a release that touches features or platform code.
+
+`./scripts/release.sh --self-test` drives each guard against a throwaway repo with a stand-in `merge-gate.sh`, and checks that the receipt it writes is the one `--verify-receipt` accepts.
+
 ## Programming rules (this repo)
 
 Versioned under `.cursor/rules/` (never a junction to `~/.cursor/rules`). Six-pack + TDD + two judges. Comments stay. Plant rules (Playwright, React Query, guardian-planta) are not copied here.

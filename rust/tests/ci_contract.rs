@@ -60,6 +60,86 @@ fn literal_test_names(yaml: &str) -> Vec<String> {
     names
 }
 
+/// The events under the workflow's top-level `on:`, in either YAML form: the
+/// inline `on: [push, pull_request]` / `on: push`, or the block with one key per
+/// event. Only the keys at the first indentation of the block are events; what
+/// sits deeper (`branches:`, `inputs:`) belongs to them.
+fn triggers(yaml: &str) -> Vec<String> {
+    let lines: Vec<&str> = yaml.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| {
+            let head = l.trim_end();
+            ["on:", "\"on\":", "'on':"]
+                .iter()
+                .any(|key| head.starts_with(key))
+        })
+        .expect("ci.yml must have a top-level `on:`");
+    let inline = lines[start]
+        .split_once(':')
+        .map(|(_, rest)| rest.split('#').next().unwrap_or("").trim())
+        .unwrap_or("");
+    if !inline.is_empty() {
+        return inline
+            .trim_matches(|c| c == '[' || c == ']')
+            .split(',')
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .collect();
+    }
+    let mut events = Vec::new();
+    let mut indent: Option<usize> = None;
+    for line in &lines[start + 1..] {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let depth = line.len() - trimmed.len();
+        if depth == 0 {
+            break;
+        }
+        let first = *indent.get_or_insert(depth);
+        if depth == first {
+            let key = trimmed.split(':').next().unwrap_or("").trim();
+            events.push(key.to_string());
+        }
+    }
+    events
+}
+
+/// GitHub Actions runs this workflow when somebody asks it to, and never on its
+/// own. It used to run on every push and pull request to main, which made its
+/// badge read like a merge verdict; AGENTS.md says the badge is not one, and
+/// publish.yml used to consult it before releasing. The judge is
+/// ./scripts/merge-gate.sh on the merge machine.
+#[test]
+fn ci_yml_runs_only_when_dispatched_by_hand() {
+    let events = triggers(&ci_yaml());
+    assert!(
+        !events.is_empty(),
+        "no event could be read out of ci.yml's `on:`. A scan that found nothing would pass \
+         the assertion below for any workflow at all"
+    );
+    assert_eq!(
+        events,
+        vec!["workflow_dispatch".to_string()],
+        "ci.yml is triggered by {events:?}. It runs only by hand: a run on push or pull_request \
+         turns its badge back into something that looks like the merge judge, and the judge is \
+         ./scripts/merge-gate.sh, locally"
+    );
+}
+
+#[test]
+fn the_trigger_reader_sees_push_in_both_yaml_forms() {
+    let block = "name: CI\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\njobs:\n  a:\n";
+    assert_eq!(triggers(block), vec!["push", "workflow_dispatch"]);
+    assert_eq!(
+        triggers("on: [push, workflow_dispatch]\njobs:\n"),
+        vec!["push", "workflow_dispatch"]
+    );
+    assert_eq!(triggers("on: push\njobs:\n"), vec!["push"]);
+}
+
 #[test]
 fn github_actions_declares_it_is_not_the_merge_judge() {
     let yaml = ci_yaml();
