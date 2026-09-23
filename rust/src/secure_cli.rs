@@ -179,4 +179,88 @@ mod tests {
             "the scheme the operator wrote is kept as written: `postgres://` stays `postgres://`"
         );
     }
+
+    /// Percent-decoding, the step both clients below apply to the credentials of
+    /// a URL. Written here because neither `url` nor `percent-encoding` is a
+    /// dependency of this crate. An escape that is not two hex digits stays as
+    /// written, as the `url` crate leaves it.
+    fn percent_decoded(text: &str) -> String {
+        let mut bytes = Vec::with_capacity(text.len());
+        let mut rest = text.as_bytes();
+        while let Some((&first, tail)) = rest.split_first() {
+            if first == b'%'
+                && let Some(escape) = tail.get(..2)
+                && let Ok(decoded) = hex::decode(escape)
+            {
+                bytes.extend(decoded);
+                rest = &tail[2..];
+            } else {
+                bytes.push(first);
+                rest = tail;
+            }
+        }
+        String::from_utf8(bytes).expect("a percent-decoded password is not UTF-8")
+    }
+
+    /// The password the daemon logs in with: sqlx parses DATABASE_URL with
+    /// `PgConnectOptions::from_str`. sqlx-postgres 0.8.6 has no getter for the
+    /// password, so it is read back through `to_url_lossy`, which rebuilds the
+    /// URL from the parsed options (`build_url` percent-encodes the stored
+    /// password with NON_ALPHANUMERIC); decoding that is exactly what was stored.
+    fn password_the_daemon_uses(url: &str) -> Result<Option<String>, String> {
+        use sqlx::ConnectOptions;
+        use std::str::FromStr;
+        let options = sqlx::postgres::PgConnectOptions::from_str(url).map_err(|e| e.to_string())?;
+        Ok(options.to_url_lossy().password().map(percent_decoded))
+    }
+
+    /// The password psql logs in with, following libpq's
+    /// `conninfo_uri_parse_options` (src/interfaces/libpq/fe-connect.c): the
+    /// credentials end at the FIRST `@` or `/`, the user name at the first `:`
+    /// inside them, and the rest is the password, percent-decoded. sqlx cuts at
+    /// the LAST `@` instead, so a URL both of them read the same is one whose
+    /// password carries no raw `@`.
+    fn password_psql_uses(url: &str) -> Option<String> {
+        let (_, rest) = url.split_once("://")?;
+        let end = rest.find(['@', '/'])?;
+        if !rest[end..].starts_with('@') {
+            return None;
+        }
+        let (_, password) = rest[..end].split_once(':')?;
+        Some(percent_decoded(password))
+    }
+
+    /// The line `secure` prints is the one the operator pastes into the daemon's
+    /// DATABASE_URL and into psql. Whatever the password holds, both have to
+    /// log in with that password and not with another one. The hex password is
+    /// the sane case: the test above fixes its URL byte for byte.
+    #[test]
+    fn the_runtime_url_hands_the_daemon_and_psql_the_password_it_was_given() {
+        let wrong: Vec<String> = ["ab/cd", "p@ss", "a%41b", "us:er", "9f8e7d6c5b4a3928"]
+            .into_iter()
+            .filter_map(|password| {
+                let url = derive_app_url(
+                    "postgresql://cuba:admin-secret@db.planta.local:5433/brain_prod",
+                    password,
+                );
+                let daemon = password_the_daemon_uses(&url);
+                let psql = password_psql_uses(&url);
+                let both_right =
+                    daemon == Ok(Some(password.to_owned())) && psql.as_deref() == Some(password);
+                (!both_right).then(|| {
+                    format!(
+                        "  {password:?} printed as {url} -> the daemon reads {daemon:?}, \
+                         psql reads {psql:?}"
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "the URL `secure` prints does not carry the password it was given, so the daemon \
+             or psql logs in with another one or cannot parse the line at all. The password \
+             has to be percent-encoded into the URL:\n{}",
+            wrong.join("\n")
+        );
+    }
 }

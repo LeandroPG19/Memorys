@@ -20,9 +20,10 @@ use std::future::Future;
 
 use common::in_a_scratch_database;
 use memory_industry::secure_cli::{AppRole, ensure_app_role};
-use sqlx::{Connection, Executor, PgConnection, PgPool};
+use sqlx::{Connection, Executor, PgConnection, PgPool, Row};
 
 const PUBLISHED_PASSWORD: &str = "app2026";
+const CREATE_APP_ROLE_SQL: &str = include_str!("../embed/create-app-role.sql");
 
 fn with_credentials(url: &str, role: &str, password: &str) -> String {
     let (scheme, rest) = url.split_once("://").expect("a database URL has a scheme");
@@ -187,6 +188,94 @@ async fn a_role_that_already_exists_keeps_the_password_its_daemon_uses() {
             !creates_databases,
             "the setup left CREATEDB on an existing {role}: keeping its password must not mean \
              skipping the NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS it reimposes"
+        );
+        admin.close().await;
+    })
+    .await;
+}
+
+/// The real application role as pg_roles shows it (the password is masked
+/// there), or None when the server has none.
+async fn the_real_app_role(pool: &PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT r::text FROM pg_roles r WHERE rolname = $1")
+        .bind(memory_industry::db::APP_ROLE)
+        .fetch_optional(pool)
+        .await
+        .expect("reading the real application role from pg_roles")
+}
+
+/// A caller that forgets `bind_app_role` used to get `cuba_app`: the script
+/// fell back to it when `memory_industry.app_role` was unset, and so acted on
+/// the role the user's real daemon logs in as. It has to refuse instead.
+///
+/// With the fallback still in place this test runs the script against the real
+/// `cuba_app`. That is why everything happens inside one transaction that is
+/// rolled back before any assertion can panic: CREATE ROLE, ALTER ROLE and
+/// GRANT are all transactional in PostgreSQL, so nothing the script did
+/// outlives the rollback, and a process killed halfway leaves an uncommitted
+/// transaction that the server aborts. The last assertions then read the real
+/// role again and require it unchanged.
+#[tokio::test]
+async fn the_script_refuses_to_run_when_it_is_not_told_which_role() {
+    with_a_throwaway_role(|url, role| async move {
+        let admin = PgPool::connect(&url)
+            .await
+            .expect("connecting to the scratch database as the admin role");
+        let before = the_real_app_role(&admin).await;
+
+        // Only the password is handed over, so the one thing missing is the role
+        // name and the refusal cannot be the one about the password.
+        let mut tx = admin
+            .begin()
+            .await
+            .expect("opening the transaction the script runs in");
+        let setup = sqlx::Executor::fetch_one(
+            &mut *tx,
+            sqlx::query(
+                "SELECT current_setting('memory_industry.app_role', true),                         set_config('memory_industry.app_password', $1, true)",
+            )
+            .bind(fresh_secret()),
+        )
+        .await;
+        let script = sqlx::Executor::execute(&mut *tx, sqlx::raw_sql(CREATE_APP_ROLE_SQL)).await;
+        let rolled_back = tx.rollback().await;
+
+        rolled_back.expect("rolling back the transaction the script ran in");
+        let role_setting: Option<String> = setup
+            .expect("setting memory_industry.app_password for the transaction")
+            .try_get(0)
+            .expect("reading memory_industry.app_role");
+        assert!(
+            role_setting.as_deref().unwrap_or_default().is_empty(),
+            "memory_industry.app_role was already {role_setting:?} before the script ran (set              on the server, the database or this role), so this test cannot show what the              script does when nobody names the role"
+        );
+        assert_eq!(
+            the_real_app_role(&admin).await,
+            before,
+            "the real {} is not what it was before the test: the script touched the role              the user's daemon logs in as",
+            memory_industry::db::APP_ROLE
+        );
+        let probe_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+                .bind(&role)
+                .fetch_one(&admin)
+                .await
+                .unwrap_or_else(|e| panic!("looking {role} up in pg_roles: {e}"));
+        assert!(
+            !probe_exists,
+            "{role} exists, but its name was never handed to the script"
+        );
+
+        let error = match script {
+            Ok(_) => panic!(
+                "embed/create-app-role.sql ran to the end without memory_industry.app_role:                  with no role named it falls back to {}, the role the user's real daemon                  logs in as, so code that forgets bind_app_role alters the live role instead                  of failing",
+                memory_industry::db::APP_ROLE
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            error.contains("memory_industry.app_role"),
+            "the script refused to run without a role, but its error does not name the              setting that was missing, so nobody reading it knows what to set: {error}"
         );
         admin.close().await;
     })
