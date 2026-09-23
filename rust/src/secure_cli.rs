@@ -117,8 +117,26 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Credentials percent-encoded for a URL. The RFC 3986 unreserved characters
+/// pass as they are, so a hex password prints unchanged; every other byte is
+/// escaped. Unescaped, `/` ended the credentials for every client, `%41` was
+/// read as `A`, and `@` split differently in sqlx (last `@`) and libpq (first
+/// `@`), so the line that worked in the daemon failed in psql.
+fn percent_encoded(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
 fn derive_app_url(admin_url: &str, password: &str) -> String {
-    let role = crate::db::APP_ROLE;
+    let role = percent_encoded(crate::db::APP_ROLE);
+    let password = percent_encoded(password);
     if let Some((scheme, rest)) = admin_url.split_once("://")
         && let Some((_creds, host)) = rest.split_once('@')
     {

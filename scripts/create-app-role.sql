@@ -12,9 +12,11 @@
 -- (~/.cache/memory-industry/pgpass_app):
 --   memory-industry secure       (this same file, embedded in the binary)
 --
--- By hand, hand the password over as a session setting, never pasted into
--- this file. psql interpolates :'pw' in a script read from stdin, not in -c:
---   { echo "SET memory_industry.app_password = :'pw';"; cat scripts/create-app-role.sql; } \
+-- By hand, name the role and hand the password over as session settings,
+-- never pasted into this file. psql interpolates :'pw' in a script read from
+-- stdin, not in -c:
+--   { echo "SET memory_industry.app_role = 'cuba_app';"; \
+--     echo "SET memory_industry.app_password = :'pw';"; cat scripts/create-app-role.sql; } \
 --     | psql "$DATABASE_URL" -v pw="$(cat ~/.cache/memory-industry/pgpass_app)"
 --
 -- Until 0.27 this file created the role with a literal password written right
@@ -22,7 +24,9 @@
 -- could open. A role that already exists keeps its password: the daemon of an
 -- install that upgrades is connecting with it.
 --
--- memory_industry.app_role names the role (cuba_app when unset); the tests set
+-- memory_industry.app_role names the role, and there is no default: until
+-- 0.27 an unset one meant cuba_app, so a caller that forgot to name the role
+-- altered the one the real daemon logs in as instead of failing. The tests set
 -- it to a throwaway name because a role belongs to the whole server. Both
 -- settings reach SQL only through format() with %I and %L.
 --
@@ -30,10 +34,13 @@
 
 DO $$
 DECLARE
-    app_role text := coalesce(
-        nullif(current_setting('memory_industry.app_role', true), ''), 'cuba_app');
+    app_role text := nullif(current_setting('memory_industry.app_role', true), '');
     app_password text := nullif(current_setting('memory_industry.app_password', true), '');
 BEGIN
+    IF app_role IS NULL THEN
+        RAISE EXCEPTION 'memory_industry.app_role is not set, so there is no role to create or alter'
+            USING HINT = 'SET memory_industry.app_role first (see the top of this file); there is no default role';
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = app_role) THEN
         IF app_password IS NULL THEN
             RAISE EXCEPTION 'memory_industry.app_password is not set, so % cannot be created', app_role
