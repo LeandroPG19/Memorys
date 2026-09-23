@@ -22,6 +22,10 @@ versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI
 
 - **`secure` refuses arguments it does not understand, and `secure --help` / `serve --help` print their help.** `secure` used to ignore every argument, so `secure --help` against a real superuser `DATABASE_URL` ran `create-app-role.sql` — creating `cuba_app` with the fixed password `app2026` if it did not exist — and `serve --help` took `--help` as its listen address and ran the migrations before failing on it. Both now answer `-h`/`--help` before they resolve a database URL. Anything else passed to `secure` exits 1 and names the argument. Every documented call passes it no arguments, so nothing that works today stops working.
 
+- **`secure` creates `cuba_app` with the random password in `pgpass_app`, not `app2026`.** The role script used to create it with a password published in this repository, and `secure`'s own advice to set `CUBA_SKIP_MIGRATIONS=1` kept that password live for good. A role that already exists keeps its password, so an install that upgrades keeps its connection; an install still on `app2026` rotates when the daemon next starts as admin with migrations. Running `scripts/create-app-role.sql` by hand now needs `memory_industry.app_role` and `memory_industry.app_password` set first — its header shows how — and it refuses without them instead of falling back to `cuba_app`.
+- **`serve` refuses an address it cannot read with exit 2, before it touches the database.** It used to connect and run the migrations first. A malformed `CUBA_HTTP_ADDR` is named as the variable, not as an argument nobody typed.
+- **`ort` is loaded once, from the located runtime, before any model opens a session.** Nothing writes `ORT_DYLIB_PATH` into the process any more. A reranker that loaded first used to fall back to the system's default `onnxruntime.dll` — on Windows, Windows ML 1.17 in System32, not the downloaded GPU runtime.
+
 ### Fixed
 
 - The reranker's "disabled by the resource plan" sentinel now actually disables it instead of falling through to the model cache.
@@ -69,6 +73,9 @@ The theme of this branch. Each of these ran green for as long as it existed and 
 - **The second judge over the whole branch left 44 mutants alive, and each has an answer.** Three were killed with tests; 41 are excluded, each with the test that judges it in the SIL or the words "judged NOWHERE" — checked against the full mutant list in both directions, so no mutant caught today is hidden. Twenty of those reasons have since become true: the CLI contract now judges twelve, and four database functions — the embedding-dimension guard among them, which nothing had ever started against a column of another width — gained tests that make and drop their own database.
 - **`hook install` has an end-to-end test**, running it in a throwaway repository, and the redactor's key-length guard is pinned on both edges with the shortest and the longest provider prefix.
 - **No test writes into the database `DATABASE_URL` points at.** Tests with no `#[ignore]` that need a server create and drop their own; a developer with it exported towards their real memory would otherwise seed it with `cargo test`.
+
+- **The URL `secure` prints carries exactly the password it was given.** It was written unencoded: a `/` broke it for every client, an `@` parsed one way for the daemon and another for psql, and `%41` turned silently into another password. Checked against sqlx's own parser and against a model of libpq's split taken from PostgreSQL 17's `fe-connect.c`.
+- **No password is interpolated into SQL.** Role creation and rotation both pass it as a bound, transaction-local setting read through `format('%L')`; the rotation used to build its statement with `format!` behind an alphanumeric filter.
 
 ## [0.26.0] — 2026-09-18
 
