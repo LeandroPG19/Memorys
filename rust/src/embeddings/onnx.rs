@@ -984,4 +984,95 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&in_the_path);
     }
+
+    /// A search answers where the library is. It does not write the answer
+    /// into the process environment on the way out.
+    ///
+    /// `std::env::set_var` is undefined behaviour while another thread reads
+    /// the environment — the reason `ScopedEnv` exists — and the daemon calls
+    /// this from a multi-threaded tokio runtime, on whichever worker first asks
+    /// for an embedding or an NLI verdict. Nothing needs the write either:
+    /// `ort` 2.0.0-rc.12 takes the library path by API, `ort::init_from`.
+    #[tokio::test]
+    async fn finding_the_runtime_does_not_write_ort_dylib_path_into_the_process() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let lib = runtime_library_filename();
+        let root = scratch_root("ort-no-env-write");
+        let installed = root
+            .join(".cache")
+            .join("memory-industry")
+            .join("onnxruntime");
+        std::fs::create_dir_all(&installed).expect("the test owns this directory");
+        let in_the_cache = installed.join(lib);
+        std::fs::write(&in_the_cache, b"not a real library").expect("temp dir is writable");
+
+        let _explicit = ScopedEnv::cleared("ORT_DYLIB_PATH");
+        let _h = ScopedEnv::set("HOME", &root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+        assert_eq!(
+            std::env::var_os("ORT_DYLIB_PATH"),
+            None,
+            "the fixture is broken: the variable is set before the search runs, so what follows \
+             would measure the operator's environment and not this function"
+        );
+
+        // Positive control: an assertion that the variable stays unset passes
+        // just as well on a search that found nothing and so had nothing to
+        // write.
+        assert_eq!(
+            locate_onnxruntime().as_ref(),
+            Some(&in_the_cache),
+            "the fixture is broken: the search did not find the runtime installed under HOME"
+        );
+        assert_eq!(
+            std::env::var_os("ORT_DYLIB_PATH"),
+            None,
+            "locate_onnxruntime wrote ORT_DYLIB_PATH into the process. A search that can be \
+             called from any tokio worker must not call std::env::set_var: another thread \
+             reading the environment at the same moment is undefined behaviour. Hand the path \
+             to `ort::init_from` instead"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An empty runtime path is refused, with an error that says it is empty,
+    /// before anything reaches `ort` — and in bounded time.
+    ///
+    /// `ort` does not refuse it. `setup_api` (ort 2.0.0-rc.12, `src/lib.rs`)
+    /// reads an empty `ORT_DYLIB_PATH` as unset and loads the bare name
+    /// `onnxruntime.dll`, which Windows resolves to the Windows ML build in
+    /// System32 — the load described at `get_model_status` as a hang on the
+    /// first embedding, and the 90 s TIMEOUT the mutant `Some(Default::default())`
+    /// produced. And `ort::init_from` checks nothing once some library is
+    /// loaded: it answers `Ok` for any path. So the check lives in this crate
+    /// or nowhere, and it has to come before the call into `ort`.
+    ///
+    /// A plain thread and `recv_timeout`, not `tokio::time::timeout`: a
+    /// `spawn_blocking` that times out keeps its thread, and dropping the
+    /// runtime at the end of the test waits for it, so the test would hang all
+    /// the same.
+    #[test]
+    fn an_empty_runtime_path_is_refused_by_name_and_never_handed_to_ort() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ =
+                tx.send(load_onnxruntime(std::path::Path::new("")).map_err(|e| format!("{e:#}")));
+        });
+
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "loading the runtime from an empty path did not answer in 5 s. That is the hang \
+                 the mutant `Some(Default::default())` hit: the path went through to `ort`, which \
+                 falls back to whatever `onnxruntime.dll` the loader finds",
+        );
+        let reason = answer.expect_err(
+            "an empty path loaded something. Whatever it loaded is not a library anyone named",
+        );
+        assert!(
+            reason.contains("empty") || reason.contains("vacía") || reason.contains("vacia"),
+            "the error has to say the path is empty, so an operator with `ORT_DYLIB_PATH=` in a \
+             .env reads their own mistake and not a loader message: {reason}"
+        );
+    }
 }
