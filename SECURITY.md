@@ -44,9 +44,13 @@ and sometimes material under NDA.
   `~/.cache/cuba-memorys/pgpass`, *when the setup creates the container*. If a
   `cuba-memorys-db` container already exists, setup keeps the credential it was built
   with rather than locking you out of your own database — and that fallback,
-  `memorys2026`, IS compiled into the binary (`setup.rs`), as is `app2026` in
-  `scripts/create-app-role.sql`. Both are development defaults. Rotate them before exposing the
-  database to anything.
+  `memorys2026`, IS compiled into the binary (`setup.rs`). It is a development default. Rotate
+  it before exposing the database to anything. The application role `cuba_app` has no
+  compiled password: `memory-industry secure` creates it with a random one, the same the daemon
+  reads from `~/.cache/memory-industry/pgpass_app` (mode 0600), and prints the `DATABASE_URL`
+  that carries it. Until 0.27 `scripts/create-app-role.sql` created it with the literal
+  `app2026`; an install that ran it back then and has not started the daemon as admin since
+  still has that password, so start it once as admin (it resets the role to `pgpass_app`).
 - **Least privilege** — the runtime downgrades itself to `cuba_app` (`NOSUPERUSER`,
   `NOBYPASSRLS`) when that role exists and its credential works; migrations run separately
   under an admin role. What stops `cuba_app` writing to the audit log is a trigger, not a

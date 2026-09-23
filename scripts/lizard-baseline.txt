@@ -32,7 +32,7 @@ src/cognitive/judge.rs::which_in_path:949 18
 src/cognitive/nli.rs::classify:294 14
 src/cognitive/nli.rs::init:164 16
 src/dashboard.rs::render:44 12
-src/db.rs::init_schema:227 9
+src/db.rs::init_schema:257 9
 src/dedupe_cli.rs::judge_likely:633 9
 src/dedupe_cli.rs::merge_entity:331 13
 src/dedupe_cli.rs::run_cli:47 30

@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use sqlx::migrate::MigrateError;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{ConnectOptions, PgPool};
+use std::pin::Pin;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -30,17 +32,45 @@ async fn provision_app_role(pool: &PgPool) {
         return;
     }
 
-    if !password.chars().all(|c| c.is_ascii_alphanumeric()) {
-        tracing::warn!("refusing to inline a non-alphanumeric password into ALTER ROLE");
-        return;
-    }
-    let statement = format!("ALTER ROLE {APP_ROLE} PASSWORD '{password}'");
-    match sqlx::query(&statement).execute(pool).await {
-        Ok(_) => tracing::info!(role = APP_ROLE, "application role provisioned"),
+    match write_app_role_password(pool, APP_ROLE, &password).await {
+        Ok(()) => tracing::info!(role = APP_ROLE, "application role provisioned"),
         Err(why) => {
             tracing::warn!(error = %why, "could not set the application role password")
         }
     }
+}
+
+const ALTER_APP_ROLE_PASSWORD: &str = "DO $$ BEGIN EXECUTE format('ALTER ROLE %I PASSWORD %L', \
+     current_setting('memory_industry.app_role'), \
+     current_setting('memory_industry.app_password')); END $$";
+
+// sqlx::Executor's own methods, not RawSql::execute: those return a BoxFuture that is
+// already Send, while the generic async fn left create_pool's future !Send (v043 spawns it).
+async fn write_app_role_password(pool: &PgPool, role: &str, password: &str) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    bind_app_role(&mut tx, role, password).await?;
+    sqlx::Executor::execute(&mut *tx, sqlx::raw_sql(ALTER_APP_ROLE_PASSWORD)).await?;
+    tx.commit().await
+}
+
+/// The one way this crate hands a role name and a password to SQL. A `DO`
+/// block takes no bind parameters, so both travel as transaction-local
+/// settings bound here and reach the statement through `format()` with `%I`
+/// and `%L`. The password used to be spliced into `ALTER ROLE` with
+/// `format!` behind an alphanumeric filter, and that statement text is what
+/// the statement logger writes out.
+pub(crate) async fn bind_app_role(
+    conn: &mut sqlx::PgConnection,
+    role: &str,
+    password: &str,
+) -> sqlx::Result<()> {
+    let settings = sqlx::query(
+        "SELECT set_config('memory_industry.app_role', $1, true), \
+                set_config('memory_industry.app_password', $2, true)",
+    )
+    .bind(role)
+    .bind(password);
+    sqlx::Executor::execute(conn, settings).await.map(drop)
 }
 
 pub async fn is_superuser(pool: &PgPool) -> Option<bool> {
@@ -262,10 +292,11 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             ),
         }
     } else {
-        MIGRATOR
-            .run(pool)
-            .await
-            .context("failed to run sqlx migrations")?;
+        // Boxed so rustc proves Send here, with concrete lifetimes: inferred, Migrator::run
+        // left create_pool's future !Send (v043 spawns it) once provision_app_role took a tx.
+        let migrate: Pin<Box<dyn Future<Output = Result<(), MigrateError>> + Send + '_>> =
+            Box::pin(MIGRATOR.run(pool));
+        migrate.await.context("failed to run sqlx migrations")?;
 
         tracing::info!("sqlx migrations applied");
         provision_app_role(pool).await;
