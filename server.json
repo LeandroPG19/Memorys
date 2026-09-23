@@ -6,12 +6,12 @@
     "url": "https://github.com/LeandroPG19/Memorys",
     "source": "github"
   },
-  "version": "0.26.0",
+  "version": "0.27.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "memory-industry",
-      "version": "0.26.0",
+      "version": "0.27.0",
       "transport": {
         "type": "stdio"
       },
@@ -84,7 +84,7 @@
     {
       "registryType": "pypi",
       "identifier": "memory-industry",
-      "version": "1.28.0",
+      "version": "1.29.0",
       "transport": {
         "type": "stdio"
       },
@@ -101,7 +101,7 @@
     {
       "registryType": "npm",
       "identifier": "cuba-memorys",
-      "version": "0.26.0",
+      "version": "0.27.0",
       "transport": {
         "type": "stdio"
       }
@@ -109,7 +109,7 @@
     {
       "registryType": "pypi",
       "identifier": "cuba-memorys",
-      "version": "1.28.0",
+      "version": "1.29.0",
       "transport": {
         "type": "stdio"
       }

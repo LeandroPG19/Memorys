@@ -5,7 +5,7 @@ All notable changes to MemoryIndustry (formerly cuba-memorys) are documented her
 [SemVer](https://semver.org/) for the Rust crate (`Cargo.toml`). PyPI
 versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI 1.28.0).
 
-## [Unreleased]
+## [0.27.0] — 2026-09-23 (Cargo `0.27.0` · npm `0.27.0` · PyPI `1.29.0`)
 
 ### Behaviour changes — read before deploying
 
@@ -78,6 +78,8 @@ The theme of this branch. Each of these ran green for as long as it existed and 
 - **No password is interpolated into SQL.** Role creation and rotation both pass it as a bound, transaction-local setting read through `format('%L')`; the rotation used to build its statement with `format!` behind an alphanumeric filter.
 
 ## [0.26.0] — 2026-09-18
+
+Never published: no `v0.26.0` tag was pushed, and npm and PyPI went from 0.25.0 straight to 0.27.0. Everything below ships inside 0.27.0.
 
 ### rustls advisory
 
