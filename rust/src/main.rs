@@ -386,6 +386,13 @@ async fn async_main() {
 /// to `http::serve`, the drain and the exit stay in the `serve` arm, where
 /// cli_contract::nothing_can_exit_a_draining_command_without_draining_first
 /// reads them.
+///
+/// The address is parsed here too, for the same reason: `http::serve` only
+/// parses it after connecting and migrating, so `serve --verbose` or a typo in
+/// CUBA_HTTP_ADDR migrated the database and failed afterwards. The exit(2) of
+/// an unreadable address lives here and not in the arm: nothing has been
+/// spawned yet, so there is nothing to drain, and the arm's own exit keeps
+/// following its drain.
 fn serve_addr(arg: Option<&str>) -> Option<String> {
     if memory_industry::cli::asks_for_help(arg) {
         eprintln!(
@@ -398,5 +405,18 @@ fn serve_addr(arg: Option<&str>) -> Option<String> {
         );
         return None;
     }
-    Some(arg.map_or_else(memory_industry::http::bind_addr, str::to_string))
+    let addr = arg.map_or_else(memory_industry::http::bind_addr, str::to_string);
+    if addr.parse::<std::net::SocketAddr>().is_err() {
+        let source = if arg.is_some() {
+            "the argument"
+        } else {
+            "CUBA_HTTP_ADDR"
+        };
+        eprintln!(
+            "memory-industry serve: {source} '{addr}' is not a listen address \
+             (expected ip:port, e.g. 127.0.0.1:8787); see `memory-industry serve --help`"
+        );
+        std::process::exit(2);
+    }
+    Some(addr)
 }
