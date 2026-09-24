@@ -7,7 +7,7 @@ pub const SCHEMA_VERSION: u32 = 2;
 
 pub const MAX_EMBEDDING_DIM: usize = 16_000;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Manifest {
     pub schema_version: u32,
     pub manifest_hash: String,
@@ -24,7 +24,7 @@ pub struct Manifest {
     pub embedding_model: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct Counts {
     pub entities: u32,
     pub observations: u32,

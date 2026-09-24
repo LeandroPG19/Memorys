@@ -39,6 +39,8 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
                  \x20 - post-checkout runs `sync import` after checkout/branch switch\n\
                  \x20 - post-merge   runs `sync import` after a merge (git runs neither\n\
                  \x20   of the other two for one)\n\
+                 \x20 - post-rewrite runs `sync import` after a rebase (`git pull --rebase`\n\
+                 \x20   included), which runs no post-merge; after an amend, nothing\n\
                  \x20 - a git merge driver that unions observations/relations/entities\n\
                  \x20   by id instead of leaving conflict markers in graph JSON. Only for a\n\
                  \x20   directory inside this repo: git never merges anything outside it\n\n\
@@ -367,12 +369,27 @@ fn install(with_codegraph: bool) -> Result<String> {
          \x20 DATABASE_URL=\"$db_url\" \"{exe}\" sync import --conflict merge >/dev/null 2>&1 || true\n\
          fi\n"
     );
+    // `git rebase`, and so `git pull --rebase` on a branch with commits of its
+    // own, runs no post-merge either: githooks(5), post-rewrite "is invoked by
+    // commands that rewrite commits (git-commit when called with --amend and
+    // git-rebase)", its first argument "one of amend or rebase". A rebase
+    // brings the other side's bundle; an amend brings nothing, and its
+    // post-commit has already exported.
+    let rewrite_block = format!(
+        "{MARKER}\n\
+         {pin_sync_dir}\n\
+         {resolve_url_sh}\n\
+         if [ -n \"$db_url\" ] && [ \"$1\" = rebase ]; then\n\
+         \x20 DATABASE_URL=\"$db_url\" \"{exe}\" sync import --conflict merge >/dev/null 2>&1 || true\n\
+         fi\n"
+    );
     let hooks_report = put_hook_blocks(
         &hooks,
         &[
             ("post-commit", post_commit_block.as_str()),
             ("post-checkout", import_block.as_str()),
             ("post-merge", import_block.as_str()),
+            ("post-rewrite", rewrite_block.as_str()),
         ],
     )?;
 
@@ -473,7 +490,10 @@ fn uninstall() -> Result<()> {
     let root = git_root()?;
     let hooks = hooks_dir(&root);
 
-    let hooks_report = remove_hook_blocks(&hooks, &["post-commit", "post-checkout", "post-merge"])?;
+    let hooks_report = remove_hook_blocks(
+        &hooks,
+        &["post-commit", "post-checkout", "post-merge", "post-rewrite"],
+    )?;
 
     let _ = Command::new("git")
         .args([
@@ -821,11 +841,11 @@ fn read_rows<T: serde::de::DeserializeOwned + serde::Serialize>(
 }
 
 /// facts.json, keyed by fact_id: brain_facts' primary key and what the import
-/// conflicts on (handlers/sync.rs:2322). A fact only ever moves from current
+/// conflicts on (handlers/sync.rs:2358). A fact only ever moves from current
 /// to closed — a supersession sets is_current false and valid_to together
-/// (sync.rs:2347, :2360; core/bitemporal.rs:154), and nothing sets it back —
+/// (sync.rs:2383, :2396; core/bitemporal.rs:154), and nothing sets it back —
 /// so of two versions the closed one is the later, and of two closes the
-/// later valid_to. Written by observed_at, as the export orders it (:564).
+/// later valid_to. Written by observed_at, as the export orders it (:576).
 fn merge_facts(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>>> {
     let a: Option<Vec<FactRow>> = read_rows(ours_path)?;
     let b: Option<Vec<FactRow>> = read_rows(theirs_path)?;
@@ -845,12 +865,12 @@ fn merge_facts(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>>> {
 }
 
 /// procedures.json, keyed by id: brain_procedures' primary key and what the
-/// import conflicts on (handlers/sync.rs:2490). The later updated_at stands,
+/// import conflicts on (handlers/sync.rs:2526). The later updated_at stands,
 /// and success_count and failure_count are the greater of the two, as the
-/// import keeps them (GREATEST, :2496-2506): each machine counts its own runs.
+/// import keeps them (GREATEST, :2532-2542): each machine counts its own runs.
 /// The counts are settled on both versions before one is picked, so the pick
 /// compares only what differs besides them. Written by created_at, as the
-/// export orders it (:599).
+/// export orders it (:611).
 fn merge_procedures(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>>> {
     let a: Option<Vec<ProcedureRow>> = read_rows(ours_path)?;
     let b: Option<Vec<ProcedureRow>> = read_rows(theirs_path)?;
@@ -878,12 +898,12 @@ fn merge_procedures(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>
 }
 
 /// artifacts.json, keyed by (path, project_id): brain_artifacts' unique key
-/// (migration 0061) and what the import conflicts on (handlers/sync.rs:2413),
+/// (migration 0061) and what the import conflicts on (handlers/sync.rs:2449),
 /// so two machines that wrote one path, each under its own id, hold one
 /// artifact. The later CRDT clock stands — crdt_counter, then crdt_actor, the
-/// order crdt::pick_lww decides by on import (:2398) — and the higher version
+/// order crdt::pick_lww decides by on import (:2434) — and the higher version
 /// breaks a tie of the clock. Written in path order, as the export writes it
-/// (:630), which is this key's order.
+/// (:642), which is this key's order.
 fn merge_artifacts(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>>> {
     let a: Option<Vec<ArtifactRow>> = read_rows(ours_path)?;
     let b: Option<Vec<ArtifactRow>> = read_rows(theirs_path)?;
@@ -902,11 +922,11 @@ fn merge_artifacts(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>>
 }
 
 /// source_trust.json, keyed by source: brain_source_trust's primary key
-/// (migration 0014) and what the import conflicts on (handlers/sync.rs:2531).
+/// (migration 0014) and what the import conflicts on (handlers/sync.rs:2567).
 /// alpha and beta count outcomes each machine gathered on its own, and the
-/// import keeps the greater of each (GREATEST, :2532-2533), so the merge does
+/// import keeps the greater of each (GREATEST, :2568-2569), so the merge does
 /// too, field by field, with the later updated_at. Written in source order, as
-/// the export writes it (:672), which is this key's order.
+/// the export writes it (:684), which is this key's order.
 fn merge_source_trust(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>>> {
     let a: Option<Vec<SourceTrustRow>> = read_rows(ours_path)?;
     let b: Option<Vec<SourceTrustRow>> = read_rows(theirs_path)?;
@@ -932,13 +952,13 @@ fn merge_source_trust(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u
 /// manifest.json, kept as ours byte for byte when both sides agree on every
 /// field the import acts on without checking it against the files:
 /// `project_id`, the scope the rows are written under (handlers/sync.rs:
-/// 1825-1835); `with_embeddings`, `embedding_dim` and `embedding_model`,
-/// whether and how the vectors are read (:1839-1864, :2598-2604); and
+/// 1861-1871); `with_embeddings`, `embedding_dim` and `embedding_model`,
+/// whether and how the vectors are read (:1875-1900, :2634-2640); and
 /// `schema_version`, whether this build reads the bundle at all
-/// (:1806-1812). The rest is derived — `manifest_hash`, `counts`,
+/// (:1842-1848). The rest is derived — `manifest_hash`, `counts`,
 /// `exported_at`, `node_id`, `project_name` — and the next export writes it
-/// again from the database (:734-749); a stale hash is only reported, as
-/// `edited_since_export` (:1866-1867, :2693). Where the sides disagree,
+/// again from the database (:746-760); a stale hash is only reported, as
+/// `edited_since_export` (:1902-1903, :2729). Where the sides disagree,
 /// keeping either is a decision about the other machine's rows, so git leaves
 /// the file to a person and the message names the field.
 fn merge_manifest(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>>> {

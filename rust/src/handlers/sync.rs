@@ -183,10 +183,22 @@ fn write_bundle_file(
     digest: &mut BundleDigest,
 ) -> Result<()> {
     ensure_within(root, path)?;
+    publish_if_changed(path, bytes)?;
+    digest.record(root, path, bytes);
+    Ok(())
+}
+
+/// Writes `bytes` at `path` through a temporary file, unless `path` already
+/// holds exactly them. post-commit exports after every commit, and the same
+/// bytes written again still moved each file's mtime, which git's index, an
+/// editor and a sync client all read as a change.
+fn publish_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
+    if std::fs::read(path).is_ok_and(|on_disk| on_disk == bytes) {
+        return Ok(());
+    }
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, bytes).with_context(|| format!("write bundle file {tmp:?}"))?;
     std::fs::rename(&tmp, path).with_context(|| format!("publish bundle file {path:?}"))?;
-    digest.record(root, path, bytes);
     Ok(())
 }
 
@@ -731,21 +743,20 @@ async fn export_into(
         relations: rel_count,
         artifacts: artifact_count,
     };
-    let manifest = Manifest {
-        schema_version: SCHEMA_VERSION,
-        manifest_hash: digest.finish(project_id),
-        project_id,
-        project_name,
-        exported_at: Utc::now(),
-        counts: counts.clone(),
-        with_embeddings,
-        embedding_dim: emb_dim,
-        embedding_model: Some(crate::embeddings::onnx::model_fingerprint()),
-        node_id: Some(crate::db::node_id(pool).await?),
-    };
-    std::fs::write(
-        root.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest)?,
+    let manifest = publish_manifest(
+        &root,
+        Manifest {
+            schema_version: SCHEMA_VERSION,
+            manifest_hash: digest.finish(project_id),
+            project_id,
+            project_name,
+            exported_at: Utc::now(),
+            counts: counts.clone(),
+            with_embeddings,
+            embedding_dim: emb_dim,
+            embedding_model: Some(crate::embeddings::onnx::model_fingerprint()),
+            node_id: Some(crate::db::node_id(pool).await?),
+        },
     )?;
 
     let warning = if entity_files > 5000 {
@@ -786,9 +797,34 @@ fn publish_embeddings(root: &Path, blob: &[u8], digest: &mut BundleDigest) -> Re
             Ok(())
         };
     }
-    std::fs::write(&path, crate::sync::compressor::compress(blob)?)?;
+    publish_if_changed(&path, &crate::sync::compressor::compress(blob)?)?;
     digest.record(root, &path, blob);
     Ok(())
+}
+
+/// Writes `manifest`, unless the one already on disk says the same with an
+/// earlier `exported_at`: then that one stays, its time included, and is what
+/// this returns. `exported_at` is the one field an export of a database nobody
+/// wrote to changes, and post-commit exports after every commit, so each commit
+/// left `manifest.json` modified — and `git merge`, `git checkout` and `git
+/// pull` refusing to overwrite local changes. It now says when the bundle last
+/// changed. `manifest_hash` is compared like every other field, so the one
+/// kept still describes the files.
+fn publish_manifest(root: &Path, manifest: Manifest) -> Result<Manifest> {
+    let path = root.join("manifest.json");
+    let unchanged = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).ok())
+        .filter(|previous| {
+            *previous
+                == Manifest {
+                    exported_at: previous.exported_at,
+                    ..manifest.clone()
+                }
+        });
+    let manifest = unchanged.unwrap_or(manifest);
+    publish_if_changed(&path, &serde_json::to_vec_pretty(&manifest)?)?;
+    Ok(manifest)
 }
 
 pub const OBSERVATION_TYPES: [&str; 9] = [
