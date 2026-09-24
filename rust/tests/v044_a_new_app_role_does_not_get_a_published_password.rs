@@ -194,6 +194,51 @@ async fn a_role_that_already_exists_keeps_the_password_its_daemon_uses() {
     .await;
 }
 
+/// What the daemon does each time it starts as admin and migrates: it gives the
+/// application role the password in pgpass_app, so a role still opening with an
+/// older one (`app2026`, or whatever an earlier run left there) moves to the one
+/// the daemon is about to log in with. Nothing watched that happen: replacing
+/// `provision_app_role`, `write_app_role_password` or `bind_app_role` with a
+/// no-op left every test green, because the password on the gate's server is
+/// whatever an earlier run left and nobody asked which one opens.
+#[tokio::test]
+async fn provisioning_moves_an_existing_role_onto_the_new_password_and_off_the_old_one() {
+    with_a_throwaway_role(|url, role| async move {
+        let admin = PgPool::connect(&url)
+            .await
+            .expect("connecting to the scratch database as the admin role");
+        let old = fresh_secret();
+        admin
+            .execute(format!("CREATE ROLE {role} LOGIN PASSWORD '{old}'").as_str())
+            .await
+            .unwrap_or_else(|e| panic!("creating {role} with the password it had before: {e}"));
+        assert!(
+            logs_in(&url, &role, &old).await,
+            "{role} does not log in with the password it was just created with, so this test \
+             cannot tell whether provisioning moved it"
+        );
+        assert_the_server_checks_passwords(&url, &role).await;
+
+        let new = fresh_secret();
+        memory_industry::db::provision_app_role(&admin, &role, &new).await;
+
+        assert!(
+            logs_in(&url, &role, &new).await,
+            "after provisioning, {role} does not log in with the password it was given. That \
+             password is pgpass_app, the one the daemon reads, so a role that refuses it is a \
+             daemon that falls back to the superuser connection"
+        );
+        assert!(
+            !logs_in(&url, &role, &old).await,
+            "after provisioning, {role} still opens with its old password: an install that \
+             started on `{PUBLISHED_PASSWORD}` keeps a door anyone who read the repository can \
+             open"
+        );
+        admin.close().await;
+    })
+    .await;
+}
+
 /// The real application role as pg_roles shows it (the password is masked
 /// there), or None when the server has none.
 async fn the_real_app_role(pool: &PgPool) -> Option<String> {

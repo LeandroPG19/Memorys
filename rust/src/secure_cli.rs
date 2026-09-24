@@ -281,4 +281,172 @@ mod tests {
             wrong.join("\n")
         );
     }
+
+    /// Where sqlx sends a connection, read through its own getters: everything
+    /// the URL decides except who logs in. The user comes back apart.
+    fn where_the_daemon_connects(url: &str) -> Result<(String, String), String> {
+        use std::str::FromStr;
+        let options = sqlx::postgres::PgConnectOptions::from_str(url).map_err(|e| e.to_string())?;
+        let place = format!(
+            "host={:?} port={} socket={:?} database={:?} sslmode={:?} application_name={:?} \
+             options={:?}",
+            options.get_host(),
+            options.get_port(),
+            options.get_socket(),
+            options.get_database(),
+            options.get_ssl_mode(),
+            options.get_application_name(),
+            options.get_options(),
+        );
+        Ok((options.get_username().to_owned(), place))
+    }
+
+    /// The user and password psql logs in with, following libpq's
+    /// `conninfo_uri_parse_options`: the credentials of the authority, cut as
+    /// in `password_psql_uses`, and then every `key=value` of the query, each
+    /// stored over what came before (`conninfo_storeval`), so a `user=` or a
+    /// `password=` in the query wins.
+    fn credentials_psql_uses(url: &str) -> (Option<String>, Option<String>) {
+        let (mut user, mut password) = (None, None);
+        let Some((_, rest)) = url.split_once("://") else {
+            return (user, password);
+        };
+        if let Some(end) = rest.find(['@', '/'])
+            && rest[end..].starts_with('@')
+        {
+            match rest[..end].split_once(':') {
+                Some((name, secret)) => {
+                    user = Some(percent_decoded(name));
+                    password = Some(percent_decoded(secret));
+                }
+                None => user = Some(percent_decoded(&rest[..end])),
+            }
+        }
+        let query = rest.split_once('?').map_or("", |(_, query)| query);
+        for (key, value) in query.split('&').filter_map(|pair| pair.split_once('=')) {
+            match key {
+                "user" => user = Some(percent_decoded(value)),
+                "password" => password = Some(percent_decoded(value)),
+                _ => {}
+            }
+        }
+        (user, password)
+    }
+
+    /// The `key=value` pairs of the query, in order, without the two that name
+    /// who logs in.
+    fn query_except_credentials(url: &str) -> Vec<&str> {
+        let query = url.split_once('?').map_or("", |(_, query)| query);
+        query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .filter(|pair| !matches!(pair.split('=').next(), Some("user" | "password")))
+            .collect()
+    }
+
+    /// Every admin URL `secure` can have connected with, since it connected
+    /// through sqlx: with and without credentials, a raw `@` in the admin's
+    /// password (sqlx cuts the authority at the last one), with and without a
+    /// port, IPv6, with and without a database, with a query, with credentials
+    /// in the query, and a Unix socket both in the query and in the host.
+    fn admin_urls() -> Vec<String> {
+        let mut urls = Vec::new();
+        for credentials in ["", "cuba@", "cuba:admin-secret@", "cuba:p@ss@"] {
+            for host in ["localhost", "db.planta.local", "127.0.0.1", "[::1]"] {
+                for port in ["", ":5433"] {
+                    for database in ["", "/brain"] {
+                        for query in [
+                            "",
+                            "?sslmode=require",
+                            "?sslmode=disable&application_name=mi-app&connect_timeout=10",
+                            "?user=cuba&password=admin-secret",
+                            "?password=admin-secret&sslmode=require",
+                        ] {
+                            urls.push(format!(
+                                "postgresql://{credentials}{host}{port}{database}{query}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        urls.extend(
+            [
+                "postgres:///brain?host=/var/run/postgresql",
+                "postgresql:///brain?host=/var/run/postgresql&sslmode=disable",
+                "postgres:///brain?host=/tmp&user=cuba&password=admin-secret",
+                "postgres://%2Fvar%2Frun%2Fpostgresql/brain",
+                "postgres://cuba:admin-secret@%2Fvar%2Frun%2Fpostgresql:5433/brain",
+            ]
+            .map(String::from),
+        );
+        urls
+    }
+
+    /// `secure` prints a URL for the runtime built from the admin's. It has to
+    /// land where the admin's did, with nothing changed but who logs in. With
+    /// no credentials in the admin URL (`postgres://localhost:5432/brain`, a
+    /// socket) it used to print `127.0.0.1:5488/brain` instead: another server
+    /// and another database, pasted by the operator into the daemon's config.
+    #[test]
+    fn the_runtime_url_lands_where_the_admin_url_did_whatever_its_form() {
+        let mut wrong = Vec::new();
+        for admin in admin_urls() {
+            let (_, admin_place) = where_the_daemon_connects(&admin).unwrap_or_else(|e| {
+                panic!(
+                    "the table holds an admin URL sqlx cannot read, so `secure` could not \
+                     have connected with it: {admin}: {e}"
+                )
+            });
+            let scheme = admin.split_once("://").map(|(scheme, _)| scheme);
+            for password in ["9f8e7d6c5b4a39281706f5e4d3c2b1a0", "a&b=c+d/e@f%41"] {
+                let runtime = derive_app_url(&admin, password);
+                let mut problems = Vec::new();
+                match where_the_daemon_connects(&runtime) {
+                    Err(e) => problems.push(format!("sqlx cannot read it: {e}")),
+                    Ok((user, place)) => {
+                        if user != crate::db::APP_ROLE {
+                            problems.push(format!("the daemon logs in as {user:?}"));
+                        }
+                        if place != admin_place {
+                            problems.push(format!("it lands at {place}, not at {admin_place}"));
+                        }
+                    }
+                }
+                let daemon = password_the_daemon_uses(&runtime);
+                if daemon != Ok(Some(password.to_owned())) {
+                    problems.push(format!("the daemon's password is {daemon:?}"));
+                }
+                let psql = credentials_psql_uses(&runtime);
+                if psql
+                    != (
+                        Some(crate::db::APP_ROLE.to_owned()),
+                        Some(password.to_owned()),
+                    )
+                {
+                    problems.push(format!("psql logs in with {psql:?}"));
+                }
+                if query_except_credentials(&runtime) != query_except_credentials(&admin) {
+                    problems.push("its query is not the admin's, credentials aside".to_owned());
+                }
+                if runtime.split_once("://").map(|(scheme, _)| scheme) != scheme {
+                    problems.push("its scheme is not the admin's".to_owned());
+                }
+                if !problems.is_empty() {
+                    wrong.push(format!(
+                        "  {admin}\n    printed {runtime}\n    {}",
+                        problems.join("; ")
+                    ));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "for these admin URLs the one `secure` prints does not reach the same server, port, \
+             database and query as {} with the password it was given. It may only change who \
+             logs in:\n{}",
+            crate::db::APP_ROLE,
+            wrong.join("\n")
+        );
+    }
 }
