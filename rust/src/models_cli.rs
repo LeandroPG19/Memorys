@@ -1433,6 +1433,141 @@ mod tests {
         );
     }
 
+    /// What `std::fs::rename` answers when the two roots are on different
+    /// volumes. A test on one disk never gets it from the real call, which is
+    /// why the branch that turns it into a copy had no test.
+    fn across_volumes(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+    }
+
+    /// Copies, then flips one byte of the copy and keeps its length: only the
+    /// SHA-256 can tell it from the source.
+    fn corrupting_copy(src: &Path, dst: &Path) -> Result<()> {
+        copy_tree(src, dst)?;
+        let victim = dst.join("model.onnx");
+        let mut bytes = read(&victim);
+        bytes[0] ^= 0xFF;
+        std::fs::write(&victim, bytes)?;
+        Ok(())
+    }
+
+    /// Copies, then the source changes before anything compares the two: a
+    /// `models` download still writing into the legacy root, say.
+    fn copy_while_the_source_changes(src: &Path, dst: &Path) -> Result<()> {
+        copy_tree(src, dst)?;
+        std::fs::write(src.join("model.onnx"), b"rewritten after the copy")?;
+        Ok(())
+    }
+
+    /// A legacy `reranker/` with two files, the new root created, and the two
+    /// paths a move is handed.
+    fn reranker_to_move(tag: &str) -> (Home, PathBuf, PathBuf) {
+        let home = Home::new(tag);
+        home.legacy("reranker/model.onnx", b"graph");
+        home.legacy("reranker/nested/weights", b"more");
+        std::fs::create_dir_all(&home.roots.preferred).expect("the test owns this directory");
+        let src = home.roots.legacy.join("reranker");
+        let dst = home.roots.preferred.join("reranker");
+        (home, src, dst)
+    }
+
+    #[test]
+    fn a_rename_refused_across_volumes_becomes_a_verified_copy_and_the_source_goes() {
+        let (_home, src, dst) = reranker_to_move("migrate-crosses");
+        let before = snapshot(&src);
+        let renames = std::cell::Cell::new(0);
+        let rename = |from: &Path, to: &Path| {
+            renames.set(renames.get() + 1);
+            across_volumes(from, to)
+        };
+
+        relocate_with(&src, &dst, &rename)
+            .expect("a volume boundary is not a failure: the entry is copied instead");
+
+        assert_eq!(
+            renames.get(),
+            1,
+            "the rename is tried first and once. It keeps the mode and the ACL; the copy is \
+             only for when the rename cannot"
+        );
+        assert_eq!(
+            snapshot(&dst),
+            before,
+            "every file arrives, byte for byte, under the new name"
+        );
+        assert!(
+            !src.exists(),
+            "the source goes once the copy is verified and in place; left behind, it is a \
+             second gigabyte and the next run's conflict"
+        );
+        assert!(
+            !sibling(&dst, "migrating").exists(),
+            "the staging name is renamed into place, not left beside it"
+        );
+    }
+
+    #[test]
+    fn a_copy_that_does_not_match_its_source_is_removed_and_the_source_stays() {
+        type Copier = dyn Fn(&Path, &Path) -> Result<()>;
+        let copiers: [(&str, &Copier); 2] = [
+            ("migrate-corrupt-copy", &corrupting_copy),
+            ("migrate-source-changes", &copy_while_the_source_changes),
+        ];
+
+        for (tag, copier) in copiers {
+            let (_home, src, dst) = reranker_to_move(tag);
+
+            let refused = copy_across_volumes_with(&src, &dst, copier)
+                .expect_err("a copy whose hash differs from its source is not a move");
+
+            let said = format!("{refused:#}");
+            assert!(
+                said.contains("no coincide"),
+                "{tag}: the error says the copy did not match, so the operator knows nothing \
+                 moved: {said}"
+            );
+            assert!(
+                !dst.exists(),
+                "{tag}: a copy that failed its check never takes the real name. Under it, the \
+                 loaders would open bytes nobody verified"
+            );
+            assert!(
+                !sibling(&dst, "migrating").exists(),
+                "{tag}: the bad copy is removed, not left for the next run to trust"
+            );
+            assert!(
+                src.join("model.onnx").exists() && src.join("nested").join("weights").exists(),
+                "{tag}: the source stays where it was. It is the only copy known to be whole"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rename_that_fails_for_another_reason_is_not_turned_into_a_copy() {
+        let (_home, src, dst) = reranker_to_move("migrate-rename-refused");
+        let before = snapshot(&src);
+        let refused = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        };
+
+        let error = relocate_with(&src, &dst, &refused)
+            .expect_err("a rename refused for any reason but the volume is an error");
+
+        assert!(
+            !dst.exists() && !sibling(&dst, "migrating").exists(),
+            "only a volume boundary turns into a copy. A file another process holds is refused \
+             by the rename too, and copying it would leave the source that cannot be removed \
+             beside a second copy of it"
+        );
+        assert_eq!(snapshot(&src), before, "the source is untouched");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some()),
+            "the io error travels in the chain, which is where `in_use` looks for it: {error:#}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn secrets_keep_their_mode_whichever_way_they_move() {

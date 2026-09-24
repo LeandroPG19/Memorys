@@ -1,3 +1,5 @@
+// needs-a-server: creates and drops login roles as a superuser, on a server that checks passwords
+//
 // `secure` used to create the application role with `PASSWORD 'app2026'`, a
 // literal that sits in this repository. Every fresh install got a LOGIN role
 // with SELECT, INSERT, UPDATE and DELETE on every table and a password anyone

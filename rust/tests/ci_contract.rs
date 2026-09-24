@@ -367,3 +367,137 @@ fn tests_that_need_a_second_node_get_one_from_the_workflow() {
          from ci.yml has to remove these files from discovery in the same edit"
     );
 }
+
+/// The first line of a test file whose plain tests need a PostgreSQL server,
+/// with the reason after the colon. The check job of ci.yml has no server and
+/// leaves those files out by reading this line; scripts/codigo-muerto.sh holds
+/// the local gate to running them in its plain run.
+///
+/// It replaced a list of globs on the file name (`'v043_*' 'v044_*'`), which
+/// named versions and not files: the next v043 file that needed nothing would
+/// have been dropped with them, and a v045 that needed a server would have run
+/// there and failed.
+const NEEDS_A_SERVER: &str = "// needs-a-server:";
+
+/// What makes a plain test need a server today: the shared helper in
+/// tests/common that creates and drops a scratch database on the server
+/// `DATABASE_URL` names, and `.expect()`s the variable. The files that read
+/// `DATABASE_URL` or `CUBA_PEER_DATABASE_URL` only from ignored tests do not
+/// count: the check job never runs those, and the e2e job gives them both
+/// servers. A plain test that reads the variable itself, without the helper, is
+/// the one shape this does not see.
+const USES_A_SERVER: &str = "in_a_scratch_database(";
+
+/// The files whose first line and whose body disagree, each with what is
+/// wrong: a server used without the marker, which the check job would run and
+/// fail; the marker on a file that uses none, which the check job would drop
+/// for nothing; or the marker with no reason after it.
+fn server_marker_problems(files: &[(String, String)]) -> Vec<String> {
+    files
+        .iter()
+        .filter_map(|(name, body)| {
+            let first = body.lines().next().unwrap_or("").trim_end();
+            let reason = first.strip_prefix(NEEDS_A_SERVER).map(str::trim);
+            match (reason, body.contains(USES_A_SERVER)) {
+                (None, true) => Some(format!(
+                    "{name}: calls {USES_A_SERVER}…) and does not open with \
+                     `{NEEDS_A_SERVER} <why>`"
+                )),
+                (Some(_), false) => Some(format!(
+                    "{name}: opens with {NEEDS_A_SERVER} and uses no server, so the check job \
+                     drops a file it could run"
+                )),
+                (Some(""), true) => Some(format!(
+                    "{name}: {NEEDS_A_SERVER} with nothing after it; say which server and why"
+                )),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn the_server_marker_check_fails_on_each_way_a_file_can_disagree() {
+    let server = "mod common;\n\n#[tokio::test]\nasync fn t() {\n    \
+                  common::in_a_scratch_database(\"x\", |url| async move { drop(url) }).await;\n}\n";
+    let rows: [(&str, String, bool); 7] = [
+        (
+            "marked_and_using",
+            format!("{NEEDS_A_SERVER} creates its own database\n{server}"),
+            false,
+        ),
+        (
+            "marked_with_crlf",
+            format!("{NEEDS_A_SERVER} creates its own database\r\n{server}"),
+            false,
+        ),
+        ("neither", "#[test]\nfn plain() {}\n".to_string(), false),
+        ("using_unmarked", server.to_string(), true),
+        (
+            "marked_without_reason",
+            format!("{NEEDS_A_SERVER}\n{server}"),
+            true,
+        ),
+        (
+            "marked_not_using",
+            format!("{NEEDS_A_SERVER} it says so\n#[test]\nfn plain() {{}}\n"),
+            true,
+        ),
+        (
+            "marker_below_the_first_line",
+            format!("//! a file\n{NEEDS_A_SERVER} too late for ci.yml to read\n{server}"),
+            true,
+        ),
+    ];
+
+    for (name, body, flagged) in rows {
+        let problems = server_marker_problems(&[(name.to_string(), body)]);
+        assert_eq!(
+            !problems.is_empty(),
+            flagged,
+            "{name}: expected {}, got {problems:?}",
+            if flagged { "a problem" } else { "none" }
+        );
+    }
+}
+
+#[test]
+fn a_test_file_that_needs_a_server_says_so_where_ci_reads_it() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let files: Vec<(String, String)> = test_file_stems()
+        .into_iter()
+        .filter(|stem| stem != "ci_contract")
+        .map(|stem| {
+            let path = dir.join(format!("{stem}.rs"));
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            (stem, body)
+        })
+        .collect();
+
+    assert!(
+        files.iter().any(|(_, body)| body.contains(USES_A_SERVER)),
+        "no test file calls {USES_A_SERVER}…), and five do. A check that found nothing to check \
+         would pass for any tree"
+    );
+    let problems = server_marker_problems(&files);
+    assert!(
+        problems.is_empty(),
+        "these test files and their first line disagree:\n{}",
+        problems.join("\n")
+    );
+
+    let yaml = ci_yaml();
+    let reads_the_marker = format!("== '{NEEDS_A_SERVER}'*");
+    assert!(
+        yaml.contains(&reads_the_marker),
+        "the check job of ci.yml has no server, and it has to leave out the files that open with \
+         `{NEEDS_A_SERVER}` by reading that line (`{reads_the_marker}` on `head -n 1` of each \
+         file). Without it every one of them runs there and fails for want of a server"
+    );
+    assert!(
+        !yaml.contains("NEEDS_A_SERVER=("),
+        "ci.yml still carries the list of globs. Two ways to leave a file out of the check job \
+         is one of them drifting from the other"
+    );
+}

@@ -1,3 +1,5 @@
+// needs-a-server: runs `secure` on its own database, as a superuser DATABASE_URL names
+//
 // `secure` connected through `db::create_pool`, which migrates, gives cuba_app
 // the pgpass_app password (provision_app_role) and then steps down to cuba_app
 // whenever that role logs in. Migration 0041 creates cuba_app on every server

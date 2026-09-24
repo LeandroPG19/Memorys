@@ -1,3 +1,4 @@
+// needs-a-server: creates and drops its own database where DATABASE_URL points
 mod common;
 
 use common::in_a_scratch_database;

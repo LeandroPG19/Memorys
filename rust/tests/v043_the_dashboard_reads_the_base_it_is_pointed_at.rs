@@ -1,3 +1,5 @@
+// needs-a-server: creates and drops its own database where DATABASE_URL points
+//
 // ONE TEST IN THIS FILE, AND IT HAS TO STAY ONE.
 //
 // `dashboard::render` is private and the only way in is `dashboard::run_cli`,
