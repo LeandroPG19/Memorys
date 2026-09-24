@@ -520,4 +520,137 @@ mod tests {
              tell which side is stale. Got: {chain}"
         );
     }
+
+    fn sha384(text: &str) -> Vec<u8> {
+        <sha2::Sha384 as sha2::Digest>::digest(text.as_bytes()).to_vec()
+    }
+
+    #[test]
+    fn a_recorded_checksum_is_realigned_only_when_it_differs_by_line_endings() {
+        let lf = "CREATE TABLE t (id int);\nCOMMENT ON TABLE t IS 'x';\n";
+        let crlf = "CREATE TABLE t (id int);\r\nCOMMENT ON TABLE t IS 'x';\r\n";
+        let edited = "CREATE TABLE t (id bigint);\r\nCOMMENT ON TABLE t IS 'x';\r\n";
+        let doubled = "CREATE TABLE t (id int);\r\r\nCOMMENT ON TABLE t IS 'x';\r\r\n";
+        let cases = [
+            ("recorded as embedded, both LF", lf, lf, None),
+            ("recorded as embedded, both CRLF", crlf, crlf, None),
+            (
+                "LF binary over a CRLF record: the base that failed",
+                lf,
+                crlf,
+                Some(lf),
+            ),
+            ("CRLF binary over an LF record", crlf, lf, Some(crlf)),
+            ("a CRLF record of other content", lf, edited, None),
+            ("a record of CRLF converted twice", crlf, doubled, None),
+        ];
+        for (case, embedded_sql, recorded_sql, expected_sql) in cases {
+            let embedded = sha384(embedded_sql);
+            let got = realigned_checksum(embedded_sql, &embedded, &sha384(recorded_sql));
+            assert_eq!(
+                got.map(<[u8]>::to_vec),
+                expected_sql.map(sha384),
+                "{case}: only a record that is the same SQL in the other line endings may be \
+                 rewritten, and only to the checksum this binary embeds"
+            );
+        }
+    }
+
+    /// Pieces that include `\n`, `\r\n` and a lone `\r`, chosen by a xorshift
+    /// seeded per case: the crate has no proptest, and this needs no new dependency.
+    fn text_with_mixed_line_endings(seed: u64) -> String {
+        const PIECES: [&str; 8] = ["\n", "\r\n", "\r", "SELECT 1;", " ", "$$", "é", "--"];
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let len = state % 48;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                PIECES[(state % PIECES.len() as u64) as usize]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn over_generated_texts_only_the_other_line_endings_are_forgiven() {
+        for seed in 0..2_000 {
+            let text = text_with_mixed_line_endings(seed);
+            let lf = text.replace("\r\n", "\n");
+            let crlf = lf.replace('\n', "\r\n");
+            let embedded = sha384(&text);
+            let forgiven = |recorded: &str| {
+                realigned_checksum(&text, &embedded, &sha384(recorded)).map(<[u8]>::to_vec)
+            };
+            assert_eq!(
+                forgiven(&text),
+                None,
+                "a record equal to the embedded checksum was rewritten: {text:?}"
+            );
+            assert_eq!(
+                forgiven(&crlf),
+                (crlf != text).then_some(embedded.clone()),
+                "the CRLF variant of {text:?}"
+            );
+            assert_eq!(
+                forgiven(&lf),
+                (lf != text).then_some(embedded.clone()),
+                "the LF variant of {text:?}"
+            );
+            assert_eq!(
+                forgiven(&format!("{lf}x")),
+                None,
+                "a record of different content was forgiven: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_up_migration_is_found_again_from_its_other_line_endings() {
+        for up in MIGRATOR
+            .iter()
+            .filter(|m| !m.migration_type.is_down_migration())
+        {
+            let lf = up.sql.replace("\r\n", "\n");
+            let crlf = lf.replace('\n', "\r\n");
+            let other = if sha384(&lf) == *up.checksum {
+                crlf
+            } else {
+                lf
+            };
+            assert_eq!(
+                realigned_checksum_for(up.version, &sha384(&other)),
+                Some(&*up.checksum),
+                "migration {} recorded in the other line endings was not realigned to what \
+                 this binary embeds",
+                up.version
+            );
+            assert_eq!(
+                realigned_checksum_for(up.version, &up.checksum),
+                None,
+                "migration {} is recorded exactly as embedded and was still rewritten",
+                up.version
+            );
+        }
+    }
+
+    #[test]
+    fn a_down_migration_is_never_what_a_record_is_realigned_to() {
+        for down in MIGRATOR
+            .iter()
+            .filter(|m| m.migration_type.is_down_migration())
+        {
+            let lf = down.sql.replace("\r\n", "\n");
+            let crlf = lf.replace('\n', "\r\n");
+            for variant in [lf, crlf] {
+                assert_eq!(
+                    realigned_checksum_for(down.version, &sha384(&variant)),
+                    None,
+                    "_sqlx_migrations records up migrations; the down SQL of {} must not be \
+                     the one a record is compared against",
+                    down.version
+                );
+            }
+        }
+    }
 }
