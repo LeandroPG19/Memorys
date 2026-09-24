@@ -1318,3 +1318,244 @@ mod env_tests {
         }
     }
 }
+
+/// What a CLI judge reports when the CLI itself goes wrong: an exit status
+/// with nothing behind it cost a whole SIL run on 2026-09-23 —
+/// `v016_extract_without_sampling` fell with `backend_failed` at 18.15 s and
+/// there was no way to tell a refused login from the CLI's own clock firing,
+/// because the stderr went to `Stdio::null()`.
+///
+/// Every CLI here is a script in a temp directory. No network, no real
+/// `claude`: the judge is pointed at the script by its struct field or, for
+/// the extraction path in `handlers::ingesta`, by `MEMORY_INDUSTRY_LLM_CLI`.
+#[cfg(test)]
+pub(crate) mod cli_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The script is removed when this drops. A failed removal is ignored: on
+    /// Windows the `cmd.exe` a timed-out test left behind can still hold it.
+    pub(crate) struct FakeCli {
+        pub(crate) path: PathBuf,
+    }
+
+    impl FakeCli {
+        pub(crate) fn command(&self) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for FakeCli {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.path).ok();
+        }
+    }
+
+    /// A stand-in for `claude` / `gemini`: drains stdin (the Claude judge
+    /// writes the prompt there, and a script that exits before reading it
+    /// races the write), prints each of `stderr` on its stderr, sleeps
+    /// `sleep_secs` and exits with `exit_code`.
+    ///
+    /// The lines are echoed unquoted by `cmd.exe` and single-quoted by `sh`,
+    /// so a character either shell would interpret is refused here rather
+    /// than turned into a script that says something else.
+    pub(crate) fn fake_cli(stderr: &[&str], sleep_secs: u32, exit_code: i32) -> FakeCli {
+        for line in stderr {
+            assert!(
+                !line.contains(['&', '|', '<', '>', '^', '%', '"', '\'', '\n', '\r']),
+                "the fake CLI cannot print {line:?} the same way on both shells"
+            );
+        }
+        let stem = crate::envs::scratch_root("fake-cli");
+        #[cfg(windows)]
+        let (path, script) = {
+            let mut body = String::from("@echo off\r\nmore >nul\r\n");
+            for line in stderr {
+                body.push_str(&format!(">&2 echo {line}\r\n"));
+            }
+            if sleep_secs > 0 {
+                body.push_str(&format!("ping -n {} 127.0.0.1 >nul\r\n", sleep_secs + 1));
+            }
+            // `exit`, not `exit /b`: the script is the whole `cmd /c`, and
+            // ending `cmd.exe` itself is what carries the code out for sure.
+            body.push_str(&format!("exit {exit_code}\r\n"));
+            (stem.with_extension("cmd"), body)
+        };
+        #[cfg(not(windows))]
+        let (path, script) = {
+            let mut body = String::from("#!/bin/sh\ncat >/dev/null\n");
+            for line in stderr {
+                body.push_str(&format!("printf '%s\\n' '{line}' >&2\n"));
+            }
+            if sleep_secs > 0 {
+                body.push_str(&format!("sleep {sleep_secs}\n"));
+            }
+            body.push_str(&format!("exit {exit_code}\n"));
+            (stem, body)
+        };
+        std::fs::write(&path, script).expect("writing the fake CLI");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("making the fake CLI executable");
+        }
+        FakeCli { path }
+    }
+
+    /// Both CLI judges, pointed at the same script. Each one launches the CLI
+    /// its own way (prompt on stdin vs. `-p`), so each one is asked.
+    fn both_cli_judges(cli: &FakeCli, timeout: Duration) -> [Box<dyn ContradictionJudge>; 2] {
+        [
+            Box::new(ClaudeCodeJudge {
+                cli: cli.command(),
+                model: "fake-model".to_string(),
+                timeout,
+            }),
+            Box::new(GeminiCliJudge {
+                cli: cli.command(),
+                model: "fake-model".to_string(),
+                timeout,
+            }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_exits_with_an_error_says_why() {
+        let cli = fake_cli(&["Invalid API key - please run /login"], 0, 3);
+
+        for judge in both_cli_judges(&cli, Duration::from_secs(30)) {
+            let err = judge
+                .run_prompt("una nota cualquiera")
+                .await
+                .expect_err("the fake CLI exits 3");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("Invalid API key - please run /login"),
+                "{}: the CLI said why it failed and the error dropped it. «exited with status \
+                 Some(3)» is all a failed SIL run had to go on, and a refused login, a model \
+                 that does not exist and a crash all read the same. Got: {message}",
+                judge.backend_name()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_secret_the_cli_prints_on_stderr_never_reaches_the_error() {
+        let cli = fake_cli(
+            &[
+                "request with token ghp_abcdefghijklmnop was refused",
+                "Authorization sk-ant-api03-abcdefghijklmnopqrstuvwxyz rejected",
+            ],
+            0,
+            1,
+        );
+
+        for judge in both_cli_judges(&cli, Duration::from_secs(30)) {
+            let err = judge
+                .run_prompt("una nota cualquiera")
+                .await
+                .expect_err("the fake CLI exits 1");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("was refused"),
+                "{}: the stderr has to reach the error at all before its redaction means \
+                 anything. Got: {message}",
+                judge.backend_name()
+            );
+            for secret in [
+                "ghp_abcdefghijklmnop",
+                "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+            ] {
+                assert!(
+                    !message.contains(secret),
+                    "{}: this error is logged by `extraction_reply_within` and sent back in \
+                     the note of `auto_extract`. A CLI that echoes its request prints the \
+                     token it was given. Got: {message}",
+                    judge.backend_name()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_outlives_its_timeout_is_a_timeout_and_not_a_failure() {
+        let cli = fake_cli(&[], 5, 0);
+
+        for judge in both_cli_judges(&cli, Duration::from_millis(300)) {
+            let err = judge
+                .run_prompt("una nota cualquiera")
+                .await
+                .expect_err("the fake CLI sleeps past the judge's timeout");
+            assert!(
+                err.downcast_ref::<JudgeTimeout>().is_some(),
+                "{}: the CLI's own clock cut it, and the caller has to be able to tell. The \
+                 extraction budget and this timeout are the same number, and when this one \
+                 fires first the extraction reads an ordinary error: `backend_failed`, which \
+                 says «installing a CLI will not help» about a CLI that was only slow. Got: \
+                 {err:#}",
+                judge.backend_name()
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_tail_of_a_long_stderr_is_kept() {
+        let mut noisy = b"HEAD-MARKER ".to_vec();
+        noisy.extend(std::iter::repeat_n(b'x', 10 * 1024));
+        noisy.extend(b" TAIL-MARKER\n");
+
+        let tail = cli_stderr_tail(&noisy);
+
+        assert!(
+            tail.len() <= CLI_STDERR_TAIL_BYTES,
+            "a CLI that dumps a stack trace would put all of it in one log line: {} bytes",
+            tail.len()
+        );
+        assert!(
+            tail.ends_with("TAIL-MARKER"),
+            "the cause is at the end of a stderr, not the start: {tail:?}"
+        );
+        assert!(!tail.contains("HEAD-MARKER"));
+    }
+
+    /// A 9-byte cycle of 2-, 3- and 4-byte characters, shifted by every pad
+    /// from 0 to 8, puts the cut on every byte of a character once.
+    #[test]
+    fn a_cut_through_any_byte_of_a_character_stays_bounded_and_ends_where_the_stderr_did() {
+        for pad in 0..9 {
+            let mut bytes = vec![b'a'; pad];
+            bytes.extend("ó€𝄞".repeat(1000).as_bytes());
+
+            let tail = cli_stderr_tail(&bytes);
+
+            assert!(
+                tail.len() <= CLI_STDERR_TAIL_BYTES,
+                "pad {pad}: {} bytes",
+                tail.len()
+            );
+            assert!(tail.ends_with("ó€𝄞"), "pad {pad}: {tail:?}");
+        }
+        assert!(
+            cli_stderr_tail(&[0xff, 0xfe, b'o', b'k']).ends_with("ok"),
+            "a CLI that writes in a legacy code page is still read, lossily"
+        );
+    }
+
+    /// Cutting first and redacting after would start the tail in the middle
+    /// of the token, where nothing recognises it any more.
+    #[test]
+    fn a_token_the_cut_falls_through_leaves_nothing_of_itself() {
+        let mut stderr = "x".repeat(4096);
+        stderr.push_str(" ghp_abcdefghijklmnopqrstuvwxyz0123456789 ");
+        stderr.push_str(&"y".repeat(CLI_STDERR_TAIL_BYTES - 16));
+
+        let tail = cli_stderr_tail(stderr.as_bytes());
+
+        assert!(
+            !tail.contains("0123456789"),
+            "the last bytes of the token survived the cut and no pattern knows them: {:?}",
+            &tail[..64.min(tail.len())]
+        );
+    }
+}

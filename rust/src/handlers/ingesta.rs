@@ -1305,4 +1305,157 @@ mod tests {
              auto_extract in one branch and returned Ok(ExtractionOutcome::default()) here"
         );
     }
+
+    /// `resolve_offline_llm_within` prefers a provider or a URL over the CLI,
+    /// and the SIL box has one of them set, so they go too.
+    fn only_this_cli(
+        cli: &crate::cognitive::judge::cli_tests::FakeCli,
+    ) -> Vec<crate::envs::ScopedEnv> {
+        use crate::envs::ScopedEnv;
+        vec![
+            ScopedEnv::set("MEMORY_INDUSTRY_LLM_CLI", &cli.command()),
+            ScopedEnv::cleared("CUBA_JUEZ_CLI"),
+            ScopedEnv::cleared("MEMORY_INDUSTRY_LLM_BASE_URL"),
+            ScopedEnv::cleared("CUBA_LLM_BASE_URL"),
+            ScopedEnv::cleared("MEMORY_INDUSTRY_LLM_PROVIDER"),
+            ScopedEnv::cleared("CUBA_LLM_PROVIDER"),
+        ]
+    }
+
+    /// The integration test that fell (`v016_extract_without_sampling`) runs
+    /// with no tracing subscriber, so the `warn!` in `extraction_reply_within`
+    /// goes nowhere there. What it prints on failure is this reply, so the
+    /// cause has to be in the reply.
+    #[tokio::test]
+    async fn a_cli_that_fails_puts_its_redacted_stderr_in_the_note() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let cli = crate::cognitive::judge::cli_tests::fake_cli(
+            &[
+                "Invalid API key - please run /login",
+                "sent token ghp_abcdefghijklmnop",
+            ],
+            0,
+            3,
+        );
+        let _env = only_this_cli(&cli);
+
+        let reply = handle(
+            &pool_that_cannot_connect(),
+            json!({
+                "action": "auto_extract",
+                "text": "el servicio de colas depende de Redis y lo mantiene plataforma"
+            }),
+        )
+        .await
+        .expect("a backend that failed is a degraded reply, not an error");
+
+        assert_eq!(reply["reason"], "backend_failed", "{reply}");
+        let note = reply["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("Invalid API key - please run /login"),
+            "the note said «the error is in the log» and the test that fell had no log. A \
+             refused login and a CLI that crashed must not read the same: {reply}"
+        );
+        assert!(
+            !note.contains("ghp_abcdefghijklmnop"),
+            "the note goes back to the MCP client: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cli_slower_than_the_budget_is_out_of_budget() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let cli = crate::cognitive::judge::cli_tests::fake_cli(&[], 5, 0);
+        let _env = only_this_cli(&cli);
+
+        let reply = handle(
+            &pool_that_cannot_connect(),
+            json!({
+                "action": "auto_extract",
+                "text": "el servicio de colas depende de Redis y lo mantiene plataforma",
+                "budget_secs": 1
+            }),
+        )
+        .await
+        .expect("a backend out of time is a degraded reply, not an error");
+
+        assert_eq!(
+            reply["reason"], "out_of_budget",
+            "the CLI never failed, it was only slow: `backend_failed` sends the operator to \
+             fix an install that is fine. {reply}"
+        );
+    }
+
+    /// The extraction's budget and the CLI's own timeout are the same number,
+    /// so which clock fires first is a coin toss decided inside one timer
+    /// tick: `tokio::time::timeout` polls the future it wraps before its own
+    /// deadline, and the CLI's deadline sits inside that future. Whichever
+    /// fires, the answer is the same.
+    #[test]
+    fn a_timeout_is_out_of_budget_whichever_clock_fired_first() {
+        use crate::cognitive::judge::JudgeTimeout;
+        let budget = std::time::Duration::from_secs(18);
+        let timeout = || JudgeTimeout {
+            what: "claude CLI".to_string(),
+            after: budget,
+        };
+
+        assert!(
+            matches!(
+                no_extraction("claude_cli", budget, &anyhow::Error::new(timeout())),
+                NoExtraction::OutOfBudget("claude_cli", 18)
+            ),
+            "the CLI's own timeout fired a tick before the extraction's: that is the \
+             `backend_failed` at 18.15 s of 2026-09-23"
+        );
+        assert!(
+            matches!(
+                no_extraction(
+                    "claude_cli",
+                    budget,
+                    &anyhow::Error::new(timeout()).context("running the extraction prompt")
+                ),
+                NoExtraction::OutOfBudget(..)
+            ),
+            "a context on top does not turn a timeout into a failure"
+        );
+        assert!(
+            matches!(
+                no_extraction(
+                    "claude_cli",
+                    budget,
+                    &anyhow::anyhow!("claude CLI exited with status Some(3): Invalid API key")
+                ),
+                NoExtraction::Failed(..)
+            ),
+            "and an error that is not a timeout is still a failure"
+        );
+    }
+
+    /// The CLI judges redact their stderr, but an OpenAI-compat backend puts
+    /// the vendor's response body in its error as it came, and that error is
+    /// what `backend_failed` now sends back in its note.
+    #[test]
+    fn a_failure_cause_is_redacted_whichever_backend_wrote_it() {
+        let why = anyhow::anyhow!(
+            "OpenAI-compat LLM provider=deepseek HTTP 401 Unauthorized: key ghp_abcdefghijklmnop \
+             is not valid"
+        );
+
+        let NoExtraction::Failed(backend, cause) =
+            no_extraction("openai_compat", std::time::Duration::from_secs(18), &why)
+        else {
+            panic!("an HTTP 401 is a failure, not a timeout and not a missing backend");
+        };
+
+        assert_eq!(backend, "openai_compat");
+        assert!(
+            cause.contains("HTTP 401"),
+            "the cause is the point of carrying it: {cause}"
+        );
+        assert!(
+            !cause.contains("ghp_abcdefghijklmnop"),
+            "the note goes back to the MCP client: {cause}"
+        );
+    }
 }
