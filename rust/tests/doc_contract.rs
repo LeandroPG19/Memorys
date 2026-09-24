@@ -415,7 +415,36 @@ fn a_credential_compiled_into_the_binary_is_disclosed_in_security_md() {
                 continue;
             }
             let body = std::fs::read_to_string(&path).expect("readable");
+            // Only production lines: a fixture inside a `#[cfg(test)]` region is
+            // never compiled into the binary, so it is not a credential anyone has
+            // to rotate. On 2026-09-23 a test table in secure_cli.rs
+            // (`for password in ["9f8e…", …]`) turned this contract red.
+            // Regions are skipped with validar-handoff.sh's three-state machine on
+            // column-0 lines, not by cutting at the first attribute: http.rs and
+            // session.rs put a `#[cfg(test)]` on a loose helper and carry
+            // production after it (1200 lines of http.rs), which a cut would hide.
+            let mut state = 0u8;
             for line in body.lines() {
+                let test_line = match state {
+                    0 if line == "#[cfg(test)]" => {
+                        state = 1;
+                        true
+                    }
+                    0 => false,
+                    1 => {
+                        state = if line.trim_end().ends_with(';') { 0 } else { 2 };
+                        true
+                    }
+                    _ => {
+                        if line == "}" {
+                            state = 0;
+                        }
+                        true
+                    }
+                };
+                if test_line {
+                    continue;
+                }
                 let upper = line.to_uppercase();
                 if !upper.contains("PASSWORD") && !upper.contains("PASSWD") {
                     continue;
@@ -435,10 +464,11 @@ fn a_credential_compiled_into_the_binary_is_disclosed_in_security_md() {
     }
 
     assert!(
-        !compiled.is_empty(),
-        "the scan found no compiled credential at all. That is either very good news or a \
-         broken scan, and today it is the second: setup.rs carries the container defaults. A \
-         check that cannot find what it knows is there proves nothing about what it cannot see"
+        compiled.contains("memorys2026"),
+        "the scan did not find `memorys2026`, the fallback container password setup.rs compiles \
+         in as PG_PASSWORD (SECURITY.md names it). Either the scan is broken or skipping \
+         #[cfg(test)] regions is swallowing production code, and a check that cannot find what \
+         it knows is there proves nothing about what it cannot see. Found: {compiled:?}"
     );
 
     let undisclosed: Vec<&String> = compiled
