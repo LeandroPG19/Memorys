@@ -496,4 +496,61 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// The URL the daemon steps down to when it starts as admin: the admin's,
+    /// as cuba_app with the password in pgpass_app. It used to be built apart
+    /// from the line `secure` prints: cut at the first `@` of the admin URL and
+    /// with the password spliced in raw. That sent the daemon to host `ss` for
+    /// an admin whose password holds an `@`, broke on a `/` or `%` in
+    /// pgpass_app, and never stepped down from an admin URL without credentials.
+    #[tokio::test]
+    async fn the_daemon_steps_down_as_cuba_app_to_the_admin_server_whatever_its_url_holds() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let root = scratch_root("pgpass-app");
+        let cache = root.join(".cache").join("memory-industry");
+        std::fs::create_dir_all(&cache).expect("the test owns this directory");
+        let stored = cache.join("pgpass_app");
+        std::fs::write(&stored, "p@ss/w0rd%41\n").expect("temp dir is writable");
+
+        let table = [
+            (
+                "postgresql://cuba:admin-secret@db.planta.local:5433/brain",
+                "postgresql://cuba_app:p%40ss%2Fw0rd%2541@db.planta.local:5433/brain",
+                "the admin's host, port and database, as cuba_app with pgpass_app \
+                 percent-encoded: raw, its `/` ends the credentials and its `%41` reads as `A`",
+            ),
+            (
+                "postgresql://cuba:p@ss@db.planta.local:5433/brain",
+                "postgresql://cuba_app:p%40ss%2Fw0rd%2541@db.planta.local:5433/brain",
+                "an `@` in the admin's password: sqlx connected the admin at the LAST `@`, so \
+                 the server is db.planta.local, not `ss`",
+            ),
+            (
+                "postgres://localhost:5432/brain",
+                "postgres://cuba_app:p%40ss%2Fw0rd%2541@localhost:5432/brain",
+                "an admin URL with no credentials steps down too, to the same server and \
+                 database; handed back unchanged, the daemon stays superuser in silence",
+            ),
+        ];
+        {
+            let _h = ScopedEnv::set("HOME", &root.display().to_string());
+            for (admin, expected, why) in table {
+                assert_eq!(runtime_database_url(admin), expected, "{why}");
+            }
+        }
+        {
+            let _h = ScopedEnv::cleared("HOME");
+            let _u = ScopedEnv::cleared("USERPROFILE");
+            let admin = "postgresql://cuba:admin-secret@db.planta.local:5433/brain";
+            assert_eq!(
+                runtime_database_url(admin),
+                admin,
+                "with no home there is no pgpass_app, and the admin URL comes back as it is: \
+                 create_pool reads that as «stay on the admin connection»"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

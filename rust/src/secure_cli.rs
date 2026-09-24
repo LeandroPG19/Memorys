@@ -383,6 +383,58 @@ mod tests {
         urls
     }
 
+    /// What is wrong with where `runtime` sends the daemon: sqlx has to read it,
+    /// log in as the application role and land at `admin_place`.
+    fn where_the_runtime_lands(runtime: &str, admin_place: &str) -> Vec<String> {
+        let mut problems = Vec::new();
+        match where_the_daemon_connects(runtime) {
+            Err(e) => problems.push(format!("sqlx cannot read it: {e}")),
+            Ok((user, place)) => {
+                if user != crate::db::APP_ROLE {
+                    problems.push(format!("the daemon logs in as {user:?}"));
+                }
+                if place != admin_place {
+                    problems.push(format!("it lands at {place}, not at {admin_place}"));
+                }
+            }
+        }
+        problems
+    }
+
+    /// What is wrong with who the daemon and psql log in as from `runtime`:
+    /// both have to be the application role with `password`.
+    fn who_the_runtime_logs_in_as(runtime: &str, password: &str) -> Vec<String> {
+        let mut problems = Vec::new();
+        let daemon = password_the_daemon_uses(runtime);
+        if daemon != Ok(Some(password.to_owned())) {
+            problems.push(format!("the daemon's password is {daemon:?}"));
+        }
+        let psql = credentials_psql_uses(runtime);
+        if psql
+            != (
+                Some(crate::db::APP_ROLE.to_owned()),
+                Some(password.to_owned()),
+            )
+        {
+            problems.push(format!("psql logs in with {psql:?}"));
+        }
+        problems
+    }
+
+    /// What `runtime` changed of `admin` besides who logs in: its query, the
+    /// credentials aside, or its scheme.
+    fn what_else_the_runtime_changed(admin: &str, runtime: &str) -> Vec<String> {
+        let scheme = |url: &str| url.split_once("://").map(|(scheme, _)| scheme.to_owned());
+        let mut problems = Vec::new();
+        if query_except_credentials(runtime) != query_except_credentials(admin) {
+            problems.push("its query is not the admin's, credentials aside".to_owned());
+        }
+        if scheme(runtime) != scheme(admin) {
+            problems.push("its scheme is not the admin's".to_owned());
+        }
+        problems
+    }
+
     /// `secure` prints a URL for the runtime built from the admin's. It has to
     /// land where the admin's did, with nothing changed but who logs in. With
     /// no credentials in the admin URL (`postgres://localhost:5432/brain`, a
@@ -398,40 +450,11 @@ mod tests {
                      have connected with it: {admin}: {e}"
                 )
             });
-            let scheme = admin.split_once("://").map(|(scheme, _)| scheme);
             for password in ["9f8e7d6c5b4a39281706f5e4d3c2b1a0", "a&b=c+d/e@f%41"] {
                 let runtime = derive_app_url(&admin, password);
-                let mut problems = Vec::new();
-                match where_the_daemon_connects(&runtime) {
-                    Err(e) => problems.push(format!("sqlx cannot read it: {e}")),
-                    Ok((user, place)) => {
-                        if user != crate::db::APP_ROLE {
-                            problems.push(format!("the daemon logs in as {user:?}"));
-                        }
-                        if place != admin_place {
-                            problems.push(format!("it lands at {place}, not at {admin_place}"));
-                        }
-                    }
-                }
-                let daemon = password_the_daemon_uses(&runtime);
-                if daemon != Ok(Some(password.to_owned())) {
-                    problems.push(format!("the daemon's password is {daemon:?}"));
-                }
-                let psql = credentials_psql_uses(&runtime);
-                if psql
-                    != (
-                        Some(crate::db::APP_ROLE.to_owned()),
-                        Some(password.to_owned()),
-                    )
-                {
-                    problems.push(format!("psql logs in with {psql:?}"));
-                }
-                if query_except_credentials(&runtime) != query_except_credentials(&admin) {
-                    problems.push("its query is not the admin's, credentials aside".to_owned());
-                }
-                if runtime.split_once("://").map(|(scheme, _)| scheme) != scheme {
-                    problems.push("its scheme is not the admin's".to_owned());
-                }
+                let mut problems = where_the_runtime_lands(&runtime, &admin_place);
+                problems.extend(who_the_runtime_logs_in_as(&runtime, password));
+                problems.extend(what_else_the_runtime_changed(&admin, &runtime));
                 if !problems.is_empty() {
                     wrong.push(format!(
                         "  {admin}\n    printed {runtime}\n    {}",
