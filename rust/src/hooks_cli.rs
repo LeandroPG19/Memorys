@@ -489,6 +489,7 @@ fn merge_driver(args: &[String]) -> Result<()> {
         SyncFile::Episode => merge_episode_file,
         SyncFile::Error => merge_error_file,
         SyncFile::Decision => merge_decision_file,
+        SyncFile::Tombstones => merge_tombstones,
     };
     let Some(bytes) = merge(ours, theirs)? else {
         anyhow::bail!("{path}: one side does not read as {kind:?} JSON; left to git as a conflict");
@@ -505,6 +506,7 @@ enum SyncFile {
     Episode,
     Error,
     Decision,
+    Tombstones,
 }
 
 /// Which sync file git's `%P` names, read from its last components — the
@@ -519,6 +521,18 @@ enum SyncFile {
 /// `projects.json` to the entity merge. Now the file name decides first, then
 /// the directory holding the file, then the one above it (an episode lives at
 /// `episodes/<YYYY-MM>/`). `/` is the only separator: git writes no other.
+///
+/// Two files every export writes get no rule on purpose, so git leaves them
+/// to a person. `manifest.json`: the import recomputes its `manifest_hash` and
+/// only reports a mismatch (handlers/sync.rs:1851-1852, `edited_since_export`
+/// at :2678), but it acts on the rest of it unchecked — `project_id` sets the
+/// scope the rows are written under (:1810-1820), and `with_embeddings`,
+/// `embedding_dim` and `embedding_model` decide whether and how the vectors
+/// are read (:1824-1848, :2583-2589). Nothing, `validate_bundle` included,
+/// checks those against the files, so which side's manifest stands is not a
+/// call this driver can make safely. `embeddings.bin.zst`: zstd over records
+/// whose width only the manifest declares, and not regenerable from the other
+/// files — the vectors come from the database and the model that made them.
 fn sync_file_kind(path: &str) -> Option<SyncFile> {
     let path = path.to_lowercase();
     let mut up = path.rsplit('/');
@@ -528,6 +542,7 @@ fn sync_file_kind(path: &str) -> Option<SyncFile> {
     match (name, parent, grandparent) {
         ("relations.json", _, _) => Some(SyncFile::Relations),
         ("projects.json", _, _) => Some(SyncFile::Projects),
+        ("tombstones.json", _, _) => Some(SyncFile::Tombstones),
         (_, "entities", _) => Some(SyncFile::Entity),
         (_, "errors", _) => Some(SyncFile::Error),
         (_, "decisions", _) => Some(SyncFile::Decision),
@@ -652,6 +667,48 @@ fn merge_decision_file(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<
     };
 
     let merged = if a.content.is_empty() { b } else { a };
+    Ok(Some(serde_json::to_vec_pretty(&merged)?))
+}
+
+/// One row of `tombstones.json` as `export_into` writes it. A field this build
+/// does not know fails the read: writing the merge back would drop it, so the
+/// file is left to a person instead.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct TombstoneRow {
+    table_name: String,
+    row_id: uuid::Uuid,
+    deleted_at: chrono::DateTime<chrono::Utc>,
+    origin_node: Option<String>,
+}
+
+/// Both sides' tombstones as one list, keyed like brain_tombstones' primary
+/// key, (table_name, row_id). Where both name a row the later deletion stands,
+/// as brain_record_tombstone() does with ON CONFLICT (migration 0045); an
+/// instant both share goes to the greater origin_node, so that which branch is
+/// ours never decides it. Written oldest deletion first, as the export orders
+/// it, then by the key: the same two sides give the same bytes either way
+/// round, and merging the result again changes nothing.
+fn merge_tombstones(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>>> {
+    let a: Option<Vec<TombstoneRow>> = read_json(ours_path)?;
+    let b: Option<Vec<TombstoneRow>> = read_json(theirs_path)?;
+    let (Some(a), Some(b)) = (a, b) else {
+        return Ok(None);
+    };
+
+    let mut merged: Vec<TombstoneRow> = a.into_iter().chain(b).collect();
+    merged.sort_by_key(|t| {
+        (
+            t.table_name.clone(),
+            t.row_id,
+            std::cmp::Reverse(t.deleted_at),
+            std::cmp::Reverse(t.origin_node.clone()),
+        )
+    });
+    merged
+        .dedup_by(|later, kept| later.table_name == kept.table_name && later.row_id == kept.row_id);
+    merged.sort_by_key(|t| (t.deleted_at, t.table_name.clone(), t.row_id));
+
     Ok(Some(serde_json::to_vec_pretty(&merged)?))
 }
 
