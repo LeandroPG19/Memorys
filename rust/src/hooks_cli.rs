@@ -849,6 +849,10 @@ mod tests {
 
     /// Runs `merge_driver` over `merge`'s sides as git would for `path`, and
     /// says whether that merge is the one that ran.
+    ///
+    /// The exit status is not what this asks: a path that gets no merge now
+    /// exits non-zero so that git leaves a conflict, and that has tests of its
+    /// own. Here only what was written back over ours counts.
     fn merged_by(dir: &Path, path: &str, merge: Merge) -> bool {
         let (ours, theirs) = merge.sides();
         let ours_path = dir.join("ours.json");
@@ -862,19 +866,21 @@ mod tests {
             theirs_path.to_str().unwrap().to_string(),
             path.to_string(),
         ];
-        merge_driver(&args).expect("every merge here reads files it can open");
+        let _exit = merge_driver(&args);
 
         merge.wrote(&std::fs::read(&ours_path).unwrap())
     }
 
-    /// Which merge every path shape gets, pinned before the decision moves.
+    /// Which merge every path shape gets.
     ///
     /// `merge_driver` chose with `a || b && c` and five `else if`, CC 18 in one
-    /// body. This table is today's answer for each shape of `%P` git can hand
+    /// body. This table was that answer for each shape of `%P` git can hand
     /// it, written and run green before a line of the decision moved, so the
-    /// move can only be a move. Some rows read like defects — marked below —
-    /// and are pinned all the same: changing what they do is a fix with a test
-    /// of its own, not something a refactor gets to do on the way past.
+    /// move could only be a move. Two groups of rows were defects and were
+    /// pinned all the same until the fix that came with its own tests: the
+    /// kind is now read from the components at the end of the path — the
+    /// layout under the sync root — and not from substrings anywhere in it.
+    /// Every row that fix moved says `was:` with the answer it replaced.
     #[test]
     fn merge_driver_picks_the_same_merge_for_every_path_shape() {
         let dir = std::env::temp_dir().join(format!("cuba-merge-table-{}", Uuid::new_v4()));
@@ -902,30 +908,43 @@ mod tests {
                 Some(Merge::Episode),
             ),
             (".memory-industry/RELATIONS.JSON", Some(Merge::Relations)),
-            // The two halves of the entity rule, each on its own.
+            // The entity rule is the parent directory; the extension never
+            // mattered and still does not. The old rule had a second half, a
+            // `.json` whose path merely contained `entities` — the half that
+            // let a root's own name pick the merge.
             (".memory-industry/entities/0b6c.bak", Some(Merge::Entity)),
             ("entities/0b6c.json", Some(Merge::Entity)),
-            ("entities.json", Some(Merge::Entity)),
-            ("entities/0b6c.bak", None),
+            // was: Entity, through that second half. Sync writes no such file.
+            ("entities.json", None),
+            // was: None — the same file as `.memory-industry/entities/0b6c.bak`
+            // two rows up, with the sync root at the repository root.
+            ("entities/0b6c.bak", Some(Merge::Entity)),
             (".memory-industry/entities.md", None),
-            // A sync root at the repository root: no leading slash. Only the
-            // entity rule has a half that does without one. Defect-shaped:
-            // the last three get no merge, so git keeps ours and drops theirs
-            // without a conflict marker.
+            // A sync root at the repository root: no leading slash. These were
+            // the first defect — the episode, error and decision rules wanted
+            // `/episodes/` with a slash in front, so git kept ours and dropped
+            // theirs without a conflict marker.
             ("relations.json", Some(Merge::Relations)),
             ("projects.json", Some(Merge::Projects)),
-            ("episodes/2026-07/x.json", None),
-            ("errors/x.json", None),
-            ("decisions/x.json", None),
-            // Two rules fit: the first in the chain wins. Defect-shaped: a
-            // root whose path says "entities" sends relations.json and
-            // projects.json to the entity merge, which cannot parse them, so
-            // ours is kept and theirs dropped in silence.
-            ("entities-archive/relations.json", Some(Merge::Entity)),
-            ("my-entities/projects.json", Some(Merge::Entity)),
+            // was: None.
+            ("episodes/2026-07/x.json", Some(Merge::Episode)),
+            // was: None.
+            ("errors/x.json", Some(Merge::Error)),
+            // was: None.
+            ("decisions/x.json", Some(Merge::Decision)),
+            // Two rules fit. These two were the second defect: a root whose
+            // path says "entities" sent relations.json and projects.json to the
+            // entity merge, which cannot parse them, so ours was kept and
+            // theirs dropped in silence. The file name is read first now.
+            // was: Entity.
+            ("entities-archive/relations.json", Some(Merge::Relations)),
+            // was: Entity.
+            ("my-entities/projects.json", Some(Merge::Projects)),
+            // was: Entity, through the `.json`-containing-`entities` half. Its
+            // place in the layout is an episode's.
             (
                 ".memory-industry/episodes/2026-07/entities.json",
-                Some(Merge::Entity),
+                Some(Merge::Episode),
             ),
             (
                 ".memory-industry/errors/relations.json",
@@ -943,18 +962,18 @@ mod tests {
                 ".memory-industry/decisions/errors/x.json",
                 Some(Merge::Error),
             ),
-            // A suffix, not a file name.
-            (
-                ".memory-industry/old-relations.json",
-                Some(Merge::Relations),
-            ),
+            // A file name, not a suffix. was: Relations — `ends_with` took
+            // any name that finished in `relations.json`.
+            (".memory-industry/old-relations.json", None),
             (".memory-industry/relations.json.orig", None),
             // Nothing sync writes.
             (".memory-industry/manifest.json", None),
             ("README.md", None),
-            // Git always hands `%P` over with forward slashes; pinned so the
-            // move does not start caring about the other kind either.
-            (".memory-industry\\entities\\x.json", Some(Merge::Entity)),
+            // Git always hands `%P` over with forward slashes, so a backslash
+            // is part of a name, never a separator: neither of these has a
+            // directory above its file. was: Entity for the first, through
+            // the `.json`-containing-`entities` half.
+            (".memory-industry\\entities\\x.json", None),
             (".memory-industry\\episodes\\x.json", None),
         ];
 
@@ -976,6 +995,114 @@ mod tests {
             "merge_driver no longer picks the merge it picked for these paths:\n{}",
             wrong.join("\n")
         );
+    }
+
+    #[test]
+    fn a_sync_root_named_like_a_bundle_directory_does_not_pick_the_merge() {
+        let dir = std::env::temp_dir().join(format!("cuba-merge-root-name-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // CUBA_SYNC_DIR=entities, =errors, =episodes: the root's own name sits
+        // in `%P` in front of the layout, and only the layout may decide.
+        let table: [(&str, Merge); 5] = [
+            ("entities/relations.json", Merge::Relations),
+            ("entities/projects.json", Merge::Projects),
+            ("errors/entities/0b6c.json", Merge::Entity),
+            ("episodes/errors/0b6c.json", Merge::Error),
+            ("entities/episodes/2026-07/0b6c.json", Merge::Episode),
+        ];
+
+        let mut wrong = Vec::new();
+        for (path, expected) in table {
+            let seen: Vec<Merge> = EVERY_MERGE
+                .into_iter()
+                .filter(|&merge| merged_by(&dir, path, merge))
+                .collect();
+            if seen != [expected] {
+                wrong.push(format!("{path}: expected {expected:?}, merged {seen:?}"));
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wrong.is_empty(),
+            "a sync root is whatever directory CUBA_SYNC_DIR names, so its name is not \
+             evidence of what a file under it holds. Read as a substring it was: \
+             `entities/relations.json` went to the entity merge, which cannot parse a \
+             list of relations, and git kept ours and dropped theirs without a marker:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// Writes `ours` and `theirs` under `dir` and returns the four arguments
+    /// git would hand the driver for `path`.
+    fn driver_args(dir: &Path, ours: &[u8], theirs: &[u8], path: &str) -> [String; 4] {
+        let ours_path = dir.join("ours.json");
+        let theirs_path = dir.join("theirs.json");
+        std::fs::write(&ours_path, ours).unwrap();
+        std::fs::write(&theirs_path, theirs).unwrap();
+        [
+            "unused-ancestor".to_string(),
+            ours_path.to_str().unwrap().to_string(),
+            theirs_path.to_str().unwrap().to_string(),
+            path.to_string(),
+        ]
+    }
+
+    #[test]
+    fn a_file_no_rule_recognises_is_left_to_git_as_a_conflict() {
+        let dir = std::env::temp_dir().join(format!("cuba-merge-unknown-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = br#"{"manifest_hash":"ours"}"#;
+        let theirs = br#"{"manifest_hash":"theirs"}"#;
+
+        for path in [".memory-industry/manifest.json", "README.md"] {
+            let args = driver_args(&dir, ours, theirs, path);
+
+            let exit = merge_driver(&args);
+
+            let err = exit.expect_err(
+                "git reads exit 0 as `merged cleanly` and takes whatever is in %A, which is \
+                 ours untouched: theirs was dropped with no conflict and nothing to say so. \
+                 Non-zero is how a driver tells git to leave the file conflicted instead",
+            );
+            assert!(
+                err.to_string().contains(path),
+                "the message is what the person resolving the conflict reads; it has to name \
+                 the file: {err}"
+            );
+            assert_eq!(
+                std::fs::read(&args[1]).unwrap(),
+                ours,
+                "no merge ran for {path}, so nothing may be written over ours"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_recognised_file_whose_sides_do_not_parse_is_left_to_git_as_a_conflict() {
+        let dir = std::env::temp_dir().join(format!("cuba-merge-unparsed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = br#"{"not":"an entity file"}"#;
+        let args = driver_args(
+            &dir,
+            ours,
+            br#"{"also not":"an entity file"}"#,
+            ".memory-industry/entities/0b6c.json",
+        );
+
+        let exit = merge_driver(&args);
+
+        assert!(
+            exit.is_err(),
+            "the entity merge could not read these sides and wrote nothing; exiting 0 then \
+             is the same silent drop of theirs as a path no rule knows"
+        );
+        assert_eq!(std::fs::read(&args[1]).unwrap(), ours);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1041,11 +1168,21 @@ mod tests {
         root.join(directory_named_by(line))
     }
 
+    /// The line of an answer that says the sync directory is in the repo.
+    fn inside(answer: AttributeLine) -> String {
+        match answer {
+            AttributeLine::Inside(line) => line,
+            AttributeLine::Outside(dir) => {
+                panic!("the sync directory is in this repo, and was reported outside: {dir:?}")
+            }
+        }
+    }
+
     #[test]
     fn a_fresh_repo_gets_the_driver_on_the_directory_sync_actually_writes_to() {
         let root = scratch_root("fresh");
 
-        let covered = directory_covered_by(&gitattributes_line(&root, None), &root);
+        let covered = directory_covered_by(&inside(gitattributes_line(&root, None)), &root);
 
         assert_eq!(
             covered,
@@ -1071,8 +1208,9 @@ mod tests {
         std::fs::create_dir_all(legacy.join(".cuba-memorys")).unwrap();
         let fresh = scratch_root("fresh-beside-legacy");
 
-        let covered_legacy = directory_covered_by(&gitattributes_line(&legacy, None), &legacy);
-        let covered_fresh = directory_covered_by(&gitattributes_line(&fresh, None), &fresh);
+        let covered_legacy =
+            directory_covered_by(&inside(gitattributes_line(&legacy, None)), &legacy);
+        let covered_fresh = directory_covered_by(&inside(gitattributes_line(&fresh, None)), &fresh);
 
         assert_eq!(
             covered_legacy,
@@ -1104,7 +1242,8 @@ mod tests {
         let configured = root.join("graph-sync");
         std::fs::create_dir_all(&configured).unwrap();
 
-        let covered = directory_covered_by(&gitattributes_line(&root, Some(&configured)), &root);
+        let covered =
+            directory_covered_by(&inside(gitattributes_line(&root, Some(&configured))), &root);
 
         assert_eq!(
             covered, configured,
@@ -1122,7 +1261,7 @@ mod tests {
     fn the_pattern_is_written_relative_the_only_way_git_can_read_one() {
         let root = scratch_root("relative");
 
-        let line = gitattributes_line(&root, None);
+        let line = inside(gitattributes_line(&root, None));
         let named = directory_named_by(&line);
 
         assert!(
@@ -1150,8 +1289,81 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Runs the real `install()` inside a throwaway repo at `root` and hands the
-    /// environment back the way it found it.
+    #[test]
+    fn a_relative_sync_dir_is_read_against_the_repo_root_and_written_the_way_git_matches() {
+        let root = scratch_root("configured-relative");
+        let expected = format!("graph-sync/** merge={MERGE_DRIVER_NAME}");
+
+        for configured in [
+            "graph-sync",
+            "./graph-sync",
+            "x/../graph-sync",
+            "./x/./../graph-sync/",
+        ] {
+            assert_eq!(
+                gitattributes_line(&root, Some(Path::new(configured))),
+                AttributeLine::Inside(expected.clone()),
+                "git matches `.gitattributes` patterns against the path from the top of the \
+                 work tree, component by component, with no `.` and no `..` in it: \
+                 `./graph-sync/**` and `x/../graph-sync/**` are both lines that match nothing \
+                 at all. And the directory is the repo root's, not this process's: the hook \
+                 runs from the top of the work tree, and `hook install` can be run from any \
+                 directory under it — this test runs from the crate's, which is not the repo \
+                 under test. CUBA_SYNC_DIR={configured}"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_nested_sync_dir_is_written_with_forward_slashes_on_every_system() {
+        let root = scratch_root("configured-nested");
+
+        let line = gitattributes_line(&root, Some(&root.join("data").join("sync")));
+
+        assert_eq!(
+            line,
+            AttributeLine::Inside(format!("data/sync/** merge={MERGE_DRIVER_NAME}")),
+            "a `.gitattributes` pattern separates directories with `/` on Windows too; \
+             `Path::display` there prints `data\\sync`, a pattern git reads as one name with \
+             an escaped `s` in it, which matches nothing"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_sync_dir_outside_the_repo_gets_no_line_and_says_where_it_is() {
+        let root = scratch_root("configured-outside-repo");
+        let elsewhere = scratch_root("configured-outside-dir");
+
+        for configured in [
+            elsewhere.clone(),
+            PathBuf::from("..").join(elsewhere.file_name().unwrap()),
+        ] {
+            match gitattributes_line(&root, Some(&configured)) {
+                AttributeLine::Outside(dir) => assert_eq!(
+                    dir.file_name(),
+                    elsewhere.file_name(),
+                    "the path reported has to be the directory sync writes to, so the \
+                     person reading `skipped` knows which one: {dir:?}"
+                ),
+                AttributeLine::Inside(line) => panic!(
+                    "git only ever merges files inside its own work tree, so no line can \
+                     reach {configured:?}; writing one anyway is how `install` used to print \
+                     `added` over a pattern that matches nothing: {line}"
+                ),
+            }
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    /// Runs `f` with git pointed at a throwaway repo at `root` and CUBA_SYNC_DIR
+    /// set to `sync_dir` (or unset), and hands the environment back the way it
+    /// found it.
     ///
     /// `install()` finds its repo with `git rev-parse --show-toplevel` and no
     /// `current_dir`, so it answers from the process working directory — which is
@@ -1166,15 +1378,18 @@ mod tests {
     /// `core.hooksPath` without `--local`: on a machine whose global config sets
     /// one, install would write its hook blocks into the operator's own hooks
     /// directory, outside this repo, and the assertions below would read a file
-    /// install never touched. CUBA_SYNC_DIR is cleared because it replaces the
-    /// directory under test outright.
-    fn install_into_scratch_repo(root: &Path) {
+    /// install never touched. CUBA_SYNC_DIR is always set or cleared here because
+    /// it replaces the directory under test outright.
+    fn in_scratch_repo<R>(root: &Path, sync_dir: Option<&str>, f: impl FnOnce() -> R) -> R {
         let empty_config = root.join("empty-gitconfig");
         std::fs::write(&empty_config, "").unwrap();
         let _no_system = crate::envs::ScopedEnv::set("GIT_CONFIG_NOSYSTEM", "1");
         let _no_global =
             crate::envs::ScopedEnv::set("GIT_CONFIG_GLOBAL", empty_config.to_str().unwrap());
-        let _default_dir = crate::envs::ScopedEnv::cleared("CUBA_SYNC_DIR");
+        let _sync_dir = match sync_dir {
+            Some(dir) => crate::envs::ScopedEnv::set("CUBA_SYNC_DIR", dir),
+            None => crate::envs::ScopedEnv::cleared("CUBA_SYNC_DIR"),
+        };
 
         let init = Command::new("git")
             .args(["init", "--quiet"])
@@ -1187,7 +1402,61 @@ mod tests {
 
         let _repo = crate::envs::ScopedEnv::set("GIT_DIR", root.join(".git").to_str().unwrap());
         let _work_tree = crate::envs::ScopedEnv::set("GIT_WORK_TREE", root.to_str().unwrap());
-        install(false).expect("install into a fresh scratch repo");
+        f()
+    }
+
+    /// The real `install()` in the throwaway repo at `root`; returns what it
+    /// reports to the person who ran it.
+    fn install_into_scratch_repo(root: &Path, sync_dir: Option<&str>) -> String {
+        in_scratch_repo(root, sync_dir, || {
+            install(false).expect("install into a scratch repo")
+        })
+    }
+
+    /// What git itself says the `merge` attribute of `path` is in the repo at
+    /// `root`. This is the oracle: a test that reasons about how a pattern
+    /// ought to match is how `./dir/**` and `dir\sub/**` shipped as `added`.
+    fn merge_attribute(root: &Path, path: &str) -> String {
+        let out = Command::new("git")
+            .args(["check-attr", "merge", "--", path])
+            .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", root.join("empty-gitconfig"))
+            // core.attributesFile defaults to $XDG_CONFIG_HOME/git/attributes,
+            // read even with the global config cut off.
+            .env("XDG_CONFIG_HOME", root.join("no-xdg-config"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git check-attr failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        stdout
+            .trim_end()
+            .rsplit(": merge: ")
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn is_set_locally(root: &Path, key: &str) -> bool {
+        Command::new("git")
+            .args(["config", "--local", "--get", key])
+            .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn read_hook(root: &Path, name: &str) -> String {
+        let path = root.join(".git").join("hooks").join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
     }
 
     fn local_git_config(root: &Path, key: &str) -> String {
@@ -1227,10 +1496,15 @@ mod tests {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         let root = scratch_root("install-fresh");
 
-        install_into_scratch_repo(&root);
+        install_into_scratch_repo(&root, None);
 
         let line = the_one_attribute_line(&root);
         let named = directory_named_by(&line);
+        assert_eq!(
+            merge_attribute(&root, &format!("{named}/entities/0b6c.json")),
+            MERGE_DRIVER_NAME,
+            "git itself has to hand the files under the sync directory to the driver: {line}"
+        );
         assert!(
             Path::new(named).is_relative(),
             "git has no syntax for an absolute pattern: {line}"
@@ -1285,7 +1559,7 @@ mod tests {
         let root = scratch_root("install-legacy");
         std::fs::create_dir_all(root.join(".cuba-memorys")).unwrap();
 
-        install_into_scratch_repo(&root);
+        install_into_scratch_repo(&root, None);
 
         let line = the_one_attribute_line(&root);
         assert_eq!(
@@ -1304,6 +1578,292 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn install_writes_a_line_git_matches_for_every_spelling_of_a_sync_dir_in_the_repo() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        // (label, CUBA_SYNC_DIR for a given repo root, the directory git must see)
+        let cases: [(&str, fn(&Path) -> String, &str); 4] = [
+            (
+                "dot-slash",
+                |_: &Path| "./graph-sync".to_string(),
+                "graph-sync",
+            ),
+            (
+                "dot-dot",
+                |_: &Path| "x/../graph-sync".to_string(),
+                "graph-sync",
+            ),
+            (
+                "nested-relative",
+                |_: &Path| "data/sync".to_string(),
+                "data/sync",
+            ),
+            (
+                "nested-absolute",
+                |root: &Path| root.join("data").join("sync").display().to_string(),
+                "data/sync",
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (label, sync_dir_for_root, dir) in cases {
+            let root = scratch_root(&format!("install-{label}"));
+            let configured = sync_dir_for_root(&root);
+
+            install_into_scratch_repo(&root, Some(&configured));
+
+            let line = the_one_attribute_line(&root);
+            let expected = format!("{dir}/** merge={MERGE_DRIVER_NAME}");
+            let attribute = merge_attribute(&root, &format!("{dir}/entities/0b6c.json"));
+            if line != expected || attribute != MERGE_DRIVER_NAME {
+                wrong.push(format!(
+                    "CUBA_SYNC_DIR={configured}: wrote `{line}`, expected `{expected}`; \
+                     git check-attr says merge: {attribute}"
+                ));
+            }
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        assert!(
+            wrong.is_empty(),
+            "git only matches a pattern spelled from the top of the work tree with `/` and \
+             no `.` or `..`. Each of these used to be written as given — `./graph-sync/**`, \
+             `x/../graph-sync/**`, `data\\sync/**` on Windows — and `install` printed `added` \
+             over a line that hands the driver no file at all, so the first merge of two \
+             machines' graphs was a text merge over JSON:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn install_with_the_sync_dir_outside_the_repo_installs_the_hooks_and_no_driver() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = scratch_root("install-outside");
+        let elsewhere = scratch_root("install-outside-target");
+        let elsewhere_name = elsewhere.file_name().unwrap().to_str().unwrap().to_string();
+
+        let report = install_into_scratch_repo(&root, Some(elsewhere.to_str().unwrap()));
+
+        assert!(
+            !root.join(".gitattributes").exists(),
+            "no pattern in this repo can reach {elsewhere:?}: git only merges files in its own \
+             work tree. A line written anyway matches nothing and reads as protection"
+        );
+        assert!(
+            !is_set_locally(&root, &format!("merge.{MERGE_DRIVER_NAME}.driver")),
+            "a driver with no line pointing at it is configuration for nothing"
+        );
+        let attributes_line = report
+            .lines()
+            .find(|l| l.starts_with(".gitattributes:"))
+            .unwrap_or_else(|| panic!("the report says nothing about .gitattributes:\n{report}"));
+        assert!(
+            attributes_line.contains("skipped")
+                && attributes_line.contains(&elsewhere_name)
+                && attributes_line.contains("outside this repo; git never merges it"),
+            "the person who ran install has to learn that git will not merge the graph, and \
+             where it is — a silent skip is the old silent dead line again:\n{report}"
+        );
+        for (hook, action) in [
+            ("post-commit", "sync export --scope all"),
+            ("post-checkout", "sync import --conflict merge"),
+        ] {
+            let body = read_hook(&root, hook);
+            assert!(
+                body.contains(MARKER) && body.contains(action) && body.contains(&elsewhere_name),
+                "the hooks still export to and import from the shared directory — that is \
+                 what CUBA_SYNC_DIR outside the repo is for — and they have to name it: {body}"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    #[tokio::test]
+    async fn install_replaces_the_merge_driver_lines_an_earlier_install_left() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = scratch_root("install-stale-lines");
+        let absolute = root.join(".memory-industry");
+        std::fs::write(
+            root.join(".gitattributes"),
+            format!(
+                "*.png binary\n\
+                 {}/** merge={MERGE_DRIVER_NAME}\n\
+                 ./.memory-industry/** merge={MERGE_DRIVER_NAME}\n",
+                absolute.display()
+            ),
+        )
+        .unwrap();
+
+        install_into_scratch_repo(&root, None);
+
+        let written = std::fs::read_to_string(root.join(".gitattributes")).unwrap();
+        let driver_lines: Vec<&str> = written
+            .lines()
+            .filter(|l| l.contains(&format!("merge={MERGE_DRIVER_NAME}")))
+            .collect();
+        assert_eq!(
+            driver_lines,
+            [format!(".memory-industry/** merge={MERGE_DRIVER_NAME}")],
+            "the lines earlier installs wrote in the shapes git cannot match have to go: kept, \
+             they pile up one per install and each reads like a guard. Only ours may stay:\n\
+             {written}"
+        );
+        assert!(
+            written.lines().any(|l| l == "*.png binary"),
+            "a line that is not the driver's is not install's to touch:\n{written}"
+        );
+        assert_eq!(
+            merge_attribute(&root, ".memory-industry/entities/0b6c.json"),
+            MERGE_DRIVER_NAME
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_reinstall_moves_the_pinned_sync_dir_and_keeps_one_block() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = scratch_root("install-twice");
+
+        install_into_scratch_repo(&root, Some("first-sync"));
+        install_into_scratch_repo(&root, Some("second-sync"));
+
+        for hook in ["post-commit", "post-checkout"] {
+            let body = read_hook(&root, hook);
+            assert_eq!(
+                body.matches(MARKER).count(),
+                1,
+                "one block per hook, however many installs: {body}"
+            );
+            assert!(
+                body.contains("CUBA_SYNC_DIR=")
+                    && body.contains("second-sync")
+                    && !body.contains("first-sync"),
+                "the hook fixes CUBA_SYNC_DIR so that a commit from an IDE with another \
+                 environment exports where this repo's merge driver looks. A reinstall with a \
+                 new directory moves the line to it, so the block has to move with it; a hook \
+                 still pinned to the first one exports where nothing guards it: {body}"
+            );
+        }
+        assert_eq!(
+            the_one_attribute_line(&root),
+            format!("second-sync/** merge={MERGE_DRIVER_NAME}")
+        );
+
+        let before = read_hook(&root, "post-commit");
+        let report = install_into_scratch_repo(&root, Some("second-sync"));
+        assert_eq!(
+            read_hook(&root, "post-commit"),
+            before,
+            "the same install twice changes nothing"
+        );
+        assert!(
+            report
+                .lines()
+                .any(|l| l.starts_with("post-commit hook:") && l.contains("already present")),
+            "and says so:\n{report}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn uninstall_takes_the_pinned_sync_dir_with_the_rest_of_the_block() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = scratch_root("install-uninstall");
+
+        in_scratch_repo(&root, Some("graph-sync"), || {
+            install(false).expect("install");
+            uninstall().expect("uninstall");
+        });
+
+        let hooks = root.join(".git").join("hooks");
+        for hook in ["post-commit", "post-checkout"] {
+            assert!(
+                !hooks.join(hook).exists(),
+                "the file held nothing but install's block, the pinned CUBA_SYNC_DIR included; \
+                 uninstall has to leave no trace of it"
+            );
+        }
+        assert!(!root.join(".gitattributes").exists());
+        assert!(!is_set_locally(
+            &root,
+            &format!("merge.{MERGE_DRIVER_NAME}.driver")
+        ));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_sync_dir_with_a_space_and_a_quote_survives_the_attributes_file_and_the_hook() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = scratch_root("install-odd-name");
+        let odd = root.join("it's a dir");
+        std::fs::create_dir_all(&odd).unwrap();
+
+        install_into_scratch_repo(&root, Some(odd.to_str().unwrap()));
+
+        assert_eq!(
+            merge_attribute(&root, "it's a dir/entities/0b6c.json"),
+            MERGE_DRIVER_NAME,
+            "whitespace ends a `.gitattributes` pattern, so `it's a dir/**` bare is the \
+             pattern `it's` followed by two attributes git refuses; the directory needs the \
+             C-style quotes git accepts: {:?}",
+            std::fs::read_to_string(root.join(".gitattributes"))
+        );
+        let post_commit = read_hook(&root, "post-commit");
+        assert!(
+            post_commit.contains("CUBA_SYNC_DIR="),
+            "the hook has to fix the directory: {post_commit}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            sync_dir_a_hook_exports(&root.join(".git").join("hooks").join("post-commit"), &root),
+            odd.canonicalize().unwrap().display().to_string(),
+            "a quote or a space in the path must reach the program the hook starts as one \
+             word, unchanged: {post_commit}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Checks `hook` parses under `sh -n`, then runs it the way git does — `sh`,
+    /// from the top of the work tree, no database configured so nothing is
+    /// started — and returns the `CUBA_SYNC_DIR` a program it started would see.
+    #[cfg(unix)]
+    fn sync_dir_a_hook_exports(hook: &Path, root: &Path) -> String {
+        let syntax = Command::new("sh").arg("-n").arg(hook).output().unwrap();
+        assert!(
+            syntax.status.success(),
+            "sh -n refuses the hook install wrote: {}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
+        let out = Command::new("sh")
+            .args([
+                "-c",
+                ". \"$1\"; exec sh -c 'printf %s \"$CUBA_SYNC_DIR\"'",
+                "sh",
+            ])
+            .arg(hook)
+            .current_dir(root)
+            .env_remove("CUBA_SYNC_DIR")
+            .env_remove("DATABASE_URL")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", root.join("empty-gitconfig"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the hook failed under sh: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
     }
 
     #[test]
