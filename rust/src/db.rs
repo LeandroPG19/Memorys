@@ -470,11 +470,20 @@ async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
 /// while sqlx's migration lock is per database, so two databases of one server
 /// migrating together both write it and one of them loses. It is an `elog`
 /// in PostgreSQL's simple_heap_update: SQLSTATE XX000, text never translated.
+///
+/// Or its sibling on a server where cuba_app does not exist yet: both runs of
+/// 0041 find no role and both CREATE ROLE cuba_app, and the second waits on the
+/// first's key in pg_authid_rolname_index and gets 23505 once it commits.
+/// Matched by the constraint field, which _bt_check_unique always sends, and
+/// not by the translated text. Tried again, 0041 finds the role and takes its
+/// ALTER ROLE branch.
 fn is_concurrent_catalog_update(error: &(dyn std::error::Error + 'static)) -> bool {
     std::iter::successors(Some(error), |e| e.source())
         .filter_map(|e| e.downcast_ref::<sqlx::Error>()?.as_database_error())
-        .any(|db| {
-            db.code().as_deref() == Some("XX000") && db.message() == "tuple concurrently updated"
+        .any(|db| match db.code().as_deref() {
+            Some("XX000") => db.message() == "tuple concurrently updated",
+            Some("23505") => db.constraint() == Some("pg_authid_rolname_index"),
+            _ => false,
         })
 }
 
