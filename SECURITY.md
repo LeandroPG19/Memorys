@@ -51,6 +51,10 @@ and sometimes material under NDA.
   that carries it. Until 0.27 `scripts/create-app-role.sql` created it with the literal
   `app2026`; an install that ran it back then and has not started the daemon as admin since
   still has that password, so start it once as admin (it resets the role to `pgpass_app`).
+  Since 0.28 that password never reaches the server: the binary computes the SCRAM-SHA-256
+  verifier (4096 iterations, random 16-byte salt) and hands PostgreSQL the verifier, which it
+  stores as is — so the password cannot land in `pg_stat_statements` or a statement log. The
+  script refuses a value that is not a verifier.
 - **Least privilege** — the runtime downgrades itself to `cuba_app` (`NOSUPERUSER`,
   `NOBYPASSRLS`) when that role exists and its credential works; migrations run separately
   under an admin role. What stops `cuba_app` writing to the audit log is a trigger, not a

@@ -74,18 +74,94 @@ async fn write_app_role_password(pool: &PgPool, role: &str, password: &str) -> s
 /// and `%L`. The password used to be spliced into `ALTER ROLE` with
 /// `format!` behind an alphanumeric filter, and that statement text is what
 /// the statement logger writes out.
+///
+/// What travels is the password's SCRAM-SHA-256 verifier with a fresh salt,
+/// never the password: log_statement logs bound parameters too, and
+/// pg_stat_statements keeps the `ALTER ROLE` the `DO` block runs. PostgreSQL
+/// stores a verifier handed to `PASSWORD` as it is (CREATE ROLE: «If the
+/// presented password string is already in MD5-encrypted or SCRAM-encrypted
+/// format, then it is stored as-is regardless of password_encryption»).
 pub(crate) async fn bind_app_role(
     conn: &mut sqlx::PgConnection,
     role: &str,
     password: &str,
 ) -> sqlx::Result<()> {
+    // A v4 uuid is 16 bytes from the OS generator, 122 of them random: the
+    // salt length PostgreSQL uses, without adding `rand` to the crate.
+    let verifier = scram_sha_256_verifier(password, uuid::Uuid::new_v4().as_bytes());
     let settings = sqlx::query(
         "SELECT set_config('memory_industry.app_role', $1, true), \
                 set_config('memory_industry.app_password', $2, true)",
     )
     .bind(role)
-    .bind(password);
+    .bind(verifier);
     sqlx::Executor::execute(conn, settings).await.map(drop)
+}
+
+/// PostgreSQL's own default for `scram_iterations`.
+const SCRAM_ITERATIONS: u32 = 4096;
+
+/// The SCRAM-SHA-256 verifier of `password` with `salt` (RFC 5802 §3,
+/// RFC 7677), in the form pg_authid keeps and `PASSWORD '...'` takes:
+/// `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`, each part in
+/// Base64. The password goes in as its bytes. PostgreSQL runs SASLprep on it
+/// first, which leaves ASCII untouched, and the password `setup` generates is
+/// hex; a non-ASCII one written into pgpass_app by hand may not log in.
+pub fn scram_sha_256_verifier(password: &str, salt: &[u8]) -> String {
+    use sha2::Digest;
+    let salted = pbkdf2_hmac_sha256(password.as_bytes(), salt, SCRAM_ITERATIONS);
+    let stored_key = sha2::Sha256::digest(hmac_sha256(&salted, b"Client Key"));
+    let server_key = hmac_sha256(&salted, b"Server Key");
+    format!(
+        "SCRAM-SHA-256${SCRAM_ITERATIONS}:{}${}:{}",
+        base64(salt),
+        base64(&stored_key),
+        base64(&server_key)
+    )
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
+    mac.update(message);
+    let mut out = [0; 32];
+    out.copy_from_slice(&mac.finalize().into_bytes());
+    out
+}
+
+/// PBKDF2 (RFC 8018 §5.2) with HMAC-SHA-256, first block only: SCRAM wants a
+/// 32-byte key and that is exactly one block.
+fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut block = hmac_sha256(password, &[salt, &1u32.to_be_bytes()[..]].concat());
+    let mut key = block;
+    for _ in 1..iterations {
+        block = hmac_sha256(password, &block);
+        key.iter_mut().zip(block).for_each(|(k, b)| *k ^= b);
+    }
+    key
+}
+
+/// Standard Base64 with padding (RFC 4648 §4), the encoding of the verifier.
+/// Written here because `base64` is not a dependency of this crate.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let group = chunk.iter().enumerate().fold(0u32, |group, (i, &b)| {
+            group | (u32::from(b) << (16 - 8 * i))
+        });
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(
+                    ALPHABET[((group >> (18 - 6 * i)) & 63) as usize],
+                ));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 pub async fn is_superuser(pool: &PgPool) -> Option<bool> {

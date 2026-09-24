@@ -12,12 +12,21 @@
 -- (~/.cache/memory-industry/pgpass_app):
 --   memory-industry secure       (this same file, embedded in the binary)
 --
--- By hand, name the role and hand the password over as session settings,
--- never pasted into this file. psql interpolates :'pw' in a script read from
--- stdin, not in -c:
+-- memory_industry.app_password carries the SCRAM-SHA-256 verifier of that
+-- password, never the password: SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>,
+-- the form pg_authid keeps. CREATE ROLE stores a verifier as it is handed
+-- («If the presented password string is already in MD5-encrypted or
+-- SCRAM-encrypted format, then it is stored as-is regardless of
+-- password_encryption», PostgreSQL docs, CREATE ROLE), so the password itself
+-- never reaches the server, where log_statement and pg_stat_statements keep
+-- what they are sent. Anything else is refused before a role is created.
+--
+-- By hand, compute the verifier on the client and hand it over with the role
+-- name as session settings, never pasted into this file. psql interpolates
+-- :'verifier' in a script read from stdin, not in -c:
 --   { echo "SET memory_industry.app_role = 'cuba_app';"; \
---     echo "SET memory_industry.app_password = :'pw';"; cat scripts/create-app-role.sql; } \
---     | psql "$DATABASE_URL" -v pw="$(cat ~/.cache/memory-industry/pgpass_app)"
+--     echo "SET memory_industry.app_password = :'verifier';"; cat scripts/create-app-role.sql; } \
+--     | psql "$DATABASE_URL" -v verifier="$(python3 -c 'import base64,hashlib,hmac,os,sys;p=sys.stdin.read().strip().encode();s=os.urandom(16);k=hashlib.pbkdf2_hmac("sha256",p,s,4096);h=lambda m:hmac.new(k,m,"sha256").digest();b=lambda x:base64.b64encode(x).decode();print("SCRAM-SHA-256$4096:%s$%s:%s"%(b(s),b(hashlib.sha256(h(b"Client Key")).digest()),b(h(b"Server Key"))))' < ~/.cache/memory-industry/pgpass_app)"
 --
 -- Until 0.27 this file created the role with a literal password written right
 -- here, so every fresh install had a LOGIN role anyone who had read the repo
@@ -40,6 +49,12 @@ BEGIN
     IF app_role IS NULL THEN
         RAISE EXCEPTION 'memory_industry.app_role is not set, so there is no role to create or alter'
             USING HINT = 'SET memory_industry.app_role first (see the top of this file); there is no default role';
+    END IF;
+    -- The value is not repeated in the error: when it is the password, the
+    -- server log would keep it from there.
+    IF app_password IS NOT NULL AND NOT starts_with(app_password, 'SCRAM-SHA-256$') THEN
+        RAISE EXCEPTION 'memory_industry.app_password is not a SCRAM-SHA-256 verifier, so it is not handed to CREATE ROLE'
+            USING HINT = 'SET it to the verifier of the password, never the password (see the top of this file)';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = app_role) THEN
         IF app_password IS NULL THEN
