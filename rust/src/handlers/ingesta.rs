@@ -56,7 +56,7 @@ async fn auto_extract(pool: &PgPool, args: &Value) -> Result<Value> {
                 "degraded": true,
                 "reason": match why {
                     NoExtraction::NoBackend => "no_backend",
-                    NoExtraction::Failed(_) => "backend_failed",
+                    NoExtraction::Failed(..) => "backend_failed",
                     NoExtraction::OutOfBudget(_, _) => "out_of_budget",
                 },
                 "note": why.note()
@@ -171,7 +171,10 @@ pub fn relation_scan_budget() -> std::time::Duration {
 
 pub enum NoExtraction {
     NoBackend,
-    Failed(&'static str),
+    /// The backend and what it said, redacted. The cause travels in the note
+    /// because the integration tests that call this run with no tracing
+    /// subscriber: a cause only in the log is a cause nobody reads there.
+    Failed(&'static str, String),
     OutOfBudget(&'static str, u64),
 }
 
@@ -182,10 +185,10 @@ impl NoExtraction {
                  capability and no local CLI was found on PATH. Install the Claude Code CLI \
                  (or set CUBA_JUEZ_CLI), or use action='parse' for a heuristic paragraph split."
                 .to_string(),
-            Self::Failed(backend) => format!(
-                "the {backend} backend was found and reachable, but the call failed. This is \
-                 not a missing CLI — installing one will not help. The error is in the log for \
-                 this request; action='parse' still works as a heuristic split."
+            Self::Failed(backend, cause) => format!(
+                "the {backend} backend was found and reachable, but the call failed: {cause}. \
+                 This is not a missing CLI — installing one will not help. action='parse' still \
+                 works as a heuristic split."
             ),
             Self::OutOfBudget(backend, secs) => format!(
                 "the {backend} backend answered too slowly and ran past its {secs}s budget. \
@@ -213,21 +216,43 @@ async fn extraction_reply_within(
         return Err(NoExtraction::NoBackend);
     };
     let name = backend.backend_name();
-    match tokio::time::timeout(budget, backend.run_prompt(prompt)).await {
-        Ok(Ok(raw)) => Ok((crate::cognitive::judge::unwrap_cli_reply(&raw), name)),
-        Ok(Err(why)) => {
-            tracing::warn!(error = %why, backend = name, "LLM extraction failed");
-            Err(NoExtraction::Failed(name))
+    let reply = match tokio::time::timeout(budget, backend.run_prompt(prompt)).await {
+        Ok(reply) => reply,
+        Err(_) => Err(crate::cognitive::judge::JudgeTimeout {
+            what: format!("{name} extraction"),
+            after: budget,
         }
-        Err(_) => {
-            tracing::warn!(
-                backend = name,
-                budget_secs = budget.as_secs(),
-                "LLM extraction ran out of its time budget"
-            );
-            Err(NoExtraction::OutOfBudget(name, budget.as_secs()))
-        }
+        .into()),
+    };
+    reply
+        .map(|raw| (crate::cognitive::judge::unwrap_cli_reply(&raw), name))
+        .map_err(|why| no_extraction(name, budget, &why))
+}
+
+/// Why a backend that was found gave no reply. A timeout is `OutOfBudget`
+/// whichever clock fired: this extraction's, or the backend's own, which is
+/// set to the same budget and wins when both fall in one timer tick (see
+/// `JudgeTimeout`).
+fn no_extraction(
+    backend: &'static str,
+    budget: std::time::Duration,
+    why: &anyhow::Error,
+) -> NoExtraction {
+    let cause = crate::redact::redact_secrets(&format!("{why:#}"));
+    if why
+        .downcast_ref::<crate::cognitive::judge::JudgeTimeout>()
+        .is_some()
+    {
+        tracing::warn!(
+            backend,
+            budget_secs = budget.as_secs(),
+            error = %cause,
+            "LLM extraction ran out of its time budget"
+        );
+        return NoExtraction::OutOfBudget(backend, budget.as_secs());
     }
+    tracing::warn!(error = %cause, backend, "LLM extraction failed");
+    NoExtraction::Failed(backend, cause)
 }
 
 async fn resolve_conflicts(

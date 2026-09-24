@@ -212,7 +212,7 @@ impl ContradictionJudge for ClaudeCodeJudge {
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawn {} (is the CLI installed and on PATH?)", self.cli))?;
@@ -225,20 +225,70 @@ impl ContradictionJudge for ClaudeCodeJudge {
         }
         drop(child.stdin.take());
 
-        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
-            .await
-            .with_context(|| format!("{} CLI timed out after {:?}", self.cli, self.timeout))?
-            .context("CLI process failed")?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "{} CLI exited with status {:?}",
-                self.cli,
-                output.status.code()
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        cli_reply(&self.cli, self.timeout, child).await
     }
+}
+
+/// How much of a failed CLI's stderr goes into its error. The cause is at the
+/// end — the last line of a trace, «Invalid API key» — and the error is one log
+/// line and, for extraction, part of the note `auto_extract` sends back.
+pub(crate) const CLI_STDERR_TAIL_BYTES: usize = 2048;
+
+/// A judge's own clock cut the call.
+///
+/// Typed so the extraction can tell it from a failure. The extraction hands
+/// its own budget to the CLI as this timeout, and `tokio::time::timeout` polls
+/// the future it wraps before its own deadline, so when both fall in one timer
+/// tick this one wins. As a plain error it read `backend_failed` — «installing a CLI
+/// will not help» — about a CLI that was only slow: the 18.15 s failure of
+/// `v016_extract_without_sampling` on 2026-09-23.
+#[derive(Debug)]
+pub struct JudgeTimeout {
+    pub what: String,
+    pub after: Duration,
+}
+
+impl std::fmt::Display for JudgeTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} timed out after {:?}", self.what, self.after)
+    }
+}
+
+impl std::error::Error for JudgeTimeout {}
+
+/// What both CLI judges do once the CLI is running: they launch it
+/// differently and fail the same way.
+///
+/// The stderr used to go to `Stdio::null()` for Claude, so a failure said
+/// «exited with status Some(1)» and nothing else, and to the error whole and
+/// unredacted for Gemini.
+async fn cli_reply(cli: &str, timeout: Duration, child: tokio::process::Child) -> Result<String> {
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| JudgeTimeout {
+            what: format!("{cli} CLI"),
+            after: timeout,
+        })?
+        .with_context(|| format!("{cli} CLI process failed"))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "{cli} CLI exited with status {:?}: {}",
+            output.status.code(),
+            cli_stderr_tail(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The last `CLI_STDERR_TAIL_BYTES` of a CLI's stderr, redacted BEFORE the
+/// cut: cut first, and a token the cut falls through keeps its last bytes
+/// where no pattern recognises them. A CLI that echoes its request prints the
+/// key it was given.
+fn cli_stderr_tail(stderr: &[u8]) -> String {
+    let mut redacted = crate::redact::redact_secrets(String::from_utf8_lossy(stderr).trim());
+    let cut = redacted.ceil_char_boundary(redacted.len().saturating_sub(CLI_STDERR_TAIL_BYTES));
+    redacted.split_off(cut)
 }
 
 /// Google Gemini CLI (`gemini`) — argv differ from Claude Code; do not reuse Claude flags.
@@ -287,20 +337,7 @@ impl ContradictionJudge for GeminiCliJudge {
             .spawn()
             .with_context(|| format!("spawn {} (is the Gemini CLI on PATH?)", self.cli))?;
 
-        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
-            .await
-            .with_context(|| format!("{} CLI timed out after {:?}", self.cli, self.timeout))?
-            .context("Gemini CLI process failed")?;
-
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "{} CLI exited with status {:?} — {err}",
-                self.cli,
-                output.status.code()
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        cli_reply(&self.cli, self.timeout, child).await
     }
 }
 
