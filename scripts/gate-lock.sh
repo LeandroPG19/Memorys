@@ -2,7 +2,8 @@
 # Sourced, never run: the "one gate at a time" lock, shared by merge-gate.sh,
 # which holds it for its whole run, and run-all-tests.sh, which takes it when
 # it runs on its own and inherits it when merge-gate.sh is its parent. The
-# exit file, at the end, belongs to whichever of the two took the lock.
+# exit file, at the end, belongs to whichever of the two took the lock. The
+# receipt, last, is what merge-gate.sh leaves and scripts/release.sh reads.
 #
 # It lived inside run-all-tests.sh until merge-gate.sh needed it too. That
 # script calls run-all-tests.sh and then keeps going — clippy and tests under
@@ -231,4 +232,65 @@ exit_file_running() {
 exit_file_verdict() {
   mkdir -p "$(dirname "$GATE_EXIT_FILE")"
   printf '%s\n' "$1" >"$GATE_EXIT_FILE"
+}
+
+# --- the receipt -------------------------------------------------------------
+# Publishing used to run this gate twice on one commit: merge-gate.sh green
+# before the merge to main, then scripts/release.sh ran it again on that same
+# commit to write its verdict into the tag. On this machine a run takes over an
+# hour, and on 2026-09-23 two runs back to back were both killed for memory.
+# So merge-gate.sh leaves the verdict itself, in ~/.cache/cuba-gate/receipts/
+# <full sha>, and release.sh copies it into the tag instead of judging again.
+#
+# One judge of "a clean log" for both scripts, sourced from here, so that what
+# lets merge-gate.sh write a receipt is exactly what lets release.sh tag.
+# shellcheck disable=SC2034 # read by the scripts that source this one
+RECEIPT_PREFIX="local-gate: MERGE GATE PASSED"
+# shellcheck disable=SC2034
+GATE_RECEIPTS="$HOME/.cache/cuba-gate/receipts"
+GATE_LOG_PROBLEM=""
+GATE_PASSED_LINE=""
+GATE_KILL_LINE=""
+
+# Exit 0 is necessary and not sufficient. AGENTS.md defines mergeable as exit
+# 0 with a clean log. The banner prints "missing = FAIL, never SKIPPED" on every
+# run, so that phrase is the one SKIPPED that does not count; any other is a
+# hole the exit code hid. Returns 1 with the reason in GATE_LOG_PROBLEM, or 0
+# with the two lines a receipt carries in GATE_PASSED_LINE and GATE_KILL_LINE.
+gate_log_verdict() {
+  local log="$1" clean skipped failed
+  GATE_LOG_PROBLEM=""
+  clean="$(tr -d '\r' <"$log")"
+  skipped="$(grep -n 'SKIPPED' <<<"$clean" | grep -v 'never SKIPPED' || true)"
+  if [[ -n "$skipped" ]]; then
+    GATE_LOG_PROBLEM="merge-gate.sh exited 0 with SKIPPED in its log, which is not a pass:
+$skipped"
+    return 1
+  fi
+  failed="$(grep -n 'test result: FAILED' <<<"$clean" || true)"
+  if [[ -n "$failed" ]]; then
+    GATE_LOG_PROBLEM="merge-gate.sh exited 0 with a failed test run in its log:
+$failed"
+    return 1
+  fi
+  GATE_PASSED_LINE="$(grep -m1 'MERGE GATE PASSED' <<<"$clean" | sed 's/║//g; s/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
+  if [[ -z "$GATE_PASSED_LINE" ]]; then
+    GATE_LOG_PROBLEM="merge-gate.sh exited 0 without printing MERGE GATE PASSED. Log: $log"
+    return 1
+  fi
+  GATE_KILL_LINE="$(grep -m1 'kill_rate=' <<<"$clean" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
+  if [[ -z "$GATE_KILL_LINE" ]]; then
+    GATE_LOG_PROBLEM="merge-gate.sh exited 0 and mutants-gate.sh never reported a kill_rate. Log: $log"
+    return 1
+  fi
+}
+
+# The receipt: the sha, the clock and two lines the gate printed, which is also
+# every line of the tag message under its title. Nothing from the environment
+# goes in: no path, no URL, no user.
+gate_receipt_lines() {
+  printf '%s %s\n' "$RECEIPT_PREFIX" "$1"
+  printf 'local-gate-date: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'local-gate-summary: %s\n' "$GATE_KILL_LINE"
+  printf 'local-gate-summary: %s\n' "$GATE_PASSED_LINE"
 }

@@ -10,7 +10,7 @@ Aliases of the same SIL: `./scripts/como-el-ci.sh todo`, `./scripts/como-el-ci.s
 
 GitHub Actions is **not** the merge judge. A green badge is not mergeable. That workflow excludes `MODEL_OR_CLI_ONLY` and has no ONNX / NLI / reranker / generative LLM. `ci.yml` runs only when dispatched by hand.
 
-Publishing is **`./scripts/release.sh vX.Y.Z`** and nothing else: it runs `merge-gate.sh` on `origin/main`, and only on a clean exit 0 pushes an annotated tag carrying `local-gate: MERGE GATE PASSED <sha>`. `publish.yml` reads that line and asks GitHub's CI nothing.
+Publishing is **`./scripts/release.sh vX.Y.Z`** and nothing else. When `merge-gate.sh` already passed on that exact commit over a clean tree, it left `~/.cache/cuba-gate/receipts/<sha>` and `release.sh` tags from that receipt without running the gate a second time; otherwise, or with `--rerun-gate`, it runs `merge-gate.sh` on `origin/main`. Either way it pushes an annotated tag carrying `local-gate: MERGE GATE PASSED <sha>` only on a clean exit 0. `publish.yml` reads that line and asks GitHub's CI nothing.
 
 ## Two judges, chained
 

@@ -77,23 +77,38 @@ E2E asserts `cuba_decreto` query `count >= 1` after record. That used to pass wi
 ## Publishing
 
 ```bash
-./scripts/release.sh v0.28.0            # gate, tag, push the tag
-./scripts/release.sh --dry-run v0.28.0  # gate, print the tag message, create nothing
+./scripts/release.sh v0.28.0               # gate (or its receipt), tag, push the tag
+./scripts/release.sh --dry-run v0.28.0     # the same, print the tag message, create nothing
+./scripts/release.sh --rerun-gate v0.28.0  # run the gate even over a receipt for HEAD
 ```
 
 The only way to publish. In order, and any failure stops it before anything is created:
 
 1. The tree is clean (untracked files count: the DB step discovers `rust/tests/*.rs` by glob), `HEAD` equals `origin/main` after a fetch, and the tag exists neither here nor on origin.
 2. The tag's version is the one `rust/Cargo.toml` declares.
-3. `./scripts/merge-gate.sh` runs on that `HEAD`. It has to exit 0 **and** leave a clean log: no `SKIPPED` other than the banner's own "never SKIPPED", no `test result: FAILED`, a `MERGE GATE PASSED` line and a `kill_rate=` line. The log stays in `~/.cache/cuba-gate/release-<tag>.log`.
+3. The gate's verdict on that `HEAD`, judged once:
+   - If `~/.cache/cuba-gate/receipts/<HEAD sha>` holds a receipt for that commit (below), it is the verdict and the gate does **not** run again.
+   - Otherwise, or with `--rerun-gate`, `./scripts/merge-gate.sh` runs on that `HEAD`, as it always did. It has to exit 0 **and** leave a clean log: no `SKIPPED` other than the banner's own "never SKIPPED", no `test result: FAILED`, a `MERGE GATE PASSED` line and a `kill_rate=` line. The log stays in `~/.cache/cuba-gate/release-<tag>.log`. The run says which of the three cases it is in.
 4. An annotated tag is created whose message carries the receipt, one exact line `local-gate: MERGE GATE PASSED <40-char sha>`, plus the date and those two summary lines. Nothing from the environment goes in it.
 5. Only that tag is pushed.
+
+### The receipt
+
+Publishing used to run the gate twice on one commit: green before the merge to `main`, then again inside `release.sh` on that same commit. A run takes over an hour on the merge machine, and on 2026-09-23 two runs back to back were both killed for memory. So `merge-gate.sh` now leaves its own verdict:
+
+- It tees its whole output into `~/.cache/cuba-gate/merge-gate.log`, and on exit 0 judges that log with `gate_log_verdict` (`scripts/gate-lock.sh`), the same function `release.sh` judges its own log with.
+- It writes `~/.cache/cuba-gate/receipts/<full sha>` only when that commit is all that was judged: `git status --porcelain` empty when the gate starts **and** when it ends, and `HEAD` where it started. The file is the four lines the tag carries under its title: `local-gate: MERGE GATE PASSED <sha>`, `local-gate-date:` (UTC, when the gate passed), and the `kill_rate=` and `MERGE GATE PASSED` summary lines.
+- A dirty tree, a tree or `HEAD` that changed during the run, or an unclean log: no receipt, and the run says why in a `no receipt:` line. A dirty start is announced at the start too, not an hour later.
+- A run that starts clean on a commit removes that commit's earlier receipt first: a red run on it takes the pass away, a green one writes it again.
+- `release.sh` uses a receipt only if it is named after `HEAD` **and** its four lines are that shape for that sha. A copy of another commit's receipt under `HEAD`'s name runs the gate.
+
+The receipt is a file in your home, not a signature: anyone who can write there can write one, as anyone who can push a tag could before. It saves a run; it does not add a judge.
 
 `publish.yml` no longer asks GitHub whether `ci.yml` passed. Its first job fetches the annotated tag (`actions/checkout` leaves a lightweight ref in its place, [actions/checkout#290](https://github.com/actions/checkout/issues/290)) and runs `scripts/release.sh --verify-receipt <tag> <sha>`: the tag must be annotated, point at the commit being built, and carry the receipt line for that commit. Every other job needs it. A tag pushed by hand is refused, so the only way a release reaches npm, PyPI and the binaries is through a green local gate.
 
 `ci.yml` runs only by `workflow_dispatch`. Its `release-matrix` job, which compiles the five published targets, no longer runs on its own: the local gate does not check other platforms, so dispatch it by hand before a release that touches features or platform code.
 
-`./scripts/release.sh --self-test` drives each guard against a throwaway repo with a stand-in `merge-gate.sh`, and checks that the receipt it writes is the one `--verify-receipt` accepts.
+`./scripts/release.sh --self-test` drives each guard against a throwaway repo with a stand-in `merge-gate.sh`, and checks that the receipt it writes is the one `--verify-receipt` accepts. It also checks that a receipt for `HEAD` replaces the gate and its lines reach the tag, and that a receipt for another commit, one naming another commit inside, and `--rerun-gate` all run the gate. `./scripts/merge-gate.sh --self-test` checks the other half: a receipt after a green run over a clean tree, and none (with the reason) after an untracked file, a tree or `HEAD` that changed during the run, or an exit 0 over `SKIPPED`.
 
 ## Programming rules (this repo)
 

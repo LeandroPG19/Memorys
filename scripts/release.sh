@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # The only way to publish a release.
 #
-#   ./scripts/release.sh vX.Y.Z              gate, tag, push the tag
-#   ./scripts/release.sh --dry-run vX.Y.Z    gate, print the tag message, create nothing
+#   ./scripts/release.sh vX.Y.Z              gate (or its receipt), tag, push the tag
+#   ./scripts/release.sh --dry-run vX.Y.Z    the same, print the tag message, create nothing
+#   ./scripts/release.sh --rerun-gate [--dry-run] vX.Y.Z
+#                                            run the gate even over a receipt for HEAD
 #   ./scripts/release.sh --self-test         every guard against the fixture that has to stop it
 #   ./scripts/release.sh --verify-receipt TAG SHA
 #                                            what .github/workflows/publish.yml runs
@@ -18,10 +20,19 @@
 #
 # Every guard runs before anything is created. A failure anywhere leaves no tag,
 # local or remote.
+#
+# The gate is not run twice on one commit. merge-gate.sh, green over a clean
+# tree, leaves its verdict in ~/.cache/cuba-gate/receipts/<sha> (gate-lock.sh
+# says why), and a release of that exact commit copies it into the tag instead
+# of spending another hour judging the same thing. No receipt, or one for
+# another commit, and the gate runs here as it always did.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RECEIPT_PREFIX="local-gate: MERGE GATE PASSED"
+# RECEIPT_PREFIX, GATE_RECEIPTS, gate_log_verdict and gate_receipt_lines: the
+# judge of the log and the shape of the receipt, shared with merge-gate.sh.
+# shellcheck source=scripts/gate-lock.sh
+source "$ROOT/scripts/gate-lock.sh"
 ONLY_WAY="The only way to publish is ./scripts/release.sh vX.Y.Z: it runs ./scripts/merge-gate.sh on the commit origin/main holds and writes the receipt into an annotated tag."
 
 die() {
@@ -30,7 +41,7 @@ die() {
 }
 
 usage() {
-  sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
@@ -88,45 +99,17 @@ check_the_version() {
     || die "the tag says $wanted and rust/Cargo.toml says $have. A release is published under the version its code declares"
 }
 
-# Step 3, second half: exit 0 is necessary and not sufficient. AGENTS.md
-# defines mergeable as exit 0 with a clean log. The banner prints
-# "missing = FAIL, never SKIPPED" on every run, so that phrase is the one
-# SKIPPED that does not count; any other is a hole the exit code hid.
+# Step 3, second half: exit 0 and a clean log, judged by the same function
+# that decides whether merge-gate.sh leaves a receipt (gate-lock.sh).
 judge_the_log() {
-  local log="$1" code="$2" clean skipped failed
+  local log="$1" code="$2"
   (( code == 0 )) || die "merge-gate.sh exited $code. Log: $log"
-  clean="$(tr -d '\r' <"$log")"
-  skipped="$(grep -n 'SKIPPED' <<<"$clean" | grep -v 'never SKIPPED' || true)"
-  [[ -z "$skipped" ]] || die "merge-gate.sh exited 0 with SKIPPED in its log, which is not a pass:
-$skipped"
-  failed="$(grep -n 'test result: FAILED' <<<"$clean" || true)"
-  [[ -z "$failed" ]] || die "merge-gate.sh exited 0 with a failed test run in its log:
-$failed"
-  GATE_PASSED_LINE="$(grep -m1 'MERGE GATE PASSED' <<<"$clean" | sed 's/║//g; s/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
-  [[ -n "$GATE_PASSED_LINE" ]] || die "merge-gate.sh exited 0 without printing MERGE GATE PASSED. Log: $log"
-  GATE_KILL_LINE="$(grep -m1 'kill_rate=' <<<"$clean" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
-  [[ -n "$GATE_KILL_LINE" ]] || die "merge-gate.sh exited 0 and mutants-gate.sh never reported a kill_rate. Log: $log"
+  gate_log_verdict "$log" || die "$GATE_LOG_PROBLEM"
 }
 
-# The whole message is built from the sha, the clock and two lines the gate
-# printed. Nothing from the environment goes in: no path, no URL, no user.
-receipt_message() {
-  local tag="$1" sha="$2"
-  printf 'MemoryIndustry %s\n\n' "$tag"
-  printf '%s %s\n' "$RECEIPT_PREFIX" "$sha"
-  printf 'local-gate-date: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  printf 'local-gate-summary: %s\n' "$GATE_KILL_LINE"
-  printf 'local-gate-summary: %s\n' "$GATE_PASSED_LINE"
-}
-
-release() {
-  local dry_run="$1" tag="$2" sha log code msg
-  cd "$ROOT"
-  version_of_tag "$tag" >/dev/null
-  check_the_tree "$tag"
-  check_the_version "$tag"
-  sha="$(git rev-parse HEAD)"
-
+# Step 3, run here: the gate on HEAD, and RECEIPT_LINES from what it printed.
+run_the_gate() {
+  local tag="$1" sha="$2" log code
   log="$HOME/.cache/cuba-gate/release-$tag.log"
   mkdir -p "$(dirname "$log")"
   echo "=== merge-gate.sh on $sha (log: $log) ==="
@@ -140,8 +123,47 @@ release() {
   # the one that was judged and the tracked files must still be its files.
   [[ "$(git rev-parse HEAD)" == "$sha" ]] || die "HEAD moved while the gate ran; the receipt would name a commit nobody judged"
   git diff --quiet HEAD || die "tracked files changed while the gate ran; the receipt would describe a tree that is not $sha"
+  RECEIPT_LINES="$(gate_receipt_lines "$sha")"
+}
 
-  msg="$(receipt_message "$tag" "$sha")"
+# Step 3, already done: a receipt merge-gate.sh left for this commit, in the
+# four lines it writes and nothing else. The file's name is not enough: a copy
+# of another commit's receipt under this name is not a pass of this one.
+is_receipt_for() {
+  local file="$1" sha="$2" lines
+  mapfile -t lines < <(tr -d '\r' <"$file")
+  (( ${#lines[@]} == 4 )) \
+    && [[ "${lines[0]}" == "$RECEIPT_PREFIX $sha" ]] \
+    && [[ "${lines[1]}" =~ ^local-gate-date:\ [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+    && [[ "${lines[2]}" == "local-gate-summary: "*kill_rate=* ]] \
+    && [[ "${lines[3]}" == "local-gate-summary: "*"MERGE GATE PASSED"* ]]
+}
+
+release() {
+  local dry_run="$1" rerun="$2" tag="$3" sha receipt msg
+  cd "$ROOT"
+  version_of_tag "$tag" >/dev/null
+  check_the_tree "$tag"
+  check_the_version "$tag"
+  sha="$(git rev-parse HEAD)"
+
+  receipt="$GATE_RECEIPTS/$sha"
+  if [[ "$rerun" == 1 ]]; then
+    echo "--rerun-gate: merge-gate.sh runs on $sha whatever receipt it left"
+    run_the_gate "$tag" "$sha"
+  elif [[ ! -f "$receipt" ]]; then
+    echo "no receipt for $sha in $GATE_RECEIPTS: merge-gate.sh runs on it now"
+    run_the_gate "$tag" "$sha"
+  elif ! is_receipt_for "$receipt" "$sha"; then
+    echo "$receipt is not a receipt for $sha in the shape merge-gate.sh writes: merge-gate.sh runs on it now"
+    run_the_gate "$tag" "$sha"
+  else
+    echo "=== merge-gate.sh already passed on $sha over a clean tree (receipt: $receipt)."
+    echo "    Not running it again; --rerun-gate runs it anyway. ==="
+    RECEIPT_LINES="$(tr -d '\r' <"$receipt")"
+  fi
+
+  msg="$(printf 'MemoryIndustry %s\n\n%s\n' "$tag" "$RECEIPT_LINES")"
   if [[ "$dry_run" == 1 ]]; then
     echo ""
     echo "dry run: the annotated tag $tag on $sha would carry:"
@@ -444,13 +466,19 @@ case "${1:-}" in
     [[ $# -eq 3 ]] || usage
     verify_receipt "$2" "$3"
     ;;
-  --dry-run)
-    [[ $# -eq 2 ]] || usage
-    release 1 "$2"
-    ;;
   ""|-h|--help) usage ;;
   *)
-    [[ $# -eq 1 ]] || usage
-    release 0 "$1"
+    dry_run=0
+    rerun=0
+    while (( $# > 1 )); do
+      case "$1" in
+        --dry-run) dry_run=1 ;;
+        --rerun-gate) rerun=1 ;;
+        *) usage ;;
+      esac
+      shift
+    done
+    [[ "$1" != -* ]] || usage
+    release "$dry_run" "$rerun" "$1"
     ;;
 esac

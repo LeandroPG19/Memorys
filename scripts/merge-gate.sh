@@ -199,10 +199,65 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit 0
 fi
 
+# The receipt scripts/release.sh publishes from instead of running this gate a
+# second time (gate-lock.sh says why). It names one commit, so it is written
+# only when that commit is all that was judged: the tree clean, untracked files
+# included, when the gate starts and when it ends, and HEAD where it started.
+# The log it is judged from is this run's own output, teed below, and the judge
+# is gate_log_verdict, the one release.sh uses on its own log.
+GATE_LOG="$HOME/.cache/cuba-gate/merge-gate.log"
+GATE_START_HEAD=""
+GATE_NO_RECEIPT=""
+GATE_TEE=""
+
+write_receipt() {
+  local status receipt
+  if [[ -n "$GATE_NO_RECEIPT" ]]; then
+    echo "no receipt: $GATE_NO_RECEIPT"
+    return 0
+  fi
+  if [[ "$(git -C "$ROOT" rev-parse --verify -q HEAD 2>/dev/null || true)" != "$GATE_START_HEAD" ]]; then
+    echo "no receipt: HEAD moved from $GATE_START_HEAD while the gate ran, so no one commit was judged whole"
+    return 0
+  fi
+  if ! status="$(git -C "$ROOT" status --porcelain)" || [[ -n "$status" ]]; then
+    echo "no receipt: the working tree changed while the gate ran, so what passed is not $GATE_START_HEAD"
+    return 0
+  fi
+  if ! gate_log_verdict "$GATE_LOG"; then
+    echo "no receipt: $GATE_LOG_PROBLEM"
+    return 0
+  fi
+  receipt="$GATE_RECEIPTS/$GATE_START_HEAD"
+  if mkdir -p "$GATE_RECEIPTS" \
+    && gate_receipt_lines "$GATE_START_HEAD" >"$receipt.new.$$" \
+    && mv -f "$receipt.new.$$" "$receipt"; then
+    echo "receipt: $receipt (scripts/release.sh publishes $GATE_START_HEAD from it without running this gate again)"
+  else
+    rm -f "$receipt.new.$$"
+    echo "no receipt: $receipt could not be written"
+  fi
+}
+
 # The exit file is this gate's whole verdict, not its first half's: the rules
-# are in gate-lock.sh, next to the lock whose holder owns the file.
+# are in gate-lock.sh, next to the lock whose holder owns the file. The tee is
+# drained first, so the log the receipt is judged from holds the last line. The
+# wait is bounded: a process the gate started and left behind (a server the
+# E2E launched) keeps the pipe open and tee would never see its end, and an
+# unbounded wait would hang the exit of a gate that has already finished.
 on_exit() {
-  local code=$?
+  local code=$? tenths=0
+  if [[ -n "$GATE_TEE" ]]; then
+    exec 1>&3 2>&4 3>&- 4>&-
+    while kill -0 "$GATE_TEE" 2>/dev/null && (( tenths < 300 )); do
+      sleep 0.1
+      tenths=$((tenths + 1))
+    done
+    if kill -0 "$GATE_TEE" 2>/dev/null; then
+      echo "note: something this gate started still holds its output open; $GATE_LOG was judged as it stood after 30 s"
+    fi
+  fi
+  (( code != 0 )) || write_receipt || echo "no receipt: writing it failed"
   exit_file_verdict "$code"
   release_gate_lock
 }
@@ -211,6 +266,23 @@ acquire_gate_lock "$GATE_LOCK" || exit 1
 exit_file_running
 trap on_exit EXIT
 export CUBA_GATE_LOCK_OWNER="$GATE_OWNER"
+
+# Whatever this commit's earlier receipt said, this run is its verdict now: a
+# red run on it takes it away, and a green one writes it again. A dirty start
+# judges no commit, so it leaves every receipt alone.
+GATE_START_HEAD="$(git -C "$ROOT" rev-parse --verify -q HEAD 2>/dev/null || true)"
+if [[ -z "$GATE_START_HEAD" ]]; then
+  GATE_NO_RECEIPT="$ROOT has no commit git can name, so a pass here is not a pass of any commit"
+elif ! gate_start_status="$(git -C "$ROOT" status --porcelain)" || [[ -n "$gate_start_status" ]]; then
+  GATE_NO_RECEIPT="the working tree was not clean when the gate started, so what it judges is not $GATE_START_HEAD"
+else
+  rm -f "$GATE_RECEIPTS/$GATE_START_HEAD"
+fi
+mkdir -p "$(dirname "$GATE_LOG")"
+exec 3>&1 4>&2
+exec > >(tee "$GATE_LOG") 2>&1
+GATE_TEE=$!
+[[ -z "$GATE_NO_RECEIPT" ]] || echo "note: this run will leave no receipt for scripts/release.sh: $GATE_NO_RECEIPT"
 
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  CUBA-MEMORYS MERGE GATE (local CI — sole merge judge)   ║"
@@ -255,6 +327,10 @@ echo "                         created before and dropped after. Your real corpu
 echo "                         is never a test fixture."
 echo "  · the eval step        reads the REAL database, because a smoke run against"
 echo "                         an empty corpus would prove nothing. Read-only."
+echo "  · its own verdict      ~/.cache/cuba-gate/merge-gate.log, and on a green"
+echo "                         run over a clean tree receipts/<sha> next to it,"
+echo "                         which scripts/release.sh tags from instead of"
+echo "                         running this gate a second time."
 echo ""
 
 export DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
