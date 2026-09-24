@@ -139,14 +139,81 @@ pub fn app_role_password() -> Option<String> {
     Some(password)
 }
 
+/// The URL the daemon steps down to: the admin's, as the application role with
+/// the pgpass_app password, built as `secure` builds the line it prints. With
+/// no pgpass_app it is the admin URL itself, which create_pool reads as «stay
+/// on the admin connection». This used to cut the admin URL at its first `@`
+/// and splice the password in raw, so an `@` in the admin's password or any
+/// `/`, `@` or `%` in pgpass_app sent the daemon somewhere else, and an admin
+/// URL without credentials never stepped down at all.
 pub fn runtime_database_url(admin_url: &str) -> String {
-    let Some(password) = app_role_password() else {
-        return admin_url.to_string();
+    match app_role_password() {
+        Some(password) => derive_app_url(admin_url, &password),
+        None => admin_url.to_string(),
+    }
+}
+
+/// Credentials percent-encoded for a URL. The RFC 3986 unreserved characters
+/// pass as they are, so a hex password prints unchanged; every other byte is
+/// escaped. Unescaped, `/` ended the credentials for every client, `%41` was
+/// read as `A`, and `@` split differently in sqlx (last `@`) and libpq (first
+/// `@`), so the line that worked in the daemon failed in psql.
+fn percent_encoded(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// The admin URL with the application role and its password in place of the
+/// admin's credentials, and nothing else changed: host, port, database and
+/// query stay as the operator wrote them. `secure` prints it and the daemon
+/// steps down to it (runtime_database_url): one function, so the two cannot
+/// disagree about where cuba_app logs in.
+///
+/// The authority ends at the first `/`, `?` or `#` and its credentials at the
+/// LAST `@` inside it, which is how sqlx (the `url` crate) read the admin URL
+/// both of them connected with. A `user=` or `password=` in the query is
+/// dropped: both clients let it override the authority. With no host (a Unix
+/// socket named by `?host=`), the credentials go in the query, because sqlx
+/// refuses credentials in front of an empty host. This used to split at the
+/// first `@` and, with no `@` at all, print 127.0.0.1:5488/brain whatever the
+/// admin had.
+pub(crate) fn derive_app_url(admin_url: &str, password: &str) -> String {
+    let role = percent_encoded(crate::db::APP_ROLE);
+    let password = percent_encoded(password);
+    let Some((scheme, rest)) = admin_url.split_once("://") else {
+        return format!("postgresql://{role}:{password}@127.0.0.1:5488/brain");
     };
-    let Some(tail) = admin_url.split('@').nth(1) else {
-        return admin_url.to_string();
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path_and_query) = rest.split_at(authority_end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (path, query) = path_and_query
+        .split_once('?')
+        .unwrap_or((path_and_query, ""));
+    let mut params: Vec<String> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| !matches!(pair.split('=').next(), Some("user" | "password")))
+        .map(str::to_owned)
+        .collect();
+    if host.is_empty() {
+        params.extend([format!("user={role}"), format!("password={password}")]);
+        return format!("{scheme}://{path}?{}", params.join("&"));
+    }
+    let query = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
     };
-    format!("postgresql://{}:{password}@{tail}", crate::db::APP_ROLE)
+    format!("{scheme}://{role}:{password}@{host}{path}{query}")
 }
 
 pub fn listen_address() -> String {

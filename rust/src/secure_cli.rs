@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 
+use crate::setup::derive_app_url;
+
 const CREATE_APP_ROLE_SQL: &str = include_str!("../embed/create-app-role.sql");
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,7 +66,8 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
                      \x20 - si no existe, CREATE ROLE cuba_app LOGIN NOSUPERUSER NOCREATEDB\n\
                      \x20   NOCREATEROLE NOBYPASSRLS, con la contraseña aleatoria que el daemon\n\
                      \x20   lee de ~/.cache/memory-industry/pgpass_app (la genera si falta);\n\
-                     \x20   si existe, le reimpone esos atributos sin cambiar la contraseña.\n\
+                     \x20   si existe, le reimpone esos atributos, y su contraseña queda esa\n\
+                     \x20   misma: se la pone la migración, que corre antes como admin.\n\
                      \x20 - GRANT USAGE en el schema public; SELECT, INSERT, UPDATE, DELETE en\n\
                      \x20   todas sus tablas; USAGE, SELECT en sus secuencias; EXECUTE en sus\n\
                      \x20   funciones. Ni DDL ni ownership.\n\
@@ -82,7 +85,10 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     }
 
     let admin_url = crate::setup::resolve_database_url().await;
-    let pool = crate::db::create_pool(&admin_url)
+    // Not create_pool: once cuba_app logs in, that one hands back cuba_app's
+    // pool, and this command then refused itself as not superuser on every
+    // install it had already secured.
+    let pool = crate::db::create_admin_pool(&admin_url)
         .await
         .context("conectando como admin para crear el rol de app")?;
 
@@ -115,34 +121,6 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     println!("Las migraciones ya corrieron como admin; el runtime como cuba_app no las necesita.");
     println!("Verificá con: memory-industry doctor");
     Ok(())
-}
-
-/// Credentials percent-encoded for a URL. The RFC 3986 unreserved characters
-/// pass as they are, so a hex password prints unchanged; every other byte is
-/// escaped. Unescaped, `/` ended the credentials for every client, `%41` was
-/// read as `A`, and `@` split differently in sqlx (last `@`) and libpq (first
-/// `@`), so the line that worked in the daemon failed in psql.
-fn percent_encoded(text: &str) -> String {
-    text.bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-                char::from(b).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
-}
-
-fn derive_app_url(admin_url: &str, password: &str) -> String {
-    let role = percent_encoded(crate::db::APP_ROLE);
-    let password = percent_encoded(password);
-    if let Some((scheme, rest)) = admin_url.split_once("://")
-        && let Some((_creds, host)) = rest.split_once('@')
-    {
-        return format!("{scheme}://{role}:{password}@{host}");
-    }
-    format!("postgresql://{role}:{password}@127.0.0.1:5488/brain")
 }
 
 #[cfg(test)]

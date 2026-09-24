@@ -27,6 +27,16 @@ versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI
 - **`handshake_timeout` has a test**, one row per input, including the three that read like accidents: `00` is a zero wait that fires the watchdog at once, only the literal `0` is off, and a value that does not parse turns the watchdog off instead of keeping the 60 s default.
 - **The reranker's test home is unique per fixture.** `FakeHome` named its directory after the process id, which every test in the binary shares, so two with one tag shared a directory and the `Drop` of one deleted the other's model.
 
+### Fixed
+
+- **`secure` runs again on an install it already secured — and, in practice, on any install.** It connected through `db::create_pool`, which migrates, gives `cuba_app` the `pgpass_app` password and then steps down to `cuba_app` whenever that role logs in. Migration 0041 creates `cuba_app` on every server that migrates, so the pool `secure` got back was `cuba_app`'s and it refused itself with «tiene que correr como un rol admin». It now uses `db::create_admin_pool`: the same connection and migrations, never stepped down. Running it twice reports the role as already existing and prints a URL that still logs in with `pgpass_app`.
+- **The URL `secure` prints lands where the admin URL did, whatever its form.** With no credentials in the admin URL (`postgres://localhost:5432/brain`, a Unix socket in `?host=`) it printed `127.0.0.1:5488/brain`, another server and another database. It also split the admin's credentials at the first `@` where sqlx splits at the last, and kept a `user=`/`password=` in the query that both clients let override the new credentials. Host, port, database and query are now kept as written; only who logs in changes. With no host, the credentials go in the query, since sqlx refuses them in front of an empty host.
+
+### Hardened
+
+- **The rotation of the application role's password is watched.** Replacing `provision_app_role`, `write_app_role_password` or `bind_app_role` with a no-op left every test green. `provision_app_role` now takes the role and the password, so a test hands it a throwaway role and requires the new password to open and the old one not to; the daemon still passes `cuba_app` and `pgpass_app`.
+- **The daemon's step-down URL is derived the same way.** `setup::runtime_database_url` split the admin's credentials at the first `@` and did not encode the password; it now calls the same `derive_app_url` that `secure` prints, which moved to `setup.rs`.
+
 ## [0.27.0] — 2026-09-23 (Cargo `0.27.0` · npm `0.27.0` · PyPI `1.29.0`)
 
 ### Behaviour changes — read before deploying

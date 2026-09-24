@@ -17,26 +17,41 @@ fn connect_options(database_url: &str) -> Result<PgConnectOptions> {
 
 pub const APP_ROLE: &str = "cuba_app";
 
-async fn provision_app_role(pool: &PgPool) {
-    let Some(password) = crate::setup::app_role_password() else {
-        return;
-    };
-    let exists: Option<(bool,)> =
-        sqlx::query_as("SELECT true FROM pg_roles WHERE rolname = $1 LIMIT 1")
-            .bind(APP_ROLE)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
+/// Gives `role` the password `password` when the role exists; one that does
+/// not is left for `secure` to create. A failure is logged, not returned: the
+/// daemon still runs, on the admin connection.
+///
+/// The role comes in by name so a test can hand it one of its own: roles
+/// belong to the whole server, and APP_ROLE is the one the user's daemon logs
+/// in as. init_schema passes APP_ROLE and the password in pgpass_app.
+///
+/// sqlx::Executor's own method for the lookup, as in write_app_role_password:
+/// with the role borrowed instead of 'static, the query type's generic async fn
+/// is the shape that left create_pool's future !Send (v043 spawns it).
+pub async fn provision_app_role(pool: &PgPool, role: &str, password: &str) {
+    let lookup = sqlx::query("SELECT 1 FROM pg_roles WHERE rolname = $1").bind(role);
+    let exists = sqlx::Executor::fetch_optional(pool, lookup)
+        .await
+        .ok()
+        .flatten();
     if exists.is_none() {
         return;
     }
 
-    match write_app_role_password(pool, APP_ROLE, &password).await {
-        Ok(()) => tracing::info!(role = APP_ROLE, "application role provisioned"),
+    match write_app_role_password(pool, role, password).await {
+        Ok(()) => tracing::info!(role, "application role provisioned"),
         Err(why) => {
             tracing::warn!(error = %why, "could not set the application role password")
         }
+    }
+}
+
+/// APP_ROLE onto the password in this machine's pgpass_app, the one the daemon
+/// is about to log in with. With no home to keep pgpass_app in there is none,
+/// and the role is left as it is.
+async fn provision_app_role_from_pgpass(pool: &PgPool) {
+    if let Some(password) = crate::setup::app_role_password() {
+        provision_app_role(pool, APP_ROLE, &password).await;
     }
 }
 
@@ -168,6 +183,22 @@ fn pool_options() -> PgPoolOptions {
 }
 
 pub async fn create_pool(database_url: &str) -> Result<PgPool> {
+    let pool = create_admin_pool(database_url).await?;
+
+    match downgrade_to_app_role(database_url).await {
+        Some(app_pool) => {
+            pool.close().await;
+            Ok(app_pool)
+        }
+        None => Ok(pool),
+    }
+}
+
+/// The connection `database_url` names, migrated, and never stepped down to
+/// the application role. `secure` needs it: it creates and alters that role,
+/// so it has to stay superuser, and create_pool hands back cuba_app's pool as
+/// soon as cuba_app logs in.
+pub async fn create_admin_pool(database_url: &str) -> Result<PgPool> {
     let pool = pool_options()
         .min_connections(1)
         .connect_with(connect_options(database_url)?)
@@ -177,14 +208,7 @@ pub async fn create_pool(database_url: &str) -> Result<PgPool> {
     tracing::info!("connected to PostgreSQL");
 
     init_schema(&pool).await?;
-
-    match downgrade_to_app_role(database_url).await {
-        Some(app_pool) => {
-            pool.close().await;
-            Ok(app_pool)
-        }
-        None => Ok(pool),
-    }
+    Ok(pool)
 }
 
 async fn downgrade_to_app_role(admin_url: &str) -> Option<PgPool> {
@@ -299,7 +323,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
         migrate.await.context("failed to run sqlx migrations")?;
 
         tracing::info!("sqlx migrations applied");
-        provision_app_role(pool).await;
+        provision_app_role_from_pgpass(pool).await;
     }
 
     sqlx::query("SET timezone TO 'UTC'")
