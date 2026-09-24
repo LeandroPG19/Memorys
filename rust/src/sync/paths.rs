@@ -138,6 +138,32 @@ fn for_containment(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// `path` without `.` or `..`, with the part of it that exists read back from
+/// the filesystem — symlinks, the case Windows stores, macOS's `/var` that is
+/// `/private/var` — and without the Windows verbatim prefix. `path` is expected
+/// absolute.
+///
+/// `pub(crate)` for `hooks_cli`: whether the sync directory is inside the repo
+/// is a comparison of two paths, and it only means something once both are
+/// spelled the same way. The part that does not exist yet stays as written:
+/// `hook install` runs before the first export has created the directory.
+pub(crate) fn real_path(path: &Path) -> PathBuf {
+    let lexical = lexical_join(Path::new(""), path);
+    let mut missing = Vec::new();
+    let mut existing = lexical.as_path();
+    while let (false, Some(parent), Some(name)) =
+        (existing.exists(), existing.parent(), existing.file_name())
+    {
+        missing.push(name);
+        existing = parent;
+    }
+    let mut real = existing
+        .canonicalize()
+        .map_or_else(|_| existing.to_path_buf(), |p| for_containment(&p));
+    real.extend(missing.iter().rev());
+    real
+}
+
 fn lexical_join(root: &Path, candidate: &Path) -> PathBuf {
     use std::path::Component;
 

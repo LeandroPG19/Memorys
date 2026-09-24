@@ -19,7 +19,8 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
                     other => anyhow::bail!("unknown hook install flag: {other} (try --help)"),
                 }
             }
-            install(with_codegraph)
+            print!("{}", install(with_codegraph)?);
+            Ok(())
         }
         Some("uninstall") => uninstall(),
         Some("merge-driver") => merge_driver(&args[1..]),
@@ -28,11 +29,13 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
                 "usage: memory-industry hook <install|uninstall> [--with-codegraph]\n\n\
                  Wires this repo's git so the knowledge graph stays in sync automatically.\n\
                  It lives in .memory-industry/, or in .cuba-memorys/ on a repo that already\n\
-                 has that older directory; $CUBA_SYNC_DIR overrides both:\n\
+                 has that older directory; $CUBA_SYNC_DIR overrides both, and install\n\
+                 writes the directory it resolves into the hooks:\n\
                  \x20 - post-commit  runs `sync export` after every commit\n\
                  \x20 - post-checkout runs `sync import` after checkout/branch switch\n\
                  \x20 - a git merge driver that unions observations/relations/entities\n\
-                 \x20   by id instead of leaving conflict markers in graph JSON\n\n\
+                 \x20   by id instead of leaving conflict markers in graph JSON. Only for a\n\
+                 \x20   directory inside this repo: git never merges anything outside it\n\n\
                  --with-codegraph also runs `codegraph build` (rust,python) after every\n\
                  commit, so the code graph stays current the way sync keeps memory current.\n\
                  Off by default — it re-parses the whole tree, which is not free on a large repo.\n\n\
@@ -101,6 +104,27 @@ fn append_hook_block(path: &Path, block: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Leaves `block` as install's one block in the hook at `path`, replacing the
+/// one an earlier install left. `append_hook_block` alone kept the first block
+/// for ever, and the block now fixes CUBA_SYNC_DIR: a reinstall that moved the
+/// `.gitattributes` line and not the hook would export where nothing guards.
+fn put_hook_block(path: &Path, block: &str) -> Result<&'static str> {
+    if read_existing_or_empty(path)?.contains(block) {
+        return Ok("already present");
+    }
+    let replaced = remove_hook_block(path)?;
+    append_hook_block(path, block)?;
+    Ok(if replaced { "updated" } else { "installed" })
+}
+
+/// `value` as one `sh` word: inside single quotes nothing is special except
+/// the single quote itself, which closes, is escaped, and reopens.
+fn sh_quote(value: &str) -> String {
+    // `'\u{27}'` is `'\''`, spelled so lizard's Rust reader does not take it for
+    // a lifetime (sync/paths.rs::slug).
+    format!("'{}'", value.replace('\u{27}', "'\\''"))
+}
+
 #[cfg(unix)]
 fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -126,48 +150,100 @@ fn set_executable(_path: &Path) -> Result<()> {
 /// `installed` all the same, and the first time two machines reconciled one
 /// graph it was resolved as text over JSON.
 ///
-/// The pattern is made relative to the root because that is what git reads a
-/// `.gitattributes` pattern against, and `default_sync_dir` hands back a path
-/// under the root: leaving it absolute would trade this defect for a pattern
-/// that matches nothing at all. A configured root outside the repo has no
-/// relative form and is left exactly as it was — it cannot be covered from here
-/// either way, which is a separate question and not this one.
-fn gitattributes_line(root: &Path, configured_sync_root: Option<&Path>) -> String {
-    let dir = match configured_sync_root {
-        Some(configured) => configured.to_path_buf(),
-        None => paths::default_sync_dir(root),
+/// git reads a pattern only one way: from the top of the work tree, directories
+/// joined with `/`, no `.` and no `..`. Measured with `git check-attr`, every
+/// other spelling of the right directory — absolute, `./dir`, `x/../dir`,
+/// `data\sync` from `Path::display` on Windows — is `merge: unspecified`, and
+/// `install` used to write each of them as given and print `added`. So both
+/// sides are resolved first (a relative CUBA_SYNC_DIR against the repo root,
+/// which is where the hook runs it, not against wherever `install` was typed)
+/// and the pattern is rebuilt from the components between them.
+///
+/// A directory outside the repo has no pattern at all: git merges only files
+/// in its own work tree. That answer is `Outside`, for `install` to say so,
+/// rather than a line that looks like protection and matches nothing.
+fn gitattributes_line(root: &Path, configured_sync_root: Option<&Path>) -> AttributeLine {
+    let root = paths::real_path(root);
+    let dir = sync_dir_for(&root, configured_sync_root);
+    let Ok(relative) = dir.strip_prefix(&root) else {
+        return AttributeLine::Outside(dir);
     };
-    let pattern = dir.strip_prefix(root).unwrap_or(&dir);
-    format!("{}/** merge={MERGE_DRIVER_NAME}", pattern.display())
+    let relative: Vec<_> = relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    AttributeLine::Inside(format!(
+        "{} merge={MERGE_DRIVER_NAME}",
+        attribute_pattern(&relative.join("/"))
+    ))
 }
 
-fn append_gitattributes_line(root: &Path, line: &str) -> Result<bool> {
+#[derive(Debug, PartialEq)]
+enum AttributeLine {
+    /// The whole `.gitattributes` line.
+    Inside(String),
+    /// Where sync writes, resolved, for the message.
+    Outside(PathBuf),
+}
+
+/// The directory `sync` will write to, as `sync::paths` resolves it, spelled
+/// the way the filesystem spells it. `root` is the repo root; a relative
+/// configured directory hangs from it, an absolute one replaces it.
+fn sync_dir_for(root: &Path, configured_sync_root: Option<&Path>) -> PathBuf {
+    let root = paths::real_path(root);
+    match configured_sync_root {
+        Some(configured) => paths::real_path(&root.join(configured)),
+        None => paths::real_path(&paths::default_sync_dir(&root)),
+    }
+}
+
+/// `<dir>/**`, quoted in the C style git accepts when `dir` holds whitespace or
+/// a double quote: whitespace ends a pattern, so `it's a dir/**` bare is the
+/// pattern `it's` and two attributes git refuses. Everything else stays bare,
+/// which is the one spelling every git version reads.
+fn attribute_pattern(dir: &str) -> String {
+    // `'\u{22}'` is the double quote and `'\u{5c}'` the backslash, spelled with
+    // escapes because lizard's Rust reader misreads quote characters in char
+    // literals and then measures nothing to the next one (sync/paths.rs::slug).
+    if !dir.contains(|c: char| c.is_whitespace() || c == '\u{22}') {
+        return format!("{dir}/**");
+    }
+    let escaped = dir.replace('\u{5c}', "\\\\").replace('\u{22}', "\\\"");
+    format!("\"{escaped}/**\"")
+}
+
+/// A line some `install` wrote, in any shape it has ever written: a bare
+/// `<dir>/**` or a quoted one, absolute, `./`-prefixed or right.
+fn is_driver_line(line: &str) -> bool {
+    line.trim()
+        .strip_suffix(&format!(" merge={MERGE_DRIVER_NAME}"))
+        .is_some_and(|pattern| pattern.ends_with("/**") || pattern.ends_with("/**\""))
+}
+
+/// Leaves `line` as the one merge-driver line in `.gitattributes`. Earlier
+/// installs wrote their lines in shapes git cannot match and never took them
+/// back, so they piled up one per install, each reading like a guard; they go,
+/// and every line that is not the driver's stays where it was.
+fn write_gitattributes_line(root: &Path, line: &str) -> Result<bool> {
     let path = root.join(".gitattributes");
     let existing = read_existing_or_empty(&path)?;
-    if existing.lines().any(|l| l.trim() == line.trim()) {
+    let (driver, other): (Vec<&str>, Vec<&str>) = existing.lines().partition(|l| is_driver_line(l));
+    if driver == [line] {
         return Ok(false);
     }
-    let mut body = existing;
-    if !body.is_empty() && !body.ends_with('\n') {
-        body.push('\n');
-    }
-    body.push_str(line);
-    body.push('\n');
-    std::fs::write(&path, body).with_context(|| format!("writing {path:?}"))?;
+    let lines: Vec<&str> = other.into_iter().chain([line]).collect();
+    std::fs::write(&path, format!("{}\n", lines.join("\n")))
+        .with_context(|| format!("writing {path:?}"))?;
     Ok(true)
 }
 
 fn remove_gitattributes_line(root: &Path) -> Result<bool> {
-    let attr_suffix = format!("/** merge={MERGE_DRIVER_NAME}");
     let path = root.join(".gitattributes");
     if !path.exists() {
         return Ok(false);
     }
     let existing = read_existing_or_empty(&path)?;
-    let filtered: Vec<&str> = existing
-        .lines()
-        .filter(|l| !l.trim().ends_with(&attr_suffix))
-        .collect();
+    let filtered: Vec<&str> = existing.lines().filter(|l| !is_driver_line(l)).collect();
     let changed = filtered.len() != existing.lines().count();
     if changed {
         if filtered.is_empty() {
@@ -192,97 +268,110 @@ fn git_config(root: &Path, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn install(with_codegraph: bool) -> Result<()> {
+/// Installs the hooks and the merge driver in the repo git finds from here,
+/// and returns the report for the person who ran it.
+fn install(with_codegraph: bool) -> Result<String> {
     let root = git_root()?;
     let hooks = hooks_dir(&root);
     std::fs::create_dir_all(&hooks).context("creating hooks dir")?;
 
     let exe = std::env::current_exe().context("resolving path to this binary")?;
     let exe = exe.display();
+    let configured = paths::configured_root();
 
+    // The hook fixes CUBA_SYNC_DIR to what it resolves to now. It used to read
+    // it from whatever environment ran the commit, and that is not the shell
+    // `install` ran in: an IDE, a GUI client or a cron job each bring their own,
+    // so the same commit exported to one directory from the terminal and to
+    // another (or to the default) from the editor — while the `.gitattributes`
+    // line, written once here, guards only the first.
+    let pin_sync_dir = format!(
+        "CUBA_SYNC_DIR={}; export CUBA_SYNC_DIR",
+        sh_quote(&sync_dir_for(&root, configured.as_deref()).to_string_lossy())
+    );
     let resolve_url_sh = "db_url=$(git config --local --get cuba-memorys.database-url 2>/dev/null || true); [ -z \"$db_url\" ] && db_url=\"$DATABASE_URL\"";
-    let codegraph_line = if with_codegraph {
-        format!(
-            " DATABASE_URL=\"$db_url\" \"{exe}\" codegraph build --lang rust,python >/dev/null 2>&1 || true\n"
+    let (codegraph_line, codegraph_state) = if with_codegraph {
+        (
+            format!(
+                " DATABASE_URL=\"$db_url\" \"{exe}\" codegraph build --lang rust,python >/dev/null 2>&1 || true\n"
+            ),
+            "enabled",
         )
     } else {
-        String::new()
+        (String::new(), "disabled (pass --with-codegraph to enable)")
     };
     let post_commit_block = format!(
         "{MARKER}\n\
+         {pin_sync_dir}\n\
          {resolve_url_sh}\n\
          if [ -n \"$db_url\" ]; then\n\
          \x20 DATABASE_URL=\"$db_url\" \"{exe}\" sync export --scope all >/dev/null 2>&1 || true\n\
          {codegraph_line}\
          fi\n"
     );
-    let commit_changed = append_hook_block(&hooks.join("post-commit"), &post_commit_block)?;
+    let commit_state = put_hook_block(&hooks.join("post-commit"), &post_commit_block)?;
 
     let post_checkout_block = format!(
         "{MARKER}\n\
+         {pin_sync_dir}\n\
          {resolve_url_sh}\n\
          if [ -n \"$db_url\" ]; then\n\
          \x20 DATABASE_URL=\"$db_url\" \"{exe}\" sync import --conflict merge >/dev/null 2>&1 || true\n\
          fi\n"
     );
-    let checkout_changed = append_hook_block(&hooks.join("post-checkout"), &post_checkout_block)?;
+    let checkout_state = put_hook_block(&hooks.join("post-checkout"), &post_checkout_block)?;
 
-    git_config(
+    let driver_report = wire_merge_driver(
         &root,
-        &format!("merge.{MERGE_DRIVER_NAME}.name"),
-        "cuba-memorys structural merge (union by id)",
-    )?;
-    git_config(
-        &root,
-        &format!("merge.{MERGE_DRIVER_NAME}.driver"),
         &format!("\"{exe}\" hook merge-driver %O %A %B %P"),
+        gitattributes_line(&root, configured.as_deref()),
     )?;
 
-    let attr_line = gitattributes_line(&root, paths::configured_root().as_deref());
-    let attrs_changed = append_gitattributes_line(&root, &attr_line)?;
-
-    println!(
-        "post-commit hook:   {}",
-        if commit_changed {
-            "installed"
-        } else {
-            "already present"
-        }
-    );
-    println!(
-        "post-checkout hook: {}",
-        if checkout_changed {
-            "installed"
-        } else {
-            "already present"
-        }
-    );
-    println!("merge driver:       configured (merge.{MERGE_DRIVER_NAME}.driver in .git/config)");
-    println!(
-        ".gitattributes:     {}",
-        if attrs_changed {
-            format!("added `{attr_line}`")
-        } else {
-            "already present".to_string()
-        }
-    );
-    println!(
-        "codegraph on commit: {}",
-        if with_codegraph {
-            "enabled"
-        } else {
-            "disabled (pass --with-codegraph to enable)"
-        }
-    );
-    println!(
-        "\nNOTE: both hooks are a no-op until this repo's database is set explicitly.\n\
+    Ok(format!(
+        "post-commit hook:   {commit_state}\n\
+         post-checkout hook: {checkout_state}\n\
+         {driver_report}\
+         codegraph on commit: {codegraph_state}\n\
+         \n\
+         NOTE: both hooks are a no-op until this repo's database is set explicitly.\n\
          They deliberately do NOT fall back to auto-detecting a running container —\n\
          on a machine with more than one MemoryIndustry database, that guess can export\n\
          from, or import into, the wrong one. Set it once, it persists in .git/config:\n\
          \x20 git config --local cuba-memorys.database-url \"postgresql://...\"\n\
-         (DATABASE_URL in the environment also works as a fallback.)"
-    );
-    Ok(())
+         (DATABASE_URL in the environment also works as a fallback.)\n"
+    ))
+}
+
+/// The merge driver's half of `install`: the driver in `.git/config` and the
+/// `.gitattributes` line that hands it the sync files, or — when the sync
+/// directory is outside the repo, where git never merges — neither, and the
+/// report says why.
+fn wire_merge_driver(root: &Path, driver: &str, line: AttributeLine) -> Result<String> {
+    let line = match line {
+        AttributeLine::Inside(line) => line,
+        AttributeLine::Outside(dir) => {
+            return Ok(format!(
+                "merge driver:       not configured (nothing in this repo for it to merge)\n\
+                 .gitattributes:     skipped — {} is outside this repo; git never merges it\n",
+                dir.display()
+            ));
+        }
+    };
+    git_config(
+        root,
+        &format!("merge.{MERGE_DRIVER_NAME}.name"),
+        "cuba-memorys structural merge (union by id)",
+    )?;
+    git_config(root, &format!("merge.{MERGE_DRIVER_NAME}.driver"), driver)?;
+    let attributes = if write_gitattributes_line(root, &line)? {
+        format!("added `{line}`")
+    } else {
+        "already present".to_string()
+    };
+    Ok(format!(
+        "merge driver:       configured (merge.{MERGE_DRIVER_NAME}.driver in .git/config)\n\
+         .gitattributes:     {attributes}\n"
+    ))
 }
 
 fn remove_hook_block(path: &Path) -> Result<bool> {
@@ -380,14 +469,18 @@ fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// git's merge driver for the sync files. Exit 0 tells git the file merged
+/// cleanly and that %A holds the result; so every path that ends without a
+/// merge written over %A is an error, and git leaves the file conflicted for a
+/// person to resolve. Returning 0 there, as this did, handed git ours as the
+/// merge: theirs was dropped with no conflict and nothing to say so.
 fn merge_driver(args: &[String]) -> Result<()> {
     let [_ancestor, ours, theirs, path] = args else {
         anyhow::bail!("usage: hook merge-driver %O %A %B %P (git passes these itself)");
     };
 
-    // No merge for this path: exit 0 without writing, so git keeps ours.
     let Some(kind) = sync_file_kind(path) else {
-        return Ok(());
+        anyhow::bail!("{path} is not a file `sync export` writes; left to git as a conflict");
     };
     let merge: fn(&str, &str) -> Result<Option<Vec<u8>>> = match kind {
         SyncFile::Entity => merge_entity_file,
@@ -397,12 +490,14 @@ fn merge_driver(args: &[String]) -> Result<()> {
         SyncFile::Error => merge_error_file,
         SyncFile::Decision => merge_decision_file,
     };
-    if let Some(bytes) = merge(ours, theirs)? {
-        std::fs::write(ours, bytes).with_context(|| format!("writing merged {ours}"))?;
-    }
+    let Some(bytes) = merge(ours, theirs)? else {
+        anyhow::bail!("{path}: one side does not read as {kind:?} JSON; left to git as a conflict");
+    };
+    std::fs::write(ours, bytes).with_context(|| format!("writing merged {ours}"))?;
     Ok(())
 }
 
+#[derive(Debug)]
 enum SyncFile {
     Entity,
     Relations,
@@ -412,38 +507,33 @@ enum SyncFile {
     Decision,
 }
 
-/// Which sync file git's `%P` names, by the rule `merge_driver` has always
-/// applied: the first row that fits wins, compared lowercased.
+/// Which sync file git's `%P` names, read from its last components — the
+/// layout `sync export` writes under its root — and nothing in front of them.
 ///
-/// It used to be an `if` over `a || b && c` and five `else if`. `&&` binds
-/// tighter, so that read `a || (b && c)` — and since `/entities/` contains
-/// `entities`, the other grouping would have answered the same; the
-/// parentheses below say which one is meant, they do not change a row.
-///
-/// The rows are substring tests on the whole path, not on its components, and
-/// `merge_driver_picks_the_same_merge_for_every_path_shape` pins what follows
-/// from that, the odd rows included: only the entity row has a half that does
-/// without a leading `/`, so at a sync root that is the repository root
-/// `episodes/`, `errors/` and `decisions/` get no merge; and a root whose path
-/// says `entities` sends `relations.json` and `projects.json` to the entity
-/// merge. Both end with git keeping ours and dropping theirs without a
-/// conflict marker. They are left as they were on purpose: this split moved
-/// the decision and must not change it.
+/// `%P` is the path from the top of the work tree, so the sync root's own path
+/// comes first: nothing at all when the root is the repository root, anything
+/// CUBA_SYNC_DIR names otherwise. The rules used to be substrings of the whole
+/// path, and that is where both of their data losses came from: `/episodes/`
+/// with a slash in front never matched at a root with nothing in front of it,
+/// and a root whose path merely said `entities` sent `relations.json` and
+/// `projects.json` to the entity merge. Now the file name decides first, then
+/// the directory holding the file, then the one above it (an episode lives at
+/// `episodes/<YYYY-MM>/`). `/` is the only separator: git writes no other.
 fn sync_file_kind(path: &str) -> Option<SyncFile> {
     let path = path.to_lowercase();
-    [
-        (
-            SyncFile::Entity,
-            path.contains("/entities/") || (path.ends_with(".json") && path.contains("entities")),
-        ),
-        (SyncFile::Relations, path.ends_with("relations.json")),
-        (SyncFile::Projects, path.ends_with("projects.json")),
-        (SyncFile::Episode, path.contains("/episodes/")),
-        (SyncFile::Error, path.contains("/errors/")),
-        (SyncFile::Decision, path.contains("/decisions/")),
-    ]
-    .into_iter()
-    .find_map(|(kind, fits)| fits.then_some(kind))
+    let mut up = path.rsplit('/');
+    let name = up.next().unwrap_or_default();
+    let parent = up.next().unwrap_or_default();
+    let grandparent = up.next().unwrap_or_default();
+    match (name, parent, grandparent) {
+        ("relations.json", _, _) => Some(SyncFile::Relations),
+        ("projects.json", _, _) => Some(SyncFile::Projects),
+        (_, "entities", _) => Some(SyncFile::Entity),
+        (_, "errors", _) => Some(SyncFile::Error),
+        (_, "decisions", _) => Some(SyncFile::Decision),
+        (_, "episodes", _) | (_, _, "episodes") => Some(SyncFile::Episode),
+        _ => None,
+    }
 }
 
 fn merge_entity_file(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>>> {
@@ -1584,7 +1674,8 @@ mod tests {
     async fn install_writes_a_line_git_matches_for_every_spelling_of_a_sync_dir_in_the_repo() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         // (label, CUBA_SYNC_DIR for a given repo root, the directory git must see)
-        let cases: [(&str, fn(&Path) -> String, &str); 4] = [
+        type Case = (&'static str, fn(&Path) -> String, &'static str);
+        let cases: [Case; 4] = [
             (
                 "dot-slash",
                 |_: &Path| "./graph-sync".to_string(),

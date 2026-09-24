@@ -116,10 +116,9 @@ src/handlers/sync.rs::resolve_conflict:843 14
 src/handlers/sync.rs::validate_bundle:1659 36
 src/handlers/vigia.rs::health:100 12
 src/handlers/zafra.rs::handle:76 35
-src/hooks_cli.rs::install:195 14
-src/hooks_cli.rs::merge_episode_file:511 9
-src/hooks_cli.rs::remove_gitattributes_line:160 9
-src/hooks_cli.rs::remove_hook_block:288 9
+src/hooks_cli.rs::merge_episode_file:601 9
+src/hooks_cli.rs::remove_gitattributes_line:240 9
+src/hooks_cli.rs::remove_hook_block:377 9
 src/http.rs::dispatch_one:1194 12
 src/http.rs::mcp_endpoint:1053 13
 src/http.rs::serve_pool:191 11
