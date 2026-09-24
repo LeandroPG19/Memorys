@@ -85,7 +85,8 @@ async fn secure_runs_again_on_an_install_it_already_secured() {
         assert!(
             stdout.starts_with("Rol cuba_app ya existía"),
             "the second `secure` found cuba_app in place, so it has to say the role already \
-             existed and that its password was left alone. stdout:\n{stdout}"
+             existed and that its password is this machine's pgpass_app, set by the migration \
+             that ran first as admin. stdout:\n{stdout}"
         );
 
         let runtime = printed_runtime_url(&stdout).unwrap_or_else(|| {

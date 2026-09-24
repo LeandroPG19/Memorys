@@ -20,8 +20,8 @@ impl AppRole {
             }
             AppRole::AlreadyExisted => {
                 "Rol cuba_app ya existía: se le reimpusieron NOSUPERUSER y NOBYPASSRLS y los \
-                 permisos. secure no cambia su contraseña: la de pgpass_app se la pone el daemon \
-                 cuando arranca como admin y migra."
+                 permisos. Su contraseña queda la de pgpass_app de esta máquina: se la puso el \
+                 paso de migración, que corre antes como admin."
             }
         }
     }
@@ -129,7 +129,7 @@ mod tests {
 
     /// What `secure` prints first. The two sentences are not decoration: the
     /// second one is the only place an operator who re-runs `secure` on an
-    /// upgraded install is told that the password was left alone on purpose.
+    /// upgraded install is told which password the role ends up with.
     #[test]
     fn each_outcome_tells_the_operator_what_happened_to_the_role() {
         assert_eq!(
@@ -142,10 +142,10 @@ mod tests {
         assert_eq!(
             AppRole::AlreadyExisted.summary(),
             "Rol cuba_app ya existía: se le reimpusieron NOSUPERUSER y NOBYPASSRLS y los \
-             permisos. secure no cambia su contraseña: la de pgpass_app se la pone el daemon \
-             cuando arranca como admin y migra.",
-            "an existing role has to say its password was NOT changed: the daemon of an install \
-             that upgrades is connecting with the old one"
+             permisos. Su contraseña queda la de pgpass_app de esta máquina: se la puso el \
+             paso de migración, que corre antes como admin.",
+            "an existing role has to say its password is now this machine's pgpass_app, set by \
+             the migration that `secure` runs as admin first, not the one it had before"
         );
         assert_ne!(
             AppRole::Created.summary(),
