@@ -720,13 +720,7 @@ async fn export_into(
         &mut digest,
     )?;
 
-    if with_embeddings && !emb_blob.is_empty() {
-        let compressed = crate::sync::compressor::compress(&emb_blob)?;
-        let blob_path = root.join("embeddings.bin.zst");
-        ensure_within(&root, &blob_path)?;
-        std::fs::write(&blob_path, compressed)?;
-        digest.record(&root, &blob_path, &emb_blob);
-    }
+    publish_embeddings(&root, &emb_blob, &mut digest)?;
 
     let counts = Counts {
         entities: entity_files,
@@ -774,6 +768,27 @@ async fn export_into(
         "node_id": manifest.node_id,
         "warning": warning,
     }))
+}
+
+/// Writes `embeddings.bin.zst` from `blob`, or — when this export carries no
+/// vectors (`blob` is only filled with `with_embeddings`) — removes the one an
+/// earlier export left. That one describes another state of the database, and
+/// `recompute_digest` hashes every file in the directory, so the import read
+/// each such bundle as edited since export, for as long as the file stayed.
+fn publish_embeddings(root: &Path, blob: &[u8], digest: &mut BundleDigest) -> Result<()> {
+    let path = root.join("embeddings.bin.zst");
+    ensure_within(root, &path)?;
+    if blob.is_empty() {
+        return if path.exists() {
+            std::fs::remove_file(&path)
+                .context("removing an embeddings.bin.zst this export did not write")
+        } else {
+            Ok(())
+        };
+    }
+    std::fs::write(&path, crate::sync::compressor::compress(blob)?)?;
+    digest.record(root, &path, blob);
+    Ok(())
 }
 
 pub const OBSERVATION_TYPES: [&str; 9] = [

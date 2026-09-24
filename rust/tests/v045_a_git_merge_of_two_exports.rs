@@ -419,6 +419,7 @@ fn stub_the_hooks(scratch: &Scratch) -> PathBuf {
     make_executable(&stub);
 
     let spellings = [
+        installed_exe(scratch),
         BIN.to_string(),
         std::fs::canonicalize(BIN).unwrap().display().to_string(),
     ];
@@ -439,6 +440,31 @@ fn stub_the_hooks(scratch: &Scratch) -> PathBuf {
         std::fs::write(&path, stubbed).unwrap();
     }
     log
+}
+
+/// The path `install` wrote into the hooks, spelled as it wrote it. The hook
+/// lines and the merge driver both quote the same `current_exe().display()`,
+/// which on Windows is the loader's backslashed path and need not match `BIN`
+/// (cargo's own join of `CARGO_TARGET_DIR`) or its `\\?\` canonical form
+/// character for character. The driver entry is the one place git hands that
+/// spelling back, so the hooks are searched for it.
+fn installed_exe(scratch: &Scratch) -> String {
+    let driver = scratch.git_ok(&["config", "--local", "--get", "merge.cuba-memorys.driver"]);
+    let Some(exe) = driver
+        .trim_end()
+        .strip_suffix(" hook merge-driver %O %A %B %P")
+        .and_then(|quoted| quoted.strip_prefix('"'))
+        .and_then(|quoted| quoted.strip_suffix('"'))
+    else {
+        panic!("control: install wrote no \"<exe>\" hook merge-driver line: {driver}");
+    };
+    let exe = exe.to_string();
+    assert_eq!(
+        std::fs::canonicalize(&exe).ok(),
+        std::fs::canonicalize(BIN).ok(),
+        "control: install wired a binary other than the one under test ({exe} vs {BIN})"
+    );
+    exe
 }
 
 #[cfg(unix)]
@@ -484,7 +510,7 @@ fn a_merge_is_imported_before_anything_exports_over_it() {
     scratch.commit("base");
     assert_eq!(
         calls_since(&log),
-        [export.clone()],
+        std::slice::from_ref(&export),
         "control: a commit exports, and the stub hears it; without this the log says nothing"
     );
     let main = scratch.git_ok(&["rev-parse", "--abbrev-ref", "HEAD"]);
@@ -501,7 +527,7 @@ fn a_merge_is_imported_before_anything_exports_over_it() {
     scratch.git_ok(&["merge", "--quiet", "--no-edit", "clean"]);
     assert_eq!(
         calls_since(&log),
-        [import.clone()],
+        std::slice::from_ref(&import),
         "a clean `git merge` runs post-merge and neither post-commit nor post-checkout \
          (githooks(5): post-commit \"is invoked by git-commit\", post-merge \"is invoked by \
          git-merge\"). With no post-merge nothing brought the merged bundle into the database, \
