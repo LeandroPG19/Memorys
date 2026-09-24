@@ -197,12 +197,17 @@ self_test() {
   # fixture NAME DECLARED_UNVIABLE STATUS:LOG...: one Unviable record per
   # argument, whose log is written as LOG, or left missing when LOG is none.
   # Writes $tmp/NAME/outcomes.json, with its logs under $tmp/NAME/log/.
+  # The one caught mutant's Test phase ends with $caught_status, 101 unless a
+  # fixture sets it, and the file declares $caught_declared caught (1).
   fixture() {
     local dir="$tmp/$1" declared="$2" records spec status log n=0
+    local caught='{"Failure":101}' caught_total=1
+    [[ -n "${caught_status:-}" ]] && caught="$caught_status"
+    [[ -n "${caught_declared:-}" ]] && caught_total="$caught_declared"
     shift 2
     mkdir -p "$dir/log"
     records='{"scenario":"Baseline","summary":"Success","log_path":"log/baseline.log","phase_results":[{"phase":"Build","process_status":"Success"},{"phase":"Test","process_status":"Success"}]}'
-    records+=',{"scenario":{"Mutant":{"name":"src/search/rrf.rs:9:9: replace f -> u32 with 0"}},"summary":"CaughtMutant","log_path":"log/caught.log","phase_results":[{"phase":"Build","process_status":"Success"},{"phase":"Test","process_status":{"Failure":101}}]}'
+    records+=',{"scenario":{"Mutant":{"name":"src/search/rrf.rs:9:9: replace f -> u32 with 0"}},"summary":"CaughtMutant","log_path":"log/caught.log","phase_results":[{"phase":"Build","process_status":"Success"},{"phase":"Test","process_status":'"$caught"'}]}'
     for spec in "$@"; do
       n=$((n + 1))
       status="${spec%:*}"
@@ -210,8 +215,8 @@ self_test() {
       [[ "$log" == none ]] || write_log "$dir/log/m$n.log" "$log"
       records+=",{\"scenario\":{\"Mutant\":{\"name\":\"src/search/cache.rs:$n:1: replace g with h\"}},\"summary\":\"Unviable\",\"log_path\":\"log/m$n.log\",\"phase_results\":[{\"phase\":\"Build\",\"process_status\":$status}]}"
     done
-    printf '{"outcomes":[%s],"total_mutants":%d,"caught":1,"missed":0,"timeout":0,"unviable":%d,"success":0,"cargo_mutants_version":"27.1.0"}\n' \
-      "$records" $(( $# + 1 )) "$declared" > "$dir/outcomes.json"
+    printf '{"outcomes":[%s],"total_mutants":%d,"caught":%d,"missed":0,"timeout":0,"unviable":%d,"success":0,"cargo_mutants_version":"27.1.0"}\n' \
+      "$records" $(( $# + 1 )) "$caught_total" "$declared" > "$dir/outcomes.json"
   }
   judge() { rc=0; check_builds "$tmp/$1/outcomes.json" >"$tmp/out" 2>"$tmp/err" || rc=$?; }
 
@@ -268,9 +273,37 @@ self_test() {
   judge miscount
   (( rc != 0 )) || self_fail "unviable=3 over one Unviable record was accepted"
 
+  # The caught half. Every fixture above already holds one caught mutant
+  # whose tests failed with 101, and they pass: that is its presence anchor.
+  # A cargo that could not start its test run, as 44 builds could not on
+  # 2026-09-23: no test ran, and cargo-mutants still files it as caught.
+  caught_status='{"Failure":-1073741502}' fixture caught_ntstatus 0
+  judge caught_ntstatus
+  (( rc != 0 )) || self_fail "a caught mutant whose test run ended with 0xC0000142 was accepted"
+  grep -q 'stopped 1 of 1 caught' "$tmp/err" || self_fail "the refusal did not count the machine's catches: $(cat "$tmp/err")"
+  grep -q '0xC0000142' "$tmp/err" || self_fail "the refusal did not name the NTSTATUS: $(cat "$tmp/err")"
+
+  # A test process exits 0..255, whatever it does; 256 is not one of them.
+  caught_status='{"Failure":256}' fixture caught_range 0
+  judge caught_range
+  (( rc != 0 )) || self_fail "a caught mutant whose test run ended with Failure(256) was accepted"
+
+  # The one NTSTATUS that is the tests catching a mutant: it recursed without
+  # end and the test process died of it. Accepted, and said out loud.
+  caught_status='{"Failure":-1073741571}' fixture caught_overflow 0
+  judge caught_overflow
+  (( rc == 0 )) || self_fail "a caught mutant that overflowed its stack was refused: $(cat "$tmp/err")"
+  grep -q 'STATUS_STACK_OVERFLOW' "$tmp/out" || self_fail "the stack overflow was accepted in silence: $(cat "$tmp/out")"
+
+  # The file's caught total disagrees with its records.
+  caught_declared=2 fixture caught_miscount 0
+  judge caught_miscount
+  (( rc != 0 )) || self_fail "caught=2 over one CaughtMutant record was accepted"
+
   echo "OK  self-test: a build rustc refused with a diagnostic stays unviable; an NTSTATUS,"
   echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log"
-  echo "    and a file whose total disagrees with its records are refused"
+  echo "    and a file whose total disagrees with its records are refused; a caught mutant"
+  echo "    counts only when its test run exited 1..255, or overflowed its stack"
   exit 0
 }
 

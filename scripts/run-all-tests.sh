@@ -313,14 +313,22 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # past it instead of refusing its own parent. pg_isready, psql and cargo are
   # stand-ins: the first two let both scripts reach their first cargo call,
   # and the cargo one reports, from inside the child's work, whether the lock
-  # is still the one merge-gate.sh took. It then fails, which ends both.
-  mkdir -p "$tmp/home2" "$tmp/bin"
+  # is still the one merge-gate.sh took, and what the exit file says while the
+  # child works. It then fails, which ends both.
+  #
+  # The exit file starts at 0, as an earlier green gate would have left it.
+  # The child is only merge-gate.sh's first half, so it neither clears the
+  # file nor writes its own code into it: merge-gate.sh says "running" when
+  # it starts and writes the whole gate's verdict when it ends.
+  mkdir -p "$tmp/home2/.cache/cuba-gate" "$tmp/bin"
+  printf '0\n' >"$tmp/home2/.cache/cuba-gate/run.exit"
   printf '#!/bin/sh\nexit 0\n' >"$tmp/bin/pg_isready"
   printf '#!/bin/sh\nexit 1\n' >"$tmp/bin/psql"
   printf '%s\n' '#!/bin/sh' \
     'if [ -n "$CUBA_GATE_LOCK_OWNER" ] && [ "$(cat "$HOME/.cache/cuba-gate/lock/owner" 2>/dev/null)" = "$CUBA_GATE_LOCK_OWNER" ]; then' \
     '  echo "stand-in cargo: the lock is still the one merge-gate took"' \
     'fi' \
+    'echo "stand-in cargo: run.exit reads: $(cat "$HOME/.cache/cuba-gate/run.exit" 2>/dev/null)"' \
     'exit 1' >"$tmp/bin/cargo"
   chmod +x "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin/cargo"
   held_exit=0
@@ -340,12 +348,57 @@ if [[ "${1:-}" == "--self-test" ]]; then
   if grep -q "stopped naming this run" "$tmp/merge-held.out"; then
     self_fail "the lock was released or taken from under merge-gate while it ran: $(cat "$tmp/merge-held.out")"
   fi
+  grep -q "stand-in cargo: run.exit reads: running pid=[0-9]" "$tmp/merge-held.out" \
+    || self_fail "while run-all-tests.sh worked under merge-gate, the exit file did not say the gate was running: $(grep 'run.exit reads' "$tmp/merge-held.out")"
+  [[ "$(cat "$tmp/home2/.cache/cuba-gate/run.exit" 2>/dev/null)" == 1 ]] \
+    || self_fail "merge-gate exited 1 and its exit file says '$(cat "$tmp/home2/.cache/cuba-gate/run.exit" 2>/dev/null)'"
+
+  # The same script on its own takes the lock itself, so the exit file is its
+  # own: "running" while it works, its code when it ends.
+  mkdir -p "$tmp/home3/.cache/cuba-gate"
+  printf '0\n' >"$tmp/home3/.cache/cuba-gate/run.exit"
+  alone_exit=0
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home3" \
+      PATH="$tmp/bin:/usr/bin:/bin" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      "$BASH" "$ROOT/scripts/run-all-tests.sh" >"$tmp/alone.out" 2>&1 || alone_exit=$?
+  (( alone_exit == 1 )) || self_fail "run-all-tests.sh alone exited $alone_exit where the stand-in cargo fails it with 1: $(cat "$tmp/alone.out")"
+  grep -q "stand-in cargo: run.exit reads: running pid=[0-9]" "$tmp/alone.out" \
+    || self_fail "while run-all-tests.sh ran on its own, its exit file did not say so: $(grep 'run.exit reads' "$tmp/alone.out")"
+  [[ "$(cat "$tmp/home3/.cache/cuba-gate/run.exit" 2>/dev/null)" == 1 ]] \
+    || self_fail "run-all-tests.sh alone exited 1 and its exit file says '$(cat "$tmp/home3/.cache/cuba-gate/run.exit" 2>/dev/null)'"
+
+  # merge-gate.sh killed while its child works, the way memory pressure killed
+  # two gates on 2026-09-23. The child finishes on its own afterwards, and its
+  # exit must not write a verdict over "running": it only knows how the first
+  # half went. The stand-in cargo kills the gate named in the record the child
+  # inherited, leaves its own parent's pid (the child's) for the wait below,
+  # and fails.
+  mkdir -p "$tmp/home4/.cache/cuba-gate" "$tmp/bin4"
+  printf '0\n' >"$tmp/home4/.cache/cuba-gate/run.exit"
+  cp "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin4/"
+  printf '%s\n' '#!/bin/sh' \
+    'echo "$PPID" >"$HOME/child.pid"' \
+    'kill -9 "$(printf "%s\n" "$CUBA_GATE_LOCK_OWNER" | sed -n "s/^pid=\([0-9]*\) .*/\1/p")"' \
+    'exit 1' >"$tmp/bin4/cargo"
+  chmod +x "$tmp/bin4/cargo"
+  { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home4" \
+      PATH="$tmp/bin4:/usr/bin:/bin" SKIP_BACKUP=1 \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      "$BASH" "$ROOT/scripts/merge-gate.sh" >"$tmp/merge-killed.out" 2>&1 || true; } 2>/dev/null
+  child="$(cat "$tmp/home4/child.pid" 2>/dev/null || true)"
+  [[ -n "$child" ]] || self_fail "the stand-in cargo never ran under the killed gate: $(cat "$tmp/merge-killed.out")"
+  for _ in $(seq 100); do [[ -e "/proc/$child" ]] || break; sleep 0.1; done
+  [[ ! -e "/proc/$child" ]] || self_fail "the child of the killed gate was still running after 10 s"
+  [[ "$(cat "$tmp/home4/.cache/cuba-gate/run.exit" 2>/dev/null)" == "running pid="* ]] \
+    || self_fail "a gate killed while its child worked left '$(cat "$tmp/home4/.cache/cuba-gate/run.exit" 2>/dev/null)' in its exit file: the child wrote a verdict that was not its to write"
 
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
-  echo "    else; the run-all-tests.sh merge-gate launches works under its lock; a"
-  echo "    dead or reused-pid lock is taken over, a foreign one is not; an exit"
-  echo "    drops only the databases whose record is still its own"
+  echo "    else; the run-all-tests.sh merge-gate launches works under its lock and"
+  echo "    leaves the exit file to it; a dead or reused-pid lock is taken over, a"
+  echo "    foreign one is not; an exit drops only the databases whose record is"
+  echo "    still its own"
   exit 0
 fi
 

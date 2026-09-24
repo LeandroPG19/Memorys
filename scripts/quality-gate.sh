@@ -366,9 +366,134 @@ if [[ "${1:-}" == "--self-test" ]]; then
     exit 1
   fi
 
+  # Regenerating the baseline keeps the why of every entry. It used to write
+  # the file whole, and the 20 lines of reason and owner in it went with the
+  # old numbers. A copy of this script in a throwaway tree, over two tangled
+  # functions, regenerates a baseline where a comment sits over each of three
+  # keys: one whose CC moved, one unchanged, and one whose function is gone.
+  # The first two keep their comment over them; the third's leaves with it,
+  # out loud. The header above the "Regenerate with" line is the script's own
+  # and is rewritten, which is why the fixture's is a stale one.
+  bt="$tmp/baseline-tree"
+  mkdir -p "$bt/scripts" "$bt/rust/src"
+  cp "$ROOT/scripts/quality-gate.sh" "$bt/scripts/"
+  for spec in kept:12 grew:10; do
+    {
+      echo "fn ${spec%:*}(n: u32) -> u32 {"
+      echo '    let mut t = 0;'
+      for i in $(seq "${spec#*:}"); do echo "    if n == $i { t += $i; }"; done
+      echo '    t'
+      echo '}'
+    } > "$bt/rust/src/${spec%:*}.rs"
+  done
+  marker='# Regenerate with: ./scripts/quality-gate.sh --update-lizard-baseline'
+  printf '%s\n' \
+    '# A stale header, which regenerating replaces.' \
+    "$marker" \
+    '# grew: two lines of reason,' \
+    '# and an owner. Owner: fixture.' \
+    'src/grew.rs::grew:1 9' \
+    '# gone: the reason of a function that no longer exists.' \
+    'src/gone.rs::gone:1 20' \
+    '# kept: one line. Owner: fixture.' \
+    'src/kept.rs::kept:1 13' > "$bt/scripts/lizard-baseline.txt"
+  regen_rc=0
+  bash "$bt/scripts/quality-gate.sh" --update-lizard-baseline >"$tmp/regen.out" 2>&1 || regen_rc=$?
+  if (( regen_rc != 0 )); then
+    echo "FAIL self-test: --update-lizard-baseline exited $regen_rc: $(cat "$tmp/regen.out")" >&2
+    exit 1
+  fi
+  if [[ "$(grep -cxF "$marker" "$bt/scripts/lizard-baseline.txt")" != 1 ]]; then
+    echo "FAIL self-test: the regenerated baseline does not carry the header's last line exactly once:" >&2
+    cat "$bt/scripts/lizard-baseline.txt" >&2
+    exit 1
+  fi
+  got="$(sed -n "\|^$marker\$|,\$p" "$bt/scripts/lizard-baseline.txt" | tail -n +2)"
+  want="$(printf '%s\n' \
+    '# grew: two lines of reason,' \
+    '# and an owner. Owner: fixture.' \
+    'src/grew.rs::grew:1 11' \
+    '# kept: one line. Owner: fixture.' \
+    'src/kept.rs::kept:1 13')"
+  if [[ "$got" != "$want" ]]; then
+    echo "FAIL self-test: regenerating the baseline did not keep each comment over its key." >&2
+    echo "      wanted:" >&2; printf '        %s\n' "$want" >&2
+    echo "      got:" >&2; printf '        %s\n' "$got" >&2
+    exit 1
+  fi
+  if grep -q 'stale header' "$bt/scripts/lizard-baseline.txt"; then
+    echo "FAIL self-test: the old header survived regeneration next to the new one" >&2
+    exit 1
+  fi
+  if ! grep -q 'src/gone.rs::gone:1' "$tmp/regen.out" || ! grep -q 'gone: the reason of a function' "$tmp/regen.out"; then
+    echo "FAIL self-test: a key that left the baseline took its comment with it in silence: $(cat "$tmp/regen.out")" >&2
+    exit 1
+  fi
+
+  # The mutation step has to hand cargo-mutants, a Windows program under Git
+  # Bash, a path that program can see. MSYS rewrites `--output /tmp/tmp.X` to
+  # C:/.../Temp/tmp.X when it launches one, but not with MSYS_NO_PATHCONV or
+  # MSYS2_ARG_CONV_EXCL set; then cargo-mutants writes under \tmp on the
+  # current drive, this script finds no outcomes.json in /tmp, and nothing is
+  # judged. The stand-in cargo passes its arguments to Python, a native
+  # program, with the rewriting off, so it receives exactly the bytes this
+  # script wrote. It writes an outcomes.json only into a directory it can
+  # see: a genuine catch (must pass) or a build the machine killed (must fail
+  # through mutants-gate.sh --check-builds). Off Windows there is nothing to
+  # rewrite, and both pass through as they are.
+  py="$(command -v python3 || command -v python || true)"
+  if [[ -z "$py" ]]; then
+    echo "FALTA python: el self-test del paso de mutación no puede correr." >&2
+    exit 2
+  fi
+  mkdir -p "$tmp/bin"
+  cat > "$tmp/fake_mutants.py" <<'PY'
+import json, os, sys
+args = sys.argv[1:]
+out = args[args.index("--output") + 1] if "--output" in args else None
+if not out or not os.path.isdir(out):
+    print(f"stand-in cargo-mutants: --output {out!r} is not a directory this process can see")
+    sys.exit(0)
+# The key is spelled in two halves on purpose: local_gate_contract.rs holds
+# that this file never reads an exit status itself (that rule lives in
+# mutants-gate.sh), and it checks by looking for the key's name.
+STATUS = "process" + "_status"
+def mutant(name, summary, phases):
+    return {"scenario": {"Mutant": {"name": name}}, "summary": summary, "log_path": "log/m.log",
+            "phase_results": [{"phase": p, STATUS: s} for p, s in phases]}
+caught = mutant("src/a.rs:1:1: replace f with g", "CaughtMutant", [("Build", "Success"), ("Test", {"Failure": 101})])
+killed = mutant("src/a.rs:2:1: replace h with i", "Unviable", [("Build", {"Failure": -1073741502})])
+records = [caught] if os.environ.get("FAKE_OUTCOME") == "genuine" else [caught, killed]
+os.makedirs(os.path.join(out, "mutants.out"), exist_ok=True)
+with open(os.path.join(out, "mutants.out", "outcomes.json"), "w", encoding="utf-8") as f:
+    json.dump({"outcomes": records, "total_mutants": len(records), "caught": 1, "missed": 0,
+               "timeout": 0, "unviable": len(records) - 1, "success": 0}, f)
+PY
+  # The stand-in's own script path is the fixture's business, not the code's
+  # under test, so it is spelled natively here: with the rewriting off,
+  # Python would not find /tmp/... either.
+  fake_py="$(cygpath -m "$tmp/fake_mutants.py" 2>/dev/null || printf '%s' "$tmp/fake_mutants.py")"
+  printf '%s\n' '#!/bin/sh' \
+    "MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 exec \"$py\" \"$fake_py\" \"\$@\"" > "$tmp/bin/cargo"
+  chmod +x "$tmp/bin/cargo"
+  mut_rc=0
+  FAKE_OUTCOME=genuine PATH="$tmp/bin:$PATH" mutate_and_judge --file src/a.rs >"$tmp/mut.out" 2>&1 || mut_rc=$?
+  if (( mut_rc != 0 )) || ! grep -q 'all 0 refused by the compiler' "$tmp/mut.out"; then
+    echo "FAIL self-test: a mutation run with one genuine catch did not pass through the build check (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+    exit 1
+  fi
+  mut_rc=0
+  FAKE_OUTCOME=killed PATH="$tmp/bin:$PATH" mutate_and_judge --file src/a.rs >"$tmp/mut.out" 2>&1 || mut_rc=$?
+  if (( mut_rc == 0 )) || ! grep -q 'stopped 1 of 1 unviable' "$tmp/mut.out"; then
+    echo "FAIL self-test: a build the machine killed was not refused, so cargo-mutants and this script did not read the same outcomes.json (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+    exit 1
+  fi
+
   echo "OK  self-test: the CRAP half reports CC violations, only CC violations, and"
   echo "    keeps two same-named functions in one file on two separate keys; an"
-  echo "    exclusion goes red when it expires, loses its date, or matches no mutant"
+  echo "    exclusion goes red when it expires, loses its date, or matches no mutant;"
+  echo "    regenerating the baseline keeps each comment over its key; the mutation"
+  echo "    step hands cargo-mutants an output path it can see, and judges what it wrote"
   exit 0
 fi
 

@@ -14,6 +14,100 @@ cd "$ROOT"
 #   ./scripts/run-all-tests.sh --self-test   (its fixtures drive this script too)
 # shellcheck source=scripts/gate-lock.sh
 source "$ROOT/scripts/gate-lock.sh"
+
+# --- self-test: the exit file against the fixtures that have to stop it ------
+# ~/.cache/cuba-gate/run.exit is what gets read when the session that launched
+# a gate is gone. It used to be written by run-all-tests.sh, the first half of
+# this gate, so a run whose tests passed said 0 there while deny, audit,
+# codigo-muerto, crap-gate or mutants-gate could still fail; and a gate killed
+# halfway (SIGKILL under memory pressure, twice on 2026-09-23) runs no trap, so
+# the file kept whatever an earlier run had left in it. Each fixture runs a
+# COPY of this script in a throwaway tree whose every step is a stand-in
+# (pg_isready, cargo, node, run-all-tests.sh and the three gate scripts after
+# it), with HOME inside the tree: nothing here touches the cluster, the real
+# lock or cargo. The exit file of every tree starts at 0, as an earlier green
+# gate would have left it, which is exactly what a gate must not leave behind
+# unless it is its own verdict.
+#   ./scripts/merge-gate.sh --self-test
+if [[ "${1:-}" == "--self-test" ]]; then
+  tmp="$(mktemp -d)"
+  sleep 300 &
+  live=$!
+  trap 'kill "$live" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+  self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
+
+  # fake_tree NAME RUN_ALL_TESTS_BODY
+  fake_tree() {
+    local t="$tmp/$1" s
+    mkdir -p "$t/scripts" "$t/rust" "$t/bin" "$t/home/.cache/cuba-gate"
+    cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" "$t/scripts/"
+    printf '#!/bin/sh\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
+    for s in codigo-muerto crap-gate mutants-gate; do
+      printf '#!/bin/sh\nexit 0\n' >"$t/scripts/$s.sh"
+    done
+    printf '#!/bin/sh\nexit 0\n' >"$t/bin/pg_isready"
+    printf '#!/bin/sh\nexit 0\n' >"$t/bin/node"
+    # cargo fails the one subcommand named in FAIL_AT, and not its --version
+    # probe, so the gate gets past "is cargo-deny installed" to the check.
+    printf '%s\n' '#!/bin/sh' \
+      'if [ "$1" = "$FAIL_AT" ] && [ "$2" != "--version" ]; then exit 1; fi' \
+      'exit 0' >"$t/bin/cargo"
+    chmod +x "$t"/scripts/*.sh "$t"/bin/*
+    printf '0\n' >"$t/home/.cache/cuba-gate/run.exit"
+  }
+  # run_copy NAME [FAIL_AT]: the copy's exit code lands in $rc. The braces
+  # keep bash's own "Killed" job notice, for the fixture that kills the copy,
+  # off this script's stderr; everything the copy prints is in NAME.out.
+  run_copy() {
+    rc=0
+    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/$1/home" \
+        PATH="$tmp/$1/bin:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="${2:-}" \
+        "$BASH" "$tmp/$1/scripts/merge-gate.sh" >"$tmp/$1.out" 2>&1 || rc=$?; } 2>/dev/null
+  }
+  exit_file() { cat "$tmp/$1/home/.cache/cuba-gate/run.exit" 2>/dev/null || true; }
+  reads_while_running='echo "stand-in run-all-tests: run.exit reads: $(cat "$HOME/.cache/cuba-gate/run.exit")"'
+
+  # The presence anchor: every step passes, so the file ends at 0, and while
+  # the first half ran it said the gate was still running. A file that ends at
+  # 0 proves nothing on its own: it started there.
+  fake_tree green "$reads_while_running"
+  run_copy green
+  (( rc == 0 )) || self_fail "a gate whose every step passed exited $rc: $(cat "$tmp/green.out")"
+  [[ "$(exit_file green)" == 0 ]] || self_fail "a green gate left '$(exit_file green)' in its exit file, not 0"
+  grep -q 'run.exit reads: running pid=[0-9]' "$tmp/green.out" \
+    || self_fail "while the gate ran, its exit file did not say so: $(grep 'run.exit reads' "$tmp/green.out")"
+
+  # The first half passes and a step after it fails: the file is the gate's.
+  fake_tree deny "$reads_while_running"
+  run_copy deny deny
+  (( rc == 1 )) || self_fail "a gate whose cargo deny failed exited $rc, not 1: $(cat "$tmp/deny.out")"
+  [[ "$(exit_file deny)" == 1 ]] \
+    || self_fail "a gate that failed at cargo deny, after its tests passed, left '$(exit_file deny)' in its exit file, not 1"
+
+  # Killed in the middle, the way the kernel or Windows kills under memory
+  # pressure: no trap runs, and the file must not read as a verdict.
+  fake_tree killed 'kill -9 "$PPID"; exit 0'
+  run_copy killed
+  (( rc != 0 )) || self_fail "a gate killed in the middle exited 0"
+  [[ "$(exit_file killed)" == "running pid="* ]] \
+    || self_fail "a gate killed in the middle left '$(exit_file killed)' in its exit file, not 'running pid=...'"
+
+  # A second gate, refused by a live one's lock: the file belongs to that one.
+  fake_tree refused 'exit 0'
+  mkdir -p "$tmp/refused/home/.cache/cuba-gate/lock"
+  owner_record "$live" fixture-live >"$tmp/refused/home/.cache/cuba-gate/lock/owner"
+  run_copy refused
+  grep -q "another gate is running: pid $live" "$tmp/refused.out" \
+    || self_fail "the second gate was not refused by the live one (exit $rc): $(cat "$tmp/refused.out")"
+  [[ "$(exit_file refused)" == 0 ]] \
+    || self_fail "a refused second gate wrote '$(exit_file refused)' into the exit file of the gate that holds the lock"
+
+  echo "OK  self-test: the exit file says running while a gate runs and holds the whole"
+  echo "    gate's verdict at the end, a step after the tests included; a gate killed"
+  echo "    in the middle leaves 'running', never an old 0; a refused gate leaves it alone"
+  exit 0
+fi
+
 acquire_gate_lock "$GATE_LOCK" || exit 1
 trap release_gate_lock EXIT
 export CUBA_GATE_LOCK_OWNER="$GATE_OWNER"

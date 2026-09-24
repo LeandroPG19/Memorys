@@ -1203,3 +1203,133 @@ fn the_two_pass_guard_can_actually_fail() {
          codigo-muerto.sh pass for months while doing nothing. stdout: {stdout}"
     );
 }
+
+/// The file a dead session reads its answer from has to be the whole gate's
+/// verdict, and has to say "running" for as long as there is none.
+///
+/// `~/.cache/cuba-gate/run.exit` was written by `run-all-tests.sh`, which is
+/// only the first half of `merge-gate.sh`. A run whose tests passed wrote `0`
+/// there and went on to `cargo deny`, `cargo audit`, `codigo-muerto`,
+/// `crap-gate` and `mutants-gate`, any of which could still fail with the file
+/// saying 0. And a gate killed halfway — SIGKILL under memory pressure, twice
+/// on 2026-09-23 — never reaches a trap, so it left whatever an earlier run had
+/// written: an old 0 read as this run's green. `merge-gate.sh --self-test`
+/// copies the script into a throwaway tree whose every step is a stand-in, and
+/// reads the file after a green run, after a step past the tests fails, after
+/// the gate is killed in the middle, and after a second gate is refused.
+#[test]
+fn the_exit_file_holds_the_whole_gates_verdict_and_says_running_until_then() {
+    // Checked before the script is launched, not after: without the mode,
+    // merge-gate.sh ignores the flag and starts a real gate against the live
+    // cluster, backup included.
+    let gate = read("scripts/merge-gate.sh");
+    assert!(
+        gate.contains("\"--self-test\""),
+        "merge-gate.sh has no --self-test mode, so nothing shows that the exit file it leaves \
+         behind is its own verdict rather than the one its first half wrote"
+    );
+
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/merge-gate.sh", "--self-test"])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "merge-gate.sh --self-test did not pass, so ~/.cache/cuba-gate/run.exit can say 0 \
+         over a gate that failed after its tests, or over one that died in the middle. \
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Same anchor as the other self-tests: the mode's label.
+    assert!(
+        stdout.contains("self-test:"),
+        "the self-test exited 0 without saying it ran. An exit code alone is what let \
+         codigo-muerto.sh pass for months while doing nothing. stdout: {stdout}"
+    );
+}
+
+/// Runs `mutants-gate.sh --check-builds` over an outcomes.json holding one
+/// caught mutant whose Test phase ended with `test_status`, and nothing else
+/// the check could object to. Returns (exit 0, stdout, stderr).
+fn check_builds_on_a_caught_mutant(dir: &Path, test_status: &str) -> (bool, String, String) {
+    let file = dir.join(format!("outcomes-{}.json", uuid::Uuid::new_v4()));
+    let json = format!(
+        r#"{{"outcomes":[{{"scenario":"Baseline","summary":"Success","log_path":"log/baseline.log","phase_results":[{{"phase":"Build","process_status":"Success"}},{{"phase":"Test","process_status":"Success"}}]}},{{"scenario":{{"Mutant":{{"name":"src/search/rrf.rs:9:9: replace f -> u32 with 0"}}}},"summary":"CaughtMutant","log_path":"log/caught.log","phase_results":[{{"phase":"Build","process_status":"Success"}},{{"phase":"Test","process_status":{test_status}}}]}}],"total_mutants":1,"caught":1,"missed":0,"timeout":0,"unviable":0,"success":0,"cargo_mutants_version":"27.1.0"}}"#
+    );
+    std::fs::write(&file, json).expect("write the outcomes.json fixture");
+    // Forward slashes: Git Bash and the Windows Python it hands the file to
+    // both read C:/..., and neither has to guess what a backslash means.
+    let arg = file.to_string_lossy().replace('\\', "/");
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/mutants-gate.sh", "--check-builds", arg.as_str()])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A caught mutant is one its tests caught, not one the machine stopped.
+///
+/// The unviable half of `--check-builds` exists because a machine out of
+/// memory ended 44 builds with `0xC0000142 STATUS_DLL_INIT_FAILED`, and the
+/// kill rate leaves unviable mutants out. The caught half had the same hole
+/// facing the other way: a mutant whose `cargo test` could not even start ends
+/// its Test phase with that same NTSTATUS, cargo-mutants files it as
+/// CaughtMutant, and it counts FOR the kill rate — the fewer tests the machine
+/// managed to start, the better the score. A genuine catch is a test process
+/// that ran to its own exit: 101 when tests fail. The one NTSTATUS that is a
+/// genuine catch is `0xC00000FD STATUS_STACK_OVERFLOW`, a mutant that recurses
+/// without end and dies of it inside the test process, which is the tests
+/// catching it; it is accepted by name, and said so.
+///
+/// This builds the outcomes.json itself instead of running the script's
+/// `--self-test`, so it goes red whatever happens to the script's fixtures.
+#[test]
+fn a_caught_mutant_whose_test_process_never_ran_is_not_caught() {
+    let dir = std::env::temp_dir().join(format!("mi-caught-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("create the scratch directory");
+    let genuine = check_builds_on_a_caught_mutant(&dir, r#"{"Failure":101}"#);
+    let never_started = check_builds_on_a_caught_mutant(&dir, r#"{"Failure":-1073741502}"#);
+    let stack_overflow = check_builds_on_a_caught_mutant(&dir, r#"{"Failure":-1073741571}"#);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The presence anchor: without it, a check that refused every outcome
+    // would pass the red case below.
+    assert!(
+        genuine.0,
+        "a caught mutant whose tests failed with 101 was refused. stdout: {}\nstderr: {}",
+        genuine.1, genuine.2
+    );
+    assert!(
+        !never_started.0,
+        "a caught mutant whose test run ended with 0xC0000142 STATUS_DLL_INIT_FAILED was \
+         accepted: cargo could not start, no test ran, and the mutant still counts for the \
+         kill rate. stdout: {}\nstderr: {}",
+        never_started.1, never_started.2
+    );
+    assert!(
+        never_started.2.contains("0xC0000142"),
+        "the refusal did not name the NTSTATUS, so whoever reads it cannot tell a machine out \
+         of memory from a test that failed. stderr: {}",
+        never_started.2
+    );
+    assert!(
+        stack_overflow.0,
+        "a caught mutant that died of 0xC00000FD STATUS_STACK_OVERFLOW was refused. A mutant \
+         that recurses without end is caught by its tests' own process. stdout: {}\nstderr: {}",
+        stack_overflow.1, stack_overflow.2
+    );
+    assert!(
+        stack_overflow.1.contains("STATUS_STACK_OVERFLOW"),
+        "the one NTSTATUS the check accepts as a catch has to be accepted out loud, or the \
+         exception reads like a hole. stdout: {}",
+        stack_overflow.1
+    );
+}

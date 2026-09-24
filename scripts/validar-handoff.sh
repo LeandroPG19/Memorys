@@ -346,6 +346,43 @@ self_test() {
   yml="$(mk_handoff "$d" frozen-crlf "$base" frozen)"
   must_fail "un test editado en un arbol CRLF y declarado frozen" "$d" "$yml" || bad=1
 
+  # -- paths: la tajada, en un arbol con varios agentes ------------------------
+  # Dos agentes en un mismo arbol: este toco produccion en cosa.rs y otro, a la
+  # vez, edito el test de contrato.rs. Sin `paths` el guardia mira el arbol
+  # entero y rechaza la pasada verde honesta del primero por el trabajo del
+  # segundo. Con `paths` mira solo lo que el handoff declara suyo.
+  d="$st_tmp/paths"; base="$(mk_repo "$d" false)"
+  sed -i 's/^    41$/    42/' "$d/rust/src/cosa.rs"
+  sed -i 's/assert!(true)/assert!(false)/' "$d/rust/tests/contrato.rs"
+  yml="$(mk_handoff "$d" arbol-entero "$base" frozen)"
+  must_fail "frozen sin paths, en un arbol donde otro agente edito un test" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" tajada-frozen "$base" frozen)"
+  printf '%s\n' 'paths:' '  - rust/src/cosa.rs' >> "$yml"
+  must_pass "frozen con paths limitado a la tajada propia, que no toco un test" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" tajada-en-linea "$base" frozen)"
+  echo 'paths: [rust/src/cosa.rs]' >> "$yml"
+  must_pass "la misma tajada escrita como lista en linea" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" tajada-con-test "$base" frozen)"
+  printf '%s\n' 'paths:' '  - rust/src/cosa.rs' '  - rust/tests/contrato.rs' >> "$yml"
+  must_fail "frozen con paths que incluyen un test editado" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" tajada-written "$base" written)"
+  printf '%s\n' 'paths:' '  - rust/tests' >> "$yml"
+  must_pass "written con paths a un directorio donde un test cambio" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" tajada-written-sin-test "$base" written)"
+  printf '%s\n' 'paths:' '  - rust/src/cosa.rs' >> "$yml"
+  must_fail "written con paths a una tajada donde ningun test cambio" "$d" "$yml" || bad=1
+  # Una ruta mal escrita no casa con nada, y una tajada vacia no tiene tests
+  # que puedan cambiar: `frozen` pasaria siempre. Las dos se rechazan.
+  yml="$(mk_handoff "$d" tajada-inventada "$base" frozen)"
+  printf '%s\n' 'paths:' '  - rust/src/no-existe.rs' >> "$yml"
+  must_fail "paths con una ruta que no existe ni en el arbol ni en el commit" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" tajada-vacia "$base" frozen)"
+  echo 'paths:' >> "$yml"
+  must_fail "paths declarado sin ninguna ruta" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" none-con-paths none - especificador)"
+  printf '%s\n' 'paths:' '  - rust/src/cosa.rs' >> "$yml"
+  must_fail "commit: none con paths, sobre un codigo que no entrega" "$d" "$yml" || bad=1
+
   # -- 5: el campo omitido, que era la fuga -----------------------------------
   d="$st_tmp/omitido"; base="$(mk_repo "$d" false)"
   sed -i 's/^    41$/    42/' "$d/rust/src/cosa.rs"
