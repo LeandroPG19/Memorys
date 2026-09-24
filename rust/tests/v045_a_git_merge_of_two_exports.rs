@@ -48,9 +48,14 @@ impl Scratch {
     /// With no database the hooks `install` writes do nothing, so no commit
     /// below exports: the bundle on each branch is the one written here.
     fn run(&self, program: &str, args: &[&str]) -> Output {
+        self.run_in(&self.repo, program, args)
+    }
+
+    /// `run` from `dir`: another clone, standing in for another machine.
+    fn run_in(&self, dir: &Path, program: &str, args: &[&str]) -> Output {
         Command::new(program)
             .args(args)
-            .current_dir(&self.repo)
+            .current_dir(dir)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
@@ -68,10 +73,14 @@ impl Scratch {
     }
 
     fn git_ok(&self, args: &[&str]) -> String {
-        let out = self.run("git", args);
+        self.git_ok_in(&self.repo, args)
+    }
+
+    fn git_ok_in(&self, dir: &Path, args: &[&str]) -> String {
+        let out = self.run_in(dir, "git", args);
         assert!(
             out.status.success(),
-            "git {args:?} failed: {}",
+            "git {args:?} in {dir:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).unwrap()
@@ -104,8 +113,12 @@ impl Scratch {
     }
 
     fn commit(&self, message: &str) {
-        self.git_ok(&["add", "-A"]);
-        self.git_ok(&["commit", "--quiet", "-m", message]);
+        self.commit_in(&self.repo, message);
+    }
+
+    fn commit_in(&self, dir: &Path, message: &str) {
+        self.git_ok_in(dir, &["add", "-A"]);
+        self.git_ok_in(dir, &["commit", "--quiet", "-m", message]);
     }
 
     fn read(&self, name: &str) -> String {
@@ -406,17 +419,13 @@ fn a_manifest_of_another_project_stops_the_merge_and_says_which_field() {
 
 /// Replaces the binary the installed hooks start with a script that writes
 /// down the arguments of every call, one line each, into the file returned:
-/// which hook ran, and in what order, without a database.
+/// which hook ran, and in what order, without a database. Each hook starts its
+/// own copy of the script, which also writes `<hook>: <arguments>` into
+/// `by_hook(log)`: a rebase runs more than one hook, and only the name tells
+/// post-rewrite's import from post-checkout's.
 fn stub_the_hooks(scratch: &Scratch) -> PathBuf {
     let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
     let log = scratch.base.join("hook-calls.log");
-    let stub = scratch.base.join("memory-industry-stub");
-    std::fs::write(
-        &stub,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", slash(&log)),
-    )
-    .unwrap();
-    make_executable(&stub);
 
     let spellings = [
         installed_exe(scratch),
@@ -424,11 +433,22 @@ fn stub_the_hooks(scratch: &Scratch) -> PathBuf {
         std::fs::canonicalize(BIN).unwrap().display().to_string(),
     ];
     let hooks = scratch.repo.join(".git").join("hooks");
-    for hook in ["post-commit", "post-checkout", "post-merge"] {
+    for hook in ["post-commit", "post-checkout", "post-merge", "post-rewrite"] {
         let path = hooks.join(hook);
         let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
         };
+        let stub = scratch.base.join(format!("memory-industry-stub-{hook}"));
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '{hook}: %s\\n' \"$*\" >> '{}'\n",
+                slash(&log),
+                slash(&by_hook(&log))
+            ),
+        )
+        .unwrap();
+        make_executable(&stub);
         let stubbed = spellings.iter().fold(body.clone(), |body, exe| {
             body.replace(&format!("\"{exe}\""), &format!("\"{}\"", slash(&stub)))
         });
@@ -485,6 +505,18 @@ fn calls_since(log: &Path) -> Vec<String> {
         .collect();
     let _ = std::fs::remove_file(log);
     calls
+}
+
+/// Where the hooks' stubs write `<hook>: <arguments>`, next to `log`.
+fn by_hook(log: &Path) -> PathBuf {
+    log.with_file_name("hook-calls-by-hook.log")
+}
+
+/// The calls since the last read as `<hook>: <arguments>`, leaving both logs
+/// empty.
+fn hook_calls_since(log: &Path) -> Vec<String> {
+    calls_since(log);
+    calls_since(&by_hook(log))
 }
 
 #[test]
@@ -573,5 +605,75 @@ fn a_merge_is_imported_before_anything_exports_over_it() {
         [export],
         "an ordinary commit has one parent and only exports, as before: the import is paid \
          for on merges alone"
+    );
+}
+
+#[test]
+fn a_rebase_is_imported_once_it_has_rewritten_and_an_amend_is_not() {
+    let scratch = Scratch::new();
+    let install = scratch.run(BIN, &["hook", "install"]);
+    assert!(
+        install.status.success(),
+        "hook install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    scratch.git_ok(&[
+        "config",
+        "--local",
+        "cuba-memorys.database-url",
+        "postgresql://stub.invalid/none",
+    ]);
+    let log = stub_the_hooks(&scratch);
+
+    scratch.write("README.md", "base\n");
+    scratch.commit("base");
+    let main = scratch.git_ok(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let main = main.trim();
+    let upstream = scratch.base.join("upstream");
+    scratch.git_ok(&["clone", "--quiet", ".", upstream.to_str().unwrap()]);
+    std::fs::write(upstream.join("theirs.txt"), "pushed from another machine\n").unwrap();
+    scratch.commit_in(&upstream, "their change");
+    scratch.write("ours.txt", "committed here\n");
+    scratch.commit("our change");
+    hook_calls_since(&log);
+
+    scratch.git_ok(&[
+        "pull",
+        "--rebase",
+        "--quiet",
+        upstream.to_str().unwrap(),
+        main,
+    ]);
+    let calls = hook_calls_since(&log);
+    assert_eq!(
+        scratch
+            .git_ok(&["log", "--format=%s"])
+            .lines()
+            .collect::<Vec<_>>(),
+        ["our change", "their change", "base"],
+        "control: the pull rebased our commit onto theirs rather than merging or \
+         fast-forwarding, or this says nothing about a rebase. Hooks: {calls:?}"
+    );
+    assert_eq!(
+        calls.last().map(String::as_str),
+        Some("post-rewrite: sync import --conflict merge"),
+        "`git pull --rebase` on a branch with commits of its own is `git rebase`, which runs \
+         no post-merge: githooks(5), post-rewrite \"is invoked by commands that rewrite commits \
+         (git-commit when called with --amend and git-rebase)\" and \"its first argument \
+         denotes the command it was invoked by: currently one of amend or rebase\". Nothing \
+         brought what the rebase brought into the database, and the next commit exported the \
+         database over it. The last hook of the rebase has to be post-rewrite's import, so the \
+         bundle that stands is the one the database holds. Hooks, in order: {calls:?}"
+    );
+
+    scratch.write("ours.txt", "amended here\n");
+    scratch.git_ok(&["add", "-A"]);
+    scratch.git_ok(&["commit", "--quiet", "--amend", "--no-edit"]);
+    assert_eq!(
+        hook_calls_since(&log),
+        ["post-commit: sync export --scope all"],
+        "an amend runs post-rewrite too, with `amend` as its argument, and brings nothing from \
+         anywhere: the amended commit is this machine's own export. post-rewrite imports for \
+         `rebase` only; for `amend` post-commit's export is all that runs"
     );
 }

@@ -14,8 +14,9 @@ mod common;
 use common::in_a_scratch_database;
 use serde_json::Value;
 use sqlx::PgPool;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 const BIN: &str = env!("CARGO_BIN_EXE_memory-industry");
@@ -336,6 +337,103 @@ async fn an_export_without_embeddings_leaves_no_blob_it_did_not_write() {
             Value::Bool(false),
             "the import hashes every file in the directory, the blob included, so a blob the \
              export did not write made every bundle read as hand-edited, for ever: {report}"
+        );
+    })
+    .await;
+}
+
+/// Every file under `dir`, at any depth.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn modified(path: &Path) -> SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
+}
+
+#[tokio::test]
+async fn an_export_of_a_database_that_did_not_change_leaves_every_file_alone() {
+    in_a_scratch_database("brain_idle_export", |url| async move {
+        let pool = memory_industry::db::create_pool(&url)
+            .await
+            .expect("migrating the scratch database");
+        let t = Uuid::new_v4().to_string()[..8].to_string();
+        remember(
+            &pool,
+            &format!("entity_idle_{t}"),
+            &format!("an observation {t}"),
+            &format!("fact_idle_{t}"),
+        )
+        .await;
+        pool.close().await;
+
+        let repo = Repo::new();
+        repo.sync(&url, &["export", "--scope", "all"]);
+        repo.commit("what post-commit exported");
+        let files = files_under(&repo.sync_dir());
+        let entities = repo.sync_dir().join("entities");
+        assert!(
+            files.iter().any(|f| f.ends_with("manifest.json"))
+                && files.iter().any(|f| f.parent() == Some(entities.as_path())),
+            "control: the first export wrote a manifest and an entity file, or there is nothing \
+             here for the second one to leave alone: {files:?}"
+        );
+        // A fixed instant in the past, so a rewrite shows whatever the
+        // filesystem's clock resolution: a file the second export writes gets
+        // the time of that write.
+        let long_ago = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        for file in &files {
+            std::fs::File::options()
+                .write(true)
+                .open(file)
+                .and_then(|f| f.set_modified(long_ago))
+                .unwrap_or_else(|e| panic!("dating {file:?}: {e}"));
+        }
+
+        repo.sync(&url, &["export", "--scope", "all"]);
+
+        let status = repo.git(&["status", "--porcelain", "--untracked-files=all"]);
+        let rewritten: Vec<&PathBuf> = files.iter().filter(|f| modified(f) != long_ago).collect();
+        let import = repo.sync(&url, &["import", "--conflict", "merge", "--json"]);
+        let stdout = String::from_utf8_lossy(&import.stdout);
+        let report: Value = stdout
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str(line).ok())
+            .unwrap_or_else(|| panic!("the import printed no JSON report:\n{stdout}"));
+
+        assert!(
+            status.is_empty(),
+            "post-commit exports after every commit, and an export of a database nothing wrote \
+             to since the last one rewrote manifest.json with a new exported_at. The tree was \
+             dirty after every commit, and `git merge`, `git checkout` and `git pull` refused \
+             with «your local changes would be overwritten». Nothing changed, so nothing may \
+             differ from the commit:\n{status}"
+        );
+        assert!(
+            rewritten.is_empty(),
+            "the same bytes written again are still a write: the file's mtime moves, and every \
+             tool that watches the tree — git's index, an editor, a sync client — sees a change \
+             that is not there. Rewritten with nothing new: {rewritten:?}"
+        );
+        assert_eq!(
+            report["edited_since_export"],
+            Value::Bool(false),
+            "the manifest the second export left alone still has to describe the files: its \
+             manifest_hash is what the import checks them against: {report}"
         );
     })
     .await;

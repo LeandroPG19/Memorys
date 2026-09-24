@@ -2688,6 +2688,67 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[tokio::test]
+    async fn install_writes_a_post_rewrite_hook_that_imports_and_uninstall_takes_it_back() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = scratch_root("install-post-rewrite");
+        let hooks = root.join(".git").join("hooks");
+        let theirs = "#!/bin/sh\necho 'the team runs this after every rewrite'\n";
+
+        let (first, second) = in_scratch_repo(&root, Some("graph-sync"), || {
+            std::fs::create_dir_all(&hooks).unwrap();
+            std::fs::write(hooks.join("post-rewrite"), theirs).unwrap();
+            let first = install(false).expect("install");
+            let second = install(false).expect("install again");
+            (first, second)
+        });
+
+        let post_rewrite = read_hook(&root, "post-rewrite");
+        let block = install_block(&post_rewrite);
+        assert!(
+            block.contains("sync import --conflict merge") && !block.contains("sync export"),
+            "`git rebase`, and so `git pull --rebase`, runs post-rewrite and not post-merge — \
+             githooks(5): post-rewrite \"is invoked by commands that rewrite commits (git-commit \
+             when called with --amend and git-rebase)\" — so what a rebase brought never reached \
+             the database, and the next commit exported the database over it. post-rewrite has \
+             to import, and never export: {post_rewrite}"
+        );
+        assert!(
+            block.contains("graph-sync'; export CUBA_SYNC_DIR"),
+            "and import from the directory install pinned, as post-merge does: {post_rewrite}"
+        );
+        assert!(
+            post_rewrite.starts_with(theirs) && post_rewrite.matches(MARKER).count() == 1,
+            "a post-rewrite that was already there is appended to, never overwritten, and a \
+             second install leaves one block: {post_rewrite}"
+        );
+        let line = |report: &str| {
+            report
+                .lines()
+                .find(|l| l.starts_with("post-rewrite hook:"))
+                .map(str::to_string)
+        };
+        assert!(
+            line(&first).is_some_and(|l| l.ends_with("installed"))
+                && line(&second).is_some_and(|l| l.ends_with("already present")),
+            "the report names the hook it wrote, and says so the second time too:\n{first}\n{second}"
+        );
+
+        in_scratch_repo(&root, Some("graph-sync"), || {
+            uninstall().expect("uninstall")
+        });
+
+        let left = std::fs::read_to_string(hooks.join("post-rewrite")).unwrap_or_default();
+        assert_eq!(
+            left.trim_end(),
+            theirs.trim_end(),
+            "uninstall removes exactly what install added: the team's own post-rewrite stays, \
+             and install's block goes with its pinned CUBA_SYNC_DIR"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn remove_gitattributes_line_matches_the_line_actually_in_the_file_not_the_current_env_var() {
         let dir = std::env::temp_dir().join(format!("cuba-attrs-test-{}", Uuid::new_v4()));
@@ -3317,7 +3378,7 @@ mod tests {
         install_into_scratch_repo(&root, Some("first-sync"));
         install_into_scratch_repo(&root, Some("second-sync"));
 
-        for hook in ["post-commit", "post-checkout", "post-merge"] {
+        for hook in ["post-commit", "post-checkout", "post-merge", "post-rewrite"] {
             let body = read_hook(&root, hook);
             assert_eq!(
                 body.matches(MARKER).count(),
@@ -3367,7 +3428,7 @@ mod tests {
         });
 
         let hooks = root.join(".git").join("hooks");
-        for hook in ["post-commit", "post-checkout", "post-merge"] {
+        for hook in ["post-commit", "post-checkout", "post-merge", "post-rewrite"] {
             assert!(
                 !hooks.join(hook).exists(),
                 "the file held nothing but install's block, the pinned CUBA_SYNC_DIR included; \
