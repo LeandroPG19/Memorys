@@ -42,9 +42,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
     mkdir -p "$t/scripts" "$t/rust" "$t/bin" "$t/home/.cache/cuba-gate"
     cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" "$t/scripts/"
     printf '#!/bin/sh\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
-    for s in codigo-muerto crap-gate mutants-gate; do
+    for s in codigo-muerto crap-gate; do
       printf '#!/bin/sh\nexit 0\n' >"$t/scripts/$s.sh"
     done
+    printf '%s\n' '#!/bin/sh' \
+      'echo "mutants caught=9 missed=1 timeout=0 unviable=0 kill_rate=0.900 min=0.800"' \
+      >"$t/scripts/mutants-gate.sh"
     printf '#!/bin/sh\nexit 0\n' >"$t/bin/pg_isready"
     printf '#!/bin/sh\nexit 0\n' >"$t/bin/node"
     # cargo fails the one subcommand named in FAIL_AT, and not its --version
@@ -58,13 +61,42 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # run_copy NAME [FAIL_AT]: the copy's exit code lands in $rc. The braces
   # keep bash's own "Killed" job notice, for the fixture that kills the copy,
   # off this script's stderr; everything the copy prints is in NAME.out.
+  # git's own directory is on the copy's PATH: on Git Bash it is /mingw64/bin,
+  # not /usr/bin. It runs with a scratch global config, so nobody's signing or
+  # hooks settings reach the fixture repos.
+  gitdir="$(dirname "$(command -v git)")"
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$tmp/gitconfig"
+  : >"$GIT_CONFIG_GLOBAL"
+  git config --global user.name fixture
+  git config --global user.email fixture@example.invalid
+  git config --global init.defaultBranch main
+  git config --global core.autocrlf false
   run_copy() {
     rc=0
     { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/$1/home" \
-        PATH="$tmp/$1/bin:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="${2:-}" \
+        PATH="$tmp/$1/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="${2:-}" \
         "$BASH" "$tmp/$1/scripts/merge-gate.sh" >"$tmp/$1.out" 2>&1 || rc=$?; } 2>/dev/null
   }
   exit_file() { cat "$tmp/$1/home/.cache/cuba-gate/run.exit" 2>/dev/null || true; }
+  # git_tree NAME RUN_ALL_TESTS_BODY: a fake_tree committed whole, its home
+  # ignored the way the real HOME is outside the real tree.
+  git_tree() {
+    fake_tree "$1" "$2"
+    printf 'home/\n' >"$tmp/$1/.gitignore"
+    git -C "$tmp/$1" init -q
+    git -C "$tmp/$1" add -A
+    git -C "$tmp/$1" commit -q -m fixture
+  }
+  receipt_of() { cat "$tmp/$1/home/.cache/cuba-gate/receipts/$2" 2>/dev/null || true; }
+  receipts_of() { ls "$tmp/$1/home/.cache/cuba-gate/receipts" 2>/dev/null || true; }
+  # A tree where no receipt may appear, and the run has to say why in a line.
+  no_receipt() {
+    local what="$1" name="$2"
+    (( rc == 0 )) || self_fail "$what exited $rc, and it passed: the receipt is not the verdict: $(cat "$tmp/$name.out")"
+    [[ -z "$(receipts_of "$name")" ]] || self_fail "$what left a receipt: $(receipts_of "$name")"
+    grep -q '^no receipt: ' "$tmp/$name.out" \
+      || self_fail "$what wrote no receipt without saying why: $(cat "$tmp/$name.out")"
+  }
   reads_while_running='echo "stand-in run-all-tests: run.exit reads: $(cat "$HOME/.cache/cuba-gate/run.exit")"'
 
   # The presence anchor: every step passes, so the file ends at 0, and while
@@ -102,9 +134,68 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$(exit_file refused)" == 0 ]] \
     || self_fail "a refused second gate wrote '$(exit_file refused)' into the exit file of the gate that holds the lock"
 
+  # The receipt scripts/release.sh reads instead of running the gate again.
+  # The presence anchor: a green gate over a clean tree leaves one for its
+  # commit, in the four lines release.sh copies into the tag.
+  git_tree receipt 'exit 0'
+  sha="$(git -C "$tmp/receipt" rev-parse HEAD)"
+  run_copy receipt
+  (( rc == 0 )) || self_fail "a green gate over a clean tree exited $rc: $(cat "$tmp/receipt.out")"
+  r="$(receipt_of receipt "$sha")"
+  [[ "$(sed -n 1p <<<"$r")" == "local-gate: MERGE GATE PASSED $sha" ]] \
+    || self_fail "a green gate over a clean tree at $sha left no receipt for it ('$r', receipts: '$(receipts_of receipt)'): $(cat "$tmp/receipt.out")"
+  [[ "$(wc -l <<<"$r")" -eq 4 ]] || self_fail "the receipt is not four lines: $r"
+  grep -qE '^local-gate-date: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' <<<"$r" \
+    || self_fail "the receipt has no UTC date: $r"
+  grep -qx 'local-gate-summary: mutants caught=9 missed=1 timeout=0 unviable=0 kill_rate=0.900 min=0.800' <<<"$r" \
+    || self_fail "the receipt lost the gate's kill_rate line: $r"
+  grep -q '^local-gate-summary: MERGE GATE PASSED' <<<"$r" || self_fail "the receipt lost the gate's verdict line: $r"
+
+  # An untracked file when the gate starts, gone before it ends: what passed is
+  # not a commit, and only the look at the start can tell.
+  git_tree dirty 'rm -f stray.rs'
+  echo x >"$tmp/dirty/stray.rs"
+  run_copy dirty
+  no_receipt "a gate over an untracked file" dirty
+
+  # A tree dirtied while the gate ran.
+  git_tree dirtied 'echo x >stray.rs'
+  run_copy dirtied
+  no_receipt "a gate whose tree changed while it ran" dirtied
+
+  # HEAD moved while the gate ran: neither commit was judged whole.
+  git_tree moved 'git commit -q --allow-empty -m "landed while the gate ran"'
+  sha="$(git -C "$tmp/moved" rev-parse HEAD)"
+  run_copy moved
+  [[ "$(git -C "$tmp/moved" rev-parse HEAD)" != "$sha" ]] || self_fail "the fixture's HEAD never moved, so it proves nothing"
+  no_receipt "a gate whose HEAD moved while it ran" moved
+
+  # Exit 0 over a SKIPPED line: release.sh's own judge of the log says no.
+  # No colon after the word: local_gate_contract.rs refuses that spelling
+  # anywhere in this file, fixtures included.
+  git_tree skipped 'echo "SKIPPED (tests that need the NLI model)"'
+  run_copy skipped
+  no_receipt "a gate that exited 0 over SKIPPED" skipped
+  grep -q '^no receipt: .*SKIPPED' "$tmp/skipped.out" \
+    || self_fail "the SKIPPED run did not say that was why: $(cat "$tmp/skipped.out")"
+
+  # An earlier pass on this commit, then a run on it that fails: the receipt
+  # goes, because the latest verdict on a commit is its verdict.
+  git_tree reddened 'exit 0'
+  sha="$(git -C "$tmp/reddened" rev-parse HEAD)"
+  mkdir -p "$tmp/reddened/home/.cache/cuba-gate/receipts"
+  printf 'local-gate: MERGE GATE PASSED %s\n' "$sha" >"$tmp/reddened/home/.cache/cuba-gate/receipts/$sha"
+  run_copy reddened deny
+  (( rc == 1 )) || self_fail "a gate whose cargo deny failed exited $rc, not 1: $(cat "$tmp/reddened.out")"
+  [[ -z "$(receipts_of reddened)" ]] \
+    || self_fail "a red gate on $sha left the receipt of an earlier pass on it: $(receipts_of reddened)"
+
   echo "OK  self-test: the exit file says running while a gate runs and holds the whole"
   echo "    gate's verdict at the end, a step after the tests included; a gate killed"
-  echo "    in the middle leaves 'running', never an old 0; a refused gate leaves it alone"
+  echo "    in the middle leaves 'running', never an old 0; a refused gate leaves it alone."
+  echo "    A green gate over a clean tree leaves a receipt for its commit; an untracked"
+  echo "    file, a tree or HEAD that changed during the run and an exit 0 over SKIPPED"
+  echo "    leave none and say why; a red run on a commit removes its earlier receipt"
   exit 0
 fi
 

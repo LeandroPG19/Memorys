@@ -210,6 +210,7 @@ self_test() {
   git init -q "$work"
   mkdir -p "$work/scripts" "$work/rust"
   tr -d '\r' <"$ROOT/scripts/release.sh" >"$work/scripts/release.sh"
+  tr -d '\r' <"$ROOT/scripts/gate-lock.sh" >"$work/scripts/gate-lock.sh"
   printf '%s\n' '#!/usr/bin/env bash' \
     ': >"$HOME/gate-ran"' \
     'echo "WHAT IT REQUIRES (missing = FAIL, never SKIPPED):"' \
@@ -363,13 +364,78 @@ self_test() {
     self_fail "a tag on another commit passed on a receipt line copied into it"
   fi
 
+  # The receipt merge-gate.sh leaves in ~/.cache/cuba-gate/receipts/<sha> when
+  # it passes over a clean tree. A release of that commit reads it instead of
+  # running the gate a second time; any other file there is not a pass of HEAD.
+  # A new version on a new commit, so that $sha is "another commit" from here on.
+  sed -i 's/^version = "0.27.0"$/version = "0.27.1"/' "$work/rust/Cargo.toml"
+  git -C "$work" commit -q -am "0.27.1"
+  git -C "$work" push -q origin main 2>/dev/null
+  sha2="$(git -C "$work" rev-parse HEAD)"
+  receipts="$HOME/.cache/cuba-gate/receipts"
+  mkdir -p "$receipts"
+  # kill_rate=0.777, where the stand-in gate prints 0.900: which of the two
+  # reached the tag says whether the gate ran.
+  receipt_of() {
+    printf '%s %s\n' "$RECEIPT_PREFIX" "$1"
+    printf 'local-gate-date: 2026-09-01T00:00:00Z\n'
+    printf 'local-gate-summary: mutants caught=7 missed=2 timeout=0 unviable=0 kill_rate=0.777 min=0.700\n'
+    printf 'local-gate-summary: MERGE GATE PASSED — safe to merge (local CI 100%%)\n'
+  }
+
+  # A receipt for another commit.
+  receipt_of "$sha" >"$receipts/$sha"
+  rm -f "$HOME/gate-ran"
+  run --dry-run v0.27.1 || self_fail "a dry run next to another commit's receipt was refused: $(cat "$tmp/out")"
+  [[ -e "$HOME/gate-ran" ]] || self_fail "the receipt for $sha let $sha2 be released without the gate"
+  grep -q "no receipt for $sha2" "$tmp/out" \
+    || self_fail "the gate ran on $sha2 without saying there is no receipt for it: $(cat "$tmp/out")"
+  grep -qxF "$RECEIPT_PREFIX $sha2" "$tmp/out" || self_fail "the dry run did not print $sha2's receipt: $(cat "$tmp/out")"
+  ! grep -q "kill_rate=0.777" "$tmp/out" || self_fail "the receipt for $sha reached the tag of $sha2: $(cat "$tmp/out")"
+
+  # A file named after HEAD that speaks of another commit.
+  cp "$receipts/$sha" "$receipts/$sha2"
+  rm -f "$HOME/gate-ran"
+  run --dry-run v0.27.1 || self_fail "a dry run over a receipt for the wrong commit was refused: $(cat "$tmp/out")"
+  [[ -e "$HOME/gate-ran" ]] || self_fail "a file named $sha2 whose receipt is for $sha let the gate be skipped"
+  grep -q "is not a receipt for $sha2" "$tmp/out" \
+    || self_fail "the gate ran over a receipt for the wrong commit without saying why: $(cat "$tmp/out")"
+
+  # A receipt for HEAD, and --rerun-gate: the gate runs anyway.
+  receipt_of "$sha2" >"$receipts/$sha2"
+  rm -f "$HOME/gate-ran"
+  run --rerun-gate --dry-run v0.27.1 || self_fail "--rerun-gate over a receipt for HEAD was refused: $(cat "$tmp/out")"
+  [[ -e "$HOME/gate-ran" ]] || self_fail "--rerun-gate did not run the gate over a receipt for HEAD"
+  grep -q "kill_rate=0.900" "$tmp/out" && ! grep -q "kill_rate=0.777" "$tmp/out" \
+    || self_fail "--rerun-gate's tag message is not the verdict of the gate it ran: $(cat "$tmp/out")"
+  no_tag_anywhere_for() {
+    ! git -C "$work" rev-parse -q --verify "refs/tags/$1" >/dev/null || self_fail "$2: a tag was created locally"
+    ! git -C "$origin" rev-parse -q --verify "refs/tags/$1" >/dev/null || self_fail "$2: a tag reached origin"
+  }
+  no_tag_anywhere_for v0.27.1 "a dry run with --rerun-gate"
+
+  # A receipt for HEAD: no gate, and the tag carries the receipt's lines.
+  rm -f "$HOME/gate-ran"
+  run v0.27.1 || self_fail "a release over a receipt for HEAD was refused: $(cat "$tmp/out")"
+  [[ ! -e "$HOME/gate-ran" ]] || self_fail "the gate ran again on $sha2 although it left a receipt for it"
+  [[ "$(git -C "$origin" cat-file -t refs/tags/v0.27.1 2>/dev/null)" == tag ]] \
+    || self_fail "origin did not receive an annotated v0.27.1: $(cat "$tmp/out")"
+  out="$(git -C "$origin" cat-file -p refs/tags/v0.27.1)"
+  while IFS= read -r line; do
+    grep -qxF "$line" <<<"$out" || self_fail "the tag lost the receipt's line '$line': $out"
+  done <"$receipts/$sha2"
+  (cd "$work" && "$BASH" scripts/release.sh --verify-receipt v0.27.1 "$sha2") >"$tmp/out" 2>&1 \
+    || self_fail "the tag written from merge-gate.sh's receipt is not one --verify-receipt accepts: $(cat "$tmp/out")"
+
   echo "OK  self-test: a dirty tree, a HEAD ahead of or behind origin/main, a tag taken"
   echo "    here or on origin and a version Cargo.toml does not declare are refused before"
   echo "    the gate; a red gate and an exit 0 over SKIPPED, a failed run or a missing"
   echo "    verdict are refused after it; nothing is tagged in any of them. The receipt a"
   echo "    green run writes is the one --verify-receipt accepts once the annotated tag is"
   echo "    fetched, and it refuses the lightweight tag checkout leaves, another commit and"
-  echo "    an annotated tag without the line"
+  echo "    an annotated tag without the line. merge-gate.sh's receipt for HEAD replaces the"
+  echo "    gate and its lines reach the tag; one for another commit, one naming another"
+  echo "    commit inside, and --rerun-gate all run the gate"
 }
 
 case "${1:-}" in
