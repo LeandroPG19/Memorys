@@ -16,6 +16,17 @@ versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI
 - **`validar-handoff.sh` takes an optional `paths:` list.** With several agents in one tree, `tests: frozen` compared the whole tree and refused one agent's honest green pass for a test another agent had edited. With `paths:`, `written` and `frozen` look only at the files under those paths; without it, nothing changes. An empty list, a path that exists neither in the tree nor at `commit`, and `paths:` with `commit: none` are refused.
 - **The first thirteen `--exclude-re` entries of `quality-gate.sh` have a reason, an owner and an expiry date**, like the rest, so the expiry reader now covers them. One of them, `builtin_retrieval_set`, has no reason: it is a pure function `--lib` can call, judged nowhere. It says so and expires on 2026-10-23, by when it needs a unit test and the pattern deleted.
 
+### Fixed
+
+- **The GPU provider libraries are looked for beside the runtime that is loaded.** `configure` loads whatever `locate_onnxruntime` finds — the home cache, then `LD_LIBRARY_PATH`, then the system directories — but `gpu::runtime_dir` looked for the providers only in the home cache. A machine whose runtime lived in `LD_LIBRARY_PATH` or `/usr/lib` loaded it and was then told it had no GPU runtime, and sent to download one. `runtime_dir` now asks the same search, and the cache rule it kept a copy of lives once, in `embeddings::onnx::runtime_cache_dir`. `ORT_DYLIB_PATH` still wins, as before.
+- **`gpu-placement-check.sh` looks where the binary looks.** It read `XDG_CACHE_HOME` first; the binary never has — `envs::home()` joins `.cache` to `HOME` or `USERPROFILE`, and `models runtime` downloads there — so on a machine that sets it the two readings the step compares were of two directories. The script dropped the variable (moving the binary instead would orphan every runtime already downloaded) and now mirrors the whole chain above. Two `--self-test` rows prove it; both were red against the old script.
+
+### Hardened
+
+- **`merge_driver` decides in a function with a name.** `a || b && c` and five `else if` (CC 18) became `sync_file_kind`, a table where the first matching row wins, with the grouping written out — which changed no row, since `/entities/` already contains `entities`. A 33-row table test over every path shape git can pass was written and run against the old body first. It pins two shapes that lose data today and were left alone on purpose: at a sync root that is the repository root, `episodes/`, `errors/` and `decisions/` get no merge; and a root whose path contains `entities` sends `relations.json` and `projects.json` to the entity merge, which cannot parse them. Either way git keeps ours and drops theirs without a conflict marker.
+- **`handshake_timeout` has a test**, one row per input, including the three that read like accidents: `00` is a zero wait that fires the watchdog at once, only the literal `0` is off, and a value that does not parse turns the watchdog off instead of keeping the 60 s default.
+- **The reranker's test home is unique per fixture.** `FakeHome` named its directory after the process id, which every test in the binary shares, so two with one tag shared a directory and the `Drop` of one deleted the other's model.
+
 ## [0.27.0] — 2026-09-23 (Cargo `0.27.0` · npm `0.27.0` · PyPI `1.29.0`)
 
 ### Behaviour changes — read before deploying

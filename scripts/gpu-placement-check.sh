@@ -93,25 +93,80 @@ verdict() {
 
 # ------------------------------------------------------- reading this machine
 
+# runtime_cache_dir() in rust/src/embeddings/onnx.rs: HOME, then USERPROFILE,
+# then nothing — and never XDG_CACHE_HOME. This script used to honour it and
+# the binary never has (envs::home() reads the two names and joins `.cache`,
+# and `models runtime` downloads there), so on a machine that sets it the two
+# readings this step compares were of two different directories. The binary
+# is the one that decides, and moving it would orphan every runtime already
+# downloaded, so the script is the one that moved.
+ort_cache_dir() {
+  local home cache
+  if [[ -n "${HOME+set}" ]]; then
+    home="$HOME"
+  elif [[ -n "${USERPROFILE+set}" ]]; then
+    home="$USERPROFILE"
+  else
+    return 1
+  fi
+  cache="$home/.cache"
+  if [[ -e "$cache/memory-industry/onnxruntime" || ! -e "$cache/cuba-memorys/onnxruntime" ]]; then
+    printf '%s\n' "$cache/memory-industry/onnxruntime"
+  else
+    printf '%s\n' "$cache/cuba-memorys/onnxruntime"
+  fi
+}
+
+# The file locate_onnxruntime() looks for, spelled for the platform this shell
+# runs on, which is the platform of the binary it judges.
+ort_library_name() {
+  case "$(uname -s)" in
+    Darwin) printf 'libonnxruntime.dylib\n' ;;
+    MINGW* | MSYS* | CYGWIN*) printf 'onnxruntime.dll\n' ;;
+    *) printf 'libonnxruntime.so\n' ;;
+  esac
+}
+
 # Mirrors runtime_dir() in rust/src/gpu.rs: the providers live beside the
-# runtime library, and ORT_DYLIB_PATH is what run-all-tests.sh exports.
+# runtime that gets loaded. ORT_DYLIB_PATH first (run-all-tests.sh exports
+# it); then the chain of locate_onnxruntime() — the home cache,
+# LD_LIBRARY_PATH split on `:`, the system directories; and with nothing found
+# anywhere, where `models runtime` would put it.
 ort_runtime_dir() {
-  local cache
+  local lib cache dir
+  local -a search=() segments=()
   if [[ -n "${ORT_DYLIB_PATH:-}" ]]; then
     dirname "$ORT_DYLIB_PATH"
     return 0
   fi
-  cache="${XDG_CACHE_HOME:-${HOME:-${USERPROFILE:-}}/.cache}"
-  if [[ -d "$cache/memory-industry/onnxruntime" ]]; then
-    printf '%s\n' "$cache/memory-industry/onnxruntime"
-    return 0
+  lib="$(ort_library_name)"
+  cache="$(ort_cache_dir)" || cache=""
+  if [[ -n "$cache" ]]; then
+    search+=("$cache")
   fi
-  printf '%s\n' "$cache/cuba-memorys/onnxruntime"
+  IFS=':' read -r -a segments <<< "${LD_LIBRARY_PATH:-}"
+  for dir in "${segments[@]}"; do
+    if [[ -n "$dir" ]]; then
+      search+=("$dir")
+    fi
+  done
+  search+=(/usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu /usr/lib64 /opt/homebrew/lib)
+  for dir in "${search[@]}"; do
+    if [[ -e "$dir/$lib" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  if [[ -n "$cache" ]]; then
+    printf '%s\n' "$cache"
+  fi
 }
 
 provider_lib_present() {
   local dir name
   dir="$(ort_runtime_dir)"
+  # No directory is the binary's `None`: nothing downloaded, no provider.
+  [[ -n "$dir" ]] || return 1
   for name in "$@"; do
     if [[ -e "$dir/$name" ]]; then
       return 0

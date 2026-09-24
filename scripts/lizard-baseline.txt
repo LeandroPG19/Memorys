@@ -39,8 +39,8 @@ src/dedupe_cli.rs::merge_entity:331 13
 src/dedupe_cli.rs::run_cli:47 30
 src/doctor.rs::run_checks_with:484 43
 src/doctor.rs::run_cli:1059 13
-src/embeddings/onnx.rs::compute_onnx_embedding:425 19
-src/embeddings/onnx.rs::init_onnx_session:282 14
+src/embeddings/onnx.rs::compute_onnx_embedding:437 19
+src/embeddings/onnx.rs::init_onnx_session:294 14
 src/eval/datasets.rs::load_jsonl_dataset:91 14
 src/eval/harness.rs::run_faro_eval:135 21
 src/eval/mod.rs::compare_runs:45 15
@@ -117,8 +117,7 @@ src/handlers/sync.rs::validate_bundle:1659 36
 src/handlers/vigia.rs::health:100 12
 src/handlers/zafra.rs::handle:76 35
 src/hooks_cli.rs::install:195 14
-src/hooks_cli.rs::merge_driver:383 18
-src/hooks_cli.rs::merge_episode_file:480 9
+src/hooks_cli.rs::merge_episode_file:511 9
 src/hooks_cli.rs::remove_gitattributes_line:160 9
 src/hooks_cli.rs::remove_hook_block:288 9
 src/http.rs::dispatch_one:1194 12

@@ -406,24 +406,21 @@ pub fn active_provider() -> String {
     status().detail
 }
 
+/// The directory the provider libraries are looked for in: beside the runtime
+/// `configure` loads, which is whatever `locate_onnxruntime` finds.
+///
+/// `ORT_DYLIB_PATH` is taken as the operator's word even when the file is not
+/// there yet, which the search does not do. With nothing found anywhere, the
+/// answer is where `models runtime` would put it; `runtime_has_gpu_provider`
+/// then finds nothing there, and a `None` — no home at all — reads the same.
 fn runtime_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
         return PathBuf::from(p).parent().map(|p| p.to_path_buf());
     }
-    // `.ok()?`: `runtime_has_gpu_provider` reads None as «nothing downloaded»
-    // and drops to the CPU, which is right for a machine that never ran
-    // `models runtime` — not a fault to report.
-    let cache = crate::envs::home().ok()?.join(".cache");
-    let preferred = cache.join("memory-industry").join("onnxruntime");
-    // A directory that exists on operators' disks, not the binary's name: a
-    // rename sweep that greps for the old name has to leave this one alone or
-    // every runtime already downloaded is orphaned.
-    let legacy = cache.join("cuba-memorys").join("onnxruntime");
-    Some(if preferred.exists() || !legacy.exists() {
-        preferred
-    } else {
-        legacy
-    })
+    match crate::embeddings::onnx::locate_onnxruntime() {
+        Some(runtime) => runtime.parent().map(|p| p.to_path_buf()),
+        None => crate::embeddings::onnx::runtime_cache_dir(),
+    }
 }
 
 fn runtime_has_gpu_provider(provider: &str) -> bool {

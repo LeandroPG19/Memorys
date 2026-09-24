@@ -381,38 +381,69 @@ fn uninstall() -> Result<()> {
 }
 
 fn merge_driver(args: &[String]) -> Result<()> {
-    let [ancestor, ours, theirs, path] = args else {
+    let [_ancestor, ours, theirs, path] = args else {
         anyhow::bail!("usage: hook merge-driver %O %A %B %P (git passes these itself)");
     };
 
-    let path_lower = path.to_lowercase();
-    let merged: Option<Vec<u8>> = if path_lower.contains("/entities/")
-        || path_lower.ends_with(".json") && path_lower.contains("entities")
-    {
-        merge_entity_file(ours, theirs)?
-    } else if path_lower.ends_with("relations.json") {
-        merge_relations(ours, theirs)?
-    } else if path_lower.ends_with("projects.json") {
-        merge_projects(ours, theirs)?
-    } else if path_lower.contains("/episodes/") {
-        merge_episode_file(ours, theirs)?
-    } else if path_lower.contains("/errors/") {
-        merge_error_file(ours, theirs)?
-    } else if path_lower.contains("/decisions/") {
-        merge_decision_file(ours, theirs)?
-    } else {
-        None
+    // No merge for this path: exit 0 without writing, so git keeps ours.
+    let Some(kind) = sync_file_kind(path) else {
+        return Ok(());
     };
-
-    let _ = ancestor;
-
-    match merged {
-        Some(bytes) => {
-            std::fs::write(ours, bytes).with_context(|| format!("writing merged {ours}"))?;
-            Ok(())
-        }
-        None => Ok(()),
+    let merge: fn(&str, &str) -> Result<Option<Vec<u8>>> = match kind {
+        SyncFile::Entity => merge_entity_file,
+        SyncFile::Relations => merge_relations,
+        SyncFile::Projects => merge_projects,
+        SyncFile::Episode => merge_episode_file,
+        SyncFile::Error => merge_error_file,
+        SyncFile::Decision => merge_decision_file,
+    };
+    if let Some(bytes) = merge(ours, theirs)? {
+        std::fs::write(ours, bytes).with_context(|| format!("writing merged {ours}"))?;
     }
+    Ok(())
+}
+
+enum SyncFile {
+    Entity,
+    Relations,
+    Projects,
+    Episode,
+    Error,
+    Decision,
+}
+
+/// Which sync file git's `%P` names, by the rule `merge_driver` has always
+/// applied: the first row that fits wins, compared lowercased.
+///
+/// It used to be an `if` over `a || b && c` and five `else if`. `&&` binds
+/// tighter, so that read `a || (b && c)` — and since `/entities/` contains
+/// `entities`, the other grouping would have answered the same; the
+/// parentheses below say which one is meant, they do not change a row.
+///
+/// The rows are substring tests on the whole path, not on its components, and
+/// `merge_driver_picks_the_same_merge_for_every_path_shape` pins what follows
+/// from that, the odd rows included: only the entity row has a half that does
+/// without a leading `/`, so at a sync root that is the repository root
+/// `episodes/`, `errors/` and `decisions/` get no merge; and a root whose path
+/// says `entities` sends `relations.json` and `projects.json` to the entity
+/// merge. Both end with git keeping ours and dropping theirs without a
+/// conflict marker. They are left as they were on purpose: this split moved
+/// the decision and must not change it.
+fn sync_file_kind(path: &str) -> Option<SyncFile> {
+    let path = path.to_lowercase();
+    [
+        (
+            SyncFile::Entity,
+            path.contains("/entities/") || (path.ends_with(".json") && path.contains("entities")),
+        ),
+        (SyncFile::Relations, path.ends_with("relations.json")),
+        (SyncFile::Projects, path.ends_with("projects.json")),
+        (SyncFile::Episode, path.contains("/episodes/")),
+        (SyncFile::Error, path.contains("/errors/")),
+        (SyncFile::Decision, path.contains("/decisions/")),
+    ]
+    .into_iter()
+    .find_map(|(kind, fits)| fits.then_some(kind))
 }
 
 fn merge_entity_file(ours_path: &str, theirs_path: &str) -> Result<Option<Vec<u8>>> {

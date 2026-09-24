@@ -637,10 +637,7 @@ mod tests {
 
     impl FakeHome {
         fn with_a_model_in_the_cache(tag: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "memory-industry-rerank-{}-{tag}",
-                std::process::id()
-            ));
+            let root = scratch_root(&format!("rerank-{tag}"));
             let cache = root.join(".cache").join("memory-industry").join("reranker");
             std::fs::create_dir_all(&cache).expect("temp dir is writable");
             std::fs::write(cache.join("model.onnx"), b"not a real graph").expect("writable");

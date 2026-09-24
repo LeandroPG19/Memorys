@@ -95,22 +95,11 @@ pub(crate) fn locate_onnxruntime() -> Option<PathBuf> {
         "libonnxruntime.so"
     };
 
-    // `.ok().map(…)` and not `?`: this is not a result, it is the first
-    // candidate of the chain below. With no home the candidate drops out and
-    // the search goes on to LD_LIBRARY_PATH and the system directories, which
-    // is how a machine with the runtime in /usr/lib and no HOME still loads it.
-    let cache_lib = crate::envs::home().ok().map(|home| {
-        let cache = home.join(".cache");
-        let preferred = cache.join("memory-industry").join("onnxruntime");
-        let legacy = cache.join("cuba-memorys").join("onnxruntime");
-        if preferred.exists() || !legacy.exists() {
-            preferred
-        } else {
-            legacy
-        }
-    });
-
-    let search: Vec<PathBuf> = cache_lib
+    // Not a result: the first candidate of the chain below. With no home the
+    // candidate drops out and the search goes on to LD_LIBRARY_PATH and the
+    // system directories, which is how a machine with the runtime in /usr/lib
+    // and no HOME still loads it.
+    let search: Vec<PathBuf> = runtime_cache_dir()
         .into_iter()
         .chain(
             std::env::var("LD_LIBRARY_PATH")
@@ -142,6 +131,29 @@ pub(crate) fn locate_onnxruntime() -> Option<PathBuf> {
     // a set_var while another thread reads the environment is undefined
     // behaviour. `gpu::configure` hands the path to `ort::init_from` instead.
     Some(found)
+}
+
+/// Where `models runtime` puts ONNX Runtime under the home: the documented
+/// name, or the pre-rename one when only that one is on disk.
+///
+/// `None` without a home, said quietly: callers read it as «nothing
+/// downloaded», which is the supported CPU machine and not a fault.
+///
+/// `gpu::runtime_dir` used to keep its own copy of this rule, and the copy
+/// was also where it stopped looking: it never saw a runtime this search
+/// found anywhere else.
+pub(crate) fn runtime_cache_dir() -> Option<PathBuf> {
+    let cache = crate::envs::home().ok()?.join(".cache");
+    let preferred = cache.join("memory-industry").join("onnxruntime");
+    // A directory that exists on operators' disks, not the binary's name: a
+    // rename sweep that greps for the old name has to leave this one alone or
+    // every runtime already downloaded is orphaned.
+    let legacy = cache.join("cuba-memorys").join("onnxruntime");
+    Some(if preferred.exists() || !legacy.exists() {
+        preferred
+    } else {
+        legacy
+    })
 }
 
 fn cache_roots() -> Vec<PathBuf> {
