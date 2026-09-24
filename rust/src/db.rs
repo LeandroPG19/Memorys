@@ -38,7 +38,7 @@ pub async fn provision_app_role(pool: &PgPool, role: &str, password: &str) {
         return;
     }
 
-    match write_app_role_password(pool, role, password).await {
+    match retry_on_catalog_race(|| Box::pin(write_app_role_password(pool, role, password))).await {
         Ok(()) => tracing::info!(role, "application role provisioned"),
         Err(why) => {
             tracing::warn!(error = %why, "could not set the application role password")
@@ -392,14 +392,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             ),
         }
     } else {
-        // Boxed so rustc proves Send here, with concrete lifetimes: inferred, Migrator::run
-        // left create_pool's future !Send (v043 spawns it) once provision_app_role took a tx.
-        let migrate: Pin<Box<dyn Future<Output = Result<(), MigrateError>> + Send + '_>> =
-            Box::pin(MIGRATOR.run(pool));
-        migrate.await.context("failed to run sqlx migrations")?;
-
-        tracing::info!("sqlx migrations applied");
-        provision_app_role_from_pgpass(pool).await;
+        migrate_and_provision(pool).await?;
     }
 
     sqlx::query("SET timezone TO 'UTC'")
@@ -425,6 +418,116 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The migrations, then cuba_app's password, each tried again when it loses a
+/// catalog race to another database of the same server (see
+/// is_concurrent_catalog_update). Out of init_schema so that function keeps
+/// its baseline CC: lizard counts a closure's `||` as a branch.
+async fn migrate_and_provision(pool: &PgPool) -> Result<()> {
+    retry_on_catalog_race(|| Box::pin(migrate(pool)))
+        .await
+        .context("failed to run sqlx migrations")?;
+
+    tracing::info!("sqlx migrations applied");
+    provision_app_role_from_pgpass(pool).await;
+    Ok(())
+}
+
+/// The migrator, on a connection of its own that is closed when the run fails.
+///
+/// A failed run leaves its session holding the migration lock: run_direct
+/// takes a session-level `pg_advisory_lock` first and returns on the error
+/// without reaching its unlock (sqlx-core 0.8.6, migrate/migrator.rs:147-189).
+/// Back in the pool, that connection would keep the lock while it idles, and a
+/// retry on another connection would wait on it for as long as the pool keeps
+/// it. Closing it ends the session, the lock and the failed migration's
+/// transaction with it; nothing of that transaction was committed.
+///
+/// run_direct, not run: run on `&mut PgConnection` asks for `Acquire<'a>` for
+/// every lifetime, which rustc refuses ("implementation of `Acquire` is not
+/// general enough"); sqlx-core 0.8.6 keeps run_direct public for exactly that
+/// (migrate/migrator.rs:140-145). Boxed so rustc proves Send here, with
+/// concrete lifetimes: inferred, Migrator::run left create_pool's future !Send
+/// (v043 spawns it) once provision_app_role took a tx.
+async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
+    let mut conn = pool.acquire().await?;
+    let outcome = {
+        let run: Pin<Box<dyn Future<Output = Result<(), MigrateError>> + Send + '_>> =
+            Box::pin(MIGRATOR.run_direct(&mut *conn));
+        run.await
+    };
+    if outcome.is_err() {
+        conn.close().await.ok();
+    }
+    outcome
+}
+
+/// Whether `error`, or an error under it, is PostgreSQL's `tuple concurrently
+/// updated`: two sessions wrote one catalog row at once. Here that row is
+/// cuba_app's in `pg_authid`, which belongs to the whole server. Migration 0041
+/// creates or alters cuba_app and provision_app_role alters its password,
+/// while sqlx's migration lock is per database, so two databases of one server
+/// migrating together both write it and one of them loses. It is an `elog`
+/// in PostgreSQL's simple_heap_update: SQLSTATE XX000, text never translated.
+fn is_concurrent_catalog_update(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |e| e.source())
+        .filter_map(|e| e.downcast_ref::<sqlx::Error>()?.as_database_error())
+        .any(|db| {
+            db.code().as_deref() == Some("XX000") && db.message() == "tuple concurrently updated"
+        })
+}
+
+/// How many times a step that lost a catalog race is tried, the first included.
+const CATALOG_RACE_ATTEMPTS: u32 = 5;
+
+/// Runs `attempt` until it gives anything but a lost catalog race, at most
+/// CATALOG_RACE_ATTEMPTS times, and returns what the last run gave. Any other
+/// error goes out from the attempt that raised it.
+///
+/// Repeating what init_schema hands it is safe. A migration runs in one
+/// transaction together with the insert of its `_sqlx_migrations` row
+/// (sqlx-postgres 0.8.6, migrate.rs:214-225 and 275-298; none of ours starts
+/// with `-- no-transaction`), so one that lost the race left no row, and no
+/// row with `success = false`, which is what sqlx calls dirty; the next run
+/// applies it from the start. write_app_role_password is one transaction too.
+///
+/// Each attempt comes boxed and Send so that create_pool's future stays Send.
+async fn retry_on_catalog_race<'a, T, E>(
+    mut attempt: impl FnMut() -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>,
+) -> Result<T, E>
+where
+    E: std::error::Error + 'static,
+{
+    let mut tried = 1;
+    loop {
+        match attempt().await {
+            Err(error) if tried < CATALOG_RACE_ATTEMPTS && is_concurrent_catalog_update(&error) => {
+                // The low half of a v4 uuid, drawn from the OS generator, as in
+                // bind_app_role: jitter without adding `rand` to the crate.
+                let wait = catalog_race_backoff(tried, uuid::Uuid::new_v4().as_u128() as u64);
+                tracing::warn!(
+                    attempt = tried,
+                    of = CATALOG_RACE_ATTEMPTS,
+                    ?wait,
+                    error = %error,
+                    "lost a race for a catalog row the whole server shares; trying again"
+                );
+                tokio::time::sleep(wait).await;
+                tried += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// The wait before retry number `retry` (1 is the first): a point in the upper
+/// half of a ceiling that doubles from 100 ms and stops at 400 ms, picked by
+/// `random`, so 50-400 ms in all. Random so that the sessions that collided do
+/// not come back in step and collide again.
+fn catalog_race_backoff(retry: u32, random: u64) -> Duration {
+    let ceiling_ms: u64 = 50 << retry.min(3);
+    Duration::from_millis(ceiling_ms / 2 + random % (ceiling_ms / 2 + 1))
 }
 
 pub async fn assert_embedding_dim(pool: &PgPool) -> Result<()> {
