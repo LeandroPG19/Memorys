@@ -861,14 +861,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The seven merges `merge_driver` can pick, as seen from outside it.
+    /// Eleven of the merges `merge_driver` can pick, as seen from outside it. The
+    /// twelfth, manifest.json's, keeps ours, and is tested on its own.
     ///
     /// Each one comes with a pair of sides that only its own merge can parse,
     /// and a test of the file that only its own merge writes back. A merge that
     /// did not run leaves ours as it was; a different merge either cannot parse
     /// the pair or reshapes it into something this test does not accept — the
     /// decision merge reads an episode, for one, and writes back only
-    /// `{id, content}`. So running all seven pairs through one path names the
+    /// `{id, content}`. So running all eleven pairs through one path names the
     /// merge that path gets, and names none when it gets none.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Merge {
@@ -879,9 +880,13 @@ mod tests {
         Error,
         Decision,
         Tombstones,
+        Facts,
+        Procedures,
+        Artifacts,
+        SourceTrust,
     }
 
-    const EVERY_MERGE: [Merge; 7] = [
+    const EVERY_MERGE: [Merge; 11] = [
         Merge::Entity,
         Merge::Relations,
         Merge::Projects,
@@ -889,6 +894,10 @@ mod tests {
         Merge::Error,
         Merge::Decision,
         Merge::Tombstones,
+        Merge::Facts,
+        Merge::Procedures,
+        Merge::Artifacts,
+        Merge::SourceTrust,
     ];
 
     fn as_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
@@ -989,6 +998,22 @@ mod tests {
                         serde_json::json!([row("brain_relations")]),
                     )
                 }
+                Merge::Facts => (
+                    serde_json::json!([fact(Uuid::new_v4(), "ours", T1, None, 0.5)]),
+                    serde_json::json!([fact(Uuid::new_v4(), "theirs", T1, None, 0.5)]),
+                ),
+                Merge::Procedures => (
+                    serde_json::json!([procedure(Uuid::new_v4(), "ours", T1, T1, (0, 0))]),
+                    serde_json::json!([procedure(Uuid::new_v4(), "theirs", T1, T1, (0, 0))]),
+                ),
+                Merge::Artifacts => (
+                    serde_json::json!([artifact("notes/ours.md", None, (1, "pc-a"), 1)]),
+                    serde_json::json!([artifact("notes/theirs.md", None, (1, "pc-b"), 1)]),
+                ),
+                Merge::SourceTrust => (
+                    serde_json::json!([trust("ours", 1.0, 1.0, T1)]),
+                    serde_json::json!([trust("theirs", 1.0, 1.0, T1)]),
+                ),
             }
         }
 
@@ -1012,6 +1037,20 @@ mod tests {
                     .is_ok_and(|merged| {
                         merged.len() == 2 && merged.iter().all(|t| t.get("table_name").is_some())
                     }),
+                Merge::Facts => serde_json::from_slice::<Vec<crate::sync::chunk::FactRow>>(written)
+                    .is_ok_and(|merged| merged.len() == 2),
+                Merge::Procedures => {
+                    serde_json::from_slice::<Vec<crate::sync::chunk::ProcedureRow>>(written)
+                        .is_ok_and(|merged| merged.len() == 2)
+                }
+                Merge::Artifacts => {
+                    serde_json::from_slice::<Vec<crate::sync::chunk::ArtifactRow>>(written)
+                        .is_ok_and(|merged| merged.len() == 2)
+                }
+                Merge::SourceTrust => {
+                    serde_json::from_slice::<Vec<crate::sync::chunk::SourceTrustRow>>(written)
+                        .is_ok_and(|merged| merged.len() == 2)
+                }
             }
         }
     }
@@ -1055,7 +1094,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cuba-merge-table-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let table: [(&str, Option<Merge>); 40] = [
+        let table: [(&str, Option<Merge>); 49] = [
             // The layout `sync export` writes, under both names of its root.
             (".memory-industry/entities/0b6c.json", Some(Merge::Entity)),
             (".cuba-memorys/entities/0b6c.json", Some(Merge::Entity)),
@@ -1145,10 +1184,26 @@ mod tests {
                 Some(Merge::Tombstones),
             ),
             (".memory-industry/old-tombstones.json", None),
-            // Sync writes these too, and they stay a person's to resolve: the
-            // import acts on manifest.json's project_id and embedding fields
-            // without checking them against the files, and embeddings.bin.zst
-            // is read with the width manifest.json declares.
+            // Every export writes these four as well, one list each, so they
+            // too stopped every merge of two branches that both exported.
+            // was: None, every row here but the last.
+            (".memory-industry/facts.json", Some(Merge::Facts)),
+            ("facts.json", Some(Merge::Facts)),
+            (".memory-industry/procedures.json", Some(Merge::Procedures)),
+            (".memory-industry/PROCEDURES.JSON", Some(Merge::Procedures)),
+            (".memory-industry/artifacts.json", Some(Merge::Artifacts)),
+            (
+                ".memory-industry/source_trust.json",
+                Some(Merge::SourceTrust),
+            ),
+            ("source_trust.json", Some(Merge::SourceTrust)),
+            (".memory-industry/errors/facts.json", Some(Merge::Facts)),
+            (".memory-industry/old-facts.json", None),
+            // manifest.json has a merge of its own now, and it keeps ours
+            // byte for byte: this table reads what was written over ours and
+            // cannot tell that from no merge, so the manifest has its own
+            // tests. embeddings.bin.zst stays a person's: it is read with the
+            // width manifest.json declares and cannot be rebuilt from files.
             (".memory-industry/manifest.json", None),
             ("manifest.json", None),
             (".memory-industry/embeddings.bin.zst", None),
@@ -1189,10 +1244,11 @@ mod tests {
 
         // CUBA_SYNC_DIR=entities, =errors, =episodes: the root's own name sits
         // in `%P` in front of the layout, and only the layout may decide.
-        let table: [(&str, Merge); 6] = [
+        let table: [(&str, Merge); 7] = [
             ("entities/relations.json", Merge::Relations),
             ("entities/projects.json", Merge::Projects),
             ("entities/tombstones.json", Merge::Tombstones),
+            ("entities/facts.json", Merge::Facts),
             ("errors/entities/0b6c.json", Merge::Entity),
             ("episodes/errors/0b6c.json", Merge::Error),
             ("entities/episodes/2026-07/0b6c.json", Merge::Episode),
@@ -1564,6 +1620,770 @@ mod tests {
              with ours untouched, so git leaves the file for a person:\n{}",
             wrong.join("\n")
         );
+    }
+
+    const T1: &str = "2026-08-01T00:00:00Z";
+    const T2: &str = "2026-08-02T00:00:00Z";
+    const T3: &str = "2026-08-03T00:00:00Z";
+
+    /// One fact, spelled the way `export_into` writes facts.json. A closed one
+    /// is what a supersession leaves behind: no longer current, `valid_to` set.
+    fn fact(
+        id: Uuid,
+        subject: &str,
+        observed_at: &str,
+        closed_at: Option<&str>,
+        confidence: f64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "fact_id": id,
+            "subject": subject,
+            "predicate": "runs on",
+            "object": "postgres",
+            "valid_from": observed_at,
+            "observed_at": observed_at,
+            "valid_to": closed_at,
+            "subject_entity_id": null,
+            "project_id": null,
+            "confidence": confidence,
+            "is_current": closed_at.is_none(),
+            "created_at": observed_at,
+            "layer_name": null,
+        })
+    }
+
+    /// One procedure as procedures.json holds it; `counts` is (success, failure).
+    fn procedure(
+        id: Uuid,
+        name: &str,
+        created_at: &str,
+        updated_at: &str,
+        counts: (i32, i32),
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "steps": [{"do": name}],
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "trigger_context": "",
+            "preconditions": "",
+            "verification": "",
+            "success_count": counts.0,
+            "failure_count": counts.1,
+            "last_outcome": null,
+            "last_used_at": null,
+            "project_id": null,
+            "embedding_model": null,
+        })
+    }
+
+    /// One artifact as artifacts.json holds it; `clock` is (crdt_counter,
+    /// crdt_actor). Every call is a row of its own id, as two machines that
+    /// both wrote one path have.
+    fn artifact(
+        path: &str,
+        project_id: Option<Uuid>,
+        clock: (i64, &str),
+        version: i64,
+    ) -> serde_json::Value {
+        let (counter, actor) = clock;
+        serde_json::json!({
+            "id": Uuid::new_v4(),
+            "path": path,
+            "content": format!("{path} v{version} by {actor}"),
+            "content_hash": format!("hash of {path} v{version} by {actor}"),
+            "version": version,
+            "project_id": project_id,
+            "origin_node": actor,
+            "crdt_actor": actor,
+            "crdt_counter": counter,
+            "updated_at": T1,
+        })
+    }
+
+    /// One row of source_trust.json.
+    fn trust(source: &str, alpha: f64, beta: f64, updated_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "source": source,
+            "alpha": alpha,
+            "beta": beta,
+            "updated_at": updated_at,
+        })
+    }
+
+    /// (case, ours, theirs, the merge as it has to be written). `None` is a
+    /// case whose winner this table does not spell out — two versions of one
+    /// row that rank the same — and is held to one row, to not depending on
+    /// which side is ours, and to merging again without change.
+    type RowCase = (
+        &'static str,
+        serde_json::Value,
+        serde_json::Value,
+        Option<serde_json::Value>,
+    );
+
+    /// A list of `T` read back and written out again, so that a field the
+    /// export fills with its default compares equal to one spelled out.
+    fn canonical<T: serde::de::DeserializeOwned + serde::Serialize>(
+        bytes: &[u8],
+    ) -> Option<serde_json::Value> {
+        let rows: Vec<T> = serde_json::from_slice(bytes).ok()?;
+        serde_json::to_value(rows).ok()
+    }
+
+    /// Runs every case through `merge_driver` for `path`, as git runs it, and
+    /// says what came out wrong: a conflict, another merge than the expected
+    /// one, a merge that depends on which branch is ours, or one that changes
+    /// when merged again with a side it already holds.
+    fn wrong_row_merges<T: serde::de::DeserializeOwned + serde::Serialize>(
+        dir: &Path,
+        path: &str,
+        cases: Vec<RowCase>,
+    ) -> Vec<String> {
+        let run = |ours: &[u8], theirs: &[u8]| -> Result<Vec<u8>> {
+            let args = driver_args(dir, ours, theirs, path);
+            merge_driver(&args)?;
+            Ok(std::fs::read(&args[1]).unwrap())
+        };
+        let mut wrong = Vec::new();
+        for (case, ours, theirs, expected) in cases {
+            let ours = serde_json::to_vec_pretty(&ours).unwrap();
+            let theirs = serde_json::to_vec_pretty(&theirs).unwrap();
+            let merged = match run(&ours, &theirs) {
+                Ok(merged) => merged,
+                Err(e) => {
+                    wrong.push(format!("{case}: left as a conflict: {e:#}"));
+                    continue;
+                }
+            };
+            let got = canonical::<T>(&merged);
+            let right = match &expected {
+                Some(expected) => got == canonical::<T>(&serde_json::to_vec(expected).unwrap()),
+                None => got
+                    .as_ref()
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|rows| rows.len() == 1),
+            };
+            if !right {
+                wrong.push(format!(
+                    "{case}: expected {}, merged {}",
+                    expected.map_or("one row".to_string(), |e| e.to_string()),
+                    String::from_utf8_lossy(&merged)
+                ));
+            }
+            let swapped = run(&theirs, &ours).ok();
+            if swapped.as_deref() != Some(merged.as_slice()) {
+                wrong.push(format!(
+                    "{case}: the merge depends on which branch is ours; the other way round it \
+                     wrote {:?}",
+                    swapped.as_deref().map(String::from_utf8_lossy)
+                ));
+            }
+            for side in [&ours, &theirs] {
+                let again = run(&merged, side).ok();
+                if again.as_deref() != Some(merged.as_slice()) {
+                    wrong.push(format!(
+                        "{case}: merging the result with a side it already holds changed it: {:?}",
+                        again.as_deref().map(String::from_utf8_lossy)
+                    ));
+                }
+            }
+        }
+        wrong
+    }
+
+    fn merge_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cuba-merge-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Two ids, the lower first.
+    fn two_ordered_ids() -> (Uuid, Uuid) {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        if a < b { (a, b) } else { (b, a) }
+    }
+
+    #[test]
+    fn facts_merge_into_one_list_keyed_by_fact_id_and_a_closed_fact_stays_closed() {
+        let dir = merge_dir("facts");
+        let [a, b, k] = [(); 3].map(|_| Uuid::new_v4());
+        let (low, high) = two_ordered_ids();
+        let open = |id: Uuid, confidence: f64| fact(id, "svc", T1, None, confidence);
+        let closed = |id: Uuid, at: &str| fact(id, "svc", T1, Some(at), 0.5);
+        let list = |rows: &[serde_json::Value]| serde_json::Value::Array(rows.to_vec());
+
+        let cases: Vec<RowCase> = vec![
+            (
+                "disjoint, written oldest observation first",
+                list(&[fact(a, "svc-a", T2, None, 0.5)]),
+                list(&[fact(b, "svc-b", T1, None, 0.5)]),
+                Some(list(&[
+                    fact(b, "svc-b", T1, None, 0.5),
+                    fact(a, "svc-a", T2, None, 0.5),
+                ])),
+            ),
+            (
+                "two facts observed at one instant",
+                list(&[fact(high, "svc-h", T1, None, 0.5)]),
+                list(&[fact(low, "svc-l", T1, None, 0.5)]),
+                Some(list(&[
+                    fact(low, "svc-l", T1, None, 0.5),
+                    fact(high, "svc-h", T1, None, 0.5),
+                ])),
+            ),
+            (
+                "theirs closed it",
+                list(&[open(k, 0.5)]),
+                list(&[closed(k, T3)]),
+                Some(list(&[closed(k, T3)])),
+            ),
+            (
+                "ours closed it",
+                list(&[closed(k, T2)]),
+                list(&[open(k, 0.5)]),
+                Some(list(&[closed(k, T2)])),
+            ),
+            (
+                "both closed it, the later close stands",
+                list(&[closed(k, T2)]),
+                list(&[closed(k, T3)]),
+                Some(list(&[closed(k, T3)])),
+            ),
+            (
+                "identical",
+                list(&[open(low, 0.5), open(high, 0.5)]),
+                list(&[open(low, 0.5), open(high, 0.5)]),
+                Some(list(&[open(low, 0.5), open(high, 0.5)])),
+            ),
+            (
+                "ours empty",
+                list(&[]),
+                list(&[open(a, 0.5)]),
+                Some(list(&[open(a, 0.5)])),
+            ),
+            (
+                "theirs empty",
+                list(&[open(a, 0.5)]),
+                list(&[]),
+                Some(list(&[open(a, 0.5)])),
+            ),
+            ("both empty", list(&[]), list(&[]), Some(list(&[]))),
+            (
+                "one open fact read two ways",
+                list(&[open(k, 0.5)]),
+                list(&[open(k, 0.9)]),
+                None,
+            ),
+        ];
+
+        let wrong = wrong_row_merges::<crate::sync::chunk::FactRow>(
+            &dir,
+            ".memory-industry/facts.json",
+            cases,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wrong.is_empty(),
+            "every export writes facts.json, so two branches that both exported stopped on it in \
+             every merge. Its rows are keyed by fact_id, the primary key of brain_facts and what \
+             the import conflicts on. A fact only ever moves from current to closed — a \
+             supersession sets is_current false and valid_to, nothing sets it back — so where \
+             both sides hold one the closed version is the later one, and of two closes the \
+             later stands. Written oldest observation first, as the export orders it:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn procedures_merge_by_id_the_later_edit_stands_and_neither_side_loses_a_count() {
+        let dir = merge_dir("procedures");
+        let [a, b, k] = [(); 3].map(|_| Uuid::new_v4());
+        let list = |rows: &[serde_json::Value]| serde_json::Value::Array(rows.to_vec());
+
+        let cases: Vec<RowCase> = vec![
+            (
+                "disjoint, written oldest first",
+                list(&[procedure(a, "deploy", T2, T2, (1, 0))]),
+                list(&[procedure(b, "backup", T1, T1, (0, 0))]),
+                Some(list(&[
+                    procedure(b, "backup", T1, T1, (0, 0)),
+                    procedure(a, "deploy", T2, T2, (1, 0)),
+                ])),
+            ),
+            (
+                "theirs edited it later",
+                list(&[procedure(k, "old steps", T1, T1, (3, 0))]),
+                list(&[procedure(k, "new steps", T1, T2, (1, 2))]),
+                Some(list(&[procedure(k, "new steps", T1, T2, (3, 2))])),
+            ),
+            (
+                "ours edited it later",
+                list(&[procedure(k, "new steps", T1, T3, (0, 1))]),
+                list(&[procedure(k, "old steps", T1, T2, (4, 0))]),
+                Some(list(&[procedure(k, "new steps", T1, T3, (4, 1))])),
+            ),
+            (
+                "identical",
+                list(&[procedure(a, "deploy", T1, T2, (2, 1))]),
+                list(&[procedure(a, "deploy", T1, T2, (2, 1))]),
+                Some(list(&[procedure(a, "deploy", T1, T2, (2, 1))])),
+            ),
+            (
+                "ours empty",
+                list(&[]),
+                list(&[procedure(a, "deploy", T1, T1, (0, 0))]),
+                Some(list(&[procedure(a, "deploy", T1, T1, (0, 0))])),
+            ),
+            (
+                "theirs empty",
+                list(&[procedure(a, "deploy", T1, T1, (0, 0))]),
+                list(&[]),
+                Some(list(&[procedure(a, "deploy", T1, T1, (0, 0))])),
+            ),
+            (
+                "two edits at one instant",
+                list(&[procedure(k, "steps a", T1, T2, (1, 0))]),
+                list(&[procedure(k, "steps b", T1, T2, (0, 1))]),
+                None,
+            ),
+        ];
+
+        let wrong = wrong_row_merges::<crate::sync::chunk::ProcedureRow>(
+            &dir,
+            ".memory-industry/procedures.json",
+            cases,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wrong.is_empty(),
+            "procedures.json is keyed by id, the primary key of brain_procedures. Where both sides \
+             hold one, the later updated_at is the version that stands, and success_count and \
+             failure_count are the greater of the two, as the import does with GREATEST: each \
+             machine counts its own runs, and taking one side's number would drop the other's. \
+             Written oldest created_at first, as the export orders it:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn artifacts_merge_by_project_and_path_and_the_later_clock_stands() {
+        let dir = merge_dir("artifacts");
+        let project = Uuid::new_v4();
+        let list = |rows: &[serde_json::Value]| serde_json::Value::Array(rows.to_vec());
+        let note_a = artifact("notes/a.md", None, (1, "pc-b"), 1);
+        let note_b = artifact("notes/b.md", None, (1, "pc-a"), 1);
+        let x_counter_2 = artifact("notes/x.md", None, (2, "pc-a"), 1);
+        let x_counter_3 = artifact("notes/x.md", None, (3, "pc-b"), 1);
+        let x_actor_b = artifact("notes/x.md", None, (2, "pc-b"), 1);
+        let x_actor_a = artifact("notes/x.md", None, (2, "pc-a"), 1);
+        let x_version_3 = artifact("notes/x.md", None, (2, "pc-a"), 3);
+        let x_version_2 = artifact("notes/x.md", None, (2, "pc-a"), 2);
+        let x_in_project = artifact("notes/x.md", Some(project), (1, "pc-a"), 1);
+        let x_nowhere = artifact("notes/x.md", None, (1, "pc-b"), 1);
+
+        let cases: Vec<RowCase> = vec![
+            (
+                "disjoint, written in path order",
+                list(&[note_b.clone()]),
+                list(&[note_a.clone()]),
+                Some(list(&[note_a.clone(), note_b.clone()])),
+            ),
+            (
+                "one path, the higher counter stands",
+                list(&[x_counter_2.clone()]),
+                list(&[x_counter_3.clone()]),
+                Some(list(&[x_counter_3])),
+            ),
+            (
+                "one path, one counter, the greater actor stands",
+                list(&[x_actor_b.clone()]),
+                list(&[x_actor_a]),
+                Some(list(&[x_actor_b])),
+            ),
+            (
+                "one path, one clock, the higher version stands",
+                list(&[x_version_3.clone()]),
+                list(&[x_version_2]),
+                Some(list(&[x_version_3])),
+            ),
+            (
+                "one path in two projects is two artifacts",
+                list(&[x_in_project.clone()]),
+                list(&[x_nowhere.clone()]),
+                Some(list(&[x_nowhere, x_in_project])),
+            ),
+            (
+                "identical",
+                list(&[note_a.clone(), note_b.clone()]),
+                list(&[note_a.clone(), note_b.clone()]),
+                Some(list(&[note_a.clone(), note_b.clone()])),
+            ),
+            (
+                "ours empty",
+                list(&[]),
+                list(&[note_a.clone()]),
+                Some(list(&[note_a.clone()])),
+            ),
+            (
+                "theirs empty",
+                list(&[note_a.clone()]),
+                list(&[]),
+                Some(list(&[note_a])),
+            ),
+            ("both empty", list(&[]), list(&[]), Some(list(&[]))),
+        ];
+
+        let wrong = wrong_row_merges::<crate::sync::chunk::ArtifactRow>(
+            &dir,
+            ".memory-industry/artifacts.json",
+            cases,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wrong.is_empty(),
+            "artifacts.json is keyed by (project_id, path), brain_artifacts' unique key and what \
+             the import conflicts on: two machines that wrote one path hold two ids for it. \
+             Where both sides hold a path, the later CRDT clock stands — the higher crdt_counter, \
+             then the greater crdt_actor, as crdt::pick_lww decides on import — and the higher \
+             version breaks a tie of the clock. Written in path order, as the export writes it:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn source_trust_merges_by_source_and_each_count_keeps_its_highest() {
+        let dir = merge_dir("source-trust");
+        let list = |rows: &[serde_json::Value]| serde_json::Value::Array(rows.to_vec());
+
+        let cases: Vec<RowCase> = vec![
+            (
+                "disjoint, written in source order",
+                list(&[trust("user", 2.0, 1.0, T1)]),
+                list(&[trust("agent", 1.0, 3.0, T1)]),
+                Some(list(&[
+                    trust("agent", 1.0, 3.0, T1),
+                    trust("user", 2.0, 1.0, T1),
+                ])),
+            ),
+            (
+                "one source counted on both machines",
+                list(&[trust("agent", 5.0, 2.0, T1)]),
+                list(&[trust("agent", 3.0, 4.0, T2)]),
+                Some(list(&[trust("agent", 5.0, 4.0, T2)])),
+            ),
+            (
+                "identical",
+                list(&[trust("agent", 2.0, 2.0, T1)]),
+                list(&[trust("agent", 2.0, 2.0, T1)]),
+                Some(list(&[trust("agent", 2.0, 2.0, T1)])),
+            ),
+            (
+                "ours empty",
+                list(&[]),
+                list(&[trust("agent", 2.0, 2.0, T1)]),
+                Some(list(&[trust("agent", 2.0, 2.0, T1)])),
+            ),
+            (
+                "theirs empty",
+                list(&[trust("agent", 2.0, 2.0, T1)]),
+                list(&[]),
+                Some(list(&[trust("agent", 2.0, 2.0, T1)])),
+            ),
+            ("both empty", list(&[]), list(&[]), Some(list(&[]))),
+        ];
+
+        let wrong = wrong_row_merges::<crate::sync::chunk::SourceTrustRow>(
+            &dir,
+            ".memory-industry/source_trust.json",
+            cases,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wrong.is_empty(),
+            "source_trust.json is keyed by source, brain_source_trust's primary key. alpha and \
+             beta are counts of outcomes each machine gathered on its own, and the import keeps \
+             the greater of each (GREATEST), so the merge does too, field by field, and keeps the \
+             later updated_at. Written in source order, as the export writes it:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_row_file_that_does_not_read_whole_is_left_to_git_as_a_conflict() {
+        let dir = merge_dir("bad-rows");
+        let bytes = |value: serde_json::Value| serde_json::to_vec_pretty(&value).unwrap();
+        // (the file, a row it holds, the field that names the row)
+        let kinds = [
+            (
+                ".memory-industry/facts.json",
+                fact(Uuid::new_v4(), "svc", T1, None, 0.5),
+                "fact_id",
+            ),
+            (
+                ".memory-industry/procedures.json",
+                procedure(Uuid::new_v4(), "deploy", T1, T1, (0, 0)),
+                "id",
+            ),
+            (
+                ".memory-industry/artifacts.json",
+                artifact("notes/a.md", None, (1, "pc-a"), 1),
+                "path",
+            ),
+            (
+                ".memory-industry/source_trust.json",
+                trust("agent", 1.0, 1.0, T1),
+                "source",
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (path, row, key) in kinds {
+            let good = bytes(serde_json::json!([row.clone()]));
+            let mut unknown = row.clone();
+            unknown["reason"] = serde_json::json!("gdpr");
+            let mut keyless = row;
+            keyless.as_object_mut().unwrap().remove(key);
+            let unreadable: [(&str, Vec<u8>); 5] = [
+                ("not a list", br#"{"not":"a list"}"#.to_vec()),
+                ("cut off mid-row", format!("[{{\"{key}\":").into_bytes()),
+                ("an empty file", Vec::new()),
+                ("a row without its key", bytes(serde_json::json!([keyless]))),
+                (
+                    "a field this build does not know",
+                    bytes(serde_json::json!([unknown])),
+                ),
+            ];
+            for (label, bad) in unreadable {
+                for (side, ours, theirs) in [("theirs", &good, &bad), ("ours", &bad, &good)] {
+                    let args = driver_args(&dir, ours, theirs, path);
+                    let exit = merge_driver(&args);
+                    let left = std::fs::read(&args[1]).unwrap();
+                    if exit.is_ok() || left != *ours {
+                        wrong.push(format!(
+                            "{path}, {label}, as {side}: exit {exit:?}, left {:?}",
+                            String::from_utf8_lossy(&left)
+                        ));
+                    }
+                }
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wrong.is_empty(),
+            "a side the merge cannot read whole is a side it would drop rows of, and a field it \
+             does not know would be dropped by writing the merge back through this build's \
+             types. Each has to exit non-zero with ours untouched, so git leaves the file for a \
+             person:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// A manifest.json as `export_into` writes it, for a bundle of `project_id`
+    /// exported by `node` and hashing to `hash`.
+    fn manifest(project_id: Option<Uuid>, hash: &str, node: Uuid) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": crate::sync::chunk::SCHEMA_VERSION,
+            "manifest_hash": hash,
+            "project_id": project_id,
+            "project_name": null,
+            "exported_at": T1,
+            "counts": {
+                "entities": 1, "observations": 2, "episodes": 0, "decisions": 0,
+                "errors": 0, "relations": 0, "artifacts": 0
+            },
+            "with_embeddings": false,
+            "embedding_dim": null,
+            "node_id": node,
+            "embedding_model": "default",
+        })
+    }
+
+    #[test]
+    fn two_manifests_of_one_project_and_one_embedding_space_merge_as_ours() {
+        let dir = merge_dir("manifest-agree");
+        let project = Some(Uuid::new_v4());
+        let ours =
+            serde_json::to_vec_pretty(&manifest(project, "hash-of-ours", Uuid::new_v4())).unwrap();
+        let mut theirs = manifest(project, "hash-of-theirs", Uuid::new_v4());
+        theirs["exported_at"] = serde_json::json!(T2);
+        theirs["counts"]["entities"] = serde_json::json!(7);
+        let theirs = serde_json::to_vec_pretty(&theirs).unwrap();
+        let args = driver_args(&dir, &ours, &theirs, ".memory-industry/manifest.json");
+
+        let exit = merge_driver(&args);
+        let left = std::fs::read(&args[1]).unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            exit.is_ok(),
+            "both sides name one project and one embedding space, so every field the import acts \
+             on agrees; what differs — manifest_hash, exported_at, counts, node_id — is derived \
+             from the files and rewritten by the next export. A conflict here stopped every \
+             merge of two branches that both exported: {exit:?}"
+        );
+        assert_eq!(
+            left,
+            ours,
+            "the merge keeps ours as it was: {}",
+            String::from_utf8_lossy(&left)
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_disagrees_on_what_the_import_acts_on_is_a_conflict_naming_the_field() {
+        let dir = merge_dir("manifest-disagree");
+        let project = Some(Uuid::new_v4());
+        let ours =
+            serde_json::to_vec_pretty(&manifest(project, "hash-of-ours", Uuid::new_v4())).unwrap();
+        let theirs_with = |field: &str, value: serde_json::Value| {
+            let mut theirs = manifest(project, "hash-of-theirs", Uuid::new_v4());
+            theirs[field] = value;
+            serde_json::to_vec_pretty(&theirs).unwrap()
+        };
+        let disagreements = [
+            ("project_id", serde_json::json!(Uuid::new_v4())),
+            ("project_id", serde_json::Value::Null),
+            ("with_embeddings", serde_json::json!(true)),
+            ("embedding_dim", serde_json::json!(384)),
+            ("embedding_model", serde_json::json!("another-model")),
+            (
+                "schema_version",
+                serde_json::json!(crate::sync::chunk::SCHEMA_VERSION + 1),
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (field, value) in disagreements {
+            let args = driver_args(
+                &dir,
+                &ours,
+                &theirs_with(field, value.clone()),
+                ".memory-industry/manifest.json",
+            );
+            let exit = merge_driver(&args);
+            let left = std::fs::read(&args[1]).unwrap();
+            let named = exit
+                .as_ref()
+                .err()
+                .is_some_and(|e| format!("{e:#}").contains(field));
+            if !named || left != ours {
+                wrong.push(format!(
+                    "{field} = {value}: exit {exit:?}, ours {}",
+                    if left == ours {
+                        "untouched"
+                    } else {
+                        "rewritten"
+                    }
+                ));
+            }
+        }
+        let args = driver_args(
+            &dir,
+            &ours,
+            br#"{"not":"a manifest"}"#,
+            ".memory-industry/manifest.json",
+        );
+        let exit = merge_driver(&args);
+        if exit.is_ok() || std::fs::read(&args[1]).unwrap() != ours {
+            wrong.push(format!("theirs not a manifest: exit {exit:?}"));
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wrong.is_empty(),
+            "the import takes project_id as the scope it writes under, with_embeddings, \
+             embedding_dim and embedding_model as how to read the vectors, and schema_version as \
+             whether it can read the bundle at all — none of them checked against the files. \
+             Where the two sides disagree on one, keeping ours is a decision about the other \
+             machine's rows, so git has to leave the file to a person, and the message is what \
+             that person reads: it has to name the field. Ours stays untouched:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// install's block in the hook `body`: from its marker to the `fi` that
+    /// closes it.
+    fn install_block(body: &str) -> &str {
+        let start = body
+            .find(MARKER)
+            .unwrap_or_else(|| panic!("no install block in the hook: {body}"));
+        let rest = &body[start..];
+        let end = rest
+            .find("\nfi\n")
+            .map_or(rest.len(), |i| i + "\nfi\n".len());
+        &rest[..end]
+    }
+
+    #[tokio::test]
+    async fn install_writes_a_post_merge_hook_that_imports_and_uninstall_takes_it_back() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = scratch_root("install-post-merge");
+        let hooks = root.join(".git").join("hooks");
+        let theirs = "#!/bin/sh\necho 'the team runs this after every merge'\n";
+
+        let (first, second) = in_scratch_repo(&root, Some("graph-sync"), || {
+            std::fs::create_dir_all(&hooks).unwrap();
+            std::fs::write(hooks.join("post-merge"), theirs).unwrap();
+            let first = install(false).expect("install");
+            let second = install(false).expect("install again");
+            (first, second)
+        });
+
+        let post_merge = read_hook(&root, "post-merge");
+        let post_checkout = read_hook(&root, "post-checkout");
+        assert_eq!(
+            install_block(&post_merge),
+            install_block(&post_checkout),
+            "`git merge` runs neither post-commit nor post-checkout — githooks(5): post-commit \
+             \"is invoked by git-commit\", post-merge \"is invoked by git-merge\" — so after a \
+             clean merge nothing brought the merged bundle into the database, and the next \
+             commit exported the database over it: the other branch's rows were lost. \
+             post-merge has to do what post-checkout does, the same import from the same pinned \
+             directory:\n--- post-merge\n{post_merge}\n--- post-checkout\n{post_checkout}"
+        );
+        assert!(
+            post_merge.contains("sync import --conflict merge")
+                && post_merge.contains("graph-sync"),
+            "control: the block compared above is an import from the pinned directory: \
+             {post_merge}"
+        );
+        assert!(
+            post_merge.starts_with(theirs) && post_merge.matches(MARKER).count() == 1,
+            "a post-merge that was already there is appended to, never overwritten, and a second \
+             install leaves one block: {post_merge}"
+        );
+        let line = |report: &str| {
+            report
+                .lines()
+                .find(|l| l.starts_with("post-merge hook:"))
+                .map(str::to_string)
+        };
+        assert!(
+            line(&first).is_some_and(|l| l.ends_with("installed"))
+                && line(&second).is_some_and(|l| l.ends_with("already present")),
+            "the report names the hook it wrote, and says so the second time too:\n{first}\n{second}"
+        );
+
+        in_scratch_repo(&root, Some("graph-sync"), || {
+            uninstall().expect("uninstall")
+        });
+
+        let left = std::fs::read_to_string(hooks.join("post-merge")).unwrap_or_default();
+        assert_eq!(
+            left.trim_end(),
+            theirs.trim_end(),
+            "uninstall removes exactly what install added: the team's own post-merge stays, and \
+             install's block goes with its pinned CUBA_SYNC_DIR"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2131,6 +2951,7 @@ mod tests {
         for (hook, action) in [
             ("post-commit", "sync export --scope all"),
             ("post-checkout", "sync import --conflict merge"),
+            ("post-merge", "sync import --conflict merge"),
         ] {
             let body = read_hook(&root, hook);
             assert!(
@@ -2194,7 +3015,7 @@ mod tests {
         install_into_scratch_repo(&root, Some("first-sync"));
         install_into_scratch_repo(&root, Some("second-sync"));
 
-        for hook in ["post-commit", "post-checkout"] {
+        for hook in ["post-commit", "post-checkout", "post-merge"] {
             let body = read_hook(&root, hook);
             assert_eq!(
                 body.matches(MARKER).count(),
@@ -2244,7 +3065,7 @@ mod tests {
         });
 
         let hooks = root.join(".git").join("hooks");
-        for hook in ["post-commit", "post-checkout"] {
+        for hook in ["post-commit", "post-checkout", "post-merge"] {
             assert!(
                 !hooks.join(hook).exists(),
                 "the file held nothing but install's block, the pinned CUBA_SYNC_DIR included; \
