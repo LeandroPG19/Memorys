@@ -575,6 +575,19 @@ pub fn is_model_loaded() -> bool {
     matches!(get_model_status(), ModelStatus::Loaded)
 }
 
+/// What the first attempt to load ONNX Runtime answered, and the library it
+/// opened, for the life of the process.
+///
+/// One attempt and not one per caller: the embedder, the reranker and NLI all
+/// reach `load_onnxruntime` from their own threads, and `get_or_init` holds
+/// the second and third outside `ort` until the first has an answer. After a
+/// failure nobody tries again — `ort` could not take a second library anyway,
+/// and the answer to repeat is the one that says why.
+///
+/// The library is kept here, loaded, so the module `ort::init_from` asks the
+/// loader for a moment later is the one this crate already opened and checked.
+static RUNTIME: OnceLock<std::result::Result<libloading::Library, String>> = OnceLock::new();
+
 /// Loads ONNX Runtime from `path` before any session opens.
 ///
 /// The empty path is refused here because nothing downstream refuses it:
@@ -587,9 +600,96 @@ pub(crate) fn load_onnxruntime(path: &std::path::Path) -> Result<()> {
         "the ONNX Runtime library path is empty: point ORT_DYLIB_PATH at the library file or \
          unset it and run `memory-industry models runtime`"
     );
-    ort::init_from(path)
+    match RUNTIME.get_or_init(|| load_onnxruntime_once(path).map_err(|e| format!("{e:#}"))) {
+        Ok(_) => Ok(()),
+        Err(reason) => Err(anyhow::anyhow!("{reason}")),
+    }
+}
+
+/// Opens and checks the library first, and only hands `ort` a library that
+/// passed.
+///
+/// `ort` 2.0.0-rc.12 cannot report a library that does not load: it hangs
+/// the calling thread forever. `load_dylib_from_path` runs inside the `Once`
+/// of `G_ORT_LIB`; when the load fails it builds an `ort::Error`, and
+/// `Error::new` calls `ort::api()`, which calls `setup_api`, which calls
+/// `load_dylib_from_path` again and waits on the same `Once` its own thread
+/// holds. Measured with cdb on the hung daemon: the embedder or reranker
+/// thread in that wait, NLI queued behind it, warm-up never ending. Every
+/// early return of that loader goes the same way — the file is not a library,
+/// it has no `OrtGetApiBase`, or its version is older than `ort` accepts — so
+/// all three are checked here, where a failure is an ordinary `Err`.
+///
+/// The path is made absolute first so both loads resolve the same file: `ort`
+/// reads a relative path against the executable's directory, the search that
+/// found it read it against the working directory.
+fn load_onnxruntime_once(path: &std::path::Path) -> Result<libloading::Library> {
+    let path = std::path::absolute(path)
+        .with_context(|| format!("resolving the ONNX Runtime path {}", path.display()))?;
+    let library = open_runtime_library(&path)?;
+    ort::init_from(&path)
         .map(drop)
-        .map_err(|e| anyhow::anyhow!("loading ONNX Runtime from {}: {e}", path.display()))
+        .map_err(|e| anyhow::anyhow!("loading ONNX Runtime from {}: {e}", path.display()))?;
+    Ok(library)
+}
+
+/// `OrtGetApiBase` as `ort-sys` declares it.
+type GetApiBase = unsafe extern "system" fn() -> *const ort::sys::OrtApiBase;
+
+/// The library at `path`, opened and checked the way `ort`'s loader is about
+/// to check it, without calling into `ort`.
+fn open_runtime_library(path: &std::path::Path) -> Result<libloading::Library> {
+    // SAFETY: the same `Library::new` on the same path that `ort` makes a
+    // moment later. Loading runs the library's own initialisation and nothing
+    // else of it; a file that is not a library is refused by the platform
+    // loader before any of its bytes run.
+    let library = unsafe { libloading::Library::new(path) }
+        .map_err(|e| anyhow::anyhow!("loading ONNX Runtime from {}: {e}", path.display()))?;
+    let version = {
+        // SAFETY: the signature `ort-sys` declares for `OrtGetApiBase`, the
+        // symbol `ort` resolves and calls next. It takes nothing and returns
+        // a pointer to a static table inside the library, which `library`
+        // keeps loaded while it is read.
+        let get_api_base =
+            unsafe { library.get::<GetApiBase>(b"OrtGetApiBase") }.map_err(|_| {
+                anyhow::anyhow!(
+                    "{} loads but is not ONNX Runtime: it has no `OrtGetApiBase`",
+                    path.display()
+                )
+            })?;
+        // SAFETY: as above.
+        let base = unsafe { get_api_base() };
+        anyhow::ensure!(
+            !base.is_null(),
+            "{} is not a usable ONNX Runtime: `OrtGetApiBase` returned nothing",
+            path.display()
+        );
+        // SAFETY: `base` is not null and points into the library `library`
+        // holds; `GetVersionString` returns a NUL-terminated string the
+        // library owns and never frees.
+        unsafe { std::ffi::CStr::from_ptr(((*base).GetVersionString)()) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    anyhow::ensure!(
+        minor_version(&version) >= ort::MINOR_VERSION,
+        "the ONNX Runtime at {} is version {version}, and this build needs 1.{} or newer: run \
+         `memory-industry models runtime` or point ORT_DYLIB_PATH at a newer library",
+        path.display(),
+        ort::MINOR_VERSION
+    );
+    Ok(library)
+}
+
+/// The minor number of an ONNX Runtime version, read the way `ort` reads it:
+/// `1.22.0` is 22, and a string without one is 0, older than anything `ort`
+/// accepts.
+fn minor_version(version: &str) -> u32 {
+    version
+        .split('.')
+        .nth(1)
+        .and_then(|minor| minor.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The runtime `locate_onnxruntime` found, loaded. `ort` keeps the first
@@ -1113,6 +1213,87 @@ mod tests {
             reason.contains("empty") || reason.contains("vacía") || reason.contains("vacia"),
             "the error has to say the path is empty, so an operator with `ORT_DYLIB_PATH=` in a \
              .env reads their own mistake and not a loader message: {reason}"
+        );
+    }
+
+    /// A runtime file that is not a library is an error, in bounded time, and
+    /// never reaches `ort`.
+    ///
+    /// Handed to `ort::init_from`, it hangs the thread forever: rc.12 builds
+    /// the load error through `ort::api()`, which re-enters the `Once` the
+    /// failing load still holds (the stack is written out at
+    /// `load_onnxruntime_once`). So the ten seconds below are not a
+    /// performance budget; they turn that hang into a failure with a name.
+    ///
+    /// `load_onnxruntime_once` and not `load_onnxruntime`: the second keeps the
+    /// first answer in a cell that belongs to the process, and a broken
+    /// library recorded there would refuse the real runtime to every later
+    /// test in this binary. The cell adds no step between the check and
+    /// `ort`, so this is the path the daemon takes.
+    ///
+    /// A plain thread and `recv_timeout`, for the reason given at the
+    /// empty-path test above.
+    #[test]
+    fn a_runtime_that_is_not_a_library_is_refused_in_bounded_time_and_never_reaches_ort() {
+        let dir = scratch_root("ort-not-a-library");
+        std::fs::create_dir_all(&dir).expect("the test owns this directory");
+        let runtime = dir.join(runtime_library_filename());
+        std::fs::write(&runtime, b"these bytes are not a shared library\n")
+            .expect("temp dir is writable");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handed = runtime.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                load_onnxruntime_once(&handed)
+                    .map(drop)
+                    .map_err(|e| format!("{e:#}")),
+            );
+        });
+
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "loading a runtime that is not a library did not answer in 10 s. That is ort \
+             rc.12 deadlocking on its own `Once`: the file went to `ort::init_from` without \
+             being opened and checked here first",
+        );
+        let reason = answer.expect_err(
+            "a file of bytes that is not a library loaded as ONNX Runtime. If `ort` already held \
+             a runtime from another test, `init_from` answers Ok for any path — which is why the \
+             check cannot be left to it",
+        );
+        assert!(
+            reason.contains("loading ONNX Runtime from"),
+            "the error has to say it was the runtime that would not load: {reason}"
+        );
+        assert!(
+            reason.contains(runtime_library_filename()),
+            "and name the file, so `/health` has a path to replace with the variable that sets \
+             it: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The version check reads the minor number the way `ort` does, because
+    /// any runtime `ort` would refuse has to be refused here first.
+    #[test]
+    fn the_runtime_version_is_read_the_way_ort_reads_it() {
+        for (version, minor) in [
+            ("1.22.0", 22),
+            ("1.24.1", 24),
+            ("1.17.3", 17),
+            ("1.x.0", 0),
+            ("1", 0),
+            ("", 0),
+        ] {
+            assert_eq!(minor_version(version), minor, "version string {version:?}");
+        }
+        assert!(
+            minor_version("1.17.3") < ort::MINOR_VERSION,
+            "the Windows ML ONNX Runtime in System32 is 1.17, and this build of `ort` refuses it \
+             — through the same deadlocking error path as a file that is not a library. If \
+             this fails, `ort` accepts 1.17 again and the check above is refusing a runtime it \
+             would have loaded"
         );
     }
 
