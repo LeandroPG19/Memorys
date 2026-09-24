@@ -611,12 +611,15 @@ mod tests {
 
     /// What PostgreSQL hands sqlx, built by hand: the tests below need the very
     /// error the server raises when two sessions write one catalog row, and no
-    /// server raises it on demand. `attempt` is not part of what the server
-    /// says; it only lets a test tell which call an error came from.
+    /// server raises it on demand. `constraint` is the `n` field of the error,
+    /// which sqlx's PgDatabaseError hands out as constraint(). `attempt` is not
+    /// part of what the server says; it only lets a test tell which call an
+    /// error came from.
     #[derive(Debug)]
     struct ServerSaid {
         sqlstate: &'static str,
         message: String,
+        constraint: Option<&'static str>,
         attempt: u32,
     }
 
@@ -635,6 +638,10 @@ mod tests {
 
         fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
             Some(std::borrow::Cow::Borrowed(self.sqlstate))
+        }
+
+        fn constraint(&self) -> Option<&str> {
+            self.constraint
         }
 
         fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
@@ -658,6 +665,7 @@ mod tests {
         sqlx::Error::Database(Box::new(ServerSaid {
             sqlstate,
             message: message.to_owned(),
+            constraint: None,
             attempt: 0,
         }))
     }
@@ -668,7 +676,21 @@ mod tests {
         sqlx::Error::Database(Box::new(ServerSaid {
             sqlstate: "XX000",
             message: "tuple concurrently updated".to_owned(),
+            constraint: None,
             attempt,
+        }))
+    }
+
+    /// A unique violation on `index`, as PostgreSQL's _bt_check_unique raises
+    /// it: SQLSTATE 23505, the index in the message and, as the server sends it,
+    /// in the constraint field. `constraint` is that field, apart so a test can
+    /// leave it out.
+    fn duplicate_key(index: &str, constraint: Option<&'static str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(ServerSaid {
+            sqlstate: "23505",
+            message: format!("duplicate key value violates unique constraint \"{index}\""),
+            constraint,
+            attempt: 0,
         }))
     }
 
@@ -694,6 +716,16 @@ mod tests {
             is_concurrent_catalog_update(&catalog_race_on(0)),
             "the ALTER ROLE ... PASSWORD of provision_app_role fails with a bare sqlx::Error"
         );
+        assert!(
+            is_concurrent_catalog_update(&MigrateError::ExecuteMigration(
+                duplicate_key("pg_authid_rolname_index", Some("pg_authid_rolname_index")),
+                41,
+            )),
+            "on a server without cuba_app, two databases running 0041 at once both find no \
+             role and both CREATE ROLE cuba_app; the second waits on the first's key in \
+             pg_authid_rolname_index and gets 23505 once it commits. Tried again, 0041 finds \
+             the role and takes its ALTER ROLE branch"
+        );
     }
 
     #[test]
@@ -716,6 +748,24 @@ mod tests {
                     server_said("42P01", "relation \"brain_audit_log\" does not exist"),
                     41,
                 )),
+            ),
+            (
+                "a duplicate in a table of ours",
+                is_concurrent_catalog_update(&duplicate_key(
+                    "uq_procedure_name_project",
+                    Some("uq_procedure_name_project"),
+                )),
+            ),
+            (
+                "a duplicate in another catalog of the server: two CREATE DATABASE of one name",
+                is_concurrent_catalog_update(&duplicate_key(
+                    "pg_database_datname_index",
+                    Some("pg_database_datname_index"),
+                )),
+            ),
+            (
+                "a 23505 naming the role index only in its text, with no constraint field",
+                is_concurrent_catalog_update(&duplicate_key("pg_authid_rolname_index", None)),
             ),
             (
                 "an error that never reached the server",
