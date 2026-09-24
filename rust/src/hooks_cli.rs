@@ -804,14 +804,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The six merges `merge_driver` can pick, as seen from outside it.
+    /// The seven merges `merge_driver` can pick, as seen from outside it.
     ///
     /// Each one comes with a pair of sides that only its own merge can parse,
     /// and a test of the file that only its own merge writes back. A merge that
     /// did not run leaves ours as it was; a different merge either cannot parse
     /// the pair or reshapes it into something this test does not accept — the
     /// decision merge reads an episode, for one, and writes back only
-    /// `{id, content}`. So running all six pairs through one path names the
+    /// `{id, content}`. So running all seven pairs through one path names the
     /// merge that path gets, and names none when it gets none.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Merge {
@@ -821,15 +821,17 @@ mod tests {
         Episode,
         Error,
         Decision,
+        Tombstones,
     }
 
-    const EVERY_MERGE: [Merge; 6] = [
+    const EVERY_MERGE: [Merge; 7] = [
         Merge::Entity,
         Merge::Relations,
         Merge::Projects,
         Merge::Episode,
         Merge::Error,
         Merge::Decision,
+        Merge::Tombstones,
     ];
 
     fn as_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
@@ -914,6 +916,22 @@ mod tests {
                         serde_json::json!({ "id": id, "content": "theirs" }),
                     )
                 }
+                // Spelled as JSON, the way `export_into` writes it, and not
+                // through a type of the driver's: this is what git hands it.
+                Merge::Tombstones => {
+                    let row = |table: &str| {
+                        serde_json::json!({
+                            "table_name": table,
+                            "row_id": Uuid::new_v4(),
+                            "deleted_at": now,
+                            "origin_node": null,
+                        })
+                    };
+                    (
+                        serde_json::json!([row("brain_observations")]),
+                        serde_json::json!([row("brain_relations")]),
+                    )
+                }
             }
         }
 
@@ -933,6 +951,10 @@ mod tests {
                 }),
                 Merge::Decision => serde_json::from_slice::<DecisionFile>(written)
                     .is_ok_and(|merged| merged.content == "theirs"),
+                Merge::Tombstones => serde_json::from_slice::<Vec<serde_json::Value>>(written)
+                    .is_ok_and(|merged| {
+                        merged.len() == 2 && merged.iter().all(|t| t.get("table_name").is_some())
+                    }),
             }
         }
     }
@@ -976,7 +998,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cuba-merge-table-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let table: [(&str, Option<Merge>); 33] = [
+        let table: [(&str, Option<Merge>); 40] = [
             // The layout `sync export` writes, under both names of its root.
             (".memory-industry/entities/0b6c.json", Some(Merge::Entity)),
             (".cuba-memorys/entities/0b6c.json", Some(Merge::Entity)),
@@ -1056,8 +1078,24 @@ mod tests {
             // any name that finished in `relations.json`.
             (".memory-industry/old-relations.json", None),
             (".memory-industry/relations.json.orig", None),
-            // Nothing sync writes.
+            // Every export writes tombstones.json, so two branches that both
+            // exported conflicted on it in every merge. was: None, all four.
+            (".memory-industry/tombstones.json", Some(Merge::Tombstones)),
+            ("tombstones.json", Some(Merge::Tombstones)),
+            (".memory-industry/TOMBSTONES.JSON", Some(Merge::Tombstones)),
+            (
+                ".memory-industry/errors/tombstones.json",
+                Some(Merge::Tombstones),
+            ),
+            (".memory-industry/old-tombstones.json", None),
+            // Sync writes these too, and they stay a person's to resolve: the
+            // import acts on manifest.json's project_id and embedding fields
+            // without checking them against the files, and embeddings.bin.zst
+            // is read with the width manifest.json declares.
             (".memory-industry/manifest.json", None),
+            ("manifest.json", None),
+            (".memory-industry/embeddings.bin.zst", None),
+            // Nothing sync writes.
             ("README.md", None),
             // Git always hands `%P` over with forward slashes, so a backslash
             // is part of a name, never a separator: neither of these has a
@@ -1094,9 +1132,10 @@ mod tests {
 
         // CUBA_SYNC_DIR=entities, =errors, =episodes: the root's own name sits
         // in `%P` in front of the layout, and only the layout may decide.
-        let table: [(&str, Merge); 5] = [
+        let table: [(&str, Merge); 6] = [
             ("entities/relations.json", Merge::Relations),
             ("entities/projects.json", Merge::Projects),
+            ("entities/tombstones.json", Merge::Tombstones),
             ("errors/entities/0b6c.json", Merge::Entity),
             ("episodes/errors/0b6c.json", Merge::Error),
             ("entities/episodes/2026-07/0b6c.json", Merge::Episode),
@@ -1193,6 +1232,281 @@ mod tests {
         assert_eq!(std::fs::read(&args[1]).unwrap(), ours);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One tombstone, spelled the way `export_into` writes it.
+    fn tombstone(
+        table: &str,
+        row_id: Uuid,
+        deleted_at: &str,
+        origin_node: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "table_name": table,
+            "row_id": row_id,
+            "deleted_at": deleted_at,
+            "origin_node": origin_node,
+        })
+    }
+
+    type ReadTombstone = (String, Uuid, chrono::DateTime<Utc>, Option<String>);
+
+    /// A tombstones.json read the way `apply_tombstones` reads one, in file
+    /// order. A row that does not read here is a row the import would skip.
+    fn tombstones_in(bytes: &[u8]) -> Vec<ReadTombstone> {
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(bytes).unwrap_or_else(|e| {
+            panic!(
+                "not a list of tombstones ({e}): {}",
+                String::from_utf8_lossy(bytes)
+            )
+        });
+        rows.iter()
+            .map(|row| {
+                (
+                    row["table_name"].as_str().expect("table_name").to_string(),
+                    row["row_id"]
+                        .as_str()
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                        .expect("row_id"),
+                    row["deleted_at"]
+                        .as_str()
+                        .and_then(|s| s.parse::<chrono::DateTime<Utc>>().ok())
+                        .expect("deleted_at"),
+                    row["origin_node"].as_str().map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    /// The driver over (ours, theirs) as git runs it for tombstones.json: what
+    /// it left in %A, or why it refused.
+    fn merge_tombstones(dir: &Path, ours: &[u8], theirs: &[u8]) -> Result<Vec<u8>> {
+        let args = driver_args(dir, ours, theirs, ".memory-industry/tombstones.json");
+        merge_driver(&args)?;
+        Ok(std::fs::read(&args[1]).unwrap())
+    }
+
+    #[test]
+    fn tombstones_merge_into_one_list_keyed_by_table_and_row() {
+        let dir = std::env::temp_dir().join(format!("cuba-merge-tombstones-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let [a, b, k] = [(); 3].map(|_| Uuid::new_v4());
+        let (low, high) = if a < b { (a, b) } else { (b, a) };
+        let (t1, t2, t3) = (
+            "2026-08-01T00:00:00Z",
+            "2026-08-02T00:00:00Z",
+            "2026-08-03T00:00:00Z",
+        );
+        let (obs, rel) = ("brain_observations", "brain_relations");
+        let row = tombstone;
+        let list = |rows: &[serde_json::Value]| serde_json::Value::Array(rows.to_vec());
+
+        // (case, ours, theirs, the merge in the order it has to be written:
+        // oldest deletion first, as the export writes it, then table, then row)
+        let cases: [(
+            &str,
+            serde_json::Value,
+            serde_json::Value,
+            serde_json::Value,
+        ); 11] = [
+            (
+                "disjoint",
+                list(&[row(obs, a, t1, Some("pc-a"))]),
+                list(&[row(obs, b, t2, Some("pc-b"))]),
+                list(&[row(obs, a, t1, Some("pc-a")), row(obs, b, t2, Some("pc-b"))]),
+            ),
+            (
+                "disjoint, theirs deleted first",
+                list(&[row(obs, b, t2, Some("pc-a"))]),
+                list(&[row(obs, a, t1, Some("pc-b"))]),
+                list(&[row(obs, a, t1, Some("pc-b")), row(obs, b, t2, Some("pc-a"))]),
+            ),
+            (
+                "overlapping, theirs deleted it again later",
+                list(&[row(obs, k, t1, Some("pc-a")), row(obs, a, t2, Some("pc-a"))]),
+                list(&[row(obs, k, t3, Some("pc-b"))]),
+                list(&[row(obs, a, t2, Some("pc-a")), row(obs, k, t3, Some("pc-b"))]),
+            ),
+            (
+                "overlapping, ours deleted it again later",
+                list(&[row(obs, k, t3, Some("pc-a"))]),
+                list(&[row(obs, k, t1, Some("pc-b")), row(obs, b, t2, Some("pc-b"))]),
+                list(&[row(obs, b, t2, Some("pc-b")), row(obs, k, t3, Some("pc-a"))]),
+            ),
+            (
+                "one id in two tables is two tombstones",
+                list(&[row(rel, k, t1, None)]),
+                list(&[row(obs, k, t1, None)]),
+                list(&[row(obs, k, t1, None), row(rel, k, t1, None)]),
+            ),
+            (
+                "one row, one instant, two nodes",
+                list(&[row(obs, k, t1, Some("pc-a"))]),
+                list(&[row(obs, k, t1, Some("pc-b"))]),
+                list(&[row(obs, k, t1, Some("pc-b"))]),
+            ),
+            (
+                "two rows, one instant",
+                list(&[row(obs, high, t1, None)]),
+                list(&[row(obs, low, t1, None)]),
+                list(&[row(obs, low, t1, None), row(obs, high, t1, None)]),
+            ),
+            (
+                "identical",
+                list(&[row(obs, a, t1, None), row(obs, b, t2, None)]),
+                list(&[row(obs, a, t1, None), row(obs, b, t2, None)]),
+                list(&[row(obs, a, t1, None), row(obs, b, t2, None)]),
+            ),
+            (
+                "ours empty",
+                list(&[]),
+                list(&[row(obs, a, t1, None)]),
+                list(&[row(obs, a, t1, None)]),
+            ),
+            (
+                "theirs empty",
+                list(&[row(obs, a, t1, None)]),
+                list(&[]),
+                list(&[row(obs, a, t1, None)]),
+            ),
+            ("both empty", list(&[]), list(&[]), list(&[])),
+        ];
+
+        let mut wrong = Vec::new();
+        for (case, ours, theirs, expected) in cases {
+            let ours = serde_json::to_vec_pretty(&ours).unwrap();
+            let theirs = serde_json::to_vec_pretty(&theirs).unwrap();
+            let expected = tombstones_in(&serde_json::to_vec(&expected).unwrap());
+
+            let merged = match merge_tombstones(&dir, &ours, &theirs) {
+                Ok(merged) => merged,
+                Err(e) => {
+                    wrong.push(format!("{case}: left as a conflict: {e}"));
+                    continue;
+                }
+            };
+            if tombstones_in(&merged) != expected {
+                wrong.push(format!(
+                    "{case}: expected {expected:?}, merged {:?}",
+                    tombstones_in(&merged)
+                ));
+            }
+            let swapped = merge_tombstones(&dir, &theirs, &ours).ok();
+            if swapped.as_deref() != Some(merged.as_slice()) {
+                wrong.push(format!(
+                    "{case}: the merge depends on which branch is ours; the other way round \
+                     it wrote {:?}",
+                    swapped.as_deref().map(String::from_utf8_lossy)
+                ));
+            }
+            for side in [&ours, &theirs] {
+                let again = merge_tombstones(&dir, &merged, side).ok();
+                if again.as_deref() != Some(merged.as_slice()) {
+                    wrong.push(format!(
+                        "{case}: merging the result with a side it already holds changed it: \
+                         {:?}",
+                        again.as_deref().map(String::from_utf8_lossy)
+                    ));
+                }
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wrong.is_empty(),
+            "every export writes tombstones.json, so two branches that both exported used to \
+             stop on it in every merge. The two sides are one set, keyed like brain_tombstones \
+             (table_name, row_id), and when both name a row the later deletion stands, as \
+             brain_record_tombstone() does with ON CONFLICT. The result may not depend on which \
+             side is ours or on how many times it is merged:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_tombstones_file_that_does_not_read_as_tombstones_is_left_to_git_as_a_conflict() {
+        let dir =
+            std::env::temp_dir().join(format!("cuba-merge-bad-tombstones-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = Uuid::new_v4();
+        let good = serde_json::to_vec_pretty(&serde_json::json!([tombstone(
+            "brain_observations",
+            id,
+            "2026-08-01T00:00:00Z",
+            None
+        )]))
+        .unwrap();
+        let bytes = |value: serde_json::Value| serde_json::to_vec_pretty(&value).unwrap();
+
+        let unreadable: [(&str, Vec<u8>); 7] = [
+            ("not a list", br#"{"not":"a list"}"#.to_vec()),
+            (
+                "cut off mid-row",
+                br#"[{"table_name":"brain_observations","#.to_vec(),
+            ),
+            ("an empty file", Vec::new()),
+            (
+                "a row with no deleted_at",
+                bytes(serde_json::json!([{
+                    "table_name": "brain_observations",
+                    "row_id": id,
+                    "origin_node": null,
+                }])),
+            ),
+            (
+                "a row_id that is not a uuid",
+                bytes(serde_json::json!([{
+                    "table_name": "brain_observations",
+                    "row_id": "row-7",
+                    "deleted_at": "2026-08-01T00:00:00Z",
+                    "origin_node": null,
+                }])),
+            ),
+            (
+                "a deleted_at that is not an instant",
+                bytes(serde_json::json!([tombstone(
+                    "brain_observations",
+                    id,
+                    "yesterday",
+                    None
+                )])),
+            ),
+            (
+                "a field this build does not know",
+                bytes(serde_json::json!([{
+                    "table_name": "brain_observations",
+                    "row_id": id,
+                    "deleted_at": "2026-08-01T00:00:00Z",
+                    "origin_node": null,
+                    "reason": "gdpr",
+                }])),
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (label, bad) in unreadable {
+            for (side, ours, theirs) in [("theirs", &good, &bad), ("ours", &bad, &good)] {
+                let args = driver_args(&dir, ours, theirs, ".memory-industry/tombstones.json");
+                let exit = merge_driver(&args);
+                let left = std::fs::read(&args[1]).unwrap();
+                if exit.is_ok() || left != *ours {
+                    wrong.push(format!(
+                        "{label}, as {side}: exit {exit:?}, left {:?}",
+                        String::from_utf8_lossy(&left)
+                    ));
+                }
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wrong.is_empty(),
+            "a side the merge cannot read whole is a side it would drop rows of, and a dropped \
+             tombstone is a deleted row that comes back on the next import. A field it does not \
+             know would be dropped by writing the merge back. Each of these has to exit non-zero \
+             with ours untouched, so git leaves the file for a person:\n{}",
+            wrong.join("\n")
+        );
     }
 
     #[test]
