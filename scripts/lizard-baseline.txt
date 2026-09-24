@@ -135,11 +135,11 @@ src/models_cli.rs::wanted_runtime_lib:347 9
 src/net/fetch.rs::get:12 13
 src/net/guard.rs::check:38 10
 src/net/guard.rs::is_forbidden:5 18
-src/protocol.rs::handle_request:468 11
-src/protocol.rs::read_resource:1337 30
-src/protocol.rs::request_sampling_max:149 9
-src/protocol.rs::run_mcp:281 27
-src/protocol.rs::run_rem_consolidation_locked:701 15
+src/protocol.rs::handle_request:497 11
+src/protocol.rs::read_resource:1366 30
+src/protocol.rs::request_sampling_max:178 9
+src/protocol.rs::run_mcp:310 27
+src/protocol.rs::run_rem_consolidation_locked:730 15
 src/recall_cli.rs::build:60 18
 src/recall_cli.rs::run_cli:6 9
 src/reembed_cli.rs::run_cli:3 19

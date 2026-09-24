@@ -42,11 +42,39 @@ static CLIENT_SUPPORTS_SAMPLING: std::sync::atomic::AtomicBool =
 
 static HANDSHAKE_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+const HANDSHAKE_TIMEOUT_PREFERRED: &str = "MEMORY_INDUSTRY_HANDSHAKE_TIMEOUT_SECS";
+const HANDSHAKE_TIMEOUT_LEGACY: &str = "CUBA_HANDSHAKE_TIMEOUT_SECS";
+const HANDSHAKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
+
+/// How long stdio waits for an MCP handshake before it exits; None is never.
+///
+/// Zero (`0`, `00`, `+0`) and `off` switch the watchdog off. Anything else
+/// that is not a whole number of seconds keeps the default, loudly. It used to
+/// switch the watchdog off in silence, so a `60s` written to set a minute left
+/// an abandoned stdio process holding every model for good — the one thing
+/// this watchdog exists to prevent. And `00` used to be a zero wait, which
+/// fired the watchdog before any client could answer.
 fn handshake_timeout() -> Option<Duration> {
-    match std::env::var("CUBA_HANDSHAKE_TIMEOUT_SECS") {
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
-        Ok(v) => v.parse::<u64>().ok().map(Duration::from_secs),
-        Err(_) => Some(Duration::from_secs(60)),
+    let Ok(raw) = crate::envs::alias(HANDSHAKE_TIMEOUT_PREFERRED, HANDSHAKE_TIMEOUT_LEGACY) else {
+        return Some(HANDSHAKE_TIMEOUT_DEFAULT);
+    };
+    let value = raw.trim();
+    if value.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    match value.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                default_secs = HANDSHAKE_TIMEOUT_DEFAULT.as_secs(),
+                "{HANDSHAKE_TIMEOUT_PREFERRED} (or {HANDSHAKE_TIMEOUT_LEGACY}) is neither a \
+                 whole number of seconds nor `off`: keeping the default instead of switching \
+                 the handshake watchdog off"
+            );
+            Some(HANDSHAKE_TIMEOUT_DEFAULT)
+        }
     }
 }
 
@@ -62,8 +90,9 @@ fn spawn_handshake_watchdog() {
         tracing::error!(
             secs = limit.as_secs(),
             "no MCP handshake — the client gave up before the models finished loading. \
-             Exiting instead of holding them for nobody (set CUBA_HANDSHAKE_TIMEOUT_SECS=0 \
-             to disable, or run `memory-industry serve` so the models load once and stay warm)"
+             Exiting instead of holding them for nobody (set \
+             MEMORY_INDUSTRY_HANDSHAKE_TIMEOUT_SECS=0 to disable, or run `memory-industry serve` \
+             so the models load once and stay warm)"
         );
         std::process::exit(1);
     });
@@ -1853,8 +1882,9 @@ mod tests {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         const PREFERRED: &str = "MEMORY_INDUSTRY_HANDSHAKE_TIMEOUT_SECS";
         const LEGACY: &str = "CUBA_HANDSHAKE_TIMEOUT_SECS";
+        type Row = (Option<&'static str>, Option<&'static str>, Option<u64>, &'static str);
 
-        let rows: [(Option<&str>, Option<&str>, Option<u64>, &str); 3] = [
+        let rows: [Row; 3] = [
             (
                 Some("5"),
                 Some("7"),

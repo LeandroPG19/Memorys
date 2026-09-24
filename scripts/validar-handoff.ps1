@@ -1,52 +1,40 @@
-# Valida un YAML de handoff Swarm Forge. Exit 0 = ok, 1 = malformado.
+# Handoff judge (Windows): a wrapper, deliberately. Same cure as
+# quality-gate.ps1, for the same drift.
+#
+# This used to be a port of validar-handoff.sh, and it stayed at shape while
+# the .sh learned the two-pass protocol in 0.28: a commit that has to exist,
+# `tests: written|frozen` compared against the red commit, and `paths:`. A
+# handoff the .sh refuses for editing a frozen test went through here as OK,
+# on Windows, which is where the orchestrator runs.
+#
+# One judge, one implementation. Git Bash is resolved explicitly because the
+# `bash` on PATH under Windows is WSL's, which cannot translate a D:\ working
+# directory and exits without reading the script. Backslashes become slashes
+# so Git Bash reads a Windows path the way PowerShell completed it.
+#
+#   .\scripts\validar-handoff.ps1 .cursor\handoffs\<stamp>.yml
+#   .\scripts\validar-handoff.ps1 --self-test
 param(
-  [Parameter(Mandatory = $true)]
-  [string]$Path
+  [string]$Path,
+  [Parameter(ValueFromRemainingArguments = $true)] [string[]]$Rest
 )
 
-$ErrorActionPreference = 'Stop'
-$roles = @(
-  'especificador', 'implementador', 'mejorador',
-  'arquitecto', 'endurecedor', 'qa'
-)
-$required = @('from', 'to', 'type', 'task', 'commit', 'evidence')
+$ErrorActionPreference = 'Continue'
 
-if (-not (Test-Path -LiteralPath $Path)) {
-  Write-Error "no existe: $Path"
-  exit 1
+$bash = @(
+  'C:/Program Files/Git/bin/bash.exe',
+  'C:/Program Files (x86)/Git/bin/bash.exe'
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if (-not $bash) {
+  Write-Host 'FALTA Git Bash. El juez de handoffs de este repo es un script de shell:'
+  Write-Host '  instala Git for Windows, o corre  bash scripts/validar-handoff.sh <fichero.yml>  en un entorno POSIX.'
+  Write-Host 'No se afirma NADA sobre el handoff.'
+  exit 2
 }
 
-$map = @{}
-Get-Content -LiteralPath $Path | ForEach-Object {
-  if ($_ -match '^\s*#' -or $_ -match '^\s*$') { return }
-  if ($_ -match '^(from|to|type|task|commit|evidence)\s*:\s*(.*)$') {
-    $map[$Matches[1]] = $Matches[2].Trim().Trim('"').Trim("'")
-  }
-}
+$judge = (Join-Path $PSScriptRoot 'validar-handoff.sh') -replace '\\', '/'
+$handed = @(@($Path) + @($Rest) | Where-Object { $_ } | ForEach-Object { $_ -replace '\\', '/' })
 
-foreach ($k in $required) {
-  if (-not $map.ContainsKey($k) -or [string]::IsNullOrWhiteSpace($map[$k])) {
-    Write-Host "FALTA campo: $k"
-    exit 1
-  }
-}
-
-if ($map['from'] -notin $roles) { Write-Host "from invalido: $($map['from'])"; exit 1 }
-if ($map['to'] -notin $roles) { Write-Host "to invalido: $($map['to'])"; exit 1 }
-if ($map['type'] -notin @('git_handoff', 'note')) { Write-Host "type invalido"; exit 1 }
-
-$commit = $map['commit']
-if ($map['type'] -eq 'note') {
-  if ($commit -ne 'none' -and $commit -notmatch '^[0-9a-f]{7,40}$') {
-    Write-Host "commit invalido para note"
-    exit 1
-  }
-} else {
-  if ($commit -ne 'none' -and $commit -notmatch '^[0-9a-f]{7,40}$') {
-    Write-Host "commit invalido: $commit"
-    exit 1
-  }
-}
-
-Write-Host "OK $Path $($map['from'])->$($map['to'])"
-exit 0
+& $bash $judge @handed
+exit $LASTEXITCODE

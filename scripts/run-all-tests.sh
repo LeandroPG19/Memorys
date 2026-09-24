@@ -424,8 +424,13 @@ inherit_gate_lock "$GATE_LOCK" || acquire_gate_lock "$GATE_LOCK" || exit 1
 [[ -z "$GATE_LOCK_HELD" ]] || exit_file_running
 trap on_exit EXIT
 
-CACHE_NEW="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry"
-CACHE_OLD="${XDG_CACHE_HOME:-$HOME/.cache}/cuba-memorys"
+# Under HOME/.cache and nowhere else, because that is where the binary keeps
+# them: envs::home() joins `.cache` to HOME, and nothing in the crate reads
+# XDG_CACHE_HOME. This used to honour it, as gpu-placement-check.sh did until
+# it was fixed for the same reason, and on a machine that sets it the gate
+# pointed ONNX_MODEL_PATH at a directory `models all` never wrote.
+CACHE_NEW="$HOME/.cache/memory-industry"
+CACHE_OLD="$HOME/.cache/cuba-memorys"
 # Prefer the cache that actually has the embedder. An empty memory-industry/
 # dir (e.g. only audit_key) must not steal paths from a populated cuba-memorys/.
 if [[ -f "$CACHE_NEW/models/model_quantized.onnx" ]]; then

@@ -25,7 +25,9 @@ fi
 export SKIP_BACKUP=1
 
 echo "=== preflight models ==="
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cuba-memorys"
+# HOME/.cache, never XDG_CACHE_HOME: the binary does not read it, so a model
+# found under it is one the gate would not load (run-all-tests.sh says more).
+CACHE="$HOME/.cache/cuba-memorys"
 for p in \
   "$CACHE/models/model_quantized.onnx" \
   "$CACHE/onnxruntime/libonnxruntime.so" \

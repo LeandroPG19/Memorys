@@ -27,7 +27,7 @@ qg_mutants_jobs() {
 # Every --exclude-re entry of the mutation step, in one place so that the
 # exclusion checks below read exactly what the mutation run is handed. Each
 # entry's reason, owner and expiry date are in the comment over that step.
-MUTANTS_EXCLUDE_RE='fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|builtin_retrieval_set|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false|src/redact\.rs:110:63: replace > with >= in credentials_in_url|src/redact\.rs:130:58: replace > with >= in secret_field|src/redact\.rs:136:51: replace \+ with \* in secret_field|src/cognitive/nli\.rs:.*replace enabled -> bool with |src/cognitive/nli\.rs:.*replace status_resolved -> bool with false|src/cognitive/nli\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace compute_embedding -> Result<Vec<f32>> with Ok\(vec!|src/http\.rs:1462:24: replace && with \|\| in embedder_state|src/(calibrate_cli|dashboard|dedupe_cli|export|link_cli|reembed_cli|rem_cli|secure_cli|skills_cli|sync_cli|eval/mod)\.rs:.*replace run_cli -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace print_help with \(\)|src/setup\.rs:.*replace log with \(\)|src/dashboard\.rs:.*replace render -> Result<String> with |src/search/calibrate\.rs:.*replace load_ood_threshold -> Option<f64> with |src/export\.rs:.*replace export_obsidian -> Result<usize> with |src/db\.rs:.*replace assert_embedding_dim -> Result<\(\)> with Ok\(\(\)\)|src/dedupe_cli\.rs:.*replace merge_by_name -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace run_rem_consolidation_locked -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace download_(model|runtime) -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace spawn_handshake_watchdog with \(\)|src/embeddings/onnx\.rs:.*replace locate_onnxruntime -> Option<PathBuf> with Some\(Default::default\(\)\)|src/main\.rs:.*replace async_main with \(\)|src/db\.rs:.*replace bind_app_role -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace init_schema -> Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace provision_app_role with \(\)|src/db\.rs:.*replace provision_app_role_from_pgpass with \(\)|src/db\.rs:.*replace write_app_role_password -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/embeddings/onnx\.rs:.*replace load_onnxruntime -> Result<\(\)> with Ok\(\(\)\)|src/embeddings/onnx\.rs:.*replace load_located_onnxruntime -> Result<\(\)> with Ok\(\(\)\)'
+MUTANTS_EXCLUDE_RE='fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false|src/redact\.rs:110:63: replace > with >= in credentials_in_url|src/redact\.rs:130:58: replace > with >= in secret_field|src/redact\.rs:136:51: replace \+ with \* in secret_field|src/cognitive/nli\.rs:.*replace enabled -> bool with |src/cognitive/nli\.rs:.*replace status_resolved -> bool with false|src/cognitive/nli\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace compute_embedding -> Result<Vec<f32>> with Ok\(vec!|src/http\.rs:1462:24: replace && with \|\| in embedder_state|src/(calibrate_cli|dashboard|dedupe_cli|export|link_cli|reembed_cli|rem_cli|secure_cli|skills_cli|sync_cli|eval/mod)\.rs:.*replace run_cli -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace print_help with \(\)|src/setup\.rs:.*replace log with \(\)|src/dashboard\.rs:.*replace render -> Result<String> with |src/search/calibrate\.rs:.*replace load_ood_threshold -> Option<f64> with |src/export\.rs:.*replace export_obsidian -> Result<usize> with |src/db\.rs:.*replace assert_embedding_dim -> Result<\(\)> with Ok\(\(\)\)|src/dedupe_cli\.rs:.*replace merge_by_name -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace run_rem_consolidation_locked -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace download_(model|runtime) -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace spawn_handshake_watchdog with \(\)|src/embeddings/onnx\.rs:.*replace locate_onnxruntime -> Option<PathBuf> with Some\(Default::default\(\)\)|src/main\.rs:.*replace async_main with \(\)|src/db\.rs:.*replace bind_app_role -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace init_schema -> Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace provision_app_role with \(\)|src/db\.rs:.*replace provision_app_role_from_pgpass with \(\)|src/db\.rs:.*replace write_app_role_password -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/embeddings/onnx\.rs:.*replace load_onnxruntime -> Result<\(\)> with Ok\(\(\)\)|src/embeddings/onnx\.rs:.*replace load_located_onnxruntime -> Result<\(\)> with Ok\(\(\)\)'
 
 echo "=== quality-gate (MemoryIndustry — CRAP/lizard + mutación del diff) ==="
 echo "NO MIRA: SIL (fmt, clippy -D, tests --ignored, e2e, deny, audit, codigo-muerto, crap-gate floor, mutants-gate mmr/rrf/cache)."
@@ -692,11 +692,14 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           # `cargo mutants -- --lib`, each for its own reason, and every one of
           # them has its decision tested somewhere the mutation CAN reach.
           #
-          # A group zero: the thirteen that 11cdc57 (0.26) put in the regex
-          # with no reason written anywhere. The commit message gives the
+          # A group zero: twelve of the thirteen that 11cdc57 (0.26) put in the
+          # regex with no reason written anywhere. The commit message gives the
           # class ("--lib never awaits an async handler that needs a
           # database"); the reason of each was read in the code on
-          # 2026-09-23, one by one. They are bare names, so each hides every
+          # 2026-09-23, one by one. The thirteenth, builtin_retrieval_set, had
+          # none: a pure function --lib could always call. It got its unit
+          # test in 0.28 (the_builtin_set_is_one_the_harness_can_score, in
+          # eval/datasets.rs) and left the regex. They are bare names, so each hides every
           # mutant of its function, the body included, and anything whose
           # name contains it (run_check also covers run_checks_with). "Judged
           # by" is where the SIL kills the mutant that empties the function;
@@ -751,17 +754,6 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     cwd, which no --lib test can move without moving
           #                     it for every other test in the binary. Judged
           #                     NOWHERE.
-          #
-          #   And one with no reason at all, said so rather than invented:
-          #   builtin_retrieval_set
-          #                     eval/datasets.rs. A pure function returning three
-          #                     fixed samples: nothing keeps --lib from calling
-          #                     it. Only `eval` without --dataset uses it, and
-          #                     the SIL's eval smoke passes --dataset. Judged
-          #                     NOWHERE, and a unit test is all it takes; when
-          #                     that test exists, delete the pattern. Until then
-          #                     it is a cover, so its date is short.
-          # Owner: endurecedor 0.28 (builtin_retrieval_set). Expires: 2026-10-23.
           #
           # This first group of five came in with b4db21c, after 11cdc57 set the
           # version to 0.26.0, so it is 0.27 work, like the third group below.
