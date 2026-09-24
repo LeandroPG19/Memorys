@@ -683,6 +683,270 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The six merges `merge_driver` can pick, as seen from outside it.
+    ///
+    /// Each one comes with a pair of sides that only its own merge can parse,
+    /// and a test of the file that only its own merge writes back. A merge that
+    /// did not run leaves ours as it was; a different merge either cannot parse
+    /// the pair or reshapes it into something this test does not accept — the
+    /// decision merge reads an episode, for one, and writes back only
+    /// `{id, content}`. So running all six pairs through one path names the
+    /// merge that path gets, and names none when it gets none.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Merge {
+        Entity,
+        Relations,
+        Projects,
+        Episode,
+        Error,
+        Decision,
+    }
+
+    const EVERY_MERGE: [Merge; 6] = [
+        Merge::Entity,
+        Merge::Relations,
+        Merge::Projects,
+        Merge::Episode,
+        Merge::Error,
+        Merge::Decision,
+    ];
+
+    fn as_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
+        serde_json::to_value(value).expect("the fixture serialises")
+    }
+
+    impl Merge {
+        /// (ours, theirs).
+        fn sides(self) -> (serde_json::Value, serde_json::Value) {
+            let now = Utc::now();
+            match self {
+                Merge::Entity => {
+                    let ours = entity_file(vec![obs(Uuid::new_v4(), "ours")]);
+                    let theirs = EntityFile {
+                        observations: vec![obs(Uuid::new_v4(), "theirs")],
+                        ..ours.clone()
+                    };
+                    (as_json(&ours), as_json(&theirs))
+                }
+                Merge::Relations => {
+                    let row = |relation_type: &str| RelationRow {
+                        id: Uuid::new_v4(),
+                        from_entity: Uuid::new_v4(),
+                        to_entity: Uuid::new_v4(),
+                        relation_type: relation_type.to_string(),
+                        strength: 0.5,
+                        bidirectional: false,
+                        project_id: None,
+                        created_at: now,
+                        provenance: "extracted".to_string(),
+                    };
+                    (as_json(&[row("ours")]), as_json(&[row("theirs")]))
+                }
+                Merge::Projects => {
+                    let row = |name: &str| ProjectRow {
+                        id: Uuid::new_v4(),
+                        name: name.to_string(),
+                        created_at: now,
+                    };
+                    (as_json(&[row("ours")]), as_json(&[row("theirs")]))
+                }
+                Merge::Episode => {
+                    let ours = EpisodeFile {
+                        id: Uuid::new_v4(),
+                        entity_id: Uuid::new_v4(),
+                        content: "pairing session".to_string(),
+                        actors: vec!["alice".to_string()],
+                        artifacts: vec![],
+                        importance: 0.5,
+                        project_id: None,
+                        started_at: now,
+                        ended_at: None,
+                    };
+                    let theirs = EpisodeFile {
+                        actors: vec!["bob".to_string()],
+                        ..ours.clone()
+                    };
+                    (as_json(&ours), as_json(&theirs))
+                }
+                Merge::Error => {
+                    let ours = ErrorFile {
+                        id: Uuid::new_v4(),
+                        error_type: "timeout".to_string(),
+                        error_message: "the pool never answered".to_string(),
+                        solution: None,
+                        resolved: false,
+                        project: "probe".to_string(),
+                        project_id: None,
+                        created_at: now,
+                    };
+                    let theirs = ErrorFile {
+                        solution: Some("restart the pool".to_string()),
+                        resolved: true,
+                        ..ours.clone()
+                    };
+                    (as_json(&ours), as_json(&theirs))
+                }
+                Merge::Decision => {
+                    let id = Uuid::new_v4();
+                    (
+                        serde_json::json!({ "id": id, "content": "" }),
+                        serde_json::json!({ "id": id, "content": "theirs" }),
+                    )
+                }
+            }
+        }
+
+        /// Whether `written` is what this merge makes of `sides()`.
+        fn wrote(self, written: &[u8]) -> bool {
+            match self {
+                Merge::Entity => serde_json::from_slice::<EntityFile>(written)
+                    .is_ok_and(|merged| merged.observations.len() == 2),
+                Merge::Relations => serde_json::from_slice::<Vec<RelationRow>>(written)
+                    .is_ok_and(|merged| merged.len() == 2),
+                Merge::Projects => serde_json::from_slice::<Vec<ProjectRow>>(written)
+                    .is_ok_and(|merged| merged.len() == 2),
+                Merge::Episode => serde_json::from_slice::<EpisodeFile>(written)
+                    .is_ok_and(|merged| merged.actors == ["alice", "bob"]),
+                Merge::Error => serde_json::from_slice::<ErrorFile>(written).is_ok_and(|merged| {
+                    merged.resolved && merged.solution.as_deref() == Some("restart the pool")
+                }),
+                Merge::Decision => serde_json::from_slice::<DecisionFile>(written)
+                    .is_ok_and(|merged| merged.content == "theirs"),
+            }
+        }
+    }
+
+    /// Runs `merge_driver` over `merge`'s sides as git would for `path`, and
+    /// says whether that merge is the one that ran.
+    fn merged_by(dir: &Path, path: &str, merge: Merge) -> bool {
+        let (ours, theirs) = merge.sides();
+        let ours_path = dir.join("ours.json");
+        let theirs_path = dir.join("theirs.json");
+        std::fs::write(&ours_path, serde_json::to_vec(&ours).unwrap()).unwrap();
+        std::fs::write(&theirs_path, serde_json::to_vec(&theirs).unwrap()).unwrap();
+
+        let args = [
+            "unused-ancestor".to_string(),
+            ours_path.to_str().unwrap().to_string(),
+            theirs_path.to_str().unwrap().to_string(),
+            path.to_string(),
+        ];
+        merge_driver(&args).expect("every merge here reads files it can open");
+
+        merge.wrote(&std::fs::read(&ours_path).unwrap())
+    }
+
+    /// Which merge every path shape gets, pinned before the decision moves.
+    ///
+    /// `merge_driver` chose with `a || b && c` and five `else if`, CC 18 in one
+    /// body. This table is today's answer for each shape of `%P` git can hand
+    /// it, written and run green before a line of the decision moved, so the
+    /// move can only be a move. Some rows read like defects — marked below —
+    /// and are pinned all the same: changing what they do is a fix with a test
+    /// of its own, not something a refactor gets to do on the way past.
+    #[test]
+    fn merge_driver_picks_the_same_merge_for_every_path_shape() {
+        let dir = std::env::temp_dir().join(format!("cuba-merge-table-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let table: [(&str, Option<Merge>); 33] = [
+            // The layout `sync export` writes, under both names of its root.
+            (".memory-industry/entities/0b6c.json", Some(Merge::Entity)),
+            (".cuba-memorys/entities/0b6c.json", Some(Merge::Entity)),
+            (".memory-industry/relations.json", Some(Merge::Relations)),
+            (".memory-industry/projects.json", Some(Merge::Projects)),
+            (
+                ".memory-industry/episodes/2026-07/0b6c.json",
+                Some(Merge::Episode),
+            ),
+            (".memory-industry/errors/0b6c.json", Some(Merge::Error)),
+            (
+                ".memory-industry/decisions/0b6c.json",
+                Some(Merge::Decision),
+            ),
+            // Lowercased before any rule reads it.
+            (".memory-industry/ENTITIES/0B6C.JSON", Some(Merge::Entity)),
+            (
+                ".memory-industry/Episodes/2026-07/x.json",
+                Some(Merge::Episode),
+            ),
+            (".memory-industry/RELATIONS.JSON", Some(Merge::Relations)),
+            // The two halves of the entity rule, each on its own.
+            (".memory-industry/entities/0b6c.bak", Some(Merge::Entity)),
+            ("entities/0b6c.json", Some(Merge::Entity)),
+            ("entities.json", Some(Merge::Entity)),
+            ("entities/0b6c.bak", None),
+            (".memory-industry/entities.md", None),
+            // A sync root at the repository root: no leading slash. Only the
+            // entity rule has a half that does without one. Defect-shaped:
+            // the last three get no merge, so git keeps ours and drops theirs
+            // without a conflict marker.
+            ("relations.json", Some(Merge::Relations)),
+            ("projects.json", Some(Merge::Projects)),
+            ("episodes/2026-07/x.json", None),
+            ("errors/x.json", None),
+            ("decisions/x.json", None),
+            // Two rules fit: the first in the chain wins. Defect-shaped: a
+            // root whose path says "entities" sends relations.json and
+            // projects.json to the entity merge, which cannot parse them, so
+            // ours is kept and theirs dropped in silence.
+            ("entities-archive/relations.json", Some(Merge::Entity)),
+            ("my-entities/projects.json", Some(Merge::Entity)),
+            (
+                ".memory-industry/episodes/2026-07/entities.json",
+                Some(Merge::Entity),
+            ),
+            (
+                ".memory-industry/errors/relations.json",
+                Some(Merge::Relations),
+            ),
+            (
+                ".memory-industry/episodes/projects.json",
+                Some(Merge::Projects),
+            ),
+            (
+                ".memory-industry/errors/episodes/x.json",
+                Some(Merge::Episode),
+            ),
+            (
+                ".memory-industry/decisions/errors/x.json",
+                Some(Merge::Error),
+            ),
+            // A suffix, not a file name.
+            (
+                ".memory-industry/old-relations.json",
+                Some(Merge::Relations),
+            ),
+            (".memory-industry/relations.json.orig", None),
+            // Nothing sync writes.
+            (".memory-industry/manifest.json", None),
+            ("README.md", None),
+            // Git always hands `%P` over with forward slashes; pinned so the
+            // move does not start caring about the other kind either.
+            (".memory-industry\\entities\\x.json", Some(Merge::Entity)),
+            (".memory-industry\\episodes\\x.json", None),
+        ];
+
+        let mut wrong = Vec::new();
+        for (path, expected) in table {
+            let seen: Vec<Merge> = EVERY_MERGE
+                .into_iter()
+                .filter(|&merge| merged_by(&dir, path, merge))
+                .collect();
+            let expected: Vec<Merge> = expected.into_iter().collect();
+            if seen != expected {
+                wrong.push(format!("{path}: expected {expected:?}, merged {seen:?}"));
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wrong.is_empty(),
+            "merge_driver no longer picks the merge it picked for these paths:\n{}",
+            wrong.join("\n")
+        );
+    }
+
     #[test]
     fn remove_gitattributes_line_matches_the_line_actually_in_the_file_not_the_current_env_var() {
         let dir = std::env::temp_dir().join(format!("cuba-attrs-test-{}", Uuid::new_v4()));

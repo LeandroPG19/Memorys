@@ -671,6 +671,45 @@ mod tests {
         }
     }
 
+    /// The fixture's own contract: two homes never share a directory.
+    ///
+    /// Its `Drop` ends in `remove_dir_all`, so two `FakeHome`s on one path —
+    /// the same tag reused by a second test — have one deleting the other's
+    /// model mid-run, and the survivor fails reading like a broken cache
+    /// lookup instead of the collision it is. A process id cannot tell them
+    /// apart: every test in this binary shares it.
+    #[tokio::test]
+    async fn two_fake_homes_with_the_same_tag_do_not_share_a_directory() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let first = FakeHome::with_a_model_in_the_cache("twin");
+        let first_model = first
+            .root
+            .join(".cache")
+            .join("memory-industry")
+            .join("reranker")
+            .join("model.onnx");
+        assert!(
+            first_model.is_file(),
+            "the fixture is broken: the model it promises is not on disk, so the assertion \
+             below could not tell a deletion from a file that was never written"
+        );
+
+        {
+            let second = FakeHome::with_a_model_in_the_cache("twin");
+            assert_ne!(
+                first.root, second.root,
+                "two FakeHomes with one tag resolved to one directory, and the Drop of either \
+                 deletes the other's fixture"
+            );
+        }
+
+        assert!(
+            first_model.is_file(),
+            "dropping the second FakeHome deleted the first one's model"
+        );
+    }
+
     #[tokio::test]
     async fn the_path_the_plan_disabled_does_not_fall_through_to_the_cache() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;

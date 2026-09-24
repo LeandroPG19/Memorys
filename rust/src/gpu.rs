@@ -834,6 +834,78 @@ mod placement_tests {
         }
     }
 
+    /// The providers are wherever the runtime that gets loaded is, and that is
+    /// not always the cache this crate manages.
+    ///
+    /// `configure` loads what `locate_onnxruntime` finds: the home cache, then
+    /// LD_LIBRARY_PATH, then the system directories. The provider libraries
+    /// were looked for only in the first of the three, so a machine whose
+    /// runtime — providers beside it — lives in LD_LIBRARY_PATH loaded that
+    /// runtime and was then told it had no GPU runtime at all, because the
+    /// cache it was checked against holds nothing.
+    ///
+    /// The segment is relative to the process directory for the reason its
+    /// neighbour in `embeddings/onnx.rs` gives: the split is on `':'` on every
+    /// platform, which cuts a Windows absolute path at its drive letter.
+    #[tokio::test]
+    async fn the_providers_are_looked_for_beside_the_runtime_the_search_found() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let lib = if cfg!(target_os = "macos") {
+            "libonnxruntime.dylib"
+        } else if cfg!(target_os = "windows") {
+            "onnxruntime.dll"
+        } else {
+            "libonnxruntime.so"
+        };
+        let unique = scratch_root("gpu-ld");
+        let beside_the_runtime = PathBuf::from("target").join(
+            unique
+                .file_name()
+                .expect("scratch_root always ends in a uuid-suffixed name"),
+        );
+        std::fs::create_dir_all(&beside_the_runtime).expect("the process directory is writable");
+        std::fs::write(beside_the_runtime.join(lib), b"not a real library")
+            .expect("the process directory is writable");
+        std::fs::write(
+            beside_the_runtime.join("onnxruntime_providers_cuda.dll"),
+            b"",
+        )
+        .expect("the process directory is writable");
+
+        // A home with nothing under it, so the cache drops out of the chain
+        // and the runtime the search settles on is the one in LD_LIBRARY_PATH.
+        let empty_home = scratch_root("gpu-ld-home");
+        let _explicit = ScopedEnv::cleared("ORT_DYLIB_PATH");
+        let _h = ScopedEnv::set("HOME", &empty_home.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &empty_home.display().to_string());
+        let _ld = ScopedEnv::set("LD_LIBRARY_PATH", &beside_the_runtime.display().to_string());
+
+        // Positive control: without it, a search that never reached the
+        // fixture would read below as the provider lookup being wrong.
+        assert_eq!(
+            crate::embeddings::onnx::locate_onnxruntime(),
+            Some(beside_the_runtime.join(lib)),
+            "the fixture is broken: the search does not settle on the runtime in \
+             LD_LIBRARY_PATH, so what follows would measure something else"
+        );
+        assert_eq!(
+            runtime_dir().as_ref(),
+            Some(&beside_the_runtime),
+            "the providers were looked for somewhere other than beside the runtime the \
+             loader opens. With the runtime in LD_LIBRARY_PATH and nothing in the cache, \
+             that is the empty cache, and the machine is told to download a GPU runtime it \
+             already has"
+        );
+        assert!(
+            runtime_has_gpu_provider("cuda"),
+            "the provider library sits beside the runtime that is loaded; answering false \
+             here sends a machine with a working GPU runtime to the CPU"
+        );
+
+        let _ = std::fs::remove_dir_all(&beside_the_runtime);
+    }
+
     /// The half of the availability probe that is a filesystem question.
     ///
     /// It decides whether an operator is sent to download a runtime they

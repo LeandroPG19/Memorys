@@ -271,6 +271,29 @@ must_pass() {
   return 0
 }
 
+# must_resolve <what> <expected-dir> [NAME=value]...
+#
+# Runs ort_runtime_dir in a subshell whose environment holds only the names
+# given, so a row says everything it depends on and nothing leaks from the
+# machine running the self-test.
+must_resolve() {
+  local what="$1" expected="$2" got
+  shift 2
+  got="$(
+    unset ORT_DYLIB_PATH HOME USERPROFILE XDG_CACHE_HOME LD_LIBRARY_PATH
+    for assignment in "$@"; do
+      export "${assignment?}"
+    done
+    ort_runtime_dir
+  )" || got=""
+  if [[ "$got" != "$expected" ]]; then
+    echo "FAIL self-test: $what — this script looks in '$got', the binary in '$expected'." >&2
+    return 1
+  fi
+  echo "  same place as the binary: $what"
+  return 0
+}
+
 self_test() {
   local bad=0
   local gpu_live="cuda — runtime GPU y GPU detectados · colocación: embedder=cpu reranker=gpu nli=cpu"
@@ -298,6 +321,30 @@ self_test() {
     0 gpu warn "$no_runtime" "memory-industry models runtime --gpu" || bad=1
   must_pass "a real GPU machine placing the reranker where it was asked to" \
     1 gpu ok "$gpu_live" "" || bad=1
+
+  # Where the provider libraries are looked for has to be where the binary
+  # looks, or the two readings this script compares are of two machines. The
+  # library is written under all three platform names, so a fixture never
+  # depends on which one this shell would pick; and every home holds a runtime
+  # or none is reachable, so no row falls through to the system directories
+  # and ends up measuring the machine running the self-test.
+  local scratch name
+  scratch="$(mktemp -d)"
+  mkdir -p "$scratch/home/.cache/memory-industry/onnxruntime" \
+           "$scratch/xdg/memory-industry/onnxruntime" \
+           "$scratch/ld" "$scratch/empty-home"
+  for name in onnxruntime.dll libonnxruntime.so libonnxruntime.dylib; do
+    : > "$scratch/home/.cache/memory-industry/onnxruntime/$name"
+    : > "$scratch/xdg/memory-industry/onnxruntime/$name"
+    : > "$scratch/ld/$name"
+  done
+  must_resolve "XDG_CACHE_HOME is not read: \`models runtime\` downloads under HOME/.cache" \
+    "$scratch/home/.cache/memory-industry/onnxruntime" \
+    HOME="$scratch/home" XDG_CACHE_HOME="$scratch/xdg" || bad=1
+  must_resolve "a runtime found through LD_LIBRARY_PATH has its providers looked for beside it" \
+    "$scratch/ld" \
+    HOME="$scratch/empty-home" LD_LIBRARY_PATH="$scratch/ld" || bad=1
+  rm -rf "$scratch"
 
   if [[ "$bad" -ne 0 ]]; then
     echo "FAIL self-test: at least one guard no longer decides anything." >&2

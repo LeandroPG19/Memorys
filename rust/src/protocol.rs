@@ -1659,6 +1659,77 @@ mod tests {
         assert!(info["capabilities"]["tools"].is_object());
     }
 
+    /// The half of the stdio watchdog that can run without ending the process.
+    ///
+    /// `spawn_handshake_watchdog` calls `std::process::exit(1)`, so it cannot be
+    /// driven from here; what it waits is decided by this function alone, and
+    /// until now nothing pinned a single row of it. Every row is today's
+    /// behaviour, including the three that read like accidents — `00` is a
+    /// zero wait rather than «off», and a value that does not parse switches
+    /// the watchdog off instead of keeping the default. They are pinned so that
+    /// changing them is a decision somebody writes down, not a side effect.
+    ///
+    /// No empty-string row: whether `set_var(name, "")` leaves the variable set
+    /// empty or removes it is the platform's call, so the row would assert the
+    /// OS rather than this function.
+    #[tokio::test]
+    async fn the_handshake_timeout_reads_its_variable_row_by_row() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        const NAME: &str = "CUBA_HANDSHAKE_TIMEOUT_SECS";
+
+        // (what the variable holds — None is unset, seconds waited — None is no
+        // watchdog at all, why this row is the answer).
+        let table: [(Option<&str>, Option<u64>, &str); 18] = [
+            (None, Some(60), "unset is the documented default of 60 s"),
+            (Some("0"), None, "0 is the documented off switch"),
+            (Some("off"), None, "`off` is the other spelling of it"),
+            (Some("OFF"), None, "compared ignoring case"),
+            (Some("Off"), None, "compared ignoring case, mixed"),
+            (Some("1"), Some(1), "the smallest wait that is a wait"),
+            (Some("30"), Some(30), "an ordinary value, taken as seconds"),
+            (Some("+30"), Some(30), "u64 parsing accepts a leading plus"),
+            (
+                Some("18446744073709551615"),
+                Some(u64::MAX),
+                "the largest u64 parses and is taken as it is",
+            ),
+            (
+                Some("18446744073709551616"),
+                None,
+                "one past u64::MAX does not parse, and what does not parse is off",
+            ),
+            (
+                Some("00"),
+                Some(0),
+                "only the literal `0` is off: `00` parses to a zero wait, so the watchdog \
+                 fires at once",
+            ),
+            (Some("-5"), None, "a negative number does not parse as u64"),
+            (Some("1.5"), None, "seconds are whole"),
+            (Some("30s"), None, "no unit suffix"),
+            (Some(" 30"), None, "no trimming"),
+            (Some("30 "), None, "no trimming at the end either"),
+            (
+                Some("no"),
+                None,
+                "only `off` is a word it knows; any other does not parse",
+            ),
+            (Some("abc"), None, "garbage does not parse"),
+        ];
+
+        for (raw, secs, why) in table {
+            let _variable = match raw {
+                Some(value) => crate::envs::ScopedEnv::set(NAME, value),
+                None => crate::envs::ScopedEnv::cleared(NAME),
+            };
+            assert_eq!(
+                handshake_timeout(),
+                secs.map(Duration::from_secs),
+                "{NAME}={raw:?}: {why}"
+            );
+        }
+    }
+
     async fn test_pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL env var required for integration tests");
