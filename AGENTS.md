@@ -27,7 +27,7 @@ Behaviour change: **especificador → implementador → mejorador → arquitecto
 
 Handoffs: `.cursor/handoffs/*.yml`. Judge: `./scripts/validar-handoff.sh`. Example: `.cursor/handoffs/handoff.example.yml`.
 
-It judges shape **and the two-pass protocol**. `commit` must exist, not just look hexadecimal, and `tests: written|frozen` is required whenever `commit != none`: `written` fails if no `#[cfg(test)]` region moved since that commit, `frozen` fails if one did. `./scripts/validar-handoff.sh --self-test` proves each guard still refuses its fixture. Until 0.28 this checked shape only, so the green pass rested on the agent being honest.
+It judges shape **and the two-pass protocol**. `commit` must exist, not just look hexadecimal, and `tests: written|frozen` is required whenever `commit != none`: `written` fails if no `#[cfg(test)]` region moved since that commit, `frozen` fails if one did. With several agents in one tree, list the slice in `paths:` and only the files under it are compared. `./scripts/validar-handoff.sh --self-test` proves each guard still refuses its fixture. Until 0.28 this checked shape only, so the green pass rested on the agent being honest.
 
 The parent dispatches. The parent **may** write product code when Mapupita asked this chat to implement, or when there is no `Task`. Rules, gate scripts, and `AGENTS.md` are always in-parent.
 
@@ -56,7 +56,8 @@ Encode models (embed / NLI / reranker) stay ONNX via `memory-industry models all
 
 - E2E must cover tools without soft-skip
 - `scripts/crap-gate.sh` — coverage floor (inside the SIL)
-- `scripts/mutants-gate.sh` — kill-rate floor on mmr/rrf/cache (inside the SIL). An unviable mutant counts only if rustc refused it with a diagnostic; a build the machine killed fails the run (`--check-builds`, also used by `quality-gate.sh`)
+- `scripts/mutants-gate.sh` — kill-rate floor on mmr/rrf/cache (inside the SIL). An unviable mutant counts only if rustc refused it with a diagnostic, and a caught one only if its test run exited 1..255 (or overflowed its stack); a build or test run the machine killed fails the run (`--check-builds`, also used by `quality-gate.sh`)
+- `~/.cache/cuba-gate/run.exit` — `running <owner>` while a gate runs, then `merge-gate.sh`'s own exit code; a gate killed in the middle leaves `running`
 - Oracles / fixtures decide green — not an AI opinion
 
 ## Immutable fixtures

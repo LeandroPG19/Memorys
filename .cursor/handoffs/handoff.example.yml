@@ -25,6 +25,14 @@ evidence: none
 # handoff de especificador no entrega código y declararía sobre la nada).
 # Omitir el campo NO es una salida: esa era justo la fuga que 0.28 cerró.
 #
+# `paths` es opcional y acota esa comparación a la tajada. Sin él se compara
+# el árbol entero, y con varios agentes en un mismo árbol eso rechaza la
+# pasada verde honesta de uno por el test que otro editó a la vez. Es una
+# lista de rutas, ficheros o directorios, y `tests` se juzga solo sobre los
+# ficheros que caen bajo ellas. Se rechaza vacía, con una ruta que no existe
+# ni en el árbol ni en `commit`, y con commit: none. Quien declara la tajada
+# responde de que sea la suya entera: un test propio fuera de ella no se mira.
+#
 # Así queda la pasada verde de un implementador:
 #
 #   from: implementador
@@ -33,4 +41,7 @@ evidence: none
 #   task: "tajada N, pasada 2 de 2: el código"
 #   commit: d624f2f
 #   tests: frozen
+#   paths:
+#     - rust/src/search/rrf.rs
+#     - rust/tests/local_gate_contract.rs
 #   evidence: "qué tiene que correr el orquestador, y qué se pone rojo sin esto"

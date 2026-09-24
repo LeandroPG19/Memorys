@@ -5,6 +5,17 @@ All notable changes to MemoryIndustry (formerly cuba-memorys) are documented her
 [SemVer](https://semver.org/) for the Rust crate (`Cargo.toml`). PyPI
 versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI 1.28.0).
 
+## [Unreleased]
+
+### Gate
+
+- **`run.exit` is the whole gate's verdict.** `~/.cache/cuba-gate/run.exit` was written by `run-all-tests.sh`, which is only the first half of `merge-gate.sh`: a run whose tests passed wrote `0` there and could then fail at `cargo deny`, `audit`, `codigo-muerto`, `crap-gate` or `mutants-gate`. And a gate killed in the middle (SIGKILL under memory pressure, twice on 2026-09-23) runs no trap, so the file kept an earlier run's `0`. The file now belongs to the run that took the lock: it says `running <owner record>` from that moment and the exit code at the end, and `run-all-tests.sh` under `merge-gate.sh` leaves it alone. A reader that expected a bare number now also sees `running …` while a gate runs or after one died. `merge-gate.sh --self-test` drives a copy of the gate through a green run, a failure after the tests, a kill in the middle and a refused second gate.
+- **A caught mutant has to have been caught by its tests.** `mutants-gate.sh --check-builds` judged only the unviable mutants. A mutant whose `cargo test` could not start ends its Test phase with an NTSTATUS such as `0xC0000142` and is still filed as caught, which counts *for* the kill rate. Now a caught mutant's test run has to exit 1..255; `0xC00000FD STATUS_STACK_OVERFLOW` is accepted by name, and said so, since a mutant that recurses without end is its tests catching it. The file's `caught` total is checked against its records, as `unviable` already was.
+- **The second judge hands cargo-mutants a path it can see.** Under Git Bash, `quality-gate.sh` passed `--output /tmp/tmp.X` to a Windows program and relied on MSYS rewriting it. With `MSYS_NO_PATHCONV` or `MSYS2_ARG_CONV_EXCL` set, cargo-mutants wrote under `\tmp` on the current drive, the script found no `outcomes.json`, and the step passed with nothing judged. The path now goes through `cygpath -m` where it exists.
+- **`--update-lizard-baseline` keeps the comments.** It used to rewrite `scripts/lizard-baseline.txt` whole, dropping every line of reason and owner in it. Each comment now stays over the key it sits on; a key that leaves the baseline takes its comment with it, and the regeneration prints both.
+- **`validar-handoff.sh` takes an optional `paths:` list.** With several agents in one tree, `tests: frozen` compared the whole tree and refused one agent's honest green pass for a test another agent had edited. With `paths:`, `written` and `frozen` look only at the files under those paths; without it, nothing changes. An empty list, a path that exists neither in the tree nor at `commit`, and `paths:` with `commit: none` are refused.
+- **The first thirteen `--exclude-re` entries of `quality-gate.sh` have a reason, an owner and an expiry date**, like the rest, so the expiry reader now covers them. One of them, `builtin_retrieval_set`, has no reason: it is a pure function `--lib` can call, judged nowhere. It says so and expires on 2026-10-23, by when it needs a unit test and the pattern deleted.
+
 ## [0.27.0] — 2026-09-23 (Cargo `0.27.0` · npm `0.27.0` · PyPI `1.29.0`)
 
 ### Behaviour changes — read before deploying

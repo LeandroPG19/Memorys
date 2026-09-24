@@ -114,11 +114,13 @@ def mutant_name(outcome):
     return json.dumps(scenario)
 
 unviable = [o for o in outcomes if o.get("summary") == "Unviable"]
-declared = int(data.get("unviable") or 0)
-if len(unviable) != declared:
-    print(f"FAIL: {path} declares unviable={declared} and holds {len(unviable)} Unviable record(s).", file=sys.stderr)
-    print("      The file changed shape, and a check that finds no records judges nothing.", file=sys.stderr)
-    sys.exit(1)
+caught = [o for o in outcomes if o.get("summary") == "CaughtMutant"]
+for field, records in (("unviable", unviable), ("caught", caught)):
+    declared = int(data.get(field) or 0)
+    if len(records) != declared:
+        print(f"FAIL: {path} declares {field}={declared} and holds {len(records)} matching record(s).", file=sys.stderr)
+        print("      The file changed shape, and a check that finds no records judges nothing.", file=sys.stderr)
+        sys.exit(1)
 
 killed = []
 for outcome in unviable:
@@ -143,8 +145,49 @@ if killed:
     print("      again. First of them:", file=sys.stderr)
     for name, why in killed[:5]:
         print(f"        {why}  {name}", file=sys.stderr)
+else:
+    print(f"OK  unviable builds: all {len(unviable)} refused by the compiler with a diagnostic, none by the machine")
+
+# The caught half, the same hole facing the other way. A mutant whose test run
+# never started (cargo.exe ending in 0xC0000142 like the 44 builds above) is
+# filed as CaughtMutant, and a caught mutant counts FOR the kill rate: the
+# fewer test runs the machine managed to start, the better the score. A catch
+# is a test run that exited on its own, 101 when tests fail, so its Test phase
+# has to be Failure(1..255). One NTSTATUS is a catch too, and is named here
+# rather than let through a range: 0xC00000FD STATUS_STACK_OVERFLOW, a mutant
+# that recurses without end, dying of it where the tests run. Only Failure is
+# judged here; a Test phase with any other shape is left as it was.
+STACK_OVERFLOW = -1073741571  # 0xC00000FD as the i32 cargo-mutants records
+stopped, overflowed = [], 0
+for outcome in caught:
+    test = next((p for p in reversed(outcome.get("phase_results") or []) if p.get("phase") == "Test"), None)
+    status = test.get("process_status") if test else None
+    if not (isinstance(status, dict) and set(status) == {"Failure"}):
+        continue
+    if status["Failure"] == STACK_OVERFLOW:
+        overflowed += 1
+        continue
+    why = exit_status(status)
+    if why is not None:
+        stopped.append((mutant_name(outcome), why))
+
+if stopped:
+    print(f"FAIL: the machine, not the tests, stopped {len(stopped)} of {len(caught)} caught mutant(s).", file=sys.stderr)
+    print("      Their test run ended with a status no test run returns: cargo could not start", file=sys.stderr)
+    print("      or was killed, no test ran, and cargo-mutants still counts them as caught, which", file=sys.stderr)
+    print("      scores a broken run high. Free memory or lower MUTANTS_JOBS and run it again.", file=sys.stderr)
+    print("      First of them:", file=sys.stderr)
+    for name, why in stopped[:5]:
+        print(f"        {why}  {name}", file=sys.stderr)
+else:
+    note = ""
+    if overflowed:
+        note = (f"; {overflowed} of them died of 0xC00000FD STATUS_STACK_OVERFLOW, a mutant that"
+                " recurses without end, which is its tests catching it")
+    print(f"OK  caught mutants: all {len(caught)} ended their test run with its own exit code{note}")
+
+if killed or stopped:
     sys.exit(1)
-print(f"OK  unviable builds: all {len(unviable)} refused by the compiler with a diagnostic, none by the machine")
 PY
 }
 

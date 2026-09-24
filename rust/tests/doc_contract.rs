@@ -545,28 +545,44 @@ fn the_gate_does_not_run_its_provisioning_inside_the_database_container() {
 
 #[test]
 fn the_gate_writes_its_own_exit_code_where_a_reader_can_find_it() {
-    let gate = read("scripts/run-all-tests.sh");
+    let lock = read("scripts/gate-lock.sh");
     assert!(
-        gate.contains("local code=$?") && gate.contains("echo \"$code\" > \"$EXIT_FILE\""),
-        "the gate has to record its own exit code, captured before the cleanup can overwrite \
-         $?, and outside /tmp because /tmp is swept on reboot. A 20-minute gate is launched in \
-         the background, and whatever the wrapper reports is the exit code of the last command \
-         in the chain, not of the gate: that is how GATE_EXIT=101 was once read as green. \
-         Leaving this to the caller does not work either — on 2026-08-16 the gate was launched \
-         three times with nohup and no capture, and each time the result was read from a file \
-         that was never going to appear"
+        lock.contains("GATE_EXIT_FILE=\"${CUBA_GATE_EXIT_FILE:-$HOME/.cache/cuba-gate/run.exit}\""),
+        "the exit file lives outside /tmp, because /tmp is swept on reboot"
     );
-    let trap = gate
-        .find("trap on_exit EXIT")
-        .expect("the gate installs its exit trap");
-    let first_step = gate
-        .find("=== cargo fmt --check ===")
-        .expect("the gate starts by checking formatting");
-    assert!(
-        trap < first_step,
-        "the trap has to be armed before the first step that can fail, or a failure in fmt or \
-         clippy leaves no exit code behind and the run looks like it never happened"
-    );
+    // Both scripts that can hold the lock record the code they exit with,
+    // captured before the cleanup can overwrite $?. A 20-minute gate is
+    // launched in the background, and whatever the wrapper reports is the exit
+    // code of the last command in the chain, not of the gate: that is how
+    // GATE_EXIT=101 was once read as green. Leaving this to the caller does not
+    // work either — on 2026-08-16 the gate was launched three times with nohup
+    // and no capture, and each time the result was read from a file that was
+    // never going to appear. Since 0.28 merge-gate.sh writes the verdict, so
+    // that a deny or mutation failure after the tests is not reported as 0.
+    for (script, first_step) in [
+        ("scripts/run-all-tests.sh", "=== cargo fmt --check ==="),
+        (
+            "scripts/merge-gate.sh",
+            "\"$ROOT/scripts/run-all-tests.sh\"\n",
+        ),
+    ] {
+        let gate = read(script);
+        assert!(
+            gate.contains("local code=$?") && gate.contains("exit_file_verdict \"$code\""),
+            "{script} has to record the code it exits with, captured before its cleanup"
+        );
+        let trap = gate
+            .find("trap on_exit EXIT")
+            .unwrap_or_else(|| panic!("{script} installs its exit trap"));
+        let step = gate
+            .rfind(first_step)
+            .unwrap_or_else(|| panic!("{script} runs {first_step}"));
+        assert!(
+            trap < step,
+            "{script}: the trap has to be armed before the first step that can fail, or a \
+             failure there leaves no exit code behind and the run looks like it never happened"
+        );
+    }
 }
 
 const UNIT_TESTS_ON_THE_GATE_DB: &str = "DATABASE_URL=\"$GATE_DATABASE_URL\" cargo test";

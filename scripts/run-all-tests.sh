@@ -103,16 +103,6 @@ fi
 source "$ROOT/scripts/gate-lock.sh"
 GATE_OWNED_DBS=()
 
-# The exit code is written here before anything else can overwrite $?. A 20-minute
-# gate gets launched in the background, and then its result is read from whatever
-# the wrapper reports — which is the exit code of the last command in the chain,
-# not of the gate. That is how GATE_EXIT=101 was once reported as green. Reading
-# this file is the only honest answer, and /tmp is swept on reboot, so it lives
-# under ~/.cache. Written by the gate itself so that launching it correctly is not
-# something the caller has to remember. A run refused by the lock never touches
-# it: the file belongs to the run that is still going.
-EXIT_FILE="${CUBA_GATE_EXIT_FILE:-$HOME/.cache/cuba-gate/run.exit}"
-
 # The admin connection and psql_url are defined further down; these three only
 # run after them. They are the whole of what the ownership rule says to the
 # server, which is also what lets the self-test put a catalog in their place.
@@ -172,12 +162,15 @@ release_owned_databases() {
   return 0
 }
 
+# $? is read before anything else can overwrite it. The exit file is written
+# only by a run that took the lock itself (gate-lock.sh says why): under
+# merge-gate.sh this is the first half of a gate, and the verdict is the
+# parent's to write.
 on_exit() {
   local code=$?
+  [[ -z "$GATE_LOCK_HELD" ]] || exit_file_verdict "$code"
   release_owned_databases
   release_gate_lock
-  mkdir -p "$(dirname "$EXIT_FILE")"
-  echo "$code" > "$EXIT_FILE"
 }
 
 # --- self-test: each guard above gets the fixture that has to stop it ---------
@@ -403,7 +396,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
 fi
 
 inherit_gate_lock "$GATE_LOCK" || acquire_gate_lock "$GATE_LOCK" || exit 1
-rm -f "$EXIT_FILE"
+[[ -z "$GATE_LOCK_HELD" ]] || exit_file_running
 trap on_exit EXIT
 
 CACHE_NEW="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry"

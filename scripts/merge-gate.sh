@@ -108,8 +108,17 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit 0
 fi
 
+# The exit file is this gate's whole verdict, not its first half's: the rules
+# are in gate-lock.sh, next to the lock whose holder owns the file.
+on_exit() {
+  local code=$?
+  exit_file_verdict "$code"
+  release_gate_lock
+}
+
 acquire_gate_lock "$GATE_LOCK" || exit 1
-trap release_gate_lock EXIT
+exit_file_running
+trap on_exit EXIT
 export CUBA_GATE_LOCK_OWNER="$GATE_OWNER"
 
 echo "╔══════════════════════════════════════════════════════════╗"

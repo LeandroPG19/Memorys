@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Sourced, never run: the "one gate at a time" lock, shared by merge-gate.sh,
 # which holds it for its whole run, and run-all-tests.sh, which takes it when
-# it runs on its own and inherits it when merge-gate.sh is its parent.
+# it runs on its own and inherits it when merge-gate.sh is its parent. The
+# exit file, at the end, belongs to whichever of the two took the lock.
 #
 # It lived inside run-all-tests.sh until merge-gate.sh needed it too. That
 # script calls run-all-tests.sh and then keeps going — clippy and tests under
@@ -195,4 +196,39 @@ release_gate_lock() {
     echo "      (now: ${holder:-nothing}). Another gate may have run beside this one." >&2
   fi
   return 0
+}
+
+# --- the exit file -----------------------------------------------------------
+# A 20-minute gate gets launched in the background, and then its result is read
+# from whatever the wrapper reports — which is the exit code of the last
+# command in the chain, not of the gate. That is how GATE_EXIT=101 was once
+# reported as green. Reading this file is the only honest answer, and /tmp is
+# swept on reboot, so it lives under ~/.cache. The gate writes it itself so
+# that launching it correctly is not something the caller has to remember.
+#
+# It belongs to the run that TOOK the lock, and to nobody else: merge-gate.sh
+# for a whole gate, run-all-tests.sh only when it runs on its own. It used to
+# be written by run-all-tests.sh whatever launched it, so under merge-gate.sh
+# a run whose tests passed wrote 0 and then deny, audit, codigo-muerto,
+# crap-gate or mutants-gate could still fail with the file saying 0. A run
+# refused by the lock never touches it: it belongs to the run still going.
+#
+# Two states. `running <owner record>` from the moment the lock is taken, so
+# a gate killed in the middle — SIGKILL runs no trap, and twice on 2026-09-23
+# memory pressure did exactly that — leaves "running" and not whatever an
+# earlier run left; the record's pid and start time say whether that run is
+# still alive (owner_alive above). Then the exit code, written by the EXIT
+# trap BEFORE the lock is released: released first, a gate started in between
+# could write its own "running" and have this run's code land on top of it.
+# shellcheck disable=SC2034 # read by the scripts that source this one
+GATE_EXIT_FILE="${CUBA_GATE_EXIT_FILE:-$HOME/.cache/cuba-gate/run.exit}"
+
+exit_file_running() {
+  mkdir -p "$(dirname "$GATE_EXIT_FILE")"
+  printf 'running %s\n' "$GATE_OWNER" >"$GATE_EXIT_FILE"
+}
+
+exit_file_verdict() {
+  mkdir -p "$(dirname "$GATE_EXIT_FILE")"
+  printf '%s\n' "$1" >"$GATE_EXIT_FILE"
 }

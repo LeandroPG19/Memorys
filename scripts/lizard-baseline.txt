@@ -7,9 +7,10 @@
 # The price, accepted: moving a function changes its key, and the gate then
 # says it is not in the baseline. That verdict is loud and obviously wrong,
 # which is the trade for the one it replaces: silent and invisibly wrong.
-# Regenerating REWRITES this file whole, so every comment below - each one
-# carrying the reason and the owner of a deliberate deviation - is dropped.
-# Put them back, or the next reader inherits the numbers without the why.
+# Every comment below sits over the key it explains, carrying the reason and
+# the owner of a deliberate deviation, and regenerating keeps it there. A key
+# that leaves the baseline takes its comment with it, and regenerating names
+# both. Everything above the next line is rewritten by the script.
 # Regenerate with: ./scripts/quality-gate.sh --update-lizard-baseline
 src/calibrate_cli.rs::run_cli:70 20
 # +1: `undo_dir()?`. It used to answer `.` when HOME was not set, so `recall

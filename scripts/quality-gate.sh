@@ -102,9 +102,60 @@ lizard_warnings() {
     sed 's|\\|/|g' | sort -u || true
 }
 
+# The header's last line. Everything above it in the baseline is this
+# script's and gets rewritten; everything below it is the entries, each with
+# the comment that sits over it.
+BASELINE_HEADER_END="# Regenerate with: ./scripts/quality-gate.sh --update-lizard-baseline"
+
+# keep_baseline_comments OLD_BASELINE NOTES_FILE < FRESH_KEYS: the fresh
+# `key cc` lines, each with the comment that sat over the same key in the old
+# baseline, and any comment after the last key at the end.
+#
+# Regenerating used to write the file whole, and every comment in it went with
+# the old numbers: 20 lines of reason and owner, each one the why of a
+# deliberate deviation. A comment belongs to the key right under it, which is
+# how every one in the file is written. A key that is gone (its function
+# deleted, or moved, since the key carries the start line) takes its comment
+# with it, and NOTES_FILE names both, so it can be put back by hand over the
+# new key if the function only moved. The old file is read with getline
+# rather than as awk's first input, because an empty first input makes
+# FNR == NR true for the second file too.
+keep_baseline_comments() {
+  awk -v oldfile="$1" -v notes="$2" -v header_end="$BASELINE_HEADER_END" '
+    BEGIN {
+      while ((getline line < oldfile) > 0) { sub(/\r$/, "", line); old[++n] = line }
+      start = 1
+      for (i = 1; i <= n; i++) if (old[i] == header_end) { start = i + 1; break }
+      for (i = start; i <= n; i++) {
+        if (old[i] ~ /^#/ || old[i] ~ /^[[:space:]]*$/) { pending = pending old[i] "\n"; continue }
+        split(old[i], f, /[[:space:]]+/)
+        if (pending != "") { comment[f[1]] = pending; keys[++k] = f[1] }
+        pending = ""
+      }
+    }
+    {
+      split($0, f, /[[:space:]]+/)
+      if (f[1] in comment) { printf "%s", comment[f[1]]; placed[f[1]] = 1 }
+      print
+    }
+    END {
+      printf "%s", pending
+      for (i = 1; i <= k; i++) {
+        if (keys[i] in placed) continue
+        printf "%s left the baseline, and the comment over it went with it:\n", keys[i] > notes
+        c = comment[keys[i]]
+        sub(/\n$/, "", c)
+        gsub(/\n/, "\n      ", c)
+        printf "      %s\n", c > notes
+      }
+    }'
+}
+
 if [[ "${1:-}" == "--update-lizard-baseline" ]]; then
   cc_max="${LIZARD_CC_MAX:-8}"
   mapfile -t all < <(cd rust && find src -name '*.rs' | sort)
+  regenerated="$(mktemp)"
+  dropped="$(mktemp)"
   {
     echo "# Functions already over CC $cc_max when this line was drawn."
     echo "# The gate fails a function that is NOT here, or one here that got worse."
@@ -115,12 +166,23 @@ if [[ "${1:-}" == "--update-lizard-baseline" ]]; then
     echo "# The price, accepted: moving a function changes its key, and the gate then"
     echo "# says it is not in the baseline. That verdict is loud and obviously wrong,"
     echo "# which is the trade for the one it replaces: silent and invisibly wrong."
-    echo "# Regenerating REWRITES this file whole, so every comment below - each one"
-    echo "# carrying the reason and the owner of a deliberate deviation - is dropped."
-    echo "# Put them back, or the next reader inherits the numbers without the why."
-    echo "# Regenerate with: ./scripts/quality-gate.sh --update-lizard-baseline"
-    lizard_warnings rust "$cc_max" "${all[@]}"
-  } > "$BASELINE"
+    echo "# Every comment below sits over the key it explains, carrying the reason and"
+    echo "# the owner of a deliberate deviation, and regenerating keeps it there. A key"
+    echo "# that leaves the baseline takes its comment with it, and regenerating names"
+    echo "# both. Everything above the next line is rewritten by the script."
+    echo "$BASELINE_HEADER_END"
+    lizard_warnings rust "$cc_max" "${all[@]}" | keep_baseline_comments "$BASELINE" "$dropped"
+  } > "$regenerated"
+  # Copied over, not moved: a mktemp file would bring its 0600 mode with it.
+  cat "$regenerated" > "$BASELINE"
+  rm -f "$regenerated"
+  if [[ -s "$dropped" ]]; then
+    echo "note: regenerating dropped the comments of keys that are no longer over CC $cc_max." >&2
+    echo "      If the function only moved, its key moved with it: put the comment back over" >&2
+    echo "      the new key." >&2
+    sed 's/^/      /' "$dropped" >&2
+  fi
+  rm -f "$dropped"
   echo "wrote $BASELINE ($(grep -vc '^#' "$BASELINE") functions over CC $cc_max)"
   exit 0
 fi
@@ -221,6 +283,41 @@ unused_exclusions() {
   while IFS= read -r alt; do
     grep -qP -e "$alt" "$list" || printf '%s\n' "$alt"
   done < <(exclusion_alternatives "$re")
+}
+
+# mutate_and_judge ARGS...: `cargo mutants` over ARGS (the --file and --in-diff
+# set) with the exclusions above, and its outcomes through the SIL's build check.
+#
+# cargo mutants exits 0 when every mutant it could not build is unviable,
+# whatever stopped the build, and a machine out of memory stops all of them
+# (0xC0000142 on Windows, 44 of 51 on 2026-09-23). Its outcomes go to a fresh
+# directory, so what gets judged is this run and never a mutants.out left
+# behind by an earlier one, and then to the same check the SIL uses: the rule
+# and its --self-test live in mutants-gate.sh, not in a copy here.
+#
+# That directory is named to cargo-mutants in the spelling cygpath -m gives.
+# cargo-mutants is a Windows program under Git Bash, and MSYS rewrites an
+# argument that looks like a POSIX path when it launches one — measured on
+# 2026-09-23: `--output /tmp/tmp.X` as two arguments arrives as
+# C:/Users/<user>/AppData/Local/Temp/tmp.X. Not with MSYS_NO_PATHCONV or
+# MSYS2_ARG_CONV_EXCL set in the shell: then cargo-mutants gets /tmp/tmp.X, writes under \tmp on the current drive, this
+# script finds no outcomes.json in its /tmp, and a run nobody judged reads as
+# one with nothing to judge. Off Windows there is no cygpath and nothing to
+# rewrite.
+mutate_and_judge() {
+  local out native rc=0
+  out="$(mktemp -d)"
+  native="$(cygpath -m "$out" 2>/dev/null || printf '%s' "$out")"
+  (cd rust && cargo mutants "$@" \
+    --exclude-re "$MUTANTS_EXCLUDE_RE" --output "$native" \
+    --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || rc=1
+  if [[ -f "$out/mutants.out/outcomes.json" ]]; then
+    "$ROOT/scripts/mutants-gate.sh" --check-builds "$out/mutants.out/outcomes.json" || rc=1
+  else
+    echo "no outcomes.json: cargo mutants built no mutant, so there is no build to judge"
+  fi
+  rm -rf "$out"
+  return "$rc"
 }
 
 # --- self-test: the CRAP filter gets a fixture that puts it in the red -------
@@ -594,6 +691,78 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           # The entries of MUTANTS_EXCLUDE_RE (top of this file) are not reachable by
           # `cargo mutants -- --lib`, each for its own reason, and every one of
           # them has its decision tested somewhere the mutation CAN reach.
+          #
+          # A group zero: the thirteen that 11cdc57 (0.26) put in the regex
+          # with no reason written anywhere. The commit message gives the
+          # class ("--lib never awaits an async handler that needs a
+          # database"); the reason of each was read in the code on
+          # 2026-09-23, one by one. They are bare names, so each hides every
+          # mutant of its function, the body included, and anything whose
+          # name contains it (run_check also covers run_checks_with). "Judged
+          # by" is where the SIL kills the mutant that empties the function;
+          # "judged NOWHERE" is a hole this exclusion does not close.
+          # Owner: endurecedor 0.26 (11cdc57). Expires: 2027-03-22.
+          #
+          #   Needs a database, which --lib has no pool for:
+          #   fetch_adjacency   the two in graph/kcore.rs and graph/closeness.rs.
+          #                     Reached only through cuba_vigia metric=structural,
+          #                     which neither the E2E nor any rust/tests file
+          #                     asks for. Judged NOWHERE. The halves that decide,
+          #                     compute_in_memory in both files, have unit tests.
+          #   list_resources, read_resource
+          #                     protocol.rs, the MCP resources/list and
+          #                     resources/read methods. No test and no E2E call
+          #                     sends either method. Judged NOWHERE.
+          #   backfill_unscoped project.rs, behind `proyecto backfill` and
+          #                     `memory-industry project backfill`. No test sends
+          #                     that action. Judged NOWHERE.
+          #   observation_in_scope
+          #                     project.rs, the scope check of every cuba_eco
+          #                     action. The E2E's test_cuba_eco calls it on an
+          #                     observation of the current scope; whether a
+          #                     refusal fails that test was not traced, and no
+          #                     test hands eco an observation of another project,
+          #                     so `with Ok(true)` is judged NOWHERE.
+          #
+          #   Dormant today: their files are in the CLI/doctor case above, so
+          #   they never reach --file. They matter the day that case shrinks,
+          #   and are written so that day does not arrive without a reason:
+          #   run_checks_with   doctor.rs, needs a pool. Judged by
+          #                     v032_reranker_says_why_its_off (--ignored), which
+          #                     expects the reranker check in what it returns.
+          #   upsert_symbol, upsert_placeholder_entity
+          #                     codegraph_cli.rs, need a connection. upsert_symbol
+          #                     is exercised by
+          #                     v017_codegraph_hardening::rebuilding_after_an_edit_refreshes_the_row_instead_of_orphaning_it
+          #                     (--ignored), whose first assertion wants the symbol
+          #                     recorded (reasoned from the code, not run against
+          #                     the mutant). upsert_placeholder_entity: no
+          #                     assertion found that reads what it writes.
+          #   run_project       cli.rs, `memory-industry project`. `with Ok(())`
+          #                     is judged by
+          #                     cli_contract::every_listed_command_is_actually_dispatched:
+          #                     the usage line of `project --help` is printed
+          #                     from inside the body. The rest of the body needs
+          #                     a database: judged NOWHERE.
+          #   run_check, run_write, workspace_client_id
+          #                     setup_agent.rs, `memory-industry setup`. They read
+          #                     and write the MCP configs under the real home
+          #                     (~/.claude.json, ~/.cursor/mcp.json) and read the
+          #                     cwd, which no --lib test can move without moving
+          #                     it for every other test in the binary. Judged
+          #                     NOWHERE.
+          #
+          #   And one with no reason at all, said so rather than invented:
+          #   builtin_retrieval_set
+          #                     eval/datasets.rs. A pure function returning three
+          #                     fixed samples: nothing keeps --lib from calling
+          #                     it. Only `eval` without --dataset uses it, and
+          #                     the SIL's eval smoke passes --dataset. Judged
+          #                     NOWHERE, and a unit test is all it takes; when
+          #                     that test exists, delete the pattern. Until then
+          #                     it is a cover, so its date is short.
+          # Owner: endurecedor 0.28 (builtin_retrieval_set). Expires: 2026-10-23.
+          #
           # This first group of five came in with b4db21c, after 11cdc57 set the
           # version to 0.26.0, so it is 0.27 work, like the third group below.
           # Owner: endurecedor 0.27 (b4db21c). Expires: 2027-03-22.
@@ -1003,23 +1172,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           if [[ -s "$diff_file" ]]; then
             in_diff=(--in-diff "$diff_file")
           fi
-          # cargo mutants exits 0 when every mutant it could not build is
-          # unviable, whatever stopped the build, and a machine out of memory
-          # stops all of them (0xC0000142 on Windows, 44 of 51 on 2026-09-23).
-          # Its outcomes go to a fresh directory, so what gets judged is this
-          # run and never a mutants.out left behind by an earlier one, and then
-          # to the same check the SIL uses: the rule and its --self-test live in
-          # mutants-gate.sh, not in a copy here.
-          qg_mutants_out="$(mktemp -d)"
-          (cd rust && cargo mutants "${files[@]}" "${in_diff[@]}" \
-            --exclude-re "$MUTANTS_EXCLUDE_RE" --output "$qg_mutants_out" \
-            --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || fail=1
-          if [[ -f "$qg_mutants_out/mutants.out/outcomes.json" ]]; then
-            "$ROOT/scripts/mutants-gate.sh" --check-builds "$qg_mutants_out/mutants.out/outcomes.json" || fail=1
-          else
-            echo "no outcomes.json: cargo mutants built no mutant, so there is no build to judge"
-          fi
-          rm -rf "$qg_mutants_out"
+          mutate_and_judge "${files[@]}" "${in_diff[@]}" || fail=1
           rm -f "$diff_file"
         fi
       else

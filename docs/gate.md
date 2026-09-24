@@ -19,8 +19,8 @@ Second judge, chained, not a substitute: `./scripts/quality-gate.sh` (lizard + `
 | `cargo audit` | known Rust advisories |
 | `codigo-muerto` | dead code / unused deps |
 | `scripts/crap-gate.sh` | coverage floor (`CRAP_MIN_LINE_COV`, default 15%) |
-| `scripts/mutants-gate.sh` | kill-rate floor on `src/search/{mmr,rrf,cache}.rs`; fails first if any unviable mutant was not refused by the compiler: its build must exit 1..255 and its log must show a rustc diagnostic in the build phase, not only cargo's `could not compile` or a linker failure. Unviable mutants leave the kill rate's denominator, so a machine out of memory would otherwise score high (`--self-test` runs the fixtures) |
-| `scripts/quality-gate.sh` | **not** in the SIL — second judge: lizard + mutants of the `rust/src` diff |
+| `scripts/mutants-gate.sh` | kill-rate floor on `src/search/{mmr,rrf,cache}.rs`; fails first if any unviable mutant was not refused by the compiler: its build must exit 1..255 and its log must show a rustc diagnostic in the build phase, not only cargo's `could not compile` or a linker failure. Unviable mutants leave the kill rate's denominator, so a machine out of memory would otherwise score high. A caught mutant counts only when its test run exited 1..255, or died of `0xC00000FD STATUS_STACK_OVERFLOW` (a mutant that recurses without end, accepted by name): a `cargo test` that never started is not a catch (`--self-test` runs the fixtures) |
+| `scripts/quality-gate.sh` | **not** in the SIL — second judge: lizard + mutants of the `rust/src` diff. `--update-lizard-baseline` keeps every comment of `scripts/lizard-baseline.txt` over the key it explains, and names the ones that leave with their key |
 
 Oracles and fixtures decide green — not an AI opinion.
 
@@ -48,6 +48,7 @@ Two gates on one machine share `brain_gate`, the ports and cargo's lock, and eac
 - A second gate refuses at once, before it sweeps, drops or builds anything, and names the first: pid, start time, command, and the `kill` that stops it.
 - A lock whose owner died is taken over; one whose pid was reused is recognised by its start time. A lock from another host is refused, not guessed at.
 - Every database the gate creates carries its run's record as a comment, and an exit drops only the ones still carrying its own.
+- `~/.cache/cuba-gate/run.exit` (or `CUBA_GATE_EXIT_FILE`) is what to read when the session that launched a gate is gone. It belongs to the run that took the lock: `merge-gate.sh` for a whole gate, `run-all-tests.sh` only when run on its own. It says `running <owner record>` from the moment the lock is taken, and the exit code once the run ends. A gate killed in the middle runs no trap and leaves `running`, never an earlier run's `0`; the record's pid and start time say whether that run is still alive. Until this release it was written by `run-all-tests.sh` even under `merge-gate.sh`, so it could say `0` over a gate that then failed at `cargo deny`, `audit`, `codigo-muerto`, `crap-gate` or `mutants-gate`. `./scripts/merge-gate.sh --self-test` drives a copy of the gate in a throwaway tree to prove each case.
 - Published migrations through **0060** are frozen (SHA-384). Wrong shipped SQL gets a **new** migration. Do not edit `0017`–`0060`.
 
 ## Required machine
@@ -98,4 +99,4 @@ The only way to publish. In order, and any failure stops it before anything is c
 
 Versioned under `.cursor/rules/` (never a junction to `~/.cursor/rules`). Six-pack + TDD + two judges. Comments stay. Plant rules (Playwright, React Query, guardian-planta) are not copied here.
 
-Handoffs: `.cursor/handoffs/*.yml`, validated by `scripts/validar-handoff.sh` — shape, plus the two-pass protocol: `commit` has to exist in the repo and `tests: written|frozen` (required when `commit != none`) is checked by extracting the `#[cfg(test)]` regions at that commit and in the tree. `written` fails when none moved, `frozen` when one did. `scripts/validar-handoff.sh --self-test` runs a fixture against each guard.
+Handoffs: `.cursor/handoffs/*.yml`, validated by `scripts/validar-handoff.sh` — shape, plus the two-pass protocol: `commit` has to exist in the repo and `tests: written|frozen` (required when `commit != none`) is checked by extracting the `#[cfg(test)]` regions at that commit and in the tree. `written` fails when none moved, `frozen` when one did. An optional `paths:` list limits that comparison to the handoff's own slice, so that one agent's honest green pass is not refused for a test another agent edited in the same tree; it is refused empty, with a path that exists neither in the tree nor at `commit`, and with `commit: none`. `scripts/validar-handoff.sh --self-test` runs a fixture against each guard.

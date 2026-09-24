@@ -41,6 +41,8 @@ uso:
   validar-handoff.sh --self-test     prueba que cada guardia puede fallar
 
 Campos: from, to, type, task, commit, evidence, y `tests` cuando commit != none.
+Opcional con commit != none: `paths`, la lista de rutas de la tajada; `tests`
+se juzga entonces solo sobre los ficheros bajo ellas.
 TXT
 }
 
@@ -98,8 +100,19 @@ region_en_arbol() { # <ruta>
   fi
 }
 
-tests_tocados() { # <commit> -> imprime los ficheros cuya region cambio
+en_la_tajada() { # <fichero> [ruta...] -> 0 si el fichero cae dentro de alguna ruta
+  local f="$1" p
+  shift
+  (( $# > 0 )) || return 0
+  for p in "$@"; do
+    [[ "$f" == "$p" || "$f" == "$p/"* ]] && return 0
+  done
+  return 1
+}
+
+tests_tocados() { # <commit> [ruta...] -> imprime los ficheros cuya region cambio
   local commit="$1" f a b ficheros
+  shift
   # `git diff` no ve lo que no esta trackeado, y la pasada roja estrena ficheros
   # de test a menudo. Sin ls-files --others, `written` diria que no se escribio
   # ningun test justo el dia que se escribio uno nuevo.
@@ -110,10 +123,43 @@ tests_tocados() { # <commit> -> imprime los ficheros cuya region cambio
   [[ -n "$ficheros" ]] || return 0
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
+    en_la_tajada "$f" "$@" || continue
     a="$(region_en_commit "$commit" "$f")"
     b="$(region_en_arbol "$f")"
     [[ "$a" == "$b" ]] || printf '%s\n' "$f"
   done <<< "$ficheros"
+}
+
+# ------------------------------------------------------------------ la tajada
+
+# `paths:` en el handoff, una ruta por linea, como lista de YAML en bloque
+#   paths:
+#     - rust/tests/local_gate_contract.rs
+#     - scripts
+# o en linea: `paths: [rust/src/cosa.rs, scripts]`. Sin comillas ni `./`
+# delante ni `/` detras, que se quitan aqui: son la misma ruta.
+lista_paths() { # <fichero.yml>
+  awk '
+    function limpia(x) {
+      gsub(/["\047\r]/, "", x)
+      sub(/^[[:space:]]+/, "", x); sub(/[[:space:]]+$/, "", x)
+      sub(/^\.\//, "", x); sub(/\/+$/, "", x)
+      if (x != "") print x
+    }
+    /^paths:/ {
+      resto = $0; sub(/^paths:[[:space:]]*/, "", resto)
+      if (resto ~ /^\[/) {
+        gsub(/[][]/, "", resto)
+        n = split(resto, a, ",")
+        for (i = 1; i <= n; i++) limpia(a[i])
+        next
+      }
+      dentro = 1; next
+    }
+    dentro && /^[[:space:]]*-/ { x = $0; sub(/^[[:space:]]*-/, "", x); limpia(x); next }
+    dentro && /^[[:space:]]*(#|$)/ { next }
+    { dentro = 0 }
+  ' "$1"
 }
 
 # -------------------------------------------------------------- el veredicto
@@ -132,6 +178,18 @@ juzgar() { # <fichero.yml>
   from=$(val from); to=$(val to); tipo=$(val type)
   task=$(val task); commit=$(val commit); evidence=$(val evidence)
   tests=$(val tests)
+
+  # `paths`, opcional: la tajada que el handoff declara suya. Con varios
+  # agentes en un mismo arbol, comparar el arbol entero rechaza la pasada
+  # verde honesta de uno por el test que otro edito a la vez. Con `paths`,
+  # written y frozen miran solo los ficheros bajo esas rutas; sin el campo,
+  # el arbol entero, como siempre.
+  local declara_paths=0
+  local -a paths=()
+  if grep -Eq '^paths:' "$path"; then
+    declara_paths=1
+    mapfile -t paths < <(lista_paths "$path")
+  fi
 
   local k v
   for k in from to tipo task commit evidence; do
@@ -153,6 +211,10 @@ juzgar() { # <fichero.yml>
       echo "tests prohibido con commit: none — un handoff sin commit no entrega codigo"
       return 1
     }
+    (( declara_paths == 0 )) || {
+      echo "paths prohibido con commit: none — no hay codigo entregado del que acotar la tajada"
+      return 1
+    }
   else
     # Que el sha TENGA FORMA no prueba nada: la forma la cumple cualquier cosa
     # que uno se invente con los dedos sobre las teclas de la a a la f.
@@ -160,8 +222,24 @@ juzgar() { # <fichero.yml>
       echo "commit no existe en este repo: $commit"
       return 1
     }
+    # Una tajada vacia no tiene tests que puedan cambiar, y una ruta mal
+    # escrita no casa con ninguno: en los dos casos `frozen` pasaria siempre,
+    # sin haber mirado nada.
+    if (( declara_paths == 1 )); then
+      (( ${#paths[@]} > 0 )) || {
+        echo "paths declarado sin ninguna ruta: una tajada vacia no tiene tests que mirar"
+        return 1
+      }
+      local p
+      for p in "${paths[@]}"; do
+        [[ -e "$ROOT/$p" ]] || git -C "$ROOT" cat-file -e "$commit:$p" 2>/dev/null || {
+          echo "paths: $p no existe ni en el arbol ni en $commit"
+          return 1
+        }
+      done
+    fi
     local cambiados
-    cambiados="$(tests_tocados "$commit")"
+    cambiados="$(tests_tocados "$commit" "${paths[@]}")"
     case "$tests" in
       written)
         [[ -n "$cambiados" ]] || {
