@@ -506,6 +506,229 @@ mod tests {
         }
     }
 
+    /// What PostgreSQL hands sqlx, built by hand: the tests below need the very
+    /// error the server raises when two sessions write one catalog row, and no
+    /// server raises it on demand. `attempt` is not part of what the server
+    /// says; it only lets a test tell which call an error came from.
+    #[derive(Debug)]
+    struct ServerSaid {
+        sqlstate: &'static str,
+        message: String,
+        attempt: u32,
+    }
+
+    impl std::fmt::Display for ServerSaid {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for ServerSaid {}
+
+    impl sqlx::error::DatabaseError for ServerSaid {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.sqlstate))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn server_said(sqlstate: &'static str, message: &str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(ServerSaid {
+            sqlstate,
+            message: message.to_owned(),
+            attempt: 0,
+        }))
+    }
+
+    /// Two sessions altering cuba_app's row in pg_authid at once: `elog(ERROR)`
+    /// in PostgreSQL's simple_heap_update, which is XX000 and never translated.
+    fn catalog_race_on(attempt: u32) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(ServerSaid {
+            sqlstate: "XX000",
+            message: "tuple concurrently updated".to_owned(),
+            attempt,
+        }))
+    }
+
+    fn attempt_of(error: &sqlx::Error) -> Option<u32> {
+        error
+            .as_database_error()?
+            .try_downcast_ref::<ServerSaid>()
+            .map(|said| said.attempt)
+    }
+
+    #[test]
+    fn the_catalog_race_is_recognised_in_every_shape_it_reaches_init_schema() {
+        assert!(
+            is_concurrent_catalog_update(&MigrateError::ExecuteMigration(catalog_race_on(0), 41)),
+            "the shape measured on two scratch databases of one server: `while executing \
+             migration 41: error returned from database: tuple concurrently updated`"
+        );
+        assert!(
+            is_concurrent_catalog_update(&MigrateError::Execute(catalog_race_on(0))),
+            "the same race surfacing at the migration's COMMIT comes wrapped as Execute"
+        );
+        assert!(
+            is_concurrent_catalog_update(&catalog_race_on(0)),
+            "the ALTER ROLE ... PASSWORD of provision_app_role fails with a bare sqlx::Error"
+        );
+    }
+
+    #[test]
+    fn nothing_but_the_catalog_race_is_taken_for_it() {
+        let verdicts = [
+            (
+                "the same text under another SQLSTATE",
+                is_concurrent_catalog_update(&server_said("40001", "tuple concurrently updated")),
+            ),
+            (
+                "XX000 with another text",
+                is_concurrent_catalog_update(&server_said(
+                    "XX000",
+                    "cache lookup failed for relation 16384",
+                )),
+            ),
+            (
+                "migration 41 failing for another reason",
+                is_concurrent_catalog_update(&MigrateError::ExecuteMigration(
+                    server_said("42P01", "relation \"brain_audit_log\" does not exist"),
+                    41,
+                )),
+            ),
+            (
+                "an error that never reached the server",
+                is_concurrent_catalog_update(&sqlx::Error::PoolTimedOut),
+            ),
+            (
+                "a migration edited after it shipped",
+                is_concurrent_catalog_update(&MigrateError::VersionMismatch(41)),
+            ),
+        ];
+        let taken: Vec<&str> = verdicts
+            .iter()
+            .filter(|(_, retried)| *retried)
+            .map(|(what, _)| *what)
+            .collect();
+        assert!(
+            taken.is_empty(),
+            "taken for the catalog race and retried, which only delays the same failure by \
+             a second and a half: {taken:?}"
+        );
+    }
+
+    /// Runs the retry over an attempt that fails with `error(n)` on its first
+    /// `failures` calls and then answers with the call number, and counts the
+    /// calls: what init_schema hands it, without a server.
+    async fn retried_after(
+        failures: u32,
+        error: fn(u32) -> sqlx::Error,
+    ) -> (Result<u32, sqlx::Error>, u32) {
+        let mut calls = 0;
+        let outcome = retry_on_catalog_race(|| {
+            calls += 1;
+            let call = calls;
+            Box::pin(async move {
+                if call <= failures {
+                    Err(error(call))
+                } else {
+                    Ok(call)
+                }
+            })
+        })
+        .await;
+        (outcome, calls)
+    }
+
+    #[tokio::test]
+    async fn a_catalog_race_that_clears_before_the_fifth_attempt_is_retried_until_it_passes() {
+        for failures in [1, 4] {
+            let (outcome, calls) = retried_after(failures, catalog_race_on).await;
+            let answered_on = outcome.unwrap_or_else(|e| {
+                panic!("{failures} catalog races and then success came out as an error: {e}")
+            });
+            assert_eq!(
+                (answered_on, calls),
+                (failures + 1, failures + 1),
+                "after {failures} races the attempt that passes is call {}, and nothing runs \
+                 after it",
+                failures + 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_catalog_race_on_every_attempt_gives_up_after_five_with_the_last_error() {
+        let (outcome, calls) = retried_after(u32::MAX, catalog_race_on).await;
+        assert_eq!(calls, 5, "five attempts in all, then the error goes out");
+        let error = outcome.expect_err("every attempt raced, so the run cannot come back Ok");
+        assert_eq!(
+            attempt_of(&error),
+            Some(5),
+            "the error that goes out is the fifth attempt's, not an earlier one: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_other_error_comes_out_on_the_first_attempt() {
+        fn not_a_race(_: u32) -> sqlx::Error {
+            sqlx::Error::PoolTimedOut
+        }
+        let (outcome, calls) = retried_after(u32::MAX, not_a_race).await;
+        assert_eq!(
+            calls, 1,
+            "an error that is not the catalog race is not retried"
+        );
+        assert!(
+            matches!(outcome, Err(sqlx::Error::PoolTimedOut)),
+            "the error goes out as it came: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn the_wait_before_a_retry_is_random_between_50_and_400_ms_and_grows() {
+        for retry in 1..=4 {
+            for random in [0, 1, 7, 12_345, u64::MAX] {
+                let wait = catalog_race_backoff(retry, random).as_millis();
+                assert!(
+                    (50..=400).contains(&wait),
+                    "retry {retry} with random {random} waits {wait} ms, outside 50..=400"
+                );
+            }
+        }
+        let shortest: Vec<u128> = (1..=4)
+            .map(|retry| catalog_race_backoff(retry, 0).as_millis())
+            .collect();
+        let longest: Vec<u128> = [(1, 50), (2, 100), (3, 200), (4, 200)]
+            .into_iter()
+            .map(|(retry, random)| catalog_race_backoff(retry, random).as_millis())
+            .collect();
+        assert_eq!(
+            (shortest, longest),
+            (vec![50, 100, 200, 200], vec![100, 200, 400, 400]),
+            "each retry waits in the upper half of a ceiling that doubles from 100 ms up to \
+             400 ms, the point in it picked by the random number"
+        );
+    }
+
     #[tokio::test]
     #[ignore]
     async fn released_connection_does_not_leak_app_current_project() {
