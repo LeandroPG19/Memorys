@@ -11,6 +11,43 @@ docs/gate.md text eol=lf
 # clone CRLF unless this line is here.
 scripts/lizard-baseline.txt text eol=lf
 
+# Everything below is read back from disk by the crate or by its contracts and
+# compared by content. Git for Windows sets core.autocrlf=true system-wide, so
+# without these lines a fresh clone holds them in CRLF, and a needle with a line
+# break stops matching: the SIL of 0.27 was red on a new Windows clone and
+# green on the tree that published it. local_gate_contract.rs checks out every
+# one of them with core.autocrlf=true and wants LF back:
+# a_fresh_clone_with_autocrlf_checks_out_the_text_the_crate_reads_back_in_lf
+#
+# The crate's own source: tests read it with include_str! and look for code
+# spanning lines. rustc gives a literal a bare LF whatever the file holds, and
+# include_str! gives the bytes on disk.
+*.rs text eol=lf
+# The panel is embedded with include_str!, so without this the binary served
+# different bytes depending on who checked it out.
+*.html text eol=lf
+# Docs, manifests, workflows and scripts the contracts read: doc_contract,
+# ci_contract, cli_contract, local_gate_contract, e2e_tool_matrix_contract.
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.py text eol=lf
+*.ps1 text eol=lf
+# The eval datasets the tests load, one JSON object per line.
+*.jsonl text eol=lf
+# Packaging goldens: packaging_contract compares them with what service.rs
+# renders, which is LF, and they are copied to Linux hosts where systemd reads a
+# trailing CR as part of the value (an ExecStart path, an environment variable).
+*.service text eol=lf
+*.socket text eol=lf
+*.example text eol=lf
+# Deliberately absent: packaging/windows/memory-industry.cmd. cmd.exe is its
+# only reader and runs it in either ending, since it has no label or goto (what
+# an LF-only batch file breaks); the binary itself writes it in LF.
+# packaging_contract compares it after normalising \r\n, so no rule here would
+# change a verdict, and pinning one would decide something nobody measured.
+
 # `schtasks /Create /XML` reads the bytes, not the declaration: a UTF-8 task
 # file is refused at (1,40) — the column `encoding=` sits in — before it is ever
 # parsed. So the working tree has to hold UTF-16LE with a BOM, which is what
