@@ -239,6 +239,245 @@ async fn provisioning_moves_an_existing_role_onto_the_new_password_and_off_the_o
     .await;
 }
 
+/// An iteration count the server never picks on its own. Set as the scratch
+/// database's `scram_iterations`, it is the count the server hashes with when
+/// a password reaches CREATE ROLE or ALTER ROLE in the clear, while a
+/// verifier the binary computed arrives with its own 4096 and is stored as it
+/// is. The count in pg_authid then says who hashed the password, and so
+/// whether the password itself travelled to the server.
+const SERVER_SIDE_ITERATIONS: &str = "1234";
+
+/// The admin pool on `url` after setting the scratch database's
+/// `scram_iterations` to SERVER_SIDE_ITERATIONS. The pool is opened after the
+/// ALTER DATABASE, so every session it hands out already has the setting.
+async fn admin_pool_that_marks_server_side_hashing(url: &str) -> PgPool {
+    let mut setup = PgConnection::connect(url)
+        .await
+        .expect("connecting to the scratch database to set its scram_iterations");
+    setup
+        .execute(
+            format!(
+                "DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET scram_iterations = {SERVER_SIDE_ITERATIONS}', current_database()); END $$"
+            )
+            .as_str(),
+        )
+        .await
+        .expect("setting scram_iterations on the scratch database (PostgreSQL 16 or later)");
+    setup
+        .close()
+        .await
+        .expect("closing the connection that set scram_iterations");
+
+    let admin = PgPool::connect(url)
+        .await
+        .expect("connecting to the scratch database as the admin role");
+    let live: String = sqlx::query_scalar("SELECT current_setting('scram_iterations')")
+        .fetch_one(&admin)
+        .await
+        .expect("reading scram_iterations in the admin pool");
+    assert_eq!(
+        live, SERVER_SIDE_ITERATIONS,
+        "the admin pool does not run with the scram_iterations set on its database, so the \
+         iteration count cannot tell a password the server hashed from a verifier the binary \
+         computed"
+    );
+    admin
+}
+
+/// What pg_authid keeps for `role`: the verifier the server checks a login
+/// against, or None for a role without a password. Only a superuser reads
+/// pg_authid, and only a superuser runs these tests.
+async fn stored_verifier(pool: &PgPool, role: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT rolpassword FROM pg_authid WHERE rolname = $1")
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("reading what pg_authid keeps for {role}: {e}"))
+}
+
+/// The iteration count and the Base64 salt of a verifier in the form
+/// PostgreSQL stores it, `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`,
+/// or None for anything else.
+fn iterations_and_salt(verifier: &str) -> Option<(&str, &str)> {
+    let (head, _keys) = verifier.strip_prefix("SCRAM-SHA-256$")?.split_once('$')?;
+    head.split_once(':')
+}
+
+/// The password the daemon provisions used to reach the server in the clear,
+/// inside `ALTER ROLE ... PASSWORD`, and the bound setting that carried it
+/// there: log_statement, log_min_duration_statement and pg_stat_statements
+/// can all keep a copy of either. The binary now computes the SCRAM-SHA-256
+/// verifier and hands the server only that, which PostgreSQL stores as it is
+/// («If the presented password string is already in MD5-encrypted or
+/// SCRAM-encrypted format, then it is stored as-is regardless of
+/// password_encryption», CREATE ROLE). Whoever hashed it shows in the stored
+/// iteration count.
+#[tokio::test]
+async fn provisioning_hands_the_server_a_verifier_and_never_the_password() {
+    with_a_throwaway_role(|url, role| async move {
+        let admin = admin_pool_that_marks_server_side_hashing(&url).await;
+        let old = fresh_secret();
+        admin
+            .execute(format!("CREATE ROLE {role} LOGIN PASSWORD '{old}'").as_str())
+            .await
+            .unwrap_or_else(|e| panic!("creating {role} with a password in the clear: {e}"));
+        let hashed_by_the_server = stored_verifier(&admin, &role).await;
+        assert_eq!(
+            hashed_by_the_server
+                .as_deref()
+                .and_then(iterations_and_salt)
+                .map(|(iterations, _)| iterations),
+            Some(SERVER_SIDE_ITERATIONS),
+            "a password handed over in the clear should be hashed here with \
+             {SERVER_SIDE_ITERATIONS} iterations, but {role} stored {hashed_by_the_server:?}. \
+             Without that the count cannot say who hashed a password (is password_encryption \
+             scram-sha-256 on this server?)"
+        );
+        assert_the_server_checks_passwords(&url, &role).await;
+
+        let new = fresh_secret();
+        memory_industry::db::provision_app_role(&admin, &role, &new).await;
+
+        let first = stored_verifier(&admin, &role).await;
+        let (iterations, salt) = first
+            .as_deref()
+            .and_then(iterations_and_salt)
+            .unwrap_or_else(|| {
+                panic!("after provisioning, {role} keeps {first:?}, not a SCRAM-SHA-256 verifier")
+            });
+        assert_eq!(
+            iterations, "4096",
+            "after provisioning, {role} keeps a verifier of {iterations} iterations, the count \
+             this server hashes with: the password reached the server in the clear, where the \
+             statement log and pg_stat_statements can keep it, instead of the verifier the \
+             binary computes with 4096"
+        );
+        assert!(
+            salt.len() == 24 && salt.ends_with("=="),
+            "the salt of the verifier is {salt:?}, which is not 16 bytes in Base64 (24 \
+             characters ending in ==), the salt length PostgreSQL uses"
+        );
+        assert!(
+            logs_in(&url, &role, &new).await,
+            "{role} does not log in with the password its verifier was computed from, so the \
+             server cannot check that verifier and the daemon falls back to the superuser"
+        );
+        assert!(
+            !logs_in(&url, &role, &old).await,
+            "after provisioning, {role} still opens with its old password"
+        );
+
+        memory_industry::db::provision_app_role(&admin, &role, &new).await;
+        let second = stored_verifier(&admin, &role).await;
+        assert_ne!(
+            first, second,
+            "provisioning the same password twice stored the same verifier: the salt is not \
+             drawn afresh, so one precomputed table opens every install with that password"
+        );
+        assert!(
+            logs_in(&url, &role, &new).await,
+            "{role} does not log in with its password after the second provisioning"
+        );
+        admin.close().await;
+    })
+    .await;
+}
+
+/// `secure` creates the role through the embedded script, which put the
+/// password it was handed into CREATE ROLE. It hands the script the verifier
+/// now, and the role keeps exactly that.
+#[tokio::test]
+async fn a_role_created_by_secure_keeps_the_verifier_the_binary_computed() {
+    with_a_throwaway_role(|url, role| async move {
+        let admin = admin_pool_that_marks_server_side_hashing(&url).await;
+        let secret = fresh_secret();
+
+        let outcome = ensure_app_role(&admin, &role, &secret)
+            .await
+            .unwrap_or_else(|e| panic!("creating the application role {role}: {e:#}"));
+        assert_eq!(
+            outcome,
+            AppRole::Created,
+            "{role} did not exist before this call, so it had to be created"
+        );
+
+        let stored = stored_verifier(&admin, &role).await;
+        assert_eq!(
+            stored
+                .as_deref()
+                .and_then(iterations_and_salt)
+                .map(|(iterations, _)| iterations),
+            Some("4096"),
+            "{role} was created with {stored:?}: a count of {SERVER_SIDE_ITERATIONS} means the \
+             server hashed a password that reached CREATE ROLE in the clear, instead of \
+             storing the verifier the binary computes with 4096"
+        );
+        assert!(
+            logs_in(&url, &role, &secret).await,
+            "{role} does not log in with the password its verifier was computed from"
+        );
+        assert_the_server_checks_passwords(&url, &role).await;
+        admin.close().await;
+    })
+    .await;
+}
+
+/// Run by hand through psql, the script took the password itself and put it
+/// into CREATE ROLE. It takes a verifier now, and refuses anything else
+/// before it creates a role: accepting a password in the clear would keep
+/// the manual path sending it to the server. The refusal must not repeat the
+/// value either, or the server log gets the password from the error.
+#[tokio::test]
+async fn the_script_refuses_a_password_in_the_clear() {
+    with_a_throwaway_role(|url, role| async move {
+        let admin = PgPool::connect(&url)
+            .await
+            .expect("connecting to the scratch database as the admin role");
+        let secret = fresh_secret();
+
+        let mut tx = admin
+            .begin()
+            .await
+            .expect("opening the transaction the script runs in");
+        let setup = sqlx::Executor::execute(
+            &mut *tx,
+            sqlx::query(
+                "SELECT set_config('memory_industry.app_role', $1, true), \
+                        set_config('memory_industry.app_password', $2, true)",
+            )
+            .bind(&role)
+            .bind(&secret),
+        )
+        .await;
+        let script = sqlx::Executor::execute(&mut *tx, sqlx::raw_sql(CREATE_APP_ROLE_SQL)).await;
+        let rolled_back = tx.rollback().await;
+
+        rolled_back.expect("rolling back the transaction the script ran in");
+        setup.expect("setting the role and the password for the transaction");
+        let error = match script {
+            Ok(_) => panic!(
+                "embed/create-app-role.sql created {role} from a password in the clear: that \
+                 password goes into CREATE ROLE, where the statement log and \
+                 pg_stat_statements can keep it. The script has to take a SCRAM-SHA-256 \
+                 verifier and refuse anything else"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            error.contains("SCRAM-SHA-256"),
+            "the script refused a password in the clear, but its error does not say that it \
+             wants a SCRAM-SHA-256 verifier, so nobody reading it knows what to hand it: {error}"
+        );
+        assert!(
+            !error.contains(&secret),
+            "the refusal repeats the password it was handed, and the server log keeps errors: \
+             {error}"
+        );
+        admin.close().await;
+    })
+    .await;
+}
+
 /// The real application role as pg_roles shows it (the password is masked
 /// there), or None when the server has none.
 async fn the_real_app_role(pool: &PgPool) -> Option<String> {
