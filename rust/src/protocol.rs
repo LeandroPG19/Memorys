@@ -1882,7 +1882,12 @@ mod tests {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         const PREFERRED: &str = "MEMORY_INDUSTRY_HANDSHAKE_TIMEOUT_SECS";
         const LEGACY: &str = "CUBA_HANDSHAKE_TIMEOUT_SECS";
-        type Row = (Option<&'static str>, Option<&'static str>, Option<u64>, &'static str);
+        type Row = (
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<u64>,
+            &'static str,
+        );
 
         let rows: [Row; 3] = [
             (
