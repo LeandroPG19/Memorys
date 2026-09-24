@@ -1446,3 +1446,141 @@ fn a_caught_mutant_whose_test_process_never_ran_is_not_caught() {
         stack_overflow.1
     );
 }
+
+/// What the crate and its contracts read back from disk and compare by content,
+/// one tracked file per extension. The file is what the checkout below
+/// reproduces, so a rule written for a directory instead of an extension is
+/// judged on the path that matters.
+const READ_BACK_AS_TEXT: [(&str, &str); 12] = [
+    ("rs", "rust/src/handlers/faro.rs"),
+    ("html", "rust/src/panel/index.html"),
+    ("md", "README.md"),
+    ("toml", "rust/Cargo.toml"),
+    ("json", "server.json"),
+    ("jsonl", "rust/eval-datasets/isolation.jsonl"),
+    ("yml", ".github/workflows/ci.yml"),
+    ("py", "rust/tests/e2e_all_tools.py"),
+    ("ps1", "scripts/validar-handoff.ps1"),
+    ("service", "packaging/memory-industry.service"),
+    ("socket", "packaging/memory-industry.socket"),
+    ("example", "packaging/memory-industry.env.example"),
+];
+
+fn declares_lf(attributes: &str, pattern: &str) -> bool {
+    attributes.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next() == Some(pattern) && words.any(|attr| attr == "eol=lf")
+    })
+}
+
+/// The SIL was red on every fresh clone on Windows while it stayed green in
+/// the tree that published 0.27: `core.autocrlf=true` comes from the system
+/// gitconfig of Git for Windows, `.gitattributes` pinned `*.sql` and `*.sh`
+/// but not `*.rs`, and `the_rerank_budget_starts_before_the_model_is_resolved`
+/// looks for a needle with a newline in `include_str!("faro.rs")`. rustc hands
+/// the needle a bare LF; the checkout handed the file CRLF.
+#[test]
+fn the_text_the_crate_reads_back_is_declared_lf() {
+    let attributes = read(".gitattributes");
+    let missing: Vec<String> = READ_BACK_AS_TEXT
+        .iter()
+        .map(|(ext, _)| format!("*.{ext}"))
+        .filter(|pattern| !declares_lf(&attributes, pattern))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        ".gitattributes has no `eol=lf` line for {missing:?}. With core.autocrlf=true, which \
+         Git for Windows sets system-wide, a fresh clone checks these out in CRLF, and a test \
+         that reads one back and looks for a line break (include_str! of its own source, a \
+         contract over a doc or a manifest) goes red on that clone and green on the tree that \
+         happened to hold LF"
+    );
+}
+
+fn git_with_autocrlf(dir: &Path, args: &[&str]) {
+    // A git hook exports GIT_DIR and GIT_INDEX_FILE, and with them set these
+    // commands would write to the repository the tests run from instead of
+    // the scratch one.
+    let out = std::process::Command::new("git")
+        .args(["-c", "core.autocrlf=true", "-c", "core.safecrlf=false"])
+        .args(args)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Reading `.gitattributes` proves a line is there, not that git applies it:
+/// a later `-text`, a typo in the pattern or a path rule that shadows it all
+/// leave the line in place. This checks out the same paths under this
+/// `.gitattributes` with `core.autocrlf=true`, as a fresh clone on Windows
+/// does, and reads the bytes back. `checkout-index` rather than `checkout`, so
+/// no hook of the machine runs.
+#[test]
+fn a_fresh_clone_with_autocrlf_checks_out_the_text_the_crate_reads_back_in_lf() {
+    // The anchor: an extension no rule names has to come back in CRLF, or the
+    // scratch repository is not converting at all and every LF below would be
+    // proving nothing.
+    const UNRULED: &str = "anchor.unruled";
+    let dir = std::env::temp_dir().join(format!("mi-eol-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("create the scratch directory");
+    git_with_autocrlf(&dir, &["init", "-q"]);
+    std::fs::write(dir.join(".gitattributes"), read(".gitattributes"))
+        .expect("write .gitattributes");
+    let paths: Vec<&str> = READ_BACK_AS_TEXT
+        .iter()
+        .map(|(_, path)| *path)
+        .chain([UNRULED])
+        .collect();
+    for path in &paths {
+        let file = dir.join(path);
+        std::fs::create_dir_all(file.parent().expect("a parent")).expect("create the parent");
+        std::fs::write(&file, "first\nsecond\n").expect("write the file");
+    }
+    git_with_autocrlf(&dir, &["add", "--", "."]);
+    for path in &paths {
+        std::fs::remove_file(dir.join(path)).expect("remove the file");
+    }
+    git_with_autocrlf(&dir, &["checkout-index", "--all", "--force"]);
+    let crlf: Vec<&str> = paths
+        .iter()
+        .copied()
+        .filter(|path| {
+            std::fs::read(dir.join(path))
+                .expect("checked out again")
+                .windows(2)
+                .any(|pair| pair == b"\r\n")
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    for (_, path) in READ_BACK_AS_TEXT {
+        assert!(
+            repo_root().join(path).is_file(),
+            "{path} is not in the tree any more: name another file with its extension, or \
+             this row checks out a path the repository does not have"
+        );
+    }
+    assert!(
+        crlf.contains(&UNRULED),
+        "a file no rule of .gitattributes names came back without CRLF under \
+         core.autocrlf=true, so this checkout does not convert and cannot tell a rule that \
+         works from one that does not"
+    );
+    let offenders: Vec<&str> = crlf.into_iter().filter(|path| *path != UNRULED).collect();
+    assert!(
+        offenders.is_empty(),
+        "a fresh clone with core.autocrlf=true checks out {offenders:?} in CRLF under this \
+         .gitattributes. Anything that reads one of them back and looks for a line break goes \
+         red on that clone: that is how the SIL of 0.27 was red on a new Windows clone and \
+         green on the tree that published it"
+    );
+}

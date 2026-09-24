@@ -2466,7 +2466,13 @@ mod tests {
         // 1.1 GB read, and timing only the inference that followed made the
         // 20 s look generous while the caller waited minutes for something
         // nobody was measuring.
-        let source = include_str!("faro.rs");
+        //
+        // rustc reads the needle below with a bare LF whatever the file holds,
+        // and include_str! hands back the bytes on disk: a checkout in CRLF
+        // (core.autocrlf on Windows) made the needle unfindable and this test
+        // red on every fresh clone. Normalised here so the check is about
+        // the code, not about who checked it out.
+        let source = include_str!("faro.rs").replace("\r\n", "\n");
         let timeout_at = source
             .find("tokio::time::timeout(rerank_budget")
             .expect("the rerank budget wraps something");
