@@ -69,40 +69,44 @@ check_ci_exclusions_are_covered_locally() {
   echo "$uncovered"
 }
 
-# The second exclusion list of ci.yml, NEEDS_A_SERVER, holds globs on the file
-# stem, quoted in the workflow: 'v043_*'.
-server_only_patterns() {
-  sed -n 's/.*NEEDS_A_SERVER=(\(.*\)).*/\1/p' "$1" | head -1 | tr -d "'\"" |
-    tr ' ' '\n' | grep -v '^$' || true
+# The second exclusion of ci.yml is not a list: a test file whose plain tests
+# need a PostgreSQL server opens with this line, and the check job, which has
+# no server, leaves out every file that does. Only the first line counts,
+# because that is the only one ci.yml reads.
+SERVER_MARKER='// needs-a-server:'
+
+server_only_files() {
+  local file
+  for file in "$1"/*.rs; do
+    [[ -f "$file" ]] || continue
+    [[ "$(head -n 1 "$file" | tr -d '\r')" == "$SERVER_MARKER"* ]] && printf '%s\n' "$file"
+  done
+  return 0
 }
 
 # Those files carry no #[ignore], so no section of run-all-tests.sh names them:
 # they run in its plain `cargo test` against the throwaway database, and that
-# line is the whole of the promise. A glob that matches no file excludes
-# nothing and reads like a cover, and the date on the exclusion is read like
-# every other exclusion date in this repo: past it, red.
+# line is the whole of the promise. A marker with nothing after it is an
+# exclusion nobody explained, and the date on the exclusion is read like every
+# other exclusion date in this repo: past it, red. Which files have to carry the
+# marker is rust/tests/ci_contract.rs's to judge, not this script's.
 check_server_only_tests_run_locally() {
-  local ci="$1" gate="$2" tests="$3" today="$4" uncovered=0 pattern expired
+  local ci="$1" gate="$2" tests="$3" today="$4" uncovered=0 file reason expired
   local plain='^DATABASE_URL="\$GATE_DATABASE_URL" cargo test$'
-  # Every check below runs once per pattern read, so a list this cannot read
-  # (split over several lines, or emptied) would check nothing and print OK.
-  if grep -q 'NEEDS_A_SERVER=(' "$ci" && [[ -z "$(server_only_patterns "$ci")" ]]; then
-    echo "FAIL: ci.yml declares NEEDS_A_SERVER and no pattern could be read from it. Keep the" >&2
-    echo "      quoted globs on the one line NEEDS_A_SERVER=( opens, or drop the list" >&2
-    uncovered=$((uncovered + 1))
-  fi
-  while read -r pattern; do
-    [[ -z "$pattern" ]] && continue
-    if [[ -z "$(compgen -G "$tests/$pattern.rs" || true)" ]]; then
-      echo "FAIL: ci.yml keeps $pattern out of the check job and no file in $tests matches it" >&2
+  while read -r file; do
+    [[ -z "$file" ]] && continue
+    reason="$(head -n 1 "$file" | tr -d '\r')"
+    reason="${reason#"$SERVER_MARKER"}"
+    if [[ -z "${reason//[[:space:]]/}" ]]; then
+      echo "FAIL: $file opens with '$SERVER_MARKER' and no reason after it" >&2
       uncovered=$((uncovered + 1))
     fi
     if ! grep -q "$plain" "$gate"; then
-      echo "FAIL: ci.yml keeps $pattern out of the check job because run-all-tests.sh runs it in" >&2
+      echo "FAIL: ci.yml keeps $file out of the check job because run-all-tests.sh runs it in" >&2
       echo "      its plain cargo test against GATE_DATABASE_URL, and that line is gone" >&2
       uncovered=$((uncovered + 1))
     fi
-  done < <(server_only_patterns "$ci")
+  done < <(server_only_files "$tests")
   while read -r expired; do
     [[ -z "$expired" ]] && continue
     echo "FAIL: an exclusion in ci.yml expired on $expired. Renew it with a reason that is still true, or drop it" >&2
@@ -138,29 +142,28 @@ if [[ "${1:-}" == "--self-test" ]]; then
   got="$(check_ci_exclusions_are_covered_locally "$tmp/ci.yml" "$tmp/gate2.sh" 2>/dev/null | tail -1)"
   [[ "$got" == "1" ]] || { echo "FAIL self-test: a CI exclusion covered nowhere was not caught (got $got)" >&2; exit 1; }
 
-  # NEEDS_A_SERVER: one glob that matches a file and one that matches none,
-  # then the same list against a gate whose cargo test is no longer plain, then
-  # the day after the exclusion's date.
+  # The server marker: two marked files (one with CRLF, as a Windows checkout
+  # leaves it), one whose marker sits below the first line and one without it,
+  # first against a gate that runs them, then against one whose cargo test is
+  # no longer plain, then the day after the exclusion's date, then with a
+  # marker that gives no reason.
   mkdir -p "$tmp/tests"
-  : >"$tmp/tests/present_a.rs"
-  printf '%s\n' "NEEDS_A_SERVER=('present_*' 'gone_*')" '# Owner: x. Expires: 2026-09-22.' > "$tmp/ci3.yml"
+  printf '%s\n' '// needs-a-server: creates its own database' 'mod common;' > "$tmp/tests/marked.rs"
+  printf '%s\r\n' '// needs-a-server: creates its own database' 'mod common;' > "$tmp/tests/marked_crlf.rs"
+  printf '%s\n' '//! a file' '// needs-a-server: too late for ci.yml to read' > "$tmp/tests/late.rs"
+  printf '%s\n' '#[test]' 'fn plain() {}' > "$tmp/tests/plain.rs"
+  printf '%s\n' '# Owner: x. Expires: 2026-09-22.' > "$tmp/ci3.yml"
   printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" cargo test' > "$tmp/gate3.sh"
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
-  [[ "$got" == "1" ]] || { echo "FAIL self-test: a server-only glob that matches no file was not caught, or one that does was (got $got)" >&2; exit 1; }
+  [[ "$got" == "0" ]] || { echo "FAIL self-test: marked files a plain cargo test runs were reported (got $got)" >&2; exit 1; }
   printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" cargo test --lib' > "$tmp/gate4.sh"
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate4.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
-  [[ "$got" == "3" ]] || { echo "FAIL self-test: server-only files with no plain cargo test left to run them were not caught (got $got)" >&2; exit 1; }
+  [[ "$got" == "2" ]] || { echo "FAIL self-test: the two marked files with no plain cargo test left to run them were not both caught, or the one marked below the first line was (got $got)" >&2; exit 1; }
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-23 2>/dev/null | tail -1)"
-  [[ "$got" == "2" ]] || { echo "FAIL self-test: a CI exclusion past its date was not caught (got $got)" >&2; exit 1; }
-  # The glob that stops matching is not always the last one: with 'v043_*'
-  # 'v044_*', either can be the one whose files were renamed away.
-  printf '%s\n' "NEEDS_A_SERVER=('gone_*' 'present_*')" > "$tmp/ci5.yml"
-  got="$(check_server_only_tests_run_locally "$tmp/ci5.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
-  [[ "$got" == "1" ]] || { echo "FAIL self-test: a server-only glob ahead of one that matches was not checked (got $got)" >&2; exit 1; }
-  # The same list split over lines reads as no patterns, and no patterns used to mean no checks.
-  printf '%s\n' 'NEEDS_A_SERVER=(' "  'gone_*'" ')' > "$tmp/ci6.yml"
-  got="$(check_server_only_tests_run_locally "$tmp/ci6.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
-  [[ "$got" == "1" ]] || { echo "FAIL self-test: a NEEDS_A_SERVER list the guard cannot read passed as checked (got $got)" >&2; exit 1; }
+  [[ "$got" == "1" ]] || { echo "FAIL self-test: a CI exclusion past its date was not caught (got $got)" >&2; exit 1; }
+  printf '%s\n' '// needs-a-server:   ' 'mod common;' > "$tmp/tests/unexplained.rs"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "1" ]] || { echo "FAIL self-test: a server marker with no reason after it was not caught (got $got)" >&2; exit 1; }
 
   mkdir -p "$tmp/src"
   # The comment line is the fixture that matters: the first version of this
@@ -194,7 +197,7 @@ if (( orphans > 0 || uncovered > 0 || server_only > 0 )); then
   exit 1
 fi
 echo "OK  every deferred and CI-excluded test file is run by name in run-all-tests.sh, and"
-echo "    every server-only file ($(server_only_patterns "$CI" | tr '\n' ' ')) runs in its plain cargo test"
+echo "    every server-only file ($(server_only_files "$RUST_DIR/tests" | xargs -r -n 1 basename | tr '\n' ' ')) runs in its plain cargo test"
 
 echo "=== codigo-muerto: the ignore ceiling ==="
 ignores="$(count_ignores "$RUST_DIR")"

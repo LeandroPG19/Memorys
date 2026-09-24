@@ -791,7 +791,18 @@ fn in_use(error: &anyhow::Error) -> bool {
 /// A rename keeps the file, its mode and its ACL. Across volumes it cannot,
 /// and the entry is copied instead.
 fn relocate(src: &Path, dst: &Path) -> Result<()> {
-    match std::fs::rename(src, dst) {
+    relocate_with(src, dst, &|from, to| std::fs::rename(from, to))
+}
+
+/// `relocate` with the rename handed in: on one disk `std::fs::rename` never
+/// answers `CrossesDevices`, so without this the branch that turns it into a
+/// copy had no test.
+fn relocate_with(
+    src: &Path,
+    dst: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    match rename(src, dst) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => copy_across_volumes(src, dst),
         Err(e) => Err(e).with_context(|| format!("moviendo {} a {}", src.display(), dst.display())),
@@ -807,11 +818,23 @@ fn relocate(src: &Path, dst: &Path) -> Result<()> {
 /// the copy takes the ACL of the directory it lands in, which is how
 /// `setup::store_password` created it in the first place.
 fn copy_across_volumes(src: &Path, dst: &Path) -> Result<()> {
+    copy_across_volumes_with(src, dst, &copy_tree)
+}
+
+/// `copy_across_volumes` with the copier handed in: `copy_tree` never writes a
+/// wrong byte, so without this the check that removes a bad copy had no test.
+/// Only the copy is handed in; the rename of the staging copy is the real one,
+/// because it is a sibling of `dst` and on its volume.
+fn copy_across_volumes_with(
+    src: &Path,
+    dst: &Path,
+    copy: &dyn Fn(&Path, &Path) -> Result<()>,
+) -> Result<()> {
     let staging = sibling(dst, "migrating");
     if std::fs::symlink_metadata(&staging).is_ok() {
         remove_entry(&staging)?;
     }
-    copy_verified(src, &staging)?;
+    copy_verified(src, &staging, copy)?;
     std::fs::rename(&staging, dst)
         .with_context(|| format!("moviendo {} a {}", staging.display(), dst.display()))?;
     remove_entry(src)
@@ -819,8 +842,12 @@ fn copy_across_volumes(src: &Path, dst: &Path) -> Result<()> {
 
 /// A copy that does not match its source, file by file in size and SHA-256,
 /// is removed before anything else happens.
-fn copy_verified(src: &Path, copy: &Path) -> Result<()> {
-    copy_tree(src, copy)
+fn copy_verified(
+    src: &Path,
+    copy: &Path,
+    copier: &dyn Fn(&Path, &Path) -> Result<()>,
+) -> Result<()> {
+    copier(src, copy)
         .with_context(|| format!("copiando {} a {}", src.display(), copy.display()))?;
     if fingerprint(src, true)? != fingerprint(copy, true)? {
         remove_entry(copy)?;

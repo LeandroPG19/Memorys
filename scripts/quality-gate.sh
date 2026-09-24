@@ -791,7 +791,12 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     three lines of set_if_absent.
           #   failure_reason    reads a OnceLock that --lib cannot populate
           #                     without loading 1.1 GB of model. reason_of, the
-          #                     half that decides, has a table.
+          #                     half that decides, has a table. In the SIL,
+          #                     v045_health_names_the_model_that_would_not_open
+          #                     fails it through the daemon's own warm-up and
+          #                     wants `failed` in /health; `with None` reads
+          #                     `loaded` there. --lib never runs that file, so the
+          #                     exclusion stays.
           #
           # A second group, all of the same two shapes. Nothing here is
           # unexamined: the half of each that decides something was pulled out
@@ -950,14 +955,30 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     section: `with false` fails require_nli_model,
           #                     `with true` skips the load and entails() errs on
           #                     "sesión NLI no inicializada".
-          #   nli.rs status_resolved with false, nli.rs failure_reason with None,
-          #   onnx.rs failure_reason with None
-          #                     judged NOWHERE through the live cell. The pure
-          #                     halves are tabled: nli_state_from, reason_of in
-          #                     both files, embedder_state_from. No SIL test
-          #                     reads /health with a model loaded or failed:
-          #                     v042_health_says_what_degraded points every
-          #                     model at nothing on purpose.
+          #   nli.rs failure_reason with None, onnx.rs failure_reason with None
+          #                     judged by
+          #                     v045_health_names_the_model_that_would_not_open,
+          #                     in the plain `cargo test` of the SIL: it points
+          #                     every model at a runtime and a model that are not
+          #                     one, forces NLI through nli::enabled() in the
+          #                     daemon's process, and wants `failed` with a reason
+          #                     and no path in /health. With None the embedder
+          #                     reads `fallback` and NLI `loaded` or `absent`. That
+          #                     test lives in rust/tests/, and `cargo mutants --
+          #                     --lib` never runs rust/tests/, so here both would
+          #                     still come back MISSED: the exclusion stays for
+          #                     --lib only.
+          #   nli.rs status_resolved with false
+          #                     judged NOWHERE through the live cell. Only a
+          #                     `loaded` NLI reads it, and `loaded` takes a
+          #                     session that opens, which takes the real model:
+          #                     the SIL loads it in nli_entailment, behind
+          #                     require_present, and that file never reads
+          #                     /health. A /health test beside it would load the
+          #                     1 GB model once more for this one mutant, and v045
+          #                     cannot, since the cell it needs broken is the
+          #                     same one. The pure half, nli_state_from, has a
+          #                     table.
           #   onnx.rs compute_embedding (the four vec! values)
           #                     a one-line wrapper over compute_embedding_with,
           #                     which is tabled. Judged by
