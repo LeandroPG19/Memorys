@@ -424,3 +424,68 @@ fn serve_refuses_an_address_it_cannot_read_before_it_touches_postgres() {
         );
     }
 }
+
+/// `cache migrate` end to end through the dispatcher: the binary resolves
+/// both roots from the home it is given, plans without `--apply`, moves with
+/// it, and answers a second run with nothing to do.
+///
+/// HOME and USERPROFILE go to the child process only; this process's
+/// environment is not touched.
+#[test]
+fn cache_migrate_moves_the_legacy_cache_and_a_second_run_has_nothing_to_do() {
+    let home = std::env::temp_dir().join(format!(
+        "memory-industry-cli-cache-migrate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_nanos()
+    ));
+    let legacy = home.join(".cache").join("cuba-memorys");
+    let preferred = home.join(".cache").join("memory-industry");
+    std::fs::create_dir_all(&legacy).expect("the test owns this directory");
+    std::fs::write(legacy.join("pgpass"), "admin").expect("temp dir is writable");
+
+    let run_in_home = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cuba-memorys"))
+            .args(args)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("DATABASE_URL", DEAD_DB)
+            .output()
+            .expect("binary runs");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().unwrap_or(-1),
+        )
+    };
+
+    let (stdout, stderr, code) = run_in_home(&["cache", "migrate"]);
+    assert_eq!(
+        code, 0,
+        "`cache migrate` without --apply is a plan and exits 0.\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("pgpass"),
+        "the plan names what it would move: {stdout}"
+    );
+    assert!(
+        legacy.join("pgpass").exists() && !preferred.exists(),
+        "a plan moves nothing"
+    );
+
+    let (_, stderr, code) = run_in_home(&["cache", "migrate", "--apply"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(preferred.join("pgpass")).expect("moved under the new name"),
+        "admin"
+    );
+    assert!(!legacy.exists(), "the emptied legacy root is removed");
+
+    let (stdout, stderr, code) = run_in_home(&["cache", "migrate", "--apply"]);
+    assert_eq!(code, 0, "a second run is a clean no-op.\nstderr: {stderr}");
+    assert!(stdout.contains("nada que migrar"), "and says so: {stdout}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}

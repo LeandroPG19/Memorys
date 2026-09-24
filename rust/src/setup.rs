@@ -620,4 +620,39 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// `pgpass_app` probes its own file instead of following wherever
+    /// `pgpass` resolved.
+    ///
+    /// An install that has a legacy `pgpass_app` and never wrote a `pgpass`
+    /// (its `DATABASE_URL` was set) resolved `pgpass` to the new root, so
+    /// `pgpass_app` went there too, found nothing, generated a second
+    /// password, and `db.rs` altered the role to it: the new root created on
+    /// its own, and the credential the role had silently replaced.
+    #[tokio::test]
+    async fn a_legacy_pgpass_app_is_read_even_without_a_legacy_pgpass() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let root = scratch_root("pgpass-app");
+        let cache = root.join(".cache");
+        let legacy = cache.join("cuba-memorys").join("pgpass_app");
+        std::fs::create_dir_all(cache.join("cuba-memorys")).expect("the test owns this directory");
+        std::fs::write(&legacy, "the-password-the-role-has").expect("temp dir is writable");
+        let _h = ScopedEnv::set("HOME", &root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+
+        assert_eq!(
+            app_role_password().as_deref(),
+            Some("the-password-the-role-has"),
+            "the legacy pgpass_app is the password the role was last altered to. Generating \
+             another one here is what `db.rs` then pushes with ALTER ROLE"
+        );
+        assert!(
+            !cache.join("memory-industry").exists(),
+            "reading a stored password must not create the new root: that directory alone is \
+             what sends `models` to download again what the legacy root holds"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -1356,6 +1356,109 @@ mod runtime_role_tests {
 }
 
 #[cfg(test)]
+mod legacy_cache_tests {
+    use super::*;
+    use crate::envs::{ScopedEnv, scratch_root};
+
+    #[test]
+    fn a_legacy_cache_with_entries_warns_and_names_the_command() {
+        let root = scratch_root("doctor-legacy-cache");
+        let legacy = root.join(".cache").join("cuba-memorys");
+        std::fs::create_dir_all(legacy.join("models")).expect("the test owns this directory");
+        std::fs::create_dir_all(legacy.join("onnxruntime")).expect("the test owns this directory");
+        std::fs::write(legacy.join("pgpass"), "admin").expect("temp dir is writable");
+
+        let check = legacy_cache_check(&legacy);
+
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "a warn, not a fail: the binary still reads the legacy root for one more release, \
+             so nothing is broken yet — it is the next download that goes to the wrong place"
+        );
+        assert!(
+            check.detail.contains("3 entradas"),
+            "the detail counts what is left there: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("memory-industry cache migrate --apply")),
+            "the hint is the command that fixes it: {:?}",
+            check.hint
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_legacy_cache_or_an_empty_one_is_healthy() {
+        let root = scratch_root("doctor-no-legacy-cache");
+        let legacy = root.join(".cache").join("cuba-memorys");
+
+        assert_eq!(
+            legacy_cache_check(&legacy).status,
+            Status::Ok,
+            "an install that never had the old name has nothing to migrate"
+        );
+        std::fs::create_dir_all(&legacy).expect("the test owns this directory");
+        assert_eq!(
+            legacy_cache_check(&legacy).status,
+            Status::Ok,
+            "an empty legacy root holds nothing to migrate either"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The runtime-role failure told the operator to delete
+    /// `~/.cache/cuba-memorys/pgpass_app` whatever the binary was reading,
+    /// while `secure` names the new root. Deleting the file named leaves the
+    /// one in use where it was.
+    #[tokio::test]
+    async fn the_runtime_role_failure_names_the_pgpass_app_the_binary_reads() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let root = scratch_root("doctor-pgpass-app");
+        let cache = root.join(".cache");
+        let preferred = cache.join("memory-industry").join("pgpass_app");
+        let legacy = cache.join("cuba-memorys").join("pgpass_app");
+        let _h = ScopedEnv::set("HOME", &root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+
+        std::fs::create_dir_all(cache.join("memory-industry"))
+            .expect("the test owns this directory");
+        std::fs::write(&preferred, "app").expect("temp dir is writable");
+        let hint = runtime_role_check("cuba", true, true)
+            .hint
+            .expect("a failure carries a hint");
+        assert!(
+            hint.contains(&preferred.display().to_string()),
+            "the hint has to name the file the binary reads, {}: {hint}",
+            preferred.display()
+        );
+        assert!(
+            !hint.contains("cuba-memorys"),
+            "naming the legacy file sends the operator to delete one nothing reads: {hint}"
+        );
+
+        std::fs::remove_file(&preferred).expect("the test owns this file");
+        std::fs::create_dir_all(cache.join("cuba-memorys")).expect("the test owns this directory");
+        std::fs::write(&legacy, "app").expect("temp dir is writable");
+        let hint = runtime_role_check("cuba", true, true)
+            .hint
+            .expect("a failure carries a hint");
+        assert!(
+            hint.contains(&legacy.display().to_string()),
+            "with only the legacy file on disk that is the one to name: {hint}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
 mod evidence_tests {
     use super::*;
 
