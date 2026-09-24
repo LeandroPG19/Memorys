@@ -292,11 +292,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             ),
         }
     } else {
-        // Boxed so rustc proves Send here, with concrete lifetimes: inferred, Migrator::run
-        // left create_pool's future !Send (v043 spawns it) once provision_app_role took a tx.
-        let migrate: Pin<Box<dyn Future<Output = Result<(), MigrateError>> + Send + '_>> =
-            Box::pin(MIGRATOR.run(pool));
-        migrate.await.context("failed to run sqlx migrations")?;
+        run_migrations(pool).await?;
 
         tracing::info!("sqlx migrations applied");
         provision_app_role(pool).await;
@@ -325,6 +321,112 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// Out of init_schema, whose CC sits at its ceiling in scripts/lizard-baseline.txt
+// under its start line: one more `?` there, or one line above it, fails the ratchet.
+async fn run_migrations(pool: &PgPool) -> Result<()> {
+    realign_line_ending_checksums(pool).await?;
+    // Boxed so rustc proves Send here, with concrete lifetimes: inferred, Migrator::run
+    // left create_pool's future !Send (v043 spawns it) once provision_app_role took a tx.
+    let migrate: Pin<Box<dyn Future<Output = Result<(), MigrateError>> + Send + '_>> =
+        Box::pin(MIGRATOR.run(pool));
+    migrate.await.context("failed to run sqlx migrations")
+}
+
+/// sqlx refuses to start when `_sqlx_migrations.checksum` is not the SHA-384 of
+/// the SQL this binary embeds, and `sqlx::migrate!` embeds the bytes as they
+/// were on disk. A Windows checkout made with core.autocrlf=true before
+/// `*.sql text eol=lf` reached .gitattributes keeps its migrations in CRLF —
+/// git does not rewrite a file when attributes are added — so a daemon built
+/// there records CRLF checksums, and the LF binary CI publishes then dies with
+/// «migration 63 was previously applied but has been modified». Measured on a
+/// live base: 63 and 64 held the SHA-384 of their CRLF bytes.
+///
+/// A record that is the same SQL in the other line endings is rewritten to the
+/// embedded checksum, in both directions. Any other difference is left for
+/// sqlx to refuse, as before. The UPDATE is conditional on the checksum it
+/// read, so two daemons starting at once apply it once, and a record that
+/// changed in between is not overwritten.
+async fn realign_line_ending_checksums(pool: &PgPool) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("opening the migration checksum realignment")?;
+    let applied = applied_checksums(&mut tx)
+        .await
+        .context("reading the recorded migration checksums")?;
+    for (version, recorded) in applied {
+        let Some(embedded) = realigned_checksum_for(version, &recorded) else {
+            continue;
+        };
+        let realign = sqlx::query(
+            "UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2 AND checksum = $3",
+        )
+        .bind(embedded)
+        .bind(version)
+        .bind(&recorded);
+        sqlx::Executor::execute(&mut *tx, realign)
+            .await
+            .context("realigning a migration checksum")?;
+        tracing::warn!(
+            version,
+            "migration {version} was recorded from the same SQL in other line endings (a \
+             core.autocrlf checkout built the binary that applied it); realigned to the \
+             checksum this binary embeds"
+        );
+    }
+    tx.commit()
+        .await
+        .context("committing the migration checksum realignment")
+}
+
+/// Empty while sqlx has not created its table: a fresh database has nothing to
+/// realign. sqlx::Executor's own methods, for the Send reason given at
+/// write_app_role_password.
+async fn applied_checksums(conn: &mut sqlx::PgConnection) -> sqlx::Result<Vec<(i64, Vec<u8>)>> {
+    let table = sqlx::Executor::fetch_optional(
+        &mut *conn,
+        sqlx::query("SELECT 1 WHERE to_regclass('_sqlx_migrations') IS NOT NULL"),
+    )
+    .await?;
+    if table.is_none() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::Executor::fetch_all(
+        conn,
+        sqlx::query("SELECT version, checksum FROM _sqlx_migrations"),
+    )
+    .await?;
+    rows.iter()
+        .map(<(i64, Vec<u8>) as sqlx::FromRow<'_, sqlx::postgres::PgRow>>::from_row)
+        .collect()
+}
+
+/// Down migrations share the version of their up migration, and
+/// `_sqlx_migrations` records only the up one.
+fn realigned_checksum_for(version: i64, recorded: &[u8]) -> Option<&'static [u8]> {
+    MIGRATOR
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+        .find(|m| m.version == version)
+        .and_then(|m| realigned_checksum(&m.sql, &m.checksum, recorded))
+}
+
+/// `embedded` when `recorded` is the SHA-384 of `sql` with every line ending
+/// written the other way, which is exactly what core.autocrlf does to a file:
+/// `\r\n` to `\n`, or `\n` to `\r\n` over the text already brought to `\n`.
+/// None when the record already matches, or differs in anything else.
+fn realigned_checksum<'a>(sql: &str, embedded: &'a [u8], recorded: &[u8]) -> Option<&'a [u8]> {
+    if recorded == embedded {
+        return None;
+    }
+    let lf = sql.replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    let only_line_endings = [lf, crlf].iter().any(|variant| {
+        <sha2::Sha384 as sha2::Digest>::digest(variant.as_bytes()).as_slice() == recorded
+    });
+    only_line_endings.then_some(embedded)
 }
 
 pub async fn assert_embedding_dim(pool: &PgPool) -> Result<()> {
