@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -50,16 +51,35 @@ fn spec(name: &str) -> Option<ModelSpec> {
     }
 }
 
+/// The two cache roots: the documented one, and the one every install from
+/// before the rename wrote to. The legacy root is still read for one release
+/// (AGENTS.md); `cache migrate` is how an install stops depending on that.
+pub(crate) struct CacheRoots {
+    pub(crate) preferred: PathBuf,
+    pub(crate) legacy: PathBuf,
+}
+
+impl CacheRoots {
+    pub(crate) fn under(home: &Path) -> Self {
+        let cache = home.join(".cache");
+        Self {
+            preferred: cache.join("memory-industry"),
+            legacy: cache.join("cuba-memorys"),
+        }
+    }
+
+    pub(crate) fn resolve() -> Result<Self> {
+        // The outer context stays. `envs::home()` names both variables and talks
+        // about where an MCP client looks for a config, which does not say WHAT
+        // could not be located here; without this line the operator gets an error
+        // that only blames the environment.
+        let home = crate::envs::home().context("no sé dónde está la caché")?;
+        Ok(Self::under(&home))
+    }
+}
+
 fn cache_root() -> Result<PathBuf> {
-    // The outer context stays. `envs::home()` names both variables and talks
-    // about where an MCP client looks for a config, which does not say WHAT
-    // could not be located here; without this line the operator gets an error
-    // that only blames the environment.
-    let cache = crate::envs::home()
-        .context("no sé dónde está la caché")?
-        .join(".cache");
-    let preferred = cache.join("memory-industry");
-    let legacy = cache.join("cuba-memorys");
+    let CacheRoots { preferred, legacy } = CacheRoots::resolve()?;
     if preferred.exists() || !legacy.exists() {
         Ok(preferred)
     } else {
@@ -111,6 +131,7 @@ fn print_help() {
         "memory-industry models <embed|nli|reranker|runtime|all|llm>\n\n\
          Descarga los modelos ONNX y el runtime a ~/.cache/memory-industry/ (o la caché\n\
          legado ~/.cache/cuba-memorys/ si ya existe), en cualquier sistema.\n\
+         Para pasar la caché legado a la nueva: memory-industry cache migrate --apply\n\
          MemoryIndustry los encuentra ahí solo — no hace falta setear env vars.\n\n\
            embed      multilingual-e5-small (384-d) — búsqueda semántica. ~113 MB\n\
            nli        mDeBERTa-v3-xnli — verify sin LLM. ~1.1 GB\n\
@@ -174,9 +195,12 @@ fn verify_checksum(dest: &std::path::Path, key: &str) -> Result<()> {
     Ok(())
 }
 
+fn has_content(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() > 0)
+}
+
 async fn download_model(spec: &ModelSpec) -> Result<()> {
     let dir = cache_root()?.join(spec.dir);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creando {}", dir.display()))?;
 
     println!(
         "→ {} ({} archivos) en {}",
@@ -184,25 +208,34 @@ async fn download_model(spec: &ModelSpec) -> Result<()> {
         spec.files.len(),
         dir.display()
     );
-    for (remote, local) in spec.files {
-        let dest = dir.join(local);
-        if dest.exists() && std::fs::metadata(&dest)?.len() > 0 {
-            println!("  ✓ {local} (ya está)");
-            continue;
+    let installed = dir.clone();
+    materialize_dir(&dir, move |staging| async move {
+        for (remote, local) in spec.files {
+            if has_content(&installed.join(local)) {
+                println!("  ✓ {local} (ya está)");
+                continue;
+            }
+            let dest = staging.join(local);
+            if has_content(&dest) {
+                print!("  ✓ {local} (bajado en un intento anterior) ... ");
+            } else {
+                let url = format!(
+                    "https://huggingface.co/{}/resolve/main/{remote}",
+                    spec.hf_repo
+                );
+                print!("  ↓ {local} ... ");
+                std::io::stdout().flush().ok();
+                download_to(&url, &dest)
+                    .await
+                    .with_context(|| format!("descargando {local}"))?;
+            }
+            verify_checksum(&dest, &format!("{}/{}", spec.dir, local))?;
+            let mb = std::fs::metadata(&dest)?.len() / 1_048_576;
+            println!("{mb} MB");
         }
-        let url = format!(
-            "https://huggingface.co/{}/resolve/main/{remote}",
-            spec.hf_repo
-        );
-        print!("  ↓ {local} ... ");
-        std::io::stdout().flush().ok();
-        download_to(&url, &dest)
-            .await
-            .with_context(|| format!("descargando {local}"))?;
-        verify_checksum(&dest, &format!("{}/{}", spec.dir, local))?;
-        let mb = std::fs::metadata(&dest)?.len() / 1_048_576;
-        println!("{mb} MB");
-    }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?;
     println!(
         "  listo. MemoryIndustry lo encuentra en {} (o {}=<ruta>)",
         dir.display(),
@@ -260,10 +293,9 @@ fn runtime_target(gpu: bool) -> Result<(String, &'static str, &'static str)> {
 async fn download_runtime(gpu: bool) -> Result<()> {
     let (archive_stem, ext, lib_name) = runtime_target(gpu)?;
     let dir = cache_root()?.join("onnxruntime");
-    std::fs::create_dir_all(&dir)?;
     let lib_dest = dir.join(lib_name);
 
-    if !gpu && lib_dest.exists() && std::fs::metadata(&lib_dest)?.len() > 0 {
+    if !gpu && has_content(&lib_dest) {
         println!("→ runtime: {lib_name} ya está en {}", dir.display());
         return Ok(());
     }
@@ -278,19 +310,23 @@ async fn download_runtime(gpu: bool) -> Result<()> {
         std::env::consts::ARCH
     );
 
-    let archive_path = dir.join(format!("{archive_stem}.{ext}"));
-    print!("  ↓ descargando ... ");
-    std::io::stdout().flush().ok();
-    download_to(&url, &archive_path)
-        .await
-        .context("descargando el runtime")?;
-    println!("{} MB", std::fs::metadata(&archive_path)?.len() / 1_048_576);
+    let extracted = materialize_dir(&dir, move |staging| async move {
+        let archive_path = staging.join(format!("{archive_stem}.{ext}"));
+        print!("  ↓ descargando ... ");
+        std::io::stdout().flush().ok();
+        download_to(&url, &archive_path)
+            .await
+            .context("descargando el runtime")?;
+        println!("{} MB", std::fs::metadata(&archive_path)?.len() / 1_048_576);
 
-    print!("  ⇢ extrayendo ... ");
-    std::io::stdout().flush().ok();
-    let extracted = extract_runtime(&archive_path, ext, lib_name, &dir, gpu)
-        .with_context(|| format!("extrayendo el runtime de {}", archive_path.display()))?;
-    std::fs::remove_file(&archive_path).ok();
+        print!("  ⇢ extrayendo ... ");
+        std::io::stdout().flush().ok();
+        let extracted = extract_runtime(&archive_path, ext, lib_name, &staging, gpu)
+            .with_context(|| format!("extrayendo el runtime de {}", archive_path.display()))?;
+        std::fs::remove_file(&archive_path).ok();
+        Ok::<_, anyhow::Error>(extracted)
+    })
+    .await?;
     println!("ok ({} librerías)", extracted.len());
     for name in &extracted {
         println!("     {name}");
@@ -440,6 +476,488 @@ async fn download_to(url: &str, dest: &Path) -> Result<()> {
     }
     std::fs::rename(&tmp, dest)?;
     Ok(())
+}
+
+/// `<path>.<suffix>`, beside `path`.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".");
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// Fills `<leaf>.downloading` and turns it into `leaf` only once `fill` has
+/// downloaded and verified everything.
+///
+/// The leaf used to be created before the download. `gpu::runtime_dir`,
+/// `onnx::locate_onnxruntime` and `rerank.rs` pick a cache root by whether
+/// that directory exists, so a download that failed left an empty
+/// `onnxruntime/` they chose over a full one in the legacy root, and the
+/// install degraded to the CPU or to no reranker without a word.
+///
+/// A failed fill keeps its staging directory, not the leaf: nothing reads it,
+/// and the next run starts from the files it already verified instead of
+/// downloading four gigabytes of reranker again.
+async fn materialize_dir<T, F, Fut>(leaf: &Path, fill: F) -> Result<T>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let staging = sibling(leaf, "downloading");
+    std::fs::create_dir_all(&staging).with_context(|| format!("creando {}", staging.display()))?;
+    let filled = fill(staging.clone()).await?;
+    promote(&staging, leaf)
+        .with_context(|| format!("moviendo {} a {}", staging.display(), leaf.display()))?;
+    Ok(filled)
+}
+
+/// A leaf that does not exist yet appears in one rename. One that does (a
+/// model with a file still missing, a `runtime --gpu` over a CPU runtime)
+/// already existed before this run, so it takes the files one by one.
+fn promote(staging: &Path, leaf: &Path) -> Result<()> {
+    if !leaf.exists() {
+        std::fs::rename(staging, leaf)?;
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(staging)? {
+        let entry = entry?;
+        std::fs::rename(entry.path(), leaf.join(entry.file_name()))?;
+    }
+    std::fs::remove_dir(staging)?;
+    Ok(())
+}
+
+const IN_USE: &str = "en uso: para el daemon y vuelve a correr";
+
+/// The files that make a cache directory usable: what the loaders look for.
+/// A directory without one of them is not a model, whatever else it holds.
+const RUNTIME_LIBRARIES: &[&str] = &[
+    "onnxruntime.dll",
+    "libonnxruntime.so",
+    "libonnxruntime.dylib",
+];
+const MODEL_GRAPHS: &[&str] = &["model.onnx", "model_quantized.onnx"];
+
+fn usable_artifacts(entry: &str) -> Option<&'static [&'static str]> {
+    match entry {
+        "onnxruntime" => Some(RUNTIME_LIBRARIES),
+        "models" | "models-nli" | "models-bge-m3" | "reranker" => Some(MODEL_GRAPHS),
+        _ => None,
+    }
+}
+
+/// What `cache migrate` does with one entry of the legacy root.
+enum Step {
+    /// Only in the legacy root: it moves under the new name.
+    Move(String),
+    /// The same in both: the legacy copy goes.
+    DropLegacy(String),
+    /// Different, and the binary reads the new copy today: the legacy one is
+    /// set aside as `aside` in the new root.
+    KeepPreferred { name: String, aside: String },
+    /// Different, and the binary reads the legacy copy today: the new one is
+    /// set aside as `aside` and the legacy one takes its place.
+    KeepLegacy { name: String, aside: String },
+    /// `<name>.migrating`, left in the new root by a copy that was
+    /// interrupted. Its source is still in the legacy root — the source is
+    /// removed only after the copy is renamed into place — so the orphan is
+    /// discarded and the entry redone from the source. Resuming it would mean
+    /// trusting bytes nobody verified, and verifying them costs what copying
+    /// them again does.
+    DropOrphan(String),
+}
+
+impl Step {
+    fn describe(&self) -> String {
+        match self {
+            Step::Move(name) => format!("{name}: solo en la caché vieja, se mueve"),
+            Step::DropLegacy(name) => {
+                format!("{name}: idéntico en las dos, se borra la copia vieja")
+            }
+            Step::KeepPreferred { name, aside } => format!(
+                "{name}: distinto en las dos; queda el de la caché nueva, que es el que se lee \
+                 hoy, y el viejo se aparta como {aside}"
+            ),
+            Step::KeepLegacy { name, aside } => format!(
+                "{name}: distinto en las dos; queda el de la caché vieja, que es el que se lee \
+                 hoy, y el nuevo se aparta como {aside}"
+            ),
+            Step::DropOrphan(name) => format!(
+                "{name}.migrating: copia a medias de una corrida interrumpida, se descarta y \
+                 {name} se rehace desde el origen"
+            ),
+        }
+    }
+}
+
+/// The plan, and after `--apply` what became of each step.
+pub(crate) struct Migration {
+    preferred: PathBuf,
+    legacy: PathBuf,
+    steps: Vec<Step>,
+    applied: bool,
+    /// One per step once applied: `Some(reason)` for a step that was skipped.
+    skipped: Vec<Option<String>>,
+    legacy_removed: bool,
+}
+
+impl Migration {
+    pub(crate) fn is_clean(&self) -> bool {
+        self.skipped.iter().all(Option::is_none)
+    }
+
+    pub(crate) fn render(&self) -> String {
+        if self.steps.is_empty() {
+            return format!("nada que migrar en {}\n", self.legacy.display());
+        }
+        let mut out = format!("{} → {}\n", self.legacy.display(), self.preferred.display());
+        if !self.applied {
+            for step in &self.steps {
+                out.push_str(&format!("  · {}\n", step.describe()));
+            }
+            out.push_str(
+                "\nEsto fue un plan: no se tocó nada.\n\
+                 Para aplicarlo:  memory-industry cache migrate --apply\n",
+            );
+            return out;
+        }
+        for (step, skipped) in self.steps.iter().zip(&self.skipped) {
+            match skipped {
+                None => out.push_str(&format!("  ✓ {}\n", step.describe())),
+                Some(why) => out.push_str(&format!("  ✗ {} — {why}\n", step.describe())),
+            }
+        }
+        if self.legacy_removed {
+            out.push_str(&format!(
+                "{} quedó vacía y se borró.\n",
+                self.legacy.display()
+            ));
+        }
+        out
+    }
+}
+
+/// `memory-industry cache migrate`: plan (and with `apply`, carry out) the
+/// move of the legacy cache root under the new name.
+///
+/// `stamp` names the copies set aside (`<name>.legacy-<stamp>`); it is an
+/// argument so a test can pin it.
+pub(crate) fn migrate_cache(roots: &CacheRoots, apply: bool, stamp: &str) -> Result<Migration> {
+    let steps = plan_migration(roots, stamp)?;
+    let mut migration = Migration {
+        preferred: roots.preferred.clone(),
+        legacy: roots.legacy.clone(),
+        steps,
+        applied: apply,
+        skipped: Vec::new(),
+        legacy_removed: false,
+    };
+    if !apply {
+        return Ok(migration);
+    }
+    if !migration.steps.is_empty() {
+        std::fs::create_dir_all(&roots.preferred)
+            .with_context(|| format!("creando {}", roots.preferred.display()))?;
+    }
+    migration.skipped = migration
+        .steps
+        .iter()
+        .map(|step| apply_step(roots, step).err().map(|e| skip_reason(&e)))
+        .collect();
+    // Refuses a directory that still holds anything, which is the check.
+    migration.legacy_removed = std::fs::remove_dir(&roots.legacy).is_ok();
+    Ok(migration)
+}
+
+fn plan_migration(roots: &CacheRoots, stamp: &str) -> Result<Vec<Step>> {
+    let names = legacy_entries(&roots.legacy)?;
+    // Decided on the state before anything moves: once `pgpass` has moved,
+    // this would answer for a machine that no longer exists.
+    let pgpass_reads_legacy =
+        !roots.preferred.join("pgpass").exists() && roots.legacy.join("pgpass").exists();
+
+    let mut steps = Vec::new();
+    for name in names {
+        if sibling(&roots.preferred.join(&name), "migrating").exists() {
+            steps.push(Step::DropOrphan(name.clone()));
+        }
+        steps.push(plan_entry(roots, name, stamp, pgpass_reads_legacy)?);
+    }
+    Ok(steps)
+}
+
+/// The names in the legacy root, sorted so the plan reads the same twice. A
+/// root that is not there is an install with nothing to migrate.
+fn legacy_entries(legacy: &Path) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(legacy) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("leyendo {}", legacy.display())),
+    };
+    let mut names = entries
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    Ok(names)
+}
+
+fn plan_entry(
+    roots: &CacheRoots,
+    name: String,
+    stamp: &str,
+    pgpass_reads_legacy: bool,
+) -> Result<Step> {
+    let new = roots.preferred.join(&name);
+    if std::fs::symlink_metadata(&new).is_err() {
+        return Ok(Step::Move(name));
+    }
+    if same_content(&roots.legacy.join(&name), &new)? {
+        return Ok(Step::DropLegacy(name));
+    }
+    let aside = aside_name(&roots.preferred, &name, stamp);
+    Ok(if legacy_is_read(roots, &name, pgpass_reads_legacy) {
+        Step::KeepLegacy { name, aside }
+    } else {
+        Step::KeepPreferred { name, aside }
+    })
+}
+
+/// Which of two different copies the binary reads today: the rule each
+/// resolver already applies, not a new one.
+///
+/// `pgpass_app` follows `pgpass`, because that is what every binary before
+/// this one did, and the role was last altered to the password that binary
+/// read. A model directory is read where its artifact is: an empty leaf left
+/// by a failed download loses to a full one. Everything else resolves to the
+/// new root whenever it exists there.
+fn legacy_is_read(roots: &CacheRoots, name: &str, pgpass_reads_legacy: bool) -> bool {
+    if name == "pgpass_app" {
+        return pgpass_reads_legacy;
+    }
+    let Some(artifacts) = usable_artifacts(name) else {
+        return false;
+    };
+    let usable = |dir: &Path| artifacts.iter().any(|a| has_content(&dir.join(a)));
+    !usable(&roots.preferred.join(name)) && usable(&roots.legacy.join(name))
+}
+
+fn aside_name(root: &Path, name: &str, stamp: &str) -> String {
+    let base = format!("{name}.legacy-{stamp}");
+    let mut candidate = base.clone();
+    let mut n = 1;
+    while std::fs::symlink_metadata(root.join(&candidate)).is_ok() {
+        n += 1;
+        candidate = format!("{base}-{n}");
+    }
+    candidate
+}
+
+fn apply_step(roots: &CacheRoots, step: &Step) -> Result<()> {
+    let old = |name: &str| roots.legacy.join(name);
+    let new = |name: &str| roots.preferred.join(name);
+    match step {
+        Step::Move(name) => relocate(&old(name), &new(name)),
+        Step::DropLegacy(name) => remove_entry(&old(name)),
+        Step::KeepPreferred { name, aside } => relocate(&old(name), &new(aside)),
+        Step::KeepLegacy { name, aside } => {
+            std::fs::rename(new(name), new(aside))
+                .with_context(|| format!("apartando {} como {aside}", new(name).display()))?;
+            relocate(&old(name), &new(name))
+        }
+        Step::DropOrphan(name) => remove_entry(&sibling(&new(name), "migrating")),
+    }
+}
+
+fn skip_reason(error: &anyhow::Error) -> String {
+    if in_use(error) {
+        IN_USE.to_string()
+    } else {
+        format!("{error:#}")
+    }
+}
+
+/// A file another process holds: on Windows the runtime a daemon loaded
+/// (`os error 32`, or `5` for the directory above it).
+fn in_use(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| {
+            io.kind() == std::io::ErrorKind::ResourceBusy
+                || (cfg!(windows) && matches!(io.raw_os_error(), Some(5 | 32 | 33)))
+        })
+}
+
+/// A rename keeps the file, its mode and its ACL. Across volumes it cannot,
+/// and the entry is copied instead.
+fn relocate(src: &Path, dst: &Path) -> Result<()> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => copy_across_volumes(src, dst),
+        Err(e) => Err(e).with_context(|| format!("moviendo {} a {}", src.display(), dst.display())),
+    }
+}
+
+/// Copy to `<dst>.migrating`, verify size and SHA-256 of every file, rename
+/// into place, and only then remove the source: a run killed at any point
+/// leaves either the source whole or the destination whole, never an entry
+/// half-written under its real name.
+///
+/// `std::fs::copy` carries the Unix mode, so `pgpass` stays 0600. On Windows
+/// the copy takes the ACL of the directory it lands in, which is how
+/// `setup::store_password` created it in the first place.
+fn copy_across_volumes(src: &Path, dst: &Path) -> Result<()> {
+    let staging = sibling(dst, "migrating");
+    if std::fs::symlink_metadata(&staging).is_ok() {
+        remove_entry(&staging)?;
+    }
+    copy_verified(src, &staging)?;
+    std::fs::rename(&staging, dst)
+        .with_context(|| format!("moviendo {} a {}", staging.display(), dst.display()))?;
+    remove_entry(src)
+}
+
+/// A copy that does not match its source, file by file in size and SHA-256,
+/// is removed before anything else happens.
+fn copy_verified(src: &Path, copy: &Path) -> Result<()> {
+    copy_tree(src, copy)
+        .with_context(|| format!("copiando {} a {}", src.display(), copy.display()))?;
+    if fingerprint(src, true)? != fingerprint(copy, true)? {
+        remove_entry(copy)?;
+        bail!(
+            "la copia de {} no coincide con el origen; el origen sigue donde estaba",
+            src.display()
+        );
+    }
+    Ok(())
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    if !std::fs::symlink_metadata(src)?.is_dir() {
+        std::fs::copy(src, dst)?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    std::fs::read_dir(src)?.try_for_each(|entry| {
+        let entry = entry?;
+        copy_tree(&entry.path(), &dst.join(entry.file_name()))
+    })
+}
+
+fn remove_entry(path: &Path) -> Result<()> {
+    let removed = if std::fs::symlink_metadata(path)?.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    removed.with_context(|| format!("borrando {}", path.display()))
+}
+
+/// Two entries hold the same thing. A file is compared by content; a
+/// directory by its files and their sizes — hashing gigabytes of weights to
+/// decide whether a duplicate can go costs what copying them does.
+fn same_content(a: &Path, b: &Path) -> Result<bool> {
+    let a_is_dir = std::fs::symlink_metadata(a)?.is_dir();
+    if a_is_dir != std::fs::symlink_metadata(b)?.is_dir() {
+        return Ok(false);
+    }
+    Ok(fingerprint(a, !a_is_dir)? == fingerprint(b, !a_is_dir)?)
+}
+
+/// Every file under `root` (or `root` itself), keyed by its path relative to
+/// `root`, with its size and, when `hashed`, its SHA-256.
+fn fingerprint(root: &Path, hashed: bool) -> Result<BTreeMap<PathBuf, (u64, String)>> {
+    let mut seen = BTreeMap::new();
+    collect_files(root, Path::new(""), hashed, &mut seen)?;
+    Ok(seen)
+}
+
+fn collect_files(
+    path: &Path,
+    rel: &Path,
+    hashed: bool,
+    seen: &mut BTreeMap<PathBuf, (u64, String)>,
+) -> Result<()> {
+    if !std::fs::symlink_metadata(path)?.is_dir() {
+        seen.insert(rel.to_path_buf(), file_stamp(path, hashed)?);
+        return Ok(());
+    }
+    std::fs::read_dir(path)?.try_for_each(|entry| {
+        let name = entry?.file_name();
+        collect_files(&path.join(&name), &rel.join(&name), hashed, seen)
+    })
+}
+
+fn file_stamp(path: &Path, hashed: bool) -> Result<(u64, String)> {
+    let len = std::fs::metadata(path)?.len();
+    let digest = if hashed {
+        sha256_file(path)?
+    } else {
+        String::new()
+    };
+    Ok((len, digest))
+}
+
+/// `None` asks for the help; `Some(apply)` is a `migrate`.
+fn parse_cache_args(args: &[String]) -> Result<Option<bool>> {
+    let Some((first, rest)) = args.split_first() else {
+        return Ok(None);
+    };
+    if args
+        .iter()
+        .any(|a| matches!(a.as_str(), "-h" | "--help" | "help"))
+    {
+        return Ok(None);
+    }
+    if first.as_str() != "migrate" {
+        bail!(
+            "cache: subcomando desconocido `{first}`. Usá: migrate [--apply]\n\
+             (`memory-industry cache --help` para más detalle)"
+        );
+    }
+    let mut apply = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--apply" => apply = true,
+            other => bail!("cache migrate: opción desconocida `{other}` (probá --help)"),
+        }
+    }
+    Ok(Some(apply))
+}
+
+pub fn run_cache_cli(args: &[String]) -> Result<()> {
+    let Some(apply) = parse_cache_args(args)? else {
+        print_cache_help();
+        return Ok(());
+    };
+    let roots = CacheRoots::resolve()?;
+    let stamp = chrono::Local::now().format("%Y%m%d").to_string();
+    let migration = migrate_cache(&roots, apply, &stamp)?;
+    print!("{}", migration.render());
+    if !migration.is_clean() {
+        bail!(
+            "{} entrada(s) sin migrar. Lo demás ya está movido: correrlo de nuevo solo \
+             retoma lo que falta",
+            migration.skipped.iter().flatten().count()
+        );
+    }
+    Ok(())
+}
+
+fn print_cache_help() {
+    println!(
+        "memory-industry cache migrate [--apply]\n\n\
+         Mueve lo que quede en ~/.cache/cuba-memorys/ (la caché de antes del cambio de\n\
+         nombre) a ~/.cache/memory-industry/. Sin --apply muestra el plan y no toca nada.\n\n\
+           solo en la vieja         se mueve\n\
+           idéntico en las dos      se borra la copia vieja\n\
+           distinto en las dos      queda la copia que el binario lee hoy; la otra se\n\
+                                    aparta como <nombre>.legacy-AAAAMMDD en la nueva.\n\
+                                    Nunca se borra.\n\n\
+         Un fichero en uso (el runtime que tiene cargado un daemon) se salta y el comando\n\
+         sale con error: pará el daemon y volvé a correrlo. Lo ya movido queda movido, y\n\
+         una segunda corrida sobre una caché ya migrada dice «nada que migrar»."
+    );
 }
 
 #[cfg(test)]

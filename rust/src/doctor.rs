@@ -277,16 +277,22 @@ fn runtime_role_check(user: &str, is_super: bool, app_role_ready: bool) -> Check
         );
     }
     if app_role_ready {
+        // The file this binary reads, not a fixed path: the fixed one named
+        // the legacy root while `secure` named the new one.
+        let pgpass_app = crate::setup::app_password_file()
+            .map_or_else(|| "pgpass_app".to_string(), |p| p.display().to_string());
         return Check::fail(
             "runtime_role",
             format!(
                 "la app corre como '{user}' (SUPERUSER) teniendo {} listo y sin privilegios",
                 crate::db::APP_ROLE
             ),
-            "la mitigación está construida y desconectada: un superuser ignora RLS y puede \
-             alterar el audit_log, así que el aislamiento por proyecto y la trazabilidad \
-             append-only no existen. Suele ser un binario viejo — reinstalá el daemon, o borrá \
-             ~/.cache/cuba-memorys/pgpass_app si de verdad querés correr como admin.",
+            format!(
+                "la mitigación está construida y desconectada: un superuser ignora RLS y puede \
+                 alterar el audit_log, así que el aislamiento por proyecto y la trazabilidad \
+                 append-only no existen. Suele ser un binario viejo — reinstalá el daemon, o \
+                 borrá {pgpass_app} si de verdad querés correr como admin."
+            ),
         );
     }
     Check::warn(
@@ -295,6 +301,25 @@ fn runtime_role_check(user: &str, is_super: bool, app_role_ready: bool) -> Check
         "un superuser ignora RLS y puede alterar el audit_log: el aislamiento por proyecto y la \
          trazabilidad append-only son decorativos. Ejecutá `memory-industry secure` y apuntá el \
          runtime a cuba_app.",
+    )
+}
+
+/// What is still in the cache root from before the rename.
+///
+/// A warn and not a fail: every resolver still reads it for one release. But
+/// each one decides between the two roots on its own, and a single entry
+/// created under the new name — `pgpass_app` at startup, `undo/` from `delete`
+/// — is enough for `models` to download again the gigabytes the legacy root
+/// already holds.
+fn legacy_cache_check(legacy: &std::path::Path) -> Check {
+    let entries = std::fs::read_dir(legacy).map_or(0, |dir| dir.flatten().count());
+    if entries == 0 {
+        return Check::ok("legacy_cache", format!("nada en {}", legacy.display()));
+    }
+    Check::warn(
+        "legacy_cache",
+        format!("{entries} entradas en {}", legacy.display()),
+        "memory-industry cache migrate --apply (sin --apply muestra el plan)",
     )
 }
 
@@ -661,6 +686,12 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
              o seteá ONNX_MODEL_PATH y ORT_DYLIB_PATH.",
         ));
     }
+
+    checks.extend(
+        crate::models_cli::CacheRoots::resolve()
+            .ok()
+            .map(|roots| legacy_cache_check(&roots.legacy)),
+    );
 
     let gpu = crate::gpu::status();
     checks.push(match gpu.hint {

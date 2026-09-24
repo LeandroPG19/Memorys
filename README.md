@@ -13,7 +13,7 @@ Formerly **cuba-memorys**. Same daemon, same `cuba_*` MCP tools, new product nam
 
 **Long-term memory for AI coding agents.** An MCP server that gives your agent a knowledge graph it can search, reason over, and be corrected by — so it stops forgetting your codebase between sessions.
 
-Written in Rust. Backed by PostgreSQL + pgvector. **31 MCP tools** (32 with `CUBA_DOCS=1`), **25 CLI commands**, and every number below measured on a benchmark that — as of v0.12 — actually measures what it claims to. (The previous one did not. See [Measured](#measured--and-the-benchmark-that-was-lying).)
+Written in Rust. Backed by PostgreSQL + pgvector. **31 MCP tools** (32 with `CUBA_DOCS=1`), **26 CLI commands**, and every number below measured on a benchmark that — as of v0.12 — actually measures what it claims to. (The previous one did not. See [Measured](#measured--and-the-benchmark-that-was-lying).)
 
 <p align="center">
   <img src="assets/demo.gif" alt="MemoryIndustry terminal demo — hybrid search, claim verification with an LLM judge, procedural memory, and the CLI" width="760" />
@@ -117,7 +117,16 @@ cuba-memorys models all --gpu    # GPU runtime, if you have one
 cuba-memorys doctor              # confirms what loaded
 ```
 
-Everything lands in `~/.cache/cuba-memorys/` and is found automatically. `models` downloads only when you run it — nothing is fetched behind your back.
+Everything lands in `~/.cache/memory-industry/` (or in `~/.cache/cuba-memorys/` on an install from before the rename) and is found automatically. `models` downloads only when you run it — nothing is fetched behind your back. A download goes to `<dir>.downloading` first and becomes `<dir>` only once every file is down and verified, so a failed one leaves no empty directory for the loaders to pick.
+
+**Moving an old cache under the new name.** The `~/.cache/cuba-memorys/` root is still read for this release, but each file decides between the two roots on its own, and one entry created under the new name — `pgpass_app` at startup, `undo/` from `delete` — is enough for `models` to download again what the old root already holds. `doctor` warns while the old root has anything in it. One command moves it:
+
+```bash
+memory-industry cache migrate            # the plan: touches nothing
+memory-industry cache migrate --apply    # moves it
+```
+
+An entry only in the old root moves; one identical in both loses its old copy. One that differs keeps the copy the binary reads today — for `pgpass_app` the one next to the `pgpass` in use, for a model directory the one that actually holds the model — and the other is set aside as `<name>.legacy-YYYYMMDD` in the new root, never deleted. A file another process holds (on Windows, the runtime a running daemon loaded) is skipped and the command exits non-zero: stop the daemon and run it again. What already moved stays moved, and a second run says there is nothing to migrate.
 
 **bge-m3 (1024-d) is better than e5-small** for Spanish, though the size of the gap is no longer claimed (the old +21 nDCG figure came from a broken benchmark). It needs a dimension migration (`scripts/migrate-embedding-dim.sh 1024`) and `CUBA_EMBED_MODEL=bge-m3 CUBA_POOLING=cls`.
 </details>

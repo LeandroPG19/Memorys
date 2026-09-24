@@ -4,7 +4,7 @@ use sqlx::{PgPool, Row};
 
 use crate::handlers;
 
-pub const COMMANDS: [&str; 25] = [
+pub const COMMANDS: [&str; 26] = [
     "serve",
     "tunnel",
     "search",
@@ -25,6 +25,7 @@ pub const COMMANDS: [&str; 25] = [
     "codegraph",
     "rem",
     "models",
+    "cache",
     "llm",
     "secure",
     "setup",

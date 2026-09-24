@@ -119,8 +119,11 @@ fn build_url() -> String {
     )
 }
 
-fn app_password_file() -> Option<std::path::PathBuf> {
-    password_file().map(|p| p.with_file_name("pgpass_app"))
+/// Its own probe, not `pgpass`'s answer. Following `pgpass` sent an install
+/// with a legacy `pgpass_app` and no `pgpass` to the new root, where it found
+/// nothing, generated a second password and `db.rs` altered the role to it.
+pub(crate) fn app_password_file() -> Option<std::path::PathBuf> {
+    cached_file("pgpass_app")
 }
 
 pub fn app_role_password() -> Option<String> {
@@ -225,12 +228,17 @@ pub fn listen_address() -> String {
 }
 
 fn password_file() -> Option<std::path::PathBuf> {
+    cached_file("pgpass")
+}
+
+/// `name` in the new cache root, unless only the legacy root has it.
+fn cached_file(name: &str) -> Option<std::path::PathBuf> {
     // `.ok()?`: `resolve_password` reads None as «use the compiled-in
     // constant». An error here would stop `setup` on a machine that has simply
     // never defined either name.
     let cache = crate::envs::home().ok()?.join(".cache");
-    let preferred = cache.join("memory-industry").join("pgpass");
-    let legacy = cache.join("cuba-memorys").join("pgpass");
+    let preferred = cache.join("memory-industry").join(name);
+    let legacy = cache.join("cuba-memorys").join(name);
     if preferred.exists() || !legacy.exists() {
         Some(preferred)
     } else {

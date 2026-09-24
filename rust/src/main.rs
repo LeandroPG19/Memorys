@@ -62,6 +62,7 @@ OPERATIONS:
   rem               run one consolidation cycle now (decay, autolink, backfill, PageRank)
   setup             wire this server into your MCP clients; `setup check` audits them
   models            download the embedding, NLI and reranker models and the ONNX runtime
+  cache migrate     move ~/.cache/cuba-memorys into ~/.cache/memory-industry (plan; --apply moves)
   llm               pick a chat model the easy way (DeepSeek/Qwen/Ollama/…); saves config
   graph             optional FalkorDB/Neo4j projection status|reconcile (Postgres stays SoT)
   secure            create the non-superuser cuba_app role so RLS and the audit trigger bite
@@ -165,6 +166,11 @@ async fn async_main() {
                 eprintln!("models: {e:#}");
                 std::process::exit(1);
             }
+            return;
+        }
+        Some("cache") => {
+            let result = memory_industry::models_cli::run_cache_cli(&argv[2..]);
+            drain_then_report(result, "cache").await;
             return;
         }
         Some("llm") => {
