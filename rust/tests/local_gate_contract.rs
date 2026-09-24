@@ -417,6 +417,119 @@ fn the_windows_second_judge_is_a_wrapper_and_not_a_second_opinion() {
     }
 }
 
+/// One handoff judge, one implementation — the same drift, the same cure.
+///
+/// `validar-handoff.ps1` was a port of the `.sh` from before 0.28, and it kept
+/// judging shape only: no `commit` that has to exist, no `tests: written|frozen`,
+/// no `paths:`. A handoff the `.sh` refuses for editing a frozen test went
+/// through it as `OK`, and Windows is where the orchestrator runs.
+#[test]
+fn the_windows_handoff_judge_is_a_wrapper_and_not_a_second_opinion() {
+    let ps = read("scripts/validar-handoff.ps1");
+
+    assert!(
+        ps.contains("validar-handoff.sh"),
+        "validar-handoff.ps1 has to hand the handoff to the shell script. A copy of its rules \
+         agrees with it only until the .sh gains its next guard, and this one missed all three \
+         that 0.28 added."
+    );
+    assert!(
+        ps.contains("Git/bin/bash.exe"),
+        "it must resolve Git Bash explicitly: the bash on PATH under Windows is WSL's, which \
+         cannot translate a Windows drive path and exits without reading anything."
+    );
+    assert!(
+        ps.contains("exit $LASTEXITCODE"),
+        "a wrapper that swallows the exit code passes every handoff the real judge refused."
+    );
+    for reimplemented in ["especificador", "FALTA campo", "0-9a-f", "Get-Content"] {
+        assert!(
+            !ps.contains(reimplemented),
+            "validar-handoff.ps1 mentions {reimplemented}, so it is reading or judging the \
+             handoff itself instead of handing it to the .sh. That second opinion is the one \
+             that stayed at shape-only while the .sh learned the two-pass protocol."
+        );
+    }
+}
+
+/// Whether a line of shell reads `XDG_CACHE_HOME`, as opposed to setting it for
+/// a fixture or unsetting it.
+fn reads_xdg_cache_home(line: &str) -> bool {
+    line.contains("$XDG_CACHE_HOME") || line.contains("${XDG_CACHE_HOME")
+}
+
+/// The scripts look for the models where the binary keeps them.
+///
+/// The binary never reads `XDG_CACHE_HOME`: `envs::home()` joins `.cache` to
+/// HOME or USERPROFILE, and `models all` / `models runtime` download there.
+/// `gpu-placement-check.sh` honoured the variable and was fixed for it in 0.28;
+/// `run-all-tests.sh` and `_validate-gate.sh` still did, so on a machine that
+/// sets it the gate pointed `ONNX_MODEL_PATH` at a directory the binary never
+/// wrote. `run-all-tests.sh --self-test` drives its half for real; this is the
+/// net under every script, `_validate-gate.sh` included, which runs a whole gate
+/// under WSL and cannot be driven from a test.
+#[test]
+fn no_script_looks_for_the_cache_where_the_binary_does_not() {
+    for read_it in [
+        r#"CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cuba-memorys""#,
+        r#"CACHE_NEW="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry""#,
+        r#"cache="$XDG_CACHE_HOME""#,
+    ] {
+        assert!(
+            reads_xdg_cache_home(read_it),
+            "the detector missed `{read_it}`, a line that reads the variable, so a clean scan \
+             below would prove nothing"
+        );
+    }
+    for set_it in [
+        r#"HOME="$scratch/home" XDG_CACHE_HOME="$scratch/xdg" || bad=1"#,
+        "unset ORT_DYLIB_PATH HOME USERPROFILE XDG_CACHE_HOME LD_LIBRARY_PATH",
+    ] {
+        assert!(
+            !reads_xdg_cache_home(set_it),
+            "`{set_it}` sets or unsets the variable for a fixture, which is how a self-test \
+             proves it is ignored; the detector must not count it as a read"
+        );
+    }
+
+    let mut scanned = Vec::new();
+    let mut readers = Vec::new();
+    for entry in std::fs::read_dir(repo_root().join("scripts"))
+        .expect("scripts/ is readable")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "sh") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let body = std::fs::read_to_string(&path).expect("readable");
+        for (n, line) in body.lines().enumerate() {
+            if !line.trim_start().starts_with('#') && reads_xdg_cache_home(line) {
+                readers.push(format!("{name}:{}: {}", n + 1, line.trim()));
+            }
+        }
+        scanned.push(name);
+    }
+
+    for anchor in ["run-all-tests.sh", "_validate-gate.sh"] {
+        assert!(
+            scanned.iter().any(|s| s == anchor),
+            "the scan never read {anchor}, so it is the scan that is broken. Read: {scanned:?}"
+        );
+    }
+    assert!(
+        readers.is_empty(),
+        "these lines look for the cache under XDG_CACHE_HOME, which the binary never reads. \
+         On a machine that sets it they name a directory `models all` never wrote, and the \
+         gate measures a model the binary would not load: {readers:#?}"
+    );
+}
+
 /// The second judge has to be able to judge, and to fail.
 #[test]
 fn the_second_judge_can_look_at_a_branch_and_its_crap_gate_can_fail() {

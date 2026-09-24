@@ -386,12 +386,37 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$(cat "$tmp/home4/.cache/cuba-gate/run.exit" 2>/dev/null)" == "running pid="* ]] \
     || self_fail "a gate killed while its child worked left '$(cat "$tmp/home4/.cache/cuba-gate/run.exit" 2>/dev/null)' in its exit file: the child wrote a verdict that was not its to write"
 
+  # Where the gate looks for the models has to be where the binary keeps them:
+  # envs::home() joins `.cache` to HOME (or USERPROFILE), and nothing in the
+  # crate reads XDG_CACHE_HOME. The only embedder is in the legacy cache under
+  # HOME and a decoy sits under XDG_CACHE_HOME, so both halves of the choice
+  # below — the preferred cache and the legacy one — have to stop reading the
+  # variable for ONNX_MODEL_PATH to come out right. The stand-in cargo reports
+  # what the script exported and fails, which ends the run at `cargo fmt`.
+  mkdir -p "$tmp/home5/.cache/cuba-memorys/models" "$tmp/xdg5/memory-industry/models" "$tmp/bin5"
+  : >"$tmp/home5/.cache/cuba-memorys/models/model_quantized.onnx"
+  : >"$tmp/xdg5/memory-industry/models/model_quantized.onnx"
+  cp "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin5/"
+  printf '%s\n' '#!/bin/sh' \
+    'echo "stand-in cargo: ONNX_MODEL_PATH=$ONNX_MODEL_PATH"' \
+    'exit 1' >"$tmp/bin5/cargo"
+  chmod +x "$tmp/bin5/cargo"
+  cache_exit=0
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u ONNX_MODEL_PATH \
+      HOME="$tmp/home5" XDG_CACHE_HOME="$tmp/xdg5" \
+      PATH="$tmp/bin5:/usr/bin:/bin" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      "$BASH" "$ROOT/scripts/run-all-tests.sh" >"$tmp/cache.out" 2>&1 || cache_exit=$?
+  grep -qxF "stand-in cargo: ONNX_MODEL_PATH=$tmp/home5/.cache/cuba-memorys/models" "$tmp/cache.out" \
+    || self_fail "with XDG_CACHE_HOME set, the gate looked for the models where the binary does not (exit $cache_exit): $(grep 'ONNX_MODEL_PATH=' "$tmp/cache.out" || cat "$tmp/cache.out")"
+
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
   echo "    else; the run-all-tests.sh merge-gate launches works under its lock and"
   echo "    leaves the exit file to it; a dead or reused-pid lock is taken over, a"
   echo "    foreign one is not; an exit drops only the databases whose record is"
-  echo "    still its own"
+  echo "    still its own; the models are looked for under HOME/.cache, where the"
+  echo "    binary keeps them, whatever XDG_CACHE_HOME says"
   exit 0
 fi
 

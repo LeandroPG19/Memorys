@@ -1662,12 +1662,16 @@ mod tests {
     /// The half of the stdio watchdog that can run without ending the process.
     ///
     /// `spawn_handshake_watchdog` calls `std::process::exit(1)`, so it cannot be
-    /// driven from here; what it waits is decided by this function alone, and
-    /// until now nothing pinned a single row of it. Every row is today's
-    /// behaviour, including the three that read like accidents — `00` is a
-    /// zero wait rather than «off», and a value that does not parse switches
-    /// the watchdog off instead of keeping the default. They are pinned so that
-    /// changing them is a decision somebody writes down, not a side effect.
+    /// driven from here; what it waits is decided by this function alone. Until
+    /// 0.28 three rows read like accidents and were pinned as such: `00` was a
+    /// zero wait that fired the watchdog at once, only the literal `0` was off,
+    /// and a value that did not parse switched the watchdog off in silence — so
+    /// `60s`, a stray space from a unit file or a negative number left an
+    /// abandoned stdio process holding every model for good, the exact thing the
+    /// watchdog exists to stop. Now zero is off however many digits it takes,
+    /// the value is trimmed, and what is not a whole number keeps the default
+    /// (and says so: the test after this one). Every row that changed says what
+    /// it used to be.
     ///
     /// No empty-string row: whether `set_var(name, "")` leaves the variable set
     /// empty or removes it is the platform's call, so the row would assert the
@@ -1676,10 +1680,11 @@ mod tests {
     async fn the_handshake_timeout_reads_its_variable_row_by_row() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         const NAME: &str = "CUBA_HANDSHAKE_TIMEOUT_SECS";
+        let _preferred = crate::envs::ScopedEnv::cleared("MEMORY_INDUSTRY_HANDSHAKE_TIMEOUT_SECS");
 
         // (what the variable holds — None is unset, seconds waited — None is no
         // watchdog at all, why this row is the answer).
-        let table: [(Option<&str>, Option<u64>, &str); 18] = [
+        let table: [(Option<&str>, Option<u64>, &str); 20] = [
             (None, Some(60), "unset is the documented default of 60 s"),
             (Some("0"), None, "0 is the documented off switch"),
             (Some("off"), None, "`off` is the other spelling of it"),
@@ -1695,26 +1700,55 @@ mod tests {
             ),
             (
                 Some("18446744073709551616"),
-                None,
-                "one past u64::MAX does not parse, and what does not parse is off",
+                Some(60),
+                "one past u64::MAX is no number of seconds this can hold, so the default \
+                 stands (it used to switch the watchdog off)",
             ),
             (
                 Some("00"),
-                Some(0),
-                "only the literal `0` is off: `00` parses to a zero wait, so the watchdog \
-                 fires at once",
+                None,
+                "zero written with two digits is still zero, and zero is off (it used to be \
+                 a zero wait that fired the watchdog at once)",
             ),
-            (Some("-5"), None, "a negative number does not parse as u64"),
-            (Some("1.5"), None, "seconds are whole"),
-            (Some("30s"), None, "no unit suffix"),
-            (Some(" 30"), None, "no trimming"),
-            (Some("30 "), None, "no trimming at the end either"),
+            (Some("+0"), None, "zero with a sign is zero too"),
+            (
+                Some("-5"),
+                Some(60),
+                "a negative wait is no wait: the default stands (it used to switch the \
+                 watchdog off)",
+            ),
+            (
+                Some("1.5"),
+                Some(60),
+                "seconds are whole; a fraction keeps the default (it used to be off)",
+            ),
+            (
+                Some("30s"),
+                Some(60),
+                "no unit suffix; the default stands (it used to be off)",
+            ),
+            (
+                Some(" 30"),
+                Some(30),
+                "trimmed: a stray space is not another value (it used to be off)",
+            ),
+            (
+                Some("30 "),
+                Some(30),
+                "trimmed at the end too (it used to be off)",
+            ),
+            (Some(" off "), None, "the word is trimmed like the number"),
             (
                 Some("no"),
-                None,
-                "only `off` is a word it knows; any other does not parse",
+                Some(60),
+                "only `off` is a word it knows; any other keeps the default (it used to be \
+                 off)",
             ),
-            (Some("abc"), None, "garbage does not parse"),
+            (
+                Some("abc"),
+                Some(60),
+                "garbage keeps the default (it used to be off)",
+            ),
         ];
 
         for (raw, secs, why) in table {
@@ -1726,6 +1760,134 @@ mod tests {
                 handshake_timeout(),
                 secs.map(Duration::from_secs),
                 "{NAME}={raw:?}: {why}"
+            );
+        }
+    }
+
+    /// What `f` returned, and what it logged at WARN or above on this thread.
+    ///
+    /// The subscriber is the thread's default, not the global one, so a test
+    /// running beside this one can neither write into the capture nor see it.
+    fn warnings_while<T>(f: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let answer = tracing::subscriber::with_default(subscriber, f);
+        let logged = String::from_utf8_lossy(&capture.0.lock().expect("capture lock")).into_owned();
+        (answer, logged)
+    }
+
+    /// A value the watchdog cannot read keeps the 60 s default, and says which
+    /// variable held what. Keeping the default in silence would be the old
+    /// defect's quieter twin: whoever wrote `60s` believes they set a minute and
+    /// never learns the line did nothing.
+    #[tokio::test]
+    async fn a_handshake_timeout_it_cannot_read_keeps_the_default_and_says_so() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        const PREFERRED: &str = "MEMORY_INDUSTRY_HANDSHAKE_TIMEOUT_SECS";
+        const LEGACY: &str = "CUBA_HANDSHAKE_TIMEOUT_SECS";
+
+        for (name, other) in [(LEGACY, PREFERRED), (PREFERRED, LEGACY)] {
+            let _other = crate::envs::ScopedEnv::cleared(other);
+            for raw in ["60s", "-5", "abc", "18446744073709551616"] {
+                let _variable = crate::envs::ScopedEnv::set(name, raw);
+                let (answer, logged) = warnings_while(handshake_timeout);
+
+                assert_eq!(
+                    answer,
+                    Some(Duration::from_secs(60)),
+                    "{name}={raw:?} is not a number of seconds: the default stands"
+                );
+                assert!(
+                    logged.contains("WARN") && logged.contains(name) && logged.contains(raw),
+                    "{name}={raw:?} kept the default in silence. The warning has to name the \
+                     variable and the value, or nobody finds the line that did nothing. \
+                     Logged: {logged:?}"
+                );
+            }
+        }
+
+        // The capture above caught a warning, so an empty one below is silence
+        // and not a capture that sees nothing.
+        let _preferred = crate::envs::ScopedEnv::cleared(PREFERRED);
+        for raw in [Some("30"), Some(" 30"), Some("0"), Some("off"), None] {
+            let _variable = match raw {
+                Some(value) => crate::envs::ScopedEnv::set(LEGACY, value),
+                None => crate::envs::ScopedEnv::cleared(LEGACY),
+            };
+            let (_, logged) = warnings_while(handshake_timeout);
+            assert!(
+                !logged.contains("WARN"),
+                "{LEGACY}={raw:?} is a value it understands, and warning about it teaches the \
+                 operator to ignore the one that matters. Logged: {logged:?}"
+            );
+        }
+    }
+
+    /// The watchdog's knob answers to the documented namespace, the way every
+    /// knob read through `envs::alias` does: the new name first, the `CUBA_*`
+    /// one while the release that keeps it lasts.
+    #[tokio::test]
+    async fn the_handshake_timeout_answers_to_the_memory_industry_name_first() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        const PREFERRED: &str = "MEMORY_INDUSTRY_HANDSHAKE_TIMEOUT_SECS";
+        const LEGACY: &str = "CUBA_HANDSHAKE_TIMEOUT_SECS";
+
+        let rows: [(Option<&str>, Option<&str>, Option<u64>, &str); 3] = [
+            (
+                Some("5"),
+                Some("7"),
+                Some(5),
+                "both set: the name the operator edited wins over the one left behind",
+            ),
+            (
+                None,
+                Some("7"),
+                Some(7),
+                "only the legacy name: every install in the field is set up with it",
+            ),
+            (
+                Some("off"),
+                Some("7"),
+                None,
+                "the new name switches it off even with the old one still set",
+            ),
+        ];
+
+        for (preferred, legacy, secs, why) in rows {
+            let _p = match preferred {
+                Some(value) => crate::envs::ScopedEnv::set(PREFERRED, value),
+                None => crate::envs::ScopedEnv::cleared(PREFERRED),
+            };
+            let _l = match legacy {
+                Some(value) => crate::envs::ScopedEnv::set(LEGACY, value),
+                None => crate::envs::ScopedEnv::cleared(LEGACY),
+            };
+            assert_eq!(
+                handshake_timeout(),
+                secs.map(Duration::from_secs),
+                "{PREFERRED}={preferred:?} {LEGACY}={legacy:?}: {why}"
             );
         }
     }

@@ -171,6 +171,50 @@ mod tests {
         )
     }
 
+    /// `eval` without `--dataset` runs on this set, so it has to be one the
+    /// harness can score. `run_cli` refuses an empty set; an answerable sample
+    /// with neither ids nor markers is the row `load_jsonl_dataset` drops,
+    /// because nothing in the ranking could ever count as relevant to it; and
+    /// the isolation row is the one abstention the set exists to exercise. Until
+    /// this test the mutation step excluded the function by name, so `vec![]`
+    /// in its place passed every judge.
+    #[test]
+    fn the_builtin_set_is_one_the_harness_can_score() {
+        let samples = builtin_retrieval_set();
+
+        assert!(
+            !samples.is_empty(),
+            "`memory-industry eval` with no --dataset would bail with «dataset is empty»"
+        );
+        let queries: HashSet<&str> = samples.iter().map(|s| s.query.as_str()).collect();
+        assert_eq!(
+            queries.len(),
+            samples.len(),
+            "two samples with one query score the same search twice and weigh it double"
+        );
+        for sample in &samples {
+            assert!(
+                !sample.query.trim().is_empty(),
+                "an empty query searches for nothing"
+            );
+            assert!(
+                sample.abstain || sample.scored_by_id() || !sample.relevant_markers.is_empty(),
+                "{:?} is answerable and has no gold: it can only ever score zero, and \
+                 load_jsonl_dataset drops that row for the same reason",
+                sample.query
+            );
+        }
+        assert!(
+            samples.iter().any(|s| s.abstain),
+            "without the isolation row the builtin run never asks whether another \
+             project's memory stays out of the answer"
+        );
+        assert!(
+            samples.iter().any(|s| !s.abstain),
+            "a set of abstentions alone measures no ranking at all"
+        );
+    }
+
     #[test]
     fn isolation_jsonl_names_the_tenant_contract() {
         let path = format!(
