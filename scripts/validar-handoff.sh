@@ -72,13 +72,13 @@ filtrar_region() { # <ruta-relativa>, contenido ya normalizado por stdin
 
 # El CR se quita AQUI, en un solo sitio y delante de todo.
 #
-# Medido 2026-09-22: en este arbol los blobs y los ficheros estan en LF, pero
-# core.autocrlf=true y git mismo avisa «LF will be replaced by CRLF the next
-# time Git touches it» — no hay linea *.rs en .gitattributes que lo impida. En
-# cuanto git toque estos ficheros, el ARBOL queda en CRLF y el COMMIT en LF, y
-# entonces cada fichero difiere de su blob SOLO por los finales de linea:
-# `frozen` acusaria a toda pasada verde honesta. Medido en el fixture:
-# rust/tests/contrato.rs son 62 B en el arbol contra 59 B en el commit.
+# Medido 2026-09-22: con core.autocrlf=true y sin regla para *.rs, git dejaba
+# el ARBOL en CRLF y el COMMIT en LF, y cada fichero diferia de su blob SOLO por
+# los finales de linea: `frozen` acusaria a toda pasada verde honesta. Medido en
+# el fixture: rust/tests/contrato.rs son 62 B en el arbol contra 59 B en el
+# commit. Desde d4b2e2b .gitattributes lleva `*.rs text eol=lf`, pero el sed
+# sigue haciendo falta: un clon hecho antes de esa regla conserva sus .rs en
+# CRLF, porque git no reescribe un fichero del arbol al ponerle atributos.
 #
 # Va delante del awk, y no dentro, porque gawk (el de Git Bash) strippea el CR
 # por su cuenta y mawk no: sin esto el guardia decidiria distinto segun el awk
