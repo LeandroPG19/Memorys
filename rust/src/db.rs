@@ -444,23 +444,120 @@ async fn migrate_and_provision(pool: &PgPool) -> Result<()> {
 /// it. Closing it ends the session, the lock and the failed migration's
 /// transaction with it; nothing of that transaction was committed.
 ///
+/// The line-ending realignment of the recorded checksums runs first, on this
+/// same connection: a failure there closes it like a failed migration, and a
+/// lost catalog race repeats both, which its conditional UPDATE makes harmless.
+async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
+    let mut conn = pool.acquire().await?;
+    let outcome = realign_then_migrate(&mut conn).await;
+    if outcome.is_err() {
+        conn.close().await.ok();
+    }
+    outcome
+}
+
 /// run_direct, not run: run on `&mut PgConnection` asks for `Acquire<'a>` for
 /// every lifetime, which rustc refuses ("implementation of `Acquire` is not
 /// general enough"); sqlx-core 0.8.6 keeps run_direct public for exactly that
 /// (migrate/migrator.rs:140-145). Boxed so rustc proves Send here, with
 /// concrete lifetimes: inferred, Migrator::run left create_pool's future !Send
-/// (v043 spawns it) once provision_app_role took a tx.
-async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
-    let mut conn = pool.acquire().await?;
-    let outcome = {
-        let run: Pin<Box<dyn Future<Output = Result<(), MigrateError>> + Send + '_>> =
-            Box::pin(MIGRATOR.run_direct(&mut *conn));
-        run.await
-    };
-    if outcome.is_err() {
-        conn.close().await.ok();
+/// (v043 spawns it) once provision_app_role took a tx. The box holds
+/// run_direct's own future, not an async block around it, so what this
+/// function keeps across the await is a trait object already proven Send.
+async fn realign_then_migrate(conn: &mut sqlx::PgConnection) -> Result<(), MigrateError> {
+    realign_line_ending_checksums(conn).await?;
+    let run: Pin<Box<dyn Future<Output = Result<(), MigrateError>> + Send + '_>> =
+        Box::pin(MIGRATOR.run_direct(&mut *conn));
+    run.await
+}
+
+/// sqlx refuses to start when `_sqlx_migrations.checksum` is not the SHA-384 of
+/// the SQL this binary embeds, and `sqlx::migrate!` embeds the bytes as they
+/// were on disk. A Windows checkout made with core.autocrlf=true before
+/// `*.sql text eol=lf` reached .gitattributes keeps its migrations in CRLF —
+/// git does not rewrite a file when attributes are added — so a daemon built
+/// there records CRLF checksums, and the LF binary CI publishes then dies with
+/// «migration 63 was previously applied but has been modified». Measured on a
+/// live base: 63 and 64 held the SHA-384 of their CRLF bytes.
+///
+/// A record that is the same SQL in the other line endings is rewritten to the
+/// embedded checksum, in both directions. Any other difference is left for
+/// sqlx to refuse, as before. The UPDATE is conditional on the checksum it
+/// read, so two daemons starting at once apply it once, and a record that
+/// changed in between is not overwritten. It runs before run_direct takes the
+/// migration lock, which is why it has to be conditional.
+///
+/// sqlx::Connection::begin and sqlx::Executor's own methods return a BoxFuture
+/// that is already Send, for the reason given at write_app_role_password.
+async fn realign_line_ending_checksums(conn: &mut sqlx::PgConnection) -> sqlx::Result<()> {
+    let mut tx = sqlx::Connection::begin(conn).await?;
+    for (version, recorded) in applied_checksums(&mut tx).await? {
+        let Some(embedded) = realigned_checksum_for(version, &recorded) else {
+            continue;
+        };
+        let realign = sqlx::query(
+            "UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2 AND checksum = $3",
+        )
+        .bind(embedded)
+        .bind(version)
+        .bind(&recorded);
+        sqlx::Executor::execute(&mut *tx, realign).await?;
+        tracing::warn!(
+            version,
+            "migration {version} was recorded from the same SQL in other line endings (a \
+             core.autocrlf checkout built the binary that applied it); realigned to the \
+             checksum this binary embeds"
+        );
     }
-    outcome
+    tx.commit().await
+}
+
+/// Empty while sqlx has not created its table: a fresh database has nothing to
+/// realign. sqlx::Executor's own methods, for the Send reason given at
+/// write_app_role_password.
+async fn applied_checksums(conn: &mut sqlx::PgConnection) -> sqlx::Result<Vec<(i64, Vec<u8>)>> {
+    let table = sqlx::Executor::fetch_optional(
+        &mut *conn,
+        sqlx::query("SELECT 1 WHERE to_regclass('_sqlx_migrations') IS NOT NULL"),
+    )
+    .await?;
+    if table.is_none() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::Executor::fetch_all(
+        conn,
+        sqlx::query("SELECT version, checksum FROM _sqlx_migrations"),
+    )
+    .await?;
+    rows.iter()
+        .map(<(i64, Vec<u8>) as sqlx::FromRow<'_, sqlx::postgres::PgRow>>::from_row)
+        .collect()
+}
+
+/// Down migrations share the version of their up migration, and
+/// `_sqlx_migrations` records only the up one.
+fn realigned_checksum_for(version: i64, recorded: &[u8]) -> Option<&'static [u8]> {
+    MIGRATOR
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+        .find(|m| m.version == version)
+        .and_then(|m| realigned_checksum(&m.sql, &m.checksum, recorded))
+}
+
+/// `embedded` when `recorded` is the SHA-384 of `sql` with every line ending
+/// written the other way, which is exactly what core.autocrlf does to a file:
+/// `\r\n` to `\n`, or `\n` to `\r\n` over the text already brought to `\n`.
+/// None when the record already matches, or differs in anything else.
+fn realigned_checksum<'a>(sql: &str, embedded: &'a [u8], recorded: &[u8]) -> Option<&'a [u8]> {
+    if recorded == embedded {
+        return None;
+    }
+    let lf = sql.replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    let only_line_endings = [lf, crlf].iter().any(|variant| {
+        <sha2::Sha384 as sha2::Digest>::digest(variant.as_bytes()).as_slice() == recorded
+    });
+    only_line_endings.then_some(embedded)
 }
 
 /// Whether `error`, or an error under it, is PostgreSQL's `tuple concurrently
