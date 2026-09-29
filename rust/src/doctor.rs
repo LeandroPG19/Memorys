@@ -113,10 +113,10 @@ fn parse_vector_dim(col_type: &str) -> Option<i64> {
 ///
 /// `rust/Cargo.toml` builds `src/main.rs` twice, as `memory-industry` and as
 /// `cuba-memorys`; `packaging/memory-industry.service:9` starts
-/// `memory-industry`; `packaging/cuba-memorys.service:11` starts
-/// `cuba-memorys-daemon`; `package.json` publishes both npm bins. AGENTS.md
-/// keeps the legacy alias for one more release, so all three are ours and none
-/// is retired here.
+/// `memory-industry`; the `cuba-memorys.service` this repo shipped until 0.27
+/// starts `cuba-memorys-daemon`, and 0.28.0 took the file out of `packaging/`
+/// but not off the machines that installed it; `package.json` publishes both
+/// npm bins. So all three are ours and none is retired here.
 ///
 /// This was the single literal `cuba-memorys` until 0.27, which is the one name
 /// no unit this repo packages produces. It discarded every process it ever saw,
@@ -1193,10 +1193,10 @@ mod tests {
     ///
     /// `rust/Cargo.toml` builds `src/main.rs` twice, as `memory-industry` and
     /// as `cuba-memorys`; `packaging/memory-industry.service:9` starts
-    /// `memory-industry`; `packaging/cuba-memorys.service:11` starts
-    /// `cuba-memorys-daemon`; `package.json` publishes both npm bins. AGENTS.md
-    /// keeps the legacy alias for one more release, so all three are ours and
-    /// none is retired here.
+    /// `memory-industry`; the `cuba-memorys.service` this repo shipped until
+    /// 0.27 starts `cuba-memorys-daemon`, and 0.28.0 took the file out of
+    /// `packaging/` but not off the machines that installed it; `package.json`
+    /// publishes both npm bins. So all three are ours and none is retired here.
     ///
     /// This list is written out here on purpose instead of being imported from
     /// production. A test that reads the same table the function reads shrinks

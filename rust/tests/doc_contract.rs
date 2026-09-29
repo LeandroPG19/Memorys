@@ -489,8 +489,12 @@ fn a_credential_compiled_into_the_binary_is_disclosed_in_security_md() {
 }
 
 fn variables_offered_in_env_example() -> BTreeSet<String> {
-    read(".env.example")
-        .lines()
+    env_names_offered_in(&read(".env.example"))
+}
+
+/// Every `NAME=` an env file offers, set or commented out.
+fn env_names_offered_in(body: &str) -> BTreeSet<String> {
+    body.lines()
         .filter_map(|line| {
             line.trim_start()
                 .trim_start_matches('#')
@@ -834,16 +838,49 @@ fn every_variable_on_the_deployment_surface_is_offered_in_env_example() {
     );
 }
 
-#[test]
-fn the_env_example_agrees_with_the_units_it_is_meant_to_feed() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the crate sits under the repository root")
-        .join("packaging");
+/// Names a unit pins in line with `Environment=`, in any of the forms systemd
+/// accepts: `Environment=A=1`, `Environment="A=1" B=2`.
+fn names_pinned_in_line(unit: &str) -> BTreeSet<String> {
+    unit.lines()
+        .filter_map(|line| line.trim().strip_prefix("Environment="))
+        .flat_map(str::split_whitespace)
+        .filter_map(|assignment| assignment.trim_matches('"').split('=').next())
+        .filter(|name| looks_like_an_env_name(name))
+        .map(str::to_string)
+        .collect()
+}
 
-    let mut set_by_units: BTreeSet<String> = BTreeSet::new();
+/// What a unit pins in line that the operator is meant to set in the env
+/// file instead.
+fn operator_knobs_pinned_in_line(unit: &str, env_file: &BTreeSet<String>) -> Vec<String> {
+    names_pinned_in_line(unit)
+        .into_iter()
+        .filter(|name| {
+            name.starts_with("CUBA_")
+                || name.starts_with("MEMORY_INDUSTRY_")
+                || ["DATABASE_URL", "ORT_DYLIB_PATH"].contains(&name.as_str())
+                || env_file.contains(name)
+        })
+        .collect()
+}
+
+const UNIT_ENV_FILE: &str = "packaging/memory-industry.env.example";
+
+#[test]
+fn every_unit_reads_its_knobs_from_the_env_file_and_pins_none_in_line() {
+    let env_file = env_names_offered_in(&read(UNIT_ENV_FILE));
+    assert!(
+        env_file.contains("CUBA_HTTP_TOKEN") && env_file.contains("DATABASE_URL"),
+        "the parser found {env_file:?} in {UNIT_ENV_FILE}, which offers both CUBA_HTTP_TOKEN and          DATABASE_URL. It is the parser that is broken, not the file"
+    );
+
     let mut units_seen = 0usize;
-    for entry in std::fs::read_dir(&root)
+    let mut with_env_file = 0usize;
+    let mut pinned: Vec<String> = Vec::new();
+    let packaging = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("packaging");
+    for entry in std::fs::read_dir(&packaging)
         .expect("packaging/ is readable")
         .flatten()
     {
@@ -852,36 +889,68 @@ fn the_env_example_agrees_with_the_units_it_is_meant_to_feed() {
             continue;
         }
         units_seen += 1;
-        for line in std::fs::read_to_string(&path).expect("readable").lines() {
-            if let Some(assignment) = line.trim().strip_prefix("Environment=")
-                && let Some(name) = assignment.split('=').next()
-                && looks_like_an_env_name(name)
-            {
-                set_by_units.insert(name.to_string());
-            }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let unit = std::fs::read_to_string(&path).expect("readable");
+        if unit
+            .lines()
+            .any(|l| l.trim().starts_with("EnvironmentFile="))
+        {
+            with_env_file += 1;
+        } else {
+            pinned.push(format!("packaging/{name}: no EnvironmentFile= line"));
+        }
+        for knob in operator_knobs_pinned_in_line(&unit, &env_file) {
+            pinned.push(format!("packaging/{name}: Environment={knob}"));
         }
     }
 
     assert!(
-        units_seen > 0 && set_by_units.len() >= 10,
-        "the parser read {units_seen} unit file(s) and found {} Environment= names. packaging/ \
-         ships a unit that sets more than a dozen, so a green result here would mean the parser \
-         stopped working, not that the files agree",
-        set_by_units.len()
+        units_seen > 0 && with_env_file > 0,
+        "the parser read {units_seen} .service file(s) under packaging/ and saw EnvironmentFile=          in {with_env_file}. packaging/memory-industry.service ships and declares one, so it is          the parser that is broken, not the units"
     );
-
-    let offered = variables_offered_in_env_example();
-    let excluded: BTreeMap<&str, &str> = NOT_A_KNOB_AN_OPERATOR_SETS.into_iter().collect();
-    let missing: Vec<&String> = set_by_units
-        .difference(&offered)
-        .filter(|name| !excluded.contains_key(name.as_str()))
-        .collect();
-
     assert!(
-        missing.is_empty(),
-        "packaging/ pins these variables and `.env.example` never mentions them: {missing:?}. \
-         Two deployment artifacts that disagree are worse than one: the unit silently wins on \
-         Linux while the operator edits a file that has no effect, and on Windows — where there \
-         is no unit — the value simply never gets set."
+        pinned.is_empty(),
+        "a unit under packaging/ sets in line what the operator sets in the env file:          {pinned:#?}. Two deployment artifacts that disagree are worse than one: the unit          silently wins on Linux while the operator edits a file that has no effect. It happened:          packaging/cuba-memorys.service pinned a hand-written GPU ceiling that beat the          planner's measurement on every card the daemon ran on. The knob goes in {UNIT_ENV_FILE}"
     );
+}
+
+#[test]
+fn the_unit_contract_rejects_a_knob_pinned_in_line() {
+    let env_file = env_names_offered_in(&read(UNIT_ENV_FILE));
+    let unit = read("packaging/memory-industry.service");
+    assert!(
+        operator_knobs_pinned_in_line(&unit, &env_file).is_empty(),
+        "the shipped unit is the clean baseline this sabotage starts from"
+    );
+    let sabotaged = unit.replacen(
+        "EnvironmentFile=",
+        "Environment=\"CUBA_GPU_MEM_LIMIT_MB=2048\" RUST_LOG=info
+EnvironmentFile=",
+        1,
+    );
+    assert_eq!(
+        operator_knobs_pinned_in_line(&sabotaged, &env_file),
+        vec!["CUBA_GPU_MEM_LIMIT_MB".to_string()],
+        "a unit that pins the GPU ceiling in line went unnoticed, or RUST_LOG — a log level, not          a knob the env file offers — was flagged. A contract that cannot see the one line it          exists to catch is a paragraph"
+    );
+}
+
+#[test]
+fn every_variable_the_generated_env_files_offer_is_offered_in_env_example() {
+    let offered = variables_offered_in_env_example();
+    for relative in [
+        "packaging/memory-industry.env.example",
+        "packaging/windows/memory-industry.env.example",
+    ] {
+        let generated = env_names_offered_in(&read(relative));
+        assert!(
+            generated.contains("CUBA_HTTP_TOKEN") && generated.contains("CUBA_GPU_MEM_LIMIT_MB"),
+            "the parser found {generated:?} in {relative}, which offers both CUBA_HTTP_TOKEN and              CUBA_GPU_MEM_LIMIT_MB. It is the parser that is broken, not the file"
+        );
+        let missing: Vec<&String> = generated.difference(&offered).collect();
+        assert!(
+            missing.is_empty(),
+            "{relative} is what `setup service` installs and offers {missing:?}, which              `.env.example` never mentions. The installed file is a subset of the reference one              by design; a knob only the generated file names is one an operator running from a              checkout never learns exists"
+        );
+    }
 }

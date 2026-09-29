@@ -3,8 +3,10 @@
 //! The defect: `packaging/cuba-memorys.service` was written by hand, pinned
 //! `CUBA_GPU_MEM_LIMIT_MB=2048` at line 67, and `resources::set_if_absent` lets
 //! an already-set variable win — so a number typed once beat the planner's
-//! measurement on every machine with a card. The same file still carries a
-//! database password and points at a repository that does not exist.
+//! measurement on every machine with a card. The same file carried a database
+//! password and pointed at a repository that does not exist. It was exempted
+//! by name for one release and deleted in 0.28.0; from then on every file
+//! under `packaging/` is scanned, with no exemption list to hide behind.
 //!
 //! These contracts need the repository tree, which is why they are here and not
 //! in the library. The ones that have to kill mutants live in
@@ -15,18 +17,6 @@ use std::path::{Path, PathBuf};
 
 use memory_industry::resources::{self, Plan, Tier};
 use memory_industry::service::{self, Profile, Target, Unit};
-
-/// AGENTS.md: the `cuba-memorys` names survive one release. These two units
-/// carry `CUBA_GPU_MEM_LIMIT_MB=2048` (:67) and a `DATABASE_URL` with a
-/// password (:90) — they are the defect 0.27 is killing, and they go out with
-/// the name they were born with.
-///
-/// Exempted BY NAME, with a reason and an expiry. Scanning only what the binary
-/// generates would exempt by omission instead: a `packaging/install.ps1` added
-/// by hand next month would be invisible to both hygiene contracts, which is
-/// literally how `packaging/` came to hold a 2048 in the first place.
-const LEGACY_PACKAGING: [&str; 2] = ["cuba-memorys.service", "cuba-memorys.socket"];
-const LEGACY_DROPPED_IN: &str = "0.28.0";
 
 /// Printed by every failure that means "the tree and the binary disagree".
 const REGENERATE: &str = "memory-industry setup service --print --linux  --out packaging\n\
@@ -78,8 +68,8 @@ fn read_normalised(path: &Path) -> String {
     text.replace("\r\n", "\n")
 }
 
-/// Every file under `packaging/`, at any depth, as (name, relative path, body).
-fn every_packaging_file() -> Vec<(String, String, String)> {
+/// Every file under `packaging/`, at any depth, as (relative path, body).
+fn every_packaging_file() -> Vec<(String, String)> {
     let root = packaging();
     let mut out = Vec::new();
     let mut stack = vec![root.clone()];
@@ -93,28 +83,16 @@ fn every_packaging_file() -> Vec<(String, String, String)> {
                 stack.push(path);
                 continue;
             }
-            let name = path
-                .file_name()
-                .expect("a file has a name")
-                .to_string_lossy()
-                .into_owned();
             let relative = path
                 .strip_prefix(&root)
                 .expect("under packaging/")
                 .to_string_lossy()
                 .replace('\\', "/");
-            out.push((name, relative, read_normalised(&path)));
+            out.push((relative, read_normalised(&path)));
         }
     }
     out.sort();
     out
-}
-
-fn without_the_legacy(files: Vec<(String, String, String)>) -> Vec<(String, String, String)> {
-    files
-        .into_iter()
-        .filter(|(name, _, _)| !LEGACY_PACKAGING.contains(&name.as_str()))
-        .collect()
 }
 
 /// The canonical render, for both targets, as (relative path, body).
@@ -428,8 +406,9 @@ fn pins_a_gpu_ceiling(line: &str) -> bool {
 
 #[test]
 fn nothing_under_packaging_carries_a_secret() {
-    // Positive control with a fixture of its own, never with the legacy file:
-    // if somebody deletes the legacy unit, the control has to stay standing.
+    // Positive control with a fixture of its own, never with a file from the
+    // tree: the legacy unit that once held these lines is gone, and the control
+    // has to stay standing without it.
     // Safe as a literal here because the scan below only ever reads
     // `packaging/`, never this source file.
     for canary in [
@@ -455,15 +434,19 @@ fn nothing_under_packaging_carries_a_secret() {
         );
     }
 
-    let files = without_the_legacy(every_packaging_file());
+    // Every file, not only what the binary generates: scanning the render alone
+    // would exempt by omission, and a `packaging/install.ps1` added by hand
+    // would be invisible to both hygiene contracts — which is literally how
+    // `packaging/` came to hold a 2048 in the first place.
+    let files = every_packaging_file();
     assert!(
         !files.is_empty(),
-        "the scan read no file at all under packaging/ outside the legacy list. A scanner \
-         that finds nothing passes every absence test ever written"
+        "the scan read no file at all under packaging/. A scanner that finds nothing passes \
+         every absence test ever written"
     );
 
     let mut found = Vec::new();
-    for (_, relative, body) in &files {
+    for (relative, body) in &files {
         for (n, line) in body.lines().enumerate() {
             if let Some(why) = secret_in(line) {
                 found.push(format!("packaging/{relative}:{}: {why}", n + 1));
@@ -491,14 +474,14 @@ fn nothing_under_packaging_pins_a_gpu_ceiling_by_hand() {
         "offering the key with no value is the whole point of the generated env file"
     );
 
-    let files = without_the_legacy(every_packaging_file());
+    let files = every_packaging_file();
     assert!(
         !files.is_empty(),
-        "the scan read no file under packaging/ outside the legacy list, so it proves nothing"
+        "the scan read no file under packaging/, so it proves nothing"
     );
 
     let mut found = Vec::new();
-    for (_, relative, body) in &files {
+    for (relative, body) in &files {
         for (n, line) in body.lines().enumerate() {
             if pins_a_gpu_ceiling(line) {
                 found.push(format!("packaging/{relative}:{}: {line}", n + 1));
@@ -531,12 +514,12 @@ fn the_units_point_at_the_repository_that_exists() {
          the reader follows is a coin toss"
     );
 
-    // Every file, legacy included. The dead URL is NOT exempt: `Documentation=`
-    // is a line no systemd reads to start anything, so fixing it costs one line
-    // per file and risks nothing.
+    // Every file, hand-written ones included: `Documentation=` is a line no
+    // systemd reads to start anything, so a dead URL costs one line to fix and
+    // nothing excuses leaving it.
     let mut urls = 0usize;
     let mut wrong = Vec::new();
-    for (_, relative, body) in every_packaging_file() {
+    for (relative, body) in every_packaging_file() {
         for (n, line) in body.lines().enumerate() {
             let Some((_, after)) = line.split_once("https://github.com/") else {
                 continue;
@@ -565,47 +548,6 @@ fn the_units_point_at_the_repository_that_exists() {
         "these point at a repository that does not exist — the reader who follows one gets a \
          404 and concludes the project is gone: {wrong:#?}. Expected {declared}"
     );
-}
-
-// --- 8 · The exemption expires on its own -----------------------------------
-
-#[test]
-fn the_legacy_packaging_exemption_expires_on_schedule() {
-    fn semver(s: &str) -> (u64, u64, u64) {
-        let mut parts = s.split('.').map(|p| {
-            p.trim_matches(|c: char| !c.is_ascii_digit())
-                .parse::<u64>()
-                .unwrap_or(0)
-        });
-        (
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-            parts.next().unwrap_or(0),
-        )
-    }
-
-    let now = semver(env!("CARGO_PKG_VERSION"));
-    let expires = semver(LEGACY_DROPPED_IN);
-    assert!(
-        expires > (0, 0, 0),
-        "LEGACY_DROPPED_IN does not parse as a version, so this ratchet can never fire"
-    );
-
-    let still_here: Vec<&str> = LEGACY_PACKAGING
-        .iter()
-        .copied()
-        .filter(|name| packaging().join(name).exists())
-        .collect();
-
-    if now >= expires {
-        assert!(
-            still_here.is_empty(),
-            "the compatibility window closed at {LEGACY_DROPPED_IN} and {still_here:?} are \
-             still in packaging/, carrying the database password and the hand-pinned GPU \
-             ceiling they were exempted for. Delete them, and delete LEGACY_PACKAGING with \
-             them. An exception with no expiry that enforces itself is a good intention"
-        );
-    }
 }
 
 // --- 10 · The versioned XML is the one an operator can hand to schtasks -----

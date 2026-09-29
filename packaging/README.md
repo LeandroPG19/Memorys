@@ -1,6 +1,6 @@
 # packaging/
 
-Everything here except this file and the two `cuba-memorys.*` is **generated**.
+Everything here except this file is **generated**.
 The source is the binary, not the tree:
 
     memory-industry setup service --print --linux  --out packaging
@@ -17,9 +17,10 @@ The units carry **no knobs**. They point at an env file, and that file offers
 every key the planner can set, commented and without a value — the planner
 measures them at startup and a value written there wins for good.
 
-`cuba-memorys.service` and `cuba-memorys.socket` are the previous release's
-names, kept for one version and dropped at 0.28.0. They still carry the defect;
-they are exempted by name, with an expiry the contract enforces on its own.
+`cuba-memorys.service` and `cuba-memorys.socket`, the hand-written pair that
+carried the defect, left the tree in 0.28.0. `--uninstall` does not remove a
+copy of them already installed; that is `systemctl --user disable --now` on both
+and deleting the two files by hand.
 
 Install, uninstall and what `--apply` will not overwrite:
 

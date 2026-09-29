@@ -5,7 +5,12 @@ All notable changes to MemoryIndustry (formerly cuba-memorys) are documented her
 [SemVer](https://semver.org/) for the Rust crate (`Cargo.toml`). PyPI
 versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI 1.28.0).
 
-## [Unreleased]
+## [0.28.0] — 2026-09-29 (Cargo `0.28.0` · npm `0.28.0` · PyPI `1.30.0`)
+
+### Behaviour changes — read before deploying
+
+- **`packaging/cuba-memorys.service` and `packaging/cuba-memorys.socket` are gone from the repository.** They were the hand-written pair that pinned `CUBA_GPU_MEM_LIMIT_MB=2048` and carried a `DATABASE_URL` with a password, kept for the one release AGENTS.md promised the `cuba-memorys` names and exempted by name from the packaging contract until 0.28.0. The exemption is gone with them: every file under `packaging/` is now scanned for secrets, hand-pinned GPU ceilings and dead repository URLs. If you installed them, `memory-industry setup service --apply` installs the generated `memory-industry.service`/`.socket` and their env file. Nothing removes the old pair for you: `setup service --uninstall` only takes away the `memory-industry.*` files it wrote, so run `systemctl --user disable --now cuba-memorys.socket cuba-memorys.service` and delete the two files under `~/.config/systemd/user/`. `doctor` still recognises a daemon running as `cuba-memorys-daemon` — the binary the old unit starts — when it looks for stale processes.
+- **Only the packaging window closes.** The `cuba-memorys` binary (the Cargo `[[bin]]` and the npm `bin` alias of the `memory-industry` package), the `cuba-memorys` package that `publish.yml` still publishes on npm and PyPI alongside `memory-industry`, the `CUBA_*` variables, the legacy `~/.cache/cuba-memorys/` fallback and the `cuba_*` tool names all stay in this release.
 
 ### Added
 
