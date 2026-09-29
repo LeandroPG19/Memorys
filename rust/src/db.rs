@@ -1235,4 +1235,139 @@ mod tests {
             }
         }
     }
+
+    // The three tests below judge the SCRAM code from inside the crate: the
+    // contract test in tests/scram_verifier_contract.rs and the v044 ones hold
+    // it to the same values, but `cargo mutants -- --lib` (quality-gate.sh)
+    // runs only these, and seven mutants lived in the meantime. Every expected
+    // value was computed apart from the functions under test.
+
+    // RFC 4231 test cases 1, 2, 6 and 7 for HMAC-SHA-256 (the last two keys
+    // are 131 bytes, longer than SHA-256's 64-byte block, so the key is hashed
+    // first). The digests are the RFC's and were recomputed with Python's hmac.
+    #[test]
+    fn hmac_sha256_matches_the_vectors_of_rfc_4231() {
+        let short_key = [0x0b_u8; 20];
+        let long_key = [0xaa_u8; 131];
+        let long_message = b"This is a test using a larger than block-size key and a larger than \
+                             block-size data. The key needs to be hashed before being used by the \
+                             HMAC algorithm.";
+        let rows: [(&[u8], &[u8], &str); 4] = [
+            (
+                short_key.as_slice(),
+                b"Hi There".as_slice(),
+                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+            ),
+            (
+                b"Jefe".as_slice(),
+                b"what do ya want for nothing?".as_slice(),
+                "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+            ),
+            (
+                long_key.as_slice(),
+                b"Test Using Larger Than Block-Size Key - Hash Key First".as_slice(),
+                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+            ),
+            (
+                long_key.as_slice(),
+                long_message.as_slice(),
+                "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+            ),
+        ];
+        for (key, message, expected) in rows {
+            assert_eq!(
+                hex::encode(hmac_sha256(key, message)),
+                expected,
+                "HMAC-SHA-256 with a key of {} bytes",
+                key.len()
+            );
+        }
+    }
+
+    // Inputs of RFC 6070 (password, salt; 1, 2 and 4096 iterations) with the
+    // SHA-256 outputs computed with Python's hashlib.pbkdf2_hmac(..., 32); the
+    // 3-iteration and long-password rows are Python's too. One iteration never
+    // reaches the loop; two or more run `^=` on 32 bytes that differ between
+    // `^` and `|`, so a key that ORs the blocks instead of XORing them fails
+    // from the second row on.
+    #[test]
+    fn pbkdf2_hmac_sha256_xors_every_iteration_into_the_key() {
+        let long_password = [0xaa_u8; 131];
+        let rows: [(&[u8], u32, &str); 5] = [
+            (
+                b"password".as_slice(),
+                1,
+                "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+            ),
+            (
+                b"password".as_slice(),
+                2,
+                "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43",
+            ),
+            (
+                b"password".as_slice(),
+                3,
+                "ad35240ac683febfaf3cd49d845473fbbbaa2437f5f82d5a415ae00ac76c6bfc",
+            ),
+            (
+                b"password".as_slice(),
+                4096,
+                "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+            ),
+            (
+                long_password.as_slice(),
+                3,
+                "5b8f88843bc0eba1574ab29d079183daade33deb8de1ee4d1c2e81c40b7110c4",
+            ),
+        ];
+        for (password, iterations, expected) in rows {
+            assert_eq!(
+                hex::encode(pbkdf2_hmac_sha256(password, b"salt", iterations)),
+                expected,
+                "PBKDF2-HMAC-SHA-256 with a password of {} bytes and {iterations} iterations",
+                password.len()
+            );
+        }
+    }
+
+    // The rows of tests/scram_verifier_contract.rs, first the exchange of
+    // RFC 7677 §3 (password "pencil", salt W22ZaJ0SNY7soEsUEjb6gQ==). Their
+    // StoredKey and ServerKey were derived with Python's hashlib and hmac, and
+    // the first row was rechecked against the ClientProof and ServerSignature
+    // the RFC prints. Salts of 16, 17 and 18 bytes end their Base64 in `==`,
+    // `=` and nothing.
+    #[test]
+    fn scram_sha_256_verifier_is_the_string_postgresql_stores() {
+        let rows = [
+            (
+                "pencil",
+                "5b6d99689d12358eeca04b141236fa81",
+                "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$\
+                 WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:\
+                 wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=",
+            ),
+            (
+                "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+                "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0",
+                "SCRAM-SHA-256$4096:oKGio6SlpqeoqaqrrK2ur7A=$\
+                 iP6ReYq60QTiA6v1oUtqUbr34Cxj/t0o8SHXLpuuVcQ=:\
+                 gJgIJpcmA+buCJhTcT9t17lH680ijTrDS9vMLNdB9jI=",
+            ),
+            (
+                "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+                "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff0001",
+                "SCRAM-SHA-256$4096:8PHy8/T19vf4+fr7/P3+/wAB$\
+                 0abSE1Yt2HJ6erUEpLNqJ64d/I5u90d31A/w4USrHcQ=:\
+                 KO3xbHCxbnNjsD3+6aWBhnQpYAID6jKviH2X84FF2IE=",
+            ),
+        ];
+        for (password, salt_hex, expected) in rows {
+            let salt = hex::decode(salt_hex).expect("the salt of a row is hex");
+            assert_eq!(
+                scram_sha_256_verifier(password, &salt),
+                expected,
+                "the verifier of {password:?} with salt {salt_hex}"
+            );
+        }
+    }
 }
