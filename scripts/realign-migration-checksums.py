@@ -21,31 +21,40 @@ def sha384(data: bytes) -> str:
     return hashlib.sha384(data).hexdigest()
 
 
-def main() -> int:
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--container", default="cuba-memorys-db")
     ap.add_argument("--db", default="brain")
     ap.add_argument("--user", default="cuba")
     ap.add_argument("--apply", action="store_true")
-    args = ap.parse_args()
+    return ap.parse_args()
 
+
+def docker_psql(args: argparse.Namespace, *psql_flags: str) -> list[str]:
+    return [
+        "docker",
+        "exec",
+        args.container,
+        "psql",
+        "-U",
+        args.user,
+        "-d",
+        args.db,
+        *psql_flags,
+    ]
+
+
+def read_db_checksums(args: argparse.Namespace) -> dict[int, str]:
     out = subprocess.check_output(
-        [
-            "docker",
-            "exec",
-            args.container,
-            "psql",
-            "-U",
-            args.user,
-            "-d",
-            args.db,
+        docker_psql(
+            args,
             "-t",
             "-A",
             "-F",
             "|",
             "-c",
             "SELECT version, encode(checksum,'hex') FROM _sqlx_migrations ORDER BY version",
-        ],
+        ),
         text=True,
     )
     db = {}
@@ -55,26 +64,41 @@ def main() -> int:
             continue
         ver_s, hx = line.split("|", 1)
         db[int(ver_s)] = hx
+    return db
 
+
+def classify_version(ver: int, hx: str):
+    """Returns ("update", entry), ("diff", entry) or None when nothing to do."""
+    ups = list(MIG.glob(f"{ver:04d}_*.up.sql"))
+    if not ups:
+        print(f"WARN: version {ver} in DB but no file", file=sys.stderr)
+        return None
+    data = ups[0].read_bytes()
+    lf = sha384(data.replace(b"\r\n", b"\n"))
+    crlf = sha384(data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    as_is = sha384(data)
+    if hx == as_is:
+        return None
+    if hx in (lf, crlf) or hx == as_is:
+        # line-ending only (or already matching after normalize)
+        return ("update", (ver, as_is, ups[0].name))
+    return ("diff", (ver, ups[0].name))
+
+
+def classify(db: dict[int, str]) -> tuple[list, list]:
     updates = []
     content_diffs = []
     for ver, hx in sorted(db.items()):
-        ups = list(MIG.glob(f"{ver:04d}_*.up.sql"))
-        if not ups:
-            print(f"WARN: version {ver} in DB but no file", file=sys.stderr)
+        verdict = classify_version(ver, hx)
+        if verdict is None:
             continue
-        data = ups[0].read_bytes()
-        lf = sha384(data.replace(b"\r\n", b"\n"))
-        crlf = sha384(data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
-        as_is = sha384(data)
-        if hx == as_is:
-            continue
-        if hx in (lf, crlf) or hx == as_is:
-            # line-ending only (or already matching after normalize)
-            updates.append((ver, as_is, ups[0].name))
-        else:
-            content_diffs.append((ver, ups[0].name))
+        kind, entry = verdict
+        (updates if kind == "update" else content_diffs).append(entry)
+    return updates, content_diffs
 
+
+def summarize(updates: list, content_diffs: list) -> int | None:
+    """Prints the counts; returns an exit code when there is nothing to apply."""
     print(f"line-ending drift: {len(updates)}")
     print(f"content diffs (refused): {len(content_diffs)}")
     for ver, name in content_diffs[:20]:
@@ -84,14 +108,17 @@ def main() -> int:
     if not updates:
         print("nothing to do")
         return 0
+    return None
+
+
+def preview_updates(updates: list) -> None:
     for ver, hx, name in updates[:5]:
         print(f"  will update {ver} {name}")
     if len(updates) > 5:
         print(f"  ... and {len(updates)-5} more")
-    if not args.apply:
-        print("dry-run only; pass --apply to write")
-        return 0
 
+
+def apply_updates(args: argparse.Namespace, updates: list) -> None:
     sql = ["BEGIN;"]
     for ver, hx, _ in updates:
         sql.append(
@@ -104,23 +131,25 @@ def main() -> int:
         ["docker", "cp", str(path), f"{args.container}:/tmp/realign_checksums.sql"]
     )
     subprocess.check_call(
-        [
-            "docker",
-            "exec",
-            args.container,
-            "psql",
-            "-U",
-            args.user,
-            "-d",
-            args.db,
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-f",
-            "/tmp/realign_checksums.sql",
-        ]
+        docker_psql(
+            args, "-v", "ON_ERROR_STOP=1", "-f", "/tmp/realign_checksums.sql"
+        )
     )
     path.unlink(missing_ok=True)
     print(f"updated {len(updates)} checksums")
+
+
+def main() -> int:
+    args = parse_args()
+    updates, content_diffs = classify(read_db_checksums(args))
+    code = summarize(updates, content_diffs)
+    if code is not None:
+        return code
+    preview_updates(updates)
+    if not args.apply:
+        print("dry-run only; pass --apply to write")
+        return 0
+    apply_updates(args, updates)
     return 0
 
 
