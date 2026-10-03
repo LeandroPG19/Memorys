@@ -18,6 +18,11 @@ pub struct Judgment {
     pub model: Option<String>,
 }
 
+// clippy 1.99 reads the `#[must_use]` that `async_trait` puts on every boxed
+// future as a second, message-less one on these three async methods. The
+// expansion is not ours to edit, and dropping `async_trait` would change the
+// trait object every judge implements.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ContradictionJudge: Send + Sync {
     async fn run_prompt(&self, prompt: &str) -> Result<String>;
