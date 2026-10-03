@@ -246,6 +246,13 @@ self_test() {
     'exit 0' >"$work/scripts/merge-gate.sh"
   printf '[package]\nname = "fixture"\nversion = "0.27.0"\n\n[dependencies]\nserde = { version = "1.0.0" }\n' \
     >"$work/rust/Cargo.toml"
+  # gate_linux_env, which release() calls first, reads engines.node from the
+  # package.json beside scripts/ and asks the node on PATH for its version.
+  printf '{"engines":{"node":">=18"}}\n' >"$work/package.json"
+  mkdir -p "$tmp/bin"
+  printf '#!/bin/sh\necho v20.0.0\n' >"$tmp/bin/node"
+  chmod +x "$tmp/bin/node"
+  export PATH="$tmp/bin:$PATH"
   git -C "$work" add -A
   git -C "$work" commit -q -m fixture
   git -C "$work" remote add origin "$origin"

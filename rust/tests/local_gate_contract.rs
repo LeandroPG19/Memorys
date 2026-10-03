@@ -458,6 +458,43 @@ fn reads_xdg_cache_home(line: &str) -> bool {
     line.contains("$XDG_CACHE_HOME") || line.contains("${XDG_CACHE_HOME")
 }
 
+/// The gate's own scratch directories, which no binary ever reads: the cargo
+/// target and the `TMPDIR` that `gate_linux_env` (gate-lock.sh) sets.
+fn is_gate_scratch_dir(line: &str) -> bool {
+    line.contains("/cargo-target/") || line.contains("/memory-industry-gate/")
+}
+
+/// A line the scan below has to flag: it reads `XDG_CACHE_HOME` and is not one of
+/// the gate's own scratch directories.
+fn reads_models_cache_under_xdg(line: &str) -> bool {
+    reads_xdg_cache_home(line) && !is_gate_scratch_dir(line)
+}
+
+/// The exemption of the scan below is for the gate's scratch directories and
+/// nothing else: a line that looks for models under `XDG_CACHE_HOME` stays flagged.
+#[test]
+fn the_xdg_scan_exempts_only_the_gates_scratch_directories() {
+    for scratch in [
+        r#"export CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cargo-target/memory-industry""#,
+        r#"export TMPDIR="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/tmp""#,
+    ] {
+        assert!(
+            reads_xdg_cache_home(scratch) && !reads_models_cache_under_xdg(scratch),
+            "`{scratch}` is the gate's own scratch directory and must be the one line the scan lets through"
+        );
+    }
+    for models in [
+        r#"CACHE_NEW="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry""#,
+        r#"CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cuba-memorys""#,
+        r#"export ONNX_MODEL_PATH="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry/models""#,
+    ] {
+        assert!(
+            reads_models_cache_under_xdg(models),
+            "`{models}` looks for models under XDG_CACHE_HOME and must stay flagged: the exemption is for the gate's scratch directories only"
+        );
+    }
+}
+
 /// The scripts look for the models where the binary keeps them.
 ///
 /// The binary never reads `XDG_CACHE_HOME`: `envs::home()` joins `.cache` to
@@ -466,8 +503,13 @@ fn reads_xdg_cache_home(line: &str) -> bool {
 /// `run-all-tests.sh` and `_validate-gate.sh` still did, so on a machine that
 /// sets it the gate pointed `ONNX_MODEL_PATH` at a directory the binary never
 /// wrote. `run-all-tests.sh --self-test` drives its half for real; this is the
-/// net under every script, `_validate-gate.sh` included, which runs a whole gate
-/// under WSL and cannot be driven from a test.
+/// net under every script.
+///
+/// One family of lines is exempt: the gate's own scratch space. `gate-lock.sh`
+/// puts the cargo target and `TMPDIR` of a gate run under
+/// `${XDG_CACHE_HOME:-$HOME/.cache}`, which is the gate's choice and not a place
+/// the binary is expected to look. The exemption names those two directories and
+/// nothing else, so a line that looks for models there is still flagged.
 #[test]
 fn no_script_looks_for_the_cache_where_the_binary_does_not() {
     for read_it in [
@@ -509,14 +551,14 @@ fn no_script_looks_for_the_cache_where_the_binary_does_not() {
             .into_owned();
         let body = std::fs::read_to_string(&path).expect("readable");
         for (n, line) in body.lines().enumerate() {
-            if !line.trim_start().starts_with('#') && reads_xdg_cache_home(line) {
+            if !line.trim_start().starts_with('#') && reads_models_cache_under_xdg(line) {
                 readers.push(format!("{name}:{}: {}", n + 1, line.trim()));
             }
         }
         scanned.push(name);
     }
 
-    for anchor in ["run-all-tests.sh", "_validate-gate.sh"] {
+    for anchor in ["run-all-tests.sh", "gate-lock.sh", "quality-gate.sh"] {
         assert!(
             scanned.iter().any(|s| s == anchor),
             "the scan never read {anchor}, so it is the scan that is broken. Read: {scanned:?}"
@@ -1582,5 +1624,354 @@ fn a_fresh_clone_with_autocrlf_checks_out_the_text_the_crate_reads_back_in_lf() 
          .gitattributes. Anything that reads one of them back and looks for a line break goes \
          red on that clone: that is how the SIL of 0.27 was red on a new Windows clone and \
          green on the tree that published it"
+    );
+}
+
+/// Scripts that are only ever `source`d and never launched, so the mode bit of
+/// the file does not matter.
+const SOURCED_ONLY: [&str; 1] = ["gate-lock.sh"];
+
+/// Whether `name`, the path under `scripts/`, is a script somebody launches: a
+/// `.sh` or `.py` directly there, not on the `SOURCED_ONLY` list.
+fn is_launched_script(name: &str) -> bool {
+    !name.contains('/')
+        && (name.ends_with(".sh") || name.ends_with(".py"))
+        && !SOURCED_ONLY.contains(&name)
+}
+
+/// A row of `git ls-files -s` (`<mode> <sha> <stage>\t<path>`) as (mode, path
+/// under `scripts/`); none for a row outside `scripts/`.
+fn mode_and_script_path(row: &str) -> Option<(&str, &str)> {
+    let (meta, path) = row.split_once('\t')?;
+    let name = path.strip_prefix("scripts/")?;
+    Some((meta.split_whitespace().next()?, name))
+}
+
+/// The rows that name a launched script whose mode is not `100755`, as
+/// `<mode> scripts/<name>`.
+fn not_executable(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(mode_and_script_path)
+        .filter(|(mode, name)| is_launched_script(name) && *mode != "100755")
+        .map(|(mode, name)| format!("{mode} scripts/{name}"))
+        .collect()
+}
+
+/// Windows creates every file as 100644 and git records what it finds, so a
+/// script written there enters the index non-executable. Git Bash launches it
+/// anyway. Linux does not: the gate's own scripts call each other as
+/// `"$ROOT/scripts/mutants-gate.sh"`, and the first of those is `Permission
+/// denied` at the first step of the gate, with nothing in the message that
+/// points at a mode bit. Eight of them were 100644 on 2026-10-03, the day the
+/// gate moved to Linux.
+#[test]
+fn every_gate_entry_point_is_executable_in_the_index() {
+    let listing = "\
+100644 aaaa 0\tscripts/merge-gate.sh
+100755 bbbb 0\tscripts/demo.sh
+100644 cccc 0\tscripts/gate-lock.sh
+100644 dddd 0\tscripts/create-app-role.sql
+100644 eeee 0\tscripts/nested/inner.sh
+100644 ffff 0\tscripts/tool.py
+100644 9999 0\trust/src/main.rs
+";
+    assert_eq!(
+        not_executable(listing),
+        vec![
+            "100644 scripts/merge-gate.sh".to_string(),
+            "100644 scripts/tool.py".to_string()
+        ],
+        "the check has to flag a 100644 .sh and .py under scripts/, and leave alone a 100755 \
+         one, the sourced-only gate-lock.sh, a .sql, a nested script and anything outside \
+         scripts/. A check that flags nothing is the one that passes on the broken index"
+    );
+    assert!(
+        not_executable("100755 bbbb 0\tscripts/demo.sh\n").is_empty(),
+        "a 100755 script was flagged"
+    );
+
+    let out = std::process::Command::new("git")
+        .args(["ls-files", "-s", "--", "scripts"])
+        .current_dir(repo_root())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git has to be reachable: the mode of a file lives in the index, not on disk");
+    assert!(
+        out.status.success(),
+        "git ls-files -s failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    let launchable = listing
+        .lines()
+        .filter(|row| row.ends_with(".sh") || row.ends_with(".py"))
+        .count();
+    assert!(
+        launchable >= 15 && listing.contains("\tscripts/merge-gate.sh"),
+        "git ls-files -s listed {launchable} scripts and this scan is only worth reading if it \
+         saw the gate: merge-gate.sh among at least 15. Listing: {listing}"
+    );
+    let wrong = not_executable(&listing);
+    assert!(
+        wrong.is_empty(),
+        "these scripts are not executable in the index: {wrong:?}. Windows creates 100644 and \
+         git records it; Git Bash launches such a script anyway, Linux answers `Permission \
+         denied` at the first step of the gate that calls it. Fix: `git update-index \
+         --chmod=+x <path>`. A script that is only sourced goes on SOURCED_ONLY"
+    );
+}
+
+/// The lines of `body` that point into a Windows drive as WSL mounts it
+/// (`/mnt/c/`, `/mnt/d/`, whatever the case), as `<name>:<line>: <text>`.
+fn windows_drive_refs(name: &str, body: &str) -> Vec<String> {
+    body.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let line = line.to_ascii_lowercase();
+            line.contains("/mnt/c/") || line.contains("/mnt/d/")
+        })
+        .map(|(n, line)| format!("{name}:{}: {}", n + 1, line.trim()))
+        .collect()
+}
+
+/// `_validate-gate.sh`, `_rerun-gate.sh` and `_finish-and-gate.sh` were left over
+/// from running the gate under WSL against a checkout on `D:`. They wrote
+/// `~/.local/bin/claude` as an `exec` of a `claude.cmd` under `/mnt/c/Users/...`
+/// whenever no `claude` was on the PATH: on a machine with the native `claude`
+/// that is a wrapper to a path that does not exist, and the work happens on a
+/// 9p mount fifty times slower than ext4. Nothing under `scripts/` points into a
+/// Windows drive any more.
+#[test]
+fn no_gate_script_points_into_a_windows_drive() {
+    let strays = windows_drive_refs(
+        "fixture.sh",
+        "exec /mnt/c/Users/x/claude.cmd \"$@\"\ncd /mnt/d/Proyectos/Memorys\nls /MNT/D/x\n\
+         ls /mnt/disk/x /mount/c/y /usr/bin\n",
+    );
+    assert_eq!(
+        strays.len(),
+        3,
+        "the scan must flag /mnt/c/ and /mnt/d/ in any case and nothing that only looks like \
+         them. It flagged {strays:?}"
+    );
+
+    let mut read_files = 0;
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir(repo_root().join("scripts"))
+        .expect("scripts/ is readable")
+        .flatten()
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let body = String::from_utf8_lossy(&std::fs::read(&path).expect("readable")).into_owned();
+        offenders.extend(windows_drive_refs(&name, &body));
+        read_files += 1;
+    }
+    assert!(
+        read_files >= 15,
+        "the scan read {read_files} files of scripts/: it is the scan that is broken, and a \
+         clean answer from it proves nothing"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these lines point into a Windows drive. The gate runs on Linux, in ext4, and a path \
+         under /mnt/c or /mnt/d is a 9p mount fifty times slower that may not even exist: \
+         {offenders:#?}"
+    );
+}
+
+/// 1-based number of the first line of `script` that is code, not a comment,
+/// and contains `needle`.
+fn first_code_line(script: &str, needle: &str) -> Option<usize> {
+    script
+        .lines()
+        .position(|line| !line.trim_start().starts_with('#') && line.contains(needle))
+        .map(|index| index + 1)
+}
+
+/// 1-based number of the first line of `script` that is nothing but a call of
+/// `gate_linux_env`. Not "contains": a `--self-test` runs it inside a `bash -c`
+/// string, long before the gate's own first step, and a scan that counted that
+/// would pass over a script that never calls it.
+fn first_bare_call(script: &str) -> Option<usize> {
+    script
+        .lines()
+        .position(|line| line.trim() == "gate_linux_env")
+        .map(|index| index + 1)
+}
+
+/// Whether `script` sources gate-lock.sh, then calls `gate_linux_env`, and only
+/// then reaches `first_step`.
+fn sets_up_the_linux_environment_before(script: &str, first_step: &str) -> bool {
+    let source = first_code_line(script, r#"source "$ROOT/scripts/gate-lock.sh""#);
+    let call = first_bare_call(script);
+    let step = first_code_line(script, first_step);
+    matches!((source, call, step), (Some(s), Some(c), Some(t)) if s < c && c < t)
+}
+
+/// What each entry point of the gate does first, as the text of that line.
+const GATE_ENTRY_POINTS: [(&str, &str); 4] = [
+    ("scripts/merge-gate.sh", r#"command -v pg_isready"#),
+    (
+        "scripts/quality-gate.sh",
+        r#"echo "=== exclusions of the mutation step"#,
+    ),
+    ("scripts/mutants-gate.sh", r#"OUT_DIR="${TMPDIR"#),
+    ("scripts/release.sh", r#"check_the_tree "$tag""#),
+];
+
+/// The environment a gate run gets on Linux (the build target and `TMPDIR`
+/// outside the tree and off tmpfs, a `node` that is new enough) is set by one
+/// function, and it has to be set before the first step that needs it, not
+/// halfway: the mutation tool copies the tree into `TMPDIR`, which is tmpfs and
+/// so RAM on this machine, and a target inside `rust/` made it copy 27.5 GB.
+/// `merge-gate.sh --self-test` drives the function itself; this holds each of
+/// the four entry points to calling it.
+#[test]
+fn every_gate_entry_point_sets_up_the_linux_environment_before_its_first_step() {
+    let good = "source \"$ROOT/scripts/gate-lock.sh\"\n  gate_linux_env\ncommand -v pg_isready\n";
+    let step = "command -v pg_isready";
+    assert!(
+        sets_up_the_linux_environment_before(good, step),
+        "the check rejected a script that sources gate-lock.sh, calls gate_linux_env and then \
+         runs its first step"
+    );
+    for (what, bad) in [
+        (
+            "calls it after the first step",
+            "source \"$ROOT/scripts/gate-lock.sh\"\ncommand -v pg_isready\ngate_linux_env\n",
+        ),
+        (
+            "mentions it only in a comment",
+            "source \"$ROOT/scripts/gate-lock.sh\"\n# gate_linux_env\ncommand -v pg_isready\n",
+        ),
+        (
+            "runs it only inside a bash -c string",
+            "source \"$ROOT/scripts/gate-lock.sh\"\nbash -c 'gate_linux_env'\ncommand -v pg_isready\n",
+        ),
+        (
+            "never sources gate-lock.sh",
+            "gate_linux_env\ncommand -v pg_isready\n",
+        ),
+        (
+            "never calls it",
+            "source \"$ROOT/scripts/gate-lock.sh\"\ncommand -v pg_isready\n",
+        ),
+        (
+            "has no first step to compare with",
+            "source \"$ROOT/scripts/gate-lock.sh\"\ngate_linux_env\n",
+        ),
+    ] {
+        assert!(
+            !sets_up_the_linux_environment_before(bad, step),
+            "the check accepted a script that {what}"
+        );
+    }
+
+    for (script, first_step) in GATE_ENTRY_POINTS {
+        let body = read(script);
+        assert!(
+            first_code_line(&body, first_step).is_some(),
+            "{script} no longer has the line `{first_step}`, so there is nothing to put \
+             gate_linux_env before. Name its new first step in GATE_ENTRY_POINTS"
+        );
+        assert!(
+            sets_up_the_linux_environment_before(&body, first_step),
+            "{script} must source scripts/gate-lock.sh and call gate_linux_env, on a line of \
+             its own, before `{first_step}`. Without it the target directory and TMPDIR are \
+             whatever the shell had (the tree, tmpfs) and `node` is whatever is on PATH"
+        );
+    }
+}
+
+/// Runs `scripts/memory-industry-test.sh e2e` with a stand-in `python3` and
+/// returns the `CUBA_BINARY_PATH` that every Python process of the E2E was
+/// handed. The stand-in is a bash function in the environment
+/// (`BASH_FUNC_python3%%`) and not a file: an executable written and launched
+/// in a test that runs beside others fails now and then with `Text file busy`,
+/// because a child forked by another thread holds the descriptor it was written
+/// through.
+fn e2e_binary_path(env: &[(&str, &str)]) -> String {
+    let mut cmd = std::process::Command::new(git_bash());
+    cmd.args(["scripts/memory-industry-test.sh", "e2e"])
+        .current_dir(repo_root())
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CUBA_BINARY_PATH")
+        .env(
+            "BASH_FUNC_python3%%",
+            "() { printf 'CUBA_BINARY_PATH=%s\\n' \"$CUBA_BINARY_PATH\"; }",
+        );
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "memory-industry-test.sh e2e exited {:?} with a stand-in python3.\nstdout: {stdout}\n\
+         stderr: {stderr}",
+        out.status.code()
+    );
+    let seen: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("CUBA_BINARY_PATH="))
+        .collect();
+    assert!(
+        !seen.is_empty() && seen.iter().all(|path| *path == seen[0]),
+        "the E2E has two Python processes and both have to be handed the same binary. They \
+         saw {seen:?}.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    seen[0].to_string()
+}
+
+/// `memory-industry-test.sh e2e` fixed the binary at `rust/target/release/...`
+/// whatever `CARGO_TARGET_DIR` said. On this machine the target lives outside
+/// the tree (`gate_linux_env`), so the E2E that this entry point launches would
+/// drive whatever stale build is left under `rust/target`, or find none. It has
+/// to ask the script that resolves it for the gate (`run-all-tests.sh
+/// --print-paths`) instead of keeping a second copy of the rule, and a
+/// `CUBA_BINARY_PATH` set by hand still wins.
+#[test]
+fn the_e2e_entry_point_resolves_the_binary_under_cargo_target_dir() {
+    let dir = std::env::temp_dir().join(format!("mi-e2e-target-{}", uuid::Uuid::new_v4()));
+    let release = dir.join("release");
+    std::fs::create_dir_all(&release).expect("create the scratch target");
+    let binary = release.join("memory-industry");
+    std::fs::write(&binary, "").expect("write the stand-in binary");
+    let target = dir.to_string_lossy().into_owned();
+    let expected = binary.to_string_lossy().into_owned();
+
+    let by_hand = "/nowhere/by-hand/memory-industry";
+    let kept = e2e_binary_path(&[
+        ("CARGO_TARGET_DIR", target.as_str()),
+        ("CUBA_BINARY_PATH", by_hand),
+    ]);
+    let found = e2e_binary_path(&[("CARGO_TARGET_DIR", target.as_str())]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        kept, by_hand,
+        "a CUBA_BINARY_PATH exported by hand has to reach the E2E as it is: the stand-in \
+         python3 is the anchor that proves what the script hands over is what is read here"
+    );
+    assert_eq!(
+        found, expected,
+        "with CARGO_TARGET_DIR={target} and a release binary there, the E2E was handed `{found}`. \
+         The entry point fixes rust/target/release/memory-industry, a directory the gate on this \
+         machine never builds into"
     );
 }

@@ -49,7 +49,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'echo "mutants caught=9 missed=1 timeout=0 unviable=0 kill_rate=0.900 min=0.800"' \
       >"$t/scripts/mutants-gate.sh"
     printf '#!/bin/sh\nexit 0\n' >"$t/bin/pg_isready"
-    printf '#!/bin/sh\nexit 0\n' >"$t/bin/node"
+    # gate_linux_env reads the version of node, and package.json says which one
+    # is the oldest the gate accepts.
+    printf '#!/bin/sh\necho v20.0.0\n' >"$t/bin/node"
+    printf '{"engines":{"node":">=18"}}\n' >"$t/package.json"
     # cargo fails the one subcommand named in FAIL_AT, and not its --version
     # probe, so the gate gets past "is cargo-deny installed" to the check.
     printf '%s\n' '#!/bin/sh' \
@@ -190,12 +193,96 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ -z "$(receipts_of reddened)" ]] \
     || self_fail "a red gate on $sha left the receipt of an earlier pass on it: $(receipts_of reddened)"
 
+  # gate_linux_env (gate-lock.sh): what a gate run on Linux hands to cargo, to the
+  # mutation tool and to node. Each row runs it in a fresh bash with an empty
+  # environment but HOME and a PATH of stand-ins, so every answer comes from the
+  # function. uname, stat and node are stand-ins whose output the row picks
+  # (FAKE_UNAME, FAKE_FS, FAKE_NODE); env/bare has the same without node.
+  mkdir -p "$tmp/env/scripts" "$tmp/env/bin" "$tmp/env/bare" "$tmp/env/home"
+  cp "$ROOT/scripts/gate-lock.sh" "$tmp/env/scripts/"
+  printf '{"engines":{"node":">=18"}}\n' >"$tmp/env/package.json"
+  printf '#!/bin/sh\necho "${FAKE_UNAME:-Linux}"\n' >"$tmp/env/bin/uname"
+  printf '#!/bin/sh\necho "${FAKE_FS:-ext2/ext3}"\n' >"$tmp/env/bin/stat"
+  printf '#!/bin/sh\necho "${FAKE_NODE:-v20.0.0}"\n' >"$tmp/env/bin/node"
+  chmod +x "$tmp"/env/bin/*
+  cp "$tmp/env/bin/uname" "$tmp/env/bin/stat" "$tmp/env/bare/"
+  for tool in dirname sed head mkdir; do
+    ln -s "$(command -v "$tool")" "$tmp/env/bare/$tool"
+  done
+  # env_run NAME [VAR=value ...]: $rc is the exit code of gate_linux_env, NAME.out
+  # what it printed and then the two variables it leaves behind.
+  env_run() {
+    local n="$1"
+    shift
+    rc=0
+    env -i HOME="$tmp/env/home" PATH="$tmp/env/bin:/usr/bin:/bin" "$@" "$BASH" -c \
+      'source "$1" && gate_linux_env && printf "CARGO_TARGET_DIR=%s\nTMPDIR=%s\n" "${CARGO_TARGET_DIR-unset}" "${TMPDIR-unset}"' \
+      _ "$tmp/env/scripts/gate-lock.sh" >"$tmp/$n.out" 2>&1 || rc=$?
+  }
+  env_var() { sed -n "s/^$2=//p" "$tmp/$1.out"; }
+
+  # The cargo target: left as it is when set, else absolute and outside the tree.
+  env_run target_default
+  (( rc == 0 )) || self_fail "gate_linux_env on Linux exited $rc: $(cat "$tmp/target_default.out")"
+  [[ "$(env_var target_default CARGO_TARGET_DIR)" == "$tmp/env/home/.cache/cargo-target/memory-industry" ]] \
+    || self_fail "with CARGO_TARGET_DIR unset the target was '$(env_var target_default CARGO_TARGET_DIR)', not under HOME/.cache/cargo-target"
+  env_run target_xdg XDG_CACHE_HOME="$tmp/env/xdg-target"
+  [[ "$(env_var target_xdg CARGO_TARGET_DIR)" == "$tmp/env/xdg-target/cargo-target/memory-industry" ]] \
+    || self_fail "with XDG_CACHE_HOME set the target was '$(env_var target_xdg CARGO_TARGET_DIR)', not under it"
+  env_run target_kept CARGO_TARGET_DIR="$tmp/env/mine"
+  [[ "$(env_var target_kept CARGO_TARGET_DIR)" == "$tmp/env/mine" ]] \
+    || self_fail "a CARGO_TARGET_DIR somebody set was changed to '$(env_var target_kept CARGO_TARGET_DIR)'"
+
+  # TMPDIR: off tmpfs, because on this machine tmpfs is RAM and the mutation tool
+  # copies the tree into it. Kept when set to something that is not tmpfs.
+  rm -rf "$tmp/env/home/.cache"
+  env_run tmp_default
+  [[ "$(env_var tmp_default TMPDIR)" == "$tmp/env/home/.cache/memory-industry-gate/tmp" ]] \
+    || self_fail "with TMPDIR unset it was '$(env_var tmp_default TMPDIR)', not under HOME/.cache/memory-industry-gate"
+  [[ -d "$tmp/env/home/.cache/memory-industry-gate/tmp" ]] \
+    || self_fail "gate_linux_env named a TMPDIR it never created"
+  env_run tmp_xdg XDG_CACHE_HOME="$tmp/env/xdg-tmp"
+  [[ "$(env_var tmp_xdg TMPDIR)" == "$tmp/env/xdg-tmp/memory-industry-gate/tmp" && -d "$tmp/env/xdg-tmp/memory-industry-gate/tmp" ]] \
+    || self_fail "with XDG_CACHE_HOME set TMPDIR was '$(env_var tmp_xdg TMPDIR)', not a directory under it"
+  mkdir -p "$tmp/env/disk" "$tmp/env/ram"
+  env_run tmp_disk TMPDIR="$tmp/env/disk" FAKE_FS=ext2/ext3
+  [[ "$(env_var tmp_disk TMPDIR)" == "$tmp/env/disk" ]] \
+    || self_fail "a TMPDIR on a disk was changed to '$(env_var tmp_disk TMPDIR)'"
+  env_run tmp_ram TMPDIR="$tmp/env/ram" FAKE_FS=tmpfs
+  [[ "$(env_var tmp_ram TMPDIR)" == "$tmp/env/home/.cache/memory-industry-gate/tmp" ]] \
+    || self_fail "a TMPDIR on tmpfs was left as '$(env_var tmp_ram TMPDIR)', which is RAM here"
+
+  # node: engines.node of package.json is the oldest accepted, and a gate that
+  # cannot say which node it ran with refuses with 2 and says how to fix it.
+  env_run node_edge FAKE_NODE=v18.0.0
+  (( rc == 0 )) || self_fail "node v18.0.0, the oldest engines.node allows, was refused (exit $rc): $(cat "$tmp/node_edge.out")"
+  env_run node_absent PATH="$tmp/env/bare"
+  (( rc == 2 )) || self_fail "gate_linux_env went on (exit $rc) with no node on PATH: $(cat "$tmp/node_absent.out")"
+  grep -q 'node' "$tmp/node_absent.out" && grep -q 'nvm use' "$tmp/node_absent.out" \
+    || self_fail "the refusal for a missing node did not say what is missing and how to fix it: $(cat "$tmp/node_absent.out")"
+  env_run node_old FAKE_NODE=v16.0.0
+  (( rc == 2 )) || self_fail "gate_linux_env went on (exit $rc) with node v16.0.0: $(cat "$tmp/node_old.out")"
+  grep -q 'v16.0.0' "$tmp/node_old.out" && grep -q '18' "$tmp/node_old.out" && grep -q 'nvm use' "$tmp/node_old.out" \
+    || self_fail "the refusal for an old node did not name its version, the one required and the fix: $(cat "$tmp/node_old.out")"
+  env_run node_garbage FAKE_NODE=nonsense
+  (( rc == 2 )) || self_fail "gate_linux_env went on (exit $rc) with a node whose version it cannot read: $(cat "$tmp/node_garbage.out")"
+
+  # Not Linux: it does nothing, not even ask for node.
+  env_run not_linux FAKE_UNAME=Darwin PATH="$tmp/env/bare"
+  (( rc == 0 )) || self_fail "gate_linux_env refused a machine that is not Linux (exit $rc): $(cat "$tmp/not_linux.out")"
+  [[ "$(env_var not_linux CARGO_TARGET_DIR)" == unset && "$(env_var not_linux TMPDIR)" == unset ]] \
+    || self_fail "gate_linux_env set variables on a machine that is not Linux: $(cat "$tmp/not_linux.out")"
+
   echo "OK  self-test: the exit file says running while a gate runs and holds the whole"
   echo "    gate's verdict at the end, a step after the tests included; a gate killed"
   echo "    in the middle leaves 'running', never an old 0; a refused gate leaves it alone."
   echo "    A green gate over a clean tree leaves a receipt for its commit; an untracked"
   echo "    file, a tree or HEAD that changed during the run and an exit 0 over SKIPPED"
-  echo "    leave none and say why; a red run on a commit removes its earlier receipt"
+  echo "    leave none and say why; a red run on a commit removes its earlier receipt."
+  echo "    gate_linux_env keeps a CARGO_TARGET_DIR that was set and otherwise puts it"
+  echo "    outside the tree, moves a TMPDIR that is unset or tmpfs under the cache, keeps"
+  echo "    one on a disk, refuses with 2 a node that is missing, older than engines.node"
+  echo "    or unreadable, and does nothing off Linux"
   exit 0
 fi
 

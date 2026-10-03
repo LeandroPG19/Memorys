@@ -317,13 +317,15 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '0\n' >"$tmp/home2/.cache/cuba-gate/run.exit"
   printf '#!/bin/sh\nexit 0\n' >"$tmp/bin/pg_isready"
   printf '#!/bin/sh\nexit 1\n' >"$tmp/bin/psql"
+  # merge-gate.sh asks for a node as new as package.json says before its first step.
+  printf '#!/bin/sh\necho v20.0.0\n' >"$tmp/bin/node"
   printf '%s\n' '#!/bin/sh' \
     'if [ -n "$CUBA_GATE_LOCK_OWNER" ] && [ "$(cat "$HOME/.cache/cuba-gate/lock/owner" 2>/dev/null)" = "$CUBA_GATE_LOCK_OWNER" ]; then' \
     '  echo "stand-in cargo: the lock is still the one merge-gate took"' \
     'fi' \
     'echo "stand-in cargo: run.exit reads: $(cat "$HOME/.cache/cuba-gate/run.exit" 2>/dev/null)"' \
     'exit 1' >"$tmp/bin/cargo"
-  chmod +x "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin/cargo"
+  chmod +x "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin/cargo" "$tmp/bin/node"
   held_exit=0
   env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home2" \
       PATH="$tmp/bin:/usr/bin:/bin" SKIP_BACKUP=1 \
@@ -369,7 +371,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # and fails.
   mkdir -p "$tmp/home4/.cache/cuba-gate" "$tmp/bin4"
   printf '0\n' >"$tmp/home4/.cache/cuba-gate/run.exit"
-  cp "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin4/"
+  cp "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin/node" "$tmp/bin4/"
   printf '%s\n' '#!/bin/sh' \
     'echo "$PPID" >"$HOME/child.pid"' \
     'kill -9 "$(printf "%s\n" "$CUBA_GATE_LOCK_OWNER" | sed -n "s/^pid=\([0-9]*\) .*/\1/p")"' \
