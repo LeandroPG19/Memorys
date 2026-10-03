@@ -1462,6 +1462,63 @@ pub(crate) mod cli_tests {
         ]
     }
 
+    /// Linux refuses to exec a file somebody still has open for writing
+    /// (`ETXTBSY`, os error 26). `fake_cli` closes its own write fd, but any
+    /// other test thread that forks in that window hands a copy of the fd to
+    /// its child until the child execs, so the script is not executable yet
+    /// when `fake_cli` returns. It fell on the SIL on 2026-10-03 as
+    /// `Text file busy` in the secret-on-stderr test and only under load, so
+    /// this one makes the load itself: threads that fork non-stop while the
+    /// test creates and execs scripts. Windows has no such rule.
+    #[cfg(unix)]
+    #[test]
+    fn a_fake_cli_is_executable_the_moment_fake_cli_returns_even_while_other_threads_fork() {
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const ETXTBSY: i32 = 26;
+        const ROUNDS: usize = 300;
+        const FORKERS: usize = 6;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let forkers: Vec<_> = (0..FORKERS)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        Command::new("/bin/sh")
+                            .args(["-c", ":"])
+                            .stdin(Stdio::null())
+                            .status()
+                            .ok();
+                    }
+                })
+            })
+            .collect();
+
+        // The result is collected first and asserted after the join, so a
+        // failing round does not leave the forking threads running.
+        let busy = (0..ROUNDS)
+            .filter(|_| {
+                let cli = fake_cli(&[], 0, 0);
+                let spawned = Command::new(cli.command()).stdin(Stdio::null()).status();
+                matches!(&spawned, Err(e) if e.raw_os_error() == Some(ETXTBSY))
+            })
+            .count();
+
+        stop.store(true, Ordering::Relaxed);
+        for forker in forkers {
+            forker.join().expect("a forking thread panicked");
+        }
+
+        assert_eq!(
+            busy, 0,
+            "{busy} of {ROUNDS} fake CLIs were not executable yet (ETXTBSY): another thread's fork \
+             still held the script's write fd when fake_cli returned"
+        );
+    }
+
     #[tokio::test]
     async fn a_cli_that_exits_with_an_error_says_why() {
         let cli = fake_cli(&["Invalid API key - please run /login"], 0, 3);
