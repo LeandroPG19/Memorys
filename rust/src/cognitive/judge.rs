@@ -1474,8 +1474,8 @@ pub(crate) mod cli_tests {
     #[test]
     fn a_fake_cli_is_executable_the_moment_fake_cli_returns_even_while_other_threads_fork() {
         use std::process::{Command, Stdio};
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         const ETXTBSY: i32 = 26;
         const ROUNDS: usize = 300;
