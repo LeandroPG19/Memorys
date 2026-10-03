@@ -13,7 +13,9 @@
 //! `rust/src/service/tests.rs`, because the gate runs `cargo mutants -- --lib`.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use memory_industry::resources::{self, Plan, Tier};
 use memory_industry::service::{self, Profile, Target, Unit};
@@ -176,6 +178,91 @@ fn first_difference(expected: &str, found: &str) -> String {
     )
 }
 
+// --- The process environment this file's tests are allowed to touch ----------
+
+/// Puts a variable back the way it was when the guard drops, panic or not.
+///
+/// Same shape as the guard in `v045_health_names_the_model_that_would_not_open.rs`
+/// and as `envs::ScopedEnv` in the library, which is `#[cfg(test)]` and so out of
+/// reach of an integration test.
+struct Env {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl Env {
+    fn set(name: &'static str, value: &Path) -> Self {
+        Self::swap(name, Some(value.as_os_str()))
+    }
+
+    fn cleared(name: &'static str) -> Self {
+        Self::swap(name, None)
+    }
+
+    fn swap(name: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+        Self { name, previous }
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+}
+
+/// The process environment is one per test binary and the harness runs tests on
+/// several threads, so two tests that edit it would see each other's values.
+/// Not `--test-threads=1`: a contract that only holds under a runner flag is not
+/// one.
+static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+/// What `Unit::from_env(.., Target::Windows, ..)` reads, pinned for one test.
+///
+/// `LOCALAPPDATA` only exists on a Windows host, and `from_env` reads it from
+/// the host to decide where to install, so a test that did not set it passed on
+/// the developer's Windows machine and failed on every Linux and macOS one. The
+/// four `chosen` variables are cleared for the opposite reason: they would be
+/// copied into the env file the test writes, and a `DATABASE_URL` from the
+/// developer's shell has no business in a scratch directory.
+///
+/// Field order matters: the variables are restored before the lock is released.
+struct HostEnv {
+    _variables: Vec<Env>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+fn own_the_environment(local_app_data: Option<&Path>) -> HostEnv {
+    let lock = ENV_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut variables = vec![
+        Env::cleared("DATABASE_URL"),
+        Env::cleared("CUBA_MODE"),
+        Env::cleared("ONNX_MODEL_PATH"),
+        Env::cleared("ORT_DYLIB_PATH"),
+    ];
+    variables.push(match local_app_data {
+        Some(dir) => Env::set("LOCALAPPDATA", dir),
+        None => Env::cleared("LOCALAPPDATA"),
+    });
+    HostEnv {
+        _variables: variables,
+        _lock: lock,
+    }
+}
+
 // --- 1 · The tree is what the binary renders --------------------------------
 
 #[test]
@@ -288,8 +375,20 @@ fn a_lan_profile_refuses_to_render_without_a_token() {
 
 #[test]
 fn the_windows_task_names_the_binary_that_exists() {
+    // Never created: `from_env` only joins it, and nothing is written there.
+    let local_app_data =
+        std::env::temp_dir().join(format!("mi-localappdata-{}", uuid::Uuid::new_v4()));
+    let _host = own_the_environment(Some(&local_app_data));
+
     let unit = Unit::from_env(Profile::Loopback, Target::Windows, None, None)
         .expect("a loopback windows render needs nothing from the operator");
+    assert!(
+        unit.env_file.starts_with(&local_app_data),
+        "the install root comes from LOCALAPPDATA, and {} is not under {}: the render read \
+         something other than the variable this test pinned",
+        unit.env_file.display(),
+        local_app_data.display()
+    );
 
     let root = std::env::temp_dir().join(format!("mi-packaging-{}", uuid::Uuid::new_v4()));
     let written =
@@ -343,6 +442,20 @@ fn the_windows_task_names_the_binary_that_exists() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_windows_render_without_localappdata_refuses_instead_of_guessing() {
+    let _host = own_the_environment(None);
+
+    let refused = Unit::from_env(Profile::Loopback, Target::Windows, None, None)
+        .expect_err("with no LOCALAPPDATA there is no known install root for Windows");
+    let said = refused.to_string();
+    assert!(
+        said.contains("LOCALAPPDATA"),
+        "the refusal has to name the variable, or the operator does not know what to define: \
+         {said}"
+    );
 }
 
 // --- 5 and 6 · packaging/ does not hide the defect again --------------------
