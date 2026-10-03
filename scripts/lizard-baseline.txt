@@ -25,10 +25,10 @@ src/cli.rs::run_search:69 15
 src/codegraph/mod.rs::walk:88 14
 src/codegraph/python_lang.rs::walk:27 11
 src/codegraph_cli.rs::run_cli:5 30
-src/cognitive/judge.rs::probe_health:548 9
-src/cognitive/judge.rs::resolve_judge:57 9
-src/cognitive/judge.rs::run_prompt:608 10
-src/cognitive/judge.rs::which_in_path:986 18
+src/cognitive/judge.rs::probe_health:553 9
+src/cognitive/judge.rs::resolve_judge:62 9
+src/cognitive/judge.rs::run_prompt:613 10
+src/cognitive/judge.rs::which_in_path:991 18
 src/cognitive/nli.rs::classify:294 14
 src/cognitive/nli.rs::init:164 16
 src/dashboard.rs::render:44 12
