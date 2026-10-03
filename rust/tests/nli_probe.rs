@@ -9,8 +9,9 @@ async fn probe() {
         "NLI model required by the local merge gate — install with cuba-memorys models nli"
     );
 
-    let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/cuba-memorys/models-nli");
+    let dir = nli::cache_model_dir().expect(
+        "the NLI model directory resolved by the product, the same one nli::available() just vouched for",
+    );
     let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
     let enc = tok
         .encode(

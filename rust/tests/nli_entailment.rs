@@ -7,7 +7,7 @@ fn require_nli_model() {
     assert!(
         nli::available() && nli::enabled(),
         "NLI model required by the local merge gate — missing CUBA_NLI_PATH / \
-         ~/.cache/cuba-memorys/models-nli. Install with `cuba-memorys models nli` \
+         ~/.cache/memory-industry/models-nli. Install with `cuba-memorys models nli` \
          (or `models all`). Soft-skip is forbidden."
     );
 }
