@@ -142,6 +142,9 @@ is_receipt_for() {
 release() {
   local dry_run="$1" rerun="$2" tag="$3" sha receipt msg
   cd "$ROOT"
+  # With no receipt, the gate below runs as a child of this script and takes the
+  # target, TMPDIR and node from here: launch this one inside `pesado` too.
+  gate_linux_env
   version_of_tag "$tag" >/dev/null
   check_the_tree "$tag"
   check_the_version "$tag"

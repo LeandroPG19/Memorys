@@ -594,6 +594,12 @@ PY
   exit 0
 fi
 
+# TMPDIR off tmpfs and the target outside the tree, before cargo mutants copies
+# anything: gate-lock.sh says why. After the self-test, which needs neither.
+# shellcheck source=scripts/gate-lock.sh
+source "$ROOT/scripts/gate-lock.sh"
+gate_linux_env
+
 # Before the diff, and whatever the diff holds: an exclusion expires by the
 # calendar, not because somebody touched the file it covers.
 echo "=== exclusions of the mutation step: expiry dates and patterns still in use ==="

@@ -59,6 +59,33 @@ Missing any of these is **FAIL**, never `SKIPPED`:
 - NLI + reranker
 - Generative LLM: `memory-industry llm set …` or `MEMORY_INDUSTRY_LLM_BASE_URL` or authenticated `claude`/`gemini` or MCP sampling
 - `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`, `cargo-audit`
+- `node` on `PATH`, at least the major in `engines.node` of `package.json` (see below)
+
+## Running the gate on Linux
+
+The gate was written and measured on Windows under Git Bash. On Linux (WSL2, ext4) it runs as it is, with the Windows branches of the scripts (`cygpath … ||` fallbacks, `tr -d '\r'`, `.exe` candidates, the `WindowsApps` filter) left in place and still held by `rust/tests/local_gate_contract.rs`. A heavy run takes the machine's single heavy-work slot and its memory cap from `pesado`:
+
+```bash
+pesado -m 36G -w 7200 -n memory-industry-juez -- bash ./scripts/merge-gate.sh
+```
+
+Do not nest `pesado` inside `pesado`: the inner one waits on the lock the outer one holds. Everything that is launched by one `pesado` is under its cap, which is why the three points below are not optional.
+
+**`gate_linux_env`** (`scripts/gate-lock.sh`) sets them up, and `merge-gate.sh`, `quality-gate.sh`, `mutants-gate.sh` and `release.sh` call it before their first step (`local_gate_contract.rs` holds each to it). On a machine that is not Linux it does nothing.
+
+- **The cargo target is outside the tree.** `CARGO_TARGET_DIR` stays as you set it; unset, it becomes `${XDG_CACHE_HOME:-$HOME/.cache}/cargo-target/memory-industry`, absolute. `cargo mutants` copies the tree it mutates into a scratch directory, and with a target inside `rust/` (`rust/target-sil`) it copied 27.5 GB and the baseline of the mutants failed on binaries of two builds mixed. `--gitignore=false` stays in `quality-gate.sh` because `eval-datasets` is git-ignored and the tests read it. The mutation scripts still `unset CARGO_TARGET_DIR` for the mutants themselves, so each scratch copy builds in its own `target/`.
+- **`TMPDIR` is on the disk, not on tmpfs.** `/tmp` is tmpfs here and tmpfs is RAM: it counts against the `pesado` memory cap, and the scratch copy of every mutant would live in it. A `TMPDIR` that is already set and is not tmpfs is kept; otherwise it becomes `${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/tmp`, created. The filesystem is read with `stat -f -c %T`, so `tmpfs` and `ramfs` are the two it refuses.
+- **`node` is required, not assumed.** The `npm wrapper smoke` step runs `node npm/install.test.js`, and the `node` on `PATH` is whichever nvm last selected. `gate_linux_env` reads the oldest major from `engines.node` in `package.json` (`>=18` is 18) and exits **2** when `node` is missing, older, or does not print a version, saying what is wrong and the fix (`nvm use 18`, or put a newer `node` first on `PATH`). It never goes on without it: the alternative is a red step forty minutes in that does not say why.
+
+**`release.sh` with no receipt** runs `merge-gate.sh` as its child, so launch it inside `pesado` as well, with the same cap:
+
+```bash
+pesado -m 36G -w 7200 -n memory-industry-release -- bash ./scripts/release.sh v0.28.0
+```
+
+With a receipt for `HEAD` it runs nothing heavy and does not need it.
+
+Every script that another script calls directly (`"$ROOT/scripts/mutants-gate.sh"`) has to be `100755` in the index: Windows creates `100644`, Git Bash does not mind, and Linux answers `Permission denied` at the first step. `every_gate_entry_point_is_executable_in_the_index` reads `git ls-files -s` and lists the ones that are not (`gate-lock.sh`, only ever sourced, is the one exception). `no_gate_script_points_into_a_windows_drive` keeps `/mnt/c/` and `/mnt/d/` out of `scripts/`.
 
 ## Isolation extras (0.26)
 

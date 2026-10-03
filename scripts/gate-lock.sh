@@ -294,3 +294,80 @@ gate_receipt_lines() {
   printf 'local-gate-summary: %s\n' "$GATE_KILL_LINE"
   printf 'local-gate-summary: %s\n' "$GATE_PASSED_LINE"
 }
+
+# --- the Linux environment of a gate run -------------------------------------
+# Written for Git Bash on Windows, this gate now runs on Linux (WSL2, ext4), and
+# three things that were true there are not true here:
+#
+#   the cargo target   `cargo mutants` copies the tree it mutates into a scratch
+#                      directory. With CARGO_TARGET_DIR inside rust/ (rust/target-sil)
+#                      it copied 27.5 GB, and the baseline of the mutants failed
+#                      from binaries of two builds mixed. So the target goes outside
+#                      the tree, in an absolute path.
+#   TMPDIR             /tmp is tmpfs here, and tmpfs counts as RAM against the
+#                      memory cap the gate runs under (`pesado -m`). The scratch
+#                      copy of every mutant would be RAM. TMPDIR goes to a directory
+#                      on the disk.
+#   node               `node npm/install.test.js` is a step of merge-gate.sh and the
+#                      one on PATH comes from nvm: whichever the shell last selected.
+#                      package.json says the oldest one the package supports.
+#
+# Whoever set CARGO_TARGET_DIR, or a TMPDIR that is not tmpfs, keeps it. A node that
+# is missing or too old is refused with exit 2 and the way to fix it; going on
+# would fail forty minutes later in a step that does not say why. Off Linux this
+# does nothing: the Windows branches of the scripts are still there for that.
+GATE_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+gate_refuse() {
+  printf 'FAIL: %s\n' "$1" >&2
+  exit 2
+}
+
+gate_is_ram_backed() {
+  case "$(stat -f -c %T "$1" 2>/dev/null || true)" in
+    tmpfs|ramfs) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+gate_target_dir_outside_the_tree() {
+  [[ -n "${CARGO_TARGET_DIR:-}" ]] && return 0
+  export CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cargo-target/memory-industry"
+}
+
+gate_tmpdir_on_disk() {
+  if [[ -n "${TMPDIR:-}" ]] && ! gate_is_ram_backed "$TMPDIR"; then
+    return 0
+  fi
+  export TMPDIR="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/tmp"
+  mkdir -p "$TMPDIR"
+}
+
+# The major of engines.node: ">=18" is 18. Empty when package.json does not say.
+gate_node_required() {
+  sed -n 's/.*"node"[[:space:]]*:[[:space:]]*">=[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    "$GATE_REPO_ROOT/package.json" 2>/dev/null | head -n 1 || true
+}
+
+gate_require_node() {
+  local need version major
+  need="$(gate_node_required)"
+  [[ "$need" =~ ^[0-9]+$ ]] \
+    || gate_refuse "cannot read engines.node (\">=N\") from $GATE_REPO_ROOT/package.json, so the oldest node the gate accepts is unknown."
+  command -v node >/dev/null 2>&1 \
+    || gate_refuse "node is not on PATH, and merge-gate.sh runs node npm/install.test.js. Put one >= $need first on PATH (nvm use $need, or export PATH=<dir of node>:\$PATH)."
+  version="$(node --version 2>/dev/null || true)"
+  major="${version#v}"
+  major="${major%%.*}"
+  [[ "$major" =~ ^[0-9]+$ ]] \
+    || gate_refuse "node --version printed '$version', which is not a version, so this run cannot say which node it uses (need >= $need): nvm use $need."
+  (( major >= need )) \
+    || gate_refuse "node $version is older than engines.node >=$need in package.json. nvm use $need, or put a newer node first on PATH."
+}
+
+gate_linux_env() {
+  [[ "$(uname -s)" == Linux ]] || return 0
+  gate_target_dir_outside_the_tree
+  gate_tmpdir_on_disk
+  gate_require_node
+}

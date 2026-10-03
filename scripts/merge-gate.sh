@@ -407,6 +407,7 @@ echo "                          (+ API key) OR MEMORY_INDUSTRY_LLM_BASE_URL=/v1"
 echo "                          (any OpenAI-compat: CN/US/EU clouds or Ollama)"
 echo "                          OR authenticated claude/gemini CLI OR MCP sampling"
 echo "  · cargo-deny, machete   install on the merge machine"
+echo "  · node                  >= engines.node of package.json, on PATH (nvm use)"
 echo ""
 echo "WHERE IT WRITES:"
 echo "  · every mutating step  a throwaway database (GATE_DB, default brain_gate),"
@@ -419,6 +420,12 @@ echo "                         run over a clean tree receipts/<sha> next to it,"
 echo "                         which scripts/release.sh tags from instead of"
 echo "                         running this gate a second time."
 echo ""
+
+# The cargo target and TMPDIR outside the tree and off tmpfs, and a node that
+# package.json accepts, before any step needs them (gate-lock.sh says why). It
+# runs after the lock so that a second gate is refused first, and a refusal here
+# is this gate's verdict: exit 2, in the exit file, with the lock released.
+gate_linux_env
 
 export DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
 if command -v pg_isready >/dev/null 2>&1; then

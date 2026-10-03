@@ -361,6 +361,13 @@ case "${1:-}" in
   *) echo "FAIL: unknown argument '$1'" >&2; exit 2 ;;
 esac
 
+# Where each mutant's scratch copy lands is TMPDIR, so it has to be a disk and not
+# tmpfs (RAM here) before the output directory below is named: gate-lock.sh says
+# why. The modes above judge a file and need neither.
+# shellcheck source=scripts/gate-lock.sh
+source "$ROOT/scripts/gate-lock.sh"
+gate_linux_env
+
 cd "$ROOT/rust"
 
 if ! command -v cargo-mutants >/dev/null 2>&1 && ! cargo mutants --version >/dev/null 2>&1; then

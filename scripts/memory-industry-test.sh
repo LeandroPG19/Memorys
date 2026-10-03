@@ -19,7 +19,13 @@ case "$CMD" in
     ;;
   e2e)
     cd "$ROOT/rust"
-    export CUBA_BINARY_PATH="${CUBA_BINARY_PATH:-$ROOT/rust/target/release/memory-industry}"
+    # The binary is where the gate looks for it (CARGO_TARGET_DIR, the .exe, the
+    # legacy name): run-all-tests.sh resolves it once and says so with --print-paths.
+    if [[ -z "${CUBA_BINARY_PATH:-}" ]]; then
+      resolved="$(bash "$ROOT/scripts/run-all-tests.sh" --print-paths)"
+      CUBA_BINARY_PATH="$(sed -n 's/^binary=//p' <<<"$resolved")"
+    fi
+    export CUBA_BINARY_PATH
     python3 tests/e2e_all_tools.py
     python3 "$ROOT/scripts/mcp_live_session_test.py"
     ;;
