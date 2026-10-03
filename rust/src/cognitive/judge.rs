@@ -1425,7 +1425,11 @@ pub(crate) mod cli_tests {
         };
         #[cfg(not(windows))]
         let (path, script) = {
-            let mut body = String::from("#!/bin/sh\ncat >/dev/null\n");
+            // The first line answers `settle_executable`'s probe and exits;
+            // the judges never pass that argument.
+            let mut body = String::from(
+                "#!/bin/sh\n[ \"$1\" = \"--fake-cli-settle\" ] && exit 0\ncat >/dev/null\n",
+            );
             for line in stderr {
                 body.push_str(&format!("printf '%s\\n' '{line}' >&2\n"));
             }
@@ -1441,8 +1445,39 @@ pub(crate) mod cli_tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("making the fake CLI executable");
+            settle_executable(&path);
         }
         FakeCli { path }
+    }
+
+    /// Linux refuses to exec a file that anybody still has open for writing
+    /// (`ETXTBSY`). `fake_cli` closes its own write fd, but a child forked by
+    /// another test thread in that window inherited a copy and keeps it until
+    /// it execs, so the script can be unrunnable for a few milliseconds after
+    /// `fake_cli` returns. That writer disappears by itself, so waiting a
+    /// bounded time is the whole fix. It belongs to this fixture, not to the
+    /// judges: production never execs a file it has just written.
+    #[cfg(unix)]
+    fn settle_executable(path: &std::path::Path) {
+        const ETXTBSY: i32 = 26;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::process::Command::new(path)
+                .arg("--fake-cli-settle")
+                .stdin(Stdio::null())
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {}
+                Err(e) => panic!("probing the fake CLI {}: {e}", path.display()),
+                Ok(_) => return,
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake CLI {} was still busy (ETXTBSY) after 5 s",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Both CLI judges, pointed at the same script. Each one launches the CLI
