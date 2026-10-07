@@ -414,8 +414,8 @@ pub fn active_provider() -> String {
 /// answer is where `models runtime` would put it; `runtime_has_gpu_provider`
 /// then finds nothing there, and a `None` — no home at all — reads the same.
 fn runtime_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
-        return PathBuf::from(p).parent().map(|p| p.to_path_buf());
+    if let Some(p) = crate::embeddings::onnx::explicit_runtime_path() {
+        return p.parent().map(|p| p.to_path_buf());
     }
     match crate::embeddings::onnx::locate_onnxruntime() {
         Some(runtime) => runtime.parent().map(|p| p.to_path_buf()),

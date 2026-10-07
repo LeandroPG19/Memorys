@@ -81,9 +81,22 @@ fn get_cache() -> &'static std::sync::Mutex<TtlLruCache<Vec<f32>>> {
     CACHE.get_or_init(|| std::sync::Mutex::new(TtlLruCache::new()))
 }
 
+/// The runtime path the operator set in `ORT_DYLIB_PATH`, or `None` when the
+/// variable is unset, empty or only spaces.
+///
+/// Empty is not a path: the env file `memory-industry setup service` renders
+/// carries `ORT_DYLIB_PATH=` as a placeholder and systemd's `EnvironmentFile`
+/// exports it empty, so the daemon saw an operator naming a file that is not
+/// there and never searched. Read the way `ONNX_MODEL_PATH` is in
+/// `resolve_model_dir`: trimmed, and blank means unset.
+pub(crate) fn explicit_runtime_path() -> Option<PathBuf> {
+    let value = std::env::var("ORT_DYLIB_PATH").ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
 pub(crate) fn locate_onnxruntime() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("ORT_DYLIB_PATH") {
-        let p = PathBuf::from(explicit);
+    if let Some(p) = explicit_runtime_path() {
         return p.exists().then_some(p);
     }
 
