@@ -1633,6 +1633,27 @@ pub(crate) mod cli_tests {
         }
     }
 
+    /// The message is what the operator reads in the log and in the note of
+    /// `auto_extract`: which CLI, that it was the clock, and how long the
+    /// clock was. A `fmt` that writes nothing leaves an empty error behind a
+    /// `downcast_ref` that still works, so the typed test above cannot see it.
+    #[test]
+    fn a_judge_timeout_says_which_cli_ran_out_of_how_long() {
+        let timeout = JudgeTimeout {
+            what: "claude CLI".to_string(),
+            after: Duration::from_millis(1500),
+        };
+
+        assert_eq!(format!("{timeout}"), "claude CLI timed out after 1.5s");
+
+        let wrapped = anyhow::Error::new(timeout).context("extraction failed");
+        let message = format!("{wrapped:#}");
+        assert!(
+            message.ends_with("claude CLI timed out after 1.5s"),
+            "the timeout is the cause at the end of the chain and must still say so: {message}"
+        );
+    }
+
     #[test]
     fn only_the_tail_of_a_long_stderr_is_kept() {
         let mut noisy = b"HEAD-MARKER ".to_vec();
