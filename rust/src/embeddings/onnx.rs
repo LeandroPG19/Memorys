@@ -1177,6 +1177,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An `ORT_DYLIB_PATH` that is empty or blank is the same as none: the
+    /// search goes on.
+    ///
+    /// `memory-industry setup service` renders `ORT_DYLIB_PATH=` into the
+    /// env file as a placeholder for the operator, and systemd's
+    /// `EnvironmentFile` exports it as an EMPTY variable, not an absent one.
+    /// The daemon on Linux read that as «the operator named a file, and it is
+    /// not there»: `locate_onnxruntime` answered `None` at once, never looked
+    /// in the cache, `LD_LIBRARY_PATH` or the system directories, and the
+    /// runtime was reported missing although it was installed.
+    /// `ONNX_MODEL_PATH` has the same placeholder and `resolve_model_dir`
+    /// already treats it as unset; this pins the same for the library.
+    ///
+    /// The control matters as much as the rest: a NON-empty path to a file
+    /// that is not there stays `None`, because that one is the operator's
+    /// word. A fix that merely ignored the variable would pass the first two
+    /// assertions and fail the third.
+    #[tokio::test]
+    async fn an_empty_ort_dylib_path_is_the_same_as_none_and_the_search_goes_on() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let lib = runtime_library_filename();
+        let root = scratch_root("ort-empty-explicit");
+        let installed = root
+            .join(".cache")
+            .join("memory-industry")
+            .join("onnxruntime");
+        std::fs::create_dir_all(&installed).expect("the test owns this directory");
+        let in_the_cache = installed.join(lib);
+        std::fs::write(&in_the_cache, b"not a real library").expect("temp dir is writable");
+
+        // The cache is the first candidate of the chain, so what answers is
+        // this fixture and not a runtime the host keeps in /usr/lib or in its
+        // own LD_LIBRARY_PATH.
+        let _h = ScopedEnv::set("HOME", &root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &root.display().to_string());
+        let _ld = ScopedEnv::cleared("LD_LIBRARY_PATH");
+
+        {
+            let _unset = ScopedEnv::cleared("ORT_DYLIB_PATH");
+            assert_eq!(
+                locate_onnxruntime().as_ref(),
+                Some(&in_the_cache),
+                "the fixture is broken: with the variable unset the search did not find the                  runtime installed under HOME, so the empty cases below measure nothing"
+            );
+        }
+        {
+            let _empty = ScopedEnv::set("ORT_DYLIB_PATH", "");
+            assert_eq!(
+                locate_onnxruntime().as_ref(),
+                Some(&in_the_cache),
+                "`ORT_DYLIB_PATH=` is what the generated env file leaves for the operator to                  fill in, and systemd exports it empty. An empty value names no file, so it                  has to mean «not set» and the search has to go on to the cache; answering                  None reports an installed runtime as missing"
+            );
+        }
+        {
+            let _blank = ScopedEnv::set("ORT_DYLIB_PATH", "   ");
+            assert_eq!(
+                locate_onnxruntime().as_ref(),
+                Some(&in_the_cache),
+                "a value of only spaces, left by an editor on that placeholder line, names no                  file either and reads as not set, the way an empty `ONNX_MODEL_PATH` does"
+            );
+        }
+        {
+            let missing = root.join("elsewhere").join(lib);
+            let _explicit = ScopedEnv::set("ORT_DYLIB_PATH", &missing.display().to_string());
+            assert_eq!(
+                locate_onnxruntime(),
+                None,
+                "control: a non-empty path to a file that is not there is the operator's                  word and does not fall back to the search. If this found the cache, the                  variable would be ignored altogether and a typo in it would load a runtime                  nobody chose"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// An empty runtime path is refused, with an error that says it is empty,
     /// before anything reaches `ort` — and in bounded time.
     ///

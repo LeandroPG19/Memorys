@@ -772,6 +772,65 @@ mod placement_tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// An empty `ORT_DYLIB_PATH` does not decide where the providers are
+    /// looked for.
+    ///
+    /// The env file `memory-industry setup service` writes carries
+    /// `ORT_DYLIB_PATH=` as a placeholder and systemd exports it empty. The
+    /// parent of an empty path is nothing, so `runtime_dir` answered `None`,
+    /// `runtime_has_gpu_provider` read that as «no runtime downloaded» and the
+    /// daemon reported no GPU provider on a machine that had one beside its
+    /// runtime. Empty or blank means unset, as `locate_onnxruntime` and
+    /// `ONNX_MODEL_PATH` already read it. A non-empty value is still the
+    /// operator's word: its parent directory, whether or not the file exists.
+    #[tokio::test]
+    async fn an_empty_ort_dylib_path_does_not_decide_where_the_gpu_provider_is_looked_for() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let home = scratch_root("runtime-dir-empty-explicit");
+        let _home = ScopedEnv::set("HOME", &home.display().to_string());
+        let _windows_home = ScopedEnv::set("USERPROFILE", &home.display().to_string());
+        let _no_ld = ScopedEnv::cleared("LD_LIBRARY_PATH");
+
+        let unset = {
+            let _no_override = ScopedEnv::cleared("ORT_DYLIB_PATH");
+            runtime_dir()
+        };
+        assert!(
+            unset.is_some(),
+            "the fixture is broken: with a home and the variable unset `runtime_dir` has to              name some directory, or the comparisons below would pass on two Nones"
+        );
+
+        {
+            let _empty = ScopedEnv::set("ORT_DYLIB_PATH", "");
+            assert_eq!(
+                runtime_dir(),
+                unset,
+                "`ORT_DYLIB_PATH=` comes out of the generated env file empty, and the parent                  of an empty path is nothing: the provider probe saw «no runtime» and the                  daemon said it had no GPU provider. Empty has to be read as unset"
+            );
+        }
+        {
+            let _blank = ScopedEnv::set("ORT_DYLIB_PATH", "   ");
+            assert_eq!(
+                runtime_dir(),
+                unset,
+                "a value of only spaces names no file and reads as unset too, the way an                  empty `ONNX_MODEL_PATH` does"
+            );
+        }
+        {
+            let beside_the_library = home.join("elsewhere");
+            let by_hand = beside_the_library.join("onnxruntime.dll");
+            let _explicit = ScopedEnv::set("ORT_DYLIB_PATH", &by_hand.display().to_string());
+            assert_eq!(
+                runtime_dir().as_ref(),
+                Some(&beside_the_library),
+                "control: a non-empty path is still the operator's word and its parent is                  where the providers are looked for. If this fell back to the search, the                  variable would be ignored altogether"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// The half its neighbour above cannot see.
     ///
     /// That test points HOME and USERPROFILE at the same directory, so it pins
