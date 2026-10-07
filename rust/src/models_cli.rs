@@ -1808,4 +1808,326 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn a_file_with_no_bytes_is_not_content_and_one_byte_is() {
+        let home = Home::new("has-content");
+        let empty = put(&home.root.join("empty.bin"), b"");
+        let one_byte = put(&home.root.join("one-byte.bin"), b"x");
+
+        assert!(
+            !has_content(&empty),
+            "an empty file is what a download that died right after creating it leaves; \
+             counting it as present skips the download and the loader then fails on it"
+        );
+        assert!(
+            has_content(&one_byte),
+            "one byte is already something to verify"
+        );
+        assert!(
+            !has_content(&home.root.join("missing.bin")),
+            "a file that is not there is not content"
+        );
+    }
+
+    /// The «delete the match arm» mutant on `usable_artifacts` survived because the
+    /// reranker case above has a usable graph in BOTH roots, and with the arm gone
+    /// that still resolves to the same step. Here the preferred leaf is the empty
+    /// one a failed download leaves, so only a directory known to be a model
+    /// directory can make the legacy copy win.
+    #[test]
+    fn every_model_directory_is_read_where_its_graph_is_not_where_it_was_made_first() {
+        let home = Home::new("migrate-model-dirs");
+        let new = &home.roots.preferred;
+        let names = ["models", "models-nli", "models-bge-m3", "reranker"];
+        for name in names {
+            home.preferred(&format!("{name}/model.onnx"), b"");
+            home.legacy(&format!("{name}/model.onnx"), b"graph");
+        }
+
+        let done = migrate_cache(&home.roots, true, STAMP).expect("the migration runs");
+
+        assert!(done.is_clean(), "{}", done.render());
+        for name in names {
+            assert_eq!(
+                read(&new.join(name).join("model.onnx")),
+                b"graph",
+                "{name}: the legacy copy holds the graph and the new leaf is empty, so it is \
+                 the one `models` reads today and it keeps the name"
+            );
+            assert_eq!(
+                read(&new.join(aside(name)).join("model.onnx")),
+                b"",
+                "{name}: the empty leaf is set aside, never deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn one_skipped_step_makes_the_run_unclean_and_the_render_names_it() {
+        let skipped = Migration {
+            preferred: PathBuf::from("/new"),
+            legacy: PathBuf::from("/old"),
+            steps: vec![Step::Move("a".into()), Step::Move("b".into())],
+            applied: true,
+            skipped: vec![None, Some(IN_USE.to_string())],
+            legacy_removed: false,
+        };
+        assert!(
+            !skipped.is_clean(),
+            "an entry left behind has to fail the run, or `cache migrate --apply` exits 0 \
+             over a runtime it could not move: {}",
+            skipped.render()
+        );
+        assert!(skipped.render().contains("✗"), "{}", skipped.render());
+
+        let moved = Migration {
+            skipped: vec![None, None],
+            ..skipped
+        };
+        assert!(moved.is_clean(), "{}", moved.render());
+    }
+
+    #[test]
+    fn a_legacy_root_that_cannot_be_read_is_an_error_and_one_that_is_absent_is_not() {
+        let home = Home::new("legacy-entries");
+        let not_a_directory = put(&home.root.join("not-a-directory"), b"x");
+
+        assert_eq!(
+            legacy_entries(&home.root.join("absent"))
+                .expect("an absent root has nothing to migrate"),
+            Vec::<String>::new()
+        );
+        let error = legacy_entries(&not_a_directory)
+            .expect_err("only «not found» means nothing to migrate: any other refusal is an error");
+        assert!(
+            format!("{error:#}").contains("leyendo"),
+            "the error names what was being read: {error:#}"
+        );
+    }
+
+    fn io_in_the_chain(source: std::io::Error) -> anyhow::Error {
+        anyhow::Error::new(source).context("moviendo a b")
+    }
+
+    #[test]
+    fn only_a_busy_file_is_in_use_and_the_windows_codes_count_only_on_windows() {
+        let busy = io_in_the_chain(std::io::Error::from(std::io::ErrorKind::ResourceBusy));
+        assert!(
+            in_use(&busy),
+            "a busy file is the one a daemon holds: {busy:#}"
+        );
+
+        let denied = io_in_the_chain(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(
+            !in_use(&denied),
+            "a refusal that is not «busy» must show its own cause, not tell the operator to \
+             stop a daemon that holds nothing: {denied:#}"
+        );
+        assert!(
+            !in_use(&anyhow::anyhow!("no io error anywhere in this chain")),
+            "no io error in the chain, nothing holds anything"
+        );
+
+        for code in [5, 32, 33] {
+            let held = io_in_the_chain(std::io::Error::from_raw_os_error(code));
+            assert_eq!(
+                in_use(&held),
+                cfg!(windows),
+                "os error {code} means a held file on Windows (sharing and lock violations) \
+                 and something else on Linux, where the same number is EIO, EPIPE or EDOM"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_entry_says_in_use_for_a_busy_file_and_gives_the_whole_cause_otherwise() {
+        let busy = io_in_the_chain(std::io::Error::from(std::io::ErrorKind::ResourceBusy));
+        assert_eq!(skip_reason(&busy), IN_USE);
+
+        let other =
+            anyhow::Error::new(std::io::Error::other("disk on fire")).context("apartando a como b");
+        assert_eq!(
+            skip_reason(&other),
+            "apartando a como b: disk on fire",
+            "the operator reads this line to find out why the entry stayed: the context and the \
+             cause, not an empty string and not the in-use hint"
+        );
+    }
+
+    /// Runs one test of this binary again as a child process and returns what it
+    /// printed. `println!` in the code under test goes to the real stdout only
+    /// with `--nocapture`, and a test cannot read its own: this is how a message
+    /// that exists only as output is checked at all.
+    fn rerun_printing(test: &str) -> String {
+        let (_crate_name, in_crate) = module_path!()
+            .split_once("::")
+            .expect("a module path starts with the crate");
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test binary knows where it lives"),
+        )
+        .arg(format!("{in_crate}::{test}"))
+        .args(["--exact", "--nocapture"])
+        .output()
+        .expect("the test binary runs again");
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success() && printed.contains("1 passed"),
+            "the child run of {test} did not pass exactly one test:\n{printed}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        printed
+    }
+
+    /// The child that `the_size_of_a_staged_model_is_reported_in_whole_megabytes`
+    /// reruns. It also stands on its own: a file a failed run left in staging,
+    /// with no registered checksum, is adopted without touching the network.
+    #[tokio::test]
+    async fn a_model_file_left_in_staging_is_adopted_and_its_size_reported() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = Home::new("staged-model");
+        let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
+        let spec = ModelSpec {
+            dir: "probe-model",
+            hf_repo: "probe/never-contacted",
+            files: &[("remote.bin", "weights.bin")],
+            env_hint: "PROBE_MODEL_PATH",
+        };
+        let staged = home
+            .roots
+            .preferred
+            .join("probe-model.downloading")
+            .join("weights.bin");
+        put(&staged, &vec![7u8; 3 * 1_048_576 + 5]);
+
+        download_model(&spec)
+            .await
+            .expect("a staged file with no registered checksum is adopted");
+
+        assert_eq!(
+            read(&home.roots.preferred.join("probe-model").join("weights.bin")).len(),
+            3 * 1_048_576 + 5,
+            "the staged file lands in the model directory"
+        );
+    }
+
+    #[test]
+    fn the_size_of_a_staged_model_is_reported_in_whole_megabytes() {
+        let printed =
+            rerun_printing("a_model_file_left_in_staging_is_adopted_and_its_size_reported");
+
+        assert!(
+            printed.lines().any(|line| line == "3 MB"),
+            "3 MiB plus 5 bytes is «3 MB»: dividing gives 3, a remainder would print 5 and a \
+             product a number with twelve digits:\n{printed}"
+        );
+    }
+
+    /// The child of `asking_for_the_cache_help_prints_it`.
+    #[test]
+    fn the_cache_help_flag_is_a_help_not_a_migration() {
+        run_cache_cli(&["--help".to_string()]).expect("asking for help is not an error");
+    }
+
+    #[test]
+    fn asking_for_the_cache_help_prints_it() {
+        let printed = rerun_printing("the_cache_help_flag_is_a_help_not_a_migration");
+
+        assert!(
+            printed.contains("memory-industry cache migrate [--apply]")
+                && printed.contains("una segunda corrida sobre una caché ya migrada"),
+            "`cache --help` that prints nothing leaves the operator with an exit 0 and no \
+             idea what the command does:\n{printed}"
+        );
+    }
+
+    /// An HTTPS proxy that accepts and hangs up. `download_to` builds its client
+    /// from the environment, so with this in place a download that is attempted
+    /// fails at once, on this machine, and the count says it was attempted.
+    struct DeadProxy {
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        listener: tokio::task::JoinHandle<()>,
+        _env: Vec<ScopedEnv>,
+    }
+
+    impl DeadProxy {
+        async fn start() -> Self {
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("an ephemeral loopback port is free");
+            let url = format!("http://{}", socket.local_addr().expect("it is bound"));
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = hits.clone();
+            let listener = tokio::spawn(async move {
+                while let Ok((stream, _)) = socket.accept().await {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+            let mut env: Vec<ScopedEnv> = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+                .iter()
+                .map(|name| ScopedEnv::set(name, &url))
+                .collect();
+            env.extend(
+                ["NO_PROXY", "no_proxy"]
+                    .iter()
+                    .map(|name| ScopedEnv::cleared(name)),
+            );
+            Self {
+                hits,
+                listener,
+                _env: env,
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for DeadProxy {
+        fn drop(&mut self) {
+            self.listener.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_runtime_is_downloaded_unless_a_cpu_one_is_there_and_gpu_was_not_asked() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = Home::new("runtime-present");
+        let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
+        let proxy = DeadProxy::start().await;
+        let (_, _, lib_name) = runtime_target(false).expect("a supported platform");
+
+        let nothing_there = download_runtime(false).await;
+        let attempted = proxy.hits();
+        assert!(
+            nothing_there.is_err() && attempted >= 1,
+            "no runtime in the cache means a download is attempted ({attempted} requests); \
+             returning «ya está» over an empty cache leaves the install without a runtime: \
+             {nothing_there:?}"
+        );
+
+        put(
+            &home.roots.preferred.join("onnxruntime").join(lib_name),
+            b"runtime",
+        );
+        download_runtime(false)
+            .await
+            .expect("a CPU runtime that is already there is not downloaded again");
+        assert_eq!(
+            proxy.hits(),
+            attempted,
+            "a runtime that is already there makes no request at all"
+        );
+
+        let gpu = download_runtime(true).await;
+        assert!(
+            gpu.is_err() && proxy.hits() > attempted,
+            "`runtime --gpu` over a CPU runtime exists to fetch the GPU build: a CPU library \
+             in the directory must not answer for it: {gpu:?}"
+        );
+    }
 }
