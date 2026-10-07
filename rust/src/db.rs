@@ -38,7 +38,12 @@ pub async fn provision_app_role(pool: &PgPool, role: &str, password: &str) {
         return;
     }
 
-    match retry_on_catalog_race(|| Box::pin(write_app_role_password(pool, role, password))).await {
+    match retry_on_catalog_race(
+        || Box::pin(write_app_role_password(pool, role, password)),
+        tokio::time::sleep,
+    )
+    .await
+    {
         Ok(()) => tracing::info!(role, "application role provisioned"),
         Err(why) => {
             tracing::warn!(error = %why, "could not set the application role password")
@@ -148,9 +153,9 @@ fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let group = chunk.iter().enumerate().fold(0u32, |group, (i, &b)| {
-            group | (u32::from(b) << (16 - 8 * i))
-        });
+        let mut padded = [0u8; 4];
+        padded[1..=chunk.len()].copy_from_slice(chunk);
+        let group = u32::from_be_bytes(padded);
         for i in 0..4 {
             if i <= chunk.len() {
                 out.push(char::from(
@@ -425,7 +430,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
 /// is_concurrent_catalog_update). Out of init_schema so that function keeps
 /// its baseline CC: lizard counts a closure's `||` as a branch.
 async fn migrate_and_provision(pool: &PgPool) -> Result<()> {
-    retry_on_catalog_race(|| Box::pin(migrate(pool)))
+    retry_on_catalog_race(|| Box::pin(migrate(pool)), tokio::time::sleep)
         .await
         .context("failed to run sqlx migrations")?;
 
@@ -599,11 +604,19 @@ const CATALOG_RACE_ATTEMPTS: u32 = 5;
 /// applies it from the start. write_app_role_password is one transaction too.
 ///
 /// Each attempt comes boxed and Send so that create_pool's future stays Send.
-async fn retry_on_catalog_race<'a, T, E>(
+///
+/// `sleep` is the wait between attempts, handed in so that a test counts the
+/// waits instead of sitting through them: with the real clock, a mutant that
+/// makes this loop endless or its wait enormous cannot fail a test, it can
+/// only hang the whole run until the mutation judge's timeout.
+async fn retry_on_catalog_race<'a, T, E, S, W>(
     mut attempt: impl FnMut() -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>,
+    mut sleep: S,
 ) -> Result<T, E>
 where
     E: std::error::Error + 'static,
+    S: FnMut(Duration) -> W,
+    W: Future<Output = ()>,
 {
     let mut tried = 1;
     loop {
@@ -619,7 +632,7 @@ where
                     error = %error,
                     "lost a race for a catalog row the whole server shares; trying again"
                 );
-                tokio::time::sleep(wait).await;
+                sleep(wait).await;
                 tried += 1;
             }
             outcome => return outcome,
@@ -894,33 +907,72 @@ mod tests {
         );
     }
 
+    /// More calls than the retry can make in any honest run (it makes five).
+    /// Past this the attempt panics, so that a mutant which makes the loop
+    /// endless fails the test where it stands instead of running until the
+    /// mutation judge's timeout.
+    const RUNAWAY_CALLS: u32 = 50;
+
     /// Runs the retry over an attempt that fails with `error(n)` on its first
     /// `failures` calls and then answers with the call number, and counts the
-    /// calls: what init_schema hands it, without a server.
+    /// calls and the waits between them: what init_schema hands it, without a
+    /// server and without sitting through a wait. The waits are only recorded,
+    /// so a wait of any size costs nothing here.
     async fn retried_after(
         failures: u32,
         error: fn(u32) -> sqlx::Error,
-    ) -> (Result<u32, sqlx::Error>, u32) {
+    ) -> (Result<u32, sqlx::Error>, u32, Vec<Duration>) {
         let mut calls = 0;
-        let outcome = retry_on_catalog_race(|| {
-            calls += 1;
-            let call = calls;
-            Box::pin(async move {
-                if call <= failures {
-                    Err(error(call))
-                } else {
-                    Ok(call)
-                }
-            })
-        })
+        let mut waits = Vec::new();
+        let outcome = retry_on_catalog_race(
+            || {
+                calls += 1;
+                let call = calls;
+                assert!(
+                    call <= RUNAWAY_CALLS,
+                    "the retry made {call} calls: it does not stop at {CATALOG_RACE_ATTEMPTS}"
+                );
+                Box::pin(async move {
+                    if call <= failures {
+                        Err(error(call))
+                    } else {
+                        Ok(call)
+                    }
+                })
+            },
+            |wait| {
+                waits.push(wait);
+                std::future::ready(())
+            },
+        )
         .await;
-        (outcome, calls)
+        (outcome, calls, waits)
+    }
+
+    /// Retry n waits in the upper half of a ceiling of 100, 200, 400 and then
+    /// 400 ms, whatever the random number drew.
+    fn assert_waits_follow_the_schedule(waits: &[Duration]) {
+        const WINDOWS_MS: [(u128, u128); 4] = [(50, 100), (100, 200), (200, 400), (200, 400)];
+        for (index, wait) in waits.iter().enumerate() {
+            let (shortest, longest) = *WINDOWS_MS.get(index).unwrap_or_else(|| {
+                panic!(
+                    "a wait number {} that the schedule has no row for",
+                    index + 1
+                )
+            });
+            let ms = wait.as_millis();
+            assert!(
+                (shortest..=longest).contains(&ms),
+                "wait before retry {} was {wait:?}, outside {shortest}..={longest} ms",
+                index + 1
+            );
+        }
     }
 
     #[tokio::test]
     async fn a_catalog_race_that_clears_before_the_fifth_attempt_is_retried_until_it_passes() {
         for failures in [1, 4] {
-            let (outcome, calls) = retried_after(failures, catalog_race_on).await;
+            let (outcome, calls, waits) = retried_after(failures, catalog_race_on).await;
             let answered_on = outcome.unwrap_or_else(|e| {
                 panic!("{failures} catalog races and then success came out as an error: {e}")
             });
@@ -931,13 +983,25 @@ mod tests {
                  after it",
                 failures + 1
             );
+            assert_eq!(
+                waits.len(),
+                failures as usize,
+                "one wait after each race and none after the attempt that passed: {waits:?}"
+            );
+            assert_waits_follow_the_schedule(&waits);
         }
     }
 
     #[tokio::test]
     async fn a_catalog_race_on_every_attempt_gives_up_after_five_with_the_last_error() {
-        let (outcome, calls) = retried_after(u32::MAX, catalog_race_on).await;
+        let (outcome, calls, waits) = retried_after(u32::MAX, catalog_race_on).await;
         assert_eq!(calls, 5, "five attempts in all, then the error goes out");
+        assert_eq!(
+            waits.len(),
+            4,
+            "a wait between attempts, so four for five, and none after the last one: {waits:?}"
+        );
+        assert_waits_follow_the_schedule(&waits);
         let error = outcome.expect_err("every attempt raced, so the run cannot come back Ok");
         assert_eq!(
             attempt_of(&error),
@@ -951,10 +1015,14 @@ mod tests {
         fn not_a_race(_: u32) -> sqlx::Error {
             sqlx::Error::PoolTimedOut
         }
-        let (outcome, calls) = retried_after(u32::MAX, not_a_race).await;
+        let (outcome, calls, waits) = retried_after(u32::MAX, not_a_race).await;
         assert_eq!(
             calls, 1,
             "an error that is not the catalog race is not retried"
+        );
+        assert!(
+            waits.is_empty(),
+            "an error that is not the catalog race is not waited out either: {waits:?}"
         );
         assert!(
             matches!(outcome, Err(sqlx::Error::PoolTimedOut)),
@@ -1326,6 +1394,39 @@ mod tests {
                 expected,
                 "PBKDF2-HMAC-SHA-256 with a password of {} bytes and {iterations} iterations",
                 password.len()
+            );
+        }
+    }
+
+    // RFC 4648 §10 test vectors, which cover a last chunk of 0, 1, 2 and 3
+    // bytes (no padding, `==`, `=`, none), and three more from the alphabet's
+    // ends: 0x00 is `A`, 0xff gives `/w`, and 0xfb 0xef 0xbe is four sextets
+    // of 62, the `+`. The expected strings were computed with Python's base64,
+    // not with the function under test. base64 packs a chunk's bytes into the
+    // low 24 bits of a u32 with from_be_bytes and not with a fold of `|`: the
+    // shifted bytes never share a bit, so `|` to `^` was a mutant no test could
+    // kill (OR and XOR give the same group), and this form has no operator to
+    // swap.
+    #[test]
+    fn base64_matches_the_vectors_of_rfc_4648() {
+        let rows: [(&[u8], &str); 10] = [
+            (b"" as &[u8], ""),
+            (b"f" as &[u8], "Zg=="),
+            (b"fo" as &[u8], "Zm8="),
+            (b"foo" as &[u8], "Zm9v"),
+            (b"foob" as &[u8], "Zm9vYg=="),
+            (b"fooba" as &[u8], "Zm9vYmE="),
+            (b"foobar" as &[u8], "Zm9vYmFy"),
+            (&[0x00_u8] as &[u8], "AA=="),
+            (&[0xff_u8] as &[u8], "/w=="),
+            (&[0xfb_u8, 0xef, 0xbe] as &[u8], "++++"),
+        ];
+        for (bytes, expected) in rows {
+            assert_eq!(
+                base64(bytes),
+                expected,
+                "Base64 of {} bytes, {bytes:02x?}",
+                bytes.len()
             );
         }
     }
