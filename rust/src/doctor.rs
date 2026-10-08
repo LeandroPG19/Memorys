@@ -6,7 +6,11 @@ use sqlx::{PgPool, Row};
 use crate::embeddings::onnx;
 use crate::service_apply::env_value;
 
-const EXPECTED_TABLES: i64 = 24;
+/// `brain%` tables in a freshly migrated database: 36 through 0064 and the four of 0065
+/// (`brain_host_identity`, `brain_accounts`, `brain_account_credentials`,
+/// `brain_pairing_codes`), counted by applying every `*.up.sql` in order to an empty database
+/// and asking `information_schema.tables` the same question the schema check asks.
+const EXPECTED_TABLES: i64 = 40;
 
 const REQUIRED_EXTENSIONS: [&str; 2] = ["vector", "pg_trgm"];
 
@@ -768,6 +772,80 @@ async fn resolve_reranker(load_it: bool) -> (bool, bool, Option<String>) {
     )
 }
 
+/// What doctor says about accounts, judged only from `facts`. Nothing in `facts` is a secret, a
+/// hash or a code, so nothing printed here can be one: doctor output is pasted into issues.
+pub fn account_checks(facts: &crate::accounts_db::AccountFacts) -> Vec<Check> {
+    vec![account_verdict(facts)]
+}
+
+fn account_verdict(f: &crate::accounts_db::AccountFacts) -> Check {
+    if !f.tables_present {
+        return Check::fail(
+            "accounts",
+            "0065 sin aplicar: faltan las tablas de cuentas",
+            "arrancá el servidor una vez para que migre la base",
+        );
+    }
+    let counts = format!(
+        "{} cuentas, {} credenciales activas, {} revocadas · huella {}",
+        f.accounts, f.active_credentials, f.revoked_credentials, f.fingerprint
+    );
+    if f.require_accounts {
+        return required_verdict(f, counts);
+    }
+    if f.accounts == 0 {
+        return Check::ok(
+            "accounts",
+            format!("sin cuentas: el token compartido sigue siendo la única puerta · {counts}"),
+        );
+    }
+    if f.shared_token && f.lan_bind {
+        return Check::warn(
+            "accounts",
+            counts,
+            "el token compartido sigue abriendo esta dirección y no se puede revocar por dispositivo: cuando todos estén emparejados, poné MEMORY_INDUSTRY_REQUIRE_ACCOUNTS=1",
+        );
+    }
+    Check::ok("accounts", counts)
+}
+
+fn required_verdict(f: &crate::accounts_db::AccountFacts, counts: String) -> Check {
+    if f.active_credentials == 0 {
+        return Check::fail(
+            "accounts",
+            format!(
+                "nadie puede entrar: el token compartido está rechazado y no hay credenciales activas · {counts}"
+            ),
+            "emparejá un dispositivo (`memory-industry account pair <nombre>`) o quitá MEMORY_INDUSTRY_REQUIRE_ACCOUNTS",
+        );
+    }
+    Check::ok("accounts", counts)
+}
+
+/// The database facts plus the three that belong to this process, as `serve` would judge them.
+async fn accounts_report(pool: &PgPool) -> Vec<Check> {
+    let mut facts = match crate::accounts_db::account_facts(pool).await {
+        Ok(facts) => facts,
+        Err(e) => {
+            return vec![Check::warn(
+                "accounts",
+                format!("no se pudo leer: {e:#}"),
+                "revisar permisos",
+            )];
+        }
+    };
+    let loopback = crate::http::bind_addr()
+        .parse::<std::net::SocketAddr>()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(true);
+    let knob = std::env::var("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS").ok();
+    facts.require_accounts =
+        crate::accounts::require_accounts_effective(loopback, knob.as_deref()).0;
+    facts.shared_token = std::env::var("CUBA_HTTP_TOKEN").is_ok_and(|t| !t.is_empty());
+    facts.lan_bind = !loopback;
+    account_checks(&facts)
+}
+
 pub async fn run_checks(pool: &PgPool, url: &str) -> Vec<Check> {
     run_checks_with(pool, url, false).await
 }
@@ -914,6 +992,8 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
             "revisar permisos",
         )),
     }
+
+    checks.extend(accounts_report(pool).await);
 
     match sqlx::query("SELECT count(*)::bigint FROM pg_proc WHERE proname='cuba_or_tsquery'")
         .fetch_one(pool)
@@ -2649,5 +2729,253 @@ mod service_tests {
             tail.ends_with('é') && tail.len() <= 8,
             "the cut has to be tolerated (lossy), not turned into «no log»: {tail:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    use crate::accounts_db::AccountFacts;
+
+    const FINGERPRINT: &str = "5F3A-91C2-77D0-AB14";
+
+    /// Distinct, multi-digit counts, so a detail that prints the wrong field (or none) cannot
+    /// pass by containing a "1" that was already in the sentence.
+    fn facts() -> AccountFacts {
+        AccountFacts {
+            tables_present: true,
+            accounts: 17,
+            active_credentials: 23,
+            revoked_credentials: 41,
+            fingerprint: FINGERPRINT.to_string(),
+            require_accounts: false,
+            shared_token: false,
+            lan_bind: false,
+        }
+    }
+
+    fn the_accounts_check(facts: &AccountFacts) -> Check {
+        let mut checks = account_checks(facts);
+        let named: Vec<usize> = checks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.name == "accounts")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            named.len(),
+            1,
+            "account_checks has to report one check named `accounts` for {facts:?}; doctor's \
+             output is read by name and by exit status, and a verdict that is absent or \
+             repeated is read as no verdict. It produced {checks:?}"
+        );
+        checks.swap_remove(named[0])
+    }
+
+    fn everything_printed(check: &Check) -> String {
+        format!(
+            "{} {} {}",
+            check.name,
+            check.detail,
+            check.hint.clone().unwrap_or_default()
+        )
+    }
+
+    fn has_a_run_of_hex(text: &str, run: usize) -> bool {
+        let mut length = 0;
+        for c in text.chars() {
+            length = if c.is_ascii_hexdigit() { length + 1 } else { 0 };
+            if length >= run {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn a_database_without_the_tables_is_a_failure_that_names_the_migration() {
+        let check = the_accounts_check(&AccountFacts {
+            tables_present: false,
+            accounts: 0,
+            ..facts()
+        });
+        assert_eq!(
+            check.status,
+            Status::Fail,
+            "a daemon whose database never got migration 0065 cannot admit a single account \
+             credential, and the shared-token path would hide that until the first pairing"
+        );
+        assert!(
+            check.detail.contains("0065 sin aplicar"),
+            "the detail has to name the migration the operator must apply: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn with_no_accounts_the_shared_token_is_said_to_be_the_only_door() {
+        let check = the_accounts_check(&AccountFacts {
+            accounts: 0,
+            active_credentials: 0,
+            revoked_credentials: 0,
+            shared_token: true,
+            lan_bind: true,
+            ..facts()
+        });
+        assert_eq!(
+            check.status,
+            Status::Ok,
+            "nothing is wrong with a host that has not created an account yet, even on a LAN \
+             bind: the warning is for a host that HAS accounts and still lets the shared token in"
+        );
+        assert!(
+            check
+                .detail
+                .contains("sin cuentas: el token compartido sigue siendo la única puerta"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains(FINGERPRINT),
+            "the fingerprint is what the operator reads to a client who is pairing: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn accounts_beside_a_shared_token_on_a_lan_bind_warn_and_name_the_knob() {
+        let check = the_accounts_check(&AccountFacts {
+            shared_token: true,
+            lan_bind: true,
+            require_accounts: false,
+            ..facts()
+        });
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "every account can be revoked on its own, but the shared token still opens the same \
+             graph and cannot be, so a LAN host with accounts and no knob has a door it cannot \
+             close per device"
+        );
+        let said = everything_printed(&check);
+        assert!(
+            said.contains("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS=1"),
+            "the warning is useless unless it names the switch that closes the door: {said}"
+        );
+    }
+
+    #[test]
+    fn the_warning_is_only_for_a_lan_bind_with_a_shared_token_to_close() {
+        for (shared_token, lan_bind, why) in [
+            (
+                true,
+                false,
+                "loopback: the shared token is the only way in there and the knob does nothing",
+            ),
+            (
+                false,
+                true,
+                "no shared token configured: there is no second door to close",
+            ),
+            (false, false, "neither"),
+        ] {
+            let check = the_accounts_check(&AccountFacts {
+                shared_token,
+                lan_bind,
+                ..facts()
+            });
+            assert_eq!(check.status, Status::Ok, "{why}: {}", check.detail);
+        }
+    }
+
+    #[test]
+    fn the_knob_on_with_no_active_credentials_fails_because_nobody_can_get_in() {
+        let check = the_accounts_check(&AccountFacts {
+            require_accounts: true,
+            shared_token: true,
+            lan_bind: true,
+            active_credentials: 0,
+            ..facts()
+        });
+        assert_eq!(
+            check.status,
+            Status::Fail,
+            "with the knob on the shared token is refused, so with no active credential the \
+             only way in is the peer token: that is a host locked out by its own setting, not a \
+             warning"
+        );
+        assert!(
+            everything_printed(&check).contains("nadie puede entrar"),
+            "{}",
+            everything_printed(&check)
+        );
+    }
+
+    #[test]
+    fn the_knob_on_with_active_credentials_is_healthy() {
+        let check = the_accounts_check(&AccountFacts {
+            require_accounts: true,
+            shared_token: true,
+            lan_bind: true,
+            ..facts()
+        });
+        assert_eq!(
+            check.status,
+            Status::Ok,
+            "the configuration the knob exists for must not be reported as a problem: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn every_verdict_carries_the_fingerprint_and_the_counts_and_never_a_secret() {
+        let cases = [
+            facts(),
+            AccountFacts {
+                shared_token: true,
+                lan_bind: true,
+                ..facts()
+            },
+            AccountFacts {
+                require_accounts: true,
+                shared_token: true,
+                lan_bind: true,
+                ..facts()
+            },
+            AccountFacts {
+                require_accounts: true,
+                shared_token: true,
+                lan_bind: true,
+                active_credentials: 0,
+                ..facts()
+            },
+        ];
+        for case in cases {
+            let check = the_accounts_check(&case);
+            let said = everything_printed(&check);
+            for needed in [FINGERPRINT, "17", "41"] {
+                assert!(
+                    check.detail.contains(needed),
+                    "the detail has to carry {needed:?} (fingerprint and counts) for {case:?}: {}",
+                    check.detail
+                );
+            }
+            if case.active_credentials > 0 {
+                assert!(
+                    check.detail.contains("23"),
+                    "and the active credentials: {}",
+                    check.detail
+                );
+            }
+            assert!(
+                !said.contains("mi1."),
+                "doctor output is pasted into issues and chats; a credential prefix means a \
+                 credential was printed: {said}"
+            );
+            assert!(
+                !has_a_run_of_hex(&said, 64),
+                "64 hex characters is a secret hash or a credential secret: {said}"
+            );
+        }
     }
 }

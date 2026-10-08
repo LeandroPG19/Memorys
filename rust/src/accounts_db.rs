@@ -130,6 +130,21 @@ async fn audit(pool: &PgPool, action: &str, payload: Value) -> Result<()> {
     Ok(())
 }
 
+/// Leaves `account.pair_redeemed` in the audit chain: who, and from which device, never a secret,
+/// a hash or the code.
+pub async fn record_pair_redeemed(pool: &PgPool, credential: &NewCredential) -> Result<()> {
+    audit(
+        pool,
+        "account.pair_redeemed",
+        json!({
+            "account": credential.account,
+            "device": credential.device_label,
+            "actor": "pair",
+        }),
+    )
+    .await
+}
+
 pub async fn host_identity(pool: &PgPool) -> Result<HostIdentity> {
     let (host_id, created_at): (Uuid, DateTime<Utc>) =
         sqlx::query_as("SELECT host_id, created_at FROM brain_host_identity")
@@ -602,4 +617,63 @@ pub async fn purge_pairing_codes(pool: &PgPool, now: DateTime<Utc>) -> Result<u6
             .await?
             .rows_affected();
     Ok(purged)
+}
+
+/// What `doctor` reports about accounts. The first five fields come from the database
+/// (`account_facts`); the next three are about this process and are filled in by `doctor`.
+///
+/// `accounts` counts accounts that are not revoked. `active_credentials` counts credentials that
+/// are neither revoked themselves nor belong to a revoked account; `revoked_credentials` counts
+/// the rest, so a revoked account's devices show up as revoked. No field holds a secret, a hash
+/// or a code.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountFacts {
+    pub tables_present: bool,
+    pub accounts: i64,
+    pub active_credentials: i64,
+    pub revoked_credentials: i64,
+    pub fingerprint: String,
+    pub require_accounts: bool,
+    pub shared_token: bool,
+    pub lan_bind: bool,
+}
+
+const ACCOUNT_TABLES: [&str; 4] = [
+    "brain_host_identity",
+    "brain_accounts",
+    "brain_account_credentials",
+    "brain_pairing_codes",
+];
+
+/// The database half of `AccountFacts`; a database without migration 0065 answers
+/// `tables_present: false`, not an error.
+pub async fn account_facts(pool: &PgPool) -> Result<AccountFacts> {
+    let present: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_name::text = ANY($1)",
+    )
+    .bind(&ACCOUNT_TABLES[..])
+    .fetch_one(pool)
+    .await
+    .context("looking for the account tables")?;
+    if present < ACCOUNT_TABLES.len() as i64 {
+        return Ok(AccountFacts::default());
+    }
+    let (accounts, active, revoked): (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM brain_accounts WHERE revoked_at IS NULL),
+                count(*) FILTER (WHERE c.revoked_at IS NULL AND a.revoked_at IS NULL),
+                count(*) FILTER (WHERE c.revoked_at IS NOT NULL OR a.revoked_at IS NOT NULL)
+           FROM brain_account_credentials c JOIN brain_accounts a ON a.id = c.account_id",
+    )
+    .fetch_one(pool)
+    .await
+    .context("counting accounts and credentials")?;
+    Ok(AccountFacts {
+        tables_present: true,
+        accounts,
+        active_credentials: active,
+        revoked_credentials: revoked,
+        fingerprint: accounts::fingerprint(&host_identity(pool).await?.host_id),
+        ..AccountFacts::default()
+    })
 }

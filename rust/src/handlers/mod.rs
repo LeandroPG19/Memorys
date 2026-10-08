@@ -167,18 +167,27 @@ pub async fn dispatch(pool: &PgPool, tool_name: &str, args: Value) -> Result<Val
         "error"
     };
     crate::observability::record_handler(tool_name, outcome, elapsed.as_secs_f64());
-    tracing::info!(tool = %tool_name, elapsed_ms = %elapsed_ms, outcome = %outcome, "handler completed");
+    let account = crate::session::current_account();
+    tracing::info!(
+        tool = %tool_name,
+        elapsed_ms = %elapsed_ms,
+        outcome = %outcome,
+        account = account.as_ref().map(|a| a.name.as_str()),
+        device = account.as_ref().map(|a| a.device.as_str()),
+        "handler completed"
+    );
 
     if let Err(why) = &dispatch_result {
         let redacted = crate::redact::redact_secrets(&format!("{why:#}"));
         let recorded = sqlx::query(
-            "INSERT INTO brain_handler_failures (tool, client, error, elapsed_ms)
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO brain_handler_failures (tool, client, error, elapsed_ms, account)
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(tool_name)
         .bind(crate::session::current_client())
         .bind(&redacted)
         .bind(elapsed_ms.min(i32::MAX as u128) as i32)
+        .bind(account.map(|a| a.name))
         .execute(pool)
         .await;
         if let Err(e) = recorded {
