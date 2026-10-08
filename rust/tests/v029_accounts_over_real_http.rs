@@ -2044,6 +2044,10 @@ async fn g16_the_schema_check_counts_the_account_tables() {
 // G17 · no tool for accounts
 // =============================================================================================
 
+// The catalogue had 29 tools before this release (cuba_docs, behind its own feature, left out) and
+// still has 29. Measured by listing the `tool_def(` names inside `tool_definitions` in
+// `rust/src/constants.rs` at the v0.28.0 tag and at this tree: 30 names each, the same 30,
+// one of them `cuba_docs`. The spec's 31 counted something else.
 #[test]
 fn g17_the_tool_catalogue_has_no_account_or_pairing_tool() {
     let names: Vec<String> = memory_industry::constants::tool_definitions()
@@ -2055,7 +2059,7 @@ fn g17_the_tool_catalogue_has_no_account_or_pairing_tool() {
 
     assert_eq!(
         names.len(),
-        31,
+        29,
         "accounts are administered from the host's CLI and nowhere else (S-3): a tool would be \
          175 tokens in every model's context for every user, and a way for a compromised agent \
          to mint credentials. Tools: {names:?}"

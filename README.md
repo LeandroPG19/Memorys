@@ -321,7 +321,7 @@ Named after Cuban culture. `cuba-memorys` advertises all of them, or set `CUBA_T
 | Variable | Default | What it does |
 |---|---|---|
 | `CUBA_MODE` | `local` | `local` / `red` (shared cloud DB) / `completo` (everything + GPU). A preset for the rest. |
-| `CUBA_NODE_NAME` | `$HOSTNAME` / `$COMPUTERNAME` | A human-readable label for this machine, written into `origin_node`. The fallback is `$HOSTNAME`, which a shell does not export to child processes, so on Linux `origin_node` stays empty unless you set this. It is **not** this installation's identity: that is a uuid generated in its own database, because two machines can easily choose the same name |
+| `CUBA_NODE_NAME` | `$HOSTNAME` / `$COMPUTERNAME` | A human-readable label for this machine, written into `origin_node` and shown by `GET /identity` to a client that is pairing. The fallback is `$HOSTNAME`, which a shell does not export to child processes, so on Linux `origin_node` stays empty unless you set this. It is **not** this installation's identity: that is a uuid generated in its own database, because two machines can easily choose the same name |
 | `DATABASE_URL` | auto (Docker) | PostgreSQL connection. Set it (external + TLS) for `red` mode. |
 | `ONNX_MODEL_PATH` + `ORT_DYLIB_PATH` | auto (`~/.cache`) | Semantic embeddings. `cuba-memorys models` sets these up for you. |
 | `RUST_LOG` | `cuba_memorys=info` | Log level, read by `tracing`'s `EnvFilter`. Logs go to **stderr** — on stdio transport, stdout is the JSON-RPC channel and anything else printed there breaks the client. `cuba_memorys=debug` for per-handler detail, `sqlx=debug` to see every query. |

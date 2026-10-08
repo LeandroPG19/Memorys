@@ -22,6 +22,7 @@ tokio::task_local! {
     static CLIENT_LABEL: String;
     static MCP_SESSION: String;
     static SCOPE: Scope;
+    static ACCOUNT: AccountRef;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,17 +46,20 @@ pub struct AccountRef {
     pub device: String,
 }
 
-// PASS-1 STUB: `with_account` runs the future with no account bound and `current_account` never
-// finds one. Pass 2 puts the reference in a task-local next to SCOPE.
-pub async fn with_account<F, R>(_account: Option<AccountRef>, fut: F) -> R
+/// Runs `fut` with `account` bound, or with none when the caller is the shared token. Requests do
+/// not nest, so `None` simply leaves the binding absent.
+pub async fn with_account<F, R>(account: Option<AccountRef>, fut: F) -> R
 where
     F: std::future::Future<Output = R>,
 {
-    fut.await
+    match account {
+        Some(account) => ACCOUNT.scope(account, fut).await,
+        None => fut.await,
+    }
 }
 
 pub fn current_account() -> Option<AccountRef> {
-    None
+    ACCOUNT.try_with(Clone::clone).ok()
 }
 
 pub fn current_scope() -> Scope {

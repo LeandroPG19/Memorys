@@ -12,8 +12,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::FutureExt;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use uuid::Uuid;
 
+use crate::accounts::{self, BearerClass, PairRequest, PairResponse};
+use crate::accounts_db::{self, CandidateState, ClaimOutcome, CredentialState, PairingCandidate};
 use crate::protocol::{self, JsonRpcRequest};
 use crate::session::Scope;
 
@@ -52,39 +56,92 @@ struct AppState {
     resource_tier: &'static str,
     /// MEMORY_INDUSTRY_REQUIRE_ACCOUNTS as `require_accounts_effective` judged it for the
     /// address this daemon bound: on only for a non-loopback bind.
-    // PASS-1 STUB: nothing reads this yet; `admit` will.
-    #[allow(dead_code)]
     require_accounts: bool,
-    /// What `/identity` and `/pair` say about this host.
-    // PASS-1 STUB: nothing reads this yet.
-    #[allow(dead_code)]
+    /// What `/identity` says about this host, read once when the daemon starts.
     host: Arc<HostInfo>,
 }
 
 /// The failed-credential counter per address, shared by `/mcp`, `/pair` and every route that
-/// admits a bearer. One type so `pair_core` borrows the very counter `admit` writes.
-// PASS-1 STUB: the alias is the seam the tests are written against (they age an entry by
-// inserting an earlier `Instant`); pass 2 may wrap it as long as the tests keep compiling.
+/// admits a bearer. One type so `pair_core` borrows the very counter `admit` writes; the tests age
+/// an entry by inserting an earlier `Instant`.
 pub type Brake =
     Arc<std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, (u32, Instant)>>>;
 
-/// What this daemon tells a stranger about itself: its installation id and a label.
-// PASS-1 STUB: filled with placeholders by `serve_pool`; pass 2 reads `brain_host_identity`
-// and `CUBA_NODE_NAME` / `HOSTNAME` / `COMPUTERNAME` once at boot.
+/// What this daemon tells a stranger about itself: its installation id and a label. A nil
+/// `host_id` means the database could not be read at start; `/identity` asks again then.
 #[derive(Debug, Clone)]
 pub(crate) struct HostInfo {
-    #[allow(dead_code)]
-    pub(crate) host_id: uuid::Uuid,
-    #[allow(dead_code)]
+    pub(crate) host_id: Uuid,
     pub(crate) name: String,
+}
+
+/// The human label of this machine: `CUBA_NODE_NAME`, else `HOSTNAME`, else `COMPUTERNAME`, else
+/// nothing. A blank value is no value.
+fn host_label() -> String {
+    ["CUBA_NODE_NAME", "HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
+/// How long the daemon waits for its identity row before it starts without it.
+const HOST_IDENTITY_BUDGET: Duration = Duration::from_secs(2);
+
+async fn host_info(pool: &PgPool) -> HostInfo {
+    let read = tokio::time::timeout(HOST_IDENTITY_BUDGET, accounts_db::host_identity(pool)).await;
+    let host_id = match read {
+        Ok(Ok(identity)) => identity.host_id,
+        Ok(Err(why)) => {
+            tracing::warn!(error = %format!("{why:#}"), "could not read the host identity; /identity will ask again");
+            Uuid::nil()
+        }
+        Err(_) => {
+            tracing::warn!("the host identity did not answer in time; /identity will ask again");
+            Uuid::nil()
+        }
+    };
+    HostInfo {
+        host_id,
+        name: host_label(),
+    }
+}
+
+/// The knob as it applies to the address this daemon bound; says so when it is ignored.
+fn require_accounts_for(addr: &SocketAddr) -> bool {
+    let raw = std::env::var("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS").ok();
+    let (on, ignored) =
+        accounts::require_accounts_effective(addr.ip().is_loopback(), raw.as_deref());
+    if let Some(warning) = ignored {
+        tracing::warn!("{warning}");
+    }
+    on
 }
 
 /// Who a request was admitted as.
 #[derive(Debug)]
 pub(crate) struct Admitted {
     pub(crate) scope: Scope,
-    #[allow(dead_code)]
     pub(crate) account: Option<crate::session::AccountRef>,
+    credential: Option<Uuid>,
+}
+
+impl Admitted {
+    fn of(scope: Scope) -> Self {
+        Self {
+            scope,
+            account: None,
+            credential: None,
+        }
+    }
+}
+
+/// Why a bearer did not get in. Only `Wrong` counts toward the brake.
+enum Rejection {
+    Wrong,
+    Policy,
+    Unavailable,
 }
 
 pub fn bind_addr() -> String {
@@ -241,6 +298,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
     }
 
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let host = Arc::new(host_info(&pool).await);
     let state = AppState {
         pool,
         token: auth_token().map(Arc::new),
@@ -255,19 +313,8 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         resource_tier: crate::resources::plan(&crate::resources::probe())
             .tier
             .as_str(),
-        // PASS-1 STUB: the knob is read, but the warning for a loopback bind is not logged yet.
-        require_accounts: crate::accounts::require_accounts_effective(
-            addr.ip().is_loopback(),
-            std::env::var("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS")
-                .ok()
-                .as_deref(),
-        )
-        .0,
-        // PASS-1 STUB: placeholder identity.
-        host: Arc::new(HostInfo {
-            host_id: uuid::Uuid::nil(),
-            name: String::new(),
-        }),
+        require_accounts: require_accounts_for(&addr),
+        host,
     };
 
     let reaper_seen = state.seen.clone();
@@ -285,7 +332,9 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         .route("/health", get(health))
         .route("/", get(connect_page))
         .route("/connect", get(connect_page))
-        .route("/events/ticket", post(events_ticket));
+        .route("/events/ticket", post(events_ticket))
+        .route("/identity", get(identity))
+        .route("/pair", post(pair));
     if panel_route_enabled(
         addr.ip().is_loopback(),
         panel_enabled(),
@@ -660,12 +709,16 @@ fn same_secret(presented: &str, expected: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn authorized(state: &AppState, headers: &HeaderMap) -> Option<Scope> {
-    let presented = headers
+fn presented_bearer(headers: &HeaderMap) -> &str {
+    headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
+        .unwrap_or("")
+}
+
+fn authorized(state: &AppState, headers: &HeaderMap) -> Option<Scope> {
+    let presented = presented_bearer(headers);
 
     if let Some(peer) = state.peer_token.as_ref()
         && same_secret(presented, peer)
@@ -877,40 +930,58 @@ struct EventsQuery {
     ticket: Option<String>,
 }
 
-fn authorized_events(state: &AppState, headers: &HeaderMap, query: &EventsQuery) -> bool {
-    if state.token.is_none() {
-        return true;
-    }
-    if authorized(state, headers).is_some() {
-        return true;
-    }
-    if let Some(ticket) = query
+/// `/events` is opened by a minted ticket or by any bearer `admit` accepts, in the header or, for
+/// a browser that cannot set one, in the query string.
+// The Err is the HTTP response to send, built once on the refusal path; boxing it would only add
+// an allocation there.
+#[allow(clippy::result_large_err)]
+async fn admit_events(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &EventsQuery,
+    peer: SocketAddr,
+) -> Result<(), Response> {
+    let ticket_is_good = query
         .ticket
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        && crate::events::ticket_valid(ticket)
-    {
-        return true;
+        .is_some_and(crate::events::ticket_valid);
+    if state.token.is_none() || ticket_is_good {
+        return Ok(());
     }
-    let Some(expected) = state.token.as_deref() else {
-        return true;
-    };
-    let presented = query
+    admit(state, &with_query_token(headers, query), peer)
+        .await
+        .map(|_| ())
+}
+
+/// The headers, plus an `Authorization` built from `?token=` when there is none of its own.
+fn with_query_token(headers: &HeaderMap, query: &EventsQuery) -> HeaderMap {
+    let mut merged = headers.clone();
+    let from_query = query
         .token
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty());
-    matches!(presented, Some(p) if same_secret(p, expected))
+        .filter(|s| !s.is_empty())
+        .and_then(|t| axum::http::HeaderValue::from_str(&format!("Bearer {t}")).ok());
+    if let Some(value) = from_query
+        && !merged.contains_key("authorization")
+    {
+        merged.insert("authorization", value);
+    }
+    merged
 }
 
 async fn events_ticket(
     State(state): State<AppState>,
-    axum::extract::ConnectInfo(_peer): axum::extract::ConnectInfo<SocketAddr>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    match authorized(&state, &headers) {
-        Some(Scope::Full) => {
+    match admit(&state, &headers, peer)
+        .await
+        .map(|admitted| admitted.scope)
+    {
+        Ok(Scope::Full) => {
             let ticket = crate::events::issue_ticket();
             (
                 StatusCode::OK,
@@ -922,7 +993,7 @@ async fn events_ticket(
             )
                 .into_response()
         }
-        Some(Scope::Peer) => (
+        Ok(Scope::Peer) => (
             StatusCode::FORBIDDEN,
             axum::Json(error_envelope(
                 Value::Null,
@@ -931,26 +1002,18 @@ async fn events_ticket(
             )),
         )
             .into_response(),
-        None => (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(error_envelope(Value::Null, -32001, "invalid bearer token")),
-        )
-            .into_response(),
+        Err(refusal) => refusal,
     }
 }
 
 async fn events_sse(
     State(state): State<AppState>,
-    axum::extract::ConnectInfo(_peer): axum::extract::ConnectInfo<SocketAddr>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<EventsQuery>,
 ) -> Response {
-    if !authorized_events(&state, &headers, &query) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(error_envelope(Value::Null, -32001, "invalid bearer token")),
-        )
-            .into_response();
+    if let Err(refusal) = admit_events(&state, &headers, &query, peer).await {
+        return refusal;
     }
 
     let rx = crate::events::subscribe();
@@ -1166,27 +1229,134 @@ fn window_still_open(elapsed: std::time::Duration) -> bool {
     elapsed < AUTH_FAILURE_WINDOW
 }
 
-fn brake_for(state: &AppState, who: std::net::IpAddr) -> Option<std::time::Duration> {
-    let (failures, since) = state.auth_failures.read().ok()?.get(&who).copied()?;
+fn brake_wait(brake: &Brake, who: std::net::IpAddr) -> Option<std::time::Duration> {
+    let (failures, since) = brake.read().ok()?.get(&who).copied()?;
     auth_brake(failures, since.elapsed())
 }
 
-fn record_auth_failure(state: &AppState, who: std::net::IpAddr) {
-    if let Ok(mut failures) = state.auth_failures.write() {
+fn note_failure(brake: &Brake, who: std::net::IpAddr) {
+    if let Ok(mut failures) = brake.write() {
         let updated = next_failure(failures.get(&who).copied());
         failures.insert(who, updated);
     }
 }
 
-fn clear_auth_failures(state: &AppState, who: std::net::IpAddr) {
-    if let Ok(mut failures) = state.auth_failures.write() {
+fn clear_failures(brake: &Brake, who: std::net::IpAddr) {
+    if let Ok(mut failures) = brake.write() {
         failures.remove(&who);
     }
 }
 
-/// Who this request is, or the response that refuses it.
-// PASS-1 STUB: today's behaviour only (brake, then peer / shared token). Pass 2 adds the
-// account credential, the REQUIRE_ACCOUNTS refusal and the 503 for an unreachable database.
+fn brake_for(state: &AppState, who: std::net::IpAddr) -> Option<std::time::Duration> {
+    brake_wait(&state.auth_failures, who)
+}
+
+fn record_auth_failure(state: &AppState, who: std::net::IpAddr) {
+    note_failure(&state.auth_failures, who);
+}
+
+fn clear_auth_failures(state: &AppState, who: std::net::IpAddr) {
+    clear_failures(&state.auth_failures, who);
+}
+
+/// The bearer's class, judged against what this daemon is configured with. With no shared token
+/// the daemon is open (it can only be bound to loopback) except for the peer token's reduced
+/// scope, exactly as before accounts existed.
+fn classify_request(state: &AppState, headers: &HeaderMap, require_accounts: bool) -> BearerClass {
+    let Some(shared) = state.token.as_ref() else {
+        return match authorized(state, headers) {
+            Some(Scope::Peer) => BearerClass::Peer,
+            _ => BearerClass::NoAuthConfigured,
+        };
+    };
+    accounts::classify_bearer(
+        presented_bearer(headers),
+        Some(shared.as_str()),
+        state.peer_token.as_ref().map(|t| t.as_str()),
+        require_accounts,
+    )
+}
+
+/// Who a request is, with nothing counted and nothing written: `/health` asks this too, and a
+/// monitor with a stale token must not push its address toward the brake.
+async fn identify(
+    state: &AppState,
+    headers: &HeaderMap,
+    require_accounts: bool,
+) -> Result<Admitted, Rejection> {
+    match classify_request(state, headers, require_accounts) {
+        BearerClass::Account { id, secret } => identify_account(&state.pool, id, &secret).await,
+        BearerClass::SharedRefusedByPolicy => Err(Rejection::Policy),
+        BearerClass::Unrecognized => Err(Rejection::Wrong),
+        BearerClass::Peer => Ok(Admitted::of(Scope::Peer)),
+        BearerClass::Shared | BearerClass::NoAuthConfigured => Ok(Admitted::of(Scope::Full)),
+    }
+}
+
+/// One query by primary key per request and no cache: a revocation made by the CLI, in another
+/// process, has to bite on the very next request.
+async fn identify_account(
+    pool: &PgPool,
+    id: Uuid,
+    secret: &[u8; 32],
+) -> Result<Admitted, Rejection> {
+    let row = match accounts_db::credential_for_auth(pool, id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err(Rejection::Wrong),
+        Err(why) => {
+            tracing::warn!(error = %format!("{why:#}"), "could not verify an account credential");
+            return Err(Rejection::Unavailable);
+        }
+    };
+    let presented: [u8; 32] = Sha256::digest(secret).into();
+    if row.state != CredentialState::Active || !accounts::ct_eq(&presented, &row.secret_hash) {
+        return Err(Rejection::Wrong);
+    }
+    Ok(Admitted {
+        scope: Scope::Full,
+        account: Some(crate::session::AccountRef {
+            name: row.account,
+            device: row.device_label,
+        }),
+        credential: Some(id),
+    })
+}
+
+fn too_many_failures(wait: Duration) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("retry-after", wait.as_secs().max(1).to_string())],
+        axum::Json(error_envelope(
+            Value::Null,
+            -32001,
+            "demasiados tokens inválidos desde esta dirección",
+        )),
+    )
+        .into_response()
+}
+
+fn refusal_for(state: &AppState, who: std::net::IpAddr, why: Rejection) -> Response {
+    let (status, message) = match why {
+        Rejection::Policy => (StatusCode::UNAUTHORIZED, accounts::REQUIRE_ACCOUNTS_REFUSAL),
+        Rejection::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cannot verify account credentials: the database is unreachable",
+        ),
+        Rejection::Wrong => {
+            record_auth_failure(state, who);
+            (StatusCode::UNAUTHORIZED, "invalid bearer token")
+        }
+    };
+    (
+        status,
+        axum::Json(error_envelope(Value::Null, -32001, message)),
+    )
+        .into_response()
+}
+
+/// Who this request is, or the response that refuses it. The brake is asked first; a wrong
+/// bearer counts against the address, a refusal by policy or an unreachable database does not,
+/// and a good one clears it.
 #[allow(clippy::result_large_err)]
 async fn admit(
     state: &AppState,
@@ -1195,30 +1365,19 @@ async fn admit(
 ) -> Result<Admitted, Response> {
     let who = peer.ip();
     if let Some(wait) = brake_for(state, who) {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            [("retry-after", wait.as_secs().max(1).to_string())],
-            axum::Json(error_envelope(
-                Value::Null,
-                -32001,
-                "demasiados tokens inválidos desde esta dirección",
-            )),
-        )
-            .into_response());
+        return Err(too_many_failures(wait));
     }
-    let Some(scope) = authorized(state, headers) else {
-        record_auth_failure(state, who);
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            axum::Json(error_envelope(Value::Null, -32001, "invalid bearer token")),
-        )
-            .into_response());
-    };
+    let admitted = identify(state, headers, state.require_accounts)
+        .await
+        .map_err(|why| refusal_for(state, who, why))?;
     clear_auth_failures(state, who);
-    Ok(Admitted {
-        scope,
-        account: None,
-    })
+    if let Some(credential) = admitted.credential {
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            let _ = accounts_db::touch_last_seen(&pool, credential, chrono::Utc::now()).await;
+        });
+    }
+    Ok(admitted)
 }
 
 /// Why a pairing request was refused. Logged; never sent: the body outside is the same.
@@ -1232,23 +1391,294 @@ pub enum Reason {
 
 #[derive(Debug)]
 pub enum PairOutcome {
-    Ok(crate::accounts::PairResponse),
-    Replayed(crate::accounts::PairResponse),
+    Ok(PairResponse),
+    Replayed(PairResponse),
     Refused(Reason),
     Braked(Duration),
     Malformed,
+    Unavailable,
+}
+
+/// A pairing request with every field decoded and checked for shape.
+struct ParsedPair {
+    nonce: [u8; 16],
+    hash: [u8; 32],
+    label: String,
+    mac: String,
+}
+
+impl ParsedPair {
+    fn from_request(req: &PairRequest) -> Option<Self> {
+        accounts::lower_hex::<32>(&req.mac)?;
+        Some(Self {
+            nonce: accounts::lower_hex::<16>(&req.nc)?,
+            hash: accounts::lower_hex::<32>(&req.h)?,
+            label: accounts::validate_device_label(&req.label).ok()?,
+            mac: req.mac.clone(),
+        })
+    }
+}
+
+/// The stored code the request's MAC was made with, if any. Trying each candidate is how the
+/// host learns which code was used without the client ever sending it.
+fn find_matching_candidate<'a>(
+    candidates: &'a [PairingCandidate],
+    p: &ParsedPair,
+) -> Option<&'a PairingCandidate> {
+    candidates.iter().find(|c| {
+        let expected = accounts::pair_request_mac(&c.code_key, &p.nonce, &p.label, &p.hash);
+        accounts::verify_mac(expected, &p.mac)
+    })
+}
+
+/// The host's signed answer: the proof, before the client stores anything, that whoever replied
+/// knows the code.
+async fn pair_answer(
+    pool: &PgPool,
+    p: &ParsedPair,
+    candidate: &PairingCandidate,
+    credential: &accounts_db::NewCredential,
+) -> Option<PairResponse> {
+    let host_id = accounts_db::host_identity(pool).await.ok()?.host_id;
+    let host_name = host_label();
+    let mac = accounts::pair_response_mac(
+        &candidate.code_key,
+        &p.nonce,
+        &p.hash,
+        &host_id,
+        &credential.credential_id,
+        &credential.account,
+        &credential.device_label,
+        &host_name,
+    );
+    Some(PairResponse {
+        v: 1,
+        host_id,
+        host_name,
+        credential_id: credential.credential_id,
+        account: credential.account.clone(),
+        label: credential.device_label.clone(),
+        mac: hex::encode(mac),
+    })
+}
+
+async fn claim_and_answer(
+    pool: &PgPool,
+    p: &ParsedPair,
+    candidate: &PairingCandidate,
+    now: chrono::DateTime<chrono::Utc>,
+) -> PairOutcome {
+    let claimed = accounts_db::claim_pairing_code(pool, candidate, &p.label, p.hash, now).await;
+    let (credential, created) = match claimed {
+        Ok(ClaimOutcome::Created(credential)) => (credential, true),
+        Ok(ClaimOutcome::Replayed(credential)) => (credential, false),
+        Ok(ClaimOutcome::Refused) => return PairOutcome::Refused(Reason::Used),
+        Err(_) => return PairOutcome::Unavailable,
+    };
+    let Some(response) = pair_answer(pool, p, candidate, &credential).await else {
+        return PairOutcome::Unavailable;
+    };
+    if !created {
+        return PairOutcome::Replayed(response);
+    }
+    if let Err(why) = accounts_db::record_pair_redeemed(pool, &credential).await {
+        tracing::warn!(error = %format!("{why:#}"), "a device was paired but the audit chain refused the event");
+    }
+    PairOutcome::Ok(response)
+}
+
+async fn redeem(pool: &PgPool, p: &ParsedPair, now: chrono::DateTime<chrono::Utc>) -> PairOutcome {
+    let Ok(candidates) = accounts_db::pairing_candidates(pool, now).await else {
+        return PairOutcome::Unavailable;
+    };
+    let Some(candidate) = find_matching_candidate(&candidates, p) else {
+        return PairOutcome::Refused(Reason::UnknownOrBadMac);
+    };
+    match accounts_db::classify_candidate(candidate, now) {
+        CandidateState::Expired => PairOutcome::Refused(Reason::Expired),
+        CandidateState::AccountRevoked => PairOutcome::Refused(Reason::AccountRevoked),
+        CandidateState::Used | CandidateState::Redeemable => {
+            claim_and_answer(pool, p, candidate, now).await
+        }
+    }
+}
+
+/// What a pairing outcome does to the address's count: a redemption or a replay clears it, a
+/// refusal adds one and leaves the reason in the log (never the MAC, the hash or the code).
+fn settle_brake(brake: &Brake, who: std::net::IpAddr, outcome: &PairOutcome) {
+    match outcome {
+        PairOutcome::Ok(_) | PairOutcome::Replayed(_) => clear_failures(brake, who),
+        PairOutcome::Refused(reason) => {
+            tracing::warn!(reason = ?reason, peer = %who, "pairing refused");
+            note_failure(brake, who);
+        }
+        _ => {}
+    }
 }
 
 /// Redeems a pairing request against the database as of `now`, counting failures in `brake`.
-// PASS-1 STUB: refuses everything.
 pub async fn pair_core(
-    _pool: &PgPool,
-    _req: &crate::accounts::PairRequest,
-    _peer_ip: std::net::IpAddr,
-    _now: chrono::DateTime<chrono::Utc>,
-    _brake: &Brake,
+    pool: &PgPool,
+    req: &PairRequest,
+    peer_ip: std::net::IpAddr,
+    now: chrono::DateTime<chrono::Utc>,
+    brake: &Brake,
 ) -> PairOutcome {
-    PairOutcome::Refused(Reason::UnknownOrBadMac)
+    if let Some(wait) = brake_wait(brake, peer_ip) {
+        return PairOutcome::Braked(wait);
+    }
+    let outcome = match ParsedPair::from_request(req) {
+        Some(parsed) => redeem(pool, &parsed, now).await,
+        None => PairOutcome::Malformed,
+    };
+    settle_brake(brake, peer_ip, &outcome);
+    outcome
+}
+
+fn plain_error(status: StatusCode, text: &str) -> Response {
+    (status, axum::Json(serde_json::json!({ "error": text }))).into_response()
+}
+
+/// `/identity` and `/pair` are never answered to a page of another origin or through an HTTP
+/// proxy or tunnel: behind one every client shares an address, and the brake would be one bucket.
+fn refuse_unsafe_door(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    if let Some(refusal) = refuse_foreign_origin(state, headers) {
+        return Some(refusal);
+    }
+    came_through_a_proxy(headers).then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            "this route does not answer through an HTTP proxy or tunnel",
+        )
+            .into_response()
+    })
+}
+
+/// The largest pairing request the daemon reads: a few hundred bytes are real ones.
+const PAIR_BODY_LIMIT: usize = 4096;
+
+async fn pair(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    if let Some(refusal) = refuse_unsafe_door(&state, &headers) {
+        return refusal;
+    }
+    let Ok(bytes) = axum::body::to_bytes(body, PAIR_BODY_LIMIT).await else {
+        return plain_error(StatusCode::PAYLOAD_TOO_LARGE, "request too large");
+    };
+    let Ok(request) = serde_json::from_slice::<PairRequest>(&bytes) else {
+        return plain_error(StatusCode::BAD_REQUEST, "bad request");
+    };
+    let outcome = pair_core(
+        &state.pool,
+        &request,
+        peer.ip(),
+        chrono::Utc::now(),
+        &state.auth_failures,
+    )
+    .await;
+    pair_reply(outcome)
+}
+
+fn pair_reply(outcome: PairOutcome) -> Response {
+    match outcome {
+        PairOutcome::Ok(response) | PairOutcome::Replayed(response) => {
+            axum::Json(response).into_response()
+        }
+        PairOutcome::Refused(_) => plain_error(StatusCode::UNAUTHORIZED, "pairing failed"),
+        PairOutcome::Braked(wait) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", wait.as_secs().max(1).to_string())],
+            axum::Json(serde_json::json!({ "error": "too many failed attempts" })),
+        )
+            .into_response(),
+        PairOutcome::Malformed => plain_error(StatusCode::BAD_REQUEST, "bad request"),
+        PairOutcome::Unavailable => {
+            plain_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct IdentityQuery {
+    cred: Option<String>,
+    nonce: Option<String>,
+}
+
+/// What `/identity` knows about a credential, and the proof only a host holding its hash can make.
+async fn credential_proof(
+    pool: &PgPool,
+    host_id: Uuid,
+    cred: Uuid,
+    nonce: [u8; 16],
+) -> Result<(&'static str, Option<String>)> {
+    let Some(row) = accounts_db::credential_for_auth(pool, cred).await? else {
+        return Ok(("unknown", None));
+    };
+    if row.state != CredentialState::Active {
+        return Ok(("revoked", None));
+    }
+    let proof = accounts::identity_proof(&row.secret_hash, &host_id, &cred, &nonce);
+    Ok(("active", Some(hex::encode(proof))))
+}
+
+/// The id the clients pin: read at start, or now if the database was not there then.
+async fn known_host_id(state: &AppState) -> Option<Uuid> {
+    if !state.host.host_id.is_nil() {
+        return Some(state.host.host_id);
+    }
+    accounts_db::host_identity(&state.pool)
+        .await
+        .ok()
+        .map(|identity| identity.host_id)
+}
+
+/// `Ok(None)` for a bare probe, `Ok(Some(..))` for a credential and a nonce in the exact shape
+/// the bridge sends, `Err` for anything else, which gets one answer whatever was wrong.
+fn asked_credential(query: &IdentityQuery) -> Result<Option<(Uuid, [u8; 16])>, ()> {
+    match (query.cred.as_deref(), query.nonce.as_deref()) {
+        (None, None) => Ok(None),
+        (Some(cred), Some(nonce)) => {
+            let cred = accounts::lower_hex::<16>(cred).ok_or(())?;
+            let nonce = accounts::lower_hex::<16>(nonce).ok_or(())?;
+            Ok(Some((Uuid::from_bytes(cred), nonce)))
+        }
+        _ => Err(()),
+    }
+}
+
+async fn identity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<IdentityQuery>,
+) -> Response {
+    if let Some(refusal) = refuse_unsafe_door(&state, &headers) {
+        return refusal;
+    }
+    let Ok(asked) = asked_credential(&query) else {
+        return plain_error(StatusCode::BAD_REQUEST, "bad request");
+    };
+    let Some(host_id) = known_host_id(&state).await else {
+        return plain_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    let mut reply = accounts::IdentityReply {
+        service: "memory-industry".to_string(),
+        host_id,
+        name: state.host.name.clone(),
+        credential: None,
+        proof: None,
+    };
+    if let Some((cred, nonce)) = asked {
+        let Ok((verdict, proof)) = credential_proof(&state.pool, host_id, cred, nonce).await else {
+            return plain_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+        };
+        reply.credential = Some(verdict.to_string());
+        reply.proof = proof;
+    }
+    axum::Json(reply).into_response()
 }
 
 async fn mcp_endpoint(
@@ -1262,10 +1692,11 @@ async fn mcp_endpoint(
     }
     let origin = request_origin(peer, &headers);
 
-    let scope = match admit(&state, &headers, peer).await {
-        Ok(admitted) => admitted.scope,
+    let admitted = match admit(&state, &headers, peer).await {
+        Ok(admitted) => admitted,
         Err(refusal) => return refusal,
     };
+    let scope = admitted.scope;
 
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1323,7 +1754,8 @@ async fn mcp_endpoint(
     };
 
     let deadline = request_deadline();
-    let Ok(mut responses) = tokio::time::timeout(deadline, dispatch).await else {
+    let attributed = crate::session::with_account(admitted.account, dispatch);
+    let Ok(mut responses) = tokio::time::timeout(deadline, attributed).await else {
         tracing::warn!(client = %key, secs = deadline.as_secs(), "request hit the deadline");
         return (
             StatusCode::GATEWAY_TIMEOUT,
@@ -1968,7 +2400,9 @@ async fn health(
     .await
     .is_ok_and(|r| r.is_ok());
 
-    let full_scope = authorized(&state, &headers) == Some(Scope::Full);
+    let full_scope = identify(&state, &headers, false)
+        .await
+        .is_ok_and(|admitted| admitted.scope == Scope::Full);
     let runtime = runtime_report(&state);
     let mut body = serde_json::json!({
         "status": overall_status(db_ok, &runtime),
@@ -3949,6 +4383,8 @@ mod admission_tests {
         state
     }
 
+    // The Err is the response `admit` would send; the test just hands it back.
+    #[allow(clippy::result_large_err)]
     async fn admitted(state: &AppState, headers: &HeaderMap) -> Result<Admitted, Response> {
         tokio::time::timeout(Duration::from_secs(2), admit(state, headers, lan()))
             .await

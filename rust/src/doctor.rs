@@ -6,7 +6,11 @@ use sqlx::{PgPool, Row};
 use crate::embeddings::onnx;
 use crate::service_apply::env_value;
 
-const EXPECTED_TABLES: i64 = 24;
+/// `brain%` tables in a freshly migrated database: 36 through 0064 and the four of 0065
+/// (`brain_host_identity`, `brain_accounts`, `brain_account_credentials`,
+/// `brain_pairing_codes`), counted by applying every `*.up.sql` in order to an empty database
+/// and asking `information_schema.tables` the same question the schema check asks.
+const EXPECTED_TABLES: i64 = 40;
 
 const REQUIRED_EXTENSIONS: [&str; 2] = ["vector", "pg_trgm"];
 
@@ -768,10 +772,78 @@ async fn resolve_reranker(load_it: bool) -> (bool, bool, Option<String>) {
     )
 }
 
-/// What doctor says about accounts, judged only from `facts`.
-// PASS-1 STUB: says nothing.
-pub fn account_checks(_facts: &crate::accounts_db::AccountFacts) -> Vec<Check> {
-    Vec::new()
+/// What doctor says about accounts, judged only from `facts`. Nothing in `facts` is a secret, a
+/// hash or a code, so nothing printed here can be one: doctor output is pasted into issues.
+pub fn account_checks(facts: &crate::accounts_db::AccountFacts) -> Vec<Check> {
+    vec![account_verdict(facts)]
+}
+
+fn account_verdict(f: &crate::accounts_db::AccountFacts) -> Check {
+    if !f.tables_present {
+        return Check::fail(
+            "accounts",
+            "0065 sin aplicar: faltan las tablas de cuentas",
+            "arrancá el servidor una vez para que migre la base",
+        );
+    }
+    let counts = format!(
+        "{} cuentas, {} credenciales activas, {} revocadas · huella {}",
+        f.accounts, f.active_credentials, f.revoked_credentials, f.fingerprint
+    );
+    if f.require_accounts {
+        return required_verdict(f, counts);
+    }
+    if f.accounts == 0 {
+        return Check::ok(
+            "accounts",
+            format!("sin cuentas: el token compartido sigue siendo la única puerta · {counts}"),
+        );
+    }
+    if f.shared_token && f.lan_bind {
+        return Check::warn(
+            "accounts",
+            counts,
+            "el token compartido sigue abriendo esta dirección y no se puede revocar por dispositivo: cuando todos estén emparejados, poné MEMORY_INDUSTRY_REQUIRE_ACCOUNTS=1",
+        );
+    }
+    Check::ok("accounts", counts)
+}
+
+fn required_verdict(f: &crate::accounts_db::AccountFacts, counts: String) -> Check {
+    if f.active_credentials == 0 {
+        return Check::fail(
+            "accounts",
+            format!(
+                "nadie puede entrar: el token compartido está rechazado y no hay credenciales activas · {counts}"
+            ),
+            "emparejá un dispositivo (`memory-industry account pair <nombre>`) o quitá MEMORY_INDUSTRY_REQUIRE_ACCOUNTS",
+        );
+    }
+    Check::ok("accounts", counts)
+}
+
+/// The database facts plus the three that belong to this process, as `serve` would judge them.
+async fn accounts_report(pool: &PgPool) -> Vec<Check> {
+    let mut facts = match crate::accounts_db::account_facts(pool).await {
+        Ok(facts) => facts,
+        Err(e) => {
+            return vec![Check::warn(
+                "accounts",
+                format!("no se pudo leer: {e:#}"),
+                "revisar permisos",
+            )];
+        }
+    };
+    let loopback = crate::http::bind_addr()
+        .parse::<std::net::SocketAddr>()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(true);
+    let knob = std::env::var("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS").ok();
+    facts.require_accounts =
+        crate::accounts::require_accounts_effective(loopback, knob.as_deref()).0;
+    facts.shared_token = std::env::var("CUBA_HTTP_TOKEN").is_ok_and(|t| !t.is_empty());
+    facts.lan_bind = !loopback;
+    account_checks(&facts)
 }
 
 pub async fn run_checks(pool: &PgPool, url: &str) -> Vec<Check> {
@@ -920,6 +992,8 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
             "revisar permisos",
         )),
     }
+
+    checks.extend(accounts_report(pool).await);
 
     match sqlx::query("SELECT count(*)::bigint FROM pg_proc WHERE proname='cuba_or_tsquery'")
         .fetch_one(pool)
