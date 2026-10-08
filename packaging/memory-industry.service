@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-ExecStart=%h/.local/bin/memory-industry serve 127.0.0.1:8787
+ExecStart=%h/.local/bin/memory-industry serve
 # Every knob lives in the env file, never here. A value pinned in a unit is a
 # second source of truth for the defaults, and that is how a hand-written GPU
 # ceiling beat the planner's measurement on every card this daemon ran on.

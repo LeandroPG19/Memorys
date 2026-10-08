@@ -6,15 +6,29 @@
     <URI>\memory-industry</URI>
   </RegistrationInfo>
   <Triggers>
+    <!-- At boot, with nobody logged in. The repetition is the second supervisor:
+         the restart policy below is unverified against a launcher that exits
+         non-zero, and a repeat while the daemon lives starts nothing because
+         MultipleInstancesPolicy is IgnoreNew. It never stops on its own. -->
+    <BootTrigger>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </BootTrigger>
     <LogonTrigger>
       <Enabled>true</Enabled>
     </LogonTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
-      <LogonType>InteractiveToken</LogonType>
-      <!-- A per-user task needs no administrator, and asking for one turns a
-           silent install into a UAC prompt somebody has to be there to answer. -->
+      <!-- S-1-5-18 is SYSTEM: a service account, so the scheduler stores no
+           secret, and the task exists before anybody logs in. LeastPrivilege
+           because SYSTEM never has to ask for elevation. SYSTEM runs this
+           daemon with every right on the machine. -->
+      <UserId>S-1-5-18</UserId>
+      <LogonType>ServiceAccount</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
@@ -29,7 +43,7 @@
     <Hidden>false</Hidden>
     <RestartOnFailure>
       <Interval>PT1M</Interval>
-      <Count>3</Count>
+      <Count>999</Count>
     </RestartOnFailure>
   </Settings>
   <Actions Context="Author">

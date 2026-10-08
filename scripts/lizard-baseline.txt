@@ -153,7 +153,7 @@ src/search/rerank.rs::score_pairs:429 10
 # disagree the installer rotates a live token under every client already
 # configured. The 11 is `?` and `&&`, which lizard counts each. Owner:
 # mejorador 0.27.
-src/service.rs::write_one:978 11
+src/service.rs::write_one:1159 11
 src/setup.rs::resolve_database_url:13 11
 # The four below each went up by the `?` of `envs::home()` returning a Result
 # (run_check by two: it calls both known_targets and project_configs). It used
