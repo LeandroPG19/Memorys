@@ -169,10 +169,14 @@ impl Mode {
 pub struct Request {
     pub mode: Mode,
     pub target: Target,
-    pub profile: Profile,
+    /// `None` when the operator did not type `--profile`: «said nothing» and
+    /// «said loopback» are different requests once an install already exists.
+    pub profile: Option<Profile>,
     pub addr: Option<String>,
     pub token: Option<String>,
     pub out: Option<PathBuf>,
+    /// `--register`: also create the scheduled task and the firewall rule.
+    pub register: bool,
 }
 
 /// `--help` answers before anything else is decided, so it is not a fourth
@@ -267,10 +271,13 @@ impl Flags {
         Ok(Request {
             mode,
             target: self.target.unwrap_or_else(Target::host),
-            profile: self.profile.unwrap_or(Profile::Loopback),
+            // PASS-1 STUB: 0.28 defaulted the profile here; pass 2 keeps `self.profile` as it is (None when unsaid).
+            profile: Some(self.profile.unwrap_or(Profile::Loopback)),
             addr: self.addr,
             token: self.token,
             out: self.out,
+            // PASS-1 STUB: 0.28 has no `--register`; pass 2 reads the flag and refuses it outside --apply on Windows.
+            register: false,
         })
     }
 }
@@ -354,12 +361,20 @@ impl Unit {
     }
 
     /// What `--print` and `--apply` render on a real machine.
+    ///
+    /// `existing_env` is the text of the env file already installed, or `None`
+    /// when there is none: the unit is resolved from it without touching the disk.
     pub fn from_env(
-        profile: Profile,
+        profile: Option<Profile>,
         target: Target,
         addr_flag: Option<&str>,
         token_flag: Option<&str>,
+        existing_env: Option<&str>,
     ) -> Result<Unit> {
+        // PASS-1 STUB: 0.28 took the profile as given and never read the installed env file; pass 2 resolves
+        // address, profile and token from `existing_env` when the flags say nothing.
+        let _ = existing_env;
+        let profile = profile.unwrap_or(Profile::Loopback);
         let addr = addr_for(profile, addr_flag)?;
         let token = match token_flag {
             Some(given) => Some(given.to_string()),
@@ -1222,6 +1237,13 @@ pub fn write_all(u: &Unit, target: Target, root: &Path) -> Result<Vec<(PathBuf, 
     Ok(written)
 }
 
+/// What `--uninstall` prints for the two things `--register` made and the
+/// installer will not remove by itself: the task and the firewall rule.
+// PASS-1 STUB: 0.28 prints no hints; pass 2 returns the schtasks and netsh delete lines for Windows. Returns [].
+pub fn uninstall_hints(_target: Target) -> Vec<String> {
+    Vec::new()
+}
+
 /// The files `--uninstall` may take away, under the install root.
 ///
 /// The env file is not among them, and the filter is what keeps it that way: it
@@ -1779,7 +1801,7 @@ mod tests {
             (Profile::Lan, Some(ROUTABLE), true),
         ] {
             for target in [Target::Linux, Target::Windows] {
-                let unit = match Unit::from_env(profile, target, given_addr, None) {
+                let unit = match Unit::from_env(Some(profile), target, given_addr, None, None) {
                     Ok(unit) => unit,
                     Err(e) => panic!(
                         "--profile {} --addr {given_addr:?} is a supported install and it was \
@@ -1813,10 +1835,11 @@ mod tests {
         // clients they already configured stop being able to talk.
         let given = "d".repeat(64);
         let unit = Unit::from_env(
-            Profile::Lan,
+            Some(Profile::Lan),
             Target::Linux,
             Some(ROUTABLE),
             Some(given.as_str()),
+            None,
         )
         .expect("a routable address with a long token is the supported LAN install");
         assert_eq!(unit.token.as_deref(), Some(given.as_str()));
@@ -1834,7 +1857,7 @@ mod tests {
         let _mode = crate::envs::ScopedEnv::set("CUBA_MODE", "red");
         let _db = crate::envs::ScopedEnv::cleared("DATABASE_URL");
 
-        let unit = Unit::from_env(Profile::Loopback, Target::Linux, None, None)
+        let unit = Unit::from_env(Some(Profile::Loopback), Target::Linux, None, None, None)
             .expect("a loopback install needs nothing but a home directory");
 
         assert_eq!(
@@ -1877,7 +1900,7 @@ mod tests {
         let scratch = Scratch::new("annotations");
         let _pinned = pinned_install_root(&scratch);
 
-        let unit = Unit::from_env(Profile::Loopback, Target::Linux, None, None)
+        let unit = Unit::from_env(Some(Profile::Loopback), Target::Linux, None, None, None)
             .expect("a loopback install needs nothing but a home directory");
 
         // Anchor before absence: an empty `computed` would satisfy any search
@@ -2722,7 +2745,7 @@ mod tests {
         let scratch = Scratch::new("absolute-paths");
         let _pinned = pinned_install_root(&scratch);
 
-        let unit = Unit::from_env(Profile::Loopback, Target::Windows, None, None)
+        let unit = Unit::from_env(Some(Profile::Loopback), Target::Windows, None, None, None)
             .expect("a loopback windows install needs a home and LOCALAPPDATA");
 
         assert_eq!(
@@ -3089,7 +3112,7 @@ mod tests {
         let _home = crate::envs::ScopedEnv::cleared("HOME");
         let _profile = crate::envs::ScopedEnv::cleared("USERPROFILE");
 
-        let said = Unit::from_env(Profile::Loopback, Target::Windows, None, None)
+        let said = Unit::from_env(Some(Profile::Loopback), Target::Windows, None, None, None)
             .expect_err(
                 "S-4: with LOCALAPPDATA and no home the old code installed anyway, and the \
                  daemon SYSTEM starts cannot find a single model. It has to refuse",
@@ -3103,6 +3126,215 @@ mod tests {
                  {said}"
             );
         }
+    }
+
+    // --- from_env over an install that already exists ---------------------------
+
+    /// The env file `--apply` leaves behind, as far as `from_env` reads it.
+    fn installed_env(addr: &str, token: &str) -> String {
+        format!(
+            "# mine\nCUBA_HTTP_TOKEN={token}\nCUBA_HTTP_ADDR={addr}\n\
+             DATABASE_URL=postgresql://operador@db/brain\n"
+        )
+    }
+
+    /// Nothing the unit renders may put the install back on loopback.
+    fn assert_no_loopback_in_any_render(unit: &Unit) {
+        let launcher = unit.env_file.with_file_name(LAUNCHER_BASENAME);
+        for (name, body) in [
+            ("launcher", render_windows_launcher(unit)),
+            ("task XML", render_windows_task(&launcher)),
+            ("socket", render_socket(unit)),
+            ("service", render_systemd(unit)),
+            ("env file", render_env_file(unit)),
+        ] {
+            assert!(
+                !body.contains("127.0.0.1"),
+                "the {name} of a LAN install holds 127.0.0.1: the clients that were reaching \
+                 the daemon stop reaching it, and nothing says so:\n{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_without_flags_over_a_lan_env_file_keeps_its_address_profile_and_token() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("keeps-lan");
+        let _pinned = pinned_install_root(&scratch);
+        // The env file renders the operator's DATABASE_URL, and a developer's own
+        // may well point at 127.0.0.1.
+        let _db = crate::envs::ScopedEnv::cleared("DATABASE_URL");
+        let token = "t".repeat(64);
+        let installed = installed_env(ROUTABLE, &token);
+
+        for target in [Target::Linux, Target::Windows] {
+            let unit = Unit::from_env(None, target, None, None, Some(&installed))
+                .expect("a second --apply over a LAN install with a good token is supported");
+
+            assert_eq!(
+                unit.addr,
+                addr(ROUTABLE),
+                "an `--apply` with no flags resolved to {} over a file that says {ROUTABLE}: \
+                 the address was reset to the default and the LAN clients lost the daemon",
+                unit.addr
+            );
+            assert_eq!(
+                unit.profile,
+                Profile::Lan,
+                "the profile follows the address"
+            );
+            assert_eq!(
+                unit.token.as_deref(),
+                Some(token.as_str()),
+                "the token is the one the clients already have"
+            );
+            assert_no_loopback_in_any_render(&unit);
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_without_flags_over_a_loopback_env_file_stays_loopback_and_makes_no_token() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("keeps-loopback");
+        let _pinned = pinned_install_root(&scratch);
+        let installed = "CUBA_HTTP_ADDR=127.0.0.1:8787\nCUBA_HTTP_TOKEN=\n";
+
+        let unit = Unit::from_env(None, Target::Linux, None, None, Some(installed))
+            .expect("a loopback install needs nothing");
+
+        assert_eq!(unit.addr, addr(DEFAULT_LOOPBACK_ADDR));
+        assert_eq!(unit.profile, Profile::Loopback);
+        assert_eq!(
+            unit.token, None,
+            "nothing reaches 127.0.0.1 from outside, so a generated token is a secret nobody \
+             asked for and every client would have to be told about it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_profile_and_address_replace_the_installed_ones_and_keep_the_token() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("explicit-lan");
+        let _pinned = pinned_install_root(&scratch);
+        let token = "t".repeat(64);
+        let installed = installed_env(DEFAULT_LOOPBACK_ADDR, &token);
+
+        let unit = Unit::from_env(
+            Some(Profile::Lan),
+            Target::Linux,
+            Some(ROUTABLE),
+            None,
+            Some(&installed),
+        )
+        .expect("moving a loopback install to the LAN is the supported upgrade");
+
+        assert_eq!(unit.addr, addr(ROUTABLE), "what the operator typed wins");
+        assert_eq!(
+            unit.token.as_deref(),
+            Some(token.as_str()),
+            "and the token the file has is the one used: generating a new one logs out every \
+             client that was configured with the old"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_loopback_profile_brings_a_lan_install_down() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("explicit-loopback");
+        let _pinned = pinned_install_root(&scratch);
+        let installed = installed_env(ROUTABLE, &"t".repeat(64));
+
+        let unit = Unit::from_env(
+            Some(Profile::Loopback),
+            Target::Linux,
+            None,
+            None,
+            Some(&installed),
+        )
+        .expect("going down to loopback is allowed when it is asked for");
+
+        assert_eq!(
+            unit.addr,
+            addr(DEFAULT_LOOPBACK_ADDR),
+            "`--profile loopback` is the explicit way down. Read as «keep what is there», the \
+             operator who asked for it keeps a daemon open to the LAN"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_the_env_file_already_has_is_never_replaced_by_another_one() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("token-kept");
+        let _pinned = pinned_install_root(&scratch);
+        let installed = installed_env(ROUTABLE, &"a".repeat(64));
+        let other = "b".repeat(64);
+
+        let refused = Unit::from_env(None, Target::Linux, None, Some(&other), Some(&installed))
+            .expect_err("a different --token over a token that is there must not be accepted");
+        assert!(
+            format!("{refused:#}").contains("el env file ya tiene un token"),
+            "the refusal says why, or the operator retries with another guess: {refused:#}"
+        );
+
+        let same = "a".repeat(64);
+        let unit = Unit::from_env(None, Target::Linux, None, Some(&same), Some(&installed))
+            .expect("the same token again is not a change");
+        assert_eq!(unit.token.as_deref(), Some(same.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_routable_env_file_with_a_short_token_is_refused_naming_the_file_and_the_floor() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("token-short");
+        let _pinned = pinned_install_root(&scratch);
+        let installed = installed_env(ROUTABLE, &"s".repeat(10));
+
+        let refused = Unit::from_env(None, Target::Linux, None, None, Some(&installed))
+            .expect_err("a LAN daemon with a 10-character token refuses to start; so does this");
+
+        let said = format!("{refused:#}");
+        assert!(
+            said.contains(ENV_BASENAME) && said.contains("32"),
+            "the operator has to learn WHICH file holds the short token and how long it must \
+             be: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_the_env_file_holds_but_nobody_can_read_is_refused_naming_file_and_value() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("addr-unreadable");
+        let _pinned = pinned_install_root(&scratch);
+        let installed = "CUBA_HTTP_ADDR=no-es-una-direccion\n";
+
+        let refused = Unit::from_env(None, Target::Linux, None, None, Some(installed))
+            .expect_err("a garbled address is not a reason to install the default over it");
+
+        let said = format!("{refused:#}");
+        assert!(
+            said.contains(ENV_BASENAME) && said.contains("no-es-una-direccion"),
+            "silently falling back to loopback is how the original defect looked: the file \
+             and the value have to be named: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_env_file_with_no_address_line_is_a_loopback_install() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("addr-absent");
+        let _pinned = pinned_install_root(&scratch);
+
+        let unit = Unit::from_env(
+            None,
+            Target::Linux,
+            None,
+            None,
+            Some("DATABASE_URL=postgresql://operador@db/brain\n"),
+        )
+        .expect("an env file that never set the address is the default install");
+
+        assert_eq!(unit.addr, addr(DEFAULT_LOOPBACK_ADDR));
+        assert_eq!(unit.profile, Profile::Loopback);
     }
 
     // --- The flags: what `setup service` was asked for --------------------------
@@ -3141,10 +3373,11 @@ mod tests {
             Request {
                 mode: Mode::Print,
                 target: Target::host(),
-                profile: Profile::Loopback,
+                profile: None,
                 addr: None,
                 token: None,
                 out: None,
+                register: false,
             },
             "`setup service` with nothing after it is the plan. A default of --apply installs a \
              daemon for somebody who was asking what it would do, and a default of --uninstall \
@@ -3253,10 +3486,11 @@ mod tests {
             Request {
                 mode: Mode::Print,
                 target: Target::Windows,
-                profile: Profile::Lan,
+                profile: Some(Profile::Lan),
                 addr: Some(ROUTABLE.to_string()),
                 token: Some(token.clone()),
                 out: Some(PathBuf::from("packaging")),
+                register: false,
             },
             "a word that lands in the wrong field is an install nobody asked for: the address \
              taken as the token is a daemon behind 17 characters the daemon itself refuses, and \
@@ -3316,6 +3550,76 @@ mod tests {
             "with --print it is the supported pair: it is how the files under packaging/ are \
              regenerated"
         );
+    }
+
+    #[test]
+    fn register_goes_with_apply_on_windows_and_is_never_implied() {
+        let asked = request(&["--windows", "--apply", "--register"]);
+        assert!(
+            asked.register,
+            "`--register` is how the scheduled task and the firewall rule get made without a \
+             second set of commands to copy"
+        );
+        assert_eq!(
+            (asked.mode, asked.target),
+            (Mode::Apply, Target::Windows),
+            "and it rides on an install for Windows, not on some other mode"
+        );
+
+        assert!(
+            !request(&["--windows", "--apply"]).register,
+            "registering creates a task that runs as SYSTEM and opens a port: it is asked for, \
+             never a default"
+        );
+    }
+
+    #[test]
+    fn register_is_refused_beside_print_and_uninstall_naming_both_flags() {
+        for mode_flag in ["--print", "--uninstall"] {
+            let said = refusal(&["--windows", mode_flag, "--register"]);
+            for flag in [mode_flag, "--register"] {
+                assert!(
+                    said.contains(flag),
+                    "`{mode_flag} --register` has to name both flags, or the operator cannot \
+                     tell which one to drop: {said}"
+                );
+            }
+        }
+
+        let said = refusal(&["--windows", "--register"]);
+        assert!(
+            said.contains("--register") && said.contains("--apply"),
+            "no mode typed is the plan, and a plan registers nothing; the refusal sends the \
+             operator to the flag that does: {said}"
+        );
+    }
+
+    #[test]
+    fn register_is_refused_for_a_linux_target() {
+        let said = refusal(&["--linux", "--apply", "--register"]);
+        assert!(
+            said.contains("--register es solo para Windows"),
+            "on Linux the supervisor is `systemctl`, which is printed and not run; accepting \
+             the flag there would claim a registration nothing performed: {said}"
+        );
+    }
+
+    #[test]
+    fn an_unspoken_profile_is_none_and_a_spoken_one_is_kept() {
+        assert_eq!(
+            request(&["--apply"]).profile,
+            None,
+            "an `--apply` that said nothing about the profile has to keep the one the install \
+             already has; defaulting it here is how a LAN install went back to 127.0.0.1"
+        );
+        for (flag, expected) in [("loopback", Profile::Loopback), ("lan", Profile::Lan)] {
+            assert_eq!(
+                request(&["--apply", "--profile", flag]).profile,
+                Some(expected),
+                "`--profile {flag}` is an explicit request, and it is the only way down to \
+                 loopback"
+            );
+        }
     }
 
     // --- What --apply and --uninstall report and touch ---------------------------
@@ -3402,5 +3706,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn uninstall_shows_how_to_take_away_what_register_put() {
+        assert_eq!(
+            firewall_delete_argv().join(" "),
+            "netsh advfirewall firewall delete rule name=memory-industry",
+            "anchor: the hint below is the very command `--register` starts with"
+        );
+
+        let windows = uninstall_hints(Target::Windows);
+        for command in [
+            "schtasks /Delete /TN memory-industry /F",
+            "netsh advfirewall firewall delete rule name=memory-industry",
+        ] {
+            assert!(
+                windows.iter().any(|hint| hint.contains(command)),
+                "`--uninstall` removes the files and leaves a task that restarts a launcher \
+                 that is gone, up to 999 times, unless the operator is told to run `{command}`: \
+                 {windows:?}"
+            );
+        }
+
+        assert!(
+            uninstall_hints(Target::Linux).is_empty(),
+            "on Linux `--register` makes nothing, so there is nothing to retire"
+        );
     }
 }

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::envs::home;
-use crate::service::{self, Asked, Mode, Request, Secrecy, Unit};
+use crate::service::{self, Asked, Mode, Profile, Request, Secrecy, Unit};
 
 const REQUIRED_ENV: [&str; 3] = ["DATABASE_URL", "ONNX_MODEL_PATH", "ORT_DYLIB_PATH"];
 
@@ -436,11 +436,13 @@ fn run_service(args: &[String]) -> Result<()> {
 
 /// This machine and these flags, which is what `--print` and `--apply` install.
 fn unit_from(request: &Request) -> Result<Unit> {
+    // PASS-1 STUB: 0.28 never read the installed env file; pass 2 reads it here and passes its text.
     Unit::from_env(
         request.profile,
         request.target,
         request.addr.as_deref(),
         request.token.as_deref(),
+        None,
     )
 }
 
@@ -448,7 +450,7 @@ fn unit_from(request: &Request) -> Result<Unit> {
 /// measurement or a `current_exe()` inside a versioned file is the very defect
 /// this command exists to close.
 fn write_canonical_render(request: &Request, dir: &Path) -> Result<()> {
-    let unit = Unit::documented(request.profile, request.target);
+    let unit = Unit::documented(request.profile.unwrap_or(Profile::Loopback), request.target);
     let launcher = unit.exe.with_extension("cmd");
     for (relative, body) in service::rendered_files(&unit, request.target.is_windows(), &launcher) {
         let path = dir.join(&relative);
@@ -490,7 +492,7 @@ fn uninstall(request: &Request) -> Result<()> {
     let local_app_data = std::env::var("LOCALAPPDATA").ok();
     let root = service::install_root(request.target, home.as_deref(), local_app_data.as_deref())?;
 
-    let unit = Unit::documented(request.profile, request.target);
+    let unit = Unit::documented(request.profile.unwrap_or(Profile::Loopback), request.target);
     for path in service::removable_files(&unit, request.target, &root) {
         match std::fs::remove_file(&path) {
             Ok(()) => println!("borrado    {}", path.display()),
