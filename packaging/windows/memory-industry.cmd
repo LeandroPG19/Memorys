@@ -6,15 +6,26 @@ rem .env file of its own. Without this launcher the task starts a daemon with
 rem no DATABASE_URL and no token, and on Windows nothing reports that: the task
 rem 'ran', and the only symptom is a daemon that never appears.
 setlocal
-rem Same failure, one step earlier: `for /f` over a file that is not there runs
-rem its body zero times and falls through, so a missing env file starts exactly
-rem the empty daemon those lines describe. The exit code below is what reaches
-rem Task Scheduler's Last Run Result; falling through is what reports success.
+rem The task runs as SYSTEM, which has no home of its own, and the model cache,
+rem nli, rerank and gpu all resolve their paths from it. It is set to the home of
+rem the user who installed BEFORE the env file is read, so the file can still
+rem override it; without it the daemon starts deaf and nothing says so.
+set "USERPROFILE=%USERPROFILE%"
+rem The log is the only trace a daemon under SYSTEM leaves. Past 5 MiB it moves to
+rem the same name plus .1, replacing the previous one, at the next start. The exist
+rem test is not decoration: the size of a file that is not there is empty, and
+rem the comparison would be a syntax error on the very first start.
+if exist "%LOCALAPPDATA%\MemoryIndustry\memory-industry.log" for %%f in ("%LOCALAPPDATA%\MemoryIndustry\memory-industry.log") do if %%~zf gtr 5242880 move /Y "%LOCALAPPDATA%\MemoryIndustry\memory-industry.log" "%LOCALAPPDATA%\MemoryIndustry\memory-industry.log.1" >nul
+rem A missing env file is the same failure one step earlier: `for /f` over a file
+rem that is not there runs its body zero times and falls through, so the daemon
+rem would start exactly as empty as the one described above. The exit code below is
+rem what reaches Task Scheduler's Last Run Result; falling through reports success.
 if not exist "%LOCALAPPDATA%\MemoryIndustry\memory-industry.env" (
-  echo memory-industry: %LOCALAPPDATA%\MemoryIndustry\memory-industry.env is not there.
-  echo Nothing would set DATABASE_URL or the bearer token, so the daemon would start
-  echo deaf and the task would report success. Run: memory-industry setup service --apply
+  echo memory-industry: %LOCALAPPDATA%\MemoryIndustry\memory-industry.env is not there. >> "%LOCALAPPDATA%\MemoryIndustry\memory-industry.log" 2>&1
+  echo Nothing would set DATABASE_URL or the bearer token, so the daemon would start >> "%LOCALAPPDATA%\MemoryIndustry\memory-industry.log" 2>&1
+  echo deaf and the task would report success. Run: memory-industry setup service --apply >> "%LOCALAPPDATA%\MemoryIndustry\memory-industry.log" 2>&1
   exit /b 1
 )
 for /f "usebackq eol=# tokens=1,* delims==" %%a in ("%LOCALAPPDATA%\MemoryIndustry\memory-industry.env") do set "%%a=%%b"
-"%LOCALAPPDATA%\MemoryIndustry\memory-industry.exe" serve 127.0.0.1:8787
+"%LOCALAPPDATA%\MemoryIndustry\memory-industry.exe" serve >> "%LOCALAPPDATA%\MemoryIndustry\memory-industry.log" 2>&1
+exit /b %errorlevel%

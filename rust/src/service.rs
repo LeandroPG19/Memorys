@@ -37,6 +37,8 @@ const LINUX_EXE: &str = "%h/.local/bin/memory-industry";
 const LINUX_ENV: &str = "%h/.config/memory-industry/memory-industry.env";
 const WINDOWS_EXE: &str = "%LOCALAPPDATA%\\MemoryIndustry\\memory-industry.exe";
 const WINDOWS_ENV: &str = "%LOCALAPPDATA%\\MemoryIndustry\\memory-industry.env";
+const LINUX_HOME: &str = "%h";
+const WINDOWS_HOME: &str = "%USERPROFILE%";
 
 /// What `documented` says instead of a measurement. `gpu::status()` answers for
 /// the machine it runs on, and a versioned file cannot carry that answer.
@@ -57,6 +59,24 @@ pub const ENV_BASENAME: &str = "memory-industry.env";
 /// on disk could disagree, the installer itself could ship a task pointing at a
 /// `.cmd` that is not there — and on Windows nothing reports that.
 pub const LAUNCHER_BASENAME: &str = "memory-industry.cmd";
+
+/// The launcher appends the daemon's stdout and stderr here, beside the env
+/// file. Under SYSTEM there is no console to read, so this file is the only
+/// trace of a daemon that dies at startup. It is not in `rendered_files` and
+/// not in `removable_files`: `--apply` does not write it and `--uninstall`
+/// leaves it, because it is the evidence of why the last run stopped.
+pub const LOG_BASENAME: &str = "memory-industry.log";
+
+/// 5 MiB. Past this the launcher moves the log to `<log>.1` at the next start,
+/// so the disk holds two files of about this size plus whatever one live run
+/// writes. A daemon that stays up for days does not rotate until it restarts.
+pub const LOG_ROTATE_BYTES: u64 = 5_242_880;
+
+/// One name for the firewall rule and one for the scheduled task, shared by the
+/// argv `--register` runs, the line the plan prints and the hints `--uninstall`
+/// gives, so none of them can name something the others do not.
+pub const FIREWALL_RULE_NAME: &str = "memory-industry";
+pub const TASK_NAME: &str = "memory-industry";
 
 fn joined(lines: Vec<String>) -> String {
     let mut out = lines.join("\n");
@@ -292,6 +312,11 @@ pub struct Unit {
     /// Why each model landed where it did, from `gpu::status()`. A comment, not
     /// a knob: it is what the operator went to `rust/src` to find out.
     pub why: String,
+    /// The home of the user who installs. SYSTEM has none, and the model cache,
+    /// `nli.rs`, `rerank.rs` and `gpu.rs` all resolve their paths from
+    /// `envs::home()`: the launcher sets `USERPROFILE` to this before it reads
+    /// the env file, or the daemon starts without models and nothing says so.
+    pub home_dir: PathBuf,
 }
 
 impl Unit {
@@ -300,10 +325,10 @@ impl Unit {
     /// measured `Plan` and `placement_summary()` all differ per machine, so a
     /// byte-for-byte golden cannot come from them.
     pub fn documented(profile: Profile, target: Target) -> Unit {
-        let (exe, env_file) = if target.is_windows() {
-            (WINDOWS_EXE, WINDOWS_ENV)
+        let (exe, env_file, home_dir) = if target.is_windows() {
+            (WINDOWS_EXE, WINDOWS_ENV, WINDOWS_HOME)
         } else {
-            (LINUX_EXE, LINUX_ENV)
+            (LINUX_EXE, LINUX_ENV, LINUX_HOME)
         };
         let addr: SocketAddr = DEFAULT_LOOPBACK_ADDR
             .parse()
@@ -324,6 +349,7 @@ impl Unit {
                 ("ORT_DYLIB_PATH".to_string(), String::new()),
             ],
             why: DOCUMENTED_WHY.to_string(),
+            home_dir: PathBuf::from(home_dir),
         }
     }
 
@@ -348,11 +374,11 @@ impl Unit {
         }
 
         let exe = std::env::current_exe().context("no se pudo resolver la ruta de este binario")?;
-        let home = crate::envs::home()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
+        let home = crate::envs::home();
+        let home_text = home.as_ref().ok().map(|p| p.to_string_lossy().into_owned());
         let local_app_data = std::env::var("LOCALAPPDATA").ok();
-        let root = install_root(target, home.as_deref(), local_app_data.as_deref())?;
+        let root = install_root(target, home_text.as_deref(), local_app_data.as_deref())?;
+        let home_dir = user_home(target, home)?;
 
         let measured =
             crate::resources::plan_env(&crate::resources::plan(&crate::resources::probe()));
@@ -391,7 +417,20 @@ impl Unit {
                 ),
             ],
             why: crate::gpu::status().detail,
+            home_dir,
         })
+    }
+}
+
+/// The home the launcher hands to the daemon. Linux already failed in
+/// `install_root` without one. Windows installs under LOCALAPPDATA, so a
+/// missing home would only surface as a daemon that SYSTEM starts deaf; it is
+/// refused here, with `envs::home`'s message naming both variables.
+fn user_home(target: Target, home: Result<PathBuf>) -> Result<PathBuf> {
+    if target.is_windows() {
+        home
+    } else {
+        Ok(home.unwrap_or_default())
     }
 }
 
@@ -597,7 +636,10 @@ pub fn render_systemd(u: &Unit) -> String {
         String::new(),
         "[Service]".to_string(),
         "Type=exec".to_string(),
-        format!("ExecStart={} serve {}", u.exe.display(), u.addr),
+        // No address: `serve` reads CUBA_HTTP_ADDR from the env file loaded
+        // below, and the .socket holds the one copy a unit can keep. A third
+        // copy here is what `--apply` could not update.
+        format!("ExecStart={} serve", u.exe.display()),
         "# Every knob lives in the env file, never here. A value pinned in a unit is a".to_string(),
         "# second source of truth for the defaults, and that is how a hand-written GPU".to_string(),
         "# ceiling beat the planner's measurement on every card this daemon ran on.".to_string(),
@@ -642,7 +684,7 @@ pub fn render_systemd(u: &Unit) -> String {
 }
 
 pub fn render_socket(u: &Unit) -> String {
-    joined(vec![
+    let mut socket = vec![
         "# Socket activation: this unit owns the port, so the daemon does not have to be"
             .to_string(),
         "# running to keep it. The first connection starts memory-industry.service.".to_string(),
@@ -661,14 +703,38 @@ pub fn render_socket(u: &Unit) -> String {
         String::new(),
         "[Socket]".to_string(),
         format!("ListenStream={}", u.addr),
+    ];
+    // At boot the LAN interface may not have its address yet, and without
+    // FreeBind systemd cannot open the socket on it. Loopback always exists, so
+    // there it would only hide a typo in the address.
+    if !u.addr.ip().is_loopback() {
+        socket.push("FreeBind=yes".to_string());
+    }
+    socket.extend([
         "Accept=no".to_string(),
         String::new(),
         "[Install]".to_string(),
         "WantedBy=default.target".to_string(),
-    ])
+    ]);
+    joined(socket)
+}
+
+/// `<dir of the env file>` + `LOG_BASENAME`, as text.
+///
+/// Cut at the last separator of EITHER kind rather than with `Path::parent`: the
+/// goldens are rendered on Linux from backslash paths, and a unix `Path` sees
+/// `%LOCALAPPDATA%\MemoryIndustry\memory-industry.env` as a single component,
+/// so its parent is empty and the log would land in whatever directory the
+/// task happened to start in.
+fn log_path_beside(env_file: &Path) -> String {
+    let env = env_file.to_string_lossy();
+    let directory_end = env.rfind(['/', '\\']).map_or(0, |at| at + 1);
+    format!("{}{LOG_BASENAME}", &env[..directory_end])
 }
 
 pub fn render_windows_launcher(u: &Unit) -> String {
+    let log = log_path_beside(&u.env_file);
+    let to_log = format!(">> \"{log}\" 2>&1");
     joined(vec![
         "@echo off".to_string(),
         "rem Generated by `memory-industry setup service`. Not edited by hand.".to_string(),
@@ -679,26 +745,45 @@ pub fn render_windows_launcher(u: &Unit) -> String {
             .to_string(),
         "rem 'ran', and the only symptom is a daemon that never appears.".to_string(),
         "setlocal".to_string(),
+        "rem The task runs as SYSTEM, which has no home of its own, and the model cache,"
+            .to_string(),
+        "rem nli, rerank and gpu all resolve their paths from it. It is set to the home of"
+            .to_string(),
+        "rem the user who installed BEFORE the env file is read, so the file can still".to_string(),
+        "rem override it; without it the daemon starts deaf and nothing says so.".to_string(),
+        format!("set \"USERPROFILE={}\"", u.home_dir.display()),
+        "rem The log is the only trace a daemon under SYSTEM leaves. Past 5 MiB it moves to"
+            .to_string(),
+        "rem the same name plus .1, replacing the previous one, at the next start. The exist"
+            .to_string(),
+        "rem test is not decoration: the size of a file that is not there is empty, and"
+            .to_string(),
+        "rem the comparison would be a syntax error on the very first start.".to_string(),
+        format!(
+            "if exist \"{log}\" for %%f in (\"{log}\") do if %%~zf gtr {LOG_ROTATE_BYTES} move /Y \"{log}\" \"{log}.1\" >nul"
+        ),
         // The same failure, one step earlier: `for /f` over a file that is not
         // there runs its body zero times and falls through, so a missing env
         // file would start exactly the empty daemon the lines above describe.
-        "rem Same failure, one step earlier: `for /f` over a file that is not there runs"
+        "rem A missing env file is the same failure one step earlier: `for /f` over a file"
             .to_string(),
-        "rem its body zero times and falls through, so a missing env file starts exactly"
+        "rem that is not there runs its body zero times and falls through, so the daemon"
             .to_string(),
-        "rem the empty daemon those lines describe. The exit code below is what reaches"
+        "rem would start exactly as empty as the one described above. The exit code below is"
             .to_string(),
-        "rem Task Scheduler's Last Run Result; falling through is what reports success."
+        "rem what reaches Task Scheduler's Last Run Result; falling through reports success."
             .to_string(),
         format!("if not exist \"{}\" (", u.env_file.display()),
         format!(
-            "  echo memory-industry: {} is not there.",
+            "  echo memory-industry: {} is not there. {to_log}",
             u.env_file.display()
         ),
-        "  echo Nothing would set DATABASE_URL or the bearer token, so the daemon would start"
-            .to_string(),
-        "  echo deaf and the task would report success. Run: memory-industry setup service --apply"
-            .to_string(),
+        format!(
+            "  echo Nothing would set DATABASE_URL or the bearer token, so the daemon would start {to_log}"
+        ),
+        format!(
+            "  echo deaf and the task would report success. Run: memory-industry setup service --apply {to_log}"
+        ),
         "  exit /b 1".to_string(),
         ")".to_string(),
         // eol=# skips the commented knobs; blank lines `for /f` skips already.
@@ -706,13 +791,18 @@ pub fn render_windows_launcher(u: &Unit) -> String {
             "for /f \"usebackq eol=# tokens=1,* delims==\" %%a in (\"{}\") do set \"%%a=%%b\"",
             u.env_file.display()
         ),
-        format!("\"{}\" serve {}", u.exe.display(), u.addr),
+        // No address: CUBA_HTTP_ADDR from the env file just loaded is the one
+        // the daemon binds. `exit /b %errorlevel%` hands Task Scheduler the
+        // daemon's own code; without it the redirect's success is what reports.
+        format!("\"{}\" serve {to_log}", u.exe.display()),
+        "exit /b %errorlevel%".to_string(),
     ])
 }
 
 /// Takes no `Unit`: the task is the same for every profile. The address lives
-/// in the `.cmd`, and the task's whole job is to run that file. A parameter
-/// this function never reads would claim there is a task per profile.
+/// in the env file the `.cmd` loads, and the task's whole job is to run that
+/// file. A parameter this function never reads would claim there is a task per
+/// profile.
 pub fn render_windows_task(launcher_path: &Path) -> String {
     joined(vec![
         // UTF-16, and the file really has to BE UTF-16LE with a BOM.
@@ -731,19 +821,33 @@ pub fn render_windows_task(launcher_path: &Path) -> String {
         "  <RegistrationInfo>".to_string(),
         "    <Description>MemoryIndustry — shared MCP knowledge-graph daemon</Description>"
             .to_string(),
-        "    <URI>\\memory-industry</URI>".to_string(),
+        format!("    <URI>\\{TASK_NAME}</URI>"),
         "  </RegistrationInfo>".to_string(),
         "  <Triggers>".to_string(),
+        "    <!-- At boot, with nobody logged in. The repetition is the second supervisor:"
+            .to_string(),
+        "         the restart policy below is unverified against a launcher that exits".to_string(),
+        "         non-zero, and a repeat while the daemon lives starts nothing because".to_string(),
+        "         MultipleInstancesPolicy is IgnoreNew. It never stops on its own. -->".to_string(),
+        "    <BootTrigger>".to_string(),
+        "      <Enabled>true</Enabled>".to_string(),
+        "      <Repetition>".to_string(),
+        "        <Interval>PT5M</Interval>".to_string(),
+        "        <StopAtDurationEnd>false</StopAtDurationEnd>".to_string(),
+        "      </Repetition>".to_string(),
+        "    </BootTrigger>".to_string(),
         "    <LogonTrigger>".to_string(),
         "      <Enabled>true</Enabled>".to_string(),
         "    </LogonTrigger>".to_string(),
         "  </Triggers>".to_string(),
         "  <Principals>".to_string(),
         "    <Principal id=\"Author\">".to_string(),
-        "      <LogonType>InteractiveToken</LogonType>".to_string(),
-        "      <!-- A per-user task needs no administrator, and asking for one turns a".to_string(),
-        "           silent install into a UAC prompt somebody has to be there to answer. -->"
-            .to_string(),
+        "      <!-- S-1-5-18 is SYSTEM: a service account, so the scheduler stores no".to_string(),
+        "           secret, and the task exists before anybody logs in. LeastPrivilege".to_string(),
+        "           because SYSTEM never has to ask for elevation. SYSTEM runs this".to_string(),
+        "           daemon with every right on the machine. -->".to_string(),
+        "      <UserId>S-1-5-18</UserId>".to_string(),
+        "      <LogonType>ServiceAccount</LogonType>".to_string(),
         "      <RunLevel>LeastPrivilege</RunLevel>".to_string(),
         "    </Principal>".to_string(),
         "  </Principals>".to_string(),
@@ -758,7 +862,8 @@ pub fn render_windows_task(launcher_path: &Path) -> String {
         "    <Hidden>false</Hidden>".to_string(),
         "    <RestartOnFailure>".to_string(),
         "      <Interval>PT1M</Interval>".to_string(),
-        "      <Count>3</Count>".to_string(),
+        // 999 is the largest count the schema takes.
+        "      <Count>999</Count>".to_string(),
         "    </RestartOnFailure>".to_string(),
         "  </Settings>".to_string(),
         "  <Actions Context=\"Author\">".to_string(),
@@ -851,11 +956,30 @@ pub fn render_plan(u: &Unit, target: Target, launcher_path: &Path) -> String {
         lines.push(format!("  {}", destination.display()));
     }
     lines.push(String::new());
+    lines.extend(firewall_plan_lines(u, target));
     lines.push("Y lo habilitarías con:".to_string());
     lines.push(format!("  {}", enable_command(target, root)));
     lines.push(String::new());
     lines.push("Esto fue un plan — no se tocó ningún fichero. Con --apply se instala.".to_string());
     joined(lines)
+}
+
+/// What the plan says about the firewall: nothing unless the install is for
+/// Windows and the address is one another machine can reach, because that is
+/// the only case where `--register` opens a port.
+fn firewall_plan_lines(u: &Unit, target: Target) -> Vec<String> {
+    let commands = if target.is_windows() {
+        firewall_commands(&u.addr)
+    } else {
+        Vec::new()
+    };
+    if commands.is_empty() {
+        return commands;
+    }
+    let mut lines = vec!["Abrirías el firewall con:".to_string()];
+    lines.extend(commands.into_iter().map(|command| format!("  {command}")));
+    lines.push(String::new());
+    lines
 }
 
 /// The command that turns the written files into a running daemon. Printed by
@@ -864,13 +988,70 @@ pub fn render_plan(u: &Unit, target: Target, launcher_path: &Path) -> String {
 pub fn enable_command(target: Target, root: &Path) -> String {
     if target.is_windows() {
         format!(
-            "schtasks /Create /XML \"{}\" /TN memory-industry",
+            "schtasks /Create /XML \"{}\" /TN {TASK_NAME} /F",
             root.join("memory-industry-task.xml").display()
         )
     } else {
         "systemctl --user daemon-reload && systemctl --user enable --now memory-industry.service"
             .to_string()
     }
+}
+
+/// The argv `--register` runs, and the shape of the line the plan prints.
+/// `/F` replaces an existing task instead of stopping to ask, which is what
+/// makes a second run harmless.
+pub fn schtasks_create_argv(xml: &Path) -> Vec<String> {
+    vec![
+        "schtasks".to_string(),
+        "/Create".to_string(),
+        "/XML".to_string(),
+        xml.display().to_string(),
+        "/TN".to_string(),
+        TASK_NAME.to_string(),
+        "/F".to_string(),
+    ]
+}
+
+fn netsh_firewall_rule(verb: &str, properties: &[String]) -> Vec<String> {
+    ["netsh", "advfirewall", "firewall", verb, "rule"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(properties.iter().cloned())
+        .collect()
+}
+
+/// Removes every rule of this name, so a second run and a changed port leave
+/// one rule and not two.
+pub fn firewall_delete_argv() -> Vec<String> {
+    netsh_firewall_rule("delete", &[format!("name={FIREWALL_RULE_NAME}")])
+}
+
+/// Inbound TCP on the daemon's port, private and domain networks only: `any`
+/// would open it on a public wifi.
+pub fn firewall_add_argv(port: u16) -> Vec<String> {
+    netsh_firewall_rule(
+        "add",
+        &[
+            format!("name={FIREWALL_RULE_NAME}"),
+            "dir=in".to_string(),
+            "action=allow".to_string(),
+            "protocol=TCP".to_string(),
+            format!("localport={port}"),
+            "profile=private,domain".to_string(),
+        ],
+    )
+}
+
+/// `[]` when nothing outside this machine can reach the address; otherwise
+/// `[delete, add]`, as the lines the plan prints and `--register` runs.
+pub fn firewall_commands(addr: &SocketAddr) -> Vec<String> {
+    if addr.ip().is_loopback() {
+        return Vec::new();
+    }
+    vec![
+        firewall_delete_argv().join(" "),
+        firewall_add_argv(addr.port()).join(" "),
+    ]
 }
 
 fn basename(relative: &str) -> &str {
@@ -1143,7 +1324,106 @@ mod tests {
                 ("CUBA_MODE".to_string(), "completo".to_string()),
             ],
             why: "cuda — runtime GPU y GPU detectados · colocación: reranker=gpu".to_string(),
+            home_dir: PathBuf::from(if windows {
+                "C:\\Users\\operador"
+            } else {
+                "/home/operador"
+            }),
         }
+    }
+
+    /// A directory the host's own `Path` can take apart. `lan_unit` spells its
+    /// Windows paths with backslashes, which a unix `Path` sees as ONE component:
+    /// `parent()` of them is empty, so a log "beside the env file" cannot be
+    /// derived from them on the machine that runs this gate.
+    fn native_root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) {
+            "C:\\opt\\mi"
+        } else {
+            "/opt/mi"
+        })
+    }
+
+    /// A Windows unit whose exe and env file live under `native_root()`, so the
+    /// log the launcher writes has a directory the host can name.
+    fn windows_unit_at_native_root() -> Unit {
+        let root = native_root();
+        let mut unit = lan_unit(Target::Windows, &"a".repeat(64));
+        unit.exe = root.join("memory-industry.exe");
+        unit.env_file = root.join(ENV_BASENAME);
+        unit
+    }
+
+    /// The same, on 127.0.0.1: what a loopback install resolves to.
+    fn loopback_unit(target: Target) -> Unit {
+        let mut unit = lan_unit(target, &"a".repeat(64));
+        unit.profile = Profile::Loopback;
+        unit.token = None;
+        unit.addr = addr(DEFAULT_LOOPBACK_ADDR);
+        unit
+    }
+
+    /// What sits between `<tag>` and `</tag>`. A tag the render lost is a panic
+    /// that quotes the XML, not an empty string that satisfies an absence check.
+    fn xml_block<'a>(xml: &'a str, tag: &str) -> &'a str {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let start = xml
+            .find(&open)
+            .unwrap_or_else(|| panic!("the task XML has no {open}:\n{xml}"))
+            + open.len();
+        let end = xml[start..]
+            .find(&close)
+            .unwrap_or_else(|| panic!("the task XML opens {open} and never closes it:\n{xml}"))
+            + start;
+        &xml[start..end]
+    }
+
+    /// The names of the elements directly under a block, comments skipped.
+    fn direct_children(block: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut depth = 0usize;
+        let mut rest = block;
+        while let Some(open) = rest.find('<') {
+            rest = &rest[open..];
+            if let Some(comment) = rest.strip_prefix("<!--") {
+                rest = comment.split_once("-->").map_or("", |(_, after)| after);
+                continue;
+            }
+            let end = rest.find('>').expect("every tag in the render is closed");
+            let tag = &rest[1..end];
+            rest = &rest[end + 1..];
+            if tag.starts_with('/') {
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            if depth == 0 {
+                names.push(tag.split([' ', '/']).next().unwrap_or(tag).to_string());
+            }
+            if !tag.ends_with('/') {
+                depth += 1;
+            }
+        }
+        names
+    }
+
+    /// The lines of one `[Section]` of a unit file, header excluded.
+    fn section<'a>(unit_file: &'a str, header: &str) -> Vec<&'a str> {
+        unit_file
+            .lines()
+            .skip_while(|l| *l != header)
+            .skip(1)
+            .take_while(|l| !l.starts_with('['))
+            .collect()
+    }
+
+    /// The index of the launcher line that starts the daemon: the quoted exe,
+    /// then `serve`.
+    fn launch_line(cmd: &str, unit: &Unit) -> usize {
+        let start = format!("\"{}\" serve", unit.exe.display());
+        cmd.lines()
+            .position(|l| l.trim_start().starts_with(&start))
+            .unwrap_or_else(|| panic!("no line of the launcher starts {start}:\n{cmd}"))
     }
 
     fn launcher_for(target: Target) -> PathBuf {
@@ -1812,10 +2092,19 @@ mod tests {
             "ExecStart has to name the binary this install resolved, not one a golden rendered \
              on somebody else's machine: {exec}"
         );
+        assert_eq!(
+            exec,
+            format!("ExecStart={} serve", unit.exe.display()),
+            "ExecStart carries no address (S-5): `serve` reads CUBA_HTTP_ADDR from the env file, \
+             so the address lives in one place. An address here is the second source that \
+             `--apply` rewrites in the env file and not in the unit, and the daemon then listens \
+             where the operator did not ask"
+        );
         assert!(
-            exec.contains(&unit.addr.to_string()),
-            "and the address this install chose, or systemd brings the daemon up on a port no \
-             client was told about: {exec}"
+            !exec.contains(&unit.addr.to_string()),
+            "the unit repeats {} and the env file says it too; they drift the first time one of \
+             them is edited: {exec}",
+            unit.addr
         );
 
         let Some(env_line) = systemd.lines().find(|l| l.starts_with("EnvironmentFile=")) else {
@@ -1859,10 +2148,20 @@ mod tests {
             "the socket unit listens on the address this install chose, or it hands `serve` an \
              fd for a port nobody dials — and the daemon is then up and unreachable at once"
         );
+        let service = render_systemd(&unit);
         assert!(
-            render_systemd(&unit).contains(&format!("serve {}", unit.addr)),
-            "which is the same address the service is told to serve. Two addresses here is \
-             socket activation handing over the wrong port, and neither file says so"
+            !service.contains(&unit.addr.to_string()),
+            "the service must NOT repeat the address the socket holds (S-5): a unit cannot read \
+             the env file, so the .socket is the one place systemd keeps it, and `--apply` \
+             rewrites that .socket. Two copies here is socket activation handing over one port \
+             while `serve` is told another, and neither file says so:\n{service}"
+        );
+        assert!(
+            service
+                .lines()
+                .any(|l| l.starts_with("ExecStart=") && l.ends_with(" serve")),
+            "the service still starts `serve`, just without an address to disagree with the \
+             socket:\n{service}"
         );
         assert!(
             socket.contains(REPO_URL),
@@ -1953,6 +2252,12 @@ mod tests {
         assert!(
             windows.contains("schtasks /Create /XML"),
             "and there is no systemd on windows: {windows}"
+        );
+        assert!(
+            windows.ends_with(" /F"),
+            "the command is printed for an operator who runs it twice, and `schtasks /Create` \
+             without /F stops to ask whether to overwrite the task — a prompt nobody is there \
+             to answer when `--register` runs the same argv: {windows}"
         );
         assert!(
             windows.contains(&root.join("memory-industry-task.xml").display().to_string()),
@@ -2271,13 +2576,533 @@ mod tests {
         );
         assert!(
             xml.contains("LeastPrivilege"),
-            "a per-user task needs no administrator, and asking for one turns a silent install \
-             into a UAC prompt the operator has to be there to answer:\n{xml}"
+            "SYSTEM needs no elevation request, and asking for one turns a silent install into \
+             a UAC prompt the operator has to be there to answer:\n{xml}"
         );
         assert!(
             !xml.contains("HighestAvailable"),
             "nothing here needs elevation:\n{xml}"
         );
+    }
+
+    // --- 0.29.0 · slice A: the task survives a reboot nobody logs in to ---------
+
+    #[test]
+    fn the_task_runs_as_system_with_no_stored_password() {
+        let xml = render_windows_task(&launcher_for(Target::Windows));
+        let principals = xml_block(&xml, "Principals");
+
+        assert_eq!(
+            principals.matches("<Principal ").count(),
+            1,
+            "exactly one principal runs this task; a second one is a second account whose \
+             rights nobody reviewed:\n{principals}"
+        );
+        assert!(
+            xml.contains("<UserId>S-1-5-18</UserId>"),
+            "S-1 (S-1-5-18 is SYSTEM): a per-user principal only exists once somebody logs in, \
+             and the point of 0.29.0 is a daemon that is back after a reboot nobody logs in \
+             to:\n{xml}"
+        );
+        assert!(
+            xml.contains("<LogonType>ServiceAccount</LogonType>"),
+            "SYSTEM is a service account: any other LogonType makes schtasks ask for a \
+             password this installer does not have:\n{xml}"
+        );
+        assert!(
+            xml.contains("<RunLevel>LeastPrivilege</RunLevel>"),
+            "SYSTEM never has to ask for elevation, and HighestAvailable would only turn the \
+             install into a UAC prompt:\n{xml}"
+        );
+        for forbidden in ["InteractiveToken", "<Password>", "HighestAvailable"] {
+            assert!(
+                !xml.contains(forbidden),
+                "the task XML mentions {forbidden}. InteractiveToken needs a session, a \
+                 <Password> would be stored in the scheduler, and HighestAvailable is the UAC \
+                 prompt:\n{xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_task_fires_at_boot_and_at_logon_and_keeps_asking_in_between() {
+        let xml = render_windows_task(&launcher_for(Target::Windows));
+        let triggers = xml_block(&xml, "Triggers");
+
+        let mut children = direct_children(triggers);
+        children.sort();
+        assert_eq!(
+            children,
+            ["BootTrigger", "LogonTrigger"],
+            "the task needs BOTH: BootTrigger brings the daemon up with nobody logged in, \
+             LogonTrigger covers the session that starts after a task that was disabled or \
+             stopped. Only {children:?} found:\n{triggers}"
+        );
+
+        for name in ["BootTrigger", "LogonTrigger"] {
+            assert!(
+                xml_block(triggers, name).contains("<Enabled>true</Enabled>"),
+                "{name} exists and is not enabled, which is the same as not having it:\n{triggers}"
+            );
+        }
+
+        let boot = xml_block(triggers, "BootTrigger");
+        assert!(
+            boot.contains("<Repetition>") && boot.contains("<Interval>PT5M</Interval>"),
+            "S-2: RestartOnFailure is unverified against a .cmd that exits non-zero, so the \
+             boot trigger re-fires every five minutes. With MultipleInstancesPolicy=IgnoreNew \
+             a repeat while the daemon lives starts nothing; without it a crashed daemon that \
+             the scheduler did not restart stays down:\n{boot}"
+        );
+        assert!(
+            boot.contains("<StopAtDurationEnd>false</StopAtDurationEnd>"),
+            "the repetition must not stop after a duration, or the supervisor retires itself \
+             and the daemon is left down for good:\n{boot}"
+        );
+    }
+
+    #[test]
+    fn the_task_restarts_without_a_practical_limit_and_never_duplicates_the_daemon() {
+        let xml = render_windows_task(&launcher_for(Target::Windows));
+        let settings = xml_block(&xml, "Settings");
+        let restart = xml_block(settings, "RestartOnFailure");
+
+        assert!(
+            restart.contains("<Interval>PT1M</Interval>"),
+            "one minute between restarts: shorter hammers a daemon that fails for want of a \
+             resource that is not up yet, longer leaves the clients without it:\n{restart}"
+        );
+        assert!(
+            restart.contains("<Count>999</Count>"),
+            "999 is the largest count the schema takes. The old 3 meant a daemon that died four \
+             times in a bad minute stayed dead until somebody noticed:\n{restart}"
+        );
+        assert!(
+            settings.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"),
+            "the BootTrigger repetition and the LogonTrigger both fire while the daemon lives; \
+             anything but IgnoreNew starts a second daemon on the same port:\n{settings}"
+        );
+        assert!(
+            settings.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"),
+            "the daemon is meant to run forever; the scheduler's default limit would kill it \
+             after three days:\n{settings}"
+        );
+    }
+
+    #[test]
+    fn a_real_render_does_not_lean_on_variables_that_mean_another_thing_for_system() {
+        let unit = lan_unit(Target::Windows, &"a".repeat(64));
+        let launcher_path = launcher_for(Target::Windows);
+        let cmd = render_windows_launcher(&unit);
+        let xml = render_windows_task(&launcher_path);
+
+        for (name, body) in [("launcher", &cmd), ("task XML", &xml)] {
+            for variable in ["%LOCALAPPDATA%", "%APPDATA%", "%USERPROFILE%", "%HOME%"] {
+                assert!(
+                    !body.contains(variable),
+                    "the {name} of a real install holds {variable}. For SYSTEM that expands to \
+                     C:\\Windows\\System32\\config\\systemprofile, where nothing is installed \
+                     and nothing says so (S-3):\n{body}"
+                );
+            }
+        }
+
+        let commanded = xml_block(&xml, "Command").trim();
+        assert_eq!(
+            commanded,
+            launcher_path.display().to_string(),
+            "the task runs the absolute path of the .cmd --apply wrote, and nothing it has to \
+             expand"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_env_bakes_absolute_paths_and_the_users_home_into_a_windows_unit() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("absolute-paths");
+        let _pinned = pinned_install_root(&scratch);
+
+        let unit = Unit::from_env(Profile::Loopback, Target::Windows, None, None)
+            .expect("a loopback windows install needs a home and LOCALAPPDATA");
+
+        assert_eq!(
+            unit.home_dir, scratch.0,
+            "S-4: the unit carries the home of the user who INSTALLS. SYSTEM has none, so \
+             the launcher has to hand it over or the models, the NLI cache and the GPU probe \
+             look under the wrong directory and the daemon starts deaf"
+        );
+
+        let cmd = render_windows_launcher(&unit);
+        let xml = render_windows_task(&unit.env_file.with_file_name(LAUNCHER_BASENAME));
+        for (name, body) in [("launcher", &cmd), ("task XML", &xml)] {
+            for variable in ["%LOCALAPPDATA%", "%APPDATA%", "%USERPROFILE%", "%HOME%"] {
+                assert!(
+                    !body.contains(variable),
+                    "from_env put {variable} in the {name} instead of the path it resolved \
+                     (S-3). For SYSTEM it expands to a directory with nothing in it:\n{body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_launcher_sets_the_users_home_before_it_reads_the_env_file() {
+        let unit = lan_unit(Target::Windows, &"a".repeat(64));
+        let cmd = render_windows_launcher(&unit);
+        let lines: Vec<&str> = cmd.lines().collect();
+
+        let set_home = lines
+            .iter()
+            .position(|l| l.trim() == "set \"USERPROFILE=C:\\Users\\operador\"")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the launcher never sets USERPROFILE to the installing user's home \
+                     (S-4). Under SYSTEM the model cache, nli, rerank and gpu all resolve \
+                     their paths from it:\n{cmd}"
+                )
+            });
+        let setlocal = lines
+            .iter()
+            .position(|l| l.trim() == "setlocal")
+            .expect("the launcher scopes its variables with setlocal");
+        let reads_env = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("for /f"))
+            .expect("the launcher loads the env file with for /f");
+        let runs = launch_line(&cmd, &unit);
+
+        assert!(
+            setlocal < set_home,
+            "set before setlocal leaks USERPROFILE into the parent shell of whoever runs the \
+             .cmd by hand:\n{cmd}"
+        );
+        assert!(
+            set_home < reads_env,
+            "the home goes BEFORE `for /f`, so the env file can still override it (an operator \
+             who needs another profile directory writes USERPROFILE there). After it, the \
+             launcher silently wins over the file it is supposed to obey:\n{cmd}"
+        );
+        assert!(
+            reads_env < runs,
+            "and the env file is read before the daemon starts:\n{cmd}"
+        );
+    }
+
+    #[test]
+    fn the_address_lives_in_the_env_file_and_the_launcher_and_the_service_do_not_repeat_it() {
+        let windows = lan_unit(Target::Windows, &"a".repeat(64));
+        let cmd = render_windows_launcher(&windows);
+        let launch = cmd
+            .lines()
+            .nth(launch_line(&cmd, &windows))
+            .expect("launch_line indexes a line of this launcher");
+        let after_serve = launch
+            .trim_start()
+            .strip_prefix(&format!("\"{}\" serve", windows.exe.display()))
+            .expect("launch_line found a line that starts this way");
+
+        assert!(
+            after_serve.trim_start().starts_with(">>"),
+            "D-c: the launcher runs `\"exe\" serve` and nothing else but the redirect to the \
+             log. An address after `serve` beats CUBA_HTTP_ADDR from the env file, which is how \
+             `--apply` used to put a LAN install back on 127.0.0.1: `{launch}`"
+        );
+
+        let linux = lan_unit(Target::Linux, &"a".repeat(64));
+        let service = render_systemd(&linux);
+        let exec = service
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("a unit with no ExecStart starts nothing");
+        assert_eq!(
+            exec,
+            format!("ExecStart={} serve", linux.exe.display()),
+            "S-5: the same drift on Linux. The address is read from the env file"
+        );
+
+        for (name, body) in [("launcher", &cmd), ("service", &service)] {
+            assert!(
+                !body.contains("192.168.0.10"),
+                "the {name} names the LAN address. It is rendered into the env file and, for \
+                 systemd, into the .socket; any other copy is the one that goes stale:\n{body}"
+            );
+        }
+
+        let env_file = render_env_file(&windows);
+        assert!(
+            env_file
+                .lines()
+                .any(|l| l == "CUBA_HTTP_ADDR=192.168.0.10:8787"),
+            "the env file is the one place the address is written for `serve`:\n{env_file}"
+        );
+        assert!(
+            render_socket(&linux)
+                .lines()
+                .any(|l| l == "ListenStream=192.168.0.10:8787"),
+            "a unit cannot read the env file, so the .socket keeps the address it listens on"
+        );
+    }
+
+    #[test]
+    fn the_launcher_appends_the_daemons_output_to_a_log_beside_the_env_file() {
+        let unit = windows_unit_at_native_root();
+        let cmd = render_windows_launcher(&unit);
+        let log = native_root().join("memory-industry.log");
+        let lines: Vec<&str> = cmd.lines().collect();
+        let runs = launch_line(&cmd, &unit);
+
+        assert!(
+            lines[runs].ends_with(&format!(">> \"{}\" 2>&1", log.display())),
+            "S-6: with no redirect, whatever the daemon prints under SYSTEM goes nowhere, and a \
+             daemon that dies at startup leaves no trace. The log sits in the env file's \
+             directory, appended, with stderr in it: `{}`",
+            lines[runs]
+        );
+        assert_eq!(
+            lines.get(runs + 1).map(|l| l.trim()),
+            Some("exit /b %errorlevel%"),
+            "the launcher has to leave with the daemon's own code: that is what reaches Task \
+             Scheduler's Last Run Result and decides whether RestartOnFailure fires. Falling \
+             off the end of a .cmd reports the redirect's success instead:\n{cmd}"
+        );
+    }
+
+    #[test]
+    fn the_launcher_rotates_the_log_at_five_mebibytes_before_it_starts_the_daemon() {
+        let unit = windows_unit_at_native_root();
+        let cmd = render_windows_launcher(&unit);
+        let log = native_root().join("memory-industry.log");
+        let runs = launch_line(&cmd, &unit);
+
+        let rotation = cmd.lines().take(runs).find(|l| {
+            l.split(|c: char| !c.is_ascii_digit())
+                .any(|number| number == "5242880")
+        });
+        let Some(rotation) = rotation else {
+            panic!(
+                "no line before the daemon starts compares the log with 5242880 bytes (5 MiB). \
+                 Without it the log grows for as long as the machine lives:\n{cmd}"
+            );
+        };
+        let lowered = rotation.to_lowercase();
+
+        assert!(
+            lowered.contains("exist"),
+            "`%%~zf` of a log that does not exist yet is empty and the comparison is a syntax \
+             error, so the first start after an install would fail on its own rotation: \
+             `{rotation}`"
+        );
+        assert!(
+            lowered.contains("move /y"),
+            "rotating is moving, and /Y is what lets it replace the previous .1 instead of \
+             stopping to ask a question nobody answers under SYSTEM: `{rotation}`"
+        );
+        assert!(
+            rotation.contains(&format!("\"{}\"", log.display()))
+                && rotation.contains(&format!("\"{}.1\"", log.display())),
+            "the log moves to <log>.1, in the same directory: `{rotation}`"
+        );
+    }
+
+    #[test]
+    fn the_launchers_refusal_is_written_to_the_log_and_still_exits_non_zero() {
+        let unit = windows_unit_at_native_root();
+        let cmd = render_windows_launcher(&unit);
+        let log = native_root().join("memory-industry.log");
+        let lines: Vec<&str> = cmd.lines().collect();
+
+        let guard = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("if not exist"))
+            .expect("the launcher guards against a missing env file");
+        let refuses = lines
+            .iter()
+            .position(|l| l.trim() == "exit /b 1")
+            .expect("the guard ends the script non-zero");
+        assert!(guard < refuses, "the refusal follows its guard:\n{cmd}");
+
+        let echoes: Vec<&&str> = lines[guard..refuses]
+            .iter()
+            .filter(|l| l.trim_start().starts_with("echo"))
+            .collect();
+        assert!(
+            !echoes.is_empty(),
+            "the guard says why it refuses; with no message the task just fails:\n{cmd}"
+        );
+        for echo in echoes {
+            assert!(
+                echo.contains(&format!(">> \"{}\"", log.display())),
+                "S-6: this refusal is the one message that explains an env file that is not \
+                 there, and under SYSTEM a console nobody reads is where it would go. Each echo \
+                 of the guard is appended to the log: `{echo}`"
+            );
+        }
+        assert_eq!(
+            lines.get(refuses + 1).map(|l| l.trim()),
+            Some(")"),
+            "and the block still ends in `exit /b 1`:\n{cmd}"
+        );
+    }
+
+    #[test]
+    fn the_socket_may_be_opened_before_its_address_exists_only_when_that_address_is_routable() {
+        let lan = render_socket(&lan_unit(Target::Linux, &"a".repeat(64)));
+        assert!(
+            section(&lan, "[Socket]").contains(&"FreeBind=yes"),
+            "S-5/A8: at boot the LAN interface may not have its address yet, and without \
+             FreeBind systemd cannot open the socket on it, so the daemon is down until a \
+             human restarts the socket:\n{lan}"
+        );
+
+        let loopback = render_socket(&loopback_unit(Target::Linux));
+        assert!(
+            section(&loopback, "[Socket]").contains(&"ListenStream=127.0.0.1:8787"),
+            "anchor: this really is the loopback socket:\n{loopback}"
+        );
+        assert!(
+            !loopback.contains("FreeBind"),
+            "127.0.0.1 always exists. FreeBind there only hides a typo in the address that \
+             would otherwise fail at once:\n{loopback}"
+        );
+    }
+
+    #[test]
+    fn what_is_printed_is_what_register_would_run() {
+        let root = native_root();
+        let xml = root.join("memory-industry-task.xml").display().to_string();
+
+        assert_eq!(
+            schtasks_create_argv(&root.join("memory-industry-task.xml")),
+            [
+                "schtasks",
+                "/Create",
+                "/XML",
+                xml.as_str(),
+                "/TN",
+                "memory-industry",
+                "/F"
+            ],
+            "the argv `--register` runs: /F so a second run replaces the task instead of \
+             prompting, and the name the QA steps (`schtasks /Query /TN memory-industry`) look \
+             for"
+        );
+        assert_eq!(
+            enable_command(Target::Windows, &root),
+            format!("schtasks /Create /XML \"{xml}\" /TN memory-industry /F"),
+            "the command that is printed is the argv that is run, quoted for a console; two \
+             spellings are how the printed one stops working while `--register` still does"
+        );
+
+        assert_eq!(
+            firewall_delete_argv(),
+            [
+                "netsh",
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                "name=memory-industry"
+            ],
+            "S-8: the delete goes first, so a second run and a changed port leave ONE rule"
+        );
+
+        let add = firewall_add_argv(8787);
+        assert_eq!(
+            add.iter().take(5).map(String::as_str).collect::<Vec<_>>(),
+            ["netsh", "advfirewall", "firewall", "add", "rule"],
+            "the add is a netsh advfirewall rule: {add:?}"
+        );
+        let mut properties: Vec<&str> = add.iter().skip(5).map(String::as_str).collect();
+        properties.sort_unstable();
+        assert_eq!(
+            properties,
+            [
+                "action=allow",
+                "dir=in",
+                "localport=8787",
+                "name=memory-industry",
+                "profile=private,domain",
+                "protocol=TCP"
+            ],
+            "inbound TCP on the daemon's port, allowed on private and domain networks only: \
+             `profile=any` would open it on a café's wifi. Found {add:?}"
+        );
+    }
+
+    #[test]
+    fn the_firewall_is_opened_only_for_an_address_somebody_else_can_reach() {
+        assert!(
+            firewall_commands(&addr(DEFAULT_LOOPBACK_ADDR)).is_empty(),
+            "nothing reaches 127.0.0.1 from outside, so there is no door to open (S-8)"
+        );
+
+        let commands = firewall_commands(&addr(ROUTABLE));
+        assert_eq!(
+            commands,
+            [
+                firewall_delete_argv().join(" "),
+                firewall_add_argv(8787).join(" ")
+            ],
+            "[delete, add], in that order and spelled as the argv that runs: add first and the \
+             delete removes the rule that was just made"
+        );
+        let delete = commands.first().cloned().unwrap_or_default();
+        assert!(
+            delete.starts_with("netsh advfirewall firewall delete rule"),
+            "anchor: the list holds the netsh commands and not empty strings: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn the_plan_prints_the_firewall_commands_only_for_a_routable_windows_install() {
+        let root = native_root();
+        let launcher = root.join(LAUNCHER_BASENAME);
+
+        let lan = render_plan(
+            &lan_unit(Target::Windows, &"a".repeat(64)),
+            Target::Windows,
+            &launcher,
+        );
+        let commands = firewall_commands(&addr(ROUTABLE));
+        assert_eq!(commands.len(), 2, "anchor: a LAN address has two commands");
+        for command in &commands {
+            assert!(
+                lan.contains(command.as_str()),
+                "the plan has to print `{command}`: the operator reads the plan to see what \
+                 `--register` is going to do to the firewall:\n{lan}"
+            );
+        }
+
+        let loopback = render_plan(&loopback_unit(Target::Windows), Target::Windows, &launcher);
+        assert!(
+            !loopback.contains("netsh"),
+            "a loopback plan opens no port, so it must not talk about the firewall:\n{loopback}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_windows_install_without_a_home_refuses_naming_both_variables() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("no-home");
+        let _local_app_data =
+            crate::envs::ScopedEnv::set("LOCALAPPDATA", &scratch.0.display().to_string());
+        let _home = crate::envs::ScopedEnv::cleared("HOME");
+        let _profile = crate::envs::ScopedEnv::cleared("USERPROFILE");
+
+        let said = Unit::from_env(Profile::Loopback, Target::Windows, None, None)
+            .expect_err(
+                "S-4: with LOCALAPPDATA and no home the old code installed anyway, and the \
+                 daemon SYSTEM starts cannot find a single model. It has to refuse",
+            )
+            .to_string();
+
+        for variable in ["HOME", "USERPROFILE"] {
+            assert!(
+                said.contains(variable),
+                "the refusal has to name {variable} or the operator defines the wrong one: \
+                 {said}"
+            );
+        }
     }
 
     // --- The flags: what `setup service` was asked for --------------------------
