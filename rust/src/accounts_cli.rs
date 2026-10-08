@@ -1,12 +1,15 @@
 //! `memory-industry account …`: the host operator's side of accounts and pairing codes.
 //!
-//! PASS-1 STUB: `parse`, `render_list` and `render_pair` exist so the inline tests below
-//! compile; they fail on purpose until pass 2 writes them. `run_cli` is still the slice-P
-//! skeleton (`--help` works, everything else is "not implemented yet").
+//! It talks to the database directly, like `sync` and `project`, and never needs the daemon or
+//! its token. Nothing it prints can log anyone in: a device is named by the first 8 hex of its
+//! credential id, and the one secret that exists, the pairing code, is printed once, by `pair`.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, Utc};
+use serde_json::json;
+use sqlx::PgPool;
 
-use crate::accounts_db::{AccountSummary, IssuedCode};
+use crate::accounts_db::{self, AccountSummary, IssuedCode};
 
 const USAGE: &str = "usage: memory-industry account <add|list|revoke|revoke-device|pair> …\n\n\
 Run on the host. Accounts authenticate and attribute; they do not partition the graph.";
@@ -33,19 +36,245 @@ pub enum Command {
     Help,
 }
 
-// PASS-1 STUB
-pub fn parse(_args: &[String]) -> Result<Command> {
-    bail!("PASS-1 STUB: account argument parsing is not implemented yet (slice F, pass 2)")
+/// What `scan` found: the plain arguments in order, and the two options a command may take.
+#[derive(Default)]
+struct Scanned {
+    positional: Vec<String>,
+    json: bool,
+    device: Option<String>,
 }
 
-// PASS-1 STUB
-pub fn render_list(_accounts: &[AccountSummary], _json: bool) -> String {
-    String::new()
+/// An option that carries something: `--json` is a switch, `--device` takes the next argument.
+fn take_option<'a>(
+    out: &mut Scanned,
+    option: &str,
+    rest: &mut impl Iterator<Item = &'a String>,
+) -> Result<()> {
+    if option == "--json" {
+        out.json = true;
+        return Ok(());
+    }
+    let value = rest
+        .next()
+        .ok_or_else(|| anyhow!("{option} needs a value"))?;
+    out.device = Some(value.clone());
+    Ok(())
 }
 
-// PASS-1 STUB
-pub fn render_pair(_issued: &IssuedCode) -> String {
-    String::new()
+/// Splits `rest` into positional arguments and the `allowed` options. An option nobody asked
+/// for is refused by name: a typo in `--device` must not mint a code for the wrong device.
+fn scan(rest: &[String], allowed: &[&str]) -> Result<Scanned> {
+    let mut out = Scanned::default();
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        if !arg.starts_with("--") {
+            out.positional.push(arg.clone());
+        } else if !allowed.contains(&arg.as_str()) {
+            bail!("unknown option {arg} (see `memory-industry account --help`)");
+        } else {
+            take_option(&mut out, arg, &mut it)?;
+        }
+    }
+    Ok(out)
+}
+
+/// `scan`, then exactly one positional argument for each of `names`.
+fn scan_exact(rest: &[String], allowed: &[&str], names: &[&str]) -> Result<Scanned> {
+    let scanned = scan(rest, allowed)?;
+    if let Some(missing) = names.get(scanned.positional.len()) {
+        bail!("missing {missing} (see `memory-industry account --help`)");
+    }
+    if let Some(extra) = scanned.positional.get(names.len()) {
+        bail!("unexpected argument {extra:?} (see `memory-industry account --help`)");
+    }
+    Ok(scanned)
+}
+
+fn one_name(rest: &[String]) -> Result<String> {
+    Ok(scan_exact(rest, &[], &["account name"])?
+        .positional
+        .remove(0))
+}
+
+fn parse_revoke_device(rest: &[String]) -> Result<Command> {
+    let mut s = scan_exact(rest, &[], &["account name", "device label"])?;
+    let label = s.positional.remove(1);
+    Ok(Command::RevokeDevice {
+        name: s.positional.remove(0),
+        label,
+    })
+}
+
+fn parse_pair(rest: &[String]) -> Result<Command> {
+    let mut s = scan_exact(rest, &["--device"], &["account name"])?;
+    Ok(Command::Pair {
+        name: s.positional.remove(0),
+        device: s.device,
+    })
+}
+
+pub fn parse(args: &[String]) -> Result<Command> {
+    let Some((sub, rest)) = args.split_first() else {
+        return Ok(Command::Help);
+    };
+    match sub.as_str() {
+        "-h" | "--help" | "help" => Ok(Command::Help),
+        "add" => Ok(Command::Add {
+            name: one_name(rest)?,
+        }),
+        "revoke" => Ok(Command::Revoke {
+            name: one_name(rest)?,
+        }),
+        "list" => Ok(Command::List {
+            json: scan_exact(rest, &["--json"], &[])?.json,
+        }),
+        "revoke-device" => parse_revoke_device(rest),
+        "pair" => parse_pair(rest),
+        other => bail!("unknown account command {other:?} (see `memory-industry account --help`)"),
+    }
+}
+
+fn when(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M UTC").to_string()
+}
+
+/// The first 8 hex of a credential id: enough to tell devices apart, half of nothing a bearer needs.
+fn short_id(id: &uuid::Uuid) -> String {
+    id.simple().to_string()[..8].to_string()
+}
+
+fn state_of(revoked_at: Option<DateTime<Utc>>) -> &'static str {
+    if revoked_at.is_some() {
+        "revoked"
+    } else {
+        "active"
+    }
+}
+
+fn list_json(accounts: &[AccountSummary]) -> serde_json::Value {
+    accounts
+        .iter()
+        .map(|a| {
+            let devices: Vec<_> = a
+                .credentials
+                .iter()
+                .map(|c| {
+                    json!({
+                        "id": short_id(&c.id),
+                        "label": c.device_label,
+                        "state": state_of(c.revoked_at),
+                        "created_at": c.created_at,
+                        "last_seen_at": c.last_seen_at,
+                    })
+                })
+                .collect();
+            json!({
+                "name": a.name,
+                "state": state_of(a.revoked_at),
+                "created_at": a.created_at,
+                "credentials": devices,
+            })
+        })
+        .collect()
+}
+
+fn list_text(accounts: &[AccountSummary]) -> String {
+    if accounts.is_empty() {
+        return "no accounts yet: create one with `memory-industry account add <name>`".into();
+    }
+    let mut out = String::new();
+    for a in accounts {
+        let state = state_of(a.revoked_at);
+        out.push_str(&format!(
+            "{}  {state}  created {}\n",
+            a.name,
+            when(a.created_at)
+        ));
+        for c in &a.credentials {
+            let state = state_of(c.revoked_at);
+            let seen = c.last_seen_at.map_or("never".to_string(), when);
+            out.push_str(&format!(
+                "  {}  {}  {state}  last seen {seen}\n",
+                short_id(&c.id),
+                c.device_label
+            ));
+        }
+    }
+    out
+}
+
+pub fn render_list(accounts: &[AccountSummary], json: bool) -> String {
+    if json {
+        return serde_json::to_string_pretty(&list_json(accounts)).unwrap_or_default();
+    }
+    list_text(accounts)
+}
+
+/// The code appears once, inside the command the client types, so the operator can read it out
+/// whole; the fingerprint lets the client check by eye that it reached the right host. The
+/// expiry is cut to the minute, which can only make it earlier than the real one.
+pub fn render_pair(issued: &IssuedCode) -> String {
+    format!(
+        "Pairing code issued. It is shown only now and is stored only as a key.\n\n\
+         On the client, run:\n\n  memory-industry bridge pair {}\n\n\
+         Host fingerprint: {} (the client prints the same one; compare them)\n\
+         valid until {} (24 hours, single use)\n",
+        issued.code,
+        issued.fingerprint,
+        when(issued.expires_at)
+    )
+}
+
+async fn pool() -> Result<PgPool> {
+    let url = crate::setup::resolve_database_url().await;
+    crate::db::create_pool(&url)
+        .await
+        .map_err(|e| e.context("connecting to database"))
+}
+
+async fn pair(pool: &PgPool, name: &str, device: Option<&str>, now: DateTime<Utc>) -> Result<()> {
+    let issued = accounts_db::issue_pairing_code(pool, name, device, now).await?;
+    print!("{}", render_pair(&issued));
+    Ok(())
+}
+
+async fn revoke(pool: &PgPool, name: &str, now: DateTime<Utc>) -> Result<()> {
+    let report = accounts_db::revoke_account(pool, name, now).await?;
+    println!(
+        "revoked account {name:?}: {} device(s) revoked, {} unused pairing code(s) deleted",
+        report.credentials_revoked, report.codes_deleted
+    );
+    Ok(())
+}
+
+async fn revoke_device(pool: &PgPool, name: &str, label: &str, now: DateTime<Utc>) -> Result<()> {
+    let revoked = accounts_db::revoke_device(pool, name, label, now).await?;
+    println!("revoked {revoked} device(s) labelled {label:?} on account {name:?}");
+    Ok(())
+}
+
+async fn execute(pool: &PgPool, command: Command, now: DateTime<Utc>) -> Result<()> {
+    match command {
+        Command::Add { name } => {
+            let created = accounts_db::add_account(pool, &name, now).await?;
+            println!("created account {:?}", created.name);
+            Ok(())
+        }
+        Command::List { json } => {
+            println!(
+                "{}",
+                render_list(&accounts_db::list_accounts(pool).await?, json)
+            );
+            Ok(())
+        }
+        Command::Revoke { name } => revoke(pool, &name, now).await,
+        Command::RevokeDevice { name, label } => revoke_device(pool, &name, &label, now).await,
+        Command::Pair { name, device } => pair(pool, &name, device.as_deref(), now).await,
+        Command::Help => {
+            println!("{USAGE}");
+            Ok(())
+        }
+    }
 }
 
 pub async fn run_cli(args: &[String]) -> Result<()> {
@@ -56,7 +285,12 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
-    bail!("account: not implemented yet")
+    let command = parse(args)?;
+    if command == Command::Help {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    execute(&pool().await?, command, Utc::now()).await
 }
 
 #[cfg(test)]

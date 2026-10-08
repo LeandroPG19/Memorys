@@ -24,7 +24,10 @@ const NEW_TABLES: [&str; 4] = [
 
 const CHECK_VIOLATION: &str = "23514";
 const UNIQUE_VIOLATION: &str = "23505";
-const FOREIGN_KEY_VIOLATION: &str = "23503";
+// ON DELETE RESTRICT raises restrict_violation (23001); foreign_key_violation (23503) is what
+// NO ACTION raises, with the same effect on a non-deferrable key. The migration says RESTRICT
+// on purpose, so the test expects the code RESTRICT really produces.
+const RESTRICT_VIOLATION: &str = "23001";
 
 fn migration(name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -427,16 +430,16 @@ async fn a_credential_and_the_code_that_made_it_must_agree_and_deletes_follow_th
 
         assert_refused(
             &pool,
-            "an account that has credentials cannot be deleted: its history would go with it (ON DELETE RESTRICT)",
+            "an account that has credentials cannot be deleted: its history would go with it (ON DELETE RESTRICT raises restrict_violation 23001, not foreign_key_violation 23503, which is NO ACTION's)",
             "DELETE FROM brain_accounts WHERE name = 'ana'",
-            FOREIGN_KEY_VIOLATION,
+            RESTRICT_VIOLATION,
         )
         .await;
         assert_refused(
             &pool,
-            "a credential that a code points at cannot be deleted either (ON DELETE RESTRICT)",
+            "a credential that a code points at cannot be deleted either (ON DELETE RESTRICT raises restrict_violation 23001, not foreign_key_violation 23503, which is NO ACTION's)",
             "DELETE FROM brain_account_credentials",
-            FOREIGN_KEY_VIOLATION,
+            RESTRICT_VIOLATION,
         )
         .await;
 
