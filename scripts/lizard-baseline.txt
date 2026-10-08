@@ -170,7 +170,7 @@ src/setup.rs::resolve_database_url:13 11
 # to fail the next increase too. Owner: mejorador 0.27.
 src/setup_agent.rs::project_configs:24 12
 src/setup_agent.rs::run_check:154 24
-src/setup_agent.rs::run_hook:577 21
+src/setup_agent.rs::run_hook:580 21
 src/setup_agent.rs::run_write:274 22
 src/skills_cli.rs::run_cli:61 19
 src/sync/paths.rs::resolve_dir:54 11
