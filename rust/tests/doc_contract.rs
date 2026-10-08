@@ -1674,12 +1674,16 @@ fn the_lan_guide_gives_the_fixed_address_steps_and_the_dhcp_warning() {
     );
 }
 
-/// The `[Unreleased]` block of the changelog, and one `###` part of it.
+/// The changelog block of the release in progress, and one `###` part of it. That block is the
+/// one headed `[Unreleased]` before the release commit renames it, and the one headed with the
+/// crate's own version after; following `CARGO_PKG_VERSION` keeps the check alive on both sides
+/// of the rename and across the next bump.
 fn changelog_part(changelog: &str, heading: &str) -> Option<String> {
-    let unreleased = changelog
+    let released = format!("{}]", env!("CARGO_PKG_VERSION"));
+    let in_progress = changelog
         .split("\n## [")
-        .find(|block| block.starts_with("Unreleased]"))?;
-    let mut parts = unreleased.split("\n### ");
+        .find(|block| block.starts_with("Unreleased]") || block.starts_with(&released))?;
+    let mut parts = in_progress.split("\n### ");
     parts
         .find(|part| part.starts_with(heading))
         .map(str::to_string)
@@ -1692,8 +1696,8 @@ fn changelog_part(changelog: &str, heading: &str) -> Option<String> {
 fn the_changelog_announces_accounts_and_the_bridge_and_what_is_not_verified() {
     let changelog = read("CHANGELOG.md");
     let behaviour = changelog_part(&changelog, "Behaviour changes").expect(
-        "CHANGELOG.md has no `### Behaviour changes` inside `[Unreleased]`: the anchor for the \
-         checks below is gone",
+        "CHANGELOG.md has no `### Behaviour changes` inside the release in progress: the anchor \
+         for the checks below is gone",
     );
     let behaviour = flatten(&behaviour);
     let announced = [
@@ -1705,14 +1709,14 @@ fn the_changelog_announces_accounts_and_the_bridge_and_what_is_not_verified() {
     let missing = missing_from(&behaviour, &announced);
     assert!(
         missing.is_empty(),
-        "`[Unreleased]` → `Behaviour changes` does not mention {missing:?}: a deployer reads that \
-         part before updating, and accounts, pairing, the bridge and the knob change what the \
-         daemon accepts"
+        "the release in progress → `Behaviour changes` does not mention {missing:?}: a deployer \
+         reads that part before updating, and accounts, pairing, the bridge and the knob change \
+         what the daemon accepts"
     );
 
     let unverified = changelog_part(&changelog, "Not verified").expect(
-        "CHANGELOG.md has no `### Not verified` inside `[Unreleased]`: the unverified list is \
-         where the next person learns what only a real host can prove",
+        "CHANGELOG.md has no `### Not verified` inside the release in progress: the unverified \
+         list is where the next person learns what only a real host can prove",
     );
     let unverified = flatten(&unverified);
     let listed = [
@@ -1724,9 +1728,9 @@ fn the_changelog_announces_accounts_and_the_bridge_and_what_is_not_verified() {
     let missing = missing_from(&unverified, &listed);
     assert!(
         missing.is_empty(),
-        "`[Unreleased]` → `Not verified` does not list {missing:?}: the per-user logon task, the \
-         hidden console, the fixed-address cmdlets and Cursor's `http` entry were never run on a \
-         real machine, and the changelog must say so"
+        "the release in progress → `Not verified` does not list {missing:?}: the per-user logon \
+         task, the hidden console, the fixed-address cmdlets and Cursor's `http` entry were never \
+         run on a real machine, and the changelog must say so"
     );
 }
 

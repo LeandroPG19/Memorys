@@ -5,7 +5,9 @@ All notable changes to MemoryIndustry (formerly cuba-memorys) are documented her
 [SemVer](https://semver.org/) for the Rust crate (`Cargo.toml`). PyPI
 versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI 1.28.0).
 
-## [Unreleased] — 0.29.0: a LAN install that comes back after the host reboots
+## [0.29.0] — 2026-10-08 (Cargo `0.29.0` · npm `0.29.0` · PyPI `1.31.0`)
+
+A LAN install that comes back after the host reboots, with accounts and a local bridge.
 
 ### Behaviour changes — read before deploying
 

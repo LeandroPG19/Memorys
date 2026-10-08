@@ -80,7 +80,7 @@ Do not nest `pesado` inside `pesado`: the inner one waits on the lock the outer 
 **`release.sh` with no receipt** runs `merge-gate.sh` as its child, so launch it inside `pesado` as well, with the same cap:
 
 ```bash
-pesado -m 36G -w 7200 -n memory-industry-release -- bash ./scripts/release.sh v0.28.0
+pesado -m 36G -w 7200 -n memory-industry-release -- bash ./scripts/release.sh v0.29.0
 ```
 
 With a receipt for `HEAD` it runs nothing heavy and does not need it.
@@ -104,9 +104,9 @@ E2E asserts `cuba_decreto` query `count >= 1` after record. That used to pass wi
 ## Publishing
 
 ```bash
-./scripts/release.sh v0.28.0               # gate (or its receipt), tag, push the tag
-./scripts/release.sh --dry-run v0.28.0     # the same, print the tag message, create nothing
-./scripts/release.sh --rerun-gate v0.28.0  # run the gate even over a receipt for HEAD
+./scripts/release.sh v0.29.0               # gate (or its receipt), tag, push the tag
+./scripts/release.sh --dry-run v0.29.0     # the same, print the tag message, create nothing
+./scripts/release.sh --rerun-gate v0.29.0  # run the gate even over a receipt for HEAD
 ```
 
 The only way to publish. In order, and any failure stops it before anything is created:
