@@ -13,7 +13,7 @@ Formerly **cuba-memorys**. Same daemon, same `cuba_*` MCP tools, new product nam
 
 **Long-term memory for AI coding agents.** An MCP server that gives your agent a knowledge graph it can search, reason over, and be corrected by — so it stops forgetting your codebase between sessions.
 
-Written in Rust. Backed by PostgreSQL + pgvector. **31 MCP tools** (32 with `CUBA_DOCS=1`), **26 CLI commands**, and every number below measured on a benchmark that — as of v0.12 — actually measures what it claims to. (The previous one did not. See [Measured](#measured--and-the-benchmark-that-was-lying).)
+Written in Rust. Backed by PostgreSQL + pgvector. **31 MCP tools** (32 with `CUBA_DOCS=1`), **28 CLI commands**, and every number below measured on a benchmark that — as of v0.12 — actually measures what it claims to. (The previous one did not. See [Measured](#measured--and-the-benchmark-that-was-lying).)
 
 <p align="center">
   <img src="assets/demo.gif" alt="MemoryIndustry terminal demo — hybrid search, claim verification with an LLM judge, procedural memory, and the CLI" width="760" />
