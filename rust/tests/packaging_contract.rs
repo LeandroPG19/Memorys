@@ -346,8 +346,14 @@ fn the_golden_env_file_offers_every_key_the_live_render_sets() {
 fn a_lan_profile_refuses_to_render_without_a_token() {
     let routable = "192.168.0.10:8787";
 
-    let refused = Unit::from_env(Profile::Lan, Target::Linux, Some(routable), Some("corto"))
-        .expect_err("a five-character token on a routable address must not render");
+    let refused = Unit::from_env(
+        Some(Profile::Lan),
+        Target::Linux,
+        Some(routable),
+        Some("corto"),
+        None,
+    )
+    .expect_err("a five-character token on a routable address must not render");
     let said = refused.to_string();
     assert!(
         said.contains("32"),
@@ -358,8 +364,14 @@ fn a_lan_profile_refuses_to_render_without_a_token() {
     // With no `--token` at all the installer generates one rather than leaving
     // the daemon open: the refusal is for a token that is too weak, not for the
     // operator having failed to invent one.
-    let generated = Unit::from_env(Profile::Lan, Target::Linux, Some(routable), None)
-        .expect("no --token means the installer generates one");
+    let generated = Unit::from_env(
+        Some(Profile::Lan),
+        Target::Linux,
+        Some(routable),
+        None,
+        None,
+    )
+    .expect("no --token means the installer generates one");
     let token = generated
         .token
         .as_deref()
@@ -380,7 +392,7 @@ fn the_windows_task_names_the_binary_that_exists() {
         std::env::temp_dir().join(format!("mi-localappdata-{}", uuid::Uuid::new_v4()));
     let _host = own_the_environment(Some(&local_app_data));
 
-    let unit = Unit::from_env(Profile::Loopback, Target::Windows, None, None)
+    let unit = Unit::from_env(Some(Profile::Loopback), Target::Windows, None, None, None)
         .expect("a loopback windows render needs nothing from the operator");
     assert!(
         unit.env_file.starts_with(&local_app_data),
@@ -448,7 +460,7 @@ fn the_windows_task_names_the_binary_that_exists() {
 fn a_windows_render_without_localappdata_refuses_instead_of_guessing() {
     let _host = own_the_environment(None);
 
-    let refused = Unit::from_env(Profile::Loopback, Target::Windows, None, None)
+    let refused = Unit::from_env(Some(Profile::Loopback), Target::Windows, None, None, None)
         .expect_err("with no LOCALAPPDATA there is no known install root for Windows");
     let said = refused.to_string();
     assert!(
