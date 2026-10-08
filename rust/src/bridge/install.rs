@@ -3,32 +3,145 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
-use crate::service_apply::CommandRunner;
+use super::BRIDGE_TASK_NAME;
+use crate::service_apply::{CommandOutcome, CommandRunner};
 
-// PASS-1 STUB: every function answers "nothing" until pass 2 implements it.
-pub fn install_commands(_exe: &Path, _print_only: bool) -> Result<Vec<Vec<String>>> {
-    Ok(Vec::new())
+/// What `schtasks /Create` accepts in `/TR`, in characters.
+const MAX_TASK_RUN_CHARS: usize = 261;
+
+fn argv(words: &[&str]) -> Vec<String> {
+    words.iter().map(ToString::to_string).collect()
 }
 
-// PASS-1 STUB
-pub fn run_install(_runner: &mut dyn CommandRunner, _exe: &Path) -> Result<Vec<String>> {
-    Ok(Vec::new())
+/// `conhost --headless` hides the console window of the per-user task; the exe stays
+/// quoted so a path with spaces is one program.
+fn task_run(exe: &Path) -> String {
+    format!("conhost.exe --headless \"{}\" bridge run", exe.display())
 }
 
-// PASS-1 STUB
-pub fn run_uninstall(_runner: &mut dyn CommandRunner) -> Result<Vec<String>> {
-    Ok(Vec::new())
+fn create_argv(task_run: &str) -> Vec<String> {
+    argv(&[
+        "schtasks",
+        "/Create",
+        "/SC",
+        "ONLOGON",
+        "/TN",
+        BRIDGE_TASK_NAME,
+        "/TR",
+        task_run,
+        "/RL",
+        "LIMITED",
+        "/F",
+    ])
 }
 
-// PASS-1 STUB
+/// The commands `bridge install` runs, create then start. `--print` shows exactly these.
+pub fn install_commands(exe: &Path, _print_only: bool) -> Result<Vec<Vec<String>>> {
+    let run = task_run(exe);
+    let length = run.chars().count();
+    if length > MAX_TASK_RUN_CHARS {
+        bail!(
+            "the task command is {length} characters and schtasks accepts at most \
+             {MAX_TASK_RUN_CHARS} in /TR: move memory-industry.exe to a shorter path"
+        );
+    }
+    Ok(vec![
+        create_argv(&run),
+        argv(&["schtasks", "/Run", "/TN", BRIDGE_TASK_NAME]),
+    ])
+}
+
+fn call(runner: &mut dyn CommandRunner, command: &[String]) -> Result<CommandOutcome> {
+    runner
+        .run(&command[0], &command[1..])
+        .with_context(|| format!("cannot run {}", command[0]))
+}
+
+fn exit_word(outcome: &CommandOutcome) -> String {
+    outcome
+        .code
+        .map_or_else(|| "killed".to_string(), |code| code.to_string())
+}
+
+/// `schtasks /Create …` is quoted the way a console wants it: an argument with a space or
+/// a quote is wrapped, and its inner quotes escaped.
+fn printable(command: &[String]) -> String {
+    let words: Vec<String> = command
+        .iter()
+        .map(|word| {
+            if word.contains([' ', '"']) {
+                format!("\"{}\"", word.replace('"', "\\\""))
+            } else {
+                word.clone()
+            }
+        })
+        .collect();
+    words.join(" ")
+}
+
+pub fn run_install(runner: &mut dyn CommandRunner, exe: &Path) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for command in install_commands(exe, false)? {
+        let outcome = call(runner, &command)?;
+        if outcome.code != Some(0) {
+            bail!(
+                "{} {} failed (exit {}): {}",
+                command[0],
+                command[1],
+                exit_word(&outcome),
+                outcome.stderr.trim()
+            );
+        }
+        lines.push(format!("ok: {}", printable(&command)));
+    }
+    lines.push(
+        "the bridge now starts at every logon of this user; check it with: \
+         memory-industry bridge status"
+            .to_string(),
+    );
+    Ok(lines)
+}
+
+/// Stops the task and removes it. A task that is not running, or is already gone, is the
+/// state the operator asked for, so neither answer stops the other call.
+pub fn run_uninstall(runner: &mut dyn CommandRunner) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let commands = [
+        argv(&["schtasks", "/End", "/TN", BRIDGE_TASK_NAME]),
+        argv(&["schtasks", "/Delete", "/TN", BRIDGE_TASK_NAME, "/F"]),
+    ];
+    for command in &commands {
+        let outcome = call(runner, command)?;
+        if outcome.code == Some(0) {
+            lines.push(format!("ok: {}", printable(command)));
+        } else {
+            lines.push(format!(
+                "{} answered {} (nothing to do if the task was not there): {}",
+                printable(command),
+                exit_word(&outcome),
+                outcome.stderr.trim()
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+/// What the CLI calls: with `--print` only the commands are shown and the runner is not
+/// touched.
 pub fn execute_install(
-    _runner: &mut dyn CommandRunner,
-    _exe: &Path,
-    _print_only: bool,
+    runner: &mut dyn CommandRunner,
+    exe: &Path,
+    print_only: bool,
 ) -> Result<Vec<String>> {
-    Ok(Vec::new())
+    if !print_only {
+        return run_install(runner, exe);
+    }
+    Ok(install_commands(exe, true)?
+        .iter()
+        .map(|command| printable(command))
+        .collect())
 }
 
 #[cfg(test)]

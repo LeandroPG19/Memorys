@@ -29,7 +29,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod fake_host;
 
-const USAGE: &str = "usage: memory-industry bridge <pair|run|status|install|uninstall> …\n\n\
+const USAGE: &str = "usage: memory-industry bridge <pair|run|status|doctor|install|uninstall> …\n\n\
 Run on a client PC. The bridge listens on 127.0.0.1 only and holds the credential.";
 
 pub const DEFAULT_BRIDGE_PORT: u16 = 8797;
@@ -432,7 +432,7 @@ fn system_deps(state_path: PathBuf) -> Result<BridgeDeps> {
     })
 }
 
-fn default_state_path() -> Result<PathBuf> {
+pub(crate) fn default_state_path() -> Result<PathBuf> {
     let local_app_data = std::env::var("LOCALAPPDATA").ok();
     let home = crate::envs::home().ok();
     let dir = state_dir(Target::host(), local_app_data.as_deref(), home.as_deref())?;
@@ -467,7 +467,7 @@ struct PairArgs {
     port: Option<u16>,
 }
 
-fn option_value(rest: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String> {
+pub(crate) fn option_value(rest: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String> {
     rest.next()
         .cloned()
         .with_context(|| format!("{flag} needs a value"))
@@ -502,31 +502,110 @@ impl PairArgs {
     }
 }
 
-fn parse_port(text: &str) -> Result<u16> {
+pub(crate) fn parse_port(text: &str) -> Result<u16> {
     text.parse::<u16>()
         .ok()
         .filter(|port| *port != 0)
         .with_context(|| format!("{text:?} is not a port (1-65535)"))
 }
 
-async fn cli_pair(args: &[String]) -> Result<()> {
-    let wanted = PairArgs::parse(args)?;
+/// What `memory-industry bridge …` was asked to do, parsed without touching the network or
+/// the disk so the guide's commands can be judged against it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    Pair {
+        code: String,
+        host: Option<String>,
+        device: Option<String>,
+        port: Option<u16>,
+    },
+    Run {
+        port: Option<u16>,
+    },
+    Status,
+    Install {
+        print: bool,
+    },
+    Uninstall,
+    Doctor,
+    Help,
+}
+
+/// A subcommand that takes nothing refuses the first stray word by name: `doctor now` is not
+/// what the author meant.
+fn no_arguments(rest: &[String], sub: &str, command: Command) -> Result<Command> {
+    match rest.first() {
+        None => Ok(command),
+        Some(extra) => bail!("bridge {sub} takes no arguments, got {extra}"),
+    }
+}
+
+fn parse_pair(rest: &[String]) -> Result<Command> {
+    let wanted = PairArgs::parse(rest)?;
     let code = wanted
         .code
-        .as_deref()
         .context("bridge pair needs the pairing code: bridge pair <code>")?;
-    let deps = system_deps(default_state_path()?)?;
-    let label = wanted.device.unwrap_or_else(default_label);
-    let mut paired = pair(
+    Ok(Command::Pair {
         code,
-        wanted.host.as_deref(),
-        &label,
-        &*deps.net,
-        &deps.timing,
-        &deps.client,
-    )
-    .await?;
-    if let Some(port) = wanted.port {
+        host: wanted.host,
+        device: wanted.device,
+        port: wanted.port,
+    })
+}
+
+fn parse_run(rest: &[String]) -> Result<Command> {
+    let port = match rest {
+        [] => None,
+        [flag, value] if flag == "--port" => Some(parse_port(value)?),
+        _ => bail!("usage: memory-industry bridge run [--port N]"),
+    };
+    Ok(Command::Run { port })
+}
+
+fn parse_install(rest: &[String]) -> Result<Command> {
+    match rest {
+        [] => Ok(Command::Install { print: false }),
+        [flag] if flag == "--print" => Ok(Command::Install { print: true }),
+        [other, ..] => bail!("bridge install: unknown option {other} (the only one is --print)"),
+    }
+}
+
+fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command> {
+    match sub {
+        "pair" => parse_pair(rest),
+        "run" => parse_run(rest),
+        "install" => parse_install(rest),
+        "status" => no_arguments(rest, "status", Command::Status),
+        "doctor" => no_arguments(rest, "doctor", Command::Doctor),
+        "uninstall" => no_arguments(rest, "uninstall", Command::Uninstall),
+        other => bail!("bridge {other}: unknown subcommand\n{USAGE}"),
+    }
+}
+
+/// Pure on purpose: the guide's `memory-industry bridge …` lines are judged by it.
+pub fn parse(args: &[String]) -> Result<Command> {
+    if args
+        .iter()
+        .any(|a| matches!(a.as_str(), "-h" | "--help" | "help"))
+    {
+        return Ok(Command::Help);
+    }
+    let Some((sub, rest)) = args.split_first() else {
+        bail!("bridge needs a subcommand\n{USAGE}");
+    };
+    parse_subcommand(sub, rest)
+}
+
+async fn cli_pair(
+    code: &str,
+    host: Option<&str>,
+    device: Option<String>,
+    port: Option<u16>,
+) -> Result<()> {
+    let deps = system_deps(default_state_path()?)?;
+    let label = device.unwrap_or_else(default_label);
+    let mut paired = pair(code, host, &label, &*deps.net, &deps.timing, &deps.client).await?;
+    if let Some(port) = port {
         paired.port = port;
     }
     let mut runner = SystemRunner;
@@ -542,12 +621,7 @@ async fn cli_pair(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn cli_run(args: &[String]) -> Result<()> {
-    let port = match args {
-        [] => None,
-        [flag, value] if flag == "--port" => Some(parse_port(value)?),
-        _ => bail!("usage: memory-industry bridge run [--port N]"),
-    };
+async fn cli_run(port: Option<u16>) -> Result<()> {
     let handle = run(system_deps(default_state_path()?)?, port).await?;
     println!("bridge listening on {}", handle.local_addr());
     tokio::signal::ctrl_c()
@@ -578,49 +652,53 @@ fn cli_status() -> Result<()> {
     Ok(())
 }
 
-/// What `memory-industry bridge …` was asked to do, parsed without touching the network or
-/// the disk so the guide's commands can be judged against it.
-// PASS-1 STUB: the enum is the contract the tests read; `parse` below answers `Help` for
-// everything until pass 2 implements it.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Command {
-    Pair {
-        code: String,
-        host: Option<String>,
-        device: Option<String>,
-        port: Option<u16>,
-    },
-    Run {
-        port: Option<u16>,
-    },
-    Status,
-    Install {
-        print: bool,
-    },
-    Uninstall,
-    Doctor,
-    Help,
+fn cli_install(print_only: bool) -> Result<()> {
+    let exe = std::env::current_exe().context("cannot resolve the path of this binary")?;
+    let mut runner = SystemRunner;
+    for line in install::execute_install(&mut runner, &exe, print_only)? {
+        println!("{line}");
+    }
+    Ok(())
 }
 
-// PASS-1 STUB
-pub fn parse(_args: &[String]) -> Result<Command> {
-    Ok(Command::Help)
+fn cli_uninstall() -> Result<()> {
+    let mut runner = SystemRunner;
+    for line in install::run_uninstall(&mut runner)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Looks for the host the way the bridge does and prints what it tried. A bridge that
+/// finds nothing fails, so a script can tell.
+async fn cli_doctor() -> Result<()> {
+    let deps = system_deps(default_state_path()?)?;
+    let paired = read_state(&deps.state_path)?.context(NOT_PAIRED)?;
+    let found = discover(&paired, &*deps.net, &deps.timing, &deps.client).await;
+    println!("{}", doctor::render_report(&found, Some(&paired)));
+    if doctor::exit_code(&found) != 0 {
+        bail!("no host was verified: see the report above");
+    }
+    Ok(())
 }
 
 pub async fn run_cli(args: &[String]) -> Result<()> {
-    if args
-        .iter()
-        .any(|a| matches!(a.as_str(), "-h" | "--help" | "help"))
-    {
-        println!("{USAGE}");
-        return Ok(());
-    }
-    match args.split_first() {
-        Some((first, rest)) if first == "pair" => cli_pair(rest).await,
-        Some((first, rest)) if first == "run" => cli_run(rest).await,
-        Some((first, _)) if first == "status" => cli_status(),
-        Some((other, _)) => bail!("bridge {other}: not available in this build\n{USAGE}"),
-        None => bail!("bridge needs a subcommand\n{USAGE}"),
+    match parse(args)? {
+        Command::Help => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        Command::Pair {
+            code,
+            host,
+            device,
+            port,
+        } => cli_pair(&code, host.as_deref(), device, port).await,
+        Command::Run { port } => cli_run(port).await,
+        Command::Status => cli_status(),
+        Command::Install { print } => cli_install(print),
+        Command::Uninstall => cli_uninstall(),
+        Command::Doctor => cli_doctor().await,
     }
 }
 

@@ -1,17 +1,128 @@
 //! `memory-industry bridge doctor`: what the bridge tried to find the host, one line per
 //! candidate, and the verdict. Nothing it prints can log anyone in.
 
-use super::discovery::Discovery;
-use super::state::BridgeState;
+use std::collections::HashSet;
 
-// PASS-1 STUB: an empty report and a success code until pass 2 implements them.
-pub fn render_report(_found: &Discovery, _state: Option<&BridgeState>) -> String {
-    String::new()
+use super::discovery::{Attempt, Discovery, Failure, Outcome, Verdict};
+use super::state::BridgeState;
+use crate::accounts;
+
+/// A sweep tries a whole /24; past this many candidate lines the answer is buried.
+const MAX_ATTEMPT_LINES: usize = 30;
+
+const RE_PAIR: &str = "ejecuta `memory-industry bridge pair <código>` con un código nuevo que te dé \
+     el operador de la madre";
+
+/// A candidate that answered with something worth reading. The ones that did not answer, or
+/// were never asked, are the bulk of a sweep and the first to be left out.
+fn is_finding(attempt: &Attempt) -> bool {
+    matches!(
+        &attempt.outcome,
+        Outcome::Checked(verdict) if !matches!(verdict, Verdict::NoAnswer(_))
+    )
 }
 
-// PASS-1 STUB
-pub fn exit_code(_found: &Discovery) -> i32 {
-    0
+/// The indexes of the attempts that get a line: every finding first, then silent ones while
+/// the budget lasts.
+fn shown(attempts: &[Attempt]) -> HashSet<usize> {
+    let (loud, quiet): (Vec<usize>, Vec<usize>) =
+        (0..attempts.len()).partition(|i| is_finding(&attempts[*i]));
+    loud.into_iter()
+        .chain(quiet)
+        .take(MAX_ATTEMPT_LINES)
+        .collect()
+}
+
+fn attempt_line(attempt: &Attempt) -> String {
+    format!(
+        "{:<12} {}  {}",
+        attempt.candidate.source.to_string(),
+        attempt.candidate.addr,
+        attempt.outcome
+    )
+}
+
+fn attempt_lines(attempts: &[Attempt]) -> Vec<String> {
+    let keep = shown(attempts);
+    let mut lines: Vec<String> = attempts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, attempt)| attempt_line(attempt))
+        .collect();
+    let left_out = attempts.len() - keep.len();
+    if left_out > 0 {
+        lines.push(format!(
+            "(+{left_out} candidatos más sin respuesta o sin probar, no listados)"
+        ));
+    }
+    lines
+}
+
+fn advice(failure: &Failure) -> String {
+    match failure {
+        Failure::Revoked => format!("la madre revocó esta credencial: {RE_PAIR}"),
+        Failure::Unknown => format!("la madre no conoce esta credencial: {RE_PAIR}"),
+        Failure::WrongHost { .. } => format!(
+            "contestó otra instalación de MemoryIndustry y no se le envió nada. Si la madre \
+             cambió de verdad, {RE_PAIR}; si no, otro equipo tiene esa dirección"
+        ),
+        Failure::Impostor => format!(
+            "algo contestó pero no pudo probar que es la madre y no se le envió ninguna \
+             credencial. Si la madre es otra instalación, {RE_PAIR}"
+        ),
+        Failure::NotFound => "no se encontró la madre: comprueba que la PC madre está encendida \
+             y en la misma red; si cambió de dirección, `memory-industry bridge pair <código> \
+             --host <nombre-o-IP>` la indica a mano"
+            .to_string(),
+    }
+}
+
+/// The last line of a good report: the host that proved itself and the fingerprint the
+/// operator compares with the one the host shows.
+fn host_line(found: &Discovery) -> Option<String> {
+    let addr = found.verified?;
+    let fingerprint = found
+        .attempts
+        .iter()
+        .find_map(|attempt| match &attempt.outcome {
+            Outcome::Checked(Verdict::Verified { fingerprint })
+                if attempt.candidate.addr == addr =>
+            {
+                Some(fingerprint.as_str())
+            }
+            _ => None,
+        });
+    Some(match fingerprint {
+        Some(fingerprint) => format!("madre: {addr} (huella {fingerprint})"),
+        None => format!("madre: {addr}"),
+    })
+}
+
+pub fn render_report(found: &Discovery, state: Option<&BridgeState>) -> String {
+    let mut lines = Vec::new();
+    if let Some(pinned) = state {
+        lines.push(format!(
+            "fijada: {} (huella {}), cuenta {}/{}",
+            pinned.host_name,
+            accounts::fingerprint(&pinned.host_id),
+            pinned.account,
+            pinned.device_label
+        ));
+    }
+    lines.push(format!("candidatos probados: {}", found.attempts.len()));
+    lines.extend(attempt_lines(&found.attempts));
+    match (host_line(found), found.failure()) {
+        (Some(host), _) => lines.push(host),
+        (None, Some(failure)) => lines.push(advice(&failure)),
+        (None, None) => {}
+    }
+    lines.join("\n")
+}
+
+/// 0 when a host proved itself, 1 when none did.
+pub fn exit_code(found: &Discovery) -> i32 {
+    i32::from(found.verified.is_none())
 }
 
 #[cfg(test)]

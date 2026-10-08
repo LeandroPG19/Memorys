@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::envs::home;
-use crate::service::{self, Asked, Mode, Profile, Request, Secrecy, Unit};
+use crate::service::{self, Asked, Mode, Profile, Request, Secrecy, Target, Unit};
 use crate::service_apply::{self, CommandOutcome, CommandRunner};
+use crate::{bridge::client_config, envs::home};
 
 const REQUIRED_ENV: [&str; 3] = ["DATABASE_URL", "ONNX_MODEL_PATH", "ORT_DYLIB_PATH"];
 
@@ -120,8 +120,8 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
-const MCP_SERVER_KEY: &str = "memory-industry";
-const MCP_SERVER_KEY_LEGACY: &str = "cuba-memorys";
+pub(crate) const MCP_SERVER_KEY: &str = "memory-industry";
+pub(crate) const MCP_SERVER_KEY_LEGACY: &str = "cuba-memorys";
 
 fn http_config_problem(block: &Value) -> Option<String> {
     let url = block.get("url").and_then(Value::as_str).unwrap_or("");
@@ -350,8 +350,8 @@ pub fn run_cli(args: &[String]) -> Result<()> {
     // flags for a target. It stays a subcommand of `setup` rather than a new
     // entry in `cli::COMMANDS`, because the README states that count and
     // `cli_contract.rs` checks the two agree.
-    if args.first().is_some_and(|a| a == "service") {
-        return run_service(&args[1..]);
+    if let Some(done) = named_subcommand(args) {
+        return done;
     }
 
     let mut target: Option<String> = None;
@@ -362,13 +362,16 @@ pub fn run_cli(args: &[String]) -> Result<()> {
             "--apply" => apply = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: memory-industry setup <check | print | service | claude | mcp | cursor> [--apply]\n\n\
+                    "usage: memory-industry setup <check | print | service | client | claude | mcp | cursor> [--apply]\n\n\
                      check   audita las configs existentes: variables faltantes, rutas muertas,\n\
                              y divergencias entre clientes (el bug que mató el recall vectorial).\n\
                      print   imprime el bloque correcto para pegarlo donde haga falta.\n\
                      hook    instala un SessionStart que inyecta la memoria automáticamente.\n\
                      service instala el daemon: unidad systemd o tarea de Windows, con el env\n\
                              file que lleva el token. `setup service --help` para sus flags.\n\
+                     client  apunta un cliente (claude|mcp|cursor|warp|all) al puente local, sin\n\
+                             clave ni IP en su config. `setup client <cliente> [--port N]\n\
+                             [--client-id NOMBRE] [--apply]`.\n\
                      claude  ~/.claude.json     mcp  ~/.mcp.json     cursor  ~/.cursor/mcp.json\n\n\
                      Sin --apply, solo muestra el plan. Con --apply, respalda el archivo y mergea."
                 );
@@ -646,6 +649,59 @@ fn run_hook(apply: bool) -> Result<()> {
 
     println!("Instalado. La próxima sesión arrancará con la memoria ya cargada,");
     println!("obedezca el modelo su CLAUDE.md o no.");
+    Ok(())
+}
+
+/// The subcommands of `setup` that take their own flags, so the loop in `run_cli` must not
+/// read them as a target.
+fn named_subcommand(args: &[String]) -> Option<Result<()>> {
+    let (first, rest) = args.split_first()?;
+    match first.as_str() {
+        "service" => Some(run_service(rest)),
+        "client" => Some(run_client(rest)),
+        _ => None,
+    }
+}
+
+/// The block every client gets, on the port its bridge listens on.
+fn client_block(port_flag: Option<u16>, client_id: Option<String>) -> Result<Value> {
+    let state_path = crate::bridge::default_state_path()?;
+    let (port, warning) = client_config::resolve_port(&state_path, port_flag)?;
+    if let Some(warning) = warning {
+        println!("AVISO: {warning}");
+    }
+    let client_id = client_id.or_else(workspace_client_id);
+    Ok(client_config::bridge_block(port, client_id.as_deref()))
+}
+
+fn write_client(
+    client: &str,
+    home: &str,
+    block: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+    apply: bool,
+) -> Result<()> {
+    let path = client_config::client_config_path(client, home, Target::host())?;
+    println!("── {client}  ({})", path.display());
+    print_lines(client_config::apply_client_config(&path, block, now, apply)?.lines);
+    Ok(())
+}
+
+/// `setup client`: the decisions are in `bridge::client_config`; this reads the home, prints
+/// and loops over the clients.
+fn run_client(args: &[String]) -> Result<()> {
+    let wanted = client_config::parse_client_args(args)?;
+    let block = client_block(wanted.port, wanted.client_id)?;
+    let home = home()?.to_string_lossy().into_owned();
+    let now = chrono::Utc::now();
+    for client in wanted.clients {
+        write_client(client, &home, &block, now, wanted.apply)?;
+    }
+    if wanted.apply {
+        println!("Reiniciá el cliente MCP para que tome el cambio.");
+    } else {
+        println!("Esto fue un plan — no se tocó ningún archivo. Para aplicarlo: --apply");
+    }
     Ok(())
 }
 

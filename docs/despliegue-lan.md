@@ -111,7 +111,8 @@ exits saying so ("is not assigned to this machine"). The wait is
 `MEMORY_INDUSTRY_BIND_WAIT_SECS` (`0` tries once). A DHCP lease that gives the
 host a different address needs a reservation on the router or a static address
 on the host: the daemon waits for the address you named, it does not follow a
-new one.
+new one. Section 10 shows how to give the host a fixed address from PowerShell
+when the router is not yours to change.
 
 > **Local-environment note, not a product rule.** On a workstation that also
 > runs Cursor, `8787` and `8788` may collide with the editor's OAuth callback,
@@ -166,6 +167,10 @@ lease change — with an `Mcp-Machine-Id` header:
 
 Callers on the daemon's own machine are always one identity, so a local client
 keys exactly as it did before.
+
+This section is the shared-token route. For Windows clients there is a route
+with no token and no address in the client's config, and with a credential you
+can revoke per device: section 11.
 
 ## 8. Check it from a client
 
@@ -269,3 +274,208 @@ of the log.
 | Search works but only by lexical search | No models were found: under SYSTEM the home is not the user's | Check `USERPROFILE` in the launcher, or set `ONNX_MODEL_PATH` in the environment file |
 | The tools fail but `/health` answers; Postgres is not up after a reboot | The container starts at sign-in, not at boot | Wait for Docker Desktop, or start the container from a task of its own |
 | `--register` refuses | The shell is not elevated | Open PowerShell as administrator |
+
+## 10. Fixed address on the host
+
+Clients find the host again by the address they saved, by its name, and by
+sweeping their own subnet, and they only believe an answer that proves it is the
+host. A host whose address keeps changing still works, but every change costs
+the clients a search. A fixed address avoids that, and it is the only step in
+this guide that changes the host's network settings. Do it once, from an
+**elevated** PowerShell (run as administrator).
+
+First look at what the host has now, and write down the `InterfaceIndex`, the
+address, the gateway and the DNS servers of the interface the clients reach:
+
+    ipconfig /all
+    Get-NetIPConfiguration
+
+Then choose the address. **Choose one outside the DHCP range** of the router:
+the router hands out addresses from a pool, and an address inside it can be given
+to another machine the day the host is switched off. Windows cannot see that
+range, because the router is not reachable from the host. Ask whoever administers
+the router for the pool (or ask them to reserve the address you picked for the
+host), and choose an address on the same subnet as the gateway that falls outside
+it. The examples use `192.168.0.10`, with a pool that starts higher up, and
+interface 12:
+
+    $ix = 12
+    Set-NetIPInterface -InterfaceIndex $ix -Dhcp Disabled
+    New-NetIPAddress -InterfaceIndex $ix -IPAddress 192.168.0.10 -PrefixLength 24 -DefaultGateway 192.168.0.1
+    Set-DnsClientServerAddress -InterfaceIndex $ix -ServerAddresses 192.168.0.1
+
+Use the values you wrote down: the prefix length that matches the subnet mask,
+the gateway of that interface, and its DNS servers (the gateway itself is the
+common answer on a small office network). If `New-NetIPAddress` answers that the
+address or the default route already exists, the lease the host had is still
+configured: remove it (`Remove-NetIPAddress` for the old address, `Remove-NetRoute`
+for the old default route, both with `-InterfaceIndex $ix`) and run the command
+again. This sequence has not been run on a real host yet; the changelog lists it
+as not verified.
+
+Check it with `ipconfig /all`: the interface must show the address and say that
+DHCP is disabled. To go back to DHCP:
+
+    Set-NetIPInterface -InterfaceIndex $ix -Dhcp Enabled
+    Set-DnsClientServerAddress -InterfaceIndex $ix -ResetServerAddresses
+
+Then put the address in `CUBA_HTTP_ADDR` (section 5) and run `--apply --register`
+again (section 9).
+
+The check that matters comes from a client, once the clients are paired
+(section 11):
+
+    memory-industry bridge doctor
+
+If another machine ever answers on the host's address, the bridge does not send
+it the credential: `bridge doctor` lists that address as unable to prove it is the
+host and exits 1. That is the symptom of an address inside the DHCP range.
+
+## 11. Accounts and the local bridge
+
+The shared token (sections 4 and 7) is one secret for everybody: it cannot be
+taken away from one lost PC without changing it on every other, and nothing says
+who wrote what. Accounts replace it with one credential per device.
+
+What an account is, and is not. It authenticates a device, it attributes what the
+device writes (`cuba_whoami` and the logs show the account and the device), and it
+can be revoked at once. It does **not** partition the graph and it is **not** a
+permission: every account can read everything and call every tool, `cuba_forget`
+and the `admin/*` routes included, exactly as the shared token can. Hand out
+accounts to people you would hand the token to.
+
+### On the host: create the account and issue a code
+
+These run on the host and talk to the database directly; they need neither the
+daemon nor its token.
+
+    memory-industry account add ana
+    memory-industry account pair ana --device pc-02
+    memory-industry account list
+
+`account pair` prints a pairing code such as `K7QM-3WXP-9HNR` once, together with
+the host fingerprint. The code is valid for 24 hours, works once, and is stored
+only as a key, so it cannot be shown again: issue another if it is lost. Give the
+code to the person at the client PC.
+
+### On a client: pair in under two minutes, without administrator
+
+A Windows PC pairs in about two minutes, and every step works without administrator
+rights, as an ordinary user:
+
+1. Put `memory-industry.exe` in a folder you own, for example
+   `%LOCALAPPDATA%\MemoryIndustry\`.
+2. Pair with the code. The code is offered only to machines on this PC's subnet
+   that answer as MemoryIndustry, and the host must prove it knows the code before
+   anything is saved. If the host is on another subnet, name it with
+   `--host madre` or `--host 192.168.0.10`.
+
+        memory-industry bridge pair K7QM-3WXP-9HNR
+
+   It prints the host fingerprint; it must be the same one `account pair` showed.
+3. Start the bridge at every sign-in of this user:
+
+        memory-industry bridge install
+
+   That creates a per-user task named `MemoryIndustry Bridge` (no administrator, no
+   window) and starts it now. `bridge install --print` shows the commands without
+   running them; `bridge uninstall` removes the task.
+4. Point the MCP client at the bridge. `all` writes Claude Code, Claude's
+   `.mcp.json`, Cursor and Warp; name one to write only that client. Without
+   `--apply` it only shows the plan; with it, it copies the file first, leaves every
+   other server alone, and does nothing on a second run:
+
+        memory-industry setup client claude --client-id pc-02 --apply
+        memory-industry setup client cursor --client-id pc-02 --apply
+
+   Restart the client. `--client-id` should be different on every PC, as in
+   section 7.
+
+Check it:
+
+    memory-industry bridge status
+    memory-industry bridge doctor
+
+### What the bridge is
+
+A small local process, `memory-industry bridge run`, started by that task. It
+listens on `127.0.0.1:8797` and nowhere else, and it **holds the credential**:
+the client config only says `http://127.0.0.1:8797/mcp`, so it carries no token
+and no address of the host, and nothing in it has to change when the host's
+address does. Each request goes to the host with the credential added. The
+bridge finds the host again by trying, in order, the last address that worked, the
+saved ones, the host's name, and the other addresses of this PC's /24; it sends the
+credential only to an answer that proves it is the host, and it refuses a web page
+that tries to use it (a foreign `Origin` or `Host`).
+
+Its state is one file, `%LOCALAPPDATA%\MemoryIndustry\bridge.json`, with the
+host's identity, this device's credential and the addresses seen. Only your
+Windows user can open it (the access list is set before the secret is written), but
+administrators and SYSTEM can read any file of yours. The port belongs to the PC,
+not to the user: one PC is one user's bridge.
+
+### Revoking
+
+On the host:
+
+    memory-industry account revoke ana
+    memory-industry account revoke-device ana pc-02
+
+The first closes every device of the account, the second only the devices of that
+account with that label. It takes effect on the next request, with no restart and
+nothing to change on the client: the bridge answers «credencial revocada» and
+stops searching until the operator issues a new code. A lost PC is
+`account revoke-device`; rotating a credential is revoke and pair again.
+
+### Closing the shared token
+
+When every client is paired, add `MEMORY_INDUSTRY_REQUIRE_ACCOUNTS=1` to the
+environment file and restart the daemon. On a non-loopback address the shared
+token then stops working on `/mcp` and `/events` and answers 401 with a message
+that says how to pair; the peer token keeps working for sync, and `/health` still
+takes the shared token for monitors. On a loopback address the setting is ignored
+with a warning. `memory-industry doctor` fails if it is on and no credential is
+active.
+
+### Reading `bridge doctor`
+
+It tries the host the way the bridge does and prints one line per candidate: where
+the address came from (`indicada`, `última buena`, `guardada`, `por nombre`,
+`barrido`), the address, and what it answered. The last line is the host it
+found and its fingerprint, `huella`, which must match the one `account pair`
+printed. It exits 0 when a host proved itself and 1 when none did, and then the
+lines say what was tried and what to do. A sweep prints the answers that matter
+and a count of the silent addresses it left out.
+
+    fijada: madre (huella 5F3A-91C2-77D0-AB14), cuenta ana/pc-02
+    candidatos probados: 3
+    última buena 192.168.0.20:8787  sin respuesta (conexión rechazada o sin ruta)
+    guardada     192.168.0.30:8787  otra instalación (huella 91AA-0B7E-33C4-D5E8)
+    barrido      192.168.0.10:8787  verificada (5F3A-91C2-77D0-AB14)
+    madre: 192.168.0.10:8787 (huella 5F3A-91C2-77D0-AB14)
+
+The report never contains the credential.
+
+### What the proof of identity does and does not cover
+
+Traffic is still HTTP in clear text: TLS is the next version. What the proof does
+now is stop a client from handing its credential to the wrong machine: a host
+name that resolves to someone else, a PC that inherited the host's old address
+from DHCP, a sweep that bumps into another server. Pairing proves the same thing
+in the other direction: a machine that does not know the code cannot complete it.
+
+It does not cover an attacker who sits on the path between a client and the host
+(ARP spoofing), who can relay the proof to the real host and keep the credential;
+and anybody who can read the traffic reads the credential as they read the shared
+token today. What you gain already is that each device has its own credential,
+revocable at once, which the shared token is not.
+
+### When it does not work
+
+| What you see | Why | What to do |
+| --- | --- | --- |
+| `bridge pair` says «la madre no aceptó el código» | The code is mistyped, older than 24 hours, or already used | Ask the operator for a new `account pair`; the code never uses 0, O, 1 or I |
+| `bridge doctor` or the client says «no se encontró la madre» | The host is off or on another network, a firewall blocks the port, or the host is outside this PC's /24 | Check the host with section 8; pair again with `--host <name or address>` |
+| The error says «la madre cambió de huella» | Another MemoryIndustry installation answered where the host used to be | If the host was reinstalled, pair again with a new code; if not, another machine took the address (section 10) |
+| The bridge says «credencial revocada» | The operator revoked this device or its account | Ask for a new code and run `bridge pair` again |
+| `bridge run` says «cannot listen on 127.0.0.1» | Another bridge, or another program, holds the port | `bridge status` shows the port; close the other one, or use `--port` in `bridge run` and in `setup client` |

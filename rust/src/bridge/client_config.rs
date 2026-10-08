@@ -5,11 +5,14 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
+use super::state::read_state;
+use super::{DEFAULT_BRIDGE_PORT, option_value, parse_port};
 use crate::service::Target;
+use crate::setup_agent::{MCP_SERVER_KEY, MCP_SERVER_KEY_LEGACY};
 
 /// The clients `setup client` knows, in the order `all` writes them.
 pub const CLIENTS: [&str; 4] = ["claude", "mcp", "cursor", "warp"];
@@ -38,53 +41,221 @@ pub struct Applied {
     pub lines: Vec<String>,
 }
 
-// PASS-1 STUB: every function answers "nothing" until pass 2 implements it.
-pub fn bridge_block(_port: u16, _client_id: Option<&str>) -> Value {
-    Value::Null
+/// The entry every client gets: the local bridge, and nothing that could log anyone in.
+pub fn bridge_block(port: u16, client_id: Option<&str>) -> Value {
+    let mut block = json!({"type": "http", "url": format!("http://127.0.0.1:{port}/mcp")});
+    if let Some(id) = client_id {
+        block["headers"] = json!({"Mcp-Client-Id": id});
+    }
+    block
 }
 
-// PASS-1 STUB
-pub fn merge_bridge_entry(cfg: &Value, _block: &Value) -> Result<MergeOutcome> {
+fn servers_of(root: &Map<String, Value>) -> Result<Map<String, Value>> {
+    match root.get("mcpServers") {
+        None => Ok(Map::new()),
+        Some(Value::Object(servers)) => Ok(servers.clone()),
+        Some(_) => bail!("mcpServers is not a JSON object: not touching it"),
+    }
+}
+
+/// Our entry replaces the old one whole (a deep merge would keep an old token), the legacy
+/// key is retired, and every other server and setting comes out equal.
+pub fn merge_bridge_entry(cfg: &Value, block: &Value) -> Result<MergeOutcome> {
+    let root = cfg
+        .as_object()
+        .context("the config is not a JSON object: not touching it")?;
+    let mut servers = servers_of(root)?;
+    let replaced_stdio = servers
+        .get(MCP_SERVER_KEY)
+        .is_some_and(|entry| entry.get("command").is_some());
+    servers.remove(MCP_SERVER_KEY_LEGACY);
+    servers.insert(MCP_SERVER_KEY.to_string(), block.clone());
+    let mut updated = root.clone();
+    updated.insert("mcpServers".to_string(), Value::Object(servers));
+    let updated = Value::Object(updated);
     Ok(MergeOutcome {
-        updated: cfg.clone(),
-        changed: false,
-        replaced_stdio: false,
+        changed: updated != *cfg,
+        updated,
+        replaced_stdio,
     })
 }
 
-// PASS-1 STUB
+/// `({}, false)` for a file that is not there. A file that is not JSON is an error: reading
+/// it as empty would replace the user's other servers.
+fn read_config(path: &Path) -> Result<(Value, bool)> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((json!({}), false)),
+        Err(err) => return Err(err).with_context(|| format!("cannot read {}", path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok((json!({}), true));
+    }
+    let cfg = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON: left untouched", path.display()))?;
+    Ok((cfg, true))
+}
+
+/// A copy of the file as it was, stamped, next to it.
+fn back_up(path: &Path, now: DateTime<Utc>) -> Result<PathBuf> {
+    let backup = path.with_extension(format!("json.bak-{}", now.format("%Y%m%dT%H%M%SZ")));
+    std::fs::copy(path, &backup).with_context(|| format!("cannot back up {}", path.display()))?;
+    Ok(backup)
+}
+
+fn write_config(path: &Path, cfg: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(cfg).context("cannot encode the config")?;
+    std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))
+}
+
+const STDIO_NOTICE: &str = "AVISO: este cliente ejecutaba memory-industry como proceso local \
+    (stdio) y pasa a hablar con el puente local";
+
+fn write_with_backup(
+    path: &Path,
+    existed: bool,
+    updated: &Value,
+    now: DateTime<Utc>,
+) -> Result<Option<PathBuf>> {
+    let backup = existed.then(|| back_up(path, now)).transpose()?;
+    write_config(path, updated)?;
+    Ok(backup)
+}
+
+fn report_lines(merged: &MergeOutcome, apply: bool, backup: Option<&Path>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if merged.replaced_stdio {
+        lines.push(STDIO_NOTICE.to_string());
+    }
+    lines.extend(backup.map(|copy| format!("copia: {}", copy.display())));
+    let verdict = match (merged.changed, apply) {
+        (false, _) => "sin cambios",
+        (true, false) => "se escribiría el bloque del puente (sin --apply no se toca nada)",
+        (true, true) => "escrito",
+    };
+    lines.push(verdict.to_string());
+    lines
+}
+
+/// Merges the bridge block into one client's config file. Without `apply` nothing is
+/// written, not even a backup; when nothing needs to change nothing is written either.
 pub fn apply_client_config(
-    _path: &Path,
-    _block: &Value,
-    _now: DateTime<Utc>,
-    _apply: bool,
+    path: &Path,
+    block: &Value,
+    now: DateTime<Utc>,
+    apply: bool,
 ) -> Result<Applied> {
+    let (cfg, existed) = read_config(path)?;
+    let merged = merge_bridge_entry(&cfg, block).with_context(|| path.display().to_string())?;
+    let backup = if merged.changed && apply {
+        write_with_backup(path, existed, &merged.updated, now)?
+    } else {
+        None
+    };
     Ok(Applied {
-        changed: false,
-        replaced_stdio: false,
-        backup: None,
-        lines: Vec::new(),
+        changed: merged.changed,
+        replaced_stdio: merged.replaced_stdio,
+        lines: report_lines(&merged, apply, backup.as_deref()),
+        backup,
     })
 }
 
-// PASS-1 STUB
-pub fn client_config_path(_client: &str, _home: &str, _target: Target) -> Result<PathBuf> {
-    Ok(PathBuf::new())
+/// Where `client` keeps its MCP config under `home`. Built by hand for Windows so that a
+/// test (or a plan) on another system still shows the path the client will read.
+pub fn client_config_path(client: &str, home: &str, target: Target) -> Result<PathBuf> {
+    let relative: &[&str] = match client {
+        "claude" => &[".claude.json"],
+        "mcp" => &[".mcp.json"],
+        "cursor" => &[".cursor", "mcp.json"],
+        "warp" => &[".warp", ".mcp.json"],
+        other => bail!("unknown client {other:?} ({})", CLIENTS.join(" | ")),
+    };
+    if target.is_windows() {
+        return Ok(PathBuf::from(format!(
+            "{}\\{}",
+            home.trim_end_matches('\\'),
+            relative.join("\\")
+        )));
+    }
+    Ok(relative
+        .iter()
+        .fold(PathBuf::from(home), |path, part| path.join(part)))
 }
 
-// PASS-1 STUB
-pub fn resolve_port(_state_path: &Path, _flag: Option<u16>) -> Result<(u16, Option<String>)> {
-    Ok((0, None))
+/// The port the clients must point at: the flag, else the one `bridge.json` says the bridge
+/// listens on, else the default with a warning that this PC is not paired yet.
+pub fn resolve_port(state_path: &Path, flag: Option<u16>) -> Result<(u16, Option<String>)> {
+    if let Some(port) = flag {
+        return Ok((port, None));
+    }
+    Ok(match read_state(state_path)? {
+        Some(paired) => (paired.port, None),
+        None => (
+            DEFAULT_BRIDGE_PORT,
+            Some(format!(
+                "no hay {}: este PC no está emparejado todavía y se usa el puerto por omisión \
+                 {DEFAULT_BRIDGE_PORT}. Empareja con `memory-industry bridge pair <código>`",
+                state_path.display()
+            )),
+        ),
+    })
 }
 
-// PASS-1 STUB
-pub fn parse_client_args(_args: &[String]) -> Result<ClientArgs> {
-    Ok(ClientArgs {
+impl ClientArgs {
+    fn add_client(&mut self, name: &str) -> Result<()> {
+        if !self.clients.is_empty() {
+            bail!("setup client: give one client, or `all`");
+        }
+        if name == "all" {
+            self.clients = CLIENTS.to_vec();
+            return Ok(());
+        }
+        let known = CLIENTS.iter().copied().find(|client| *client == name);
+        let Some(client) = known else {
+            bail!("unknown client {name:?} ({} | all)", CLIENTS.join(" | "));
+        };
+        self.clients = vec![client];
+        Ok(())
+    }
+
+    fn take(&mut self, arg: &str, rest: &mut std::slice::Iter<'_, String>) -> Result<()> {
+        match arg {
+            "--apply" => self.apply = true,
+            "--port" => self.port = Some(parse_port(&option_value(rest, "--port")?)?),
+            "--client-id" => self.client_id = Some(client_id(option_value(rest, "--client-id")?)?),
+            flag if flag.starts_with("--") => bail!("setup client: unknown option {flag}"),
+            name => self.add_client(name)?,
+        }
+        Ok(())
+    }
+}
+
+fn client_id(raw: String) -> Result<String> {
+    if raw.trim().is_empty() {
+        bail!("--client-id needs a non-empty value");
+    }
+    Ok(raw)
+}
+
+pub fn parse_client_args(args: &[String]) -> Result<ClientArgs> {
+    let mut parsed = ClientArgs {
         clients: Vec::new(),
         port: None,
         client_id: None,
         apply: false,
-    })
+    };
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        parsed.take(arg, &mut rest)?;
+    }
+    if parsed.clients.is_empty() {
+        bail!("setup client needs a client: {} | all", CLIENTS.join(" | "));
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]

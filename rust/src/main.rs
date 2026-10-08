@@ -68,7 +68,7 @@ OPERATIONS:
   secure            create the non-superuser cuba_app role so RLS and the audit trigger bite
   project backfill  assign leftover NULL project_id rows to a named project (dry-run; --apply writes)
   account           (host) accounts and pairing codes: add|list|revoke|revoke-device|pair
-  bridge            (client) local bridge to the host: pair|run|status|install|uninstall
+  bridge            (client) local bridge to the host: pair|run|status|doctor|install|uninstall
 
   -h, --help        this
   -V, --version     print the version and exit — touches no database
