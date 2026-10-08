@@ -4,9 +4,11 @@
 //! mutant can break. The database lives in `accounts_db`, the wire in `http`
 //! and the client in `bridge`.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Duration;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const CODE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -18,6 +20,18 @@ pub const CREDENTIAL_PREFIX: &str = "mi1";
 pub const REQUIRE_ACCOUNTS_REFUSAL: &str = "this daemon only accepts account credentials: the shared token is not accepted here. \
      Pair this device with a code from the host operator: memory-industry bridge pair <code>";
 
+const SYMBOL_BITS: usize = 5;
+const SYMBOL_MASK: u64 = 31;
+const CODE_GROUP: usize = 4;
+const ACCOUNT_NAME_MAX: usize = 32;
+const DEVICE_LABEL_MAX: usize = 40;
+
+const DOMAIN_CODE_KEY: &str = "memory-industry/pair-code/v1";
+const DOMAIN_PAIR_REQ: &str = "memory-industry/pair-req/v1";
+const DOMAIN_PAIR_RESP: &str = "memory-industry/pair-resp/v1";
+const DOMAIN_IDENTITY: &str = "memory-industry/identity/v1";
+const DOMAIN_FINGERPRINT: &str = "memory-industry/host-fingerprint/v1";
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodeError {
     Length(usize),
@@ -25,45 +39,55 @@ pub enum CodeError {
 }
 
 impl std::fmt::Display for CodeError {
-    // PASS-1 STUB: a message that names nothing.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid pairing code")
+        match self {
+            CodeError::Length(n) => write!(
+                f,
+                "a pairing code has {CODE_SYMBOLS} symbols, this one has {n}"
+            ),
+            CodeError::Symbol(c) => write!(
+                f,
+                "'{c}' is not a symbol of a pairing code (0/O/1/I are not used, they look alike; \
+                 the symbols are the letters A-Z without I and O, and the digits 2-9)"
+            ),
+        }
     }
 }
 
 impl std::error::Error for CodeError {}
 
 /// 32 random bytes the client keeps; only `hash()` ever travels.
-// PASS-1 STUB: `derive(Debug)` prints the bytes, which is the leak the real type forbids.
-#[derive(Debug)]
 pub struct Secret([u8; 32]);
 
+// Debug and Display are written by hand: a derived Debug would put the bytes in
+// every `{:?}` of a struct that holds one, and in every panic message.
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 impl std::fmt::Display for Secret {
-    // PASS-1 STUB: prints nothing instead of `<redacted>`.
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Ok(())
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
     }
 }
 
 impl Secret {
-    // PASS-1 STUB: all zeros.
     pub fn generate() -> Self {
-        Secret([0; 32])
+        Secret(random_bytes::<32>())
     }
 
-    // PASS-1 STUB: the secret itself, unhashed.
     pub fn hash(&self) -> [u8; 32] {
-        self.0
+        Sha256::digest(self.0).into()
     }
 
-    // PASS-1 STUB: empty.
     pub fn to_hex(&self) -> String {
-        String::new()
+        hex::encode(self.0)
     }
 
-    // PASS-1 STUB: nothing parses.
-    pub fn from_hex(_hex: &str) -> Option<Self> {
-        None
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        lower_hex::<32>(hex).map(Secret)
     }
 }
 
@@ -108,117 +132,275 @@ pub struct IdentityReply {
     pub proof: Option<String>,
 }
 
-// PASS-1 STUB: zeros, never random.
+/// The OS CSPRNG through `Uuid::new_v4` (`getrandom` underneath), without making
+/// `getrandom` a direct dependency: `N.div_ceil(16) + 1` v4 UUIDs, 122 random bits
+/// each, are hashed in counter mode into `N` bytes.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
-    [0; N]
+    let mut seed = Vec::new();
+    for _ in 0..=N.div_ceil(16) {
+        seed.extend_from_slice(Uuid::new_v4().as_bytes());
+    }
+    let mut out = [0u8; N];
+    for (block, chunk) in out.chunks_mut(32).enumerate() {
+        let digest = Sha256::new()
+            .chain_update((block as u32).to_be_bytes())
+            .chain_update(&seed)
+            .finalize();
+        chunk.copy_from_slice(&digest[..chunk.len()]);
+    }
+    out
 }
 
-// PASS-1 STUB: the same code every time.
+/// `XXXX-XXXX-XXXX`: 12 symbols of 5 bits, 60 bits of the OS CSPRNG.
 pub fn generate_code() -> String {
-    "AAAA-AAAA-AAAA".to_string()
+    let bits = u64::from_be_bytes(random_bytes::<8>());
+    let symbols: Vec<char> = (0..CODE_SYMBOLS)
+        .map(|i| {
+            let index = (bits >> (SYMBOL_BITS * i)) & SYMBOL_MASK;
+            char::from(CODE_ALPHABET.as_bytes()[index as usize])
+        })
+        .collect();
+    symbols
+        .chunks(CODE_GROUP)
+        .map(|group| group.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
-// PASS-1 STUB: refuses everything.
-pub fn normalize_code(_raw: &str) -> Result<String, CodeError> {
-    Err(CodeError::Length(0))
+/// What a person types (any case, spaces and dashes anywhere) reduced to the 12
+/// symbols that are hashed. A symbol outside the alphabet is named, before the
+/// length is judged, so `0` for `O` is reported as that and not as a length.
+pub fn normalize_code(raw: &str) -> Result<String, CodeError> {
+    let symbols: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if let Some(bad) = symbols.chars().find(|c| !CODE_ALPHABET.contains(*c)) {
+        return Err(CodeError::Symbol(bad));
+    }
+    match symbols.chars().count() {
+        CODE_SYMBOLS => Ok(symbols),
+        n => Err(CodeError::Length(n)),
+    }
 }
 
-// PASS-1 STUB: zeros.
-pub fn code_key(_normalized: &str) -> [u8; 32] {
-    [0; 32]
+pub fn code_key(normalized: &str) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(DOMAIN_CODE_KEY)
+        .chain_update([0u8])
+        .chain_update(normalized)
+        .finalize()
+        .into()
 }
 
-// PASS-1 STUB: validates nothing and keeps the case.
+fn is_alnum(c: char, lowercase_only: bool) -> bool {
+    c.is_ascii_digit()
+        || if lowercase_only {
+            c.is_ascii_lowercase()
+        } else {
+            c.is_ascii_alphabetic()
+        }
+}
+
+/// Mirrors the column CHECKs: a first character that is a letter or digit, then
+/// letters, digits and the `extra` ones, up to `max` characters in all.
+fn has_shape(text: &str, max: usize, extra: &str, lowercase_only: bool) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| is_alnum(c, lowercase_only))
+        && text.chars().count() <= max
+        && chars.all(|c| is_alnum(c, lowercase_only) || extra.contains(c))
+}
+
 pub fn validate_account_name(raw: &str) -> Result<String> {
-    Ok(raw.to_string())
+    let name = raw.to_ascii_lowercase();
+    if !has_shape(&name, ACCOUNT_NAME_MAX, "._-", true) {
+        bail!(
+            "account name {raw:?} must be 1-{ACCOUNT_NAME_MAX} characters: lowercase letters, \
+             digits, '.', '_' or '-', starting with a letter or a digit"
+        );
+    }
+    Ok(name)
 }
 
-// PASS-1 STUB: validates nothing.
 pub fn validate_device_label(raw: &str) -> Result<String> {
+    if !has_shape(raw, DEVICE_LABEL_MAX, "._ -", false) {
+        bail!(
+            "device label {raw:?} must be 1-{DEVICE_LABEL_MAX} characters: letters, digits, \
+             '.', '_', '-' or a space, starting with a letter or a digit"
+        );
+    }
     Ok(raw.to_string())
 }
 
-// PASS-1 STUB: empty.
-pub fn bearer(_credential_id: Uuid, _secret: &Secret) -> String {
-    String::new()
+/// Exactly `2 * N` lowercase hex characters. `hex::decode` alone would accept
+/// uppercase, a second spelling of the same bytes.
+fn lower_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let canonical =
+        text.len() == 2 * N && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !canonical {
+        return None;
+    }
+    hex::decode(text).ok()?.try_into().ok()
 }
 
-// PASS-1 STUB: nothing parses.
-pub fn parse_bearer(_raw: &str) -> Option<(Uuid, [u8; 32])> {
-    None
+pub fn bearer(credential_id: Uuid, secret: &Secret) -> String {
+    format!(
+        "{CREDENTIAL_PREFIX}.{}.{}",
+        credential_id.simple(),
+        secret.to_hex()
+    )
 }
 
-// PASS-1 STUB: empty.
-pub fn enc(_domain: &str, _fields: &[&[u8]]) -> Vec<u8> {
-    Vec::new()
+pub fn parse_bearer(raw: &str) -> Option<(Uuid, [u8; 32])> {
+    let mut parts = raw.split('.');
+    let (prefix, id, secret) = (parts.next()?, parts.next()?, parts.next()?);
+    if prefix != CREDENTIAL_PREFIX || parts.next().is_some() {
+        return None;
+    }
+    Some((
+        Uuid::from_bytes(lower_hex::<16>(id)?),
+        lower_hex::<32>(secret)?,
+    ))
 }
 
-// PASS-1 STUB: zeros.
-pub fn pair_request_mac(
-    _code_key: &[u8; 32],
-    _nc: &[u8; 16],
-    _label: &str,
-    _h: &[u8; 32],
-) -> [u8; 32] {
-    [0; 32]
+fn put(out: &mut Vec<u8>, bytes: &[u8]) {
+    let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(bytes);
 }
 
-// PASS-1 STUB: zeros.
+/// The transcript every MAC covers: the domain, then each field, every one
+/// preceded by its length as a big-endian u32, so a boundary cannot be moved.
+pub fn enc(domain: &str, fields: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put(&mut out, domain.as_bytes());
+    for field in fields {
+        put(&mut out, field);
+    }
+    out
+}
+
+fn hmac_over(key: &[u8], domain: &str, fields: &[&[u8]]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts a key of any length");
+    mac.update(&enc(domain, fields));
+    mac.finalize().into_bytes().into()
+}
+
+pub fn pair_request_mac(code_key: &[u8; 32], nc: &[u8; 16], label: &str, h: &[u8; 32]) -> [u8; 32] {
+    hmac_over(code_key, DOMAIN_PAIR_REQ, &[nc, label.as_bytes(), h])
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn pair_response_mac(
-    _code_key: &[u8; 32],
-    _nc: &[u8; 16],
-    _h: &[u8; 32],
-    _host_id: &Uuid,
-    _credential_id: &Uuid,
-    _account: &str,
-    _label: &str,
-    _host_name: &str,
+    code_key: &[u8; 32],
+    nc: &[u8; 16],
+    h: &[u8; 32],
+    host_id: &Uuid,
+    credential_id: &Uuid,
+    account: &str,
+    label: &str,
+    host_name: &str,
 ) -> [u8; 32] {
-    [0; 32]
+    let fields: [&[u8]; 7] = [
+        nc,
+        h,
+        host_id.as_bytes(),
+        credential_id.as_bytes(),
+        account.as_bytes(),
+        label.as_bytes(),
+        host_name.as_bytes(),
+    ];
+    hmac_over(code_key, DOMAIN_PAIR_RESP, &fields)
 }
 
-// PASS-1 STUB: zeros.
 pub fn identity_proof(
-    _secret_hash: &[u8; 32],
-    _host_id: &Uuid,
-    _credential_id: &Uuid,
-    _nonce: &[u8; 16],
+    secret_hash: &[u8; 32],
+    host_id: &Uuid,
+    credential_id: &Uuid,
+    nonce: &[u8; 16],
 ) -> [u8; 32] {
-    [0; 32]
+    hmac_over(
+        secret_hash,
+        DOMAIN_IDENTITY,
+        &[host_id.as_bytes(), credential_id.as_bytes(), nonce],
+    )
 }
 
-// PASS-1 STUB: nothing verifies.
-pub fn verify_mac(_expected: [u8; 32], _presented_hex: &str) -> bool {
-    false
+pub fn verify_mac(expected: [u8; 32], presented_hex: &str) -> bool {
+    lower_hex::<32>(presented_hex).is_some_and(|presented| ct_eq(&expected, &presented))
 }
 
-// PASS-1 STUB: everything is equal.
-pub fn ct_eq(_a: &[u8], _b: &[u8]) -> bool {
-    true
+/// Same fold as `http::same_secret`: the length is not a secret, the bytes are.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-// PASS-1 STUB: empty.
-pub fn fingerprint(_host_id: &Uuid) -> String {
-    String::new()
+pub fn fingerprint(host_id: &Uuid) -> String {
+    let digest = Sha256::new()
+        .chain_update(DOMAIN_FINGERPRINT)
+        .chain_update(host_id.as_bytes())
+        .finalize();
+    let shown = hex::encode_upper(&digest[..8]);
+    format!(
+        "{}-{}-{}-{}",
+        &shown[0..4],
+        &shown[4..8],
+        &shown[8..12],
+        &shown[12..16]
+    )
 }
 
-// PASS-1 STUB: nothing is recognised.
+fn is_token(bearer: &str, token: Option<&str>) -> bool {
+    token.is_some_and(|t| ct_eq(bearer.as_bytes(), t.as_bytes()))
+}
+
+/// Peer, then the shared token, then a credential, then nothing. The shared token
+/// is compared before the credential shape so a token that happens to start with
+/// `mi1.` stays the shared token.
 pub fn classify_bearer(
-    _bearer: &str,
-    _shared: Option<&str>,
-    _peer: Option<&str>,
-    _require_accounts_on_lan: bool,
+    bearer: &str,
+    shared: Option<&str>,
+    peer: Option<&str>,
+    require_accounts_on_lan: bool,
 ) -> BearerClass {
-    BearerClass::Unrecognized
+    if shared.is_none() && peer.is_none() {
+        return BearerClass::NoAuthConfigured;
+    }
+    if is_token(bearer, peer) {
+        return BearerClass::Peer;
+    }
+    if is_token(bearer, shared) {
+        return if require_accounts_on_lan {
+            BearerClass::SharedRefusedByPolicy
+        } else {
+            BearerClass::Shared
+        };
+    }
+    match parse_bearer(bearer) {
+        Some((id, secret)) => BearerClass::Account { id, secret },
+        None => BearerClass::Unrecognized,
+    }
 }
 
-// PASS-1 STUB: the knob is always off and never warns.
+/// The knob is read once, here. Only an explicit yes turns it on, and on a loopback
+/// bind it does nothing (the shared token is the only way in there), which is said.
 pub fn require_accounts_effective(
-    _addr_is_loopback: bool,
-    _raw: Option<&str>,
+    addr_is_loopback: bool,
+    raw: Option<&str>,
 ) -> (bool, Option<String>) {
-    (false, None)
+    let asked = raw.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    if asked && addr_is_loopback {
+        let warning = "the account-only policy is ignored on loopback: on a loopback bind \
+                       the shared token is the only way in";
+        return (false, Some(warning.to_string()));
+    }
+    (asked, None)
 }
 
 #[cfg(test)]
