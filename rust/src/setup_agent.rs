@@ -754,4 +754,144 @@ mod tests {
         assert!(cuba_block(&without).is_none());
         assert!(cuba_block(&json!({})).is_none());
     }
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    }
+
+    /// A home that is a scratch directory and has no `bridge.json`, with the variables that
+    /// pick the home and the bridge's state directory pointed at it.
+    struct ScratchHome {
+        dir: crate::bridge::fake_host::TempDir,
+        _home: ScopedEnv,
+        _profile: ScopedEnv,
+        _local_app_data: ScopedEnv,
+    }
+
+    impl ScratchHome {
+        fn new(tag: &str) -> Self {
+            let dir = crate::bridge::fake_host::TempDir::new(tag);
+            let root = dir.path().display().to_string();
+            ScratchHome {
+                _home: ScopedEnv::cleared("HOME"),
+                _profile: ScopedEnv::set("USERPROFILE", &root),
+                _local_app_data: ScopedEnv::cleared("LOCALAPPDATA"),
+                dir,
+            }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.dir.path().join(relative)
+        }
+    }
+
+    fn bridge_block_with(client_id: &str) -> Value {
+        json!({
+            "type": "http",
+            "url": "http://127.0.0.1:8797/mcp",
+            "headers": {"Mcp-Client-Id": client_id}
+        })
+    }
+
+    /// I4/I5 (the wiring: flags reach the writer, the writer reaches the right file)
+    #[tokio::test]
+    async fn setup_client_apply_writes_the_bridge_block_and_keeps_the_other_servers() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = ScratchHome::new("setup-client-apply");
+        let claude = home.path(".claude.json");
+        std::fs::write(
+            &claude,
+            json!({"numStartups": 3, "mcpServers": {"otro": {"command": "/bin/otro"}}}).to_string(),
+        )
+        .expect("seed");
+
+        run_cli(&words("client claude --client-id planta --apply"))
+            .expect("`setup client claude --apply` must work: it is the command the guide teaches");
+
+        let after = read_json(&claude).expect("the config is still JSON");
+        assert_eq!(
+            after["mcpServers"]["memory-industry"],
+            bridge_block_with("planta"),
+            "the client now talks to the local bridge, with the id the operator chose and no \
+             credential. Got: {after}"
+        );
+        assert_eq!(
+            after["mcpServers"]["otro"],
+            json!({"command": "/bin/otro"}),
+            "another server in the same file is not ours to touch"
+        );
+        assert_eq!(
+            after["numStartups"],
+            json!(3),
+            "nor are the client's own settings"
+        );
+        let backups = crate::bridge::fake_host::dir_entries(home.dir.path())
+            .into_iter()
+            .filter(|name| name.contains(".bak-"))
+            .count();
+        assert_eq!(backups, 1, "one time-stamped copy of the file as it was");
+    }
+
+    /// I5
+    #[tokio::test]
+    async fn setup_client_without_apply_is_a_plan_and_writes_nothing() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = ScratchHome::new("setup-client-plan");
+
+        run_cli(&words("client cursor --client-id planta"))
+            .expect("a plan for a known client works");
+
+        assert!(
+            crate::bridge::fake_host::dir_entries(home.dir.path()).is_empty(),
+            "without --apply nothing is created, not the file and not .cursor/. Found: {:?}",
+            crate::bridge::fake_host::dir_entries(home.dir.path())
+        );
+    }
+
+    /// I5/I6
+    #[tokio::test]
+    async fn setup_client_all_writes_the_four_known_files() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = ScratchHome::new("setup-client-all");
+
+        run_cli(&words("client all --client-id planta --apply"))
+            .expect("`setup client all --apply` must work");
+
+        for relative in [
+            ".claude.json",
+            ".mcp.json",
+            ".cursor/mcp.json",
+            ".warp/.mcp.json",
+        ] {
+            let written = read_json(&home.path(relative));
+            assert_eq!(
+                written
+                    .as_ref()
+                    .map(|cfg| &cfg["mcpServers"]["memory-industry"]),
+                Some(&bridge_block_with("planta")),
+                "{relative} must hold the bridge block after `client all`. Got: {written:?}"
+            );
+        }
+    }
+
+    /// I5
+    #[tokio::test]
+    async fn setup_client_names_the_valid_clients_when_given_a_wrong_one_or_none() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = ScratchHome::new("setup-client-wrong");
+
+        for line in ["client vim --apply", "client --apply"] {
+            let err = run_cli(&words(line)).expect_err("there is no such client to write to");
+            let said = format!("{err:#}");
+            assert!(
+                said.contains("warp") && said.contains("all"),
+                "`setup {line}` must list the clients it knows (claude, mcp, cursor, warp, all). \
+                 Got: {said}"
+            );
+        }
+        assert!(
+            crate::bridge::fake_host::dir_entries(home.dir.path()).is_empty(),
+            "a refused command writes nothing"
+        );
+    }
 }

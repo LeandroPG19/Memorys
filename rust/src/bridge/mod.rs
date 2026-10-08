@@ -18,7 +18,10 @@ use crate::service::Target;
 use crate::service_apply::CommandRunner;
 use crate::setup_agent::SystemRunner;
 
+pub mod client_config;
 pub mod discovery;
+pub mod doctor;
+pub mod install;
 pub mod pair;
 pub mod proxy;
 pub mod state;
@@ -575,6 +578,35 @@ fn cli_status() -> Result<()> {
     Ok(())
 }
 
+/// What `memory-industry bridge …` was asked to do, parsed without touching the network or
+/// the disk so the guide's commands can be judged against it.
+// PASS-1 STUB: the enum is the contract the tests read; `parse` below answers `Help` for
+// everything until pass 2 implements it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    Pair {
+        code: String,
+        host: Option<String>,
+        device: Option<String>,
+        port: Option<u16>,
+    },
+    Run {
+        port: Option<u16>,
+    },
+    Status,
+    Install {
+        print: bool,
+    },
+    Uninstall,
+    Doctor,
+    Help,
+}
+
+// PASS-1 STUB
+pub fn parse(_args: &[String]) -> Result<Command> {
+    Ok(Command::Help)
+}
+
 pub async fn run_cli(args: &[String]) -> Result<()> {
     if args
         .iter()
@@ -639,5 +671,120 @@ mod tests {
             !state_path.exists(),
             "refusing to run must not create a state file as a side effect"
         );
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    }
+
+    fn parsed(line: &str) -> Command {
+        match parse(&words(line)) {
+            Ok(command) => command,
+            Err(err) => panic!("`bridge {line}` must parse, the guide shows it. Got: {err:#}"),
+        }
+    }
+
+    fn refused(line: &str) -> String {
+        match parse(&words(line)) {
+            Ok(command) => panic!("`bridge {line}` must be refused. Parsed as {command:?}"),
+            Err(err) => format!("{err:#}"),
+        }
+    }
+
+    /// I7 (the parser the guide is judged against)
+    #[test]
+    fn every_subcommand_the_guide_teaches_parses_to_its_own_command() {
+        assert_eq!(
+            parsed("pair K7QM-3WXP-9HNR"),
+            Command::Pair {
+                code: "K7QM-3WXP-9HNR".to_string(),
+                host: None,
+                device: None,
+                port: None,
+            },
+            "`bridge pair <code>` is the one command a client types to pair"
+        );
+        assert_eq!(
+            parsed("pair K7QM-3WXP-9HNR --host madre --device pc-02 --port 9100"),
+            Command::Pair {
+                code: "K7QM-3WXP-9HNR".to_string(),
+                host: Some("madre".to_string()),
+                device: Some("pc-02".to_string()),
+                port: Some(9100),
+            },
+            "`--host`, `--device` and `--port` each carry their own value"
+        );
+        assert_eq!(parsed("run"), Command::Run { port: None });
+        assert_eq!(
+            parsed("run --port 9000"),
+            Command::Run { port: Some(9000) },
+            "`bridge run --port` overrides the port in the state file"
+        );
+        assert_eq!(parsed("status"), Command::Status);
+        assert_eq!(parsed("doctor"), Command::Doctor);
+        assert_eq!(
+            parsed("install"),
+            Command::Install { print: false },
+            "`bridge install` registers the task; only `--print` is a dry run"
+        );
+        assert_eq!(parsed("install --print"), Command::Install { print: true });
+        assert_eq!(parsed("uninstall"), Command::Uninstall);
+    }
+
+    /// I7 (a typo in the guide must be caught by the parser, not by a reader)
+    #[test]
+    fn a_misspelled_subcommand_or_option_is_refused_by_name() {
+        assert!(
+            refused("pari K7QM-3WXP-9HNR").contains("pari"),
+            "the typo must be named so the reader sees what to fix"
+        );
+        assert!(
+            refused("install --bogus").contains("--bogus"),
+            "an option nobody defined must not be ignored: `install --prnt` would register the \
+             task the reader only wanted to look at"
+        );
+        assert!(
+            refused("doctor now").contains("now"),
+            "`doctor` takes nothing; a stray word means the line is not what the author meant"
+        );
+        assert!(
+            refused("pair").contains("code"),
+            "`bridge pair` without a code cannot pair; the error must say what is missing"
+        );
+        assert!(
+            refused("pair K7QM-3WXP-9HNR --port 0").contains("port"),
+            "port 0 is not a port the bridge could listen on"
+        );
+    }
+
+    #[test]
+    fn help_is_asked_for_anywhere_and_a_bare_bridge_needs_a_subcommand() {
+        assert_eq!(parsed("--help"), Command::Help);
+        assert_eq!(
+            parsed("pair --help"),
+            Command::Help,
+            "`--help` after a subcommand is still a request for help, as `run_cli` treats it today"
+        );
+        assert!(
+            refused("").contains("subcommand"),
+            "`bridge` alone must say that it needs a subcommand"
+        );
+    }
+
+    /// I2/I3 (the help names every subcommand the guide teaches)
+    #[test]
+    fn the_usage_names_every_subcommand() {
+        for sub in ["pair", "run", "status", "install", "uninstall", "doctor"] {
+            assert!(
+                USAGE.contains(sub),
+                "`memory-industry bridge --help` does not list `{sub}`: a command the page \
+                 teaches and the help hides is one nobody finds. USAGE: {USAGE}"
+            );
+        }
     }
 }

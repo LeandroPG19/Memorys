@@ -968,15 +968,20 @@ fn flatten(text: &str) -> String {
 }
 
 /// The `memory-industry setup service …` lines of a document, as the words the
-/// binary would receive after `service`. Fenced and indented blocks both count;
-/// a trailing `\` or `^` joins the next line; a ` #` starts a comment.
+/// binary would receive after `service`.
 fn setup_service_commands(text: &str) -> Vec<(String, Vec<String>)> {
-    const PREFIX: &str = "memory-industry setup service";
+    commands_with_prefix(text, "memory-industry setup service")
+}
+
+/// The lines of a document that start with `prefix`, as the words the binary would receive
+/// after it. Fenced and indented blocks both count; a trailing `\` or `^` joins the next
+/// line; a ` #` starts a comment.
+fn commands_with_prefix(text: &str, prefix: &str) -> Vec<(String, Vec<String>)> {
     let mut found = Vec::new();
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
         let mut joined = line.trim().to_string();
-        if !joined.starts_with(PREFIX) {
+        if !joined.starts_with(prefix) {
             continue;
         }
         while joined.ends_with('\\') || joined.ends_with('^') {
@@ -990,7 +995,7 @@ fn setup_service_commands(text: &str) -> Vec<(String, Vec<String>)> {
             }
         }
         let command = joined.split(" #").next().unwrap_or("").trim().to_string();
-        let args = command[PREFIX.len()..]
+        let args = command[prefix.len()..]
             .split_whitespace()
             .map(|w| w.trim_matches(|c| c == '"' || c == '\'').to_string())
             .collect();
@@ -1252,4 +1257,497 @@ fn packaging_readme_warns_that_the_windows_goldens_are_not_installed_by_hand() {
         "packaging/README.md does not say the Windows files are installed with \
          `setup service --apply`, which bakes absolute paths in"
     );
+}
+
+// ── 0.29.0 part 2: accounts, the bridge and the fixed address (slice I) ──────────────
+
+const ACCOUNTS_HEADING: &str = "Accounts";
+const FIXED_ADDRESS_HEADING: &str = "Fixed address on the host";
+
+/// The body of the `##` section whose heading line contains `heading`, up to the next `##`
+/// heading. Lines inside a fence are never headings (a PowerShell comment starts with `#`).
+fn section(text: &str, heading: &str) -> Option<String> {
+    let mut body = Vec::new();
+    let mut inside_section = false;
+    let mut inside_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            inside_fence = !inside_fence;
+        }
+        let is_heading = !inside_fence && line.starts_with("## ");
+        if is_heading && inside_section {
+            break;
+        }
+        if is_heading && line.contains(heading) {
+            inside_section = true;
+            continue;
+        }
+        if inside_section {
+            body.push(line);
+        }
+    }
+    inside_section.then(|| body.join("\n"))
+}
+
+/// The lines a reader would copy: indented by four spaces, or inside a fence.
+fn code_lines(text: &str) -> Vec<&str> {
+    let mut inside_fence = false;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            inside_fence = !inside_fence;
+            continue;
+        }
+        if inside_fence || line.starts_with("    ") {
+            out.push(line);
+        }
+    }
+    out
+}
+
+fn missing_from<'a>(haystack: &str, needles: &[&'a str]) -> Vec<&'a str> {
+    needles
+        .iter()
+        .copied()
+        .filter(|needle| !haystack.contains(needle))
+        .collect()
+}
+
+/// I7. The guide's account, bridge and `setup client` commands are judged by the parsers
+/// the binary uses, so a typo in the page is a red test and not a reader's error message.
+#[test]
+fn every_account_bridge_and_client_command_in_the_lan_guide_is_one_the_parsers_accept() {
+    use memory_industry::accounts_cli::{self, Command as Account};
+    use memory_industry::bridge::{self, Command as Bridge, client_config};
+
+    let guide = read(LAN_GUIDE);
+    let accounts = commands_with_prefix(&guide, "memory-industry account");
+    let bridges = commands_with_prefix(&guide, "memory-industry bridge");
+    let clients = commands_with_prefix(&guide, "memory-industry setup client");
+
+    assert!(
+        accounts.len() >= 5 && bridges.len() >= 4 && !clients.is_empty(),
+        "{LAN_GUIDE} shows {} `memory-industry account`, {} `memory-industry bridge` and {} \
+         `memory-industry setup client` command(s); the procedure needs at least 5, 4 and 1. \
+         Fewer means the scan found nothing to judge and a green result would prove nothing. \
+         Found: {accounts:?} {bridges:?} {clients:?}",
+        accounts.len(),
+        bridges.len(),
+        clients.len()
+    );
+
+    let mut refused: Vec<String> = Vec::new();
+    let mut shown_accounts = Vec::new();
+    for (command, args) in &accounts {
+        match accounts_cli::parse(args) {
+            Ok(parsed) => shown_accounts.push(parsed),
+            Err(err) => refused.push(format!("`{command}` -> {err}")),
+        }
+    }
+    let mut shown_bridge = Vec::new();
+    for (command, args) in &bridges {
+        match bridge::parse(args) {
+            Ok(parsed) => shown_bridge.push(parsed),
+            Err(err) => refused.push(format!("`{command}` -> {err}")),
+        }
+    }
+    for (command, args) in &clients {
+        if let Err(err) = client_config::parse_client_args(args) {
+            refused.push(format!("`{command}` -> {err}"));
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "{LAN_GUIDE} tells the reader to type commands the binary refuses: {refused:#?}"
+    );
+
+    let teaches = |wanted: bool, what: &str| {
+        assert!(
+            wanted,
+            "{LAN_GUIDE} never shows {what}. Parsed: {shown_accounts:?} {shown_bridge:?}"
+        );
+    };
+    teaches(
+        shown_accounts
+            .iter()
+            .any(|c| matches!(c, Account::Add { .. })),
+        "`account add`, how an account is created",
+    );
+    teaches(
+        shown_accounts
+            .iter()
+            .any(|c| matches!(c, Account::Pair { .. })),
+        "`account pair`, how the code for a device is issued",
+    );
+    teaches(
+        shown_accounts
+            .iter()
+            .any(|c| matches!(c, Account::List { .. })),
+        "`account list`, how the operator sees who is paired",
+    );
+    teaches(
+        shown_accounts
+            .iter()
+            .any(|c| matches!(c, Account::Revoke { .. })),
+        "`account revoke`, how a person loses access",
+    );
+    teaches(
+        shown_accounts
+            .iter()
+            .any(|c| matches!(c, Account::RevokeDevice { .. })),
+        "`account revoke-device`, how one lost PC loses access",
+    );
+    teaches(
+        shown_bridge
+            .iter()
+            .any(|c| matches!(c, Bridge::Pair { .. })),
+        "`bridge pair`, the one command a client types to pair",
+    );
+    teaches(
+        shown_bridge
+            .iter()
+            .any(|c| matches!(c, Bridge::Install { .. })),
+        "`bridge install`, how the bridge starts at every logon",
+    );
+    teaches(
+        shown_bridge.iter().any(|c| matches!(c, Bridge::Doctor)),
+        "`bridge doctor`, how the client finds out why it cannot reach the host",
+    );
+}
+
+/// I7. Whatever else the guide tells the reader to run is a command the binary has.
+#[test]
+fn every_other_memory_industry_command_in_the_lan_guide_exists() {
+    let guide = read(LAN_GUIDE);
+    let known: BTreeSet<&str> = memory_industry::cli::COMMANDS.iter().copied().collect();
+    let judged_elsewhere = ["account", "bridge"];
+    let setup_subcommands = ["service", "client", "check", "print", "hook"];
+
+    let mut unknown = Vec::new();
+    let mut seen = 0;
+    for line in guide.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [first, command, rest @ ..] = words.as_slice() else {
+            continue;
+        };
+        if *first != "memory-industry" || judged_elsewhere.contains(command) {
+            continue;
+        }
+        seen += 1;
+        let ok = if *command == "setup" {
+            rest.first().is_some_and(|sub| {
+                setup_subcommands.contains(sub) || ["claude", "mcp", "cursor"].contains(sub)
+            })
+        } else {
+            known.contains(command)
+        };
+        if !ok {
+            unknown.push(line.trim().to_string());
+        }
+    }
+    assert!(
+        seen >= 3,
+        "the scan found {seen} other `memory-industry` command line(s) in {LAN_GUIDE} and the \
+         page shows at least `models all`, `doctor --deep` and `setup service`: it is not \
+         reading the page"
+    );
+    assert!(
+        unknown.is_empty(),
+        "{LAN_GUIDE} tells the reader to run commands the binary does not have: {unknown:#?}"
+    );
+}
+
+/// I7. The section on accounts and the bridge is the procedure: what to type on the host and
+/// on a client, what the bridge is, how to revoke, how to read `bridge doctor`, what the
+/// proof of identity does not cover, and a table of symptoms tied to the messages the code
+/// prints. Presence anchors, declared as such: the commands themselves are judged by the
+/// parsers above, and the behaviour by the unit tests of slices F, H and I.
+#[test]
+fn the_lan_guide_teaches_accounts_pairing_and_the_bridge() {
+    let raw = read(LAN_GUIDE);
+    let accounts_section = section(&raw, ACCOUNTS_HEADING).unwrap_or_else(|| {
+        panic!(
+            "{LAN_GUIDE} has no `## …{ACCOUNTS_HEADING}…` section: the page has not been \
+             extended for accounts and the bridge, so none of the facts below can be located"
+        )
+    });
+    let guide = flatten(&accounts_section);
+
+    let cited = [
+        "memory-industry account add",
+        "memory-industry account pair",
+        "memory-industry account list",
+        "memory-industry account revoke",
+        "memory-industry account revoke-device",
+        "memory-industry bridge pair",
+        "memory-industry bridge install",
+        "memory-industry bridge doctor",
+        "memory-industry setup client",
+        "MEMORY_INDUSTRY_REQUIRE_ACCOUNTS",
+        r"%LOCALAPPDATA%\MemoryIndustry\bridge.json",
+    ];
+    let missing = missing_from(&guide, &cited);
+    assert!(
+        missing.is_empty(),
+        "the accounts section of {LAN_GUIDE} does not cite {missing:?}"
+    );
+
+    let bridge_loopback = format!("127.0.0.1:{}", memory_industry::bridge::DEFAULT_BRIDGE_PORT);
+    assert!(
+        guide.contains(&bridge_loopback),
+        "the accounts section names the bridge's loopback address, and it must be \
+         {bridge_loopback}: bridge::DEFAULT_BRIDGE_PORT. A page with another port sends the \
+         reader's client where nothing listens"
+    );
+    let host_port = memory_industry::http::DEFAULT_ADDR
+        .rsplit(':')
+        .next()
+        .unwrap_or("");
+    assert_eq!(
+        host_port,
+        memory_industry::bridge::DEFAULT_HOST_PORT.to_string(),
+        "the bridge looks for the host on the port the daemon binds by default; two constants \
+         that disagree make every pairing without --host miss"
+    );
+    assert!(
+        guide.contains(&format!("192.168.0.10:{host_port}")),
+        "the accounts section shows the host as <address>:{host_port} (http::DEFAULT_ADDR's \
+         port), the address `bridge doctor` prints in its last line"
+    );
+
+    let facts = [
+        ("two minutes", "pairing a client takes under two minutes"),
+        ("without administrator", "and needs no administrator rights"),
+        (
+            "holds the credential",
+            "what the bridge is: it holds the credential",
+        ),
+        ("next request", "revocation applies from the next request"),
+        ("huella", "the fingerprint word `bridge doctor` prints"),
+        (
+            "madre:",
+            "the last line of `bridge doctor`, the host it found",
+        ),
+        ("clear text", "traffic is still plain HTTP"),
+        ("TLS", "and TLS is the answer"),
+        ("next version", "which is the next version"),
+        (
+            "does not cover",
+            "what the proof of identity does not cover",
+        ),
+    ];
+    let absent: Vec<String> = facts
+        .iter()
+        .filter(|(text, _)| !guide.contains(text))
+        .map(|(text, meaning)| format!("«{text}» ({meaning})"))
+        .collect();
+    assert!(
+        absent.is_empty(),
+        "the accounts section of {LAN_GUIDE} is missing: {absent:#?}"
+    );
+}
+
+/// I7. The symptom table of the accounts section quotes what the bridge prints, so a row
+/// cannot send the operator looking for text that does not exist.
+#[test]
+fn the_accounts_troubleshooting_table_quotes_messages_the_bridge_prints() {
+    let raw = read(LAN_GUIDE);
+    let accounts_section = section(&raw, ACCOUNTS_HEADING)
+        .unwrap_or_else(|| panic!("{LAN_GUIDE} has no `## …{ACCOUNTS_HEADING}…` section"));
+    let rows: Vec<&str> = accounts_section
+        .lines()
+        .filter(|l| l.trim_start().starts_with('|'))
+        .collect();
+    assert!(
+        rows.len() >= 7,
+        "the accounts section has {} table rows; the table needs its header, its divider and at \
+         least 5 symptoms. Found: {rows:?}",
+        rows.len()
+    );
+    let table = flatten(&rows.join("\n"));
+
+    let mod_rs = include_str!("../src/bridge/mod.rs");
+    let pair_rs = include_str!("../src/bridge/pair.rs");
+    let proxy_rs = include_str!("../src/bridge/proxy.rs");
+    let symptoms = [
+        (
+            "la madre cambió de huella",
+            mod_rs,
+            "the host answered with another fingerprint than the one pinned",
+        ),
+        (
+            "credencial revocada",
+            mod_rs,
+            "the operator revoked this device",
+        ),
+        (
+            "cannot listen on 127.0.0.1",
+            proxy_rs,
+            "the bridge's port is taken by another program",
+        ),
+        (
+            "no se encontró la madre",
+            mod_rs,
+            "nothing on the LAN proved to be the host",
+        ),
+        (
+            "la madre no aceptó el código",
+            pair_rs,
+            "the pairing code is mistyped, expired or used",
+        ),
+    ];
+    let absent: Vec<String> = symptoms
+        .iter()
+        .filter(|(text, _, _)| !table.contains(text))
+        .map(|(text, _, row)| format!("«{text}» ({row})"))
+        .collect();
+    assert!(
+        absent.is_empty(),
+        "the accounts table in {LAN_GUIDE} has no row for: {absent:#?}. Each must sit in a \
+         markdown table row (a line starting with `|`), phrased with exactly that text"
+    );
+    for (text, source, _) in symptoms {
+        assert!(
+            source.contains(text),
+            "the guide's table quotes «{text}» but the bridge's source never prints it: the row \
+             would send the operator looking for text that does not exist"
+        );
+    }
+}
+
+/// I7. The host needs a fixed address, and the page says how to give it one without a router
+/// the operator cannot reach, and what can go wrong. Presence anchors, declared as such.
+#[test]
+fn the_lan_guide_gives_the_fixed_address_steps_and_the_dhcp_warning() {
+    let raw = read(LAN_GUIDE);
+    let fixed = section(&raw, FIXED_ADDRESS_HEADING).unwrap_or_else(|| {
+        panic!(
+            "{LAN_GUIDE} has no `## …{FIXED_ADDRESS_HEADING}…` section: the host keeps one \
+             address only if somebody fixes it, and this is where the page says how"
+        )
+    });
+
+    let code = code_lines(&fixed).join("\n");
+    let commands = [
+        "Get-NetIPConfiguration",
+        "Set-NetIPInterface",
+        "-Dhcp Disabled",
+        "New-NetIPAddress",
+        "Set-DnsClientServerAddress",
+        "ipconfig /all",
+    ];
+    let not_copyable = missing_from(&code, &commands);
+    assert!(
+        not_copyable.is_empty(),
+        "the `{FIXED_ADDRESS_HEADING}` section must show {not_copyable:?} in a code block the \
+         reader can copy (indented four spaces or fenced), not only in prose. Code lines found:\n{code}"
+    );
+
+    let prose = flatten(&fixed);
+    let facts = [
+        ("elevated", "these commands need an elevated PowerShell"),
+        (
+            "outside the DHCP",
+            "choose an address outside the DHCP range",
+        ),
+        (
+            "cannot see",
+            "Windows cannot see the DHCP range of the router",
+        ),
+        (
+            "administers the router",
+            "ask whoever administers the router for the range",
+        ),
+        (
+            "memory-industry bridge doctor",
+            "the check afterwards: another machine on that IP is rejected by the bridge",
+        ),
+    ];
+    let absent: Vec<String> = facts
+        .iter()
+        .filter(|(text, _)| !prose.contains(text))
+        .map(|(text, meaning)| format!("«{text}» ({meaning})"))
+        .collect();
+    assert!(
+        absent.is_empty(),
+        "the `{FIXED_ADDRESS_HEADING}` section of {LAN_GUIDE} is missing: {absent:#?}"
+    );
+}
+
+/// The `[Unreleased]` block of the changelog, and one `###` part of it.
+fn changelog_part(changelog: &str, heading: &str) -> Option<String> {
+    let unreleased = changelog
+        .split("\n## [")
+        .find(|block| block.starts_with("Unreleased]"))?;
+    let mut parts = unreleased.split("\n### ");
+    parts
+        .find(|part| part.starts_with(heading))
+        .map(str::to_string)
+}
+
+/// I8. The changelog says what a deployer has to know before updating: that accounts, pairing,
+/// the bridge and the knob change behaviour, and what has not been verified on a real host.
+/// Presence anchors, declared as such.
+#[test]
+fn the_changelog_announces_accounts_and_the_bridge_and_what_is_not_verified() {
+    let changelog = read("CHANGELOG.md");
+    let behaviour = changelog_part(&changelog, "Behaviour changes").expect(
+        "CHANGELOG.md has no `### Behaviour changes` inside `[Unreleased]`: the anchor for the \
+         checks below is gone",
+    );
+    let behaviour = flatten(&behaviour);
+    let announced = [
+        "MEMORY_INDUSTRY_REQUIRE_ACCOUNTS",
+        "account",
+        "pairing code",
+        "bridge",
+    ];
+    let missing = missing_from(&behaviour, &announced);
+    assert!(
+        missing.is_empty(),
+        "`[Unreleased]` → `Behaviour changes` does not mention {missing:?}: a deployer reads that \
+         part before updating, and accounts, pairing, the bridge and the knob change what the \
+         daemon accepts"
+    );
+
+    let unverified = changelog_part(&changelog, "Not verified").expect(
+        "CHANGELOG.md has no `### Not verified` inside `[Unreleased]`: the unverified list is \
+         where the next person learns what only a real host can prove",
+    );
+    let unverified = flatten(&unverified);
+    let listed = [
+        "ONLOGON",
+        "conhost --headless",
+        "Set-NetIPInterface",
+        "Cursor",
+    ];
+    let missing = missing_from(&unverified, &listed);
+    assert!(
+        missing.is_empty(),
+        "`[Unreleased]` → `Not verified` does not list {missing:?}: the per-user logon task, the \
+         hidden console, the fixed-address cmdlets and Cursor's `http` entry were never run on a \
+         real machine, and the changelog must say so"
+    );
+}
+
+/// I8. The README (written by slice G, only watched here) has a row for the knob and names
+/// the two routes. Presence anchors, declared as such.
+#[test]
+fn the_readme_documents_the_accounts_knob_and_the_two_pairing_routes() {
+    let readme = read("README.md");
+    assert!(
+        readme
+            .lines()
+            .any(|l| l.trim_start().starts_with('|')
+                && l.contains("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS")),
+        "README.md has no table row for MEMORY_INDUSTRY_REQUIRE_ACCOUNTS: the knob that closes \
+         the shared token to the LAN would be one an operator never learns exists"
+    );
+    for route in ["/identity", "/pair"] {
+        assert!(
+            readme.contains(route),
+            "README.md never names the {route} route: a firewall rule or a monitor cannot be \
+             written for an endpoint the page does not list"
+        );
+    }
 }
