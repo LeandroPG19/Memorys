@@ -89,15 +89,29 @@ are versioned. It belongs in the environment file that the unit loads.
 
 ## 5. The address
 
-Bind the **concrete** address of the interface the clients use:
+Bind the **concrete** address of the interface the clients use. It lives in one
+place, the environment file `setup service` writes, as `CUBA_HTTP_ADDR`:
 
     CUBA_HTTP_ADDR=192.168.0.10:8787
+
+The launcher and the systemd unit do not repeat it: `serve` reads it from that
+file, so editing the file and running `--apply` again is the whole change.
+`setup service --apply` without `--profile` keeps the address the file already
+has; it never drops a LAN install back to loopback on its own. Going back to
+loopback is explicit: `--profile loopback`.
 
 Not `0.0.0.0:8787`. That binds every interface, including a VPN adapter or a
 phone hotspot — interfaces you did not mean to serve.
 
-If the port is already taken, `serve` says so and exits; it does not guess
-another one. Pick a free port and put it in the client config too.
+If the port is already taken, `serve` says so ("is already in use") and exits;
+it does not guess another one. Pick a free port and put it in the client config
+too. If the address is not assigned to this machine yet — a DHCP lease that has
+not arrived at boot — `serve` waits and retries for up to five minutes, then
+exits saying so ("is not assigned to this machine"). The wait is
+`MEMORY_INDUSTRY_BIND_WAIT_SECS` (`0` tries once). A DHCP lease that gives the
+host a different address needs a reservation on the router or a static address
+on the host: the daemon waits for the address you named, it does not follow a
+new one.
 
 > **Local-environment note, not a product rule.** On a workstation that also
 > runs Cursor, `8787` and `8788` may collide with the editor's OAuth callback,
@@ -117,6 +131,12 @@ first line — this is the second. On Windows this needs an administrator; if th
 installing the daemon is not one, the daemon will run and answer locally while
 remote clients time out — that symptom is a missing firewall rule, not a broken
 daemon.
+
+`setup service --apply --register` (section 9) opens the rule for you, for the
+Private and Domain network profiles and for the chosen port only, and does
+nothing for a loopback address. To see what exists:
+
+    netsh advfirewall firewall show rule name=memory-industry
 
 ## 7. Each client machine
 
@@ -164,6 +184,88 @@ the daemon machine:
 
 ## 9. Keeping it running
 
-Linux: the unit and socket in `packaging/`. Windows: a scheduled task that runs
-at logon and restarts on failure. Whichever you use, it must load the
-environment file rather than carrying the token inline.
+Whichever platform, the daemon loads the environment file rather than carrying
+the token inline, and `setup service` writes that file once and never rotates
+the token behind your back.
+
+Look at the plan first: it writes nothing.
+
+    memory-industry setup service --profile lan --addr 192.168.0.10:8787
+
+### Windows (the host), from an elevated PowerShell
+
+    memory-industry setup service --profile lan --addr 192.168.0.10:8787 --apply --register
+
+That writes three files under `%LOCALAPPDATA%\MemoryIndustry\` (the launcher
+`memory-industry.cmd`, the task definition and the environment file, which holds
+the token), then registers a scheduled task named `memory-industry` and opens
+the firewall rule. Without `--register` it only prints the commands it would
+have run. Without an elevated shell, `--register` refuses and says which right
+is missing; it never half-installs.
+
+What the task does, and what it implies:
+
+- It starts **at boot**, with nobody logged in, and again at logon; every five
+  minutes it asks to start again, and a second copy never runs. If the daemon
+  dies it is restarted after a minute, without a practical limit.
+- It runs as **SYSTEM**: a service account, so Windows stores no password, and
+  it works with the machine sitting at the sign-in screen. The consequence is
+  that the daemon runs with all the privileges the machine has. Treat the token
+  and the environment file accordingly.
+- Because SYSTEM has no profile of its own, every path baked into the task, the
+  launcher and the log is **absolute**, and the launcher sets `USERPROFILE` to
+  the home of whoever installed before it reads the environment file, so the
+  model cache is found. If the `.exe` moves, or the installing user changes,
+  run `--apply again` (with `--register`): the paths are written in.
+- The launcher appends the daemon's output to `memory-industry.log`, in the same
+  folder as the environment file. At the next start, a log over 5 MiB moves to
+  `memory-industry.log.1`, replacing the one before. A daemon that refuses to
+  start leaves its reason there.
+- The database container starts when Docker Desktop does, which is at sign-in,
+  not at boot. Until then the daemon answers, but the tools that need the
+  database fail; see the table below.
+
+To change the address, edit `CUBA_HTTP_ADDR` in the environment file and run
+`--apply --register` again, or pass `--profile lan --addr <new>`. `--apply`
+without `--profile` keeps what the file says.
+
+Look at what is installed, read-only:
+
+    schtasks /Query /TN memory-industry /V /FO LIST
+    netsh advfirewall firewall show rule name=memory-industry
+
+To remove it, `setup service --uninstall` prints the exact commands and runs none:
+
+    memory-industry setup service --uninstall
+
+On Windows they are `schtasks /Delete /TN memory-industry /F` and
+`netsh advfirewall firewall delete rule name=memory-industry`.
+
+### Linux
+
+The unit and socket in `packaging/`, generated by the same command with
+`--apply` (there is no task and no firewall rule to register on Linux; open the
+port with your own firewall):
+
+    memory-industry setup service --profile lan --addr 192.168.0.10:8787 --apply
+
+The service no longer carries the address on its `ExecStart` line, the
+socket does, and for a routable address the socket sets `FreeBind=yes` so it can
+open before the address exists.
+
+### When it does not come back
+
+Run `memory-industry doctor` on the host: it reports the address and profile the
+environment file holds, whether the task is registered, and the last error line
+of the log.
+
+| What you see | Why | What to do |
+| --- | --- | --- |
+| The log says "is not assigned to this machine" | The address belongs to no interface yet, or the host got another one | Check the address with `ipconfig` (Windows) or `ip addr` (Linux); fix `CUBA_HTTP_ADDR`; give the host a fixed address |
+| The log says "is already in use" | Another process holds the port | Find it with `netstat -ano`, or pick another port in both the file and the clients |
+| The log says "refusing to bind" | `CUBA_HTTP_TOKEN` is missing or shorter than 32 characters | Fix the environment file; do not copy the token into the task |
+| Local answers, remote clients time out | The firewall rule is missing, or the network profile is Public | Run `--apply --register` elevated; check `netsh advfirewall firewall show rule name=memory-industry` |
+| The daemon does not start after a reboot | The task is not registered, or it ran and failed | `schtasks /Query /TN memory-industry /V /FO LIST` for the last result; read `memory-industry.log` |
+| Search works but only by lexical search | No models were found: under SYSTEM the home is not the user's | Check `USERPROFILE` in the launcher, or set `ONNX_MODEL_PATH` in the environment file |
+| The tools fail but `/health` answers; Postgres is not up after a reboot | The container starts at sign-in, not at boot | Wait for Docker Desktop, or start the container from a task of its own |
+| `--register` refuses | The shell is not elevated | Open PowerShell as administrator |

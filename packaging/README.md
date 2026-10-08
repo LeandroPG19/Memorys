@@ -13,6 +13,15 @@ written by hand is a second source of truth for the defaults, and that is how a
 hand-pinned GPU ceiling ended up beating the resource planner's measurement on
 every machine with a card.
 
+The files under `packaging/windows/` are **documentation of the shape**, not
+something to hand to `schtasks`: they write `%LOCALAPPDATA%` and `%USERPROFILE%`
+because the render has no machine to name. The scheduled task runs as SYSTEM,
+which cannot expand either (it has no profile of its own), so installing these
+files as they are would register a task pointing at an empty folder. They are
+installed with `setup service --apply` (add `--register` on Windows, from an
+elevated shell), which renders the same files with the absolute paths of the
+machine it runs on.
+
 The units carry **no knobs**. They point at an env file, and that file offers
 every key the planner can set, commented and without a value — the planner
 measures them at startup and a value written there wins for good.
