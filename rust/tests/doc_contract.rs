@@ -1044,7 +1044,16 @@ fn every_setup_service_command_in_the_lan_guide_is_one_the_parser_accepts() {
     let refused: Vec<String> = commands
         .iter()
         .filter_map(|(command, args)| {
-            memory_industry::service::parse_request(args.as_slice())
+            // The guide shows --register only in the Windows procedure; the
+            // parser judges it for the target, and the target defaults to the
+            // host. Without this, the check passes on a Windows host and fails
+            // on Linux for a command that is correct.
+            let mut judged = args.clone();
+            let names_a_target = args.iter().any(|a| a == "--windows" || a == "--linux");
+            if args.iter().any(|a| a == "--register") && !names_a_target {
+                judged.push("--windows".to_string());
+            }
+            memory_industry::service::parse_request(judged.as_slice())
                 .err()
                 .map(|e| format!("`{command}` -> {e}"))
         })
