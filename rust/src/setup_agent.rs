@@ -510,8 +510,9 @@ fn print_lines(lines: impl IntoIterator<Item = String>) {
 }
 
 /// The real door to the OS: spawns the program and reports how it ended. All
-/// that is decided about the output is in `service_apply`.
-struct SystemRunner;
+/// that is decided about the output is in `service_apply`. `pub(crate)` because
+/// doctor asks the scheduler through the same door.
+pub(crate) struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
     fn run(&mut self, program: &str, args: &[String]) -> std::io::Result<CommandOutcome> {

@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use sqlx::{PgPool, Row};
 
 use crate::embeddings::onnx;
+use crate::service_apply::env_value;
 
 const EXPECTED_TABLES: i64 = 24;
 
@@ -92,22 +93,30 @@ pub enum BindProbe {
     NotAssigned,
 }
 
-// PASS-1 STUB: today every failed bind is «in use». Pass 2 maps
-// `AddrNotAvailable` to `NotAssigned`.
-fn probe_of_failed_bind(_e: &std::io::Error) -> BindProbe {
-    BindProbe::InUse
+/// `AddrNotAvailable` is the OS saying no interface owns the address; every
+/// other refusal is taken to be a socket already holding the port.
+fn probe_of_failed_bind(e: &std::io::Error) -> BindProbe {
+    if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+        BindProbe::NotAssigned
+    } else {
+        BindProbe::InUse
+    }
 }
 
-// PASS-1 STUB: today's verdict, which only knows free / not free.
 fn port_verdict(addr: &str, probe: BindProbe) -> Check {
-    if probe == BindProbe::Free {
-        return Check::ok("http_port", format!("{addr} is free"));
+    match probe {
+        BindProbe::Free => Check::ok("http_port", format!("{addr} is free")),
+        BindProbe::NotAssigned => Check::warn(
+            "http_port",
+            format!("{addr} is not assigned to this machine"),
+            "no interface here owns that IP, so there is no process to look for: `serve` waits for the address to appear and then gives up. See what this machine owns (`ipconfig` on Windows, `ip addr` on Linux) and fix CUBA_HTTP_ADDR, or give the interface that address.",
+        ),
+        BindProbe::InUse => Check::warn(
+            "http_port",
+            format!("something is already listening on {addr}"),
+            "if that is this daemon, nothing is wrong. If it is not, `serve` will refuse to start here: pick another address with CUBA_HTTP_ADDR and point the clients at it.",
+        ),
     }
-    Check::warn(
-        "http_port",
-        format!("something is already listening on {addr}"),
-        "if that is this daemon, nothing is wrong. If it is not, `serve` will refuse to start here: pick another address with CUBA_HTTP_ADDR and point the clients at it.",
-    )
 }
 
 /// Where the daemon's address came from, so a disagreement can be named.
@@ -118,15 +127,18 @@ pub enum AddrSource {
     Default,
 }
 
-// PASS-1 STUB: today doctor reads only its own process environment and never
-// the env file the service loads. Pass 2: process > env file > DEFAULT_ADDR.
+/// The address the daemon will bind, by the daemon's own precedence: the
+/// process environment, then the env file the service loads, then the default.
+/// Reading only doctor's own environment made it probe a port the installed
+/// service never uses.
 pub fn effective_http_addr(
     process_env: Option<&str>,
-    _env_file: Option<&str>,
+    env_file: Option<&str>,
 ) -> (String, AddrSource) {
-    match process_env {
-        Some(a) => (a.to_string(), AddrSource::Process),
-        None => (crate::http::DEFAULT_ADDR.to_string(), AddrSource::Default),
+    match (process_env, env_file) {
+        (Some(a), _) => (a.to_string(), AddrSource::Process),
+        (None, Some(a)) => (a.to_string(), AddrSource::EnvFile),
+        (None, None) => (crate::http::DEFAULT_ADDR.to_string(), AddrSource::Default),
     }
 }
 
@@ -142,30 +154,205 @@ pub struct ServiceFacts {
     pub log_tail: Option<String>,
 }
 
-// PASS-1 STUB: today doctor says nothing about the service.
-pub fn service_checks(_f: &ServiceFacts) -> Vec<Check> {
-    Vec::new()
+const ADDR_KEY: &str = "CUBA_HTTP_ADDR";
+const TOKEN_KEY: &str = "CUBA_HTTP_TOKEN";
+
+/// What doctor says about the installed service, judged only from `f`. Without
+/// an env file there is no service and nothing else is reported: a development
+/// machine is not a failure.
+pub fn service_checks(f: &ServiceFacts) -> Vec<Check> {
+    let path = f.env_path.display();
+    let Some(text) = f.env_text.as_deref() else {
+        return vec![Check::ok(
+            "service_install",
+            format!("sin instalación de servicio en {path}"),
+        )];
+    };
+    let mut checks = vec![Check::ok(
+        "service_install",
+        format!("instalación en {path}"),
+    )];
+    let from_file = env_value(text, ADDR_KEY);
+    let (addr, _) = effective_http_addr(f.process_addr.as_deref(), from_file.as_deref());
+    let token = env_value(text, TOKEN_KEY).unwrap_or_default();
+    checks.push(address_check(&addr, &token, &f.env_path));
+    checks.extend(address_conflict(
+        f.process_addr.as_deref(),
+        from_file.as_deref(),
+    ));
+    checks.extend(task_check(f.task_exists));
+    checks.push(log_check(f.log_tail.as_deref()));
+    checks
 }
 
-// PASS-1 STUB: today nobody looks for the last error in the log.
-pub fn last_error_line(_log_tail: &str) -> Option<String> {
-    None
+/// Profile and token as `serve` will judge them. Only the token's LENGTH is
+/// ever reported: doctor output is pasted into issues and chats.
+fn address_check(addr: &str, token: &str, env_path: &std::path::Path) -> Check {
+    let Ok(socket) = addr.parse::<std::net::SocketAddr>() else {
+        return Check::fail(
+            "service_address",
+            format!("{addr} no es una dirección ip:puerto"),
+            format!(
+                "`serve` no puede enlazarla. Corregí CUBA_HTTP_ADDR en {}",
+                env_path.display()
+            ),
+        );
+    };
+    let loopback = socket.ip().is_loopback();
+    let profile = if loopback { "loopback" } else { "lan" };
+    let detail = format!("{addr} · perfil {profile} · {}", env_path.display());
+    let chars = token.chars().count();
+    let floor = crate::http::MIN_ROUTABLE_TOKEN_CHARS;
+    if !loopback && chars < floor {
+        return Check::fail(
+            "service_address",
+            detail,
+            format!(
+                "serve se negará a arrancar: en una dirección que otras máquinas alcanzan el token CUBA_HTTP_TOKEN tiene {chars} caracteres y necesita al menos {floor}. Ponele uno más largo en {}",
+                env_path.display()
+            ),
+        );
+    }
+    Check::ok("service_address", detail)
+}
+
+/// Two places set the address and they disagree: the daemon obeys the process
+/// one, and the operator editing the env file would never see why nothing moved.
+fn address_conflict(process: Option<&str>, file: Option<&str>) -> Option<Check> {
+    match (process, file) {
+        (Some(p), Some(f)) if p != f => Some(Check::warn(
+            "service_address_conflict",
+            format!("CUBA_HTTP_ADDR en el entorno de doctor ({p}) difiere del env file ({f})"),
+            "la variable del entorno gana sobre el env file: quitala de ese entorno o alineá los dos valores",
+        )),
+        _ => None,
+    }
+}
+
+/// `None` where nobody answered (Linux, or `schtasks` would not start): saying
+/// «missing» about a task that may be there would send the operator to redo it.
+fn task_check(exists: Option<bool>) -> Option<Check> {
+    match exists? {
+        true => Some(Check::ok(
+            "service_task",
+            format!(
+                "tarea programada «{}» registrada",
+                crate::service::TASK_NAME
+            ),
+        )),
+        false => Some(Check::warn(
+            "service_task",
+            format!(
+                "no existe la tarea programada «{}»",
+                crate::service::TASK_NAME
+            ),
+            "sin ella el daemon no vuelve tras un reinicio: ejecutá `memory-industry setup service --apply --register` desde una consola de administrador",
+        )),
+    }
+}
+
+fn log_check(log_tail: Option<&str>) -> Check {
+    let Some(tail) = log_tail else {
+        return Check::ok("service_log", "todavía no hay log");
+    };
+    match last_error_line(tail) {
+        None => Check::ok("service_log", "sin errores en el final del log"),
+        Some(line) => Check::warn(
+            "service_log",
+            format!("último error: {line}"),
+            format!(
+                "el log está junto al env file: {}",
+                crate::service::LOG_BASENAME
+            ),
+        ),
+    }
+}
+
+/// The last line that reads as a failure: a tracing ERROR, or what the
+/// launcher (`memory-industry: …`) and `main` (`serve: …`) print before any
+/// tracing exists. Under SYSTEM there is no console, so this line is how the
+/// operator learns why the last start failed.
+pub fn last_error_line(log_tail: &str) -> Option<String> {
+    log_tail
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| is_error_line(line))
+        .map(str::to_string)
+}
+
+fn is_error_line(line: &str) -> bool {
+    line.starts_with("serve: ")
+        || line.starts_with("memory-industry:")
+        || serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| v["level"] == "ERROR")
 }
 
 /// The most doctor reads of the log: the error that matters is the last one.
 pub const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
-// PASS-1 STUB: today doctor does not read the log.
-pub fn read_log_tail(_path: &std::path::Path, _max_bytes: u64) -> Option<String> {
-    None
+/// At most the last `max_bytes` of the file, never the whole of it: a log that
+/// has run for weeks must not stall a health check. The cut can land inside a
+/// character, so the bytes are read lossily.
+pub fn read_log_tail(path: &std::path::Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(max_bytes)))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-// PASS-1 STUB: today doctor never asks the scheduler anything.
+/// Whether the scheduled task is registered. Only Windows has one to ask, so
+/// elsewhere the runner is never called; and a `schtasks` that cannot start
+/// or is killed has said nothing, which is `None`, not «missing».
 pub fn scheduled_task_exists(
-    _runner: &mut dyn crate::service_apply::CommandRunner,
-    _target: crate::service::Target,
+    runner: &mut dyn crate::service_apply::CommandRunner,
+    target: crate::service::Target,
 ) -> Option<bool> {
-    None
+    if !target.is_windows() {
+        return None;
+    }
+    let args = ["/Query", "/TN", crate::service::TASK_NAME].map(String::from);
+    let outcome = runner.run("schtasks", &args).ok()?;
+    outcome.code.map(|code| code == 0)
+}
+
+/// Everything doctor needs from the machine about the service, gathered in one
+/// place so that judging it stays pure.
+fn service_facts() -> ServiceFacts {
+    let target = crate::service::Target::host();
+    let home = crate::envs::home()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let local_app_data = std::env::var("LOCALAPPDATA").ok();
+    let env_path = crate::service::install_root(target, home.as_deref(), local_app_data.as_deref())
+        .unwrap_or_default()
+        .join(crate::service::ENV_BASENAME);
+    ServiceFacts {
+        env_text: crate::service::installed_env(target).ok().flatten(),
+        process_addr: std::env::var(ADDR_KEY).ok(),
+        task_exists: scheduled_task_exists(&mut crate::setup_agent::SystemRunner, target),
+        log_tail: read_log_tail(
+            &env_path.with_file_name(crate::service::LOG_BASENAME),
+            LOG_TAIL_BYTES,
+        ),
+        env_path,
+    }
+}
+
+/// The port check, aimed at the address the service will really bind, and the
+/// service's own checks. Both read the env file the service loads, never only
+/// doctor's own process environment.
+fn service_report() -> (Check, Vec<Check>) {
+    let facts = service_facts();
+    let from_file = facts
+        .env_text
+        .as_deref()
+        .and_then(|text| env_value(text, ADDR_KEY));
+    let (addr, _) = effective_http_addr(facts.process_addr.as_deref(), from_file.as_deref());
+    (http_port_check(Some(&addr)), service_checks(&facts))
 }
 
 pub fn redact_url(url: &str) -> String {
@@ -595,9 +782,9 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     ));
 
     checks.push(Check::ok("database_url", redact_url(url)));
-    checks.push(http_port_check(
-        std::env::var("CUBA_HTTP_ADDR").ok().as_deref(),
-    ));
+    let (port, service) = service_report();
+    checks.push(port);
+    checks.extend(service);
 
     let machine = crate::resources::probe();
     let resource_plan = crate::resources::plan(&machine);
