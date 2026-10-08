@@ -3,19 +3,27 @@
 //! it hands the OS the scheduled task and the firewall rule.
 //!
 //! Everything that DECIDES lives here, behind `CommandRunner`, because
-//! `setup_agent.rs` is outside `cargo mutants` (`quality-gate.sh:164`): there
+//! `setup_agent.rs` is outside the mutation run (`quality-gate.sh:164`): there
 //! the real runner spawns the process and prints, and nothing else.
-//!
-//! PASS 1 OF 2 (0.29.0, slice C): the types are the real seams, the function
-//! bodies are stand-ins that behave like 0.28 — they change nothing — so the
-//! tests below compile and fail on their assertions. Pass 2 replaces every
-//! `PASS-1 STUB` and leaves the `#[cfg(test)]` region byte for byte.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 
-use crate::service::Unit;
+use crate::service::{
+    FIREWALL_RULE_NAME, TASK_NAME, TASK_XML_BASENAME, Target, Unit, firewall_add_argv,
+    firewall_commands, firewall_delete_argv, manual_steps, schtasks_create_argv,
+};
+
+const ADDR_KEY: &str = "CUBA_HTTP_ADDR";
+const TOKEN_KEY: &str = "CUBA_HTTP_TOKEN";
+
+const NOT_ELEVATED: &str = "--register necesita una consola de administrador (elevada): crear una \
+    tarea que corre como SYSTEM y abrir un puerto en el firewall son derechos de administrador. \
+    Abrí PowerShell «como administrador» y repetí, o quitá --register y ejecutá a mano los \
+    comandos que --apply imprime";
 
 /// How a command ended, as far as a decision needs to know. `code` is `None`
 /// when the process was killed by a signal and has no exit code.
@@ -33,46 +41,249 @@ pub trait CommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> std::io::Result<CommandOutcome>;
 }
 
+/// The value of `key` on one line, if the line sets it. A `#` line sets
+/// nothing, and the key must be the whole name: `CUBA_HTTP_ADDR_OTHER` is
+/// another variable.
+fn line_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let line = line.trim_start();
+    if line.starts_with('#') {
+        return None;
+    }
+    let (name, value) = line.split_once('=')?;
+    (name.trim() == key).then_some(value.trim())
+}
+
 /// The last effective `KEY=value` line's value, trimmed. A `#` line is not
-/// effective, and CRLF is tolerated.
-// PASS-1 STUB: 0.28 never reads a key back out of the env file; pass 2 parses it. Returns None.
-pub fn env_value(_text: &str, _key: &str) -> Option<String> {
-    None
+/// effective, and CRLF is tolerated. The last wins because that is what the
+/// launcher's `for /f` and systemd's `EnvironmentFile` do with a repeated key.
+pub fn env_value(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|line| line_value(line, key))
+        .next_back()
+        .map(str::to_string)
 }
 
 /// Replaces ONLY the last effective line of `key`, keeping its own line ending;
 /// appends `key=value` when there is none; every other byte is untouched.
-// PASS-1 STUB: 0.28 never edits an env file; pass 2 does the line surgery. Returns the text as it came.
-pub fn set_env_value(text: &str, _key: &str, _value: &str) -> String {
-    text.to_string()
+pub fn set_env_value(text: &str, key: &str, value: &str) -> String {
+    let mut offset = 0;
+    let mut last = None;
+    for line in text.split_inclusive('\n') {
+        if line_value(line, key).is_some() {
+            last = Some((offset, line));
+        }
+        offset += line.len();
+    }
+    let Some((at, line)) = last else {
+        let separator = if text.is_empty() || text.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        return format!("{text}{separator}{key}={value}\n");
+    };
+    let ending = &line[line.trim_end_matches(['\r', '\n']).len()..];
+    format!(
+        "{}{key}={value}{ending}{}",
+        &text[..at],
+        &text[at + line.len()..]
+    )
+}
+
+/// The address line, brought to what the unit resolved, and the report line
+/// that says so when it moved.
+fn sync_address(text: &str, unit: &Unit) -> (String, Option<String>) {
+    let want = unit.addr.to_string();
+    let have = env_value(text, ADDR_KEY).filter(|value| !value.is_empty());
+    if have.as_deref() == Some(want.as_str()) {
+        return (text.to_string(), None);
+    }
+    let was = have.as_deref().unwrap_or("(sin definir)");
+    let line = format!("dirección: {was} -> {want}");
+    (set_env_value(text, ADDR_KEY, &want), Some(line))
+}
+
+/// The token line: kept when there is one, filled when it is empty and the unit
+/// has one, left alone otherwise. The report says which, and never the value.
+fn sync_token(text: &str, unit: &Unit) -> (String, Option<String>) {
+    let have = env_value(text, TOKEN_KEY).filter(|value| !value.is_empty());
+    match (have, unit.token.as_deref()) {
+        (Some(_), _) => (text.to_string(), Some("token: conservado".to_string())),
+        (None, Some(token)) => (
+            set_env_value(text, TOKEN_KEY, token),
+            Some("token: rellenado".to_string()),
+        ),
+        (None, None) => (text.to_string(), None),
+    }
 }
 
 /// Brings an existing env file in line with what `unit` resolved: the address
 /// always, the token only when the file's is empty. Atomic (temp file in the
 /// same directory, then rename), 0600 on unix, and no rewrite when nothing
 /// changes. Returns the lines `--apply` reports.
-// PASS-1 STUB: 0.28 leaves an existing env file exactly as it is; pass 2 syncs it. Reports nothing.
-pub fn sync_env_file(_path: &Path, _unit: &Unit) -> Result<Vec<String>> {
-    Ok(Vec::new())
+pub fn sync_env_file(path: &Path, unit: &Unit) -> Result<Vec<String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("no se pudo leer {}", path.display())),
+    };
+    let (with_address, address_line) = sync_address(&text, unit);
+    let (synced, token_line) = sync_token(&with_address, unit);
+    if synced != text {
+        replace_atomically(path, &synced)?;
+    }
+    Ok(address_line.into_iter().chain(token_line).collect())
+}
+
+/// A file only this account can read, created or refused: `create_new` so a
+/// planted file or link at the temp name is an error and not somebody else's
+/// file written through.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Temp file in the same directory, then rename: a crash leaves the old file or
+/// the new one, never half of either. The token is in this file, so the temp is
+/// private from the first byte and removed if anything fails.
+fn replace_atomically(path: &Path, contents: &str) -> Result<()> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temp = directory.join(format!(".memory-industry.env.{}.tmp", uuid::Uuid::new_v4()));
+    let done = create_private(&temp)
+        .and_then(|mut file| {
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temp, path));
+    if let Err(e) = done {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e).with_context(|| format!("no se pudo actualizar {}", path.display()));
+    }
+    Ok(())
 }
 
 /// Whether this console may create a scheduled task for SYSTEM and open a
 /// firewall port: `fltmc` succeeds only for an administrator. Never panics.
-// PASS-1 STUB: 0.28 never asks; pass 2 runs `fltmc`. Answers false without running anything.
-pub fn probe_elevated(_runner: &mut dyn CommandRunner) -> bool {
-    false
+pub fn probe_elevated(runner: &mut dyn CommandRunner) -> bool {
+    runner
+        .run("fltmc", &[])
+        .is_ok_and(|outcome| outcome.code == Some(0))
+}
+
+/// The refusal `--apply --register` gives BEFORE it writes a file: a half
+/// install (the launcher and the env file with its token, and no task) reads as
+/// «failed» to the operator and as «installed» to the next `--apply`.
+pub fn require_elevated(runner: &mut dyn CommandRunner) -> Result<()> {
+    if probe_elevated(runner) {
+        Ok(())
+    } else {
+        Err(anyhow!(NOT_ELEVATED))
+    }
+}
+
+/// One command, judged by its exit code. The reason carries the first line of
+/// what the command said, which for `netsh` is what names the cause.
+fn run_checked(runner: &mut dyn CommandRunner, argv: &[String]) -> std::result::Result<(), String> {
+    let [program, args @ ..] = argv else {
+        return Err("comando vacío".to_string());
+    };
+    match runner.run(program, args) {
+        Ok(done) if done.code == Some(0) => Ok(()),
+        Ok(done) => Err(format!("{program} terminó {}", reason(&done))),
+        Err(e) => Err(format!("no se pudo ejecutar {program}: {e}")),
+    }
+}
+
+fn reason(done: &CommandOutcome) -> String {
+    let said = [&done.stderr, &done.stdout]
+        .into_iter()
+        .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or("sin mensaje");
+    match done.code {
+        Some(code) => format!("con código {code}: {said}"),
+        None => format!("sin código de salida: {said}"),
+    }
+}
+
+/// Delete, then add: a second run and a changed port leave ONE rule.
+fn open_port(runner: &mut dyn CommandRunner, port: u16) -> Result<String> {
+    // Any outcome is fine: with no rule to remove `netsh` exits 1, which is
+    // every first run. If `netsh` cannot run at all, the add says so.
+    let _ = run_checked(runner, &firewall_delete_argv());
+    run_checked(runner, &firewall_add_argv(port)).map_err(|why| {
+        anyhow!(
+            "no se pudo crear la regla de firewall del puerto {port} ({why}). La regla anterior \
+             ya se borró y la tarea NO se registró; repetir --register es seguro"
+        )
+    })?;
+    Ok(format!(
+        "firewall: regla {FIREWALL_RULE_NAME} abierta en TCP {port} (redes privada y de dominio)"
+    ))
+}
+
+fn create_task(runner: &mut dyn CommandRunner, xml: &Path, port_opened: bool) -> Result<String> {
+    run_checked(runner, &schtasks_create_argv(xml)).map_err(|why| {
+        let firewall = if port_opened {
+            "la regla de firewall quedó puesta"
+        } else {
+            "el firewall no se tocó"
+        };
+        anyhow!("no se pudo registrar la tarea ({why}). {firewall}; repetir --register es seguro")
+    })?;
+    Ok(format!(
+        "tarea: {TASK_NAME} registrada (arranca con el equipo, como SYSTEM)"
+    ))
+}
+
+/// What `--apply` ends with: the registration when it was asked for, and
+/// otherwise the commands the operator runs by hand.
+pub fn next_steps(
+    runner: &mut dyn CommandRunner,
+    registering: bool,
+    unit: &Unit,
+    target: Target,
+    root: &Path,
+) -> Result<Vec<String>> {
+    if registering {
+        register(runner, true, unit, &root.join(TASK_XML_BASENAME))
+    } else {
+        Ok(manual_steps(&unit.addr, target, root))
+    }
 }
 
 /// `--register`: the firewall rule (only for a routable address) and then the
-/// task, in that order, each safe to repeat.
-// PASS-1 STUB: 0.28 only prints the commands; pass 2 runs them through the runner. Does nothing, returns Ok.
+/// task, in that order, each safe to repeat. There is no rollback: when a step
+/// fails the error says what is already done.
 pub fn register(
-    _runner: &mut dyn CommandRunner,
-    _elevated: bool,
-    _unit: &Unit,
-    _xml: &Path,
+    runner: &mut dyn CommandRunner,
+    elevated: bool,
+    unit: &Unit,
+    xml: &Path,
 ) -> Result<Vec<String>> {
-    Ok(Vec::new())
+    if !elevated {
+        return Err(anyhow!(NOT_ELEVATED));
+    }
+    let routable = !firewall_commands(&unit.addr).is_empty();
+    let firewall = if routable {
+        open_port(runner, unit.addr.port())?
+    } else {
+        format!(
+            "firewall: no se abrió ningún puerto porque {} es loopback y ninguna otra máquina lo alcanza",
+            unit.addr
+        )
+    };
+    let task = create_task(runner, xml, routable)?;
+    Ok(vec![firewall, task])
 }
 
 #[cfg(test)]

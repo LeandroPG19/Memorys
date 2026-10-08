@@ -60,6 +60,10 @@ pub const ENV_BASENAME: &str = "memory-industry.env";
 /// `.cmd` that is not there — and on Windows nothing reports that.
 pub const LAUNCHER_BASENAME: &str = "memory-industry.cmd";
 
+/// The task XML `--apply` writes beside the launcher and `--register` hands to
+/// `schtasks`; the plan prints the same name.
+pub const TASK_XML_BASENAME: &str = "memory-industry-task.xml";
+
 /// The launcher appends the daemon's stdout and stderr here, beside the env
 /// file. Under SYSTEM there is no console to read, so this file is the only
 /// trace of a daemon that dies at startup. It is not in `rendered_files` and
@@ -200,6 +204,7 @@ struct Flags {
     addr: Option<String>,
     token: Option<String>,
     out: Option<PathBuf>,
+    register: bool,
 }
 
 impl Flags {
@@ -211,6 +216,7 @@ impl Flags {
         match flag {
             "--linux" => self.target = Some(Target::Linux),
             "--windows" => self.target = Some(Target::Windows),
+            "--register" => self.register = true,
             "--profile" | "--addr" | "--token" | "--out" => self.set_value(flag, rest.next())?,
             other => bail!("opción desconocida para `setup service`: {other}"),
         }
@@ -268,18 +274,41 @@ impl Flags {
                  instalación, no en un directorio que elijas"
             );
         }
+        let target = self.target.unwrap_or_else(Target::host);
+        if self.register {
+            refuse_register(mode, target)?;
+        }
         Ok(Request {
             mode,
-            target: self.target.unwrap_or_else(Target::host),
-            // PASS-1 STUB: 0.28 defaulted the profile here; pass 2 keeps `self.profile` as it is (None when unsaid).
-            profile: Some(self.profile.unwrap_or(Profile::Loopback)),
+            target,
+            profile: self.profile,
             addr: self.addr,
             token: self.token,
             out: self.out,
-            // PASS-1 STUB: 0.28 has no `--register`; pass 2 reads the flag and refuses it outside --apply on Windows.
-            register: false,
+            register: self.register,
         })
     }
+}
+
+/// `--register` creates a task that runs as SYSTEM and opens a port, so it is
+/// only ever asked for together with the one mode that installs, and only where
+/// there is a task scheduler to ask. The mode is checked first: `--print
+/// --register` on Linux is wrong twice, and the first thing to fix is the mode.
+fn refuse_register(mode: Mode, target: Target) -> Result<()> {
+    if mode != Mode::Apply {
+        bail!(
+            "--register solo va con --apply: pediste --{}, que no instala nada, y registrar una \
+             tarea que corre como SYSTEM no se hace por accidente",
+            mode.label()
+        );
+    }
+    if !target.is_windows() {
+        bail!(
+            "--register es solo para Windows: en Linux el supervisor es systemd y `--apply` \
+             imprime el `systemctl` que lo habilita, sin ejecutarlo"
+        );
+    }
+    Ok(())
 }
 
 /// `setup service`'s flags, turned into the one thing it was asked for.
@@ -371,22 +400,10 @@ impl Unit {
         token_flag: Option<&str>,
         existing_env: Option<&str>,
     ) -> Result<Unit> {
-        // PASS-1 STUB: 0.28 took the profile as given and never read the installed env file; pass 2 resolves
-        // address, profile and token from `existing_env` when the flags say nothing.
-        let _ = existing_env;
-        let profile = profile.unwrap_or(Profile::Loopback);
-        let addr = addr_for(profile, addr_flag)?;
-        let token = match token_flag {
-            Some(given) => Some(given.to_string()),
-            None if addr.ip().is_loopback() => None,
-            // Not a refusal: the operator asked for a routable daemon, and the
-            // installer can produce a token the daemon accepts more reliably
-            // than a person inventing one at the prompt.
-            None => Some(new_token()),
-        };
-        if let Some(why) = refuse_unsafe(profile, &addr, token.as_deref()) {
-            bail!(why);
-        }
+        let installed_addr = installed_value(existing_env, "CUBA_HTTP_ADDR");
+        let installed_token = installed_value(existing_env, "CUBA_HTTP_TOKEN");
+        let (profile, addr) = resolve_address(profile, addr_flag, installed_addr)?;
+        let token = resolve_token(profile, addr, token_flag, installed_token.as_deref())?;
 
         let exe = std::env::current_exe().context("no se pudo resolver la ruta de este binario")?;
         let home = crate::envs::home();
@@ -395,26 +412,13 @@ impl Unit {
         let root = install_root(target, home_text.as_deref(), local_app_data.as_deref())?;
         let home_dir = user_home(target, home)?;
 
-        let measured =
-            crate::resources::plan_env(&crate::resources::plan(&crate::resources::probe()));
-        let computed = planner_keys()
-            .into_iter()
-            .map(|key| {
-                let value = measured
-                    .iter()
-                    .find(|(k, _)| *k == key.as_str())
-                    .map(|(_, v)| v.clone());
-                (key, value)
-            })
-            .collect();
-
         Ok(Unit {
             profile,
             exe,
             addr,
             token,
             env_file: root.join(ENV_BASENAME),
-            computed,
+            computed: measured_keys(),
             chosen: vec![
                 ("CUBA_HTTP_ADDR".to_string(), addr.to_string()),
                 ("CUBA_MODE".to_string(), read_or_empty("CUBA_MODE")),
@@ -434,6 +438,120 @@ impl Unit {
             why: crate::gpu::status().detail,
             home_dir,
         })
+    }
+}
+
+/// The planner's keys, each with what this machine measured for it.
+fn measured_keys() -> Vec<(String, Option<String>)> {
+    let measured = crate::resources::plan_env(&crate::resources::plan(&crate::resources::probe()));
+    planner_keys()
+        .into_iter()
+        .map(|key| {
+            let value = measured
+                .iter()
+                .find(|(k, _)| *k == key.as_str())
+                .map(|(_, v)| v.clone());
+            (key, value)
+        })
+        .collect()
+}
+
+/// A non-empty value of the installed env file. An empty `KEY=` is the file
+/// saying «not set yet», which is what `render_env_file` writes for a token.
+fn installed_value(existing_env: Option<&str>, key: &str) -> Option<String> {
+    existing_env
+        .and_then(|text| crate::service_apply::env_value(text, key))
+        .filter(|value| !value.is_empty())
+}
+
+/// The profile and the address of this install.
+///
+/// An `--apply` that said neither `--profile` nor `--addr` keeps what the env
+/// file holds: re-deriving it from the flags is what put a LAN daemon back on
+/// 127.0.0.1 on the second run. Anything the operator typed is resolved as it
+/// always was, which makes `--profile loopback` the explicit way down.
+fn resolve_address(
+    profile: Option<Profile>,
+    addr_flag: Option<&str>,
+    installed_addr: Option<String>,
+) -> Result<(Profile, SocketAddr)> {
+    if profile.is_none()
+        && addr_flag.is_none()
+        && let Some(raw) = installed_addr
+    {
+        let addr: SocketAddr = raw.parse().with_context(|| {
+            format!(
+                "{ENV_BASENAME} guarda CUBA_HTTP_ADDR={raw}, que no es una dirección ip:puerto. \
+                 No instalo encima de un valor que no entiendo: corregilo en el fichero"
+            )
+        })?;
+        let kept = if addr.ip().is_loopback() {
+            Profile::Loopback
+        } else {
+            Profile::Lan
+        };
+        return Ok((kept, addr));
+    }
+    let profile = profile.unwrap_or(Profile::Loopback);
+    Ok((profile, addr_for(profile, addr_flag)?))
+}
+
+/// The token of this install, once it is known to be one the daemon accepts. A
+/// token that came out of the file names the file when it is too weak: the
+/// operator did not type it, so they have to be told where it is.
+fn resolve_token(
+    profile: Profile,
+    addr: SocketAddr,
+    token_flag: Option<&str>,
+    installed: Option<&str>,
+) -> Result<Option<String>> {
+    let token = pick_token(addr, token_flag, installed)?;
+    if let Some(why) = refuse_unsafe(profile, &addr, token.as_deref()) {
+        let from_file = token_flag.is_none() && installed.is_some();
+        bail!(if from_file {
+            format!("{ENV_BASENAME}: {why}")
+        } else {
+            why
+        });
+    }
+    Ok(token)
+}
+
+/// The token of this install: the one in the file, never a new one over it.
+fn pick_token(
+    addr: SocketAddr,
+    token_flag: Option<&str>,
+    installed: Option<&str>,
+) -> Result<Option<String>> {
+    match (token_flag, installed) {
+        (Some(given), Some(have)) if given != have => bail!(
+            "el env file ya tiene un token ({ENV_BASENAME}) y --token trae otro. No lo \
+             sobrescribo: cada cliente ya configurado dejaría de entrar. Quitá --token, o \
+             cambialo a mano en el fichero sabiendo que hay que reconfigurar los clientes"
+        ),
+        (Some(given), _) => Ok(Some(given.to_string())),
+        (None, Some(have)) => Ok(Some(have.to_string())),
+        (None, None) if addr.ip().is_loopback() => Ok(None),
+        // Not a refusal: the operator asked for a routable daemon, and the
+        // installer can produce a token the daemon accepts more reliably than a
+        // person inventing one at the prompt.
+        (None, None) => Ok(Some(new_token())),
+    }
+}
+
+/// The text of the env file already installed for this target, if there is one.
+/// Read before anything is written: the address and the token in it are what an
+/// `--apply` with no flags has to keep.
+pub fn installed_env(target: Target) -> Result<Option<String>> {
+    let home = crate::envs::home()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let local_app_data = std::env::var("LOCALAPPDATA").ok();
+    let path = install_root(target, home.as_deref(), local_app_data.as_deref())?.join(ENV_BASENAME);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("no se pudo leer {}", path.display())),
     }
 }
 
@@ -1004,12 +1122,33 @@ pub fn enable_command(target: Target, root: &Path) -> String {
     if target.is_windows() {
         format!(
             "schtasks /Create /XML \"{}\" /TN {TASK_NAME} /F",
-            root.join("memory-industry-task.xml").display()
+            root.join(TASK_XML_BASENAME).display()
         )
     } else {
         "systemctl --user daemon-reload && systemctl --user enable --now memory-industry.service"
             .to_string()
     }
+}
+
+/// What `--apply` tells the operator to run when it was not asked to register:
+/// the supervisor command, and on Windows the firewall commands too when the
+/// address is one another machine reaches.
+pub fn manual_steps(addr: &SocketAddr, target: Target, root: &Path) -> Vec<String> {
+    let mut lines = vec![
+        "Habilitalo con (o repetí --apply con --register desde una consola de administrador):"
+            .to_string(),
+        format!("  {}", enable_command(target, root)),
+    ];
+    let door = if target.is_windows() {
+        firewall_commands(addr)
+    } else {
+        Vec::new()
+    };
+    if !door.is_empty() {
+        lines.push("Y abrí el puerto en el firewall con:".to_string());
+        lines.extend(door.into_iter().map(|command| format!("  {command}")));
+    }
+    lines
 }
 
 /// The argv `--register` runs, and the shape of the line the plan prints.
@@ -1095,7 +1234,7 @@ pub fn rendered_files(u: &Unit, windows: bool, launcher_path: &Path) -> Vec<(Str
                 render_windows_launcher(u),
             ),
             (
-                "windows/memory-industry-task.xml".to_string(),
+                format!("windows/{TASK_XML_BASENAME}"),
                 render_windows_task(launcher_path),
             ),
             (
@@ -1239,9 +1378,14 @@ pub fn write_all(u: &Unit, target: Target, root: &Path) -> Result<Vec<(PathBuf, 
 
 /// What `--uninstall` prints for the two things `--register` made and the
 /// installer will not remove by itself: the task and the firewall rule.
-// PASS-1 STUB: 0.28 prints no hints; pass 2 returns the schtasks and netsh delete lines for Windows. Returns [].
-pub fn uninstall_hints(_target: Target) -> Vec<String> {
-    Vec::new()
+pub fn uninstall_hints(target: Target) -> Vec<String> {
+    if !target.is_windows() {
+        return Vec::new();
+    }
+    vec![
+        format!("schtasks /Delete /TN {TASK_NAME} /F"),
+        firewall_delete_argv().join(" "),
+    ]
 }
 
 /// The files `--uninstall` may take away, under the install root.

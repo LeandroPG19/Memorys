@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use crate::envs::home;
 use crate::service::{self, Asked, Mode, Profile, Request, Secrecy, Unit};
+use crate::service_apply::{self, CommandOutcome, CommandRunner};
 
 const REQUIRED_ENV: [&str; 3] = ["DATABASE_URL", "ONNX_MODEL_PATH", "ORT_DYLIB_PATH"];
 
@@ -398,14 +399,23 @@ usage: memory-industry setup service [--print | --apply | --uninstall]
                                      [--linux | --windows]
                                      [--profile loopback|lan]
                                      [--token T] [--addr A] [--out DIR]
+                                     [--register]
 
 Sin modo, --print: muestra el plan y no escribe nada.
 
 --out DIR    escribe el render canónico en DIR en vez de a stdout. Es como se
              regeneran los ficheros de packaging/, y solo va con --print.
 --apply      instala. NO pisa un env file que ya exista: lleva el token y la
-             DATABASE_URL que tus clientes ya usan.
---uninstall  retira lo que generó y deja el env file donde está.
+             DATABASE_URL que tus clientes ya usan. Sin --profile ni --addr
+             conserva la dirección que ese fichero ya tiene (nunca la vuelve a
+             127.0.0.1); solo --profile y --addr la cambian, y un token que ya
+             está ahí no se sobrescribe.
+--register   solo con --apply y en Windows, desde una consola de administrador:
+             crea la tarea que arranca el daemon con el equipo (como SYSTEM) y,
+             si la dirección no es loopback, la regla de firewall. Repetirlo es
+             seguro. Sin permisos de administrador falla antes de escribir nada.
+--uninstall  retira lo que generó y deja el env file donde está. En Windows
+             imprime los dos comandos que retiran la tarea y la regla.
 --profile lan exige --addr con la dirección concreta de la interfaz, y genera
              un token si no le pasás uno.";
 
@@ -436,13 +446,13 @@ fn run_service(args: &[String]) -> Result<()> {
 
 /// This machine and these flags, which is what `--print` and `--apply` install.
 fn unit_from(request: &Request) -> Result<Unit> {
-    // PASS-1 STUB: 0.28 never read the installed env file; pass 2 reads it here and passes its text.
+    let installed = service::installed_env(request.target)?;
     Unit::from_env(
         request.profile,
         request.target,
         request.addr.as_deref(),
         request.token.as_deref(),
-        None,
+        installed.as_deref(),
     )
 }
 
@@ -472,17 +482,46 @@ fn print_plan(request: &Request) -> Result<()> {
 /// not `apply`: `run_write` and `run_hook` both take an `apply: bool`, and a
 /// function with that name would be shadowed by the parameter inside them.
 fn install(request: &Request) -> Result<()> {
+    let mut runner = SystemRunner;
+    if request.register {
+        service_apply::require_elevated(&mut runner)?;
+    }
     let unit = unit_from(request)?;
     let root = install_root_of(&unit);
-    for (path, wrote) in service::write_all(&unit, request.target, &root)? {
-        println!("{}", service::wrote_line(&path, wrote));
-    }
+    let written = service::write_all(&unit, request.target, &root)?
+        .into_iter()
+        .map(|(path, wrote)| service::wrote_line(&path, wrote));
+    print_lines(written.chain(service_apply::sync_env_file(&unit.env_file, &unit)?));
     println!();
-    println!(
-        "Habilitalo con:\n  {}",
-        service::enable_command(request.target, &root)
-    );
+    print_lines(service_apply::next_steps(
+        &mut runner,
+        request.register,
+        &unit,
+        request.target,
+        &root,
+    )?);
     Ok(())
+}
+
+fn print_lines(lines: impl IntoIterator<Item = String>) {
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+/// The real door to the OS: spawns the program and reports how it ended. All
+/// that is decided about the output is in `service_apply`.
+struct SystemRunner;
+
+impl CommandRunner for SystemRunner {
+    fn run(&mut self, program: &str, args: &[String]) -> std::io::Result<CommandOutcome> {
+        let output = std::process::Command::new(program).args(args).output()?;
+        Ok(CommandOutcome {
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
 }
 
 fn uninstall(request: &Request) -> Result<()> {
@@ -512,6 +551,15 @@ fn uninstall(request: &Request) -> Result<()> {
         "{} sigue ahí: lleva el token y la DATABASE_URL. Borrarlo es un acto aparte.",
         root.join(service::ENV_BASENAME).display()
     );
+    let hints = service::uninstall_hints(request.target);
+    if !hints.is_empty() {
+        println!();
+        println!("La tarea y la regla de firewall que creó --register siguen puestas. Retiralas");
+        println!("desde una consola de administrador:");
+        for hint in hints {
+            println!("  {hint}");
+        }
+    }
     Ok(())
 }
 
