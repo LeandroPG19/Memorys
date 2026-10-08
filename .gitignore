@@ -90,3 +90,6 @@ sandbox/
 # local production secrets
 .deploy/
 
+
+# Output of scripts/empaquetar-visita.sh: a zip with the Windows .exe, not source
+dist-visita/
