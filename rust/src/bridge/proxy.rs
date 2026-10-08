@@ -1326,4 +1326,128 @@ mod tests {
             "the call carries the NEW credential"
         );
     }
+
+    /// The defect J2b found: a revoked device kept sending its credential for 30 s.
+    #[tokio::test]
+    async fn a_401_from_the_host_casts_doubt_and_a_revocation_cuts_the_next_call() {
+        let w = world().await;
+        assert_eq!(
+            w.h.post_mcp(CALL).await.status,
+            200,
+            "control: before the revocation the call is served"
+        );
+        w.host
+            .set_cred_status(w.id.credential_id, CredStatus::Revoked);
+        w.host
+            .set_mcp(McpMode::reply(401, &[], b"invalid bearer token"));
+
+        let first = w.h.post_mcp(CALL).await;
+        assert_eq!(
+            first.status, 401,
+            "the call that finds out gets the answer of the daemon"
+        );
+        assert_eq!(
+            first.body, b"invalid bearer token",
+            "and gets it untouched: the bridge learns from it, it does not rewrite it"
+        );
+        let second = w.h.post_mcp(CALL).await;
+
+        assert_eq!(second.status, 401);
+        assert!(
+            second.text().contains("revocada: empareja de nuevo"),
+            "inside the freshness window the clock did not move, yet the next call must be told \
+             to pair again, not shown the raw invalid-bearer-token of the daemon. Got: {}",
+            second.text()
+        );
+        let after_the_revocation: Vec<_> = w.host.mcp_requests().into_iter().skip(1).collect();
+        assert_eq!(
+            after_the_revocation.len(),
+            1,
+            "exactly one /mcp request reached the host after the revocation: every further one \
+             would add a refused credential to the brake of the daemon for the whole address"
+        );
+        assert!(
+            after_the_revocation[0].header("authorization").is_some(),
+            "anchor: that one request did carry the credential (it is the call that learned)"
+        );
+        assert_eq!(
+            w.host.identity_requests().len(),
+            2,
+            "the 401 cast doubt, so the next call asked /identity once before deciding"
+        );
+
+        let third = w.h.post_mcp(CALL).await;
+
+        assert!(third.text().contains("revocada: empareja de nuevo"));
+        assert_eq!(
+            w.host.mcp_requests().len(),
+            2,
+            "still no call sent with the revoked credential"
+        );
+        assert_eq!(
+            w.host.identity_requests().len(),
+            2,
+            "and the verdict is remembered until revoked_recheck, not asked again per call"
+        );
+    }
+
+    /// An upstream 401 always casts doubt, whatever caused it; the doubt costs one check.
+    #[tokio::test]
+    async fn a_401_for_another_reason_costs_one_identity_check_and_the_next_call_goes_through() {
+        let w = world().await;
+        let refusal = McpMode::reply(401, &[], b"unauthorized");
+        w.host.set_mcp(refusal);
+
+        let first = w.h.post_mcp(CALL).await;
+        assert_eq!(
+            first.status, 401,
+            "the 401 passes through whatever its cause"
+        );
+        w.host.set_mcp(McpMode::reply(
+            200,
+            &[("Content-Type", "application/json")],
+            br#"{"jsonrpc":"2.0","id":7,"result":{}}"#,
+        ));
+        let second = w.h.post_mcp(CALL).await;
+
+        assert_eq!(
+            second.status, 200,
+            "the credential is still active, so the check clears the doubt and the call is \
+             forwarded"
+        );
+        assert_eq!(
+            w.host.identity_requests().len(),
+            2,
+            "one check at the first call, plus exactly one re-check after the 401"
+        );
+        assert_eq!(
+            w.host.mcp_requests().len(),
+            2,
+            "both calls reached the host"
+        );
+
+        w.h.post_mcp(CALL).await;
+        assert_eq!(
+            w.host.identity_requests().len(),
+            2,
+            "the doubt is cleared: a third call inside the window asks nothing more"
+        );
+    }
+
+    /// H18 stays true: only a 401 casts doubt.
+    #[tokio::test]
+    async fn a_successful_answer_casts_no_doubt_and_asks_nothing_extra() {
+        let w = world().await;
+
+        for _ in 0..3 {
+            assert_eq!(w.h.post_mcp(CALL).await.status, 200);
+        }
+
+        assert_eq!(
+            w.host.identity_requests().len(),
+            1,
+            "three served calls inside the window, one proof"
+        );
+        assert_eq!(w.host.mcp_requests().len(), 3);
+    }
 }

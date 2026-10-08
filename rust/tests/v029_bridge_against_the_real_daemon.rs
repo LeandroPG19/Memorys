@@ -7,7 +7,7 @@
 //! `DATABASE_URL` names the server. Every database written here is one this file creates and
 //! drops (`common::in_a_scratch_database`); the database the URL itself points at is never
 //! touched. One daemon per test (two where the scenario needs two), each on its own port in
-//! 18880..=18890, each over its own scratch database, so the per-address brake of one test is
+//! 18880..=18891, each over its own scratch database, so the per-address brake of one test is
 //! never the brake of another.
 //!
 //! What stands in for the outside world, and why:
@@ -66,6 +66,7 @@ const J5_KNOB_ON: u16 = 18887;
 const J5_KNOB_OFF: u16 = 18888;
 const J6_PORT: u16 = 18889;
 const J7_PORT: u16 = 18890;
+const J2B_PORT: u16 = 18891;
 
 const LOOPBACK: &str = "127.0.0.1";
 const EVERY_INTERFACE: &str = "0.0.0.0";
@@ -677,6 +678,70 @@ async fn j2_a_revoked_device_is_told_to_pair_again_and_the_bridge_stops_asking()
              daemon's brake: a bridge that keeps sending the credential after it is revoked \
              spends the whole address's budget (10 per minute) and brakes the PC's other \
              clients, and the legitimate pairing of its replacement"
+        );
+        drop(bridge);
+        daemon.stop().await;
+        pool.close().await;
+    })
+    .await;
+}
+
+// =============================================================================================
+// J2b · revoking cuts the next call even inside the freshness window
+// =============================================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn j2b_a_revoked_device_is_cut_at_its_next_call_without_waiting_for_the_window() {
+    in_a_scratch_database("brain_j_revoke_now", |url_| async move {
+        let pool = migrated(&url_).await;
+        account(&pool, "ana").await;
+        let daemon = start_daemon(LOOPBACK, J2B_PORT, &pool, &[]).await;
+        let scratch = Scratch::new();
+        let clock = JumpClock::new();
+
+        let state = paired_state(&pool, J2B_PORT, "ana", "pc-lab-1").await;
+        save(&scratch.state_path(), &state);
+        let bridge = open_bridge(&scratch.state_path(), &clock, Some(0)).await;
+        assert_named(
+            &through_the_bridge(&bridge, whoami_call()).await,
+            "pc-lab-1",
+            "control: before the revocation the same call is served",
+        );
+
+        db::revoke_device(&pool, "ana", "pc-lab-1", Utc::now())
+            .await
+            .expect("revoking the device");
+
+        let first = through_the_bridge(&bridge, whoami_call()).await;
+        assert_eq!(
+            first.status, 401,
+            "the call that finds out is refused by the daemon: {}",
+            first.body
+        );
+        for round in 2..=5 {
+            let reply = through_the_bridge(&bridge, whoami_call()).await;
+            assert_eq!(
+                reply.status, 401,
+                "round {round}: a revoked device is refused: {}",
+                reply.body
+            );
+            assert!(
+                reply
+                    .error_message()
+                    .contains("revocada: empareja de nuevo"),
+                "round {round}: the clock did not move, yet from the second call on the user \
+                 must be told to pair again, not shown the daemon's 'invalid bearer token'. \
+                 Got: {}",
+                reply.body
+            );
+        }
+
+        let recorded = failures_the_daemon_recorded(J2B_PORT).await;
+        assert!(
+            recorded <= 1,
+            "five calls from a revoked device left {recorded} refused credentials on the \
+             daemon's brake: the bridge kept sending the credential for the whole freshness \
+             window, and ten in a minute brake the address for the PC's other bridges"
         );
         drop(bridge);
         daemon.stop().await;
