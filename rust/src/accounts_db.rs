@@ -603,3 +603,31 @@ pub async fn purge_pairing_codes(pool: &PgPool, now: DateTime<Utc>) -> Result<u6
             .rows_affected();
     Ok(purged)
 }
+
+/// What `doctor` reports about accounts. The first five fields come from the database
+/// (`account_facts`); the next three are about this process and are filled in by `doctor`.
+///
+/// `accounts` counts accounts that are not revoked. `active_credentials` counts credentials that
+/// are neither revoked themselves nor belong to a revoked account; `revoked_credentials` counts
+/// the rest, so a revoked account's devices show up as revoked. No field holds a secret, a hash
+/// or a code.
+// PASS-1 STUB: the type is the contract the tests are written against; `account_facts` below is
+// the stub.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountFacts {
+    pub tables_present: bool,
+    pub accounts: i64,
+    pub active_credentials: i64,
+    pub revoked_credentials: i64,
+    pub fingerprint: String,
+    pub require_accounts: bool,
+    pub shared_token: bool,
+    pub lan_bind: bool,
+}
+
+/// The database half of `AccountFacts`; a database without migration 0065 answers
+/// `tables_present: false`, not an error.
+// PASS-1 STUB: answers "nothing is there".
+pub async fn account_facts(_pool: &PgPool) -> Result<AccountFacts> {
+    Ok(AccountFacts::default())
+}
