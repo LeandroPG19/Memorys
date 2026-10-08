@@ -75,11 +75,32 @@ impl Check {
 /// reports.
 pub fn http_port_check(addr: Option<&str>) -> Check {
     let addr = addr.unwrap_or(crate::http::DEFAULT_ADDR);
-    port_verdict(addr, std::net::TcpListener::bind(addr).is_ok())
+    let probe = match std::net::TcpListener::bind(addr) {
+        Ok(_) => BindProbe::Free,
+        Err(e) => probe_of_failed_bind(&e),
+    };
+    port_verdict(addr, probe)
 }
 
-fn port_verdict(addr: &str, free: bool) -> Check {
-    if free {
+/// What trying to bind an address told us. `NotAssigned` is the one that used
+/// to be reported as «something is already listening», which sends the
+/// operator hunting for a process that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindProbe {
+    Free,
+    InUse,
+    NotAssigned,
+}
+
+// PASS-1 STUB: today every failed bind is «in use». Pass 2 maps
+// `AddrNotAvailable` to `NotAssigned`.
+fn probe_of_failed_bind(_e: &std::io::Error) -> BindProbe {
+    BindProbe::InUse
+}
+
+// PASS-1 STUB: today's verdict, which only knows free / not free.
+fn port_verdict(addr: &str, probe: BindProbe) -> Check {
+    if probe == BindProbe::Free {
         return Check::ok("http_port", format!("{addr} is free"));
     }
     Check::warn(
@@ -87,6 +108,64 @@ fn port_verdict(addr: &str, free: bool) -> Check {
         format!("something is already listening on {addr}"),
         "if that is this daemon, nothing is wrong. If it is not, `serve` will refuse to start here: pick another address with CUBA_HTTP_ADDR and point the clients at it.",
     )
+}
+
+/// Where the daemon's address came from, so a disagreement can be named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrSource {
+    Process,
+    EnvFile,
+    Default,
+}
+
+// PASS-1 STUB: today doctor reads only its own process environment and never
+// the env file the service loads. Pass 2: process > env file > DEFAULT_ADDR.
+pub fn effective_http_addr(
+    process_env: Option<&str>,
+    _env_file: Option<&str>,
+) -> (String, AddrSource) {
+    match process_env {
+        Some(a) => (a.to_string(), AddrSource::Process),
+        None => (crate::http::DEFAULT_ADDR.to_string(), AddrSource::Default),
+    }
+}
+
+/// What doctor learned about the installed service, gathered before judging so
+/// that `service_checks` stays pure. `task_exists` is `None` where there is no
+/// scheduler to ask (Linux); `log_tail` is `None` when there is no log yet.
+/// `process_addr` is `CUBA_HTTP_ADDR` in doctor's own environment.
+pub struct ServiceFacts {
+    pub env_path: std::path::PathBuf,
+    pub env_text: Option<String>,
+    pub process_addr: Option<String>,
+    pub task_exists: Option<bool>,
+    pub log_tail: Option<String>,
+}
+
+// PASS-1 STUB: today doctor says nothing about the service.
+pub fn service_checks(_f: &ServiceFacts) -> Vec<Check> {
+    Vec::new()
+}
+
+// PASS-1 STUB: today nobody looks for the last error in the log.
+pub fn last_error_line(_log_tail: &str) -> Option<String> {
+    None
+}
+
+/// The most doctor reads of the log: the error that matters is the last one.
+pub const LOG_TAIL_BYTES: u64 = 64 * 1024;
+
+// PASS-1 STUB: today doctor does not read the log.
+pub fn read_log_tail(_path: &std::path::Path, _max_bytes: u64) -> Option<String> {
+    None
+}
+
+// PASS-1 STUB: today doctor never asks the scheduler anything.
+pub fn scheduled_task_exists(
+    _runner: &mut dyn crate::service_apply::CommandRunner,
+    _target: crate::service::Target,
+) -> Option<bool> {
+    None
 }
 
 pub fn redact_url(url: &str) -> String {
@@ -1313,7 +1392,7 @@ mod tests {
 
     #[test]
     fn a_port_something_else_already_holds_is_a_warning_not_a_verdict_on_the_number() {
-        let taken = port_verdict("127.0.0.1:8787", false);
+        let taken = port_verdict("127.0.0.1:8787", BindProbe::InUse);
         assert_eq!(taken.status, Status::Warn);
         assert!(
             taken.detail.contains("8787"),
@@ -1334,7 +1413,7 @@ mod tests {
     fn a_free_port_is_fine_whatever_its_number_is() {
         for addr in ["127.0.0.1:8787", "127.0.0.1:8788", "192.168.0.10:9999"] {
             assert_eq!(
-                port_verdict(addr, true).status,
+                port_verdict(addr, BindProbe::Free).status,
                 Status::Ok,
                 "{addr} is free, so there is nothing to report. This check used to warn on 8788 as a property of the product, which was one workstation's Cursor install written into the binary and backwards on the machine this ships to."
             );
@@ -1706,6 +1785,682 @@ mod deep_tests {
                 "deep && crate::cognitive", "::nli::enabled()"
             )),
             "that is the exact call that blocked the runtime, and it is only absent while nobody has put it back"
+        );
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use crate::service::{TASK_NAME, Target};
+    use crate::service_apply::{CommandOutcome, CommandRunner};
+    use std::path::PathBuf;
+
+    const LAN: &str = "192.168.0.10:8787";
+    const LOOPBACK: &str = "127.0.0.1:8787";
+    const ENV_PATH: &str = "/home/operador/.config/memory-industry/memory-industry.env";
+
+    fn token(chars: usize) -> String {
+        "a".repeat(chars)
+    }
+
+    /// An env file as an operator leaves it, with the address and token lines
+    /// the daemon reads and a comment and a `DATABASE_URL` that are not doctor's.
+    fn env_file(addr: &str, token: &str) -> String {
+        format!(
+            "# mine\nDATABASE_URL=postgresql://op@db/brain\nCUBA_HTTP_ADDR={addr}\nCUBA_HTTP_TOKEN={token}\n"
+        )
+    }
+
+    fn facts(env_text: Option<String>) -> ServiceFacts {
+        ServiceFacts {
+            env_path: PathBuf::from(ENV_PATH),
+            env_text,
+            process_addr: None,
+            task_exists: None,
+            log_tail: None,
+        }
+    }
+
+    fn installed(addr: &str, token: &str) -> ServiceFacts {
+        facts(Some(env_file(addr, token)))
+    }
+
+    fn the<'a>(checks: &'a [Check], name: &str) -> &'a Check {
+        let seen: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        checks.iter().find(|c| c.name == name).unwrap_or_else(|| {
+            panic!("doctor has to report `{name}` here and reported only {seen:?}")
+        })
+    }
+
+    fn has_check(checks: &[Check], name: &str) -> bool {
+        checks.iter().any(|c| c.name == name)
+    }
+
+    /// Whole words, so `lan` is not found inside `plan`.
+    fn has_word(text: &str, word: &str) -> bool {
+        text.split(|c: char| !c.is_alphanumeric())
+            .any(|w| w.eq_ignore_ascii_case(word))
+    }
+
+    fn said(c: &Check) -> String {
+        format!("{} {}", c.detail, c.hint.as_deref().unwrap_or_default())
+    }
+
+    // --- D1: address and profile come from the env file ------------------------
+
+    #[test]
+    fn d1_the_address_and_profile_are_the_ones_the_env_file_holds() {
+        let checks = service_checks(&installed(LAN, &token(64)));
+        let address = the(&checks, "service_address");
+        assert_eq!(
+            address.status,
+            Status::Ok,
+            "a LAN address with a 64-character token is a healthy install: {address:?}"
+        );
+        assert!(
+            address.detail.contains(LAN),
+            "doctor has to say the address the daemon will bind, read from the env file and not from doctor's own CUBA_HTTP_ADDR, which is unset here: {}",
+            address.detail
+        );
+        assert!(
+            has_word(&address.detail, "lan") && !has_word(&address.detail, "loopback"),
+            "{LAN} can be reached by other machines, so the profile is lan: {}",
+            address.detail
+        );
+        assert!(
+            address.detail.contains(ENV_PATH),
+            "the operator has to be told which file to edit to change it: {}",
+            address.detail
+        );
+        assert_eq!(
+            the(&checks, "service_install").status,
+            Status::Ok,
+            "an install that is there is not a finding"
+        );
+    }
+
+    #[test]
+    fn d1_the_token_never_travels_into_the_report() {
+        let secret = "s3cr3t".repeat(11);
+        let checks = service_checks(&installed(LAN, &secret));
+        the(&checks, "service_address");
+        for c in &checks {
+            assert!(
+                !c.detail.contains(&secret) && !c.hint.as_deref().unwrap_or("").contains(&secret),
+                "doctor output is pasted into issues and chats, so it must not carry the bearer token: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn d1_loopback_says_loopback() {
+        let checks = service_checks(&installed(LOOPBACK, ""));
+        let address = the(&checks, "service_address");
+        assert_eq!(
+            address.status,
+            Status::Ok,
+            "loopback with no token is the default install and must not alarm: {address:?}"
+        );
+        assert!(
+            address.detail.contains(LOOPBACK)
+                && has_word(&address.detail, "loopback")
+                && !has_word(&address.detail, "lan"),
+            "{LOOPBACK} is reachable only from this machine, and the report has to say so: {}",
+            address.detail
+        );
+    }
+
+    #[test]
+    fn d1_a_routable_address_with_a_weak_token_says_serve_will_refuse() {
+        for weak in [String::new(), "short".to_string(), token(31)] {
+            let checks = service_checks(&installed(LAN, &weak));
+            let address = the(&checks, "service_address");
+            assert_eq!(
+                address.status,
+                Status::Fail,
+                "a {}-character token on {LAN} is below the floor `serve` enforces, so the daemon will not start and doctor cannot call that ok: {address:?}",
+                weak.chars().count()
+            );
+            let words = said(address);
+            assert!(
+                words.contains("serve") && words.contains("negará"),
+                "the operator has to learn that `serve` will refuse to start, not only that something is wrong: {words}"
+            );
+        }
+    }
+
+    #[test]
+    fn d1_the_token_floor_is_exactly_the_one_serve_enforces() {
+        let floor = crate::http::MIN_ROUTABLE_TOKEN_CHARS;
+        let at = service_checks(&installed(LAN, &token(floor)));
+        assert_eq!(
+            the(&at, "service_address").status,
+            Status::Ok,
+            "{floor} characters is accepted by `serve`; refusing it here would send the operator to regenerate a good token"
+        );
+        let below = service_checks(&installed(LAN, &token(floor - 1)));
+        assert_eq!(
+            the(&below, "service_address").status,
+            Status::Fail,
+            "{} characters is refused by `serve`, and doctor has to agree",
+            floor - 1
+        );
+    }
+
+    #[test]
+    fn d1_a_routable_address_with_no_token_line_at_all_is_a_failure() {
+        let no_token = format!("CUBA_HTTP_ADDR={LAN}\n");
+        let checks = service_checks(&facts(Some(no_token)));
+        assert_eq!(
+            the(&checks, "service_address").status,
+            Status::Fail,
+            "a missing token line is the same refusal as an empty one: `serve` has nothing to authenticate with"
+        );
+    }
+
+    #[test]
+    fn d1_a_machine_with_no_service_installed_is_not_a_failure() {
+        let checks = service_checks(&facts(None));
+        let install = the(&checks, "service_install");
+        assert_eq!(
+            install.status,
+            Status::Ok,
+            "a development machine has no service and that is fine: {install:?}"
+        );
+        assert!(
+            install.detail.contains("sin instalación de servicio en")
+                && install.detail.contains(ENV_PATH),
+            "the report has to say where doctor looked: {}",
+            install.detail
+        );
+        assert!(
+            !has_check(&checks, "service_address"),
+            "there is no address to report without an env file"
+        );
+        assert!(
+            checks.iter().all(|c| c.status == Status::Ok),
+            "nothing about a missing service may warn or fail: {checks:?}"
+        );
+    }
+
+    // --- D2: the same precedence as the daemon ---------------------------------
+
+    #[test]
+    fn d2_the_process_beats_the_file_and_the_file_beats_the_default() {
+        assert_eq!(
+            effective_http_addr(Some("10.0.0.1:1"), Some("10.0.0.2:2")),
+            ("10.0.0.1:1".to_string(), AddrSource::Process),
+            "the process variable is read first by the daemon, so doctor must report it when both are set"
+        );
+        assert_eq!(
+            effective_http_addr(None, Some("10.0.0.2:2")),
+            ("10.0.0.2:2".to_string(), AddrSource::EnvFile),
+            "the service loads the env file, so with no process variable its address is the one in effect; ignoring it made doctor probe a port the daemon never uses"
+        );
+        assert_eq!(
+            effective_http_addr(Some("10.0.0.1:1"), None),
+            ("10.0.0.1:1".to_string(), AddrSource::Process),
+            "a process variable with no file is still the process variable"
+        );
+    }
+
+    #[test]
+    fn d2_with_neither_the_default_is_loopback_8787() {
+        assert_eq!(
+            effective_http_addr(None, None),
+            ("127.0.0.1:8787".to_string(), AddrSource::Default),
+            "no variable anywhere is what `serve` binds on its own"
+        );
+        assert_eq!(
+            crate::http::DEFAULT_ADDR,
+            "127.0.0.1:8787",
+            "the default this test pins is the daemon's, not a copy"
+        );
+    }
+
+    #[test]
+    fn d2_a_process_address_that_differs_from_the_file_is_a_warning_naming_both() {
+        let mut f = installed(LAN, &token(64));
+        f.process_addr = Some("127.0.0.1:9999".to_string());
+        let checks = service_checks(&f);
+        let conflict = checks
+            .iter()
+            .find(|c| {
+                c.status == Status::Warn
+                    && c.detail.contains(LAN)
+                    && c.detail.contains("127.0.0.1:9999")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "two sources disagree about where the daemon listens and doctor has to warn, naming both values so the operator sees which one to remove: {checks:?}"
+                )
+            });
+        assert!(
+            !conflict.hint.as_deref().unwrap_or_default().is_empty(),
+            "a warning that names the problem and not the way out is half a message: {conflict:?}"
+        );
+    }
+
+    #[test]
+    fn d2_a_process_address_equal_to_the_file_or_absent_warns_about_nothing() {
+        let mut same = installed(LAN, &token(64));
+        same.process_addr = Some(LAN.to_string());
+        let absent = installed(LAN, &token(64));
+        for (case, f) in [("equal", same), ("absent", absent)] {
+            let checks = service_checks(&f);
+            the(&checks, "service_address");
+            assert!(
+                checks.iter().all(|c| c.status == Status::Ok),
+                "a process address that is {case} to the file's is no disagreement, and a warning here would train the operator to ignore doctor: {checks:?}"
+            );
+        }
+    }
+
+    // --- D3: an unassigned address is not «someone is listening» ---------------
+
+    #[test]
+    fn d3_an_address_not_assigned_to_this_machine_says_so_and_names_the_way_to_check() {
+        let c = port_verdict(LAN, BindProbe::NotAssigned);
+        assert_eq!(
+            c.status,
+            Status::Warn,
+            "an unassigned address is the daemon's problem to wait out, not a verdict: {c:?}"
+        );
+        assert!(
+            c.detail.contains("is not assigned to this machine") && c.detail.contains(LAN),
+            "the report has to say what is true of {LAN}: {}",
+            c.detail
+        );
+        assert!(
+            !c.detail.contains("already listening"),
+            "there is no process on an address nobody owns, and saying so sends the operator hunting for it: {}",
+            c.detail
+        );
+        let hint = c.hint.unwrap_or_default();
+        assert!(
+            hint.contains("ipconfig")
+                && hint.contains("ip addr")
+                && hint.contains("CUBA_HTTP_ADDR"),
+            "the way out is to look at the machine's addresses on either OS and to fix the variable: {hint}"
+        );
+    }
+
+    #[test]
+    fn d3_an_address_in_use_keeps_its_message_and_a_free_one_says_free() {
+        let held = port_verdict(LOOPBACK, BindProbe::InUse);
+        assert_eq!(
+            held.status,
+            Status::Warn,
+            "in use stays a warning: {held:?}"
+        );
+        assert!(
+            held.detail
+                .contains(&format!("something is already listening on {LOOPBACK}")),
+            "the in-use message is the one operators already know: {}",
+            held.detail
+        );
+        assert!(
+            !held.detail.contains("not assigned"),
+            "a port that is held is not an address that is missing: {}",
+            held.detail
+        );
+        let free = port_verdict(LOOPBACK, BindProbe::Free);
+        assert_eq!(free.status, Status::Ok, "free is ok: {free:?}");
+        assert!(
+            free.detail.contains(&format!("{LOOPBACK} is free")),
+            "{}",
+            free.detail
+        );
+    }
+
+    #[test]
+    fn d3_a_failed_bind_is_classified_by_why_it_failed() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            probe_of_failed_bind(&Error::from(ErrorKind::AddrNotAvailable)),
+            BindProbe::NotAssigned,
+            "AddrNotAvailable is the OS saying the address is not on this machine"
+        );
+        assert_eq!(
+            probe_of_failed_bind(&Error::from(ErrorKind::AddrInUse)),
+            BindProbe::InUse,
+            "AddrInUse is another socket holding the port"
+        );
+    }
+
+    #[test]
+    fn d3_the_real_check_tells_a_held_port_from_an_address_nobody_owns() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+        let held_addr = held.local_addr().expect("a bound socket has an address");
+        let in_use = http_port_check(Some(&held_addr.to_string()));
+        assert!(
+            in_use.detail.contains("already listening"),
+            "a port this test holds is in use: {}",
+            in_use.detail
+        );
+        // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): documentation space no machine
+        // is assigned. Binding it opens no connection; the OS refuses at once,
+        // unless the host sets ip_nonlocal_bind, which a dev box does not.
+        let nobody = http_port_check(Some("192.0.2.1:8787"));
+        assert!(
+            nobody.detail.contains("is not assigned to this machine"),
+            "the OS refuses to bind an address that is not on any interface and doctor has to say that, not blame a listener: {}",
+            nobody.detail
+        );
+    }
+
+    // --- D4: the scheduled task ------------------------------------------------
+
+    struct ScriptedRunner {
+        reply: Result<Option<i32>, std::io::ErrorKind>,
+        calls: Vec<(String, Vec<String>)>,
+    }
+
+    impl ScriptedRunner {
+        fn answering(reply: Result<Option<i32>, std::io::ErrorKind>) -> Self {
+            Self {
+                reply,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl CommandRunner for ScriptedRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> std::io::Result<CommandOutcome> {
+            self.calls.push((program.to_string(), args.to_vec()));
+            match self.reply {
+                Ok(code) => Ok(CommandOutcome {
+                    code,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+                Err(kind) => Err(std::io::Error::from(kind)),
+            }
+        }
+    }
+
+    #[test]
+    fn d4_on_windows_a_query_that_succeeds_means_the_task_exists() {
+        let mut runner = ScriptedRunner::answering(Ok(Some(0)));
+        assert_eq!(
+            scheduled_task_exists(&mut runner, Target::Windows),
+            Some(true),
+            "`schtasks /Query` exits 0 for a task that is registered"
+        );
+        assert_eq!(
+            runner.calls,
+            vec![(
+                "schtasks".to_string(),
+                vec![
+                    "/Query".to_string(),
+                    "/TN".to_string(),
+                    TASK_NAME.to_string()
+                ]
+            )],
+            "doctor asks exactly one question, about the task `--register` creates, and changes nothing"
+        );
+    }
+
+    #[test]
+    fn d4_on_windows_a_query_that_fails_means_the_task_is_missing() {
+        let mut runner = ScriptedRunner::answering(Ok(Some(1)));
+        assert_eq!(
+            scheduled_task_exists(&mut runner, Target::Windows),
+            Some(false),
+            "`schtasks /Query` exits non-zero when the task is not registered"
+        );
+    }
+
+    #[test]
+    fn d4_when_schtasks_cannot_even_start_doctor_does_not_claim_the_task_is_missing() {
+        let mut runner = ScriptedRunner::answering(Err(std::io::ErrorKind::NotFound));
+        assert_eq!(
+            scheduled_task_exists(&mut runner, Target::Windows),
+            None,
+            "not knowing is not the same as «missing»: a warning that says to register a task that may be there would be a lie"
+        );
+    }
+
+    #[test]
+    fn d4_off_windows_no_runner_is_invoked_and_nothing_is_known() {
+        let mut runner = ScriptedRunner::answering(Ok(Some(0)));
+        assert_eq!(
+            scheduled_task_exists(&mut runner, Target::Linux),
+            None,
+            "there is no Task Scheduler on this target, so there is no answer"
+        );
+        assert!(
+            runner.calls.is_empty(),
+            "no runner invocado: running `schtasks` on Linux is a spawn error at best: {:?}",
+            runner.calls
+        );
+    }
+
+    #[test]
+    fn d4_a_missing_task_warns_with_the_command_that_creates_it() {
+        let mut f = installed(LAN, &token(64));
+        f.task_exists = Some(false);
+        let checks = service_checks(&f);
+        let task = the(&checks, "service_task");
+        assert_eq!(
+            task.status,
+            Status::Warn,
+            "an installed service with no task does not come back after a reboot: {task:?}"
+        );
+        assert!(
+            said(task).contains("setup service --apply --register"),
+            "the way out is the command, spelled out: {}",
+            said(task)
+        );
+    }
+
+    #[test]
+    fn d4_a_task_that_exists_is_ok_and_an_unknown_one_is_not_reported() {
+        let mut present = installed(LAN, &token(64));
+        present.task_exists = Some(true);
+        assert_eq!(
+            the(&service_checks(&present), "service_task").status,
+            Status::Ok,
+            "the task is there"
+        );
+        let unknown = installed(LAN, &token(64));
+        assert!(
+            !has_check(&service_checks(&unknown), "service_task"),
+            "with no answer (Linux) there is no service_task check at all, rather than a made-up one"
+        );
+    }
+
+    // --- D5: the last error in the log ----------------------------------------
+
+    fn info(msg: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-10-08T10:00:00Z","level":"INFO","fields":{{"message":"{msg}"}},"target":"memory_industry"}}"#
+        )
+    }
+
+    fn error(msg: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-10-08T10:00:01Z","level":"ERROR","fields":{{"message":"{msg}"}},"target":"memory_industry::http"}}"#
+        )
+    }
+
+    #[test]
+    fn d5_the_last_error_line_wins_and_comes_back_trimmed() {
+        let first = error("first failure");
+        let last = error("second failure");
+        let log = format!(
+            "{}\n{first}\n{}\n  {last} \t\r\n{}\n{}\n",
+            info("starting"),
+            info("retrying"),
+            info("listening"),
+            info("models warm")
+        );
+        assert_eq!(
+            last_error_line(&log),
+            Some(last),
+            "the first error is history and the last one is what the daemon died of; the line comes back without the padding of the file"
+        );
+    }
+
+    #[test]
+    fn d5_a_launcher_or_serve_message_counts_as_an_error() {
+        let launcher = "memory-industry: C:\\x\\memory-industry.env is not there.";
+        let serve = "serve: cannot bind 192.168.0.10:8787: it is not assigned to this machine";
+        let after_json = format!("{}\n{launcher}\n{}\n", error("old"), info("tail"));
+        assert_eq!(
+            last_error_line(&after_json).as_deref(),
+            Some(launcher),
+            "the launcher writes this line before any tracing exists, and it is the whole reason the task did not start"
+        );
+        let json_last = format!("{serve}\n{}\n", error("newer"));
+        assert_eq!(
+            last_error_line(&json_last),
+            Some(error("newer")),
+            "the last wins across kinds: a later JSON error beats an earlier `serve: ` line"
+        );
+        assert_eq!(
+            last_error_line(&format!("{}\n{serve}\n", info("x"))).as_deref(),
+            Some(serve),
+            "`serve: ` is what main prints when the server returns an error"
+        );
+    }
+
+    #[test]
+    fn d5_a_log_with_no_errors_has_none() {
+        let log = format!(
+            "{}\n{}\n{}\n{}\n",
+            info("starting"),
+            info("0 ERROR rows in the table"),
+            info("serve: listening on 127.0.0.1:8787"),
+            r#"{"timestamp":"2026-10-08T10:00:00Z","level":"WARN","fields":{"message":"slow"}}"#,
+        );
+        assert_eq!(
+            last_error_line(&log),
+            None,
+            "the word ERROR inside an INFO message, a `serve: ` that is not at the start of the line and a WARN are not errors: reporting them would cry wolf"
+        );
+        assert_eq!(last_error_line(""), None, "an empty log has no error");
+    }
+
+    #[test]
+    fn d5_the_service_log_check_shows_the_error_or_says_there_is_none_or_no_log() {
+        let mut f = installed(LAN, &token(64));
+        f.log_tail = None;
+        let none = service_checks(&f);
+        let no_log = the(&none, "service_log");
+        assert!(
+            no_log.status == Status::Ok && no_log.detail.contains("todavía no hay log"),
+            "a service that never ran has no log yet and that is not a finding: {no_log:?}"
+        );
+
+        f.log_tail = Some(format!("{}\n{}\n", info("starting"), info("listening")));
+        let clean = service_checks(&f);
+        let clean = the(&clean, "service_log");
+        assert!(
+            clean.status == Status::Ok && clean.detail.contains("sin errores"),
+            "a log with nothing wrong says so: {clean:?}"
+        );
+
+        let failure = error("cannot bind 192.168.0.10:8787");
+        f.log_tail = Some(format!(
+            "{}\n{failure}\n{}\n",
+            info("starting"),
+            info("retrying")
+        ));
+        let bad = service_checks(&f);
+        let bad = the(&bad, "service_log");
+        assert_eq!(
+            bad.status,
+            Status::Warn,
+            "an error in the log is worth the operator's eye but the daemon may have recovered since: {bad:?}"
+        );
+        assert!(
+            bad.detail.contains(&failure),
+            "the point of reading the log is to show the line itself, since under SYSTEM there is no console: {}",
+            bad.detail
+        );
+    }
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("mi-doctor-log-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("scratch directory is creatable");
+            Self(dir)
+        }
+
+        fn file(&self, bytes: &[u8]) -> PathBuf {
+            let path = self.0.join(crate::service::LOG_BASENAME);
+            std::fs::write(&path, bytes).expect("scratch is writable");
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn d5_only_the_tail_of_a_large_log_is_read() {
+        let scratch = Scratch::new();
+        let mut log = format!("{}\n", error("buried at the start")).into_bytes();
+        let filler = format!("{}\n", info("steady state"));
+        while log.len() < 1024 * 1024 {
+            log.extend_from_slice(filler.as_bytes());
+        }
+        log.extend_from_slice(format!("{}\n", info("the very last line")).as_bytes());
+        let path = scratch.file(&log);
+
+        let tail = read_log_tail(&path, LOG_TAIL_BYTES).expect("a log that exists has a tail");
+        assert!(
+            tail.len() as u64 <= LOG_TAIL_BYTES,
+            "doctor must not read a 1 MiB log whole (it read {} bytes against a bound of {LOG_TAIL_BYTES}): a log that has run for weeks would stall a health check",
+            tail.len()
+        );
+        assert!(
+            tail.contains("the very last line"),
+            "the tail is the END of the file, where the daemon's last words are"
+        );
+        assert_eq!(
+            last_error_line(&tail),
+            None,
+            "the only error sits in the first bytes, outside the last {LOG_TAIL_BYTES}: seeing it means the whole file was read"
+        );
+    }
+
+    #[test]
+    fn d5_a_log_smaller_than_the_bound_comes_back_whole_and_a_missing_one_is_none() {
+        let scratch = Scratch::new();
+        let path = scratch.file(b"line one\nline two\n");
+        assert_eq!(
+            read_log_tail(&path, LOG_TAIL_BYTES).as_deref(),
+            Some("line one\nline two\n"),
+            "a short log has no tail to cut"
+        );
+        assert_eq!(
+            read_log_tail(
+                &scratch.0.join("memory-industry.log.missing"),
+                LOG_TAIL_BYTES
+            ),
+            None,
+            "no file is «todavía no hay log», which is a different fact from an empty one"
+        );
+    }
+
+    #[test]
+    fn d5_a_cut_in_the_middle_of_a_character_does_not_lose_the_log() {
+        let scratch = Scratch::new();
+        let path = scratch.file("ééééé".as_bytes());
+        let tail = read_log_tail(&path, 5).expect(
+            "5 bytes of a file of 2-byte characters cuts one in half; the log is still readable",
+        );
+        assert!(
+            tail.ends_with('é') && tail.len() <= 8,
+            "the cut has to be tolerated (lossy), not turned into «no log»: {tail:?}"
         );
     }
 }
