@@ -150,15 +150,23 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// Temp file in the same directory, then rename: a crash leaves the old file or
-/// the new one, never half of either. The token is in this file, so the temp is
-/// private from the first byte and removed if anything fails.
-fn replace_atomically(path: &Path, contents: &str) -> Result<()> {
+/// Where the temp file of a rewrite of `path` goes: next to it, because a rename
+/// across filesystems is a copy and no longer atomic. A bare file name has an
+/// empty parent, which is the current directory. Its own function because once
+/// the rename is done the temp's location leaves no trace to test.
+fn temp_beside(path: &Path) -> std::path::PathBuf {
     let directory = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let temp = directory.join(format!(".memory-industry.env.{}.tmp", uuid::Uuid::new_v4()));
+    directory.join(format!(".memory-industry.env.{}.tmp", uuid::Uuid::new_v4()))
+}
+
+/// Temp file in the same directory, then rename: a crash leaves the old file or
+/// the new one, never half of either. The token is in this file, so the temp is
+/// private from the first byte and removed if anything fails.
+fn replace_atomically(path: &Path, contents: &str) -> Result<()> {
+    let temp = temp_beside(path);
     let done = create_private(&temp)
         .and_then(|mut file| {
             file.write_all(contents.as_bytes())?;
@@ -685,6 +693,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_env_path_that_cannot_be_read_is_an_error_and_not_an_absent_file() {
+        let scratch = Scratch::new();
+        let path = scratch.env_path();
+        std::fs::create_dir(&path).expect("a directory where the env file should be");
+
+        let refused = sync_env_file(&path, &unit_at(ROUTABLE, Some(&"t".repeat(64))))
+            .expect_err("a path that is there and cannot be read is not «no install»");
+
+        let said = format!("{refused:#}");
+        assert!(
+            said.contains("no se pudo leer") && said.contains(&path.display().to_string()),
+            "reading None into «nothing to sync» leaves the daemon on the old address while \
+             `--apply` reports success; the error has to name the path: {said}"
+        );
+    }
+
+    #[test]
+    fn a_key_missing_from_the_file_is_appended_as_one_line_and_never_after_a_blank_one() {
+        for (text, expected) in [
+            ("A=1\nB=2\n", "A=1\nB=2\nCUBA_HTTP_ADDR=127.0.0.1:8787\n"),
+            ("A=1\nB=2", "A=1\nB=2\nCUBA_HTTP_ADDR=127.0.0.1:8787\n"),
+            ("", "CUBA_HTTP_ADDR=127.0.0.1:8787\n"),
+        ] {
+            assert_eq!(
+                set_env_value(text, "CUBA_HTTP_ADDR", LOOPBACK),
+                expected,
+                "the separator is a newline only when the last line lacks one: a file that \
+                 already ends in «\\n» (or is empty) gets no blank line in front of the key, \
+                 and one that does not gets exactly one break. Input {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_temp_file_of_a_rewrite_lives_next_to_the_file_it_replaces() {
+        let beside = temp_beside(Path::new("/opt/mi/memory-industry.env"));
+        assert_eq!(
+            beside.parent(),
+            Some(Path::new("/opt/mi")),
+            "a temp elsewhere makes the rename a copy across filesystems, which is not atomic \
+             and can leave half a token file: {beside:?}"
+        );
+        let name = beside.file_name().and_then(|name| name.to_str());
+        assert!(
+            name.is_some_and(
+                |name| name.starts_with(".memory-industry.env.") && name.ends_with(".tmp")
+            ),
+            "and it is recognisable as ours, so a leftover is not mistaken for the operator's: \
+             {beside:?}"
+        );
+
+        let bare = temp_beside(Path::new("memory-industry.env"));
+        assert_eq!(
+            bare.parent(),
+            Some(Path::new(".")),
+            "a bare file name has an empty parent, and the current directory is where it \
+             lives: {bare:?}"
+        );
+    }
+
     // --- The elevation probe -------------------------------------------------------
 
     type Answer = Box<dyn FnMut(&[String]) -> io::Result<CommandOutcome>>;
@@ -980,5 +1049,195 @@ mod tests {
             "there is no rollback, so the error is the rollback plan: what stayed, and that the \
              next run needs no cleanup: {said}"
         );
+    }
+
+    // --- require_elevated: the refusal that comes before any file is written --------
+
+    #[test]
+    fn require_elevated_refuses_after_one_fltmc_probe_and_lets_an_administrator_through() {
+        let mut denied = Fake::new(|_| probe_answer("denied"));
+
+        let refused = require_elevated(&mut denied)
+            .expect_err("a console without administrator rights must not get to write files");
+
+        let said = format!("{refused:#}");
+        assert!(
+            said.contains("administrador") && said.contains("--register"),
+            "the refusal names the right that is missing and the flag it is for: {said}"
+        );
+        assert_eq!(
+            denied.calls,
+            vec![vec!["fltmc".to_string()]],
+            "the check is one `fltmc` and nothing that changes the machine"
+        );
+
+        let mut administrator = Fake::new(|_| probe_answer("administrator"));
+        require_elevated(&mut administrator).expect("an elevated console goes on");
+        assert_eq!(
+            administrator.calls,
+            vec![vec!["fltmc".to_string()]],
+            "and it was asked, not assumed"
+        );
+    }
+
+    // --- reason: what a failed command said -----------------------------------------
+
+    fn reason_of(code: Option<i32>, stdout: &str, stderr: &str) -> String {
+        reason(&CommandOutcome {
+            code,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        })
+    }
+
+    #[test]
+    fn the_reason_is_the_first_non_blank_line_of_stderr_then_stdout_with_the_exit_code() {
+        for (code, stdout, stderr, expected) in [
+            (Some(1), "", "", "con código 1: sin mensaje"),
+            (
+                Some(1),
+                "  solo stdout  \nsegunda",
+                "",
+                "con código 1: solo stdout",
+            ),
+            (
+                Some(2),
+                "",
+                "solo stderr\nsegunda",
+                "con código 2: solo stderr",
+            ),
+            (Some(3), "out", "err", "con código 3: err"),
+            (
+                Some(1),
+                "",
+                "\n   \n  ERROR: no rule  \nresto",
+                "con código 1: ERROR: no rule",
+            ),
+            (Some(1), "out", " \n\t\n", "con código 1: out"),
+            (None, "", "killed", "sin código de salida: killed"),
+        ] {
+            assert_eq!(
+                reason_of(code, stdout, stderr),
+                expected,
+                "stdout {stdout:?}, stderr {stderr:?}: `netsh` names the cause on its first \
+                 non-blank line, blank lines in front are not a message, stderr wins over \
+                 stdout, and an empty answer says so instead of ending in «: »"
+            );
+        }
+    }
+
+    // --- next_steps: the end of --apply ---------------------------------------------
+
+    #[test]
+    fn registering_ends_with_the_report_of_what_register_did_and_runs_its_commands() {
+        let root = PathBuf::from("/opt/mi");
+        let mut runner = Fake::succeeding();
+
+        let report = next_steps(
+            &mut runner,
+            true,
+            &unit_at(ROUTABLE, Some(&"t".repeat(64))),
+            Target::Windows,
+            &root,
+        )
+        .expect("an elevated console registers a LAN install");
+
+        assert_eq!(
+            report,
+            [
+                format!(
+                    "firewall: regla {FIREWALL_RULE_NAME} abierta en TCP 8787 (redes privada y de \
+                     dominio)"
+                ),
+                format!("tarea: {TASK_NAME} registrada (arranca con el equipo, como SYSTEM)"),
+            ],
+            "the operator reads this to learn that the door and the task exist"
+        );
+        assert_eq!(
+            runner.calls,
+            vec![
+                firewall_delete_argv(),
+                firewall_add_argv(8787),
+                schtasks_create_argv(&root.join(TASK_XML_BASENAME))
+            ],
+            "the task registered is the XML `--apply` wrote under the install root"
+        );
+
+        let mut loopback = Fake::succeeding();
+        let report = next_steps(
+            &mut loopback,
+            true,
+            &unit_at(LOOPBACK, None),
+            Target::Windows,
+            &root,
+        )
+        .expect("an elevated console registers a loopback install");
+        assert_eq!(
+            report,
+            [
+                format!(
+                    "firewall: no se abrió ningún puerto porque {LOOPBACK} es loopback y ninguna \
+                     otra máquina lo alcanza"
+                ),
+                format!("tarea: {TASK_NAME} registrada (arranca con el equipo, como SYSTEM)"),
+            ],
+            "and for loopback, why there is no rule"
+        );
+        assert_eq!(
+            loopback.calls,
+            vec![schtasks_create_argv(&root.join(TASK_XML_BASENAME))],
+            "a loopback install talks to schtasks only"
+        );
+    }
+
+    #[test]
+    fn not_registering_ends_with_the_commands_to_run_by_hand_and_runs_none() {
+        let root = PathBuf::from("/opt/mi");
+        let token = "t".repeat(64);
+
+        for (target, unit, must_say) in [
+            (
+                Target::Windows,
+                unit_at(ROUTABLE, Some(&token)),
+                "netsh advfirewall firewall add rule",
+            ),
+            (
+                Target::Windows,
+                unit_at(LOOPBACK, None),
+                "schtasks /Create /XML",
+            ),
+            (
+                Target::Linux,
+                unit_at(ROUTABLE, Some(&token)),
+                "systemctl --user enable --now memory-industry.service",
+            ),
+        ] {
+            let mut runner = Fake::succeeding();
+
+            let steps = next_steps(&mut runner, false, &unit, target, &root)
+                .expect("printing instructions cannot fail");
+
+            assert_eq!(
+                steps,
+                manual_steps(&unit.addr, target, &root),
+                "{target:?} {}: without --register the end of `--apply` is the manual steps, \
+                 as `manual_steps` renders them",
+                unit.addr
+            );
+            assert!(
+                steps
+                    .first()
+                    .is_some_and(|line| line.starts_with("Habilitalo con"))
+                    && steps.iter().any(|line| line.contains(must_say)),
+                "{target:?} {}: an empty or invented list leaves the operator with a daemon \
+                 that was never enabled: {steps:?}",
+                unit.addr
+            );
+            assert!(
+                runner.calls.is_empty(),
+                "the operator did not ask for --register, so nothing touches the machine: {:?}",
+                runner.calls
+            );
+        }
     }
 }

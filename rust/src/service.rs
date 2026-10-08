@@ -3481,6 +3481,147 @@ mod tests {
         assert_eq!(unit.profile, Profile::Loopback);
     }
 
+    // --- resolve_token: who is told to look in the file -----------------------------
+
+    #[test]
+    fn a_weak_token_names_the_env_file_only_when_the_operator_did_not_type_it() {
+        let weak = "s".repeat(10);
+        let lan = addr(ROUTABLE);
+        let refusal = |flag: Option<&str>, installed: Option<&str>| {
+            resolve_token(Profile::Lan, lan, flag, installed)
+                .expect_err("a 10-character token on a routable address is refused")
+                .to_string()
+        };
+
+        let from_the_file = refusal(None, Some(weak.as_str()));
+        assert!(
+            from_the_file.starts_with(&format!("{ENV_BASENAME}: el token tiene 10 caracteres")),
+            "the operator never typed this token, so the message has to say which file holds \
+             it: {from_the_file}"
+        );
+
+        for (case, flag, installed) in [
+            ("typed and the file has none", Some(weak.as_str()), None),
+            (
+                "typed and identical to the file's (`--token` repeating what is installed)",
+                Some(weak.as_str()),
+                Some(weak.as_str()),
+            ),
+        ] {
+            let said = refusal(flag, installed);
+            assert!(
+                said.starts_with("el token tiene 10 caracteres") && !said.contains(ENV_BASENAME),
+                "{case}: the operator typed it, so sending them to edit a file is the wrong \
+                 advice: {said}"
+            );
+        }
+    }
+
+    // --- installed_env: the text of the file already on disk --------------------
+
+    fn installed_env_path(target: Target, scratch: &Scratch) -> PathBuf {
+        let root = scratch.0.display().to_string();
+        install_root(target, Some(&root), Some(&root))
+            .expect("both variables are given")
+            .join(ENV_BASENAME)
+    }
+
+    #[tokio::test]
+    async fn the_installed_env_is_the_text_of_the_file_of_that_target_and_none_when_absent() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("installed-env");
+        let _pinned = pinned_install_root(&scratch);
+
+        for target in [Target::Linux, Target::Windows] {
+            assert_eq!(
+                super::installed_env(target).expect("a missing file is not an error"),
+                None,
+                "{target:?}: no file is an install that never happened; an error here would \
+                 make a first `--apply` look like a broken one"
+            );
+
+            let path = installed_env_path(target, &scratch);
+            let text = format!("CUBA_HTTP_ADDR={ROUTABLE}\n# written for {target:?}\n");
+            std::fs::create_dir_all(path.parent().expect("the env file has a directory"))
+                .expect("scratch is writable");
+            std::fs::write(&path, &text).expect("scratch is writable");
+
+            assert_eq!(
+                super::installed_env(target).expect("a file the operator can read is readable"),
+                Some(text),
+                "{target:?}: the address and the token this returns are what an `--apply` \
+                 without flags keeps; any other text (empty, invented, none) resets the install"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_env_path_that_cannot_be_read_is_an_error_naming_it_and_not_an_absent_install() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let scratch = Scratch::new("installed-env-unreadable");
+        let _pinned = pinned_install_root(&scratch);
+
+        for target in [Target::Linux, Target::Windows] {
+            let path = installed_env_path(target, &scratch);
+            std::fs::create_dir_all(&path).expect("a directory where the env file should be");
+
+            let said = format!(
+                "{:#}",
+                super::installed_env(target)
+                    .expect_err("a path that is there but cannot be read is not «no install»")
+            );
+
+            assert!(
+                said.contains("no se pudo leer") && said.contains(&path.display().to_string()),
+                "{target:?}: reporting None here installs the default over a LAN install that \
+                 merely could not be read, and the clients lose the daemon: {said}"
+            );
+        }
+    }
+
+    // --- manual_steps: what --apply tells the operator to run by hand -----------
+
+    #[test]
+    fn the_manual_steps_are_the_supervisor_command_and_the_firewall_where_it_applies() {
+        let root = Path::new("/opt/mi");
+        let headline =
+            "Habilitalo con (o repetí --apply con --register desde una consola de administrador):";
+        let schtasks = format!(
+            "  schtasks /Create /XML \"{}\" /TN {TASK_NAME} /F",
+            root.join(TASK_XML_BASENAME).display()
+        );
+
+        assert_eq!(
+            manual_steps(&addr(ROUTABLE), Target::Windows, root),
+            [
+                headline,
+                schtasks.as_str(),
+                "Y abrí el puerto en el firewall con:",
+                "  netsh advfirewall firewall delete rule name=memory-industry",
+                "  netsh advfirewall firewall add rule name=memory-industry dir=in \
+                 action=allow protocol=TCP localport=8787 profile=private,domain",
+            ],
+            "Windows on the LAN: the task and then the two firewall commands, each under its \
+             own heading, because the task alone starts a daemon nobody can reach"
+        );
+        assert_eq!(
+            manual_steps(&addr("127.0.0.1:8787"), Target::Windows, root),
+            [headline, schtasks.as_str()],
+            "loopback needs no rule: a «Y abrí el puerto» heading over nothing sends the \
+             operator looking for a command that is not there"
+        );
+        assert_eq!(
+            manual_steps(&addr(ROUTABLE), Target::Linux, root),
+            [
+                headline,
+                "  systemctl --user daemon-reload && systemctl --user enable --now \
+                 memory-industry.service",
+            ],
+            "Linux has no `netsh`, however routable the address is: the firewall is the \
+             operator's own there and the installer does not talk about it"
+        );
+    }
+
     // --- The flags: what `setup service` was asked for --------------------------
 
     /// `parse_request` over a literal command line. The real caller hands it the
