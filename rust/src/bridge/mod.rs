@@ -331,8 +331,9 @@ impl Bridge {
         self.search(&mut core).await
     }
 
-    /// A send failed before the host could have received it: the address is in doubt.
-    pub(crate) async fn transport_failed(&self) {
+    /// The verified address is in doubt: a send failed before the host could have received
+    /// it, or the host refused the credential. The next call asks `/identity` again first.
+    pub(crate) async fn doubt(&self) {
         self.core.lock().await.freshness.transport_failed();
     }
 

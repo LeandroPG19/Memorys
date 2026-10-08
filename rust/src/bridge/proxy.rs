@@ -256,6 +256,17 @@ async fn send_once(
     }
 }
 
+/// A 401 from the host means the credential may have been revoked since it was last
+/// verified. The call that got it is answered as the host answered; the next one asks
+/// `/identity` before it sends anything, so a revoked device stops sending its credential
+/// at once and not when the freshness window ends. A success never casts doubt.
+async fn learn_from(bridge: &Bridge, response: Response) -> Response {
+    if response.status() == StatusCode::UNAUTHORIZED {
+        bridge.doubt().await;
+    }
+    response
+}
+
 /// The one retry: only after a failure to connect, so the request cannot have arrived,
 /// and only after looking for the host again.
 async fn retry_elsewhere(
@@ -263,20 +274,19 @@ async fn retry_elsewhere(
     parts: &Parts,
     body: &Bytes,
 ) -> Result<Response, Refusal> {
-    bridge.transport_failed().await;
+    bridge.doubt().await;
     let route = bridge.route().await?;
-    send_once(bridge, &route, parts, body)
-        .await
-        .map_err(|failure| match failure {
-            SendFailure::Connect(why) => Refusal::NotFound(why),
-            SendFailure::Other(why) => Refusal::MayHaveArrived(why),
-        })
+    match send_once(bridge, &route, parts, body).await {
+        Ok(response) => Ok(learn_from(bridge, response).await),
+        Err(SendFailure::Connect(why)) => Err(Refusal::NotFound(why)),
+        Err(SendFailure::Other(why)) => Err(Refusal::MayHaveArrived(why)),
+    }
 }
 
 async fn forward(bridge: &Bridge, parts: &Parts, body: Bytes) -> Result<Response, Refusal> {
     let route = bridge.route().await?;
     match send_once(bridge, &route, parts, &body).await {
-        Ok(response) => Ok(response),
+        Ok(response) => Ok(learn_from(bridge, response).await),
         Err(SendFailure::Connect(_)) => retry_elsewhere(bridge, parts, &body).await,
         Err(SendFailure::Other(why)) => Err(Refusal::MayHaveArrived(why)),
     }
