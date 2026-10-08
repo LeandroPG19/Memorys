@@ -19,9 +19,9 @@ src/calibrate_cli.rs::run_cli:70 20
 # Same cause as the four setup_agent.rs entries further down. Exact number, no
 # margin: the ratchet has to fail the next increase too.
 # Owner: mejorador 0.27.
-src/cli.rs::run_delete:261 15
-src/cli.rs::run_save:191 10
-src/cli.rs::run_search:69 15
+src/cli.rs::run_delete:263 15
+src/cli.rs::run_save:193 10
+src/cli.rs::run_search:71 15
 src/codegraph/mod.rs::walk:88 14
 src/codegraph/python_lang.rs::walk:27 11
 src/codegraph_cli.rs::run_cli:5 30
@@ -124,7 +124,12 @@ src/http.rs::serve_pool:191 11
 src/link_cli.rs::run_cli:5 13
 src/llm_cli.rs::print_status:154 13
 src/llm_cli.rs::set_provider:246 28
-src/main.rs::async_main:127 24
+# +2: the `account | bridge` arm of the command dispatcher (0.29.0). async_main is
+# the one place that has an arm per CLI command and each new command costs a
+# branch; the bodies live in accounts_cli::run_cli and bridge::run_cli, so no
+# decision was added here. Exact number, no margin: the ratchet has to fail the
+# next increase too. Owner: implementador 0.29.
+src/main.rs::async_main:129 26
 src/models_cli.rs::download_model:202 10
 src/models_cli.rs::download_runtime:293 13
 src/models_cli.rs::download_to:450 13

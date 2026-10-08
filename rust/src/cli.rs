@@ -4,7 +4,7 @@ use sqlx::{PgPool, Row};
 
 use crate::handlers;
 
-pub const COMMANDS: [&str; 26] = [
+pub const COMMANDS: [&str; 28] = [
     "serve",
     "tunnel",
     "search",
@@ -31,6 +31,8 @@ pub const COMMANDS: [&str; 26] = [
     "setup",
     "graph",
     "project",
+    "account",
+    "bridge",
 ];
 
 fn undo_dir() -> Result<std::path::PathBuf> {
