@@ -1,0 +1,6 @@
+from: especificador
+to: implementador
+type: note
+task: "0.29.0 persistencia LAN en Windows: tarea SYSTEM al arrancar, setup service --apply --register (tarea + firewall), direccion unica en el env file, log del launcher, doctor, reintento de bind con IP sin asignar, FreeBind=yes y guia reescrita; spec en .cursor/handoffs/0.29.0-lan-persistence.spec.md (tajadas A,B,E en paralelo; luego C; luego D)"
+commit: none
+evidence: "none (solo lectura: sed/grep/cat sobre rust/src/{service,http,main,doctor,setup_agent}.rs, rust/tests/{packaging_contract,doc_contract,local_gate_contract}.rs, packaging/, docs/despliegue-lan.md y scripts/validar-handoff.sh; no se compilo ni se corrio ningun test)"

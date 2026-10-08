@@ -1,0 +1,6 @@
+from: especificador
+to: implementador
+type: note
+task: "0.29.0 cuentas + emparejamiento + puente local: cuentas en la madre (migracion 0065, CLI account add/list/revoke/revoke-device/pair), identidad simetrica HMAC sin crate nuevo con credencial generada por el cliente, /identity y /pair en el daemon, admision por credencial con MEMORY_INDUSTRY_REQUIRE_ACCOUNTS, puente bridge pair/run/doctor/install en 127.0.0.1:8797 con descubrimiento verificado, setup client y guia con IP fija; spec en .cursor/handoffs/0.29.0-accounts-bridge.spec.md (tajada P sola; luego F con H; luego G; luego I con J)"
+commit: none
+evidence: "none (solo lectura: cat/sed/grep sobre rust/src/{http,session,service_apply,setup_agent,main,cli,doctor,db}.rs, rust/Cargo.toml, rust/Cargo.lock, rust/migrations/, rust/tests/{migrations_contract,cli_contract,doc_contract,v026_the_panel_over_real_http}.rs, docs/despliegue-lan.md, scripts/lizard-baseline.txt y la guia pg-aiguide design-postgres-tables; no se compilo ni se corrio ningun test)"
