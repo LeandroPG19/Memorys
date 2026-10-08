@@ -11,10 +11,6 @@
 //! * A raw HTTP/1.1 client, so a test controls every header it sends (a `Connection`, a
 //!   `Host`, a duplicate) and reads a streamed body piece by piece.
 
-// A toolbox: a helper the next test needs is not dead code, and which of them the current
-// tests leave unused is not something this file can check without a compiler.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -175,8 +171,12 @@ impl Identity {
         self.secret.to_hex()
     }
 
+    /// The `Authorization` header value the host must receive.
     pub fn bearer(&self) -> String {
-        accounts::bearer(self.credential_id, &self.secret)
+        format!(
+            "Bearer {}",
+            accounts::bearer(self.credential_id, &self.secret)
+        )
     }
 
     /// `<label>-<8 hex of the credential id>`
@@ -676,6 +676,78 @@ enum BodyMode {
     Done,
 }
 
+/// The request as it goes on the wire. Without a `Host` the target address is used,
+/// without a `Content-Length` the body's, and without a `Connection` header `close`.
+fn request_bytes(
+    addr: SocketAddr,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Vec<u8> {
+    let given = |name: &str| {
+        headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case(name))
+    };
+    let mut payload = format!("{method} {target} HTTP/1.1\r\n").into_bytes();
+    if !given("host") {
+        payload.extend_from_slice(format!("Host: {addr}\r\n").as_bytes());
+    }
+    if !given("content-length") {
+        payload.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
+    if !given("connection") {
+        payload.extend_from_slice(b"Connection: close\r\n");
+    }
+    for (name, value) in headers {
+        payload.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    payload.extend_from_slice(b"\r\n");
+    payload.extend_from_slice(body);
+    payload
+}
+
+/// Reads until the response head is complete: the head, and whatever of the body came
+/// with it.
+async fn read_head(read: &mut OwnedReadHalf) -> (Head, Vec<u8>) {
+    let mut buf = Vec::new();
+    let end = loop {
+        if let Some(end) = head_end(&buf) {
+            break end;
+        }
+        let mut piece = [0u8; 8192];
+        let n = tokio::time::timeout(Duration::from_secs(15), read.read(&mut piece))
+            .await
+            .expect("the server answered within 15 s")
+            .expect("the response head could be read");
+        assert!(n > 0, "the server closed the connection before it answered");
+        buf.extend_from_slice(&piece[..n]);
+    };
+    let head = Head::parse(&buf[..end]);
+    buf.drain(..end);
+    (head, buf)
+}
+
+fn status_of(head: &Head) -> u16 {
+    head.first_line
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status line")
+}
+
+fn body_mode(status: u16, head: &Head) -> BodyMode {
+    if status == 204 || status == 304 || status < 200 {
+        return BodyMode::Length(0);
+    }
+    if head.is_chunked() {
+        return BodyMode::Chunked;
+    }
+    head.content_length()
+        .map_or(BodyMode::UntilClose, BodyMode::Length)
+}
+
 /// An open response. Dropping it closes the connection, which is how a test plays a client
 /// that walks away.
 pub(crate) struct ResponseReader {
@@ -702,63 +774,16 @@ impl ResponseReader {
             .await
             .expect("the server under test accepts a connection");
         let (mut read, mut write) = stream.into_split();
-        let given = |name: &str| {
-            headers
-                .iter()
-                .any(|(key, _)| key.eq_ignore_ascii_case(name))
-        };
-        let mut payload = format!("{method} {target} HTTP/1.1\r\n").into_bytes();
-        if !given("host") {
-            payload.extend_from_slice(format!("Host: {addr}\r\n").as_bytes());
-        }
-        if !given("content-length") {
-            payload.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-        }
-        if !given("connection") {
-            payload.extend_from_slice(b"Connection: close\r\n");
-        }
-        for (name, value) in headers {
-            payload.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
-        }
-        payload.extend_from_slice(b"\r\n");
-        payload.extend_from_slice(body);
+        let payload = request_bytes(addr, method, target, headers, body);
         // The write half is kept open until the reader is dropped: an HTTP/1.1 server may
         // treat a half-closed connection as a client that left, and cancel its answer.
         let holder = tokio::spawn(async move {
             let _ = write.write_all(&payload).await;
             std::future::pending::<()>().await;
         });
-
-        let mut buf = Vec::new();
-        let end = loop {
-            if let Some(end) = head_end(&buf) {
-                break end;
-            }
-            let mut piece = [0u8; 8192];
-            let n = tokio::time::timeout(Duration::from_secs(15), read.read(&mut piece))
-                .await
-                .expect("the server answered within 15 s")
-                .expect("the response head could be read");
-            assert!(n > 0, "the server closed the connection before it answered");
-            buf.extend_from_slice(&piece[..n]);
-        };
-        let head = Head::parse(&buf[..end]);
-        buf.drain(..end);
-        let status: u16 = head
-            .first_line
-            .split(' ')
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .expect("a status line");
-        let mode = if status == 204 || status == 304 || status < 200 {
-            BodyMode::Length(0)
-        } else if head.is_chunked() {
-            BodyMode::Chunked
-        } else if let Some(length) = head.content_length() {
-            BodyMode::Length(length)
-        } else {
-            BodyMode::UntilClose
-        };
+        let (head, buf) = read_head(&mut read).await;
+        let status = status_of(&head);
+        let mode = body_mode(status, &head);
         ResponseReader {
             read,
             holder,
@@ -938,9 +963,6 @@ struct FakeCode {
 #[derive(Debug, Clone)]
 pub(crate) struct Issued {
     pub credential_id: Uuid,
-    pub h: [u8; 32],
-    pub account: String,
-    pub label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1211,6 +1233,54 @@ async fn answer_identity(stream: &mut TcpStream, shared: &Shared, seen: &Seen) {
     json_response(stream, 200, &reply).await;
 }
 
+/// What a redeemed code assigns.
+struct Claimed {
+    key: [u8; 32],
+    account: String,
+    label: String,
+    credential_id: Uuid,
+}
+
+/// A code is used once; the same `h` again is a replay of that use, another is refused.
+fn mint(code: &mut FakeCode, h: &[u8; 32]) -> Result<Uuid, u16> {
+    match code.used_with {
+        None => {
+            let id = Uuid::new_v4();
+            code.used_with = Some((id, *h));
+            Ok(id)
+        }
+        Some((id, h_then)) if h_then == *h => Ok(id),
+        Some(_) => Err(401),
+    }
+}
+
+/// The code whose key makes the request's MAC, claimed for `h`.
+fn claim(
+    inner: &mut Inner,
+    req: &accounts::PairRequest,
+    nc: &[u8; 16],
+    h: &[u8; 32],
+) -> Result<Claimed, u16> {
+    let matched = inner
+        .codes
+        .iter()
+        .position(|c| {
+            accounts::verify_mac(
+                accounts::pair_request_mac(&c.key, nc, &req.label, h),
+                &req.mac,
+            )
+        })
+        .ok_or(401u16)?;
+    let code = &mut inner.codes[matched];
+    let credential_id = mint(code, h)?;
+    Ok(Claimed {
+        key: code.key,
+        account: code.account.clone(),
+        label: code.label.clone().unwrap_or_else(|| req.label.clone()),
+        credential_id,
+    })
+}
+
 /// The daemon's redemption, reduced: the MAC picks the code, a code is used once, the same
 /// `h` again is a replay, anything else is the same refusal.
 fn redeem(shared: &Shared, raw: &[u8]) -> Result<accounts::PairResponse, u16> {
@@ -1219,30 +1289,8 @@ fn redeem(shared: &Shared, raw: &[u8]) -> Result<accounts::PairResponse, u16> {
     let h = hex_array::<32>(&req.h).ok_or(400u16)?;
     let mut guard = lock(&shared.inner);
     let inner = &mut *guard;
-    let matched = inner
-        .codes
-        .iter()
-        .position(|c| {
-            accounts::verify_mac(
-                accounts::pair_request_mac(&c.key, &nc, &req.label, &h),
-                &req.mac,
-            )
-        })
-        .ok_or(401u16)?;
-    let code = &mut inner.codes[matched];
-    let earlier = code.used_with;
-    let credential_id = match earlier {
-        None => {
-            let id = Uuid::new_v4();
-            code.used_with = Some((id, h));
-            id
-        }
-        Some((id, h_then)) if h_then == h => id,
-        Some(_) => return Err(401),
-    };
-    let key = code.key;
-    let account = code.account.clone();
-    let label = code.label.clone().unwrap_or_else(|| req.label.clone());
+    let claimed = claim(inner, &req, &nc, &h)?;
+    let credential_id = claimed.credential_id;
     inner.creds.insert(
         credential_id,
         FakeCred {
@@ -1256,21 +1304,16 @@ fn redeem(shared: &Shared, raw: &[u8]) -> Result<accounts::PairResponse, u16> {
         .iter()
         .any(|i| i.credential_id == credential_id)
     {
-        inner.issued.push(Issued {
-            credential_id,
-            h,
-            account: account.clone(),
-            label: label.clone(),
-        });
+        inner.issued.push(Issued { credential_id });
     }
     let mac = accounts::pair_response_mac(
-        &key,
+        &claimed.key,
         &nc,
         &h,
         &shared.host_id,
         &credential_id,
-        &account,
-        &label,
+        &claimed.account,
+        &claimed.label,
         HOST_NAME,
     );
     Ok(accounts::PairResponse {
@@ -1278,8 +1321,8 @@ fn redeem(shared: &Shared, raw: &[u8]) -> Result<accounts::PairResponse, u16> {
         host_id: shared.host_id,
         host_name: HOST_NAME.to_string(),
         credential_id,
-        account,
-        label,
+        account: claimed.account,
+        label: claimed.label,
         mac: hex::encode(mac),
     })
 }

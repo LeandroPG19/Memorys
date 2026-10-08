@@ -1,19 +1,57 @@
 //! The loopback side of the bridge: what a local MCP client talks to. It lets nobody in
 //! but this PC, adds the credential, and forwards byte for byte.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use anyhow::Result;
-use axum::http::HeaderMap;
-use axum::response::Response;
+use anyhow::{Context, Result};
+use axum::Router;
+use axum::body::{Body, Bytes, to_bytes};
+use axum::extract::{Request, State};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
-use super::Bridge;
 use super::state::BridgeState;
+use super::{Bridge, Refusal, Route};
+use crate::accounts;
+
+/// The daemon's own cap on a request body.
+const MAX_BODY: usize = 8 * 1024 * 1024;
+
+/// The JSON-RPC code the bridge uses for everything it cannot do itself.
+const BRIDGE_ERROR_CODE: i32 = -32003;
+
+/// Describe one connection, not the end-to-end message: never forwarded in either
+/// direction.
+const HOP_BY_HOP: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// What the bridge sets itself, or that would name the bridge instead of the host.
+const BRIDGE_OWN: [&str; 5] = [
+    "host",
+    "origin",
+    "authorization",
+    "mcp-machine-id",
+    "content-length",
+];
 
 /// The running listener. Dropping it or calling `shutdown` stops serving.
 pub struct BridgeHandle {
     addr: SocketAddr,
+    task: JoinHandle<()>,
 }
 
 impl BridgeHandle {
@@ -21,32 +59,288 @@ impl BridgeHandle {
         self.addr
     }
 
-    pub async fn shutdown(self) {
-        // PASS-1 STUB
-        unimplemented!("PASS-1 STUB: BridgeHandle::shutdown")
+    pub async fn shutdown(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
     }
+}
+
+impl Drop for BridgeHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Header names the client listed in its own `Connection` header: hop-by-hop too.
+fn named_by_connection(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .collect()
+}
+
+fn is_hop_by_hop(name: &str, named: &[String]) -> bool {
+    HOP_BY_HOP.contains(&name) || named.iter().any(|token| token == name)
+}
+
+fn machine_id(s: &BridgeState) -> String {
+    let id = s.credential_id.simple().to_string();
+    format!("{}-{}", s.device_label, &id[..8])
 }
 
 /// The headers the host receives: the client's, minus hop-by-hop ones, `Host`, `Origin`,
 /// `Authorization` and `Mcp-Machine-Id`, plus the credential and the machine id. Never an
 /// invented `Mcp-Client-Id`.
-pub fn forward_headers(_incoming: &HeaderMap, _s: &BridgeState) -> HeaderMap {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: proxy::forward_headers")
+pub fn forward_headers(incoming: &HeaderMap, s: &BridgeState) -> HeaderMap {
+    let named = named_by_connection(incoming);
+    let mut out = HeaderMap::new();
+    for (name, value) in incoming {
+        let own = BRIDGE_OWN.contains(&name.as_str());
+        if !own && !is_hop_by_hop(name.as_str(), &named) {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    let bearer = accounts::bearer(s.credential_id, &s.secret);
+    if let Ok(mut credential) = HeaderValue::from_str(&format!("Bearer {bearer}")) {
+        credential.set_sensitive(true);
+        out.insert(header::AUTHORIZATION, credential);
+    }
+    if let Ok(machine) = HeaderValue::from_str(&machine_id(s)) {
+        out.insert("mcp-machine-id", machine);
+    }
+    out
+}
+
+/// The host's headers on their way back to the client, minus the hop-by-hop ones.
+fn response_headers(upstream: &HeaderMap) -> HeaderMap {
+    let named = named_by_connection(upstream);
+    let mut out = HeaderMap::new();
+    for (name, value) in upstream {
+        if !is_hop_by_hop(name.as_str(), &named) {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out
+}
+
+/// An `Origin` is this bridge's own only when it is this machine on this port. A page
+/// served from anywhere else, or from a sandbox (`null`), is not.
+fn local_origin(origin: &str, port: u16) -> bool {
+    let rest = origin
+        .trim()
+        .split_once("://")
+        .map_or(origin.trim(), |(_, rest)| rest);
+    let (name, declared) = rest.rsplit_once(':').unwrap_or((rest, ""));
+    matches!(name, "localhost" | "127.0.0.1" | "[::1]") && declared == port.to_string()
+}
+
+fn local_host(host: &str, port: u16) -> bool {
+    [format!("127.0.0.1:{port}"), format!("localhost:{port}")]
+        .iter()
+        .any(|own| own.eq_ignore_ascii_case(host.trim()))
+}
+
+fn origin_welcome(headers: &HeaderMap, port: u16) -> bool {
+    match headers.get(header::ORIGIN) {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .is_ok_and(|origin| local_origin(origin, port)),
+    }
+}
+
+fn host_welcome(headers: &HeaderMap, port: u16) -> bool {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| local_host(host, port))
 }
 
 /// Refuses a web page (a foreign `Origin`) and a rebinding attack (a `Host` that is not
 /// this bridge's own loopback name) before the host is contacted.
-pub fn browser_guard(_headers: &HeaderMap, _port: u16) -> Result<(), Response> {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: proxy::browser_guard")
+// The `Err` is the 403 itself, built once on the rejection path and handed back as is;
+// boxing it would change the signature the tests call.
+#[allow(clippy::result_large_err)]
+pub fn browser_guard(headers: &HeaderMap, port: u16) -> Result<(), Response> {
+    if origin_welcome(headers, port) && host_welcome(headers, port) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        "this bridge does not serve web pages or other hosts' names",
+    )
+        .into_response())
+}
+
+/// The id of the call being answered, so a client matches an error to its request. A
+/// batch, an unreadable body or a call without an id has none.
+fn request_id(body: &[u8]) -> Value {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(mut call)) => match call.remove("id") {
+            Some(id @ (Value::Number(_) | Value::String(_))) => id,
+            _ => Value::Null,
+        },
+        _ => Value::Null,
+    }
+}
+
+fn rpc_error(id: &Value, status: u16, message: &str) -> Response {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": BRIDGE_ERROR_CODE, "message": message },
+    });
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    (status, axum::Json(body)).into_response()
+}
+
+fn refused(id: &Value, refusal: &Refusal) -> Response {
+    rpc_error(id, refusal.status(), &refusal.message())
+}
+
+/// Why one send failed, in the only terms that decide whether to retry.
+enum SendFailure {
+    /// No connection was made: the request cannot have reached the host.
+    Connect(String),
+    /// A connection existed: the request may have been delivered.
+    Other(String),
+}
+
+fn failure_of(err: &reqwest::Error) -> SendFailure {
+    if err.is_connect() {
+        return SendFailure::Connect("no se pudo conectar con la madre".to_string());
+    }
+    let why = if err.is_timeout() {
+        "la madre no contestó a tiempo"
+    } else {
+        "la conexión con la madre se cortó sin respuesta"
+    };
+    SendFailure::Other(why.to_string())
+}
+
+/// The host's answer, streamed: status and headers now, the body as it arrives. Dropping
+/// it (the client left) drops the request to the host.
+fn pass_back(upstream: reqwest::Response) -> Response {
+    let status = upstream.status();
+    let headers = response_headers(upstream.headers());
+    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
+async fn send_once(
+    bridge: &Bridge,
+    route: &Route,
+    parts: &Parts,
+    body: &Bytes,
+) -> Result<Response, SendFailure> {
+    let target = parts.uri.path_and_query().map_or("/mcp", |p| p.as_str());
+    let request = bridge
+        .client
+        .request(
+            parts.method.clone(),
+            format!("http://{}{target}", route.addr),
+        )
+        .headers(forward_headers(&parts.headers, &route.state))
+        .body(body.clone());
+    match tokio::time::timeout(bridge.timing.upstream_headers, request.send()).await {
+        Ok(Ok(upstream)) => Ok(pass_back(upstream)),
+        Ok(Err(err)) => Err(failure_of(&err)),
+        Err(_) => Err(SendFailure::Other(
+            "la madre no contestó a tiempo".to_string(),
+        )),
+    }
+}
+
+/// The one retry: only after a failure to connect, so the request cannot have arrived,
+/// and only after looking for the host again.
+async fn retry_elsewhere(
+    bridge: &Bridge,
+    parts: &Parts,
+    body: &Bytes,
+) -> Result<Response, Refusal> {
+    bridge.transport_failed().await;
+    let route = bridge.route().await?;
+    send_once(bridge, &route, parts, body)
+        .await
+        .map_err(|failure| match failure {
+            SendFailure::Connect(why) => Refusal::NotFound(why),
+            SendFailure::Other(why) => Refusal::MayHaveArrived(why),
+        })
+}
+
+async fn forward(bridge: &Bridge, parts: &Parts, body: Bytes) -> Result<Response, Refusal> {
+    let route = bridge.route().await?;
+    match send_once(bridge, &route, parts, &body).await {
+        Ok(response) => Ok(response),
+        Err(SendFailure::Connect(_)) => retry_elsewhere(bridge, parts, &body).await,
+        Err(SendFailure::Other(why)) => Err(Refusal::MayHaveArrived(why)),
+    }
+}
+
+async fn relay(bridge: &Bridge, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let Ok(body) = to_bytes(body, MAX_BODY).await else {
+        return rpc_error(
+            &Value::Null,
+            413,
+            "el cuerpo de la petición supera los 8 MiB o no se pudo leer",
+        );
+    };
+    let id = request_id(&body);
+    match forward(bridge, &parts, body).await {
+        Ok(response) => response,
+        Err(refusal) => refused(&id, &refusal),
+    }
+}
+
+#[derive(Clone)]
+struct App {
+    bridge: Arc<Bridge>,
+    port: u16,
+}
+
+async fn handle(State(app): State<App>, request: Request) -> Response {
+    if let Err(refusal) = browser_guard(request.headers(), app.port) {
+        return refusal;
+    }
+    let reading = *request.method() == Method::GET;
+    let path = request.uri().path().to_string();
+    match path.as_str() {
+        "/mcp" => relay(&app.bridge, request).await,
+        "/bridge/health" if reading => axum::Json(app.bridge.health()).into_response(),
+        _ => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
 }
 
 /// Binds `127.0.0.1:<port>` and nothing else: it takes a port, not an address, so it
 /// cannot be configured onto the LAN.
-pub async fn start(_port: u16, _bridge: Arc<Bridge>) -> Result<BridgeHandle> {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: proxy::start")
+pub async fn start(port: u16, bridge: Arc<Bridge>) -> Result<BridgeHandle> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .with_context(|| {
+            format!(
+                "cannot listen on 127.0.0.1:{port}: is another bridge, or another program, \
+                 using that port?"
+            )
+        })?;
+    let addr = listener
+        .local_addr()
+        .context("cannot read the bound address")?;
+    let app = Router::new().fallback(handle).with_state(App {
+        bridge,
+        port: addr.port(),
+    });
+    let task = tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, app).await {
+            tracing::error!(error = %err, "the bridge's listener stopped");
+        }
+    });
+    Ok(BridgeHandle { addr, task })
 }
 
 #[cfg(test)]
@@ -63,6 +357,8 @@ mod tests {
         ResponseReader, contains_ci, eventually, write_state_json,
     };
     use super::*;
+
+    type Case<'a> = (u16, Vec<(&'a str, &'a str)>, &'a [u8]);
 
     const CALL: &[u8] = br#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#;
 
@@ -208,7 +504,7 @@ mod tests {
     #[tokio::test]
     async fn every_status_and_body_of_the_host_comes_back_intact() {
         let w = world().await;
-        let cases: [(u16, Vec<(&str, &str)>, &[u8]); 7] = [
+        let cases: [Case<'_>; 7] = [
             (200, vec![], br#"{"jsonrpc":"2.0","id":7,"result":{}}"#),
             (202, vec![], b""),
             (400, vec![], br#"{"error":"bad request"}"#),

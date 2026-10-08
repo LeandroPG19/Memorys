@@ -1,13 +1,26 @@
 //! Finding the host again, and refusing to hand a credential to anyone who cannot prove
 //! it is the host. Order, bounds and verdicts are decided here and nowhere else.
 
+use std::collections::HashSet;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
+use tokio::net::TcpStream;
 use uuid::Uuid;
 
 use super::state::BridgeState;
 use super::{Network, Timing};
+use crate::accounts::{self, IdentityReply};
+
+const SERVICE: &str = "memory-industry";
+
+/// An identity answer is a few hundred bytes; anything bigger is not one.
+const MAX_IDENTITY_BYTES: usize = 64 * 1024;
+
+const NOT_PROBED_BUDGET: &str = "no probado (tiempo agotado)";
+const NOT_PROBED_FOUND: &str = "no probado (ya se encontró la madre)";
 
 /// Where a candidate address came from, kept in the report so an operator reads why a
 /// host was or was not found.
@@ -18,6 +31,18 @@ pub enum Source {
     Stored,
     Name,
     Sweep,
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Source::Explicit => "indicada",
+            Source::LastGood => "última buena",
+            Source::Stored => "guardada",
+            Source::Name => "por nombre",
+            Source::Sweep => "barrido",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +64,40 @@ pub enum Verdict {
     Unknown,
 }
 
+impl fmt::Display for Verdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Verdict::Verified { fingerprint } => write!(f, "verificada ({fingerprint})"),
+            Verdict::NoAnswer(why) => write!(f, "sin respuesta ({why})"),
+            Verdict::NotMemoryIndustry => f.write_str("no es MemoryIndustry"),
+            Verdict::WrongHost { seen } => {
+                write!(
+                    f,
+                    "otra instalación (huella {})",
+                    accounts::fingerprint(seen)
+                )
+            }
+            Verdict::Impostor => f.write_str("no pudo probar que es la madre"),
+            Verdict::Revoked => f.write_str("credencial revocada"),
+            Verdict::Unknown => f.write_str("credencial desconocida"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Checked(Verdict),
     /// A candidate the budget ran out before it was asked ("no probado (tiempo agotado)").
     NotProbed(String),
+}
+
+impl fmt::Display for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Outcome::Checked(verdict) => fmt::Display::fmt(verdict, f),
+            Outcome::NotProbed(why) => f.write_str(why),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,75 +122,440 @@ pub struct Discovery {
     pub attempts: Vec<Attempt>,
 }
 
+/// Lower is louder.
+fn failure_of(verdict: &Verdict) -> Option<(u8, Failure)> {
+    match verdict {
+        Verdict::Revoked => Some((0, Failure::Revoked)),
+        Verdict::Unknown => Some((1, Failure::Unknown)),
+        Verdict::WrongHost { seen } => Some((2, Failure::WrongHost { seen: *seen })),
+        Verdict::Impostor => Some((3, Failure::Impostor)),
+        _ => None,
+    }
+}
+
 impl Discovery {
     /// `None` when a host was verified.
     pub fn failure(&self) -> Option<Failure> {
-        // PASS-1 STUB
-        unimplemented!("PASS-1 STUB: Discovery::failure")
+        if self.verified.is_some() {
+            return None;
+        }
+        let loudest = self
+            .attempts
+            .iter()
+            .filter_map(|attempt| match &attempt.outcome {
+                Outcome::Checked(verdict) => failure_of(verdict),
+                Outcome::NotProbed(_) => None,
+            })
+            .min_by_key(|(rank, _)| *rank);
+        Some(loudest.map_or(Failure::NotFound, |(_, failure)| failure))
+    }
+
+    /// What was tried and what each answered, for an operator. No secrets in it.
+    pub fn report(&self) -> String {
+        let lines: Vec<String> = self
+            .attempts
+            .iter()
+            .map(|a| {
+                format!(
+                    "{} ({}): {}",
+                    a.candidate.addr, a.candidate.source, a.outcome
+                )
+            })
+            .collect();
+        lines.join("; ")
     }
 }
 
 /// When the last proof was good, and whether anything since has cast doubt on it.
 #[derive(Debug, Default)]
 pub struct Freshness {
-    _stub: (),
+    verified: Option<Instant>,
+    doubted: bool,
 }
 
 impl Freshness {
-    pub fn needs_check(&self, _now: Instant, _t: &Timing) -> bool {
-        // PASS-1 STUB
-        unimplemented!("PASS-1 STUB: Freshness::needs_check")
+    pub fn needs_check(&self, now: Instant, t: &Timing) -> bool {
+        self.doubted
+            || self
+                .verified
+                .is_none_or(|at| now.saturating_duration_since(at) >= t.reverify_after)
     }
 
-    pub fn verified_at(&mut self, _now: Instant) {
-        // PASS-1 STUB
-        unimplemented!("PASS-1 STUB: Freshness::verified_at")
+    pub fn verified_at(&mut self, now: Instant) {
+        self.verified = Some(now);
+        self.doubted = false;
     }
 
     pub fn transport_failed(&mut self) {
-        // PASS-1 STUB
-        unimplemented!("PASS-1 STUB: Freshness::transport_failed")
+        self.doubted = true;
+    }
+}
+
+fn push_unique(out: &mut Vec<Candidate>, addr: SocketAddr, source: Source) {
+    if !out.iter().any(|known| known.addr == addr) {
+        out.push(Candidate { addr, source });
     }
 }
 
 /// Last good, then the stored addresses, then the resolved name, then the sweep; each
 /// address once, in the position of its first appearance.
 pub fn candidates_in_order(
-    _s: &BridgeState,
-    _resolved: &[IpAddr],
-    _sweep: &[SocketAddr],
+    s: &BridgeState,
+    resolved: &[IpAddr],
+    sweep: &[SocketAddr],
 ) -> Vec<Candidate> {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: discovery::candidates_in_order")
+    let mut out = Vec::new();
+    if let Some(addr) = s.last_good {
+        push_unique(&mut out, addr, Source::LastGood);
+    }
+    for addr in &s.addresses {
+        push_unique(&mut out, *addr, Source::Stored);
+    }
+    for ip in resolved {
+        push_unique(&mut out, SocketAddr::new(*ip, s.host_port), Source::Name);
+    }
+    for addr in sweep {
+        push_unique(&mut out, *addr, Source::Sweep);
+    }
+    out
 }
 
 /// `.1`-`.254` of the /24 of `own`, without `own`.
-pub fn subnet_candidates(_own: Ipv4Addr, _port: u16) -> Vec<SocketAddr> {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: discovery::subnet_candidates")
+pub fn subnet_candidates(own: Ipv4Addr, port: u16) -> Vec<SocketAddr> {
+    let [a, b, c, own_last] = own.octets();
+    (1..=254u8)
+        .filter(|last| *last != own_last)
+        .map(|last| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, last)), port))
+        .collect()
+}
+
+/// A word for an operator, not the transport library's sentence (which carries the URL).
+fn transport_word(err: &reqwest::Error) -> String {
+    let word = if err.is_timeout() {
+        "tiempo agotado"
+    } else if err.is_connect() {
+        "conexión rechazada o sin ruta"
+    } else {
+        "cerró la conexión sin responder"
+    };
+    word.to_string()
+}
+
+/// `GET /identity<query>` and the reply, if what answered speaks MemoryIndustry. No
+/// header of ours goes with it: the peer is not trusted yet.
+async fn fetch_identity(
+    c: &reqwest::Client,
+    addr: SocketAddr,
+    query: &str,
+    limit: Duration,
+) -> Result<IdentityReply, Verdict> {
+    let sent = c
+        .get(format!("http://{addr}/identity{query}"))
+        .timeout(limit)
+        .send()
+        .await;
+    let response = sent.map_err(|e| Verdict::NoAnswer(transport_word(&e)))?;
+    let too_big = response
+        .content_length()
+        .is_some_and(|n| n > MAX_IDENTITY_BYTES as u64);
+    if !response.status().is_success() || too_big {
+        return Err(Verdict::NotMemoryIndustry);
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| Verdict::NoAnswer(transport_word(&e)))?;
+    let reply: IdentityReply = serde_json::from_slice(&bytes)
+        .ok()
+        .filter(|_| bytes.len() <= MAX_IDENTITY_BYTES)
+        .ok_or(Verdict::NotMemoryIndustry)?;
+    if reply.service == SERVICE {
+        Ok(reply)
+    } else {
+        Err(Verdict::NotMemoryIndustry)
+    }
+}
+
+/// Who answers at `addr`, asked with no credential: for pairing, which offers a code only
+/// to what speaks MemoryIndustry.
+pub(crate) async fn probe_service(
+    c: &reqwest::Client,
+    addr: SocketAddr,
+    limit: Duration,
+) -> Result<IdentityReply, Verdict> {
+    fetch_identity(c, addr, "", limit).await
+}
+
+fn proof_holds(reply: &IdentityReply, s: &BridgeState, nonce: &[u8; 16]) -> bool {
+    let expected = accounts::identity_proof(&s.secret.hash(), &s.host_id, &s.credential_id, nonce);
+    reply
+        .proof
+        .as_deref()
+        .is_some_and(|presented| accounts::verify_mac(expected, presented))
+}
+
+/// The pinned host id is public, so knowing it proves nothing; the proof is what does.
+fn judge(reply: &IdentityReply, s: &BridgeState, nonce: &[u8; 16]) -> Verdict {
+    if reply.host_id != s.host_id {
+        return Verdict::WrongHost {
+            seen: reply.host_id,
+        };
+    }
+    match reply.credential.as_deref() {
+        Some("revoked") => Verdict::Revoked,
+        Some("unknown") => Verdict::Unknown,
+        Some("active") if proof_holds(reply, s, nonce) => Verdict::Verified {
+            fingerprint: accounts::fingerprint(&s.host_id),
+        },
+        _ => Verdict::Impostor,
+    }
 }
 
 /// `GET /identity?cred=…&nonce=…` with no credential in it, judged against the pinned
 /// host. Never sends `Authorization`.
 pub async fn check_identity(
-    _c: &reqwest::Client,
-    _addr: SocketAddr,
-    _s: &BridgeState,
-    _nonce: [u8; 16],
-    _limit: Duration,
+    c: &reqwest::Client,
+    addr: SocketAddr,
+    s: &BridgeState,
+    nonce: [u8; 16],
+    limit: Duration,
 ) -> Verdict {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: discovery::check_identity")
+    let query = format!(
+        "?cred={}&nonce={}",
+        s.credential_id.simple(),
+        hex::encode(nonce)
+    );
+    match fetch_identity(c, addr, &query, limit).await {
+        Ok(reply) => judge(&reply, s, &nonce),
+        Err(verdict) => verdict,
+    }
 }
 
+/// A TCP connect inside its own short budget: the part of a probe that, on a quiet /24,
+/// is almost always a SYN nobody answers.
+async fn reachable(addr: SocketAddr, within: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(within, TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// The addresses of `addrs` that speak MemoryIndustry, in the order given. At most
+/// `probe_parallelism` probes run at once and the whole sweep ends at `probe_total`.
+pub(crate) async fn sweep_services(
+    c: &reqwest::Client,
+    t: &Timing,
+    addrs: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let mut serving = vec![false; addrs.len()];
+    let collect = async {
+        let mut probes = futures::stream::iter(addrs.iter().copied().enumerate())
+            .map(move |(i, addr)| async move {
+                let up = reachable(addr, t.probe_connect).await;
+                (i, up && probe_service(c, addr, t.identity).await.is_ok())
+            })
+            .buffer_unordered(t.probe_parallelism.max(1));
+        while let Some((i, answers)) = probes.next().await {
+            serving[i] = answers;
+        }
+    };
+    let _ = tokio::time::timeout(t.probe_total, collect).await;
+    addrs
+        .iter()
+        .zip(serving)
+        .filter_map(|(addr, answers)| answers.then_some(*addr))
+        .collect()
+}
+
+/// What to do after a verdict.
+enum Flow {
+    Found(SocketAddr),
+    Stop,
+    Continue,
+}
+
+fn flow_of(addr: SocketAddr, verdict: &Verdict) -> Flow {
+    match verdict {
+        Verdict::Verified { .. } => Flow::Found(addr),
+        Verdict::Revoked | Verdict::Unknown => Flow::Stop,
+        _ => Flow::Continue,
+    }
+}
+
+/// `Some(answer)` when the search is over.
+fn settle(flow: Flow) -> Option<Option<SocketAddr>> {
+    match flow {
+        Flow::Found(addr) => Some(Some(addr)),
+        Flow::Stop => Some(None),
+        Flow::Continue => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Ctx<'a> {
+    s: &'a BridgeState,
+    net: &'a dyn Network,
+    t: &'a Timing,
+    c: &'a reqwest::Client,
+}
+
+async fn ask(ctx: Ctx<'_>, addr: SocketAddr, limit: Duration) -> Verdict {
+    check_identity(ctx.c, addr, ctx.s, accounts::random_bytes::<16>(), limit).await
+}
+
+async fn sweep_probe(ctx: Ctx<'_>, addr: SocketAddr) -> Verdict {
+    if !reachable(addr, ctx.t.probe_connect).await {
+        return Verdict::NoAnswer("sin conexión".to_string());
+    }
+    ask(ctx, addr, ctx.t.identity).await
+}
+
+struct Search<'a> {
+    ctx: Ctx<'a>,
+    deadline: Instant,
+    tried: HashSet<SocketAddr>,
+    attempts: Vec<Attempt>,
+}
+
+impl Search<'_> {
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// The candidates not asked yet, marked as asked.
+    fn fresh(&mut self, found: Vec<Candidate>) -> Vec<Candidate> {
+        found
+            .into_iter()
+            .filter(|candidate| self.tried.insert(candidate.addr))
+            .collect()
+    }
+
+    fn skip(&mut self, left: &[Candidate], why: &str) {
+        for candidate in left {
+            self.attempts.push(Attempt {
+                candidate: *candidate,
+                outcome: Outcome::NotProbed(why.to_string()),
+            });
+        }
+    }
+
+    async fn run(&mut self) -> Option<SocketAddr> {
+        let stored = self.fresh(candidates_in_order(self.ctx.s, &[], &[]));
+        if let Some(done) = settle(self.in_turn(stored).await) {
+            return done;
+        }
+        let named = self.named().await;
+        if let Some(done) = settle(self.in_turn(named).await) {
+            return done;
+        }
+        let swept = self.swept();
+        settle(self.in_parallel(swept).await).flatten()
+    }
+
+    async fn named(&mut self) -> Vec<Candidate> {
+        let name = self.ctx.s.host_name.as_str();
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let asked = tokio::time::timeout(self.ctx.t.resolve, self.ctx.net.resolve(name)).await;
+        let resolved = asked.unwrap_or_default();
+        self.fresh(candidates_in_order(self.ctx.s, &resolved, &[]))
+    }
+
+    fn swept(&mut self) -> Vec<Candidate> {
+        let targets = self.ctx.net.sweep_targets(self.ctx.s.host_port);
+        self.fresh(candidates_in_order(self.ctx.s, &[], &targets))
+    }
+
+    /// One at a time, in order: the cheap, likely addresses.
+    async fn in_turn(&mut self, candidates: Vec<Candidate>) -> Flow {
+        for (i, candidate) in candidates.iter().enumerate() {
+            let left = self.remaining();
+            if left.is_zero() {
+                self.skip(&candidates[i..], NOT_PROBED_BUDGET);
+                return Flow::Continue;
+            }
+            let verdict = ask(self.ctx, candidate.addr, self.ctx.t.identity.min(left)).await;
+            let flow = flow_of(candidate.addr, &verdict);
+            self.attempts.push(Attempt {
+                candidate: *candidate,
+                outcome: Outcome::Checked(verdict),
+            });
+            if !matches!(flow, Flow::Continue) {
+                return flow;
+            }
+        }
+        Flow::Continue
+    }
+
+    /// The sweep: at most `probe_parallelism` at once, all of it inside `probe_total`.
+    /// Whatever the budget cut off is reported as not probed.
+    async fn in_parallel(&mut self, candidates: Vec<Candidate>) -> Flow {
+        let ctx = self.ctx;
+        let budget = ctx.t.probe_total.min(self.remaining());
+        let addrs: Vec<SocketAddr> = candidates.iter().map(|c| c.addr).collect();
+        let mut results: Vec<Option<Verdict>> = vec![None; addrs.len()];
+        let collect = async {
+            let mut probes = futures::stream::iter(addrs.iter().copied().enumerate())
+                .map(move |(i, addr)| async move { (i, sweep_probe(ctx, addr).await) })
+                .buffer_unordered(ctx.t.probe_parallelism.max(1));
+            while let Some((i, verdict)) = probes.next().await {
+                let flow = flow_of(addrs[i], &verdict);
+                results[i] = Some(verdict);
+                if !matches!(flow, Flow::Continue) {
+                    return flow;
+                }
+            }
+            Flow::Continue
+        };
+        let flow = tokio::time::timeout(budget, collect)
+            .await
+            .unwrap_or(Flow::Continue);
+        self.record_swept(candidates, results, &flow);
+        flow
+    }
+
+    fn record_swept(
+        &mut self,
+        candidates: Vec<Candidate>,
+        results: Vec<Option<Verdict>>,
+        flow: &Flow,
+    ) {
+        let why = if matches!(flow, Flow::Continue) {
+            NOT_PROBED_BUDGET
+        } else {
+            NOT_PROBED_FOUND
+        };
+        for (candidate, result) in candidates.into_iter().zip(results) {
+            let outcome = match result {
+                Some(verdict) => Outcome::Checked(verdict),
+                None => Outcome::NotProbed(why.to_string()),
+            };
+            self.attempts.push(Attempt { candidate, outcome });
+        }
+    }
+}
+
+/// Finds the host: stored addresses, then the name, then the bounded sweep. Every
+/// candidate is accepted only after its identity check; a revoked or unknown credential
+/// ends the search, a wrong host id is a finding and the search goes on.
 pub async fn discover(
-    _s: &BridgeState,
-    _net: &dyn Network,
-    _t: &Timing,
-    _c: &reqwest::Client,
+    s: &BridgeState,
+    net: &dyn Network,
+    t: &Timing,
+    c: &reqwest::Client,
 ) -> Discovery {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: discovery::discover")
+    let mut search = Search {
+        ctx: Ctx { s, net, t, c },
+        deadline: Instant::now() + t.discovery_total,
+        tried: HashSet::new(),
+        attempts: Vec::new(),
+    };
+    let verified = search.run().await;
+    Discovery {
+        verified,
+        attempts: search.attempts,
+    }
 }
 
 #[cfg(test)]

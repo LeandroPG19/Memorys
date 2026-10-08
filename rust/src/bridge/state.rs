@@ -1,13 +1,17 @@
 //! The bridge's one file: who the host is, which credential this device holds, where the
 //! host was last seen. It holds the secret, so it is written ACL-first and failing closed.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::{DEFAULT_BRIDGE_PORT, DEFAULT_HOST_PORT, STATE_BASENAME};
 use crate::accounts::Secret;
 use crate::service::Target;
 use crate::service_apply::CommandRunner;
@@ -15,9 +19,14 @@ use crate::service_apply::CommandRunner;
 /// The `version` this build reads and writes.
 pub const STATE_VERSION: u32 = 1;
 
+/// How many remembered addresses the file keeps, most recent first.
+const MAX_ADDRESSES: usize = 8;
+
+const STATE_DIR_NAME: &str = "MemoryIndustry";
+
 /// `bridge.json`. `Debug` is derived on purpose: `Secret` prints `<redacted>`, so the
 /// derive cannot leak it.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BridgeState {
     pub version: u32,
     pub host_id: Uuid,
@@ -25,45 +34,220 @@ pub struct BridgeState {
     pub account: String,
     pub device_label: String,
     pub credential_id: Uuid,
+    #[serde(with = "secret_hex")]
     pub secret: Secret,
     /// Most recent first, at most 8.
+    #[serde(default)]
     pub addresses: Vec<SocketAddr>,
+    #[serde(default)]
     pub last_good: Option<SocketAddr>,
     /// The host's port, for the address a name resolves to (the sweep and `addresses`
     /// carry their own).
+    #[serde(default = "default_host_port")]
     pub host_port: u16,
     /// The bridge's own loopback port.
+    #[serde(default = "default_bridge_port")]
     pub port: u16,
     pub paired_at: DateTime<Utc>,
 }
 
+fn default_host_port() -> u16 {
+    DEFAULT_HOST_PORT
+}
+
+fn default_bridge_port() -> u16 {
+    DEFAULT_BRIDGE_PORT
+}
+
+/// The secret travels as 64 lowercase hex digits. A malformed one is reported without
+/// echoing what was read: that text may be most of a real secret.
+mod secret_hex {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::accounts::Secret;
+
+    pub fn serialize<S: Serializer>(secret: &Secret, out: S) -> Result<S::Ok, S::Error> {
+        out.serialize_str(&secret.to_hex())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<Secret, D::Error> {
+        let text = String::deserialize(input)?;
+        Secret::from_hex(&text)
+            .ok_or_else(|| D::Error::custom("the secret is not 64 lowercase hex digits"))
+    }
+}
+
+impl BridgeState {
+    /// The state after `addr` answered as the host: it becomes the last good address and
+    /// the head of the list. `None` when nothing would change.
+    pub fn healed(&self, addr: SocketAddr) -> Option<BridgeState> {
+        if self.last_good == Some(addr) && self.addresses.first() == Some(&addr) {
+            return None;
+        }
+        let mut addresses = vec![addr];
+        addresses.extend(self.addresses.iter().filter(|known| **known != addr));
+        addresses.truncate(MAX_ADDRESSES);
+        Some(BridgeState {
+            version: self.version,
+            host_id: self.host_id,
+            host_name: self.host_name.clone(),
+            account: self.account.clone(),
+            device_label: self.device_label.clone(),
+            credential_id: self.credential_id,
+            secret: Secret::from_hex(&self.secret.to_hex())?,
+            addresses,
+            last_good: Some(addr),
+            host_port: self.host_port,
+            port: self.port,
+            paired_at: self.paired_at,
+        })
+    }
+}
+
+/// `%LOCALAPPDATA%\MemoryIndustry` on Windows. Off Windows (development only)
+/// `<home>/.local/share/MemoryIndustry`. A missing base is an error: guessing would put a
+/// secret wherever the shell happened to be.
 pub fn state_dir(
-    _target: Target,
-    _local_app_data: Option<&str>,
-    _home: Option<&Path>,
+    target: Target,
+    local_app_data: Option<&str>,
+    home: Option<&Path>,
 ) -> Result<PathBuf> {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: state::state_dir")
+    if target.is_windows() {
+        let base = local_app_data.map(str::trim).filter(|b| !b.is_empty());
+        let base = base.context(
+            "LOCALAPPDATA is not set: the bridge will not guess where to keep its credential",
+        )?;
+        // Built by hand: the path is Windows' even when this runs elsewhere (tests).
+        return Ok(PathBuf::from(format!(
+            "{}\\{STATE_DIR_NAME}",
+            base.trim_end_matches('\\')
+        )));
+    }
+    let home =
+        home.context("no home directory: the bridge will not guess where to keep its credential")?;
+    Ok(home.join(".local").join("share").join(STATE_DIR_NAME))
 }
 
-pub fn read_state(_path: &Path) -> Result<Option<BridgeState>> {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: state::read_state")
+/// `Ok(None)` when the file does not exist (this device is not paired).
+pub fn read_state(path: &Path) -> Result<Option<BridgeState>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("cannot read {}", path.display())),
+    };
+    parse_state(&text, path).map(Some)
 }
 
+/// The version is read before the shape, so a file from a newer build is reported as
+/// that and not as a pile of missing fields.
+fn parse_state(text: &str, path: &Path) -> Result<BridgeState> {
+    let document: serde_json::Value = serde_json::from_str(text)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    let version = document.get("version").and_then(serde_json::Value::as_u64);
+    if version != Some(u64::from(STATE_VERSION)) {
+        let found = version.map_or_else(|| "none".to_string(), |v| v.to_string());
+        bail!(
+            "{} has bridge state version {found}; this build reads version {STATE_VERSION}",
+            path.display()
+        );
+    }
+    serde_json::from_value(document)
+        .with_context(|| format!("{} has a missing or malformed field", path.display()))
+}
+
+/// Writes `state` next to `path` and renames it into place. On Windows the ACL is put on
+/// the EMPTY temp file before a byte of the secret exists; if it cannot be, nothing is
+/// stored and the previous file is untouched. On unix the file is born `0600`.
 pub fn write_state(
-    _path: &Path,
-    _state: &BridgeState,
-    _target: Target,
-    _runner: &mut dyn CommandRunner,
+    path: &Path,
+    state: &BridgeState,
+    target: Target,
+    runner: &mut dyn CommandRunner,
 ) -> Result<()> {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: state::write_state")
+    let document = serde_json::to_vec_pretty(state).context("cannot encode the bridge state")?;
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let temp = dir.join(format!(".{STATE_BASENAME}.{}.tmp", Uuid::new_v4().simple()));
+    let written = write_through(&temp, path, &document, target, runner);
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
 }
 
-pub fn acl_argv(_file: &Path, _principal: &str) -> Vec<String> {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: state::acl_argv")
+fn write_through(
+    temp: &Path,
+    path: &Path,
+    document: &[u8],
+    target: Target,
+    runner: &mut dyn CommandRunner,
+) -> Result<()> {
+    let mut file =
+        create_private(temp).with_context(|| format!("cannot create {}", temp.display()))?;
+    if target.is_windows() {
+        protect(temp, runner)?;
+    }
+    file.write_all(document)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("cannot write {}", temp.display()))?;
+    drop(file);
+    std::fs::rename(temp, path).with_context(|| format!("cannot replace {}", path.display()))
+}
+
+/// New, empty, owner-only from the first instant on unix (the mode is part of the
+/// `open`, not a `chmod` after it).
+fn create_private(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn protect(temp: &Path, runner: &mut dyn CommandRunner) -> Result<()> {
+    let principal = current_principal(runner)?;
+    let argv = acl_argv(temp, &principal);
+    let outcome = runner
+        .run(&argv[0], &argv[1..])
+        .context("the ACL could not be applied: icacls did not run")?;
+    if outcome.code != Some(0) {
+        bail!(
+            "the ACL could not be applied to the state file (icacls exited with {:?}): \
+             nothing was saved",
+            outcome.code
+        );
+    }
+    Ok(())
+}
+
+/// `whoami`'s answer, if it is something a grant can be addressed to.
+fn current_principal(runner: &mut dyn CommandRunner) -> Result<String> {
+    let outcome = runner
+        .run("whoami", &[])
+        .context("the ACL could not be applied: whoami did not run")?;
+    let who = outcome.stdout.trim();
+    if outcome.code != Some(0) || who.is_empty() || who.contains(['"', ':', '\n', '\r']) {
+        bail!("the ACL could not be applied: whoami did not name a usable account");
+    }
+    Ok(who.to_string())
+}
+
+/// Grants the one user full control and drops everything inherited.
+pub fn acl_argv(file: &Path, principal: &str) -> Vec<String> {
+    vec![
+        "icacls".to_string(),
+        file.to_string_lossy().into_owned(),
+        "/inheritance:r".to_string(),
+        "/grant:r".to_string(),
+        format!("{principal}:(F)"),
+    ]
 }
 
 #[cfg(test)]

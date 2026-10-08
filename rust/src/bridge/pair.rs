@@ -3,10 +3,20 @@
 //! stores the returned state.
 
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 
-use super::state::BridgeState;
-use super::{Network, Timing};
-use crate::accounts::CodeError;
+use chrono::Utc;
+
+use super::discovery::{probe_service, sweep_services};
+use super::state::{BridgeState, STATE_VERSION};
+use super::{DEFAULT_BRIDGE_PORT, DEFAULT_HOST_PORT, Network, Timing};
+use crate::accounts::{self, CodeError, PairRequest, PairResponse, Secret};
+
+/// A pairing answer is a short JSON object; anything bigger is not one.
+const MAX_PAIR_BYTES: usize = 16 * 1024;
+
+/// What to wait when the host brakes without saying for how long.
+const DEFAULT_RETRY_AFTER_SECS: u64 = 60;
 
 /// `--host madre[:9000]` or `--host 192.168.0.10[:9000]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +28,7 @@ pub struct HostSpec {
 #[derive(Debug)]
 pub enum PairError {
     BadCode(CodeError),
+    BadLabel(String),
     BadHost(String),
     NotFound(String),
     /// Something answered the offer but could not prove it knows the code.
@@ -29,30 +40,278 @@ pub enum PairError {
     Transport(String),
 }
 
+impl PairError {
+    /// Which of two failures from different candidates says more. A refusal by a real
+    /// host beats an impostor, which beats a network error.
+    fn weight(&self) -> u8 {
+        match self {
+            PairError::Refused => 3,
+            PairError::Impostor => 2,
+            _ => 1,
+        }
+    }
+}
+
 impl fmt::Display for PairError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // PASS-1 STUB
-        f.write_str("PASS-1 STUB: PairError")
+        match self {
+            PairError::BadCode(why) => write!(f, "código mal escrito: {why}"),
+            PairError::BadLabel(why) | PairError::BadHost(why) | PairError::Transport(why) => {
+                f.write_str(why)
+            }
+            PairError::NotFound(tried) => write!(f, "no se encontró la madre: {tried}"),
+            PairError::Impostor => f.write_str(
+                "el equipo que contestó no conoce el código: no es la madre. \
+                 No se guardó nada",
+            ),
+            PairError::Refused => f.write_str(
+                "la madre no aceptó el código (puede estar mal escrito, caducado o ya usado)",
+            ),
+            PairError::Braked(secs) => write!(
+                f,
+                "la madre pide esperar: espera {secs} s antes de volver a probar"
+            ),
+        }
     }
 }
 
 impl std::error::Error for PairError {}
 
-pub fn parse_host(_raw: &str) -> Result<HostSpec, PairError> {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: pair::parse_host")
+fn is_hostname(text: &str) -> bool {
+    !text.is_empty() && !text.contains(|c: char| c.is_whitespace() || c == '/')
 }
 
-pub async fn pair(
-    _code: &str,
-    _host: Option<&str>,
-    _label: &str,
-    _net: &dyn Network,
-    _t: &Timing,
-    _c: &reqwest::Client,
+pub fn parse_host(raw: &str) -> Result<HostSpec, PairError> {
+    let bad = || {
+        PairError::BadHost(format!(
+            "--host {raw:?} no es válido: usa nombre, nombre:puerto, IP o IP:puerto"
+        ))
+    };
+    let mut parts = raw.trim().split(':');
+    let host = parts.next().filter(|h| is_hostname(h)).ok_or_else(bad)?;
+    let port = match parts.next() {
+        None => DEFAULT_HOST_PORT,
+        Some(text) => text
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(bad)?,
+    };
+    if parts.next().is_some() {
+        return Err(bad());
+    }
+    Ok(HostSpec {
+        host: host.to_string(),
+        port,
+    })
+}
+
+/// A literal address as it is, a name through the operating system's resolver.
+async fn addresses_of(host: &str, net: &dyn Network, t: &Timing) -> Vec<IpAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    let asked = tokio::time::timeout(t.resolve, net.resolve(host)).await;
+    asked.unwrap_or_default()
+}
+
+fn listed(addrs: &[SocketAddr]) -> String {
+    let texts: Vec<String> = addrs.iter().map(SocketAddr::to_string).collect();
+    texts.join(", ")
+}
+
+/// The addresses named by `--host` that speak MemoryIndustry.
+async fn named_hosts(
+    raw: &str,
+    net: &dyn Network,
+    t: &Timing,
+    c: &reqwest::Client,
+) -> Result<Vec<SocketAddr>, PairError> {
+    let spec = parse_host(raw)?;
+    let ips = addresses_of(&spec.host, net, t).await;
+    if ips.is_empty() {
+        return Err(PairError::NotFound(format!("{} no se resolvió", spec.host)));
+    }
+    let addrs: Vec<SocketAddr> = ips
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, spec.port))
+        .collect();
+    let mut serving = Vec::new();
+    for addr in &addrs {
+        if probe_service(c, *addr, t.identity).await.is_ok() {
+            serving.push(*addr);
+        }
+    }
+    if serving.is_empty() {
+        let tried = listed(&addrs);
+        return Err(PairError::NotFound(format!(
+            "nada habló como MemoryIndustry en {tried}"
+        )));
+    }
+    Ok(serving)
+}
+
+/// Without `--host`: the own /24, and only what answers like MemoryIndustry.
+async fn swept_hosts(
+    net: &dyn Network,
+    t: &Timing,
+    c: &reqwest::Client,
+) -> Result<Vec<SocketAddr>, PairError> {
+    let targets = net.sweep_targets(DEFAULT_HOST_PORT);
+    if targets.is_empty() {
+        return Err(PairError::NotFound(
+            "no pude averiguar la red propia; usa --host <nombre|ip>".to_string(),
+        ));
+    }
+    let serving = sweep_services(c, t, &targets).await;
+    if serving.is_empty() {
+        return Err(PairError::NotFound(format!(
+            "ninguna MemoryIndustry contestó en {} direcciones de la red propia; usa --host <nombre|ip>",
+            targets.len()
+        )));
+    }
+    Ok(serving)
+}
+
+/// Where the host answered: the `POST /pair` and what it said. A 401 and a 429 are
+/// answers; so is anything else that is not a 2xx.
+async fn exchange(
+    c: &reqwest::Client,
+    addr: SocketAddr,
+    request: &PairRequest,
+    t: &Timing,
+) -> Result<PairResponse, PairError> {
+    let sent = c
+        .post(format!("http://{addr}/pair"))
+        .json(request)
+        .timeout(t.request_waits)
+        .send()
+        .await;
+    let response = sent.map_err(|_| PairError::Transport(format!("{addr} no contestó")))?;
+    let status = response.status();
+    if status.as_u16() == 429 {
+        let seconds = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok());
+        return Err(PairError::Braked(
+            seconds.unwrap_or(DEFAULT_RETRY_AFTER_SECS),
+        ));
+    }
+    if status.as_u16() == 401 {
+        return Err(PairError::Refused);
+    }
+    if !status.is_success() {
+        return Err(PairError::Transport(format!("{addr} respondió {status}")));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| PairError::Transport(format!("{addr} cortó la respuesta")))?;
+    serde_json::from_slice(&bytes)
+        .ok()
+        .filter(|_| bytes.len() <= MAX_PAIR_BYTES)
+        .ok_or(PairError::Impostor)
+}
+
+/// The host's MAC over everything it assigned, keyed by the code: only whoever knows the
+/// code, which the host does, can make it.
+fn host_knows_the_code(reply: &PairResponse, key: &[u8; 32], nc: &[u8; 16], h: &[u8; 32]) -> bool {
+    let expected = accounts::pair_response_mac(
+        key,
+        nc,
+        h,
+        &reply.host_id,
+        &reply.credential_id,
+        &reply.account,
+        &reply.label,
+        &reply.host_name,
+    );
+    reply.v == 1 && accounts::verify_mac(expected, &reply.mac)
+}
+
+/// One offer of the code to one address. The secret never leaves: only its hash does.
+async fn offer(
+    addr: SocketAddr,
+    key: &[u8; 32],
+    label: &str,
+    t: &Timing,
+    c: &reqwest::Client,
 ) -> Result<BridgeState, PairError> {
-    // PASS-1 STUB
-    unimplemented!("PASS-1 STUB: pair::pair")
+    let secret = Secret::generate();
+    let nc = accounts::random_bytes::<16>();
+    let h = secret.hash();
+    let request = PairRequest {
+        v: 1,
+        nc: hex::encode(nc),
+        label: label.to_string(),
+        h: hex::encode(h),
+        mac: hex::encode(accounts::pair_request_mac(key, &nc, label, &h)),
+    };
+    let reply = exchange(c, addr, &request, t).await?;
+    if !host_knows_the_code(&reply, key, &nc, &h) {
+        return Err(PairError::Impostor);
+    }
+    Ok(BridgeState {
+        version: STATE_VERSION,
+        host_id: reply.host_id,
+        host_name: reply.host_name,
+        account: reply.account,
+        device_label: reply.label,
+        credential_id: reply.credential_id,
+        secret,
+        addresses: vec![addr],
+        last_good: Some(addr),
+        host_port: addr.port(),
+        port: DEFAULT_BRIDGE_PORT,
+        paired_at: Utc::now(),
+    })
+}
+
+/// Offers the code to each address in turn. A brake ends it (every further try spends the
+/// host's budget); anything else moves on, and the most telling failure is the one kept.
+async fn offer_to_each(
+    addrs: &[SocketAddr],
+    key: &[u8; 32],
+    label: &str,
+    t: &Timing,
+    c: &reqwest::Client,
+) -> Result<BridgeState, PairError> {
+    let mut worst: Option<PairError> = None;
+    for addr in addrs {
+        match offer(*addr, key, label, t, c).await {
+            Ok(state) => return Ok(state),
+            Err(braked @ PairError::Braked(_)) => return Err(braked),
+            Err(err) if worst.as_ref().is_none_or(|w| err.weight() > w.weight()) => {
+                worst = Some(err);
+            }
+            Err(_) => {}
+        }
+    }
+    Err(worst.unwrap_or_else(|| PairError::NotFound(listed(addrs))))
+}
+
+/// Pairs this device with the host that knows `code`. The code is checked before any
+/// connection; the credential is generated here and only its hash is sent; nothing is
+/// kept unless the host proves it knew the code too.
+pub async fn pair(
+    code: &str,
+    host: Option<&str>,
+    label: &str,
+    net: &dyn Network,
+    t: &Timing,
+    c: &reqwest::Client,
+) -> Result<BridgeState, PairError> {
+    let normalized = accounts::normalize_code(code).map_err(PairError::BadCode)?;
+    let label = accounts::validate_device_label(label)
+        .map_err(|e| PairError::BadLabel(format!("{e:#}")))?;
+    let key = accounts::code_key(&normalized);
+    let hosts = match host {
+        Some(raw) => named_hosts(raw, net, t, c).await?,
+        None => swept_hosts(net, t, c).await?,
+    };
+    offer_to_each(&hosts, &key, &label, t, c).await
 }
 
 #[cfg(test)]
@@ -232,7 +491,7 @@ mod tests {
         .expect_err("0 is not in the alphabet");
 
         assert!(
-            err.to_string().contains('0'),
+            err.to_string().contains("0"),
             "the message names the offending character. Got: {err}"
         );
         assert_eq!(
