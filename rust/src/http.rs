@@ -320,7 +320,7 @@ async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
         return bind_retrying(
             addr,
             bind_wait(),
-            |a| tokio::net::TcpListener::bind(a),
+            tokio::net::TcpListener::bind::<SocketAddr>,
             tokio::time::sleep,
         )
         .await;
@@ -333,16 +333,23 @@ async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
         .context("failed to adopt systemd-activated socket")
 }
 
-// ---- STUBS of 0.29.0 slice B, pass 1 (tests only) --------------------------
-// Everything from here to `END STUBS` exists so the tests compile and fail on
-// their assertions instead of on missing symbols. Pass 2 replaces the bodies
-// (and drops the `allow`) without touching the test region.
-
-#[allow(dead_code)]
+/// Pause between two tries at an address the machine does not have yet.
 pub(crate) const BIND_RETRY_STEP: Duration = Duration::from_secs(5);
 
-pub(crate) fn bind_wait_from(_raw: Option<&str>) -> Duration {
-    Duration::ZERO
+const BIND_WAIT_DEFAULT_SECS: u64 = 300;
+
+/// How long `serve` keeps trying to bind an address that is not assigned yet.
+///
+/// Right after a Windows boot the daemon starts before the network card has its
+/// fixed address, and the first bind fails with «address not available». Five
+/// minutes covers a slow DHCP-less link; `0` turns the retry off, and anything
+/// that is not a number of seconds falls back to the default rather than
+/// switching the retry off by typo.
+pub(crate) fn bind_wait_from(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(BIND_WAIT_DEFAULT_SECS);
+    Duration::from_secs(secs)
 }
 
 pub(crate) fn bind_wait() -> Duration {
@@ -353,11 +360,33 @@ pub(crate) fn bind_wait() -> Duration {
     )
 }
 
+/// What the operator is told when a bind fails, by the kind of failure.
+///
+/// «Is another daemon already running?» used to be the answer to every one of
+/// them, including an IP the machine simply did not have yet.
+pub(crate) fn bind_failure_message(addr: &SocketAddr, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::AddrNotAvailable => format!(
+            "cannot bind {addr}: it is not assigned to this machine ({e}). Check CUBA_HTTP_ADDR \
+             against the addresses this machine has (ipconfig on Windows, ip addr on Linux)"
+        ),
+        std::io::ErrorKind::AddrInUse => format!(
+            "cannot bind {addr}: it is already in use — is another daemon already running? ({e})"
+        ),
+        _ => format!("cannot bind {addr}: {e}"),
+    }
+}
+
+/// Bind, and keep trying for `window` only while the address is not assigned.
+///
+/// The clock is the sum of what was asked to sleep, so a test with a fake
+/// `sleep` runs instantly. Every other failure — a port in use, a permission —
+/// will not clear by waiting and fails on the first try with its own cause.
 pub(crate) async fn bind_retrying<B, BFut, S, SFut>(
     addr: SocketAddr,
-    _window: Duration,
+    window: Duration,
     mut bind: B,
-    _sleep: S,
+    mut sleep: S,
 ) -> Result<tokio::net::TcpListener>
 where
     B: FnMut(SocketAddr) -> BFut,
@@ -365,11 +394,22 @@ where
     S: FnMut(Duration) -> SFut,
     SFut: std::future::Future<Output = ()>,
 {
-    bind(addr)
-        .await
-        .with_context(|| format!("cannot bind {addr} — is another daemon already running?"))
+    let mut waited = Duration::ZERO;
+    loop {
+        let failure = match bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(failure) => failure,
+        };
+        let left = window.saturating_sub(waited);
+        if failure.kind() != std::io::ErrorKind::AddrNotAvailable || left.is_zero() {
+            anyhow::bail!(bind_failure_message(&addr, &failure));
+        }
+        let nap = left.min(BIND_RETRY_STEP);
+        tracing::warn!(%addr, left_secs = left.as_secs(), "address not assigned to this machine yet — retrying");
+        sleep(nap).await;
+        waited += nap;
+    }
 }
-// ---- END STUBS ---------------------------------------------------------------
 
 /// Load the models, but do not wait forever for them.
 ///

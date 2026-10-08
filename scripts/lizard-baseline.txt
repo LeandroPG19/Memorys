@@ -118,8 +118,8 @@ src/handlers/zafra.rs::handle:76 35
 src/hooks_cli.rs::merge_episode_file:684 9
 src/hooks_cli.rs::remove_gitattributes_line:278 9
 src/hooks_cli.rs::remove_hook_block:448 9
-src/http.rs::dispatch_one:1194 12
-src/http.rs::mcp_endpoint:1053 13
+src/http.rs::dispatch_one:1276 12
+src/http.rs::mcp_endpoint:1135 13
 src/http.rs::serve_pool:191 11
 src/link_cli.rs::run_cli:5 13
 src/llm_cli.rs::print_status:154 13
