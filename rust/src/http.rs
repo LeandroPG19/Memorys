@@ -317,9 +317,13 @@ fn note_activity(state: &AppState, key: &str) {
 /// second, rather than after two minutes of loading models.
 async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
     let Some(std_listener) = systemd_listener() else {
-        return tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("cannot bind {addr} — is another daemon already running?"));
+        return bind_retrying(
+            addr,
+            bind_wait(),
+            |a| tokio::net::TcpListener::bind(a),
+            tokio::time::sleep,
+        )
+        .await;
     };
     let adopted = std_listener
         .local_addr()
@@ -328,6 +332,44 @@ async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::from_std(std_listener)
         .context("failed to adopt systemd-activated socket")
 }
+
+// ---- STUBS of 0.29.0 slice B, pass 1 (tests only) --------------------------
+// Everything from here to `END STUBS` exists so the tests compile and fail on
+// their assertions instead of on missing symbols. Pass 2 replaces the bodies
+// (and drops the `allow`) without touching the test region.
+
+#[allow(dead_code)]
+pub(crate) const BIND_RETRY_STEP: Duration = Duration::from_secs(5);
+
+pub(crate) fn bind_wait_from(_raw: Option<&str>) -> Duration {
+    Duration::ZERO
+}
+
+pub(crate) fn bind_wait() -> Duration {
+    bind_wait_from(
+        crate::envs::alias("MEMORY_INDUSTRY_BIND_WAIT_SECS", "CUBA_BIND_WAIT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(crate) async fn bind_retrying<B, BFut, S, SFut>(
+    addr: SocketAddr,
+    _window: Duration,
+    mut bind: B,
+    _sleep: S,
+) -> Result<tokio::net::TcpListener>
+where
+    B: FnMut(SocketAddr) -> BFut,
+    BFut: std::future::Future<Output = std::io::Result<tokio::net::TcpListener>>,
+    S: FnMut(Duration) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    bind(addr)
+        .await
+        .with_context(|| format!("cannot bind {addr} — is another daemon already running?"))
+}
+// ---- END STUBS ---------------------------------------------------------------
 
 /// Load the models, but do not wait forever for them.
 ///
@@ -3442,6 +3484,277 @@ mod health_report_tests {
                 "{canary:?} was served in the runtime block. A model path is inventory, and on \
                  Windows it carries the operator's user name; the sentence with the path in it \
                  belongs to `doctor`, which runs on their machine: {served}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod bind_retry_tests {
+    use super::*;
+
+    // 0.29.0 slice B: `serve` waits for its IP to exist (scenarios B1-B7).
+
+    use std::cell::{Cell, RefCell};
+    use std::future::Ready;
+    use std::io::{Error as IoError, ErrorKind};
+    use tokio::net::TcpListener;
+
+    /// What a LAN deployment actually asks for: an address of the machine's own
+    /// network card, which Windows has not assigned yet right after boot.
+    fn lan_addr() -> SocketAddr {
+        "192.168.0.10:8787".parse().unwrap()
+    }
+
+    fn not_assigned() -> IoError {
+        ErrorKind::AddrNotAvailable.into()
+    }
+
+    /// A loop that ignores its window would hang the suite instead of failing
+    /// it, so a fake bind gives up on its own after this many attempts.
+    const RUNAWAY_AFTER: u32 = 20;
+
+    /// A bind that always fails with `failure`, and stops the runaway.
+    fn always_failing(
+        failure: fn() -> IoError,
+    ) -> impl FnMut(u32, SocketAddr) -> Ready<std::io::Result<TcpListener>> {
+        move |nth, _| {
+            std::future::ready(Err(if nth > RUNAWAY_AFTER {
+                IoError::other("runaway: bind_retrying kept going past its window")
+            } else {
+                failure()
+            }))
+        }
+    }
+
+    struct Run {
+        result: Result<TcpListener>,
+        attempts: u32,
+        slept: Vec<Duration>,
+    }
+
+    impl Run {
+        /// The whole chain, because the operator reads `serve: {e:#}`.
+        fn refusal(&self) -> String {
+            match &self.result {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => panic!("expected bind_retrying to give up, it returned a listener"),
+            }
+        }
+    }
+
+    /// Runs `bind_retrying` with a fake clock (it only writes down what it was
+    /// asked to sleep, so nothing here waits) and a bind that learns its own
+    /// attempt number.
+    async fn drive<F, Fut>(addr: SocketAddr, window: Duration, mut nth_bind: F) -> Run
+    where
+        F: FnMut(u32, SocketAddr) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<TcpListener>>,
+    {
+        let attempts = Cell::new(0);
+        let slept = RefCell::new(Vec::new());
+        let result = bind_retrying(
+            addr,
+            window,
+            |a| {
+                attempts.set(attempts.get() + 1);
+                nth_bind(attempts.get(), a)
+            },
+            |d| {
+                slept.borrow_mut().push(d);
+                std::future::ready(())
+            },
+        )
+        .await;
+        Run {
+            result,
+            attempts: attempts.get(),
+            slept: slept.into_inner(),
+        }
+    }
+
+    fn secs(list: &[u64]) -> Vec<Duration> {
+        list.iter().map(|s| Duration::from_secs(*s)).collect()
+    }
+
+    #[tokio::test]
+    async fn a_port_in_use_fails_at_once() {
+        let held = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = held.local_addr().unwrap();
+
+        let run = drive(addr, Duration::from_secs(300), |_, a| TcpListener::bind(a)).await;
+
+        assert_eq!(
+            (run.attempts, run.slept.len()),
+            (1, 0),
+            "a port somebody holds will not free itself in five minutes; retrying it would \
+             hold a second daemon off the port for the whole window and hide that the first one \
+             is running"
+        );
+        let refusal = run.refusal();
+        assert!(
+            refusal.contains("is already in use") && refusal.contains(&addr.to_string()),
+            "the operator has to be told which address is taken: {refusal}"
+        );
+        assert!(
+            !refusal.contains("is not assigned to this machine"),
+            "this is the opposite problem from an IP the machine does not have yet, and saying \
+             otherwise sends the operator to ipconfig: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_that_is_not_assigned_yet_is_retried_until_it_binds() {
+        let run = drive(lan_addr(), Duration::from_secs(300), |nth, _| async move {
+            if nth <= 3 {
+                Err(not_assigned())
+            } else {
+                TcpListener::bind("127.0.0.1:0").await
+            }
+        })
+        .await;
+
+        assert!(
+            run.result.is_ok(),
+            "the network card got its address on the fourth try, inside the window, and the \
+             daemon still gave up: {}",
+            run.result
+                .as_ref()
+                .err()
+                .map_or(String::new(), |e| format!("{e:#}"))
+        );
+        assert_eq!(
+            run.attempts, 4,
+            "three refusals and then the bind that worked"
+        );
+        assert_eq!(
+            run.slept,
+            secs(&[5, 5, 5]),
+            "one step between attempts and none after the last: a daemon that sleeps after \
+             binding, or retries without sleeping, is a different bug each"
+        );
+    }
+
+    #[tokio::test]
+    async fn when_the_window_runs_out_the_message_says_the_address_is_not_assigned() {
+        let run = drive(
+            lan_addr(),
+            Duration::from_secs(12),
+            always_failing(not_assigned),
+        )
+        .await;
+
+        assert_eq!(
+            run.slept,
+            secs(&[5, 5, 2]),
+            "the last sleep is cut to what is left of the window (12 s in all); sleeping a \
+             whole step would keep the daemon waiting past the budget the operator set"
+        );
+        assert_eq!(
+            run.attempts, 4,
+            "attempts at 0, 5, 10 and 12 s, and then it stops"
+        );
+        let refusal = run.refusal();
+        for needle in [
+            "is not assigned to this machine",
+            "192.168.0.10:8787",
+            "CUBA_HTTP_ADDR",
+        ] {
+            assert!(
+                refusal.contains(needle),
+                "the message has to name {needle:?}: it used to say «is another daemon already \
+                 running?» about an IP the machine simply did not have yet, and that sent the \
+                 operator hunting for a process that did not exist: {refusal}"
+            );
+        }
+        assert!(
+            refusal.contains("ipconfig") || refusal.contains("ip addr"),
+            "it should say how to see which addresses the machine does have: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_window_tries_once_and_does_not_sleep() {
+        let run = drive(lan_addr(), Duration::ZERO, always_failing(not_assigned)).await;
+
+        assert_eq!(
+            (run.attempts, run.slept.len()),
+            (1, 0),
+            "MEMORY_INDUSTRY_BIND_WAIT_SECS=0 is how an operator turns the retry off; a daemon \
+             that still sleeps one step ignores it"
+        );
+        assert!(
+            run.refusal().contains("is not assigned to this machine"),
+            "with no retry the refusal still has to tell the truth about why"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_other_bind_error_fails_at_once_with_its_own_cause() {
+        let denied = || IoError::from(ErrorKind::PermissionDenied);
+        let run = drive(
+            lan_addr(),
+            Duration::from_secs(300),
+            always_failing(|| IoError::from(ErrorKind::PermissionDenied)),
+        )
+        .await;
+
+        assert_eq!(
+            (run.attempts, run.slept.len()),
+            (1, 0),
+            "a permission error does not go away by waiting; only an address the machine does \
+             not have yet is worth five minutes"
+        );
+        let refusal = run.refusal();
+        assert!(
+            refusal.contains("cannot bind") && refusal.contains(&denied().to_string()),
+            "the operating system's own words are the diagnosis: {refusal}"
+        );
+    }
+
+    #[test]
+    fn the_wait_is_five_minutes_unless_the_operator_says_a_number_of_seconds() {
+        let cases: [(Option<&str>, u64); 7] = [
+            (None, 300),
+            (Some("45"), 45),
+            (Some(" 60 "), 60),
+            (Some("0"), 0),
+            (Some("abc"), 300),
+            (Some(""), 300),
+            (Some("-5"), 300),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                bind_wait_from(raw),
+                Duration::from_secs(expected),
+                "{raw:?}: unset or unreadable means the default five minutes (a typo must not \
+                 silently turn the retry off), 0 means no retry, spaces are forgiven and a \
+                 negative number is not a number of seconds"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_bind_wait_answers_to_either_spelling_and_the_new_one_wins() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        {
+            let _preferred = crate::envs::ScopedEnv::set("MEMORY_INDUSTRY_BIND_WAIT_SECS", "10");
+            let _legacy = crate::envs::ScopedEnv::set("CUBA_BIND_WAIT_SECS", "99");
+            assert_eq!(
+                bind_wait(),
+                Duration::from_secs(10),
+                "with both set the preferred name decides, or a stale line in a unit file would \
+                 quietly override the one the operator edited"
+            );
+        }
+        {
+            let _preferred = crate::envs::ScopedEnv::cleared("MEMORY_INDUSTRY_BIND_WAIT_SECS");
+            let _legacy = crate::envs::ScopedEnv::set("CUBA_BIND_WAIT_SECS", "99");
+            assert_eq!(
+                bind_wait(),
+                Duration::from_secs(99),
+                "every machine in the field is configured with the legacy name"
             );
         }
     }
