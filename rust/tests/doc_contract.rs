@@ -954,3 +954,293 @@ fn every_variable_the_generated_env_files_offer_is_offered_in_env_example() {
         );
     }
 }
+
+const LAN_GUIDE: &str = "docs/despliegue-lan.md";
+
+/// Whitespace folded and backticks dropped: the guide wraps its prose at 80
+/// columns and quotes commands in backticks, and a phrase split by a newline
+/// is still the same phrase to the reader.
+fn flatten(text: &str) -> String {
+    text.replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The `memory-industry setup service …` lines of a document, as the words the
+/// binary would receive after `service`. Fenced and indented blocks both count;
+/// a trailing `\` or `^` joins the next line; a ` #` starts a comment.
+fn setup_service_commands(text: &str) -> Vec<(String, Vec<String>)> {
+    const PREFIX: &str = "memory-industry setup service";
+    let mut found = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let mut joined = line.trim().to_string();
+        if !joined.starts_with(PREFIX) {
+            continue;
+        }
+        while joined.ends_with('\\') || joined.ends_with('^') {
+            joined.pop();
+            match lines.next() {
+                Some(next) => {
+                    joined.push(' ');
+                    joined.push_str(next.trim());
+                }
+                None => break,
+            }
+        }
+        let command = joined.split(" #").next().unwrap_or("").trim().to_string();
+        let args = command[PREFIX.len()..]
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c| c == '"' || c == '\'').to_string())
+            .collect();
+        found.push((command, args));
+    }
+    found
+}
+
+/// E1. A command in the guide that the parser refuses is a command the reader
+/// types, copies from the page, and gets «opción desconocida» for. The guide is
+/// checked against `parse_request`, not against a list of flags somebody keeps.
+///
+/// Depends on slice C for `--register`: until the parser knows it, the line that
+/// shows the registration step is refused here, which is the point.
+#[test]
+fn every_setup_service_command_in_the_lan_guide_is_one_the_parser_accepts() {
+    let guide = read(LAN_GUIDE);
+    let commands = setup_service_commands(&guide);
+
+    assert!(
+        commands.len() >= 4,
+        "{LAN_GUIDE} shows {} `memory-industry setup service` command(s) and the procedure needs \
+         at least 4: print the plan, apply the LAN profile, apply with --register, and \
+         --uninstall. Found: {commands:?}. Fewer means the scan found nothing to judge and a \
+         green result would prove nothing",
+        commands.len()
+    );
+
+    let shows = |wanted: &dyn Fn(&[String]) -> bool| {
+        commands.iter().any(|(_, args)| wanted(args.as_slice()))
+    };
+    let has = |args: &[String], word: &str| args.iter().any(|a| a == word);
+    assert!(
+        shows(&|a| !has(a, "--apply") && !has(a, "--uninstall")),
+        "{LAN_GUIDE} never shows the plan (`setup service` or `--print`) that writes nothing: {commands:?}"
+    );
+    assert!(
+        shows(&|a| has(a, "--apply") && has(a, "--profile") && has(a, "lan")),
+        "{LAN_GUIDE} never shows `--apply --profile lan`, the command this page exists for: {commands:?}"
+    );
+    assert!(
+        shows(&|a| has(a, "--apply") && has(a, "--register")),
+        "{LAN_GUIDE} never shows `--apply --register`, the step that makes the daemon come back \
+         after a reboot: {commands:?}"
+    );
+    assert!(
+        shows(&|a| has(a, "--uninstall")),
+        "{LAN_GUIDE} never shows `--uninstall`, how the install is taken away: {commands:?}"
+    );
+
+    let refused: Vec<String> = commands
+        .iter()
+        .filter_map(|(command, args)| {
+            memory_industry::service::parse_request(args.as_slice())
+                .err()
+                .map(|e| format!("`{command}` -> {e}"))
+        })
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "{LAN_GUIDE} tells the reader to type commands that `setup service` refuses: {refused:#?}"
+    );
+}
+
+/// E2. The procedure's exact words, the troubleshooting table, and the tie
+/// between the table's quoted error messages and the code that prints them.
+///
+/// Depends on slice B for `is not assigned to this machine` / `is already in
+/// use` in `http.rs`, and on slice C for `--register` in `service.rs`.
+#[test]
+fn the_lan_guide_carries_the_procedure_and_a_troubleshooting_table_tied_to_the_code() {
+    let raw = read(LAN_GUIDE);
+    let guide = flatten(&raw);
+    let service_rs = include_str!("../src/service.rs");
+    let http_rs = include_str!("../src/http.rs");
+
+    let procedure = [
+        "--profile lan",
+        "--register",
+        "schtasks /Query /TN memory-industry",
+        "netsh advfirewall firewall show rule name=memory-industry",
+        "memory-industry.log",
+        "MEMORY_INDUSTRY_BIND_WAIT_SECS",
+        "memory-industry doctor",
+    ];
+    let missing: Vec<&str> = procedure
+        .iter()
+        .copied()
+        .filter(|w| !guide.contains(w))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{LAN_GUIDE} does not mention {missing:?}. The page is the whole procedure: apply with \
+         --register, check the task and the firewall rule with those two read-only commands, read \
+         the log, know the bind-wait knob, run doctor"
+    );
+
+    // Absence is only meaningful once the new text is known to be there.
+    assert!(
+        !guide.contains("a scheduled task that runs at logon"),
+        "{LAN_GUIDE} still says «a scheduled task that runs at logon». The task now starts at \
+         boot as SYSTEM, with no session; the old sentence is the promise 0.29.0 replaces"
+    );
+
+    // The names the guide uses are the names the code uses.
+    for (word, why) in [
+        ("--register", "the flag `setup service` parses"),
+        ("memory-industry.log", "the file the launcher appends to"),
+    ] {
+        assert!(
+            service_rs.contains(word),
+            "{LAN_GUIDE} documents {word}, {why}, but rust/src/service.rs never mentions it: the \
+             page promises something the binary does not have"
+        );
+    }
+    assert!(
+        http_rs.contains("MEMORY_INDUSTRY_BIND_WAIT_SECS"),
+        "{LAN_GUIDE} documents MEMORY_INDUSTRY_BIND_WAIT_SECS but rust/src/http.rs does not read it"
+    );
+
+    let rows: Vec<&str> = raw
+        .lines()
+        .filter(|l| l.trim_start().starts_with('|'))
+        .collect();
+    assert!(
+        rows.len() >= 9,
+        "{LAN_GUIDE} has {} table rows; the troubleshooting table needs its header, its divider \
+         and at least 7 symptoms. Found: {rows:?}",
+        rows.len()
+    );
+    let table = flatten(&rows.join("\n"));
+    let symptoms = [
+        (
+            "is not assigned to this machine",
+            "the address belongs to no interface yet",
+        ),
+        ("is already in use", "another process holds the port"),
+        (
+            "refusing to bind",
+            "token missing or shorter than 32 characters",
+        ),
+        (
+            "remote clients time out",
+            "local answers, remote does not: the firewall rule is missing",
+        ),
+        (
+            "does not start after a reboot",
+            "check the task and read the log",
+        ),
+        (
+            "lexical search",
+            "no models: USERPROFILE / ONNX_MODEL_PATH under SYSTEM",
+        ),
+        (
+            "Postgres is not up after a reboot",
+            "the container starts at sign-in, not at boot",
+        ),
+    ];
+    let absent: Vec<String> = symptoms
+        .iter()
+        .filter(|(text, _)| !table.contains(text))
+        .map(|(text, row)| format!("«{text}» ({row})"))
+        .collect();
+    assert!(
+        absent.is_empty(),
+        "the troubleshooting table in {LAN_GUIDE} has no row for: {absent:#?}. Each must sit in a \
+         markdown table row (a line starting with `|`), phrased with exactly that text"
+    );
+
+    for message in [
+        "is not assigned to this machine",
+        "is already in use",
+        "refusing to bind",
+    ] {
+        assert!(
+            http_rs.contains(message),
+            "the guide's table quotes «{message}» but rust/src/http.rs never prints it: the row \
+             would send the operator looking for text that does not exist"
+        );
+    }
+}
+
+/// E3. What running as SYSTEM means, said in the page. These are presence
+/// anchors, declared as such: the behaviour is judged by E1/E2 and by the unit
+/// tests of slices A and C; this keeps the explanation from being dropped.
+#[test]
+fn the_lan_guide_says_what_running_as_system_implies() {
+    let guide = flatten(&read(LAN_GUIDE));
+    assert!(
+        guide.contains("--profile lan"),
+        "{LAN_GUIDE} has no `--profile lan` at all, so none of the facts below can be located: \
+         the guide has not been rewritten for 0.29.0"
+    );
+
+    let facts = [
+        ("SYSTEM", "the task runs as SYSTEM"),
+        ("logged in", "and needs nobody logged in"),
+        (
+            "privileges",
+            "SYSTEM runs the daemon with every privilege on the machine",
+        ),
+        ("absolute", "the .exe, env file and log paths are absolute"),
+        (
+            "--apply again",
+            "if the .exe moves, --apply is repeated: the paths are baked in",
+        ),
+        ("5 MiB", "the log rotates at 5 MiB when the daemon starts"),
+        (
+            "without --profile",
+            "--apply without --profile keeps the env file's address",
+        ),
+        (
+            "CUBA_HTTP_ADDR",
+            "the address is changed in the env file, then --apply",
+        ),
+        (
+            "schtasks /Delete /TN memory-industry /F",
+            "the first command --uninstall prints to remove the task",
+        ),
+        (
+            "netsh advfirewall firewall delete rule name=memory-industry",
+            "the second command --uninstall prints to remove the firewall rule",
+        ),
+    ];
+    let missing: Vec<String> = facts
+        .iter()
+        .filter(|(text, _)| !guide.contains(text))
+        .map(|(text, meaning)| format!("«{text}» ({meaning})"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{LAN_GUIDE} does not explain what the SYSTEM task implies; missing: {missing:#?}"
+    );
+}
+
+/// E4. The versioned Windows files use `%LOCALAPPDATA%` as documentation; SYSTEM
+/// has no such profile, so feeding them to `schtasks` by hand installs a task
+/// that points at nothing. Presence anchor, declared as such.
+#[test]
+fn packaging_readme_warns_that_the_windows_goldens_are_not_installed_by_hand() {
+    let readme = flatten(&read("packaging/README.md"));
+    assert!(
+        readme.contains("%LOCALAPPDATA%"),
+        "packaging/README.md does not say the files under packaging/windows use %LOCALAPPDATA% \
+         as documentation: the SYSTEM task cannot expand it, so passing them to `schtasks` as \
+         they are installs a task pointing at an empty profile"
+    );
+    assert!(
+        readme.contains("setup service --apply"),
+        "packaging/README.md does not say the Windows files are installed with \
+         `setup service --apply`, which bakes absolute paths in"
+    );
+}
