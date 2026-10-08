@@ -22,6 +22,7 @@ tokio::task_local! {
     static CLIENT_LABEL: String;
     static MCP_SESSION: String;
     static SCOPE: Scope;
+    static ACCOUNT: AccountRef;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +36,31 @@ pub const PEER_VERBS: [(&str, &str); 3] = [
     ("cuba_sync", "pull"),
     ("cuba_sync", "notify"),
 ];
+
+/// The account and device a request was admitted as, when it came in with an account credential.
+/// It travels beside the client identity and never replaces it: `current_client()` is a session
+/// key and its shape must not change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountRef {
+    pub name: String,
+    pub device: String,
+}
+
+/// Runs `fut` with `account` bound, or with none when the caller is the shared token. Requests do
+/// not nest, so `None` simply leaves the binding absent.
+pub async fn with_account<F, R>(account: Option<AccountRef>, fut: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    match account {
+        Some(account) => ACCOUNT.scope(account, fut).await,
+        None => fut.await,
+    }
+}
+
+pub fn current_account() -> Option<AccountRef> {
+    ACCOUNT.try_with(Clone::clone).ok()
+}
 
 pub fn current_scope() -> Scope {
     SCOPE.try_with(|s| *s).unwrap_or(Scope::Full)
@@ -602,6 +628,69 @@ mod tests {
             client_label_of(key.clone()),
             "claude-code@ws-7",
             "two machines are two workspaces; the label has to say which one"
+        );
+    }
+
+    fn ana_on_a_lab_pc() -> AccountRef {
+        AccountRef {
+            name: "ana".into(),
+            device: "pc-lab-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_account_is_seen_inside_with_account_and_nowhere_else() {
+        assert_eq!(
+            current_account(),
+            None,
+            "outside any request there is no account: the shared token, stdio and every test \
+             that never admits a credential must read None, or whoami would name someone who \
+             did not make the call"
+        );
+
+        let inside = with_account(Some(ana_on_a_lab_pc()), async { current_account() }).await;
+        assert_eq!(
+            inside,
+            Some(ana_on_a_lab_pc()),
+            "the account admitted for a request has to reach the handler that writes the audit \
+             line, the failure row and the whoami answer, or every attribution reads null"
+        );
+
+        assert_eq!(
+            current_account(),
+            None,
+            "the binding ends with the request: a task-local that leaked would attribute the \
+             next caller's work to this one"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_an_account_leaves_the_session_identity_alone() {
+        let seen = with_account(
+            Some(ana_on_a_lab_pc()),
+            with_identity("cursor".into(), Some("chat-a".into()), async {
+                (
+                    current_client(),
+                    current_client_label(),
+                    current_mcp_session(),
+                    current_account(),
+                )
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            seen.0.as_deref(),
+            Some("cursor::chat-a"),
+            "current_client() is the session key of every install: an account that changed its \
+             shape would orphan every open jornada on upgrade"
+        );
+        assert_eq!(seen.1.as_deref(), Some("cursor"));
+        assert_eq!(seen.2.as_deref(), Some("chat-a"));
+        assert_eq!(
+            seen.3,
+            Some(ana_on_a_lab_pc()),
+            "and the account is still there beside the identity, not instead of it"
         );
     }
 }

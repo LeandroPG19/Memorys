@@ -235,7 +235,7 @@ pub fn validate_device_label(raw: &str) -> Result<String> {
 
 /// Exactly `2 * N` lowercase hex characters. `hex::decode` alone would accept
 /// uppercase, a second spelling of the same bytes.
-fn lower_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+pub(crate) fn lower_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     let canonical =
         text.len() == 2 * N && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     if !canonical {

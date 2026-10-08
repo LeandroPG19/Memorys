@@ -44,12 +44,16 @@ pub async fn handle(pool: &PgPool, _args: Value) -> Result<Value> {
     let machine = crate::resources::probe();
     let plan = crate::resources::plan(&machine);
 
+    let account = crate::session::current_account();
+
     Ok(serde_json::json!({
         "server": "MemoryIndustry",
         "version": env!("CARGO_PKG_VERSION"),
         "client_id": crate::session::current_client_label()
             .or_else(crate::session::current_client),
         "mcp_session": crate::session::current_mcp_session(),
+        "account": account.as_ref().map(|a| a.name.as_str()),
+        "device": account.as_ref().map(|a| a.device.as_str()),
         "session_id": crate::session::session_id().map(|s| s.to_string()),
         "rls_enforced": !is_superuser,
         "scope": match crate::session::current_scope() {
