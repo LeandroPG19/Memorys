@@ -5,6 +5,29 @@ All notable changes to MemoryIndustry (formerly cuba-memorys) are documented her
 [SemVer](https://semver.org/) for the Rust crate (`Cargo.toml`). PyPI
 versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI 1.28.0).
 
+## [Unreleased] — 0.29.0: a LAN install that comes back after the host reboots
+
+### Behaviour changes — read before deploying
+
+- **The Windows task now runs as SYSTEM and starts at boot.** It used to run as the installing user and fire only at logon, so a host that rebooted and sat at the sign-in screen served nobody. The task (`memory-industry`) has a `BootTrigger` with a five-minute repetition (a second copy never starts: `IgnoreNew`), a `LogonTrigger`, and restarts after a minute up to 999 times. SYSTEM has no profile of its own, so every path the task, the launcher and the log carry is **absolute**, and the launcher sets `USERPROFILE` to the home of whoever installed before it reads the env file; if the `.exe` moves, `setup service --apply --register` is run again. SYSTEM runs the daemon with every privilege the machine has: treat the token and the env file accordingly.
+- **The address lives in one place, the env file.** The Windows launcher and the systemd `ExecStart` no longer carry it as an argument (the argument won over `CUBA_HTTP_ADDR`, so a later `--apply` without `--profile` rewrote the launcher to loopback while the kept env file still said LAN). `setup service --apply` without `--profile` and without `--addr` keeps the installed address and profile; `--profile loopback` is the explicit way back; an explicit `--profile` and `--addr` update only `CUBA_HTTP_ADDR` in the env file, atomically, keeping its other bytes and its line endings, and a token already there is never replaced (a different `--token` is refused, an empty one is filled for a LAN install and never printed).
+
+### Added
+
+- **`setup service --apply --register` (Windows, elevated).** It probes elevation first and refuses before writing a single file, then deletes and adds the inbound firewall rule `memory-industry` for the port (Private and Domain profiles; none for a loopback address) and registers the task with `schtasks /Create /XML … /F`. Repeating it leaves one rule and one task, and each failure says what was left done. Without `--register`, `--apply` prints the same commands. `--uninstall` prints how to remove the task and the rule.
+- **The launcher writes `memory-industry.log`** beside the env file, and moves it to `.log.1` at the next start when it is over 5 MiB, so a daemon that refuses to start leaves its reason somewhere.
+- **`serve` waits for an address that is not assigned yet.** A DHCP lease that arrives after boot used to fail once with «is another daemon already running?». It now retries `EADDRNOTAVAIL` in 5-second steps for up to `MEMORY_INDUSTRY_BIND_WAIT_SECS` (alias `CUBA_BIND_WAIT_SECS`, default 300, `0` tries once) and then exits saying «is not assigned to this machine», with `ipconfig` / `ip addr` as the way to check. A port in use still fails at once with its own message.
+- **The systemd socket gets `FreeBind=yes` for a routable address**, so it can open before the address exists.
+- **`doctor` reports the installed service**: the address and profile the env file holds (and a warning when the process variable differs), a routable address with a token under 32 characters as a failure (`serve` would refuse it), whether the task exists (Windows) and the last error of `memory-industry.log` (only its tail is read). Until now it read `CUBA_HTTP_ADDR` from its own console and said «127.0.0.1:8787 is free» while the daemon sat elsewhere.
+
+### Changed
+
+- **`docs/despliegue-lan.md` is the whole procedure**: `--profile lan`, `--register`, what the SYSTEM task implies, the log, the bind wait, the uninstall commands and a troubleshooting table. `packaging/README.md` warns that the Windows files there are documentation (`%LOCALAPPDATA%`) and are installed with `setup service --apply`. Three goldens regenerated (`memory-industry.cmd`, `memory-industry-task.xml`, `memory-industry.service`).
+
+### Not verified (needs the real host, scenario M1)
+
+`<Repetition>` without `<Duration>` in a `BootTrigger`, `RestartOnFailure` reacting to a launcher that exits non-zero, `fltmc` as the elevation probe, and the exact text `netsh` prints when there is no rule to delete. None of them runs on this development machine; the five-minute repetition covers the second and third if they behave otherwise. 0.29.0 is not tagged until two reboots of a real host (one with nobody signed in) leave its clients connected.
+
 ## [0.28.0] — 2026-10-07 (Cargo `0.28.0` · npm `0.28.0` · PyPI `1.30.0`)
 
 ### Behaviour changes — read before deploying
