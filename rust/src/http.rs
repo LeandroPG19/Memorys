@@ -3047,6 +3047,276 @@ mod tests {
              the list there would cost debugging for no security"
         );
     }
+
+    #[tokio::test]
+    async fn the_label_is_the_first_of_three_names_that_is_not_blank() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _blank = crate::envs::ScopedEnv::set("CUBA_NODE_NAME", "   ");
+        let _host = crate::envs::ScopedEnv::set("HOSTNAME", "caja-de-planta");
+        let _computer = crate::envs::ScopedEnv::cleared("COMPUTERNAME");
+        assert_eq!(
+            host_label(),
+            "caja-de-planta",
+            "a blank CUBA_NODE_NAME is no name at all, so the label must fall through to \
+             HOSTNAME; an empty label is what every client pins as this machine's name"
+        );
+
+        let _named = crate::envs::ScopedEnv::set("CUBA_NODE_NAME", "  planta-madre  ");
+        assert_eq!(
+            host_label(),
+            "planta-madre",
+            "the name the operator chose, trimmed, wins over the machine's own HOSTNAME"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_knob_is_read_from_the_environment_for_a_bind_other_machines_can_reach() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let lan_bind: SocketAddr = "192.168.1.50:8787".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        {
+            let _unset = crate::envs::ScopedEnv::cleared("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS");
+            assert!(
+                !require_accounts_for(&lan_bind),
+                "with the knob unset the shared token keeps opening a LAN bind, as in 0.28"
+            );
+        }
+        let _set = crate::envs::ScopedEnv::set("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS", "1");
+        assert!(
+            require_accounts_for(&lan_bind),
+            "MEMORY_INDUSTRY_REQUIRE_ACCOUNTS=1 on a bind other machines can reach is the knob \
+             doing its job; a read that ignores it leaves the shared token open to the LAN"
+        );
+        assert!(
+            !require_accounts_for(&loopback),
+            "the same knob on loopback is ignored, because the shared token is the only way in there"
+        );
+    }
+
+    fn pair_request_with(nc: &str, label: &str, h: &str, mac: &str) -> PairRequest {
+        PairRequest {
+            v: 1,
+            nc: nc.to_string(),
+            label: label.to_string(),
+            h: h.to_string(),
+            mac: mac.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_pairing_request_in_the_exact_shape_parses_and_anything_else_does_not() {
+        let nc = "00112233445566778899aabbccddeeff";
+        let h = "ab".repeat(32);
+        let mac = "cd".repeat(32);
+
+        let parsed = ParsedPair::from_request(&pair_request_with(nc, "mi-pc", &h, &mac)).expect(
+            "lowercase hex of the exact lengths and a valid label must parse, or no device could pair",
+        );
+        assert_eq!(
+            parsed.nonce[0], 0x00,
+            "the nonce is the 16 bytes of the hex, in order"
+        );
+        assert_eq!(
+            parsed.nonce[15], 0xff,
+            "the last byte of the nonce is the last pair of hex"
+        );
+        assert_eq!(
+            parsed.hash, [0xab; 32],
+            "the hash is the 32 bytes of its hex"
+        );
+        assert_eq!(
+            parsed.label, "mi-pc",
+            "the label is kept as the client sent it"
+        );
+        assert_eq!(
+            parsed.mac, mac,
+            "the MAC is kept as text, to be verified against a candidate"
+        );
+
+        for (why, request) in [
+            (
+                "an uppercase MAC",
+                pair_request_with(nc, "mi-pc", &h, &"CD".repeat(32)),
+            ),
+            (
+                "a nonce one byte short",
+                pair_request_with("0011", "mi-pc", &h, &mac),
+            ),
+            (
+                "a label that starts with a dash",
+                pair_request_with(nc, "-mi-pc", &h, &mac),
+            ),
+        ] {
+            assert!(
+                ParsedPair::from_request(&request).is_none(),
+                "{why} must be refused as malformed, before any database is asked about the code"
+            );
+        }
+    }
+
+    #[test]
+    fn the_candidate_whose_code_made_the_mac_is_the_one_found() {
+        let code_key = [7u8; 32];
+        let nonce = [1u8; 16];
+        let hash = [2u8; 32];
+        let label = "mi-pc";
+        let mac = hex::encode(crate::accounts::pair_request_mac(
+            &code_key, &nonce, label, &hash,
+        ));
+        let request = ParsedPair {
+            nonce,
+            hash,
+            label: label.to_string(),
+            mac,
+        };
+        let candidate = |key: [u8; 32]| PairingCandidate {
+            id: Uuid::new_v4(),
+            code_key: key,
+            expires_at: chrono::Utc::now(),
+            used_at: None,
+            account_revoked: false,
+        };
+        let right = candidate(code_key);
+        let right_id = right.id;
+        let candidates = [candidate([9u8; 32]), right];
+
+        let found = find_matching_candidate(&candidates, &request).expect(
+            "the code that made the MAC must be found among the candidates, or the host cannot \
+             tell which code the client typed and refuses every pairing",
+        );
+        assert_eq!(
+            found.id, right_id,
+            "the candidate whose code key made the MAC is the one returned, not the first one"
+        );
+
+        let forged = ParsedPair {
+            nonce,
+            hash,
+            label: label.to_string(),
+            mac: hex::encode([0u8; 32]),
+        };
+        assert!(
+            find_matching_candidate(&candidates, &forged).is_none(),
+            "a MAC that no stored code made must match nothing, or any guess would pair"
+        );
+    }
+
+    fn failures_of(brake: &Brake, who: std::net::IpAddr) -> Option<u32> {
+        brake.read().unwrap().get(&who).map(|entry| entry.0)
+    }
+
+    fn some_response() -> PairResponse {
+        PairResponse {
+            v: 1,
+            host_id: Uuid::nil(),
+            host_name: String::new(),
+            credential_id: Uuid::nil(),
+            account: "ana".to_string(),
+            label: "mi-pc".to_string(),
+            mac: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_refused_pairing_counts_against_its_address_and_a_redemption_clears_it() {
+        let brake = Brake::default();
+        let who = local_peer().ip();
+
+        settle_brake(&brake, who, &PairOutcome::Refused(Reason::UnknownOrBadMac));
+        assert_eq!(
+            failures_of(&brake, who),
+            Some(1),
+            "a refused pairing is one failure against the address that sent it, or guessing codes is free"
+        );
+
+        settle_brake(&brake, who, &PairOutcome::Refused(Reason::Used));
+        assert_eq!(failures_of(&brake, who), Some(2), "every refusal adds one");
+
+        settle_brake(&brake, who, &PairOutcome::Unavailable);
+        assert_eq!(
+            failures_of(&brake, who),
+            Some(2),
+            "an unreachable database is not the client's fault and must not count against it"
+        );
+
+        settle_brake(&brake, who, &PairOutcome::Ok(some_response()));
+        assert_eq!(
+            failures_of(&brake, who),
+            None,
+            "a redemption clears the address, as a good bearer does, or a legitimate device \
+             that mistyped twice stays braked after it pairs"
+        );
+
+        settle_brake(&brake, who, &PairOutcome::Refused(Reason::Expired));
+        settle_brake(&brake, who, &PairOutcome::Replayed(some_response()));
+        assert_eq!(
+            failures_of(&brake, who),
+            None,
+            "a replay clears too: the client that lost the response to its own redemption is not an attacker"
+        );
+    }
+
+    #[test]
+    fn identity_asks_for_a_proof_only_with_a_full_credential_and_nonce() {
+        let query = |cred: Option<&str>, nonce: Option<&str>| IdentityQuery {
+            cred: cred.map(str::to_string),
+            nonce: nonce.map(str::to_string),
+        };
+        let cred = "00112233445566778899aabbccddeeff";
+        let nonce = "ffeeddccbbaa99887766554433221100";
+
+        assert_eq!(
+            asked_credential(&query(None, None)),
+            Ok(None),
+            "a bare probe asks for nothing, so a monitor asking whether the host is there does not cost a credential check"
+        );
+
+        let (asked_cred, asked_nonce) = asked_credential(&query(Some(cred), Some(nonce)))
+            .expect("a credential and a nonce in the exact shape must be accepted")
+            .expect("and they are asked for, not taken for a bare probe");
+        assert_eq!(
+            asked_cred,
+            Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
+            "the 32 hex digits of the credential are its UUID, in order"
+        );
+        assert_eq!(
+            hex::encode(asked_nonce),
+            nonce,
+            "the nonce is passed on byte for byte: the proof is computed over exactly what the client sent"
+        );
+
+        for (why, asked) in [
+            ("a credential without a nonce", query(Some(cred), None)),
+            ("a nonce without a credential", query(None, Some(nonce))),
+            (
+                "a credential with the dashes of a UUID",
+                query(Some("00112233-4455-6677-8899-aabbccddeeff"), Some(nonce)),
+            ),
+            ("a nonce that is too short", query(Some(cred), Some("00"))),
+        ] {
+            assert!(
+                asked_credential(&asked).is_err(),
+                "{why} is a malformed question and must get one answer for every malformed query"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_read_at_start_is_the_id_the_clients_pin_and_needs_no_database_read() {
+        let mut state = state_with_clients(Some("s3cret"), &[]);
+        let host_id = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        state.host = Arc::new(HostInfo {
+            host_id,
+            name: "planta-madre".to_string(),
+        });
+
+        assert_eq!(
+            known_host_id(&state).await,
+            Some(host_id),
+            "the id read when the daemon started is the one /identity reports; asking the database \
+             again on every probe would turn a monitor into a database load"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4700,5 +4970,369 @@ mod admission_tests {
                  must not blind them: {body}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_live_ticket_opens_events_without_a_bearer_even_with_a_token_configured() {
+        let state = state_with_policy(false);
+        let by_ticket = EventsQuery {
+            token: None,
+            ticket: Some(crate::events::issue_ticket()),
+        };
+        if let Err(refusal) = admit_events(&state, &HeaderMap::new(), &by_ticket, lan()).await {
+            panic!(
+                "a ticket minted a moment ago must open /events with no bearer: a browser cannot set \
+                 a header, and the ticket is the way in it has. It was refused with {}",
+                refusal.status()
+            );
+        }
+
+        let forged = EventsQuery {
+            token: None,
+            ticket: Some("not-a-ticket-anyone-was-issued".to_string()),
+        };
+        assert!(
+            admit_events(&state, &HeaderMap::new(), &forged, lan())
+                .await
+                .is_err(),
+            "a ticket nobody issued must not open the stream while a token is configured, or any \
+             caller on the LAN opens it by inventing one"
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_failures_is_a_429_that_says_how_long_and_speaks_the_jsonrpc_error() {
+        let response = too_many_failures(Duration::from_secs(42));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an address over the limit gets 429, not the 401 of a wrong token"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("42"),
+            "Retry-After is the wait in whole seconds, so the client knows when to try again"
+        );
+        let body = json_of(response).await;
+        assert_eq!(
+            body["error"]["code"].as_i64(),
+            Some(-32001),
+            "the code is the one every auth refusal carries, and a client that keys on it must \
+             not see a different number here: {body}"
+        );
+        assert_eq!(
+            message_of(&body),
+            "demasiados tokens inválidos desde esta dirección",
+            "the sentence a panel shows for a braked address"
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_for_answers_each_rejection_in_its_own_words_and_only_a_wrong_token_counts() {
+        let state = state_with_policy(true);
+        let who = lan().ip();
+
+        let by_policy = refusal_for(&state, who, Rejection::Policy);
+        assert_eq!(
+            by_policy.status(),
+            StatusCode::UNAUTHORIZED,
+            "a token refused by policy is a 401"
+        );
+        let body = json_of(by_policy).await;
+        assert_eq!(
+            body["error"]["code"].as_i64(),
+            Some(-32001),
+            "the same code as every other auth refusal: {body}"
+        );
+        assert_eq!(
+            message_of(&body),
+            REQUIRE_ACCOUNTS_REFUSAL,
+            "the policy refusal says what to do about it"
+        );
+        assert!(
+            state.auth_failures.read().unwrap().get(&who).is_none(),
+            "a policy refusal is not a wrong token and must not start the brake"
+        );
+
+        let unreachable = refusal_for(&state, who, Rejection::Unavailable);
+        assert_eq!(
+            unreachable.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a database that cannot answer is a 503, not a 401 that blames the client"
+        );
+        let body = json_of(unreachable).await;
+        assert!(
+            message_of(&body).contains("database is unreachable"),
+            "the 503 names the database as the cause: {body}"
+        );
+        assert!(
+            state.auth_failures.read().unwrap().get(&who).is_none(),
+            "an unreachable database does not count against the address either"
+        );
+
+        let wrong = refusal_for(&state, who, Rejection::Wrong);
+        assert_eq!(
+            wrong.status(),
+            StatusCode::UNAUTHORIZED,
+            "a wrong token is a 401"
+        );
+        let body = json_of(wrong).await;
+        assert_eq!(
+            body["error"]["code"].as_i64(),
+            Some(-32001),
+            "a wrong token carries the auth code as well: {body}"
+        );
+        assert_eq!(
+            message_of(&body),
+            "invalid bearer token",
+            "the sentence clients recognise"
+        );
+        assert_eq!(
+            state
+                .auth_failures
+                .read()
+                .unwrap()
+                .get(&who)
+                .map(|entry| entry.0),
+            Some(1),
+            "a wrong token is the one refusal that counts toward the brake, once"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_error_is_its_status_and_one_json_error_field() {
+        let response = plain_error(StatusCode::BAD_REQUEST, "bad request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "the status is the one asked for"
+        );
+        assert_eq!(
+            json_of(response).await,
+            serde_json::json!({ "error": "bad request" }),
+            "the body is a JSON object with one error field, the shape /identity and /pair share"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_door_of_identity_and_pair_refuses_a_proxy_and_admits_a_direct_caller() {
+        let state = state_with_policy(false);
+
+        assert!(
+            refuse_unsafe_door(&state, &HeaderMap::new()).is_none(),
+            "a direct caller with no origin and no forwarding header reaches /identity and /pair"
+        );
+
+        let behind_proxy = headers_with("x-forwarded-for", "203.0.113.9");
+        let refusal = refuse_unsafe_door(&state, &behind_proxy).expect(
+            "a request that came through a proxy must be refused: behind one every client shares \
+             an address and the brake would be one bucket for all of them",
+        );
+        assert_eq!(
+            refusal.status(),
+            StatusCode::FORBIDDEN,
+            "a proxied request to this door is a 403"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_refuses_a_proxy_and_a_bad_body_before_it_asks_the_database() {
+        let state = state_with_policy(false);
+
+        let proxied = pair(
+            State(state.clone()),
+            axum::extract::ConnectInfo(lan()),
+            headers_with("x-forwarded-for", "203.0.113.9"),
+            axum::body::Body::from("{}"),
+        )
+        .await;
+        assert_eq!(
+            proxied.status(),
+            StatusCode::FORBIDDEN,
+            "a proxied /pair is refused at the door, whatever its body says"
+        );
+
+        let garbage = pair(
+            State(state.clone()),
+            axum::extract::ConnectInfo(lan()),
+            HeaderMap::new(),
+            axum::body::Body::from("not json"),
+        )
+        .await;
+        assert_eq!(
+            garbage.status(),
+            StatusCode::BAD_REQUEST,
+            "a body that is not JSON is a 400"
+        );
+        assert_eq!(
+            json_of(garbage).await,
+            serde_json::json!({ "error": "bad request" }),
+            "one sentence for every malformed body"
+        );
+
+        let too_big = pair(
+            State(state),
+            axum::extract::ConnectInfo(lan()),
+            HeaderMap::new(),
+            axum::body::Body::from(vec![b' '; PAIR_BODY_LIMIT + 1]),
+        )
+        .await;
+        assert_eq!(
+            too_big.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a body over the limit is refused before it is parsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_pairing_outcome_has_its_own_status_and_one_sentence_for_the_refusals() {
+        let ok = pair_reply(PairOutcome::Ok(some_response_for_pairing()));
+        assert_eq!(
+            ok.status(),
+            StatusCode::OK,
+            "a redemption answers 200 with the proof"
+        );
+        let body = json_of(ok).await;
+        assert_eq!(
+            body["account"].as_str(),
+            Some("ana"),
+            "the answer names the account the device was paired to: {body}"
+        );
+
+        let replayed = pair_reply(PairOutcome::Replayed(some_response_for_pairing()));
+        assert_eq!(
+            replayed.status(),
+            StatusCode::OK,
+            "a replay answers the same 200, so the client that lost its answer gets its proof"
+        );
+
+        let refused = pair_reply(PairOutcome::Refused(Reason::Used));
+        assert_eq!(
+            refused.status(),
+            StatusCode::UNAUTHORIZED,
+            "a refused code is a 401"
+        );
+        assert_eq!(
+            json_of(refused).await,
+            serde_json::json!({ "error": "pairing failed" }),
+            "every refusal reads the same from outside, whatever the reason inside"
+        );
+
+        let braked = pair_reply(PairOutcome::Braked(Duration::from_secs(30)));
+        assert_eq!(
+            braked.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a braked address is told to wait, with a 429"
+        );
+        assert_eq!(
+            braked
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("30"),
+            "Retry-After is the wait in whole seconds"
+        );
+
+        let malformed = pair_reply(PairOutcome::Malformed);
+        assert_eq!(
+            malformed.status(),
+            StatusCode::BAD_REQUEST,
+            "a malformed pairing is a 400"
+        );
+
+        let unavailable = pair_reply(PairOutcome::Unavailable);
+        assert_eq!(
+            unavailable.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a database that cannot answer is a 503, and the client may try again"
+        );
+        assert_eq!(
+            json_of(unavailable).await,
+            serde_json::json!({ "error": "temporarily unavailable" }),
+            "the 503 carries the same sentence as the other transient refusal"
+        );
+    }
+
+    fn some_response_for_pairing() -> PairResponse {
+        PairResponse {
+            v: 1,
+            host_id: Uuid::nil(),
+            host_name: String::new(),
+            credential_id: Uuid::nil(),
+            account: "ana".to_string(),
+            label: "mi-pc".to_string(),
+            mac: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_answers_a_bare_probe_from_the_start_up_read_and_refuses_half_a_query() {
+        let mut state = state_with_policy(false);
+        let host_id = Uuid::from_u128(0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100);
+        state.host = Arc::new(HostInfo {
+            host_id,
+            name: "planta-madre".to_string(),
+        });
+
+        let probe = identity(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Query(IdentityQuery {
+                cred: None,
+                nonce: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            probe.status(),
+            StatusCode::OK,
+            "a bare probe is answered with the host's identity"
+        );
+        let body = json_of(probe).await;
+        assert_eq!(
+            body["service"].as_str(),
+            Some("memory-industry"),
+            "the answer names the service, so a client can tell this is the daemon: {body}"
+        );
+        let host_text = host_id.to_string();
+        assert_eq!(
+            body["host_id"].as_str(),
+            Some(host_text.as_str()),
+            "the host id is the one read when the daemon started: {body}"
+        );
+        assert_eq!(
+            body["name"].as_str(),
+            Some("planta-madre"),
+            "the label is the one this host has"
+        );
+        assert!(
+            body.get("credential").is_none() && body.get("proof").is_none(),
+            "a bare probe has no credential verdict and no proof, because nothing was asked: {body}"
+        );
+
+        let half = identity(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Query(IdentityQuery {
+                cred: Some("00112233445566778899aabbccddeeff".to_string()),
+                nonce: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            half.status(),
+            StatusCode::BAD_REQUEST,
+            "a credential without its nonce is a malformed question, refused before any database is asked"
+        );
+        assert_eq!(
+            json_of(half).await,
+            serde_json::json!({ "error": "bad request" }),
+            "one sentence for every malformed query"
+        );
     }
 }

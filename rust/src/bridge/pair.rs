@@ -326,6 +326,7 @@ mod tests {
     };
     use super::*;
     use crate::accounts;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
     const REFUSED: &str =
@@ -736,6 +737,198 @@ mod tests {
         assert!(
             matches!(verdict, Verdict::Verified { .. }),
             "the winner's secret is the one the host stored, so its proof verifies: {verdict:?}"
+        );
+    }
+
+    /// Answers the offer with a MAC it cannot have computed: an impostor, not the host.
+    async fn impostor_host() -> RawRecorder {
+        let response = serde_json::json!({
+            "v": 1, "host_id": uuid::Uuid::new_v4(), "host_name": "madre",
+            "credential_id": uuid::Uuid::new_v4(), "account": "ana",
+            "label": "pc-lab-1", "mac": "ab".repeat(32),
+        })
+        .to_string();
+        RawRecorder::start(&[("POST /pair", response)]).await
+    }
+
+    /// The body of the one request a fake host was sent, read by its Content-Length.
+    async fn request_body(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("the request head");
+            head.push(byte[0]);
+        }
+        let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        let length = text
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; length];
+        stream
+            .read_exact(&mut body)
+            .await
+            .expect("the request body");
+        body
+    }
+
+    /// A host that answers the offer with a MAC it computes from the request, as a real one
+    /// does, and pads the answer with an unknown field up to `total` bytes. The client must
+    /// read it: a real answer is a few hundred bytes, and the cap is 16 KiB.
+    async fn padded_host(code: &str, total: usize) -> SocketAddr {
+        let key = accounts::code_key(&accounts::normalize_code(code).expect("a valid code"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free loopback port for the padded host");
+        let addr = listener.local_addr().expect("the bound address");
+        let host_id = uuid::Uuid::new_v4();
+        let credential_id = uuid::Uuid::new_v4();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let sent: accounts::PairRequest =
+                serde_json::from_slice(&request_body(&mut stream).await).expect("a PairRequest");
+            let nc: [u8; 16] = hex::decode(&sent.nc)
+                .expect("nc is hex")
+                .try_into()
+                .expect("16 bytes");
+            let h: [u8; 32] = hex::decode(&sent.h)
+                .expect("h is hex")
+                .try_into()
+                .expect("32 bytes");
+            let mac = accounts::pair_response_mac(
+                &key,
+                &nc,
+                &h,
+                &host_id,
+                &credential_id,
+                "ana",
+                "pc-lab-1",
+                "madre",
+            );
+            let mut doc = serde_json::json!({
+                "v": 1, "host_id": host_id, "host_name": "madre",
+                "credential_id": credential_id, "account": "ana", "label": "pc-lab-1",
+                "mac": hex::encode(mac), "pad": "",
+            });
+            let bare = doc.to_string().len();
+            doc["pad"] = serde_json::json!("x".repeat(total.saturating_sub(bare)));
+            let answer = doc.to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                answer.len()
+            );
+            let _ = stream.write_all(format!("{head}{answer}").as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        addr
+    }
+
+    /// The weight is what decides which of several failures is the one reported.
+    #[test]
+    fn a_refusal_outweighs_an_impostor_which_outweighs_a_network_error() {
+        assert_eq!(PairError::Refused.weight(), 3);
+        assert_eq!(PairError::Impostor.weight(), 2);
+        assert_eq!(PairError::Transport(String::new()).weight(), 1);
+        assert_eq!(PairError::NotFound(String::new()).weight(), 1);
+    }
+
+    #[test]
+    fn a_host_name_is_one_word_without_a_slash_and_never_empty() {
+        for name in ["madre", "madre.local", "mi-pc", "1madre", "192.168.0.10"] {
+            assert!(
+                is_hostname(name),
+                "{name:?} is a host name the resolver can take"
+            );
+        }
+        for text in ["", "mi pc", "a/b", "madre\tlocal"] {
+            assert!(!is_hostname(text), "{text:?} is not a host name");
+        }
+    }
+
+    /// Of several candidates that all failed, the most telling failure is the one reported: a
+    /// refusal beats an impostor, which beats a network error. Between two of the same weight
+    /// the first one seen is kept.
+    #[tokio::test]
+    async fn the_most_telling_failure_of_the_candidates_is_the_one_reported() {
+        let key = [9u8; 32];
+        let timing = tiny_timing();
+        let (refusing, _) = host_with_code().await;
+        refusing.set_pair(PairMode::Refuse(String::new()));
+        let impostor = impostor_host().await;
+        let silent = Closer::start().await;
+        let other_silent = Closer::start().await;
+        let (refused_at, impostor_at) = (refusing.addr(), impostor.addr());
+        let (silent_at, other_at) = (silent.addr(), other_silent.addr());
+
+        let err = offer_to_each(&[refused_at, silent_at], &key, "mi-pc", &timing, &client())
+            .await
+            .expect_err("nobody paired");
+        assert_eq!(
+            err.to_string(),
+            REFUSED,
+            "a refusal beats a network error, though the network error came first"
+        );
+
+        let err = offer_to_each(
+            &[impostor_at, refused_at],
+            &key,
+            "mi-pc",
+            &timing,
+            &client(),
+        )
+        .await
+        .expect_err("nobody paired");
+        assert_eq!(
+            err.to_string(),
+            REFUSED,
+            "a refusal beats an impostor that came first"
+        );
+
+        let err = offer_to_each(&[silent_at, impostor_at], &key, "mi-pc", &timing, &client())
+            .await
+            .expect_err("nobody paired");
+        assert!(
+            matches!(err, PairError::Impostor),
+            "an impostor beats a network error that came first. Got: {err}"
+        );
+
+        let err = offer_to_each(&[silent_at, other_at], &key, "mi-pc", &timing, &client())
+            .await
+            .expect_err("nobody paired");
+        assert_eq!(
+            err.to_string(),
+            format!("{silent_at} no contestó"),
+            "two network errors of the same weight: the first one seen is the one kept"
+        );
+    }
+
+    /// The cap is 16 KiB. A 2 KiB answer with the host's own MAC is read and the code is
+    /// paired; one of 17 KiB is refused for its size, whatever its MAC says.
+    #[tokio::test]
+    async fn an_answer_of_a_few_kilobytes_is_read_and_one_past_the_cap_is_refused() {
+        let code = accounts::generate_code();
+        let key = accounts::code_key(&accounts::normalize_code(&code).expect("a valid code"));
+
+        let within = padded_host(&code, 2048).await;
+        let state = offer(within, &key, "mi-pc", &tiny_timing(), &client())
+            .await
+            .expect("a 2 KiB answer with the right MAC is inside the 16 KiB limit");
+        assert_eq!(state.device_label, "pc-lab-1");
+
+        let beyond = padded_host(&code, 17 * 1024).await;
+        let err = offer(beyond, &key, "mi-pc", &tiny_timing(), &client())
+            .await
+            .expect_err("17 KiB is past the limit, whatever its MAC says");
+        assert!(
+            matches!(err, PairError::Impostor),
+            "an answer past the limit is refused as an impostor's. Got: {err}"
         );
     }
 }

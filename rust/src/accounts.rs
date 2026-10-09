@@ -1019,6 +1019,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ct_eq_does_not_cancel_two_differences_against_each_other() {
+        assert!(
+            !ct_eq(&[1, 1], &[0, 0]),
+            "two bytes that each differ in the same bit must not compare equal: an accumulator \
+             that XORs the differences cancels them to zero and would accept a wrong secret"
+        );
+        assert!(
+            !ct_eq(&[0x0f, 0xf0], &[0xf0, 0x0f]),
+            "two differing bytes whose XOR is the same in both positions must not compare equal: \
+             the fold has to OR the differences, so any one of them is enough to refuse"
+        );
+    }
+
     // ── P6 ────────────────────────────────────────────────────────────────────────
 
     #[test]

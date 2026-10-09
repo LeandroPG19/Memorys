@@ -588,4 +588,125 @@ mod tests {
             "no file means this device is not paired, which `bridge run` reports itself"
         );
     }
+
+    /// Only a missing file means "not paired": any other read failure must stay an error, or
+    /// a broken state file would look like a device that never paired.
+    #[test]
+    fn a_state_path_that_cannot_be_read_is_an_error_and_not_an_unpaired_device() {
+        let dir = TempDir::new("unreadable");
+        let err = match read_state(dir.path()) {
+            Ok(found) => panic!(
+                "a directory read as a state (present: {}); only a missing file means not paired",
+                found.is_some()
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:#}").contains("cannot read"),
+            "the operator must learn the file could not be read. Got: {err:#}"
+        );
+    }
+
+    /// The port fields are optional in a file written before they existed: the defaults are
+    /// the bridge's real ports, not zero.
+    #[test]
+    fn a_state_file_without_the_port_fields_reads_with_the_default_ports() {
+        let dir = TempDir::new("default-ports");
+        let path = state_file(&dir);
+        write_state(&path, &sample(), Target::Linux, &mut ScriptedRunner::idle())
+            .expect("a development write");
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the state file"))
+                .expect("it is JSON");
+        let fields = document.as_object_mut().expect("an object");
+        fields.remove("host_port");
+        fields.remove("port");
+        std::fs::write(&path, document.to_string()).expect("the file is written back");
+
+        let state = read_state(&path)
+            .expect("a file without the port fields still reads")
+            .expect("and exists");
+
+        assert_eq!(
+            state.host_port, DEFAULT_HOST_PORT,
+            "the host's port defaults to the one the host listens on"
+        );
+        assert_eq!(
+            state.port, DEFAULT_BRIDGE_PORT,
+            "the bridge's loopback port defaults to the one the client config names"
+        );
+    }
+
+    const ADDR_A: &str = "10.0.5.20:8787";
+    const ADDR_B: &str = "10.0.5.21:8787";
+    const ADDR_C: &str = "10.0.5.22:8787";
+
+    fn sa(text: &str) -> SocketAddr {
+        text.parse().expect("an address")
+    }
+
+    fn with_addresses(addresses: &[&str], last_good: Option<&str>) -> BridgeState {
+        let known: Vec<SocketAddr> = addresses
+            .iter()
+            .map(|a| a.parse::<SocketAddr>().expect("an address"))
+            .collect();
+        let last: Option<SocketAddr> = last_good.map(sa);
+        Identity::new().state(8787, known, last)
+    }
+
+    #[test]
+    fn a_host_at_the_head_of_the_list_and_last_good_needs_no_rewrite() {
+        let state = with_addresses(&[ADDR_A, ADDR_B], Some(ADDR_A));
+        assert!(
+            state.healed(sa(ADDR_A)).is_none(),
+            "nothing changed, so nothing is written"
+        );
+    }
+
+    #[test]
+    fn a_host_that_answers_where_it_is_last_good_but_not_first_takes_the_head() {
+        let state = with_addresses(&[ADDR_A, ADDR_B], Some(ADDR_B));
+        let healed = state
+            .healed(sa(ADDR_B))
+            .expect("the head of the list is stale, so the state changes");
+        assert_eq!(healed.addresses, vec![sa(ADDR_B), sa(ADDR_A)]);
+        assert_eq!(healed.last_good, Some(sa(ADDR_B)));
+    }
+
+    #[test]
+    fn a_host_that_answers_at_the_head_but_not_as_last_good_becomes_last_good() {
+        let state = with_addresses(&[ADDR_A, ADDR_B], Some(ADDR_B));
+        let healed = state
+            .healed(sa(ADDR_A))
+            .expect("the last good address moves, so the state changes");
+        assert_eq!(healed.addresses, vec![sa(ADDR_A), sa(ADDR_B)]);
+        assert_eq!(healed.last_good, Some(sa(ADDR_A)));
+    }
+
+    #[test]
+    fn a_host_that_is_last_good_but_not_first_moves_to_the_front_once() {
+        let state = with_addresses(&[ADDR_B, ADDR_A], Some(ADDR_A));
+        let healed = state
+            .healed(sa(ADDR_A))
+            .expect("the head of the list is stale, so the state changes");
+        assert_eq!(
+            healed.addresses,
+            vec![sa(ADDR_A), sa(ADDR_B)],
+            "the address appears once, at the front, and the others keep their order"
+        );
+    }
+
+    #[test]
+    fn a_new_address_goes_first_and_the_known_ones_keep_their_order() {
+        let state = with_addresses(&[ADDR_A, ADDR_B], Some(ADDR_A));
+        let healed = state
+            .healed(sa(ADDR_C))
+            .expect("a new address changes the state");
+        assert_eq!(
+            healed.addresses,
+            vec![sa(ADDR_C), sa(ADDR_A), sa(ADDR_B)],
+            "a new answer is remembered and the addresses already known are kept, not dropped"
+        );
+        assert_eq!(healed.last_good, Some(sa(ADDR_C)));
+    }
 }

@@ -1460,4 +1460,90 @@ mod tests {
         );
         assert_eq!(w.host.mcp_requests().len(), 3);
     }
+
+    /// `shutdown` returns only once the listener is gone, so the same port can be bound at
+    /// once. The bind is tried straight after the call, with no yield in between.
+    #[tokio::test]
+    async fn shutdown_releases_the_port_before_it_returns() {
+        let id = Identity::new();
+        let state = id.state(8787, vec![], None);
+        let prepared = Harness::prepare(&state, FakeNet::new());
+        let handle = start(0, prepared.bridge.clone())
+            .await
+            .expect("the bridge starts on a free loopback port");
+        let port = handle.local_addr().port();
+
+        handle.shutdown().await;
+
+        assert!(
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
+            "a bridge that was shut down still holds 127.0.0.1:{port}: a restart on the same \
+             port would fail with `address in use`"
+        );
+    }
+
+    /// Dropping the handle stops the listener without a `shutdown`. The aborted task releases
+    /// the port only when the runtime runs it, so the check yields between tries (no sleep),
+    /// for a bounded number of tries.
+    #[tokio::test]
+    async fn dropping_the_handle_stops_the_listener() {
+        let id = Identity::new();
+        let state = id.state(8787, vec![], None);
+        let prepared = Harness::prepare(&state, FakeNet::new());
+        let handle = start(0, prepared.bridge.clone())
+            .await
+            .expect("the bridge starts on a free loopback port");
+        let port = handle.local_addr().port();
+
+        drop(handle);
+
+        let mut released = false;
+        for _ in 0..100 {
+            if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+                released = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            released,
+            "a dropped bridge kept listening on 127.0.0.1:{port}: the listener must go with the \
+             handle"
+        );
+    }
+
+    /// The health page is a `GET`. A `POST` to it is not a health check: it gets the 404 of any
+    /// unknown route, and the host is not asked.
+    #[tokio::test]
+    async fn the_health_page_answers_only_a_get() {
+        let w = world().await;
+
+        let reply = w.h.send("POST", "/bridge/health", &[], b"").await;
+
+        assert_eq!(
+            reply.status, 404,
+            "only GET is the health page; a POST to it must not return the bridge's state"
+        );
+        assert!(
+            w.host.seen().is_empty(),
+            "a route the bridge does not serve never reaches the host"
+        );
+    }
+
+    /// A `Connection` header names the headers that are hop-by-hop for that one connection,
+    /// in any case, and across as many `Connection` lines as the client sends.
+    #[test]
+    fn a_connection_header_names_its_own_hop_by_hop_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::CONNECTION,
+            HeaderValue::from_static("Close, X-Hop-Tag"),
+        );
+        headers.append(header::CONNECTION, HeaderValue::from_static("x-more"));
+
+        assert_eq!(
+            named_by_connection(&headers),
+            vec!["close", "x-hop-tag", "x-more"],
+        );
+    }
 }

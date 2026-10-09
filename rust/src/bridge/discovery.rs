@@ -566,6 +566,7 @@ mod tests {
     };
     use super::*;
     use crate::accounts;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -1184,6 +1185,207 @@ mod tests {
             asked <= 8 && skipped >= 32 && asked + skipped == 40,
             "in 300 ms at 4 at a time, 200 ms each, at most 8 can be asked; the rest must be \
              reported as 'no probado (tiempo agotado)'. Asked {asked}, skipped {skipped}"
+        );
+    }
+
+    /// An address nothing listens on: bound and let go, so a connect to it is refused at once.
+    fn refused_address() -> SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
+        let at = probe.local_addr().expect("the bound address");
+        drop(probe);
+        at
+    }
+
+    /// One answer, with the status line and body given, to the one request it reads. A
+    /// RawRecorder only answers 200, and a non-2xx with a body is what this needs.
+    async fn answer_once(status_line: &'static str, body: String) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free loopback port");
+        let at = listener.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                match stream.read(&mut byte).await {
+                    Ok(1) => head.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let reply = format!(
+                "{status_line}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        at
+    }
+
+    /// A MemoryIndustry identity answer of `total` bytes, padded with an unknown field.
+    fn identity_padded_to(host_id: Uuid, total: usize) -> String {
+        let mut doc = serde_json::json!({
+            "service": SERVICE, "host_id": host_id, "name": "madre",
+            "credential": "revoked", "pad": "",
+        });
+        let bare = doc.to_string().len();
+        doc["pad"] = serde_json::json!("x".repeat(total.saturating_sub(bare)));
+        doc.to_string()
+    }
+
+    /// An impostor is the loudest failure after a revoked or unknown credential, and it is
+    /// not the same news as a host that was never found.
+    #[test]
+    fn an_impostor_verdict_is_reported_as_an_impostor_and_not_as_a_missing_host() {
+        let found = Discovery {
+            verified: None,
+            attempts: vec![Attempt {
+                candidate: Candidate {
+                    addr: addr("192.168.0.30:8787"),
+                    source: Source::Stored,
+                },
+                outcome: Outcome::Checked(Verdict::Impostor),
+            }],
+        };
+
+        assert_eq!(
+            found.failure(),
+            Some(Failure::Impostor),
+            "an answer that could not prove it is the host is an impostor, not a host that was \
+             not found"
+        );
+    }
+
+    /// Each way a transport can fail has its own word, which the operator reads in
+    /// `bridge doctor`. The words are the contract, so the exact strings are asserted.
+    #[tokio::test]
+    async fn a_transport_failure_is_named_by_a_word_for_each_way_it_can_fail() {
+        let id = Identity::new();
+        let state = id.state(8787, vec![], None);
+        let silent = Tarpit::start().await;
+        let hung_up = Closer::start().await;
+
+        assert_eq!(
+            check_identity(&client(), silent.addr(), &state, [7u8; 16], ms(50)).await,
+            Verdict::NoAnswer("tiempo agotado".to_string()),
+            "a host that holds the connection past the limit is a timeout"
+        );
+        assert_eq!(
+            check_identity(&client(), refused_address(), &state, [7u8; 16], ms(300)).await,
+            Verdict::NoAnswer("conexión rechazada o sin ruta".to_string()),
+            "nothing listens at the address: the connect is refused"
+        );
+        assert_eq!(
+            check_identity(&client(), hung_up.addr(), &state, [7u8; 16], ms(300)).await,
+            Verdict::NoAnswer("cerró la conexión sin responder".to_string()),
+            "a peer that accepts and hangs up answers nothing"
+        );
+    }
+
+    /// The connect a sweep probe makes first: a listening port is reachable, a refused one
+    /// is not, and a sweep must not ask a port that is not.
+    #[tokio::test]
+    async fn reachable_tells_a_listening_port_from_a_refused_one() {
+        let listening = Closer::start().await;
+
+        assert!(
+            reachable(listening.addr(), ms(500)).await,
+            "a port that accepts a connect is reachable"
+        );
+        assert!(
+            !reachable(refused_address(), ms(500)).await,
+            "a port nothing listens on is not reachable"
+        );
+    }
+
+    /// The limit is 64 KiB. A 2 KiB identity is read. The `*` to `+` mutant reads the limit
+    /// as 1 KiB + 64 bytes, and it is that mutant this refuses.
+    #[tokio::test]
+    async fn an_identity_of_two_kilobytes_is_read_and_not_refused_for_its_size() {
+        let id = Identity::new();
+        let body = identity_padded_to(id.host_id, 2048);
+        let host = RawRecorder::start(&[("GET /identity", body)]).await;
+
+        assert_eq!(
+            check(&id, host.addr()).await,
+            Verdict::Revoked,
+            "a 2 KiB answer is inside the 64 KiB limit and says what the credential is"
+        );
+    }
+
+    /// Exactly the limit is read; one byte more is not. The Content-Length check is the one
+    /// that refuses early, before the body is read.
+    #[tokio::test]
+    async fn an_identity_of_exactly_the_limit_is_read_and_one_byte_more_is_not() {
+        let id = Identity::new();
+        let at_limit = identity_padded_to(id.host_id, MAX_IDENTITY_BYTES);
+        assert_eq!(
+            at_limit.len(),
+            MAX_IDENTITY_BYTES,
+            "anchor: the helper builds the boundary it claims"
+        );
+        let host = RawRecorder::start(&[("GET /identity", at_limit)]).await;
+        assert_eq!(
+            check(&id, host.addr()).await,
+            Verdict::Revoked,
+            "64 KiB is the limit itself, and the limit is read"
+        );
+
+        let over = identity_padded_to(id.host_id, MAX_IDENTITY_BYTES + 1);
+        let host = RawRecorder::start(&[("GET /identity", over)]).await;
+        assert_eq!(
+            check(&id, host.addr()).await,
+            Verdict::NotMemoryIndustry,
+            "one byte past the limit is not read as an identity"
+        );
+    }
+
+    /// Anything that is not 2xx is not an identity, whatever body it carries. The body here
+    /// is a valid revoked identity, so only the status decides.
+    #[tokio::test]
+    async fn an_answer_that_is_not_2xx_is_not_memory_industry_even_with_an_identity_body() {
+        let id = Identity::new();
+        let body = identity_json(id.host_id, "revoked", None);
+        let not_found = answer_once("HTTP/1.1 404 Not Found", body.clone()).await;
+        let ok = answer_once("HTTP/1.1 200 OK", body).await;
+
+        assert_eq!(
+            check(&id, ok).await,
+            Verdict::Revoked,
+            "anchor: the same body under a 200 is a revoked identity"
+        );
+        assert_eq!(
+            check(&id, not_found).await,
+            Verdict::NotMemoryIndustry,
+            "a 404 is not this service, even when its body reads like one"
+        );
+    }
+
+    /// The sweep is over at the first host that proves itself, whatever the silent
+    /// candidates before it did. The host here is the only one that answers.
+    #[tokio::test]
+    async fn the_sweep_finds_the_host_among_silent_candidates() {
+        let id = Identity::new();
+        let host = FakeHost::start(id.host_id, vec![id.fake_cred()]).await;
+        let silent = Closer::start().await;
+        let state = id.state(host.addr().port(), vec![], None);
+        let net = FakeNet::new().sweep(vec![silent.addr(), host.addr()]);
+
+        let found = discover(&state, &net, &tiny_timing(), &client()).await;
+
+        assert_eq!(
+            found.verified,
+            Some(host.addr()),
+            "a silent candidate in the sweep does not end it: the host that proves itself wins"
+        );
+        assert_eq!(
+            net.sweeps(),
+            1,
+            "the stored and named candidates found nothing, so the sweep ran"
         );
     }
 }

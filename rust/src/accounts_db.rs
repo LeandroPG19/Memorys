@@ -674,6 +674,187 @@ pub async fn account_facts(pool: &PgPool) -> Result<AccountFacts> {
         active_credentials: active,
         revoked_credentials: revoked,
         fingerprint: accounts::fingerprint(&host_identity(pool).await?.host_id),
-        ..AccountFacts::default()
+        // Filled in by `doctor` from this process; the database has no say in them, so they
+        // stay at their defaults here. Written out, not `..default()`: a functional update makes
+        // cargo-mutants emit `delete field` mutants that --exclude-re cannot match.
+        require_accounts: false,
+        shared_token: false,
+        lan_bind: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone};
+
+    fn at(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 9, hour, minute, second)
+            .single()
+            .expect("a valid instant")
+    }
+
+    /// `connect_lazy` only parses the URL and never dials it. Each test that gets this pool must
+    /// be refused before its first query, or it would wait out the timeout and fail there.
+    fn pool_that_is_never_dialled() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://accounts-db-test:unused@127.0.0.1:63999/does-not-exist")
+            .expect("connect_lazy only parses the URL, it does not dial the network")
+    }
+
+    /// One row of `list_accounts`: an account, and optionally one of its devices.
+    fn listed(account: u128, name: &str, device: Option<(u128, &str)>) -> ListRow {
+        let created = at(8, 0, 0);
+        (
+            Uuid::from_u128(account),
+            name.to_string(),
+            created,
+            None,
+            device.map(|(id, _)| Uuid::from_u128(id)),
+            device.map(|(_, label)| label.to_string()),
+            device.map(|_| created + Duration::minutes(5)),
+            None,
+            None,
+        )
+    }
+
+    fn candidate(expires_at: DateTime<Utc>) -> PairingCandidate {
+        PairingCandidate {
+            id: Uuid::from_u128(7),
+            code_key: [0; 32],
+            expires_at,
+            used_at: None,
+            account_revoked: false,
+        }
+    }
+
+    #[test]
+    fn key32_takes_exactly_32_bytes_and_names_the_column_it_refuses() {
+        let want: [u8; 32] = std::array::from_fn(|i| 2 + i as u8);
+        assert_eq!(
+            key32(want.to_vec(), "code_key").expect("32 bytes are a key"),
+            want,
+            "the bytes come back as stored: a key that is not the stored one never matches the \
+             code it was made from"
+        );
+        for len in [31, 33] {
+            let err = key32(vec![9; len], "secret_hash").expect_err("only 32 bytes are a key");
+            let want_text = format!("secret_hash holds {len} bytes, expected 32");
+            assert!(
+                format!("{err:#}").contains(&want_text),
+                "a {len}-byte value is refused, and the message names the column: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn fold_keeps_one_row_per_account_and_its_devices_in_the_order_they_came() {
+        let folded = fold_accounts(vec![
+            listed(1, "ana", Some((11, "pc-1"))),
+            listed(1, "ana", Some((12, "pc-2"))),
+            listed(2, "zed", None),
+        ]);
+        let names: Vec<&str> = folded.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["ana", "zed"],
+            "two rows of ana are one account with two devices, and zed, who has none, is still \
+             listed"
+        );
+        let devices: Vec<&str> = folded[0]
+            .credentials
+            .iter()
+            .map(|c| c.device_label.as_str())
+            .collect();
+        assert_eq!(
+            devices,
+            ["pc-1", "pc-2"],
+            "ana's devices, in the order the rows gave them"
+        );
+        assert!(
+            folded[1].credentials.is_empty(),
+            "zed has no device, and none is invented for it"
+        );
+    }
+
+    #[test]
+    fn a_code_is_redeemable_strictly_before_its_expiry_and_expired_at_it() {
+        let expiry = at(12, 0, 30);
+        let c = candidate(expiry);
+        assert_eq!(
+            classify_candidate(&c, expiry - Duration::seconds(1)),
+            CandidateState::Redeemable,
+            "one second before the expiry the code is still redeemable"
+        );
+        assert_eq!(
+            classify_candidate(&c, expiry),
+            CandidateState::Expired,
+            "at the expiry instant itself the code is expired: the rule is now < expires_at"
+        );
+        assert_eq!(
+            classify_candidate(&c, expiry + Duration::seconds(1)),
+            CandidateState::Expired,
+            "and one second after it, still expired"
+        );
+    }
+
+    #[test]
+    fn a_used_code_and_a_revoked_account_are_judged_before_the_clock() {
+        let expiry = at(12, 0, 30);
+        let used = PairingCandidate {
+            used_at: Some(expiry - Duration::hours(1)),
+            ..candidate(expiry)
+        };
+        assert_eq!(
+            classify_candidate(&used, expiry + Duration::days(1)),
+            CandidateState::Used,
+            "a code that was used reads as Used, even long after it expired"
+        );
+        let revoked = PairingCandidate {
+            account_revoked: true,
+            ..candidate(expiry)
+        };
+        assert_eq!(
+            classify_candidate(&revoked, expiry - Duration::seconds(1)),
+            CandidateState::AccountRevoked,
+            "a revoked account refuses its codes even while they are still in time"
+        );
+    }
+
+    #[test]
+    fn the_issued_event_names_the_account_and_a_device_only_when_one_was_fixed() {
+        assert_eq!(
+            issued_payload("ana", None),
+            json!({"account": "ana", "actor": "cli"}),
+            "without --device the event names the account and who issued it, and no device"
+        );
+        assert_eq!(
+            issued_payload("ana", Some("pc-lab-1")),
+            json!({"account": "ana", "actor": "cli", "device": "pc-lab-1"}),
+            "with --device the event also names the device the code is fixed to"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_issue_is_refused_before_the_database_for_a_bad_name_or_label() {
+        let pool = pool_that_is_never_dialled();
+        let now = at(12, 0, 0);
+
+        let err = prepare_issue(&pool, "a b", None, now)
+            .await
+            .expect_err("a name with a space is not an account");
+        assert!(
+            format!("{err:#}").contains("account name"),
+            "the refusal must name the rule that failed: {err:#}"
+        );
+
+        let err = prepare_issue(&pool, "ana", Some("pc \"lab\""), now)
+            .await
+            .expect_err("a device label with quotes is not a device");
+        assert!(
+            format!("{err:#}").contains("device label"),
+            "the refusal must name the label rule: {err:#}"
+        );
+    }
 }

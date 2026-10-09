@@ -415,4 +415,76 @@ mod tests {
             "and the verdict line stays last. Report:\n{report}"
         );
     }
+
+    /// The window holds thirty candidates and says nothing about leaving any out. Past it,
+    /// the count is exactly the candidates that did not fit: forty minus thirty is ten.
+    #[test]
+    fn the_window_lists_thirty_candidates_and_counts_the_rest_exactly() {
+        let sweep = |n: u32| -> Vec<Attempt> {
+            (1..=n)
+                .map(|i| no_answer(Source::Sweep, &format!("10.0.0.{i}:8787")))
+                .collect()
+        };
+
+        let thirty = attempt_lines(&sweep(30));
+        assert_eq!(
+            thirty.len(),
+            30,
+            "a window that holds every candidate lists them and no count. Got: {thirty:?}"
+        );
+        assert!(
+            thirty.iter().all(|line| !line.starts_with("(+")),
+            "nothing was left out, so no line may count what was left out. Got: {thirty:?}"
+        );
+
+        let forty = attempt_lines(&sweep(40));
+        assert_eq!(
+            forty.len(),
+            31,
+            "thirty candidates and one line that counts the other ten. Got: {forty:?}"
+        );
+        assert_eq!(
+            forty.last().map(String::as_str),
+            Some("(+10 candidatos más sin respuesta o sin probar, no listados)"),
+            "the count is what did not fit: 40 - 30"
+        );
+    }
+
+    /// The fingerprint on the last line is the one of the candidate whose address was
+    /// verified. Another candidate's fingerprint, even one that verified first, is not the
+    /// one the operator compares with the host's own.
+    #[test]
+    fn the_last_line_carries_the_fingerprint_of_the_verified_address_only() {
+        let verified_at = |at: &str, fingerprint: &str| {
+            tried(
+                Source::Sweep,
+                at,
+                Verdict::Verified {
+                    fingerprint: fingerprint.to_string(),
+                },
+            )
+        };
+        let found = Discovery {
+            verified: Some(addr("192.168.0.20:8787")),
+            attempts: vec![
+                verified_at("192.168.0.10:8787", "1111-2222-3333-4444"),
+                verified_at("192.168.0.20:8787", FINGERPRINT),
+            ],
+        };
+        assert_eq!(
+            render_report(&found, None).lines().last(),
+            Some("madre: 192.168.0.20:8787 (huella 5F3A-91C2-77D0-AB14)"),
+            "the host line names the fingerprint of the address that verified"
+        );
+
+        let elsewhere = Discovery {
+            verified: Some(addr("192.168.0.20:8787")),
+            attempts: vec![verified_at("192.168.0.10:8787", FINGERPRINT)],
+        };
+        assert_eq!(
+            render_report(&elsewhere, None).lines().last(),
+            Some("madre: 192.168.0.20:8787"),
+            "no candidate at the verified address carries a fingerprint, so none is claimed"
+        );
+    }
 }

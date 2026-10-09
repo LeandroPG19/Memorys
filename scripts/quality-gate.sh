@@ -27,7 +27,7 @@ qg_mutants_jobs() {
 # Every --exclude-re entry of the mutation step, in one place so that the
 # exclusion checks below read exactly what the mutation run is handed. Each
 # entry's reason, owner and expiry date are in the comment over that step.
-MUTANTS_EXCLUDE_RE='fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false|src/redact\.rs:110:63: replace > with >= in credentials_in_url|src/redact\.rs:130:58: replace > with >= in secret_field|src/redact\.rs:136:51: replace \+ with \* in secret_field|src/cognitive/nli\.rs:.*replace enabled -> bool with |src/cognitive/nli\.rs:.*replace status_resolved -> bool with false|src/cognitive/nli\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace compute_embedding -> Result<Vec<f32>> with Ok\(vec!|src/http\.rs:1462:24: replace && with \|\| in embedder_state|src/(calibrate_cli|dashboard|dedupe_cli|export|link_cli|reembed_cli|rem_cli|secure_cli|skills_cli|sync_cli|eval/mod)\.rs:.*replace run_cli -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace print_help with \(\)|src/setup\.rs:.*replace log with \(\)|src/dashboard\.rs:.*replace render -> Result<String> with |src/search/calibrate\.rs:.*replace load_ood_threshold -> Option<f64> with |src/export\.rs:.*replace export_obsidian -> Result<usize> with |src/db\.rs:.*replace assert_embedding_dim -> Result<\(\)> with Ok\(\(\)\)|src/dedupe_cli\.rs:.*replace merge_by_name -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace run_rem_consolidation_locked -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace download_(model|runtime) -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace spawn_handshake_watchdog with \(\)|src/embeddings/onnx\.rs:.*replace locate_onnxruntime -> Option<PathBuf> with Some\(Default::default\(\)\)|src/main\.rs:.*replace async_main with \(\)|src/db\.rs:.*replace bind_app_role -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace init_schema -> Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace provision_app_role with \(\)|src/db\.rs:.*replace provision_app_role_from_pgpass with \(\)|src/db\.rs:.*replace write_app_role_password -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/embeddings/onnx\.rs:.*replace load_onnxruntime -> Result<\(\)> with Ok\(\(\)\)|src/embeddings/onnx\.rs:.*replace load_located_onnxruntime -> Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace migrate_and_provision -> Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace migrate -> Result<\(\), MigrateError> with Ok\(\(\)\)|src/db\.rs:.*replace realign_then_migrate -> Result<\(\), MigrateError> with Ok\(\(\)\)|src/db\.rs:.*replace realign_line_ending_checksums -> sqlx::Result<\(\)> with Ok\(\(\)\)'
+MUTANTS_EXCLUDE_RE='fetch_adjacency|list_resources|read_resource|run_checks_with|upsert_symbol|upsert_placeholder_entity|backfill_unscoped|observation_in_scope|run_project|run_check|run_write|workspace_client_id|http.rs.*serve_pool|gpu.rs.*gpu_availability|gpu.rs.*cuda_provider|resources.rs.*replace apply|rerank.rs.*failure_reason|http.rs.*mcp_endpoint|http.rs.*replace panel |http.rs.*warm_reranker_eagerly|llm_cli.rs.*judge_is_sampling |rerank.rs.*warm_up|rerank.rs.*score_off_runtime|rerank.rs.*score_one_chunk|rerank.rs.*score_pairs|nli.rs.*replace init |onnx.rs.*init_onnx_session|gpu.rs.*replace wants_gpu -> bool with false|gpu.rs.*preferred_device_var|gpu.rs.*compiled_provider.*with None|http.rs.*compiled_gpu_provider.*with None|service.rs.*replace restrict -> Result<bool> with Ok.false|src/redact\.rs:110:63: replace > with >= in credentials_in_url|src/redact\.rs:130:58: replace > with >= in secret_field|src/redact\.rs:136:51: replace \+ with \* in secret_field|src/cognitive/nli\.rs:.*replace enabled -> bool with |src/cognitive/nli\.rs:.*replace status_resolved -> bool with false|src/cognitive/nli\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace failure_reason -> Option<String> with None|src/embeddings/onnx\.rs:.*replace compute_embedding -> Result<Vec<f32>> with Ok\(vec!|src/http\.rs:1462:24: replace && with \|\| in embedder_state|src/(calibrate_cli|dashboard|dedupe_cli|export|link_cli|reembed_cli|rem_cli|secure_cli|skills_cli|sync_cli|eval/mod)\.rs:.*replace run_cli -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace print_help with \(\)|src/setup\.rs:.*replace log with \(\)|src/dashboard\.rs:.*replace render -> Result<String> with |src/search/calibrate\.rs:.*replace load_ood_threshold -> Option<f64> with |src/export\.rs:.*replace export_obsidian -> Result<usize> with |src/db\.rs:.*replace assert_embedding_dim -> Result<\(\)> with Ok\(\(\)\)|src/dedupe_cli\.rs:.*replace merge_by_name -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace run_rem_consolidation_locked -> Result<\(\)> with Ok\(\(\)\)|src/models_cli\.rs:.*replace download_(model|runtime) -> Result<\(\)> with Ok\(\(\)\)|src/protocol\.rs:.*replace spawn_handshake_watchdog with \(\)|src/embeddings/onnx\.rs:.*replace locate_onnxruntime -> Option<PathBuf> with Some\(Default::default\(\)\)|src/main\.rs:.*replace async_main with \(\)|src/db\.rs:.*replace bind_app_role -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace init_schema -> Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace provision_app_role with \(\)|src/db\.rs:.*replace provision_app_role_from_pgpass with \(\)|src/db\.rs:.*replace write_app_role_password -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/embeddings/onnx\.rs:.*replace load_onnxruntime -> Result<\(\)> with Ok\(\(\)\)|src/embeddings/onnx\.rs:.*replace load_located_onnxruntime -> Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace migrate_and_provision -> Result<\(\)> with Ok\(\(\)\)|src/db\.rs:.*replace migrate -> Result<\(\), MigrateError> with Ok\(\(\)\)|src/db\.rs:.*replace realign_then_migrate -> Result<\(\), MigrateError> with Ok\(\(\)\)|src/db\.rs:.*replace realign_line_ending_checksums -> sqlx::Result<\(\)> with Ok\(\(\)\)|src/http\.rs:.*replace \|\| with && in identify_account|src/http\.rs:.*replace != with == in identify_account|src/http\.rs:.*delete ! in identify_account|src/http\.rs:.*replace pair_answer -> Option<PairResponse> with None|src/http\.rs:.*delete ! in claim_and_answer|src/http\.rs:.*replace credential_proof -> Result<\(&\x27static str, Option<String>\)> with Ok\(\("", None\)\)|src/http\.rs:.*replace credential_proof -> Result<\(&\x27static str, Option<String>\)> with Ok\(\("", Some\(String::new\(\)\)\)\)|src/http\.rs:.*replace credential_proof -> Result<\(&\x27static str, Option<String>\)> with Ok\(\("xyzzy", None\)\)|src/http\.rs:.*replace credential_proof -> Result<\(&\x27static str, Option<String>\)> with Ok\(\("", Some\("xyzzy"\.into\(\)\)\)\)|src/http\.rs:.*replace credential_proof -> Result<\(&\x27static str, Option<String>\)> with Ok\(\("xyzzy", Some\(String::new\(\)\)\)\)|src/http\.rs:.*replace credential_proof -> Result<\(&\x27static str, Option<String>\)> with Ok\(\("xyzzy", Some\("xyzzy"\.into\(\)\)\)\)|src/http\.rs:.*replace != with == in credential_proof|src/accounts_db\.rs:.*replace record_pair_redeemed -> Result<\(\)> with Ok\(\(\)\)|src/accounts_db\.rs:.*replace list_accounts -> Result<Vec<AccountSummary>> with Ok\(vec!\[\]\)|src/accounts_db\.rs:.*replace lock_account -> Result<Uuid> with Ok\(Default::default\(\)\)|src/accounts_db\.rs:.*replace > with < in revoke_rows|src/accounts_db\.rs:.*replace > with >= in revoke_rows|src/accounts_db\.rs:.*replace revoke_device -> Result<usize> with Ok\(0\)|src/accounts_db\.rs:.*replace revoke_device -> Result<usize> with Ok\(1\)|src/accounts_db\.rs:.*replace ensure_code_capacity -> Result<\(\)> with Ok\(\(\)\)|src/accounts_db\.rs:.*replace \+ with - in store_code|src/accounts_db\.rs:.*replace pairing_candidates -> Result<Vec<PairingCandidate>> with Ok\(vec!\[\]\)|src/accounts_db\.rs:.*replace - with \+ in pairing_candidates|src/accounts_db\.rs:.*replace == with != in claim_pairing_code|src/accounts_db\.rs:.*replace credential_for_auth -> Result<Option<CredentialRow>> with Ok\(None\)|src/accounts_db\.rs:.*replace touch_last_seen -> Result<\(\)> with Ok\(\(\)\)|src/accounts_db\.rs:.*replace purge_pairing_codes -> Result<u64> with Ok\(1\)|src/accounts_db\.rs:.*replace purge_pairing_codes -> Result<u64> with Ok\(0\)|src/accounts_db\.rs:.*replace - with \+ in purge_pairing_codes|src/accounts_db\.rs:.*replace < with > in account_facts|src/accounts_db\.rs:.*replace < with <= in account_facts'
 
 echo "=== quality-gate (MemoryIndustry — CRAP/lizard + mutación del diff) ==="
 echo "NO MIRA: SIL (fmt, clippy -D, tests --ignored, e2e, deny, audit, codigo-muerto, crap-gate floor, mutants-gate mmr/rrf/cache)."
@@ -1215,6 +1215,138 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     `cargo mutants -- --lib` never runs
           #                     rust/tests/, so here all four would still come
           #                     back MISSED: the exclusion stays for --lib only.
+          #
+          # A ninth group: the twelve survivors of the 0.29 head in rust/src/http.rs
+          # that need a database. Each sits in an async function that asks
+          # accounts_db (brain_account_credentials, brain_pairing_codes) and has
+          # no pool under --lib, so no unit test reaches the branch that decides.
+          # The tests that kill them are in rust/tests/v029_accounts_over_real_http.rs:
+          # they start a real daemon over a scratch database and check what a
+          # client sees (status, body, audit events). The SIL's plain `cargo test`
+          # runs that file with DATABASE_URL set (scripts/run-all-tests.sh, line
+          # with `cargo test`, no --ignored). This judge runs `cargo mutants -- --lib`,
+          # which never builds a file under rust/tests/, so here all twelve would
+          # still come back MISSED: the exclusion stays for --lib only.
+          # Every pattern names the function and the replacement that survived, not
+          # the line:col, so the sibling mutants of the same function stay judged
+          # where a unit test reaches them. The `'` of `&'static str` is written
+          # `\x27`: the pattern sits inside a single-quoted bash string.
+          # Owner: endurecedor 0.29. Expires: 2027-03-22.
+          #
+          #   identify_account, three mutants: `||` to `&&` on the credential state
+          #   check, `!=` to `==` on it, and `!` deleted from `!accounts::ct_eq`.
+          #                     Judged by
+          #                     v029_accounts_over_real_http::g10_a_revoked_device_or_account_stops_on_the_very_next_request:
+          #                     a revoked device with its right secret must be a 401
+          #                     with «invalid bearer token» on the very next request,
+          #                     and every live credential must still answer 200 before
+          #                     the revocation. The `||` to `&&` mutant admits the
+          #                     revoked device; the `!=` and `!` mutants refuse the
+          #                     live ones. Also judged by
+          #                     v029_accounts_over_real_http::g11_every_kind_of_bad_credential_is_a_401_that_counts_toward_the_brake,
+          #                     which wants a 401 for an existing id with the wrong secret.
+          #
+          #   pair_answer with None
+          #                     the host's signed answer to a redemption. With None a
+          #                     valid code answers 503 where the proof belongs.
+          #                     Judged by
+          #                     v029_accounts_over_real_http::g4_pairing_creates_the_credential_and_the_host_proves_it_knew_the_code:
+          #                     the valid code must answer 200 with a MAC that verify_mac
+          #                     accepts under the key derived from the code.
+          #
+          #   claim_and_answer, `!` deleted from `if !created`
+          #                     a first redemption must record exactly one
+          #                     account.pair_redeemed audit event, and a replay none.
+          #                     Without the `!` the first redemption answers as a
+          #                     replay and records nothing. Judged by the same g4 test,
+          #                     which counts the events for the one redemption it makes.
+          #
+          #   credential_proof, seven mutants: six replacements of the whole return
+          #   value (`Ok(("", None))` and the other five), and `!=` to `==` on the
+          #   state check. The /identity verdict and proof come only from the
+          #   database. Judged by
+          #   v029_accounts_over_real_http::g2_g3_identity_proves_knowledge_of_an_active_credential_and_only_that:
+          #   an active credential must answer "active" with the proof the client
+          #   computes over the host, the credential and the nonce; a revoked one
+          #   "revoked" with no proof; a credential nobody issued "unknown" with no
+          #   proof. Each replacement answers a verdict that is none of those.
+          #
+          # The same shape as the groups above: each entry says what the mutant breaks, which test
+          # kills it, and why --lib cannot see that test. Nothing here is a cover. Every test named was
+          # read in rust/tests/ and asserts the observable the mutant changes.
+          #
+          # Needs a database, which --lib has no pool for (precedent: the db.rs groups above). Judged by
+          # rust/tests/v029_accounts_storage.rs. That file creates and drops its own database and carries
+          # no #[ignore], so the plain DATABASE_URL cargo test of run-all-tests.sh runs it. `cargo mutants
+          # -- --lib` never builds a file under rust/tests/, so each of these would still come back MISSED
+          # under --lib: the kill happens in the SIL, out of the mutation's sight.
+          #   accounts_db.rs list_accounts with Ok(vec![])
+          #                     the_list_is_ordered_by_name_and_carries_each_device_without_a_secret
+          #                     wants ["ana", "zed"] back from list_accounts and gets nothing.
+          #   accounts_db.rs lock_account with Ok(Uuid::default())
+          #                     revoking_an_account_revokes_its_devices_deletes_its_unused_codes_and_can_be_repeated
+          #                     wants report.credentials_revoked == 3; the nil id revokes nothing.
+          #   accounts_db.rs revoke_rows, `>` with `<`
+          #                     the same test: it wants an account.revoke audit event naming ana.
+          #   accounts_db.rs revoke_rows, `>` with `>=`
+          #                     the same test: after the repeat it wants exactly one account.revoke
+          #                     event (assert_eq! on events.len() == 1), so a second write is caught.
+          #   accounts_db.rs revoke_device with Ok(0) and with Ok(1)
+          #                     revoking_a_device_matches_its_label_in_any_case_and_only_that_account
+          #                     wants revoked == 2 and an error for an unmatched label.
+          #   accounts_db.rs ensure_code_capacity with Ok(())
+          #                     at_most_50_codes_are_active_at_once_and_expired_ones_do_not_count
+          #                     wants the 51st active code refused, saying too many active pairing codes.
+          #   accounts_db.rs store_code, `+` with `-`
+          #                     a_pairing_code_expires_after_exactly_24_hours_and_is_stored_only_as_a_key
+          #                     wants issued.expires_at == issue instant + 24 hours.
+          #   accounts_db.rs credential_for_auth with Ok(None)
+          #                     the_authentication_lookup_returns_the_hash_the_account_the_label_and_the_state
+          #                     expects the credential that was paired to be found.
+          #   accounts_db.rs touch_last_seen with Ok(())
+          #                     last_seen_is_written_at_most_once_a_minute
+          #                     wants the first touch recorded as last_seen_at.
+          #   accounts_db.rs purge_pairing_codes with Ok(1), with Ok(0), and `-` with `+`
+          #                     the_purge_removes_codes_used_or_expired_over_a_week_ago_and_keeps_the_rest
+          #                     wants purged == 2 and the right rows kept.
+          #
+          # Owner: endurecedor 0.29. Expires: 2027-03-22.
+          #
+          # Needs a database, which --lib has no pool for. Judged by rust/tests/v029_accounts_redeem.rs,
+          # plain DATABASE_URL run, no #[ignore]. The same reason as the group above: --lib never builds
+          # rust/tests/.
+          #
+          #   accounts_db.rs pairing_candidates with Ok(vec![])
+          #   accounts_db.rs pairing_candidates, `-` with `+`
+          #                     used_and_expired_codes_stay_listed_for_a_week_so_they_can_be_told_apart
+          #                     wants the code listed 6 days after issue and not listed 8 days after.
+          #   accounts_db.rs claim_pairing_code, `==` with `!=`
+          #                     a_code_is_used_once_and_the_second_claim_creates_nothing
+          #                     wants the first claim of a valid code to be Created.
+          #
+          # Owner: endurecedor 0.29. Expires: 2027-03-22.
+          #
+          # Needs a database and a running daemon. Judged by rust/tests/v029_accounts_over_real_http.rs,
+          # plain DATABASE_URL run, no #[ignore]. --lib cannot start the real daemon on its loopback ports.
+          #
+          #   accounts_db.rs record_pair_redeemed with Ok(())
+          #                     g4_pairing_creates_the_credential_and_the_host_proves_it_knew_the_code
+          #                     wants exactly one account.pair_redeemed event, naming ana and pc-lab-1.
+          #   accounts_db.rs account_facts, `<` with `>`
+          #                     g16_a_database_without_the_account_tables_is_a_doctor_failure_not_a_crash
+          #                     wants account_facts to answer on a database without the tables.
+          #   accounts_db.rs account_facts, `<` with `<=`
+          #                     g16_account_facts_count_what_the_database_holds_and_doctor_prints_them
+          #                     wants tables_present true on a migrated database.
+          #
+          # Owner: endurecedor 0.29. Expires: 2027-03-22.
+          #
+          # Not an exclusion: a change of production code, so there is no mutant to exclude.
+          # accounts_db.rs account_facts used to end in `..AccountFacts::default()`, a functional update
+          # that makes cargo-mutants emit five `delete field X from struct AccountFacts` mutants, and
+          # --exclude-re does not match those (27.1.0). The struct literal now writes all eight fields out.
+          # The three added fields (require_accounts, shared_token, lan_bind) are false, which is what
+          # the derived Default gave them, so the values did not change. The mutants no longer exist.
           diff_file="$(mktemp)"
           # Same base as the file list above, or the two halves of this judge
           # would disagree about what "the change" is.

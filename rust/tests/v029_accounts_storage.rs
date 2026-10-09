@@ -537,6 +537,11 @@ async fn revoking_an_account_revokes_its_devices_deletes_its_unused_codes_and_ca
             events.iter().any(|e| e["account"] == json!("ana")),
             "the revocation is in the audit chain, naming the account: {events:?}"
         );
+        assert_eq!(
+            events.len(),
+            1,
+            "one revocation is one account.revoke event: the repeat changed nothing and must write none"
+        );
         let audit = whole_audit_text(&pool).await;
         for secret in &known {
             for hidden in [secret.to_hex(), hex::encode(secret.hash())] {

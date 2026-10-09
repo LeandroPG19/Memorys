@@ -539,4 +539,54 @@ mod tests {
              the real one:\n{text}"
         );
     }
+
+    /// `connect_lazy` only parses the URL and never dials it. Each test that gets this pool must
+    /// be refused before its first query, or it would wait out the timeout and fail there.
+    fn pool_that_is_never_dialled() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://accounts-cli-test:unused@127.0.0.1:63999/does-not-exist")
+            .expect("connect_lazy only parses the URL, it does not dial the network")
+    }
+
+    #[tokio::test]
+    async fn the_operator_commands_refuse_a_bad_name_before_the_database() {
+        let pool = pool_that_is_never_dialled();
+        let now = at(12, 0, 0);
+
+        let err = pair(&pool, "a b", None, now)
+            .await
+            .expect_err("a name with a space must not get a pairing code");
+        assert!(
+            format!("{err:#}").contains("account name"),
+            "`account pair` must say which part was refused: {err:#}"
+        );
+
+        let err = revoke_device(&pool, "a b", "pc-1", now)
+            .await
+            .expect_err("a name with a space must not revoke a device");
+        assert!(
+            format!("{err:#}").contains("account name"),
+            "`account revoke-device` must say which part was refused: {err:#}"
+        );
+
+        let err = execute(&pool, Command::Add { name: "a b".into() }, now)
+            .await
+            .expect_err("a name with a space must not create an account");
+        assert!(
+            format!("{err:#}").contains("account name"),
+            "`account add` must say which part was refused: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cli_refuses_an_unknown_command_before_the_database() {
+        let err = run_cli(&argv(&["bogus"]))
+            .await
+            .expect_err("an unknown command must exit non-zero, not succeed silently");
+        assert!(
+            format!("{err:#}").contains("unknown account command"),
+            "the refusal must name the problem: {err:#}"
+        );
+    }
 }

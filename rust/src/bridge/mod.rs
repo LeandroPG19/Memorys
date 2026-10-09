@@ -144,10 +144,16 @@ impl Network for SystemNetwork {
     fn own_ipv4_towards(&self, peer: IpAddr) -> Option<Ipv4Addr> {
         let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
         socket.connect((peer, 9)).ok()?;
-        match socket.local_addr().ok()?.ip() {
-            IpAddr::V4(own) if !own.is_unspecified() => Some(own),
-            _ => None,
-        }
+        usable_source(socket.local_addr().ok()?.ip())
+    }
+}
+
+/// The source address the OS picked for a connected socket, when a sweep can start from it:
+/// `0.0.0.0` has no subnet to sweep, and an IPv6 source has no IPv4 /24.
+fn usable_source(source: IpAddr) -> Option<Ipv4Addr> {
+    match source {
+        IpAddr::V4(own) if !own.is_unspecified() => Some(own),
+        _ => None,
     }
 }
 
@@ -445,6 +451,12 @@ fn default_label() -> String {
     let raw = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_default();
+    label_from(&raw)
+}
+
+/// What a raw machine name becomes as a label. Split from `default_label` so the rule is
+/// tested without touching the process environment.
+fn label_from(raw: &str) -> String {
     let kept: String = raw
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || "._- ".contains(*c))
@@ -705,7 +717,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::fake_host::{FakeNet, ManualClock, TempDir, deps};
+    use super::fake_host::{FakeNet, Identity, ManualClock, TempDir, deps};
     use super::*;
 
     /// H24
@@ -749,6 +761,221 @@ mod tests {
         assert!(
             !state_path.exists(),
             "refusing to run must not create a state file as a side effect"
+        );
+    }
+
+    /// A bridge's core with no search behind it: the answers `ready` and `label` give
+    /// without a discovery. `verified` carries the instant the address was checked.
+    fn core_at(verified: Option<(SocketAddr, Instant)>, failure: Option<Failed>) -> Core {
+        let mut freshness = Freshness::default();
+        let verified = verified.map(|(addr, at)| {
+            freshness.verified_at(at);
+            addr
+        });
+        Core {
+            state: Arc::new(Identity::new().state(8787, vec![], None)),
+            freshness,
+            verified,
+            failure,
+        }
+    }
+
+    fn failed(at: Instant, refusal: Refusal) -> Option<Failed> {
+        Some(Failed { at, refusal })
+    }
+
+    #[test]
+    fn each_refusal_says_its_status_and_whether_it_is_a_revocation() {
+        assert_eq!(Refusal::Revoked.status(), 401);
+        assert_eq!(Refusal::Unknown.status(), 401);
+        assert_eq!(
+            Refusal::Busy.status(),
+            503,
+            "a search still running asks the caller to retry; it does not blame the host"
+        );
+        assert_eq!(Refusal::NotFound(String::new()).status(), 502);
+        assert_eq!(Refusal::Impostor(String::new()).status(), 502);
+        assert_eq!(Refusal::MayHaveArrived(String::new()).status(), 502);
+        assert!(Refusal::Revoked.is_revocation());
+        assert!(Refusal::Unknown.is_revocation());
+        for other in [
+            Refusal::Busy,
+            Refusal::NotFound(String::new()),
+            Refusal::Impostor(String::new()),
+            Refusal::MayHaveArrived(String::new()),
+            Refusal::WrongHost {
+                pinned: String::new(),
+                seen: String::new(),
+            },
+        ] {
+            assert!(!other.is_revocation(), "{other:?} is not a revocation");
+        }
+    }
+
+    #[test]
+    fn a_search_that_tried_no_address_says_so_and_does_not_list_nothing() {
+        let nothing = Refusal::NotFound(String::new()).message();
+        assert!(
+            nothing.contains("no hay ninguna dirección que probar"),
+            "an empty list of tried addresses is named as such. Got: {nothing}"
+        );
+        assert_eq!(
+            Refusal::NotFound("10.0.5.20:8787".to_string()).message(),
+            "no se encontró la madre. Probado: 10.0.5.20:8787",
+            "a search that tried addresses lists them"
+        );
+    }
+
+    #[test]
+    fn a_failure_answers_until_its_window_ends_and_a_revocation_has_its_own_window() {
+        let t = Timing {
+            revoked_recheck: Duration::from_secs(10),
+            rescan_cooldown: Duration::from_secs(60),
+            ..Timing::production()
+        };
+        let t0 = Instant::now();
+
+        let rescan = core_at(None, failed(t0, Refusal::NotFound(String::new())));
+        assert!(
+            rescan.ready(t0 + Duration::from_secs(59), &t).is_some(),
+            "inside the rescan cooldown the failure is answered without a search"
+        );
+        assert!(
+            rescan.ready(t0 + Duration::from_secs(60), &t).is_none(),
+            "at the end of the cooldown the bridge searches again: the window is `<`, not `<=`"
+        );
+
+        let revoked = core_at(None, failed(t0, Refusal::Revoked));
+        assert!(
+            revoked.ready(t0 + Duration::from_secs(9), &t).is_some(),
+            "a revoked device is answered inside its own, shorter, window"
+        );
+        assert!(
+            revoked.ready(t0 + Duration::from_secs(10), &t).is_none(),
+            "and rechecked when that window ends, not when the rescan cooldown does"
+        );
+    }
+
+    #[test]
+    fn the_label_names_what_the_bridge_knows_and_why_it_knows_no_more() {
+        let t = Timing::production();
+        let now = Instant::now();
+        let addr: SocketAddr = "10.0.5.20:8787".parse().expect("an address");
+
+        assert_eq!(core_at(Some((addr, now)), None).label(now, &t), "verified");
+        assert_eq!(
+            core_at(None, failed(now, Refusal::Revoked)).label(now, &t),
+            "revoked",
+            "a revoked credential is labelled as such, so the operator knows to pair again"
+        );
+        assert_eq!(
+            core_at(None, failed(now, Refusal::NotFound(String::new()))).label(now, &t),
+            "unreachable",
+            "a host that was not found is unreachable, not revoked"
+        );
+        assert_eq!(core_at(None, None).label(now, &t), "unverified");
+    }
+
+    #[test]
+    fn the_default_state_path_ends_in_the_bridge_file() {
+        let path = default_state_path().expect("a home or local app data to keep the state in");
+        assert!(
+            path.ends_with(STATE_BASENAME),
+            "the state lives in the bridge's own file, not in a bare directory. Got: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn a_machine_name_becomes_a_label_that_keeps_its_inside_and_loses_the_rest() {
+        assert_eq!(label_from("pc-02"), "pc-02", "a plain name is the label");
+        assert_eq!(
+            label_from("  .-PC 02 "),
+            "PC 02",
+            "leading punctuation and spaces go; the inside stays"
+        );
+        assert_eq!(
+            label_from("ñ/*"),
+            "device",
+            "when nothing usable is left the label is the fixed word"
+        );
+        assert_eq!(label_from(""), "device");
+        assert_eq!(
+            label_from(&"x".repeat(60)).len(),
+            40,
+            "a label is at most 40 characters"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_literal_address_resolves_to_itself() {
+        assert_eq!(
+            SystemNetwork.resolve("127.0.0.1").await,
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            "an address written as a number is its own answer, and it is listed"
+        );
+        assert_eq!(
+            SystemNetwork.resolve("::1").await,
+            vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)],
+        );
+    }
+
+    #[test]
+    fn the_own_address_towards_loopback_is_loopback() {
+        assert_eq!(
+            SystemNetwork.own_ipv4_towards(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Some(Ipv4Addr::LOCALHOST),
+            "a UDP connect to loopback sends nothing and reports the loopback source"
+        );
+    }
+
+    #[test]
+    fn only_a_real_ipv4_source_can_start_a_sweep() {
+        assert_eq!(
+            usable_source(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))),
+            Some(Ipv4Addr::new(192, 168, 1, 20))
+        );
+        assert_eq!(
+            usable_source(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            None,
+            "0.0.0.0 has no subnet to sweep"
+        );
+        assert_eq!(
+            usable_source(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            None,
+            "an IPv6 source has no IPv4 /24"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cli_refuses_a_line_it_cannot_read_before_it_touches_the_disk() {
+        let bogus: Vec<String> = vec!["bogus".to_string()];
+        let err = match run_cli(&bogus).await {
+            Ok(()) => panic!("`bridge bogus` must be refused, not run"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:#}").contains("unknown subcommand"),
+            "the reader is told the subcommand is unknown. Got: {err:#}"
+        );
+        let no_code: Vec<String> = vec!["pair".to_string()];
+        assert!(
+            run_cli(&no_code).await.is_err(),
+            "`bridge pair` without a code cannot pair and must not reach the network"
+        );
+    }
+
+    /// `pair` reads the code before it looks for a host or writes a state file, so a symbol
+    /// outside the pairing alphabet is refused on this machine with no network and no disk.
+    #[tokio::test]
+    async fn the_pair_cli_refuses_a_mistyped_code_before_any_network_or_state_write() {
+        let err = match cli_pair("!", None, Some("pc-02".to_string()), None).await {
+            Ok(()) => panic!("a code with a symbol outside the alphabet must not pair"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:#}").contains("código mal escrito"),
+            "the operator is told the code is mistyped, not shown a network error. Got: {err:#}"
         );
     }
 }
@@ -852,6 +1079,26 @@ mod parse_tests {
         assert!(
             refused("").contains("subcommand"),
             "`bridge` alone must say that it needs a subcommand"
+        );
+    }
+
+    /// I7 (a flag nobody defined is named even after the code, not taken for a second code)
+    #[test]
+    fn an_unknown_flag_after_the_code_is_named_by_it() {
+        assert!(
+            refused("pair K7QM-3WXP-9HNR --bogus").contains("--bogus"),
+            "`--bogus` is an option the parser does not know: it must be named, not reported as \
+             a second pairing code"
+        );
+    }
+
+    /// I7 (`run` takes the port flag and nothing else)
+    #[test]
+    fn run_takes_no_flag_but_the_port() {
+        assert!(
+            refused("run --bogus 9000").contains("usage: memory-industry bridge run"),
+            "`run` answers any flag but `--port` with its usage line, so the reader sees the one \
+             form that exists"
         );
     }
 

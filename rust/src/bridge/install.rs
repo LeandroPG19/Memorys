@@ -497,4 +497,57 @@ mod tests {
             "without --print the same commands reach the runner"
         );
     }
+
+    /// A call that exits 0 is reported as ok, and one that does not is reported with the code
+    /// it exited with: the operator reads which of the two happened.
+    #[test]
+    fn uninstall_says_ok_for_each_call_that_worked_and_the_code_for_each_that_did_not() {
+        let mut all_fine = Schtasks::answering(&[]);
+        let lines = run_uninstall(&mut all_fine).expect("both calls exit 0");
+        assert_eq!(
+            lines,
+            vec![
+                r#"ok: schtasks /End /TN "MemoryIndustry Bridge""#.to_string(),
+                r#"ok: schtasks /Delete /TN "MemoryIndustry Bridge" /F"#.to_string(),
+            ],
+            "a call that exited 0 is ok, and both did"
+        );
+
+        let mut not_running = Schtasks::answering(&[(
+            "/End",
+            1,
+            "ERROR: There is no running instance of the task.",
+        )]);
+        let lines = run_uninstall(&mut not_running).expect("a task not running is not an error");
+        assert!(
+            lines[0].starts_with(
+                r#"schtasks /End /TN "MemoryIndustry Bridge" answered 1 (nothing to do"#
+            ),
+            "the /End that exited 1 is reported with its code. Got: {}",
+            lines[0]
+        );
+        assert_eq!(
+            lines[1], r#"ok: schtasks /Delete /TN "MemoryIndustry Bridge" /F"#,
+            "the /Delete that exited 0 is still ok"
+        );
+    }
+
+    /// The code a command exited with is what the operator reads; a command the machine killed
+    /// has no code, and says so.
+    #[test]
+    fn a_command_that_exits_names_its_code_and_one_that_is_killed_says_so() {
+        let exited = CommandOutcome {
+            code: Some(5),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let killed = CommandOutcome {
+            code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+
+        assert_eq!(exit_word(&exited), "5");
+        assert_eq!(exit_word(&killed), "killed");
+    }
 }
