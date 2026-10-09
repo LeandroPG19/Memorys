@@ -2,8 +2,14 @@
 # regla de firewall + arranque sin sesion). Sirve para ensayarlo en una PC propia
 # y para repetirlo en el equipo real con el menor tiempo posible.
 #
+#   ENSAYO-se-desinstala-al-final.cmd   (doble clic, PC de ensayo)  o  INSTALAR-EQUIPO-REAL.cmd
+#                                    (hacen todo lo de abajo con UN reinicio; ver LEEME.txt)
+#   .\ensayo-madre.ps1              (= -Fase Todo; sin -Conservar retira todo al final)
+#   .\ensayo-madre.ps1 -Fase Humo   (prueba de 2 minutos, solo lectura, no instala nada)
+#
+# Cada fase tambien se puede usar por separado:
 #   .\ensayo-madre.ps1 -Fase Antes   [-Ip 192.168.0.10] [-Puerto 8797]   (consola de administrador)
-#   Restart-Computer                 (REINICIAR, no apagar; y no iniciar sesion)
+#   (reiniciar desde el menu de Windows: Reiniciar, no Apagar)
 #   .\ensayo-madre.ps1 -Fase Despues                                      (consola de administrador)
 #   .\ensayo-madre.ps1 -Fase Limpiar [-BorrarEnv]                         (solo en el ensayo)
 #
@@ -21,11 +27,14 @@
 # para comparar antes y despues del reinicio.
 [CmdletBinding()]
 param(
-    # 'Arranque' no es una fase para el operador: es lo que ejecuta la tarea
+    # 'Humo' es una prueba de solo lectura (y el primer paso de Todo). 'Todo' es la fase
+    # por omision: humo, Antes, un reinicio y, al volver a iniciar
+    # sesion, Despues y Limpiar solas. 'Final' es lo que ejecuta la tarea de inicio de
+    # sesion que Todo arma. 'Arranque' no es una fase para el operador: es lo que ejecuta la tarea
     # memory-industry-ensayo-reinicio al arrancar el equipo, antes de que nadie
     # inicie sesion. Vive en este mismo fichero para que el paquete lleve uno solo.
-    [ValidateSet('Antes', 'Despues', 'Limpiar', 'Arranque')]
-    [string]$Fase,
+    [ValidateSet('Todo', 'Humo', 'Antes', 'Despues', 'Limpiar', 'Arranque', 'Final')]
+    [string]$Fase = 'Todo',
     [string]$Binario,
     [string]$Ip,
     # 8797: lejos de 8787/8788, que la guia ya avisa que pueden estar ocupados en
@@ -41,7 +50,10 @@ param(
     [switch]$Forzar,
     # En Despues: matar el daemon otra vez, ahora que la repeticion de 5 minutos del
     # BootTrigger ya corre (antes del primer reinicio no puede estar activa).
-    [switch]$MatarTrasReinicio
+    [switch]$MatarTrasReinicio,
+    # En Todo: al terminar NO retirar lo instalado (el equipo real se queda con el
+    # servicio; el ensayo en una PC propia lo retira).
+    [switch]$Conservar
 )
 
 # ---------------------------------------------------------------------------
@@ -54,6 +66,8 @@ param(
 $script:NombreTarea = 'memory-industry'
 $script:NombreRegla = 'memory-industry'
 $script:TareaReinicio = 'memory-industry-ensayo-reinicio'
+$script:TareaDespues = 'memory-industry-ensayo-despues'
+$script:ArchivoSumas = 'SHA256SUMS.txt'
 $script:ArchivoEnv = 'memory-industry.env'
 $script:ArchivoLauncher = 'memory-industry.cmd'
 $script:ArchivoXml = 'memory-industry-task.xml'
@@ -74,12 +88,16 @@ $script:UmbralReinicioRapidoSeg = 100
 # M1 paso 5: tras el reinicio, el /health responde a <= 5 min.
 $script:UmbralArranqueSistemaSeg = 300
 $script:EsperaArranqueMin = 10
+# Cuanto espera la fase Final a que la comprobacion del arranque termine su medicion:
+# su vigilancia (EsperaArranqueMin) mas un minuto de margen.
+$script:EsperaMedicionSeg = ($script:EsperaArranqueMin + 1) * 60
 $script:TimeoutSaludMs = 4000
 
 $script:Checks = New-Object System.Collections.ArrayList
 $script:Lineas = New-Object System.Collections.ArrayList
 $script:Codigo = 0
 $script:Ctx = $null
+$script:ModoTodo = $false
 
 # ===========================================================================
 # Funciones puras o casi puras: se prueban sin Windows (ver el final del fichero).
@@ -186,6 +204,8 @@ function Protect-Secreto {
     }
     $Texto = [regex]::Replace($Texto, '(?i)(CUBA_HTTP_TOKEN\s*=\s*)\S+', '$1<redactado>')
     $Texto = [regex]::Replace($Texto, '(?i)(Bearer\s+)\S+', '$1<redactado>')
+    # La clave de una URL de base de datos: postgresql://usuario:CLAVE@servidor/...
+    $Texto = [regex]::Replace($Texto, '(?i)(://[^:/\s]+:)[^@\s]+@', '$1<redactado>@')
     return [regex]::Replace($Texto, '\b[0-9A-Fa-f]{32,}\b', '<redactado-hex>')
 }
 
@@ -197,7 +217,7 @@ function Test-LineaError {
     param([string]$Linea)
     $l = $Linea.Trim()
     if ($l.Length -eq 0) { return $false }
-    if ($l.StartsWith('serve: ') -or $l.StartsWith('memory-industry:')) { return $true }
+    if ($l.StartsWith('serve: ') -or $l.StartsWith('memory-industry:') -or $l.StartsWith('[MemoryIndustry]')) { return $true }
     if ($l.StartsWith('{')) {
         try { $o = $l | ConvertFrom-Json; return ($o.level -eq 'ERROR') } catch { return $false }
     }
@@ -345,7 +365,23 @@ function Get-ChecksDespues {
         }
 
         $ses = $Arranque.sesion_al_primer_health
-        if ($null -eq $ses) {
+        $inicioProc = $null
+        if ($null -ne $Arranque.proceso) { $inicioProc = ConvertTo-Offset $Arranque.proceso.inicio }
+        $primera = ConvertTo-Offset $Actual.primera_sesion
+        if ($Antes.autologon -eq $true) {
+            & $add 'arranque_sin_sesion' 'AVISO' 'este equipo inicia sesion solo (AutoAdminLogon): no se puede demostrar el arranque sin sesion. El resto del ensayo sigue valiendo'
+        }
+        elseif ($null -ne $inicioProc -and $null -ne $primera) {
+            # Lo que importa es que el proceso ya existia antes de la primera sesion,
+            # no cuando entro el operador: asi puede iniciar sesion en cuanto quiera.
+            if ($inicioProc -lt $primera) {
+                & $add 'arranque_sin_sesion' 'PASA' ('el daemon arranco {0} y la primera sesion de usuario {1}' -f $inicioProc.ToString('HH:mm:ss'), $primera.ToString('HH:mm:ss'))
+            }
+            else {
+                & $add 'arranque_sin_sesion' 'FALLA' ('el daemon arranco {0}, despues de la primera sesion de usuario ({1}): no se demuestra que arranque con nadie conectado' -f $inicioProc.ToString('HH:mm:ss'), $primera.ToString('HH:mm:ss'))
+            }
+        }
+        elseif ($null -eq $ses) {
             & $add 'arranque_sin_sesion' 'AVISO' 'no se pudo determinar si habia una sesion de usuario cuando respondio el daemon'
         }
         elseif ($ses) {
@@ -438,6 +474,125 @@ function Get-OrdenesDesinstalar {
         if ($permitida) { [void]$ordenes.Add([pscustomobject]@{ Programa = $programa; Argumentos = $partes; Linea = $linea.Trim() }) }
     }
     return @($ordenes)
+}
+
+function Read-Sumas {
+    # `hash  nombre` o `hash *nombre` (sha256sum, modo texto o binario). Devuelve
+    # nombre -> hash en minusculas. Un @{} de PowerShell compara las claves sin
+    # distinguir mayusculas (como el sistema de ficheros de Windows), y el nombre se
+    # guarda tal cual para poder abrir el fichero tambien donde si las distinguen.
+    param([string]$Texto)
+    $mapa = @{}
+    foreach ($l in ($Texto -split "`r?`n")) {
+        if ($l -match '^\s*([0-9A-Fa-f]{64})\s+\*?(.+?)\s*$') { $mapa[$Matches[2]] = $Matches[1].ToLower() }
+    }
+    return $mapa
+}
+
+function Compare-Sumas {
+    # `Sumas` sale de Read-Sumas; `Reales` es nombre -> hash de lo que hay en disco
+    # (o $null si el fichero no esta). El binario es obligatorio: un paquete cuyo
+    # SHA256SUMS.txt no lo lista no demuestra nada sobre el .exe.
+    param($Sumas, $Reales)
+    $problemas = New-Object System.Collections.ArrayList
+    if (-not $Sumas.ContainsKey('memory-industry.exe')) {
+        [void]$problemas.Add('SHA256SUMS.txt no lista memory-industry.exe')
+    }
+    foreach ($nombre in @($Sumas.Keys | Sort-Object)) {
+        $real = $null
+        if ($Reales.ContainsKey($nombre)) { $real = $Reales[$nombre] }
+        if ([string]::IsNullOrEmpty($real)) { [void]$problemas.Add(('falta {0}' -f $nombre)) }
+        elseif ($real.ToLower() -ne $Sumas[$nombre]) { [void]$problemas.Add(('{0} no coincide con SHA256SUMS.txt (esperado {1}..., hay {2}...)' -f $nombre, $Sumas[$nombre].Substring(0, 12), $real.Substring(0, 12))) }
+    }
+    return @($problemas)
+}
+
+function Test-AutoLogonValor {
+    # HKLM\...\Winlogon\AutoAdminLogon vale "1" cuando el equipo inicia sesion solo.
+    param($Valor)
+    if ($null -eq $Valor) { return $false }
+    return ("$Valor".Trim() -eq '1')
+}
+
+function Test-RespuestaSi {
+    param([string]$Respuesta)
+    # S, s, SI, si, "si" con tilde. Vacio es NO. El acento se construye con [char] para
+    # que el fichero siga siendo ASCII.
+    if ($null -eq $Respuesta) { return $false }
+    return ($Respuesta.Trim().ToLower() -in @('s', 'si', ('s' + [string][char]0xED)))
+}
+
+function Get-ResumenTodo {
+    # Lo que se le dice a quien hace doble clic antes de preguntar por el reinicio.
+    param([string]$Direccion, [bool]$AutoLogon, [bool]$Conservar, [string]$Salida, $Avisos = @(), $SesionesAjenas = @(), $Pendientes = @())
+    $l = New-Object System.Collections.ArrayList
+    [void]$l.Add('Primera parte lista: todo salio bien.')
+    [void]$l.Add(('  - Se instalo MemoryIndustry como servicio de Windows en {0} (tarea programada y regla de firewall).' -f $Direccion))
+    [void]$l.Add('  - Se comprobo que responde, que vuelve solo si se detiene y que repetir la instalacion no la rompe.')
+    [void]$l.Add('')
+    [void]$l.Add('Ahora hay que REINICIAR el equipo, para comprobar que el servicio arranca solo.')
+    [void]$l.Add('  - Guarda lo que tengas abierto: el reinicio cierra los programas.')
+    [void]$l.Add('  - Al volver, inicia sesion cuando quieras: el resultado se abre solo.')
+    $aj = @($SesionesAjenas)
+    if ($aj.Count -gt 0) {
+        [void]$l.Add(('  - ATENCION: hay {0} sesion(es) de otras personas abiertas; el reinicio les cierra su trabajo:' -f $aj.Count))
+        foreach ($x in $aj) { [void]$l.Add(('      ' + $x)) }
+    }
+    if (@($Pendientes).Count -gt 0) { [void]$l.Add(('  - Windows ya tenia un reinicio pendiente por: {0}.' -f (@($Pendientes) -join ', '))) }
+    if ($AutoLogon) {
+        [void]$l.Add('')
+        [void]$l.Add('AVISO: este equipo inicia sesion solo, sin contrasena. La prueba "arranca sin que nadie inicie sesion"')
+        [void]$l.Add('no podra darse por valida. Todo lo demas (arranque, respuesta, firewall, token) se comprueba igual.')
+    }
+    $av = @($Avisos)
+    if ($av.Count -gt 0) {
+        [void]$l.Add('')
+        [void]$l.Add('Avisos de la primera parte (no impiden seguir):')
+        foreach ($x in $av) { [void]$l.Add(('  - {0}: {1}' -f $x.id, $x.detalle)) }
+    }
+    [void]$l.Add('')
+    if ($Conservar) { [void]$l.Add('Al terminar el servicio se queda instalado.') }
+    else { [void]$l.Add(('Al terminar se retira todo lo instalado (era un ensayo). El informe se conserva en {0}' -f $Salida)) }
+    return @($l)
+}
+
+function Format-Resultado {
+    # RESULTADO.txt: lo unico que lee quien hizo doble clic. Sin jerga: que paso, y si
+    # fallo, que fue.
+    param([string]$Veredicto, $Checks, [string]$Limpieza, $Arranque, [string]$Salida, [string]$Equipo, [string]$Fecha, $AvisosAntes = @())
+    $l = New-Object System.Collections.ArrayList
+    [void]$l.Add(('RESULTADO DEL ENSAYO DE MEMORYINDUSTRY: {0}' -f $Veredicto))
+    [void]$l.Add(('Equipo: {0}    Fecha: {1}' -f $Equipo, $Fecha))
+    [void]$l.Add('')
+    if ($Veredicto -eq 'PASA') {
+        [void]$l.Add('En palabras simples:')
+        [void]$l.Add('  El servicio se instalo, el equipo se reinicio y el servicio volvio a funcionar solo.')
+        $seg = $null
+        if ($null -ne $Arranque) { $seg = $Arranque.segundos_arranque_hasta_health }
+        if ($null -ne $seg) { [void]$l.Add(('  Respondio {0} despues de arrancar el equipo.' -f (Format-Seg $seg))) }
+    }
+    else {
+        [void]$l.Add('Algo no salio como se esperaba. Lo que fallo:')
+        foreach ($c in @($Checks | Where-Object { $_.resultado -eq 'FALLA' })) { [void]$l.Add(('  - {0}: {1}' -f $c.id, $c.detalle)) }
+    }
+    $avisos = @($Checks | Where-Object { $_.resultado -eq 'AVISO' })
+    if ($avisos.Count -gt 0) {
+        [void]$l.Add('')
+        [void]$l.Add('Avisos (no cambian el resultado):')
+        foreach ($c in $avisos) { [void]$l.Add(('  - {0}: {1}' -f $c.id, $c.detalle)) }
+    }
+    $aa = @($AvisosAntes)
+    if ($aa.Count -gt 0) {
+        [void]$l.Add('')
+        [void]$l.Add('Avisos de la primera parte (la instalacion):')
+        foreach ($c in $aa) { [void]$l.Add(('  - {0}: {1}' -f $c.id, $c.detalle)) }
+    }
+    [void]$l.Add('')
+    [void]$l.Add(('Limpieza: {0}' -f $Limpieza))
+    [void]$l.Add('')
+    [void]$l.Add('Pendiente a mano: desde OTRA maquina de la red, abrir http://<ip>:<puerto>/health. Es la unica prueba real del firewall.')
+    [void]$l.Add(('Detalle completo: {0}\informe.txt' -f $Salida.TrimEnd('\', '/')))
+    return (($l -join "`r`n") + "`r`n")
 }
 
 function Write-TextoArchivo {
@@ -666,6 +821,31 @@ function Get-InfoTarea {
     catch { return $null }
 }
 
+function Get-UsuarioActual {
+    # DOMINIO\usuario de quien ejecuta esto (ya elevado): la tarea de resultado tiene que
+    # ser de ESE usuario para abrir la ventana en su escritorio.
+    try { return [System.Security.Principal.WindowsIdentity]::GetCurrent().Name }
+    catch { return ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME) }
+}
+
+function Get-AutoLogon {
+    try {
+        return (Test-AutoLogonValor (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name AutoAdminLogon -ErrorAction Stop).AutoAdminLogon)
+    }
+    catch { return $false }
+}
+
+function Get-PrimeraSesion {
+    # Cuando empezo el primer escritorio interactivo de este arranque: el explorer.exe
+    # mas antiguo de una sesion > 0. $null si no se puede leer.
+    try {
+        $horas = @(Get-Process -Name explorer -ErrorAction Stop | Where-Object { $_.SessionId -gt 0 } | ForEach-Object { $_.StartTime } | Sort-Object)
+        if ($horas.Count -eq 0) { return $null }
+        return ([DateTimeOffset]$horas[0]).ToString('o')
+    }
+    catch { return $null }
+}
+
 function Get-DirTrabajo { return (Join-Path $env:ProgramData 'MemoryIndustryEnsayo') }
 
 function Get-DiagnosticoArranque {
@@ -804,7 +984,7 @@ function New-Contexto {
 
 function Test-PrerequisitosComunes {
     # Elevacion y plataforma: lo unico que Antes, Despues y Limpiar exigen igual.
-    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+    if (-not (Test-EsWindows)) {
         Stop-Rechazo 'este ensayo es para Windows (usa tareas programadas, netsh y el firewall de Windows)'
     }
     if (-not (Test-Elevado)) {
@@ -837,6 +1017,716 @@ function Resolve-Ip {
 }
 
 # ===========================================================================
+# Humo: prueba de 2 minutos, de SOLO LECTURA, antes de instalar nada
+# ===========================================================================
+
+$script:VersionEsperada = 'memory-industry 0.29.0'
+# Ensayo: una base que no existe, a proposito. `serve` arranca degradado y no toca
+# Docker ni ninguna base real del equipo.
+$script:UrlEnsayo = 'postgresql://ensayo:ensayo@127.0.0.1:1/brain'
+# Valor por omision del repositorio (docker-compose.yml / .env.example).
+$script:UrlPorOmision = 'postgresql://cuba:memorys2026@127.0.0.1:5488/brain'
+$script:ContenedorBase = 'memory-industry-db'
+$script:TextoDocker = 'Esto es ESPERABLE en un equipo con Docker Desktop justo despues de reiniciar: Docker arranca al INICIAR SESION, no al encender. El servicio arranca degradado (sin base) y recupera sus herramientas solo cuando Docker este arriba. Los bucles de fondo (rem y sync) solo arrancan en el siguiente reinicio del servicio.'
+$script:FilasHumo = New-Object System.Collections.ArrayList
+$script:UsuarioInteractivo = $null
+
+function New-Fila {
+    param([string]$Id, [string]$Estado, [string]$Detalle, [string]$Accion = '')
+    return [pscustomobject]@{ id = $Id; estado = $Estado; detalle = $Detalle; accion = $Accion }
+}
+
+function Get-VeredictoHumo {
+    # Un solo PARA basta: nada se instala con una fila en PARA.
+    param($Filas)
+    if (@($Filas | Where-Object { $_.estado -eq 'PARA' }).Count -gt 0) { return 'PARA' }
+    return 'OK'
+}
+
+function Format-FilaHumo {
+    param($Fila)
+    $l = '[{0,-5}] {1,-22} {2}' -f $Fila.estado, $Fila.id, $Fila.detalle
+    if ($Fila.accion) { $l += "`r`n" + (' ' * 9) + '-> ' + $Fila.accion }
+    return $l
+}
+
+function Test-MismoUsuario {
+    # DOMINIO\usuario: si los dos traen dominio se comparan enteros; si no, el nombre.
+    param([string]$A, [string]$B)
+    if ([string]::IsNullOrWhiteSpace($A) -or [string]::IsNullOrWhiteSpace($B)) { return $false }
+    $pa = @($A -split '\\')
+    $pb = @($B -split '\\')
+    if ($pa.Count -ge 2 -and $pb.Count -ge 2) { return ($A -ieq $B) }
+    return ($pa[$pa.Count - 1] -ieq $pb[$pb.Count - 1])
+}
+
+function Get-FilasCuentas {
+    param([bool]$Elevado, [string]$Instala, [string]$Interactivo)
+    $f = New-Object System.Collections.ArrayList
+    if ($Elevado) { [void]$f.Add((New-Fila 'elevacion' 'OK' 'esta consola es de administrador (fltmc responde)')) }
+    else { [void]$f.Add((New-Fila 'elevacion' 'PARA' 'esta consola NO es de administrador' 'Cierra esta ventana y usa el lanzador .cmd de la carpeta: pide el aviso de administrador. No se instalo nada.')) }
+    if ([string]::IsNullOrWhiteSpace($Interactivo)) {
+        [void]$f.Add((New-Fila 'cuenta' 'AVISO' ('se instalara con la cuenta {0}; no pude saber quien esta sentado delante (no hay explorer.exe en esta sesion)' -f $Instala) 'Comprueba que esa es tu cuenta.'))
+    }
+    elseif (Test-MismoUsuario $Instala $Interactivo) {
+        [void]$f.Add((New-Fila 'cuenta' 'OK' ('se instalara con la cuenta {0}, que es la de la persona sentada' -f $Instala)))
+    }
+    else {
+        [void]$f.Add((New-Fila 'cuenta' 'PARA' ('se instalaria con la cuenta {0}, pero la persona sentada es {1}' -f $Instala, $Interactivo) ('Cierra sesion, entra con {0} y repite el lanzador. Cuando salga el aviso de administrador acepta con "Si" SIN escribir otra contrasena. Asi el resultado se abre en tu escritorio.' -f $Interactivo)))
+    }
+    return @($f)
+}
+
+function Get-ProblemasRuta {
+    # Una ruta que entra en la tarea, el launcher o el env file tiene que ser ASCII y
+    # sin %: cmd.exe, schtasks y el XML la leen cada uno con su propia pagina de codigos.
+    param([string]$Ruta, [string]$TipoUnidad = '')
+    $p = New-Object System.Collections.ArrayList
+    if ([string]::IsNullOrEmpty($Ruta)) { [void]$p.Add('no hay ruta'); return @($p) }
+    if ($Ruta -match '[^\x20-\x7E]') { [void]$p.Add('tiene caracteres que no son ASCII (acentos, enies, simbolos)') }
+    if ($Ruta.Contains('%')) { [void]$p.Add('tiene un signo de porcentaje') }
+    if ($Ruta -match '^\\\\') { [void]$p.Add('esta en la red') }
+    elseif ($TipoUnidad -and $TipoUnidad -ne 'Fixed') { [void]$p.Add(('no esta en un disco fijo del equipo (es {0})' -f $TipoUnidad)) }
+    if ($Ruta -match '(?i)\\(OneDrive[^\\]*|Downloads|Descargas|Desktop|Escritorio)(\\|$)') { [void]$p.Add('esta en una carpeta sincronizada, de descargas o del escritorio') }
+    return @($p)
+}
+
+function Get-DirPaquete {
+    # A mano y no con Join-Path: asi se puede calcular (y probar) sin que la unidad exista.
+    $d = [string][System.IO.Path]::DirectorySeparatorChar
+    return ($env:ProgramData.TrimEnd('\', '/') + $d + 'MemoryIndustry' + $d + 'paquete')
+}
+
+function Test-EnCopiaProtegida {
+    param([string]$Carpeta)
+    if ([string]::IsNullOrEmpty($Carpeta) -or [string]::IsNullOrEmpty($env:ProgramData)) { return $false }
+    return ($Carpeta.TrimEnd('\', '/') -ieq (Get-DirPaquete).TrimEnd('\', '/'))
+}
+
+function Get-FilasPaquete {
+    param([string]$Carpeta, [string]$TipoUnidad, $ProblemasSumas, [bool]$EnCopiaProtegida, [bool]$ExigirCopiaProtegida)
+    $f = New-Object System.Collections.ArrayList
+    $pr = @(Get-ProblemasRuta $Carpeta $TipoUnidad)
+    if ($pr.Count -gt 0) { [void]$f.Add((New-Fila 'paquete_ruta' 'PARA' ('la carpeta del paquete {0}' -f ($pr -join '; ')) 'Descomprime el zip en C:\memory-industry-visita y repite.')) }
+    else { [void]$f.Add((New-Fila 'paquete_ruta' 'OK' ('carpeta del paquete: {0}' -f $Carpeta))) }
+    $ps = @($ProblemasSumas)
+    if ($ps.Count -gt 0) { [void]$f.Add((New-Fila 'paquete_sumas' 'PARA' ('SHA256SUMS.txt: {0}' -f ($ps -join '; ')) 'Vuelve a copiar el paquete original: el archivo se corrompio o no es el que se ensayo. No se instalo nada.')) }
+    else { [void]$f.Add((New-Fila 'paquete_sumas' 'OK' 'todos los ficheros coinciden con SHA256SUMS.txt')) }
+    if ($EnCopiaProtegida) { [void]$f.Add((New-Fila 'copia_protegida' 'OK' 'se ejecuta desde la copia protegida (solo SYSTEM y Administradores pueden modificarla)')) }
+    elseif ($ExigirCopiaProtegida) { [void]$f.Add((New-Fila 'copia_protegida' 'PARA' 'no se ejecuta desde la copia protegida de C:\ProgramData\MemoryIndustry\paquete' 'Usa el lanzador .cmd: copia el paquete a una carpeta que solo administradores pueden tocar y lo ejecuta desde alli.')) }
+    else { [void]$f.Add((New-Fila 'copia_protegida' 'AVISO' 'no se ejecuta desde la copia protegida (esta fase suelta no la exige)' 'El lanzador .cmd si la usa.')) }
+    return @($f)
+}
+
+function Get-DiagnosticoExe {
+    # Del resultado de `--version` (hasta dos intentos) y de lo que dejo Windows en sus
+    # registros, que le paso al .exe y que hacer. Una DLL que falta NO es el antivirus,
+    # aunque haya eventos de Defender en el registro: se miran despues.
+    param($Intentos, [bool]$DllPresente, $EventosDefender, $EventosPolitica, $EventosApp, [string]$Esperada)
+    $i = @($Intentos)
+    $ult = $i[$i.Count - 1]
+    $ev = @($EventosApp | Select-Object -First 2) -join ' | '
+    if (-not $ult.NoArranco -and -not $ult.Agotado -and $ult.Codigo -eq 0) {
+        $salida = $ult.Salida.Trim()
+        if ($salida -eq $Esperada) {
+            return [pscustomobject]@{ Estado = 'OK'; Detalle = ('--version imprime "{0}" y sale con 0 ({1} intento(s))' -f $salida, $i.Count); Accion = '' }
+        }
+        return [pscustomobject]@{ Estado = 'PARA'; Detalle = ('--version imprime "{0}" y se esperaba "{1}"' -f $salida, $Esperada); Accion = 'Este no es el .exe del paquete: vuelve a copiar el paquete original.' }
+    }
+    $dll = @(-1073741515, -1073741701, 3221225781, 3221225595) -contains [int64]$ult.Codigo
+    if ($dll) {
+        $dd = 'vcruntime140.dll '
+        if ($DllPresente) { $dd += 'esta en System32, pero otra libreria falta o no es compatible' } else { $dd += 'NO esta en System32' }
+        return [pscustomobject]@{ Estado = 'PARA'; Detalle = ('el .exe no arranca porque le falta una libreria de Windows ({0}). No lo bloquea el antivirus.' -f $dd); Accion = 'Instala "Microsoft Visual C++ Redistributable x64" (vc_redist.x64.exe, de Microsoft) y repite.' }
+    }
+    if ($ult.Agotado) {
+        $quien = ''
+        if (@($EventosDefender).Count -gt 0) { $quien = ' Defender dejo avisos: ' + (@($EventosDefender | Select-Object -First 2) -join ' | ') }
+        return [pscustomobject]@{ Estado = 'PARA'; Detalle = ('--version no respondio en el tiempo dado, dos veces.{0}' -f $quien); Accion = 'Probablemente el antivirus esta analizando el .exe por primera vez: espera 5 minutos y repite. Si vuelve a pasar, manda la carpeta ensayo-informe.' }
+    }
+    if (@($EventosPolitica).Count -gt 0) {
+        return [pscustomobject]@{ Estado = 'PARA'; Detalle = ('Windows no dejo ejecutar el .exe por una politica de control de aplicaciones: {0}' -f (@($EventosPolitica | Select-Object -First 2) -join ' | ')); Accion = 'Pide a quien administra el equipo que permita este .exe (AppLocker o Control de aplicaciones) y repite.' }
+    }
+    if (@($EventosDefender).Count -gt 0) {
+        return [pscustomobject]@{ Estado = 'PARA'; Detalle = ('el antivirus bloqueo o aviso del .exe: {0}' -f (@($EventosDefender | Select-Object -First 2) -join ' | ')); Accion = 'Pide a quien administra el equipo que lo permita (exclusion del .exe) y repite.' }
+    }
+    $razon = ''
+    if ($ult.Error) { $razon = ' ' + $ult.Error.Trim() }
+    if ($ult.NoArranco -or $ult.Codigo -eq -1) {
+        return [pscustomobject]@{ Estado = 'PARA'; Detalle = ('Windows no dejo ejecutar el .exe.{0}{1}' -f $razon, $(if ($ev) { ' Errores recientes: ' + $ev } else { '' })); Accion = 'Manda la carpeta ensayo-informe: no hay una causa clara en los registros.' }
+    }
+    return [pscustomobject]@{ Estado = 'PARA'; Detalle = ('--version termino con codigo {0}.{1}{2}' -f $ult.Codigo, $razon, $(if ($ev) { ' Errores recientes: ' + $ev } else { '' })); Accion = 'Manda la carpeta ensayo-informe.' }
+}
+
+function Get-FilasPolitica {
+    param($Politicas, [string]$Modo, $Antivirus, $Sac, [string]$AppLocker)
+    $f = New-Object System.Collections.ArrayList
+    $def = @($Politicas | Where-Object { ($_.Scope -eq 'MachinePolicy' -or $_.Scope -eq 'UserPolicy') -and $_.Policy -ne 'Undefined' })
+    if ($def.Count -gt 0) {
+        [void]$f.Add((New-Fila 'politica_scripts' 'AVISO' ('una directiva de grupo define la politica de scripts: {0}' -f (($def | ForEach-Object { '{0}={1}' -f $_.Scope, $_.Policy }) -join ', ')) 'Los lanzadores usan -ExecutionPolicy Bypass, que una directiva de grupo NO anula. Si el script no arranca, es esto.'))
+    }
+    else { [void]$f.Add((New-Fila 'politica_scripts' 'OK' 'ninguna directiva de grupo fija la politica de scripts')) }
+    if ($Modo -eq 'FullLanguage') { [void]$f.Add((New-Fila 'modo_powershell' 'OK' 'PowerShell en FullLanguage')) }
+    else { [void]$f.Add((New-Fila 'modo_powershell' 'PARA' ('PowerShell esta restringido (modo {0}): hay un control de aplicaciones activo' -f $Modo) 'Este ensayo no puede correr asi. Pide a quien administra el equipo que permita estos scripts, o manda la carpeta ensayo-informe.')) }
+    $av = @($Antivirus)
+    if ($av.Count -gt 0) { [void]$f.Add((New-Fila 'antivirus' 'INFO' ('antivirus registrado: {0}' -f ($av -join ', ')))) }
+    else { [void]$f.Add((New-Fila 'antivirus' 'INFO' 'no pude leer el antivirus registrado (Centro de seguridad)')) }
+    if ($null -eq $Sac) { [void]$f.Add((New-Fila 'smart_app_control' 'INFO' 'Smart App Control: no aplica en este Windows')) }
+    elseif ([int]$Sac -eq 1) { [void]$f.Add((New-Fila 'smart_app_control' 'AVISO' 'Smart App Control esta ACTIVADO: puede bloquear un .exe sin firma' 'Si el .exe no arranca, es esto: hay que desactivarlo (no se puede volver a activar sin reinstalar Windows) o firmar el .exe.')) }
+    elseif ([int]$Sac -eq 2) { [void]$f.Add((New-Fila 'smart_app_control' 'AVISO' 'Smart App Control esta en evaluacion: puede bloquear un .exe sin firma' 'Si el .exe no arranca, es esto.')) }
+    else { [void]$f.Add((New-Fila 'smart_app_control' 'OK' 'Smart App Control desactivado')) }
+    if ([string]::IsNullOrEmpty($AppLocker)) { [void]$f.Add((New-Fila 'applocker' 'INFO' 'AppLocker: sin politica efectiva')) }
+    else { [void]$f.Add((New-Fila 'applocker' 'AVISO' ('AppLocker tiene politica efectiva: {0}' -f $AppLocker) 'Si el .exe o los scripts no arrancan, es esto.')) }
+    return @($f)
+}
+
+function Test-AdaptadorExcluido {
+    # VPN, tuneles y adaptadores virtuales: tienen IP privada, pero ningun cliente de la
+    # LAN llega por ahi. TAP va aparte y sensible a mayusculas para no cazar "adapter".
+    param([string]$Descripcion)
+    if ([string]::IsNullOrEmpty($Descripcion)) { return $false }
+    if ($Descripcion -match 'VPN|AnyConnect|Fortinet|PANGP|WireGuard|Wintun|Tailscale|ZeroTier|Hamachi|Bluetooth|Virtual|vEthernet|WSL|Hyper-V|VirtualBox|VMware') { return $true }
+    return ($Descripcion -cmatch '\bTAP\b')
+}
+
+function Select-IpPorMetrica {
+    # La que el equipo usaria para salir (ruta por omision de menor metrica) entre las
+    # privadas de adaptadores reales; sin ruta por omision, la primera privada real.
+    param($Candidatos)
+    $reales = @($Candidatos | Where-Object { (Test-IpPrivada $_.Ip) -and -not $_.Excluida })
+    if ($reales.Count -eq 0) { return $null }
+    $con = @($reales | Where-Object { $_.Gateway })
+    if ($con.Count -eq 0) { return $reales[0] }
+    $mejor = $con[0]
+    foreach ($c in $con) {
+        $m = 9999; if ($null -ne $c.Metrica) { $m = [int]$c.Metrica }
+        $mm = 9999; if ($null -ne $mejor.Metrica) { $mm = [int]$mejor.Metrica }
+        if ($m -lt $mm) { $mejor = $c }
+    }
+    return $mejor
+}
+
+function Format-Candidato {
+    param($C, [int]$Numero)
+    $gw = 'sin puerta de enlace'; if ($C.Gateway) { $gw = 'con puerta de enlace' }
+    $ip = 'IP desconocida'; if ($C.Dhcp -eq $true) { $ip = 'DHCP (puede cambiar)' } elseif ($C.Dhcp -eq $false) { $ip = 'fija' }
+    $x = ''; if ($C.Excluida) { $x = '  [descartada: VPN o adaptador virtual]' }
+    return ('{0}) {1}  {2}  {3}, {4}, red {5}, metrica {6}{7}' -f $Numero, $C.Ip, $C.Alias, $gw, $ip, $C.Perfil, $(if ($null -ne $C.Metrica) { $C.Metrica } else { 'n/d' }), $x)
+}
+
+function Get-HostPuertoUrl {
+    # Solo el host y el puerto: lo demas de la URL lleva la clave.
+    param([string]$Url)
+    if ($Url -notmatch '^(?i)postgres(ql)?://(?:[^@/]*@)?(\[[^\]]+\]|[^:/\s?]+)(?::(\d+))?(?:[/?]|$)') { return $null }
+    $puerto = 5432
+    if ($Matches[3]) { $puerto = [int]$Matches[3] }
+    return [pscustomobject]@{ Host = $Matches[2].Trim('[', ']'); Puerto = $puerto }
+}
+
+function Get-FilaBaseDatos {
+    param([string]$Modo, $Alcanzable, $HostPuerto, $Docker)
+    if ($Modo -ne 'real') {
+        return (New-Fila 'base_datos' 'INFO' 'ensayo: la base se fija a una URL inalcanzable a proposito (127.0.0.1:1); el servicio arrancara degradado y no toca Docker ni ninguna base del equipo')
+    }
+    $hp = 'la base'
+    if ($null -ne $HostPuerto) { $hp = '{0}:{1}' -f $HostPuerto.Host, $HostPuerto.Puerto }
+    $dock = ''
+    if ($null -ne $Docker -and $Docker.Existe) {
+        if (-not $Docker.Motor) { $dock = ' Docker esta instalado pero su motor NO esta en marcha.' }
+        elseif ($Docker.Contenedor) { $dock = (' Docker en marcha; contenedor {0}: {1}.' -f $script:ContenedorBase, $Docker.Contenedor) }
+        else { $dock = (' Docker en marcha, pero no existe el contenedor {0}.' -f $script:ContenedorBase) }
+    }
+    elseif ($null -ne $Docker) { $dock = ' No encuentro docker.exe.' }
+    if ($Alcanzable) { return (New-Fila 'base_datos' 'OK' ('{0} responde.{1}' -f $hp, $dock)) }
+    return (New-Fila 'base_datos' 'AVISO' ('{0} NO responde ahora.{1} {2}' -f $hp, $dock, $script:TextoDocker) 'No hace falta que la base este arriba para instalar. Cuando alguien inicie sesion y Docker Desktop arranque, la base vuelve.')
+}
+
+function Get-SesionesAjenas {
+    # Salida de `query user`: la primera linea es la cabecera y la sesion propia lleva '>'.
+    param($Texto)
+    if ($null -eq $Texto) { return $null }
+    $l = @(($Texto -split "`r?`n") | Where-Object { $_.Trim().Length -gt 0 })
+    if ($l.Count -le 1) { return @() }
+    return @($l | Select-Object -Skip 1 | Where-Object { -not $_.TrimStart().StartsWith('>') -and -not $_.StartsWith('>') } | ForEach-Object { $_.Trim() })
+}
+
+function Test-ConfirmaReinicio {
+    # Con otras personas con sesion abierta, un reinicio les cierra su trabajo: hace
+    # falta escribir SI entero, no basta una S.
+    param([string]$Respuesta, [bool]$HayOtrasSesiones)
+    if (-not (Test-RespuestaSi $Respuesta)) { return $false }
+    if (-not $HayOtrasSesiones) { return $true }
+    $r = $Respuesta.Trim().ToLower()
+    return ($r -eq 'si' -or $r -eq ('s' + [string][char]0xED))
+}
+
+function Get-FilaSesiones {
+    param($Ajenas, $Pendientes)
+    $pend = @($Pendientes)
+    $pt = ''
+    if ($pend.Count -gt 0) { $pt = ' Pendiente de reinicio por: ' + ($pend -join ', ') + '.' }
+    if ($null -eq $Ajenas) { return (New-Fila 'sesiones' 'INFO' ('no pude listar las sesiones (query user).{0}' -f $pt)) }
+    $aj = @($Ajenas)
+    if ($aj.Count -gt 0) { return (New-Fila 'sesiones' 'AVISO' ('hay {0} sesion(es) de otras personas abiertas.{1}' -f $aj.Count, $pt) 'El reinicio les cerrara el trabajo: avisales. Se pedira escribir SI.') }
+    if ($pend.Count -gt 0) { return (New-Fila 'sesiones' 'AVISO' ('no hay otras sesiones.{0}' -f $pt) 'Windows ya tiene un reinicio pendiente; el del ensayo lo aprovecha.') }
+    return (New-Fila 'sesiones' 'OK' 'no hay otras sesiones abiertas ni reinicios pendientes')
+}
+
+function Test-InstalacionAjena {
+    # Una instalacion que NO es de este ensayo: otra direccion, una tarea que ejecuta
+    # otra cosa o una regla de firewall con otro puerto. Devuelve el motivo, o $null.
+    param($DirPrevia, [string]$Direccion, [bool]$HayEnv, [bool]$HayTarea, $ComandoTarea, [string]$Launcher, [bool]$HayRegla, $PuertoRegla, [int]$Puerto)
+    if (-not [string]::IsNullOrEmpty($DirPrevia) -and $DirPrevia -ne $Direccion) { return ('el env file ya tiene otra direccion ({0})' -f $DirPrevia) }
+    if (($HayTarea -or $HayRegla) -and -not $HayEnv) { return 'hay tarea o regla de firewall pero no env file' }
+    if ($HayTarea) {
+        if ([string]::IsNullOrEmpty($ComandoTarea)) { return 'no pude leer lo que ejecuta la tarea memory-industry' }
+        if ($ComandoTarea.Trim() -ine $Launcher) { return ('la tarea memory-industry ejecuta otra cosa ({0})' -f $ComandoTarea.Trim()) }
+    }
+    if ($HayRegla -and -not [string]::IsNullOrEmpty([string]$PuertoRegla) -and [string]$PuertoRegla -ne [string]$Puerto) { return ('la regla de firewall memory-industry abre el puerto {0}' -f $PuertoRegla) }
+    return $null
+}
+
+function Get-AvisosAntes {
+    param($Antes)
+    if ($null -eq $Antes -or $null -eq $Antes.checks) { return @() }
+    return @($Antes.checks | Where-Object { $_.resultado -eq 'AVISO' })
+}
+
+function Get-ProblemasRutasInstalacion {
+    # El .exe, la carpeta de instalacion y el perfil del usuario: lo que acaba escrito en
+    # el launcher, la tarea y el env file.
+    param([string]$Binario, [string]$Raiz, [string]$Perfil)
+    $r = New-Object System.Collections.ArrayList
+    foreach ($par in @(@('el .exe', $Binario), @('la carpeta de instalacion', $Raiz), @('el perfil del usuario (USERPROFILE)', $Perfil))) {
+        foreach ($m in @(Get-ProblemasRuta $par[1] '' | Where-Object { $_ -notmatch 'sincronizada' })) { [void]$r.Add(('{0} {1}' -f $par[0], $m)) }
+    }
+    return @($r)
+}
+
+function Get-TextoBaseNoUp {
+    param([bool]$Real)
+    if ($Real) { return ('el servicio responde pero la base de datos no esta arriba. ' + $script:TextoDocker) }
+    return 'el servicio responde sin base de datos: es lo previsto en el ensayo (se uso una URL inalcanzable a proposito). Las herramientas que la usan no se comprueban.'
+}
+
+function Format-UrlSinClave {
+    param([string]$Url)
+    return [regex]::Replace($Url, '(://[^:/\s]+:)[^@\s]+@', '$1***@')
+}
+
+function Resolve-EleccionIp {
+    # `Texto` es lo que escribio el operador: vacio confirma la propuesta; un numero elige
+    # de la lista que se le mostro. Una VPN o un adaptador virtual no se acepta.
+    param([string]$Texto, $Candidatas, $Propuesta)
+    $t = ''
+    if ($null -ne $Texto) { $t = $Texto.Trim() }
+    if ($t -eq '') {
+        if ($null -eq $Propuesta) { return [pscustomobject]@{ Candidata = $null; Error = 'no hay ninguna direccion propuesta; escribe el numero de una' } }
+        return [pscustomobject]@{ Candidata = $Propuesta; Error = $null }
+    }
+    $n = 0
+    if (-not [int]::TryParse($t, [ref]$n) -or $n -lt 1 -or $n -gt @($Candidatas).Count) { return [pscustomobject]@{ Candidata = $null; Error = ('"{0}" no es un numero de la lista' -f $t) } }
+    $c = @($Candidatas)[$n - 1]
+    if ($c.Excluida) { return [pscustomobject]@{ Candidata = $null; Error = 'esa es una VPN o un adaptador virtual: los clientes no llegan por ahi' } }
+    if (-not (Test-IpPrivada $c.Ip)) { return [pscustomobject]@{ Candidata = $null; Error = 'esa direccion no es privada (10.x, 172.16-31.x, 192.168.x)' } }
+    return [pscustomobject]@{ Candidata = $c; Error = $null }
+}
+
+# --- Lo que lee de Windows (cada sondeo es una funcion para poder simularlo) ---------
+
+function Test-EsWindows { return ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) }
+
+function Get-UsuarioInteractivo {
+    # Quien esta sentado: el propietario del explorer.exe de ESTA sesion. Quien elevo puede
+    # ser otra cuenta (UAC pidiendo credenciales de un administrador distinto).
+    try {
+        $mi = (Get-Process -Id $PID -ErrorAction Stop).SessionId
+        $p = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'explorer.exe'" -ErrorAction Stop | Where-Object { [int]$_.SessionId -eq $mi }) | Select-Object -First 1
+        if (-not $p) { return $null }
+        $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
+        if ($o.ReturnValue -ne 0) { return $null }
+        return ('{0}\{1}' -f $o.Domain, $o.User)
+    }
+    catch { return $null }
+}
+
+function Get-TipoUnidad {
+    param([string]$Ruta)
+    try { return [string](New-Object System.IO.DriveInfo($Ruta.Substring(0, 1))).DriveType } catch { return '' }
+}
+
+function Test-DllSistema {
+    param([string]$Nombre)
+    $dir = Join-Path $env:SystemRoot 'System32'
+    return (Test-Path -LiteralPath (Join-Path $dir $Nombre))
+}
+
+function Get-EventosFalloExe {
+    # Solo cuando el .exe fallo: los ultimos errores de Application, los avisos de
+    # Defender (1116, 1117, 5007) y los bloqueos de CodeIntegrity y AppLocker.
+    $res = [pscustomobject]@{ Defender = @(); Politica = @(); App = @() }
+    $desde = (Get-Date).AddMinutes(-15)
+    $resumen = { param($e) ('{0} {1}: {2}' -f $e.ProviderName, $e.Id, (([string]$e.Message) -replace '\s+', ' ').Substring(0, [math]::Min(110, ([string]$e.Message).Length))) }
+    try { $res.Defender = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = 1116, 1117, 5007; StartTime = $desde } -MaxEvents 4 -ErrorAction Stop | ForEach-Object { & $resumen $_ }) } catch { }
+    try { $res.Politica += @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-CodeIntegrity/Operational'; Level = 2, 3; StartTime = $desde } -MaxEvents 3 -ErrorAction Stop | ForEach-Object { & $resumen $_ }) } catch { }
+    try { $res.Politica += @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-AppLocker/EXE and DLL'; Id = 8002, 8004; StartTime = $desde } -MaxEvents 3 -ErrorAction Stop | ForEach-Object { & $resumen $_ }) } catch { }
+    try { $res.App = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 2; StartTime = $desde } -MaxEvents 3 -ErrorAction Stop | ForEach-Object { & $resumen $_ }) } catch { }
+    return $res
+}
+
+function Get-DatosPolitica {
+    $r = [pscustomobject]@{ Lista = @(); Modo = ''; Av = @(); Sac = $null; AppLocker = '' }
+    try { $r.Lista = @(Get-ExecutionPolicy -List | ForEach-Object { [pscustomobject]@{ Scope = [string]$_.Scope; Policy = [string]$_.ExecutionPolicy } }) } catch { }
+    try { $r.Modo = [string]$ExecutionContext.SessionState.LanguageMode } catch { }
+    try { $r.Av = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop | ForEach-Object { [string]$_.displayName }) } catch { }
+    try { $r.Sac = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name VerifiedAndReputablePolicyState -ErrorAction Stop).VerifiedAndReputablePolicyState } catch { }
+    try {
+        $x = [xml](Get-AppLockerPolicy -Effective -Xml -ErrorAction Stop)
+        $cols = @($x.AppLockerPolicy.RuleCollection | Where-Object { $_.EnforcementMode -and $_.EnforcementMode -ne 'NotConfigured' })
+        if ($cols.Count -gt 0) { $r.AppLocker = (($cols | ForEach-Object { '{0}={1}' -f $_.Type, $_.EnforcementMode }) -join ', ') }
+    }
+    catch { }
+    return $r
+}
+
+function Test-TareasYFirewall {
+    # Lo unico que "toca" Humo: una tarea de prueba como SYSTEM, creada y borrada en el
+    # acto. Sin esto no se sabe si Task Scheduler deja registrar tareas de SYSTEM hasta
+    # que el instalador ya ha escrito sus ficheros.
+    $r = [pscustomobject]@{ Tarea = $false; ErrorTarea = ''; Firewall = $false; ErrorFirewall = '' }
+    $nombre = 'memory-industry-humo-prueba'
+    try {
+        $accion = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c exit 0'
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $disp = New-ScheduledTaskTrigger -AtStartup
+        [void](Register-ScheduledTask -TaskName $nombre -Action $accion -Trigger $disp -Principal $principal -Force -ErrorAction Stop)
+        $r.Tarea = ((Get-ConteoTarea $nombre) -eq 1)
+        if (-not $r.Tarea) { $r.ErrorTarea = 'la tarea no figura tras registrarla' }
+    }
+    catch { $r.ErrorTarea = $_.Exception.Message }
+    finally { try { Unregister-ScheduledTask -TaskName $nombre -Confirm:$false -ErrorAction Stop } catch { } }
+    try { [void](Get-NetFirewallProfile -ErrorAction Stop); $r.Firewall = $true } catch { $r.ErrorFirewall = $_.Exception.Message }
+    return $r
+}
+
+function Get-CandidatosHumo {
+    $metricas = @{}
+    try {
+        foreach ($rt in @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop)) {
+            $im = 0
+            try { $im = [int](Get-NetIPInterface -InterfaceIndex $rt.InterfaceIndex -AddressFamily IPv4 -ErrorAction Stop).InterfaceMetric } catch { }
+            $total = [int]$rt.RouteMetric + $im
+            $k = [int]$rt.InterfaceIndex
+            if (-not $metricas.ContainsKey($k) -or $total -lt $metricas[$k]) { $metricas[$k] = $total }
+        }
+    }
+    catch { }
+    $lista = New-Object System.Collections.ArrayList
+    foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        if ($ni.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }
+        if ($ni.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Loopback) { continue }
+        if ($ni.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Tunnel) { continue }
+        $props = $ni.GetIPProperties()
+        $p4 = $null
+        try { $p4 = $props.GetIPv4Properties() } catch { }
+        $idx = 0; $dhcp = $null
+        if ($p4) { $idx = [int]$p4.Index; $dhcp = [bool]$p4.IsDhcpEnabled }
+        $gw = @($props.GatewayAddresses | Where-Object { $_.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and $_.Address.ToString() -ne '0.0.0.0' }).Count -gt 0
+        $perfil = 'desconocida'
+        try { $perfil = [string](Get-NetConnectionProfile -InterfaceIndex $idx -ErrorAction Stop).NetworkCategory } catch { }
+        $metrica = $null
+        if ($metricas.ContainsKey($idx)) { $metrica = $metricas[$idx] }
+        foreach ($u in $props.UnicastAddresses) {
+            if ($u.Address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { continue }
+            [void]$lista.Add([pscustomobject]@{
+                    Ip = $u.Address.ToString(); Alias = $ni.Name; Descripcion = $ni.Description
+                    Gateway = $gw; Metrica = $metrica; Dhcp = $dhcp; Perfil = $perfil; Indice = $idx
+                    Excluida = (Test-AdaptadorExcluido ($ni.Name + ' ' + $ni.Description))
+                })
+        }
+    }
+    return @($lista)
+}
+
+function Get-OtrosMemory {
+    # Otras cosas que se llaman memory o cuba (los daemons de otros usos de esta PC) y
+    # quien escucha en 8787 y 8788. Solo informacion.
+    $r = [pscustomobject]@{ Tareas = @(); Reglas = @(); Procesos = @(); Escuchas = @() }
+    try { $r.Tareas = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -match 'memory|cuba' -and $_.TaskName -ne $script:NombreTarea -and $_.TaskName -notlike 'memory-industry-ensayo*' -and $_.TaskName -ne 'memory-industry-humo-prueba' } | ForEach-Object { [string]$_.TaskName }) } catch { }
+    try { $r.Reglas = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object { $_.DisplayName -match 'memory|cuba' -and $_.DisplayName -ne $script:NombreRegla } | ForEach-Object { [string]$_.DisplayName }) } catch { }
+    try { $r.Procesos = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -match 'memory|cuba' } | ForEach-Object { '{0} (PID {1})' -f $_.ProcessName, $_.Id }) } catch { }
+    foreach ($pt in 8787, 8788) { foreach ($e in @(Get-Escuchas $pt)) { $r.Escuchas += ('{0}:{1} (PID {2})' -f $e.Direccion, $pt, $e.IdProceso) } }
+    return $r
+}
+
+function Test-PuertoTcp {
+    param([string]$Servidor, [int]$Puerto, [int]$TimeoutMs = 3000)
+    $c = New-Object System.Net.Sockets.TcpClient
+    try {
+        $ar = $c.BeginConnect($Servidor, $Puerto, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
+        $c.EndConnect($ar)
+        return $c.Connected
+    }
+    catch { return $false }
+    finally { $c.Close() }
+}
+
+function Get-EstadoDocker {
+    $r = [pscustomobject]@{ Existe = $false; Motor = $false; Contenedor = '' }
+    $exe = $null
+    try { $exe = (Get-Command docker.exe -ErrorAction Stop).Source } catch { }
+    if (-not $exe -and (Test-Path -LiteralPath 'C:\Program Files\Docker\Docker\resources\bin\docker.exe')) { $exe = 'C:\Program Files\Docker\Docker\resources\bin\docker.exe' }
+    if (-not $exe) { return $r }
+    $r.Existe = $true
+    $i = Invoke-Nativo $exe @('info', '--format', '{{.ServerVersion}}') 20 -Utf8
+    $r.Motor = ((-not $i.NoArranco) -and (-not $i.Agotado) -and $i.Codigo -eq 0 -and $i.Salida.Trim().Length -gt 0)
+    if ($r.Motor) {
+        $c = Invoke-Nativo $exe @('ps', '-a', '--filter', ('name=^{0}$' -f $script:ContenedorBase), '--format', '{{.Status}}') 20 -Utf8
+        if ($c.Codigo -eq 0) { $r.Contenedor = $c.Salida.Trim() }
+    }
+    return $r
+}
+
+function Get-TextoQuser {
+    $q = Invoke-Nativo 'query.exe' @('user') 15
+    if ($q.NoArranco -or $q.Agotado) { return $null }
+    return $q.Salida
+}
+
+function Get-RebootPendiente {
+    $m = New-Object System.Collections.ArrayList
+    if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { [void]$m.Add('mantenimiento de Windows (CBS)') }
+    if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { [void]$m.Add('Windows Update') }
+    return @($m)
+}
+
+function Invoke-VersionExe {
+    # 90 s y UN reintento: la primera vez que se ejecuta un .exe nuevo, el antivirus lo
+    # analiza antes de dejarlo correr y puede tardar mas de lo normal.
+    param([string]$Exe)
+    $intentos = New-Object System.Collections.ArrayList
+    for ($n = 1; $n -le 2; $n++) {
+        $r = Invoke-Nativo $Exe @('--version') 90 -Utf8
+        [void]$intentos.Add($r)
+        if (-not $r.NoArranco -and -not $r.Agotado -and $r.Codigo -eq 0) { break }
+        if ($r.NoArranco) { break }
+    }
+    return @($intentos)
+}
+
+# --- El humo --------------------------------------------------------------------------
+
+function Get-ResultadoHumo {
+    # Devuelve las filas y lo que Todo necesita para seguir (IP elegida, candidatas,
+    # usuario interactivo). No instala nada y no pregunta nada.
+    param($Ctx, [bool]$ExigirCopiaProtegida)
+    $filas = New-Object System.Collections.ArrayList
+    $modo = 'ensayo'
+    if ($Conservar) { $modo = 'real' }
+    $elevado = (Test-Elevado)
+    if ($elevado) {
+        $fl = Invoke-Nativo 'fltmc.exe' @() 15
+        $elevado = ((-not $fl.NoArranco) -and (-not $fl.Agotado) -and $fl.Codigo -eq 0)
+    }
+    $instala = Get-UsuarioActual
+    $interactivo = Get-UsuarioInteractivo
+    $script:UsuarioInteractivo = $interactivo
+    foreach ($f in @(Get-FilasCuentas $elevado $instala $interactivo)) { [void]$filas.Add($f) }
+
+    # (2) El paquete
+    $carpeta = $PSScriptRoot
+    $sumas = @()
+    $sumas = @(Get-ProblemasSumas $carpeta $Ctx.Binario)
+    foreach ($f in @(Get-FilasPaquete $carpeta (Get-TipoUnidad $carpeta) $sumas (Test-EnCopiaProtegida $carpeta) $ExigirCopiaProtegida)) { [void]$filas.Add($f) }
+    $rutas = @(Get-ProblemasRutasInstalacion $Ctx.Binario $Ctx.Raiz $env:USERPROFILE)
+    if ($rutas.Count -gt 0) { [void]$filas.Add((New-Fila 'rutas_ascii' 'PARA' ($rutas -join '; ') 'Mueve el paquete a C:\memory-industry-visita y usa un usuario cuyo nombre sea solo letras y numeros, o manda la carpeta ensayo-informe.')) }
+    else { [void]$filas.Add((New-Fila 'rutas_ascii' 'OK' 'las rutas del .exe, de la instalacion y del perfil son ASCII y sin %')) }
+
+    # (3) El .exe
+    if (Test-Path -LiteralPath $Ctx.Binario -PathType Leaf) {
+        $intentos = @(Invoke-VersionExe $Ctx.Binario)
+        $ult = $intentos[$intentos.Count - 1]
+        $ok = (-not $ult.NoArranco -and -not $ult.Agotado -and $ult.Codigo -eq 0)
+        $dll = Test-DllSistema 'vcruntime140.dll'
+        $ev = [pscustomobject]@{ Defender = @(); Politica = @(); App = @() }
+        if (-not $ok) { $ev = Get-EventosFalloExe }
+        $dx = Get-DiagnosticoExe $intentos $dll $ev.Defender $ev.Politica $ev.App $script:VersionEsperada
+        [void]$filas.Add((New-Fila 'exe' $dx.Estado $dx.Detalle $dx.Accion))
+        if ($dll) { [void]$filas.Add((New-Fila 'vcruntime140' 'OK' 'vcruntime140.dll esta en System32')) }
+        elseif ($ok) { [void]$filas.Add((New-Fila 'vcruntime140' 'INFO' 'vcruntime140.dll no esta en System32, pero el .exe arranca: no la necesita (CRT estatico)')) }
+        else { [void]$filas.Add((New-Fila 'vcruntime140' 'INFO' 'vcruntime140.dll NO esta en System32')) }
+    }
+    else { [void]$filas.Add((New-Fila 'exe' 'PARA' ('no encuentro el .exe en {0}' -f $Ctx.Binario) 'Descomprime el zip entero y usa el lanzador de la misma carpeta.')) }
+
+    # (4) Politicas
+    $pol = Get-DatosPolitica
+    foreach ($f in @(Get-FilasPolitica $pol.Lista $pol.Modo $pol.Av $pol.Sac $pol.AppLocker)) { [void]$filas.Add($f) }
+
+    # (5) Task Scheduler y firewall
+    if ($elevado) {
+        $tf = Test-TareasYFirewall
+        if ($tf.Tarea) { [void]$filas.Add((New-Fila 'task_scheduler' 'OK' 'se pudo crear y borrar una tarea de prueba como SYSTEM')) }
+        else { [void]$filas.Add((New-Fila 'task_scheduler' 'PARA' ('no se pudo crear una tarea como SYSTEM: {0}' -f $tf.ErrorTarea) 'Task Scheduler o una directiva lo impiden: manda la carpeta ensayo-informe.')) }
+        if ($tf.Firewall) { [void]$filas.Add((New-Fila 'firewall' 'OK' 'el firewall de Windows responde (Get-NetFirewallProfile)')) }
+        else { [void]$filas.Add((New-Fila 'firewall' 'PARA' ('no se puede consultar el firewall de Windows: {0}' -f $tf.ErrorFirewall) 'Si lo gestiona otro producto o una directiva, avisa: el instalador no podra abrir el puerto.')) }
+    }
+    else { [void]$filas.Add((New-Fila 'task_scheduler' 'INFO' 'sin administrador no se probo Task Scheduler ni el firewall')) }
+
+    # (6) Red
+    $cands = @(Get-CandidatosHumo)
+    $elegida = Select-IpPorMetrica $cands
+    $n = 0
+    $texto = New-Object System.Collections.ArrayList
+    foreach ($c in $cands) { $n++; [void]$texto.Add((Format-Candidato $c $n)) }
+    if ($cands.Count -eq 0) { [void]$filas.Add((New-Fila 'red_candidatas' 'PARA' 'no hay ninguna direccion IPv4 en un adaptador activo' 'Conecta el cable o el wifi y repite.')) }
+    else { [void]$filas.Add((New-Fila 'red_candidatas' 'INFO' ("direcciones IPv4 de este equipo:`r`n         " + ($texto -join "`r`n         ")))) }
+    if ($null -eq $elegida) { [void]$filas.Add((New-Fila 'red_elegida' 'PARA' 'ninguna direccion es privada y de un adaptador real (no VPN ni virtual)' 'Conecta el equipo a la red de la planta y repite.')) }
+    else {
+        $esDhcp = ($elegida.Dhcp -eq $true)
+        $det = 'se usaria {0} ({1}), la de menor metrica de la ruta por omision' -f $elegida.Ip, $elegida.Alias
+        if ($esDhcp) { [void]$filas.Add((New-Fila 'red_elegida' 'AVISO' ($det + '. ATENCION: esta direccion la reparte el DHCP y PUEDE CAMBIAR; los clientes dejarian de encontrar el servicio') 'Fija la IP del equipo (despliegue-lan.md, seccion "Fixed address on the host") antes de instalar.')) }
+        else { [void]$filas.Add((New-Fila 'red_elegida' 'OK' $det)) }
+        if ($elegida.Perfil -eq 'Public') { [void]$filas.Add((New-Fila 'red_perfil' 'AVISO' 'la red de esa direccion es Publica: la regla de firewall solo abre Privada y Dominio' 'En el equipo real se te ofrecera cambiarla a Privada.')) }
+    }
+    $puertoLibre = $true
+    foreach ($e in @(Get-Escuchas $Ctx.Puerto)) {
+        $info = Get-InfoProceso $e.IdProceso
+        if (-not (Test-ProcesoEsNuestro $info $Ctx.Binario)) { $puertoLibre = $false; [void]$filas.Add((New-Fila 'puerto' 'PARA' ('el puerto {0} ya lo usa otro programa (PID {1}, {2})' -f $Ctx.Puerto, $e.IdProceso, $(if ($info) { $info.Nombre } else { 'desconocido' })) 'Manda la carpeta ensayo-informe: hay que elegir otro puerto.')) }
+    }
+    if ($puertoLibre) { [void]$filas.Add((New-Fila 'puerto' 'OK' ('el puerto {0} esta libre (o es de un ensayo anterior)' -f $Ctx.Puerto))) }
+    $otros = Get-OtrosMemory
+    $partes = New-Object System.Collections.ArrayList
+    if (@($otros.Tareas).Count) { [void]$partes.Add('tareas: ' + (@($otros.Tareas) -join ', ')) }
+    if (@($otros.Reglas).Count) { [void]$partes.Add('reglas: ' + (@($otros.Reglas) -join ', ')) }
+    if (@($otros.Procesos).Count) { [void]$partes.Add('procesos: ' + (@($otros.Procesos) -join ', ')) }
+    if (@($otros.Escuchas).Count) { [void]$partes.Add('escuchan en 8787/8788: ' + (@($otros.Escuchas) -join ', ')) }
+    if ($partes.Count -gt 0) { [void]$filas.Add((New-Fila 'otros_memory' 'INFO' ('hay otras cosas llamadas memory o cuba en este equipo (no se tocan): ' + ($partes -join '; ')))) }
+    else { [void]$filas.Add((New-Fila 'otros_memory' 'OK' 'no hay otras tareas, reglas ni procesos memory o cuba, ni nadie en 8787 u 8788')) }
+
+    # (7) Base de datos
+    $url = $env:DATABASE_URL
+    if ($modo -eq 'real' -and [string]::IsNullOrEmpty($url)) { $url = $script:UrlPorOmision }
+    $hp = $null
+    if ($url) { $hp = Get-HostPuertoUrl $url }
+    $alc = $null
+    if ($modo -eq 'real' -and $hp) { $alc = Test-PuertoTcp $hp.Host $hp.Puerto 3000 }
+    $dk = $null
+    if ($modo -eq 'real') { $dk = Get-EstadoDocker }
+    [void]$filas.Add((Get-FilaBaseDatos $modo $alc $hp $dk))
+
+    # (8) Sesiones
+    [void]$filas.Add((Get-FilaSesiones (Get-SesionesAjenas (Get-TextoQuser)) (Get-RebootPendiente)))
+
+    return [pscustomobject]@{ Filas = @($filas); Veredicto = (Get-VeredictoHumo $filas); Candidatas = $cands; Elegida = $elegida; Interactivo = $interactivo }
+}
+
+function Write-FilasHumo {
+    param($Filas)
+    foreach ($f in @($Filas)) {
+        $color = 'Green'
+        if ($f.estado -eq 'PARA') { $color = 'Red' } elseif ($f.estado -eq 'AVISO') { $color = 'Yellow' } elseif ($f.estado -eq 'INFO') { $color = '' }
+        Write-Informe (Format-FilaHumo $f) $color
+    }
+}
+
+function Invoke-FaseHumo {
+    $ctx = $script:Ctx
+    if (-not (Test-EsWindows)) {
+        Stop-Rechazo 'este ensayo es para Windows'
+    }
+    [void](New-Item -ItemType Directory -Path $ctx.Salida -Force)
+    Write-Informe ('MemoryIndustry - prueba de humo (solo lectura, no instala nada) - {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) 'Cyan'
+    $h = Get-ResultadoHumo $ctx $false
+    Write-FilasHumo $h.Filas
+    Write-Json (Join-Path $ctx.Salida 'humo.json') ([ordered]@{ fase = 'Humo'; fecha = (Get-AhoraTexto); veredicto = $h.Veredicto; filas = @($h.Filas) })
+    Write-Informe ''
+    Write-Informe ('HUMO: {0}' -f $h.Veredicto) $(if ($h.Veredicto -eq 'OK') { 'Green' } else { 'Red' })
+    Save-Informe $ctx -Anexar
+    if ($h.Veredicto -ne 'OK') { $script:Codigo = 1 }
+}
+
+
+function Read-TextoSecreto {
+    # Lo que se teclea aqui (una URL con clave) no se muestra ni queda en la transcripcion.
+    param([string]$Pregunta)
+    $r = Read-Host $Pregunta -AsSecureString
+    if ($r -is [string]) { return $r }
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($r)
+    try { return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }
+    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
+function Resolve-BaseDatos {
+    # Ensayo: URL inalcanzable a proposito. Equipo real: una URL explicita; Enter ofrece la
+    # del repositorio. Se deja en DATABASE_URL del proceso, que es de donde `setup service`
+    # la copia al env file. Nunca se imprime entera.
+    param([bool]$Real)
+    if (-not $Real) {
+        $env:DATABASE_URL = $script:UrlEnsayo
+        Write-Informe 'Base de datos: ensayo, URL inalcanzable a proposito (el servicio arrancara degradado).'
+        return
+    }
+    Write-Informe ('Base de datos: pulsa Enter para usar la del repositorio ({0}) o escribe otra URL postgresql:// (no se muestra al escribir).' -f (Format-UrlSinClave $script:UrlPorOmision))
+    $url = $null
+    for ($i = 0; $i -lt 3 -and -not $url; $i++) {
+        $t = Read-TextoSecreto 'URL de la base'
+        if ([string]::IsNullOrWhiteSpace($t)) { $t = $script:UrlPorOmision }
+        $t = $t.Trim()
+        if ($null -ne (Get-HostPuertoUrl $t)) { $url = $t } else { Write-Informe 'Eso no parece una URL postgresql://usuario:clave@servidor:puerto/base. Otra vez.' 'Yellow' }
+    }
+    if (-not $url) { Stop-Rechazo 'no se dio una URL de base de datos valida. No se instalo nada.' }
+    $env:DATABASE_URL = $url
+    $hp = Get-HostPuertoUrl $url
+    $alc = Test-PuertoTcp $hp.Host $hp.Puerto 3000
+    $fila = Get-FilaBaseDatos 'real' $alc $hp (Get-EstadoDocker)
+    Write-Informe (Format-FilaHumo $fila) $(if ($fila.estado -eq 'OK') { 'Green' } else { 'Yellow' })
+}
+
+function Resolve-IpReal {
+    # En el equipo real la IP no se elige sola: se muestra la lista y se pide confirmar o
+    # elegir un numero ANTES de instalar. Una IP de DHCP se avisa en grande.
+    param($Ctx, $Humo)
+    $cands = @($Humo.Candidatas)
+    $n = 0
+    foreach ($c in $cands) { $n++; Write-Informe ('  ' + (Format-Candidato $c $n)) }
+    $elegida = $Humo.Elegida
+    for ($i = 0; $i -lt 3; $i++) {
+        $ayuda = 'Escribe el numero de la direccion que usaran los clientes'
+        if ($elegida) { $ayuda += (' o pulsa Enter para confirmar {0}' -f $elegida.Ip) }
+        $t = Read-Host $ayuda
+        $r = Resolve-EleccionIp $t $cands $elegida
+        if ($r.Error) { Write-Informe $r.Error 'Yellow'; continue }
+        $c = $r.Candidata
+        if ($c.Dhcp -eq $true) {
+            Write-Informe ('ATENCION: {0} la reparte el DHCP y PUEDE CAMBIAR en cualquier momento. Si cambia, ningun cliente encontrara el servicio. Lo correcto es fijar la IP antes (despliegue-lan.md, "Fixed address on the host").' -f $c.Ip) 'Red'
+            $sigue = Read-Host 'Continuar igualmente con esta direccion? (S/N)'
+            if (-not (Test-RespuestaSi $sigue)) { continue }
+        }
+        $Ctx.Ip = $c.Ip
+        Write-Informe ('Direccion elegida: {0} ({1})' -f $c.Ip, $c.Alias) 'Green'
+        return
+    }
+    Stop-Rechazo 'no se confirmo ninguna direccion. No se instalo nada.'
+}
+
+function Get-ComandoTarea {
+    # Lo que ejecuta la tarea registrada, leido de su definicion (no del nombre).
+    $q = Invoke-Nativo 'schtasks.exe' @('/Query', '/TN', $script:NombreTarea, '/XML') 30 -Utf8
+    if ($q.NoArranco -or $q.Agotado -or $q.Codigo -ne 0 -or $q.Salida.IndexOf('<') -lt 0) { return $null }
+    try {
+        $doc = New-Object System.Xml.XmlDocument
+        $doc.LoadXml($q.Salida.Substring($q.Salida.IndexOf('<')))
+        $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
+        $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+        $c = $doc.SelectSingleNode('//t:Exec/t:Command', $ns)
+        if ($c) { return $c.InnerText.Trim() }
+    }
+    catch { }
+    return $null
+}
+
+# ===========================================================================
 # Fase Antes
 # ===========================================================================
 
@@ -845,6 +1735,10 @@ function Invoke-FaseAntes {
     Test-PrerequisitosComunes
     if (-not (Test-Path -LiteralPath $ctx.Binario)) {
         Stop-Rechazo ('no encuentro el binario en {0}. Pasa -Binario <ruta a memory-industry.exe>.' -f $ctx.Binario)
+    }
+    $rutasMalas = @(Get-ProblemasRutasInstalacion $ctx.Binario $ctx.Raiz $env:USERPROFILE)
+    if ($rutasMalas.Count -gt 0) {
+        Stop-Rechazo ('rutas que el instalador no puede usar: {0}. Mueve el paquete a C:\memory-industry-visita o usa otro usuario, o manda la carpeta ensayo-informe.' -f ($rutasMalas -join '; '))
     }
     Resolve-Ip $ctx
     $direccion = '{0}:{1}' -f $ctx.Ip, $ctx.Puerto
@@ -875,9 +1769,12 @@ function Invoke-FaseAntes {
         # --- 0. El binario -------------------------------------------------
         Write-Paso '0. Binario'
         $a.binario.sha256 = (Get-FileHash -LiteralPath $ctx.Binario -Algorithm SHA256).Hash.ToLower()
-        $v = Invoke-Nativo $ctx.Binario @('--version') 20 -Utf8
+        $intentos = @(Invoke-VersionExe $ctx.Binario)
+        $v = $intentos[$intentos.Count - 1]
         if ($v.NoArranco -or $v.Agotado -or $v.Codigo -ne 0) {
-            Stop-Rechazo ('el binario no se ejecuta ({0}). Si hay antivirus o SmartScreen, desbloquear el fichero y repetir. {1}' -f $ctx.Binario, $v.Error)
+            $ev = Get-EventosFalloExe
+            $dx = Get-DiagnosticoExe $intentos (Test-DllSistema 'vcruntime140.dll') $ev.Defender $ev.Politica $ev.App $script:VersionEsperada
+            Stop-Rechazo ('el binario no se ejecuta ({0}): {1} {2}' -f $ctx.Binario, $dx.Detalle, $dx.Accion)
         }
         $a.binario.version = $v.Salida.Trim()
         Write-Informe ('Binario {0}' -f $ctx.Binario)
@@ -901,15 +1798,21 @@ function Invoke-FaseAntes {
             $preexistia = ($null -ne $envPrevio) -or $hayTarea -or $hayRegla
             $dirPrevia = $null
             if ($null -ne $envPrevio) { $dirPrevia = Get-ValorEnv $envPrevio $script:ClaveDireccion }
-            $ajena = $false
-            if ($null -ne $dirPrevia -and $dirPrevia -ne '' -and $dirPrevia -ne $direccion) { $ajena = $true }
-            if (($hayTarea -or $hayRegla) -and $null -eq $envPrevio) { $ajena = $true }
-            if ($ajena -and -not $Forzar) {
-                Stop-Rechazo ('ya hay una instalacion de memory-industry en este equipo ({0}; tarea: {1}; regla: {2}; direccion actual: {3}) que no es de este ensayo. `--apply` cambiaria su direccion y la tarea y la regla de firewall son unicas por nombre: se pisarian. Si es lo que quieres, repite con -Forzar.' -f $ctx.Raiz, $hayTarea, $hayRegla, $dirPrevia)
+            $comando = $null
+            if ($hayTarea) { $comando = Get-ComandoTarea }
+            $puertoRegla = $null
+            if ($hayRegla) { $puertoRegla = @(Get-DetalleRegla $script:NombreRegla)[0].Puerto }
+            $motivo = Test-InstalacionAjena $dirPrevia $direccion ($null -ne $envPrevio) $hayTarea $comando $ctx.Launcher $hayRegla $puertoRegla $ctx.Puerto
+            if ($motivo -and -not $Forzar) {
+                # Quien hace doble clic no puede pasar -Forzar: lo que se le dice es a quien avisar.
+                Stop-Rechazo ('ya hay una instalacion de memory-industry en este equipo que no es de este ensayo ({0}). Instalar encima la pisaria: la tarea y la regla de firewall son unicas por nombre. No se toco nada. Manda la carpeta ensayo-informe.' -f $motivo)
             }
             Write-TextoArchivo $estadoRuta (ConvertTo-Json -InputObject ([ordered]@{ preexistia = $preexistia; creado = (Get-AhoraTexto); ip = $ctx.Ip; puerto = $ctx.Puerto; binario = $ctx.Binario }) -Depth 4)
         }
         $a.preexistia = $preexistia
+        $autoLogon = Get-AutoLogon
+        $a.autologon = $autoLogon
+        if ($autoLogon) { Add-Check 'autologon' 'AVISO' 'el equipo inicia sesion solo (AutoAdminLogon=1): la prueba de arranque sin sesion no podra darse por valida; lo demas si' }
         Add-Check 'guarda_instalacion' 'PASA' ('instalacion previa: {0}' -f $(if ($preexistia) { 'si (se conserva en Limpiar salvo -Forzar)' } else { 'no' }))
 
         $propias = @()
@@ -930,7 +1833,7 @@ function Invoke-FaseAntes {
             Write-Informe 'Se detuvo el daemon de un ensayo anterior para medir desde cero.'
         }
 
-        $nombresEntorno = @('DATABASE_URL', 'CUBA_HTTP_ADDR', 'CUBA_HTTP_TOKEN', 'CUBA_MODE', 'ONNX_MODEL_PATH', 'ORT_DYLIB_PATH') | Where-Object { [Environment]::GetEnvironmentVariable($_) }
+        $nombresEntorno = @($(if ($script:ModoTodo) { @() } else { @('DATABASE_URL') }) + @('CUBA_HTTP_ADDR', 'CUBA_HTTP_TOKEN', 'CUBA_MODE', 'ONNX_MODEL_PATH', 'ORT_DYLIB_PATH')) | Where-Object { [Environment]::GetEnvironmentVariable($_) }
         if (@($nombresEntorno).Count -gt 0) {
             Add-Check 'entorno_variables' 'AVISO' ('definidas en esta consola: {0}. DATABASE_URL, CUBA_MODE, ONNX_MODEL_PATH y ORT_DYLIB_PATH se copian al env file; CUBA_HTTP_ADDR en el entorno gana sobre el fichero. El daemon usara esa base.' -f (@($nombresEntorno) -join ', '))
         }
@@ -1033,7 +1936,23 @@ function Invoke-FaseAntes {
             $idx = (Get-NetIPAddress -IPAddress $ctx.Ip -ErrorAction Stop).InterfaceIndex
             $cat = [string](Get-NetConnectionProfile -InterfaceIndex $idx -ErrorAction Stop).NetworkCategory
             $a.red_categoria = $cat
-            if ($cat -eq 'Public') { Add-Check 'red_perfil' 'AVISO' 'la red de esta IP es Public: la regla solo abre Private y Domain, asi que otras maquinas NO entrarian (este ensayo, desde el mismo equipo, no lo detecta)' }
+            if ($cat -eq 'Public' -and $Conservar) {
+                # Equipo real: con la red Publica ningun cliente entra, y eso no puede quedar
+                # callado. El arreglo se ofrece, no se aplica solo.
+                Write-Informe 'La red de esta direccion es PUBLICA: la regla de firewall solo abre Privada y Dominio, asi que ningun otro equipo podria entrar.' 'Red'
+                Write-Informe ('  Arreglo:  Set-NetConnectionProfile -InterfaceIndex {0} -NetworkCategory Private' -f $idx)
+                $quiere = Read-Host 'Ejecutar ese cambio ahora? (S/N)'
+                if (Test-RespuestaSi $quiere) {
+                    try {
+                        Set-NetConnectionProfile -InterfaceIndex $idx -NetworkCategory Private -ErrorAction Stop
+                        $cat = [string](Get-NetConnectionProfile -InterfaceIndex $idx -ErrorAction Stop).NetworkCategory
+                        $a.red_categoria = $cat
+                    }
+                    catch { Write-Informe ('  no se pudo cambiar: {0}' -f $_.Exception.Message) 'Red' }
+                }
+            }
+            if ($cat -eq 'Public' -and $Conservar) { Add-Check 'red_perfil' 'FALLA' 'la red de esta IP es Public: la regla solo abre Private y Domain, asi que NINGUN otro equipo entraria. Cambiala a Privada (Set-NetConnectionProfile -NetworkCategory Private) o abre el puerto a mano.' }
+            elseif ($cat -eq 'Public') { Add-Check 'red_perfil' 'AVISO' 'la red de esta IP es Public: la regla solo abre Private y Domain, asi que otras maquinas NO entrarian (este ensayo, desde el mismo equipo, no lo detecta)' }
             else { Add-Check 'red_perfil' 'PASA' ('la red de esta IP es {0}' -f $cat) }
         }
         catch { Add-Check 'red_perfil' 'AVISO' 'no se pudo leer el perfil de red de esta IP' }
@@ -1057,7 +1976,7 @@ function Invoke-FaseAntes {
         $j = $w.Salud.Json
         $a.mediciones.health = [ordered]@{ status = $j.status; database = $j.database; ready = $j.ready; version = $j.version; ms = $w.Salud.Ms }
         Add-Check 'arranque_health' 'PASA' ('puerto a los {0}, /health a los {1}: status={2} database={3} ready={4} version={5}' -f (Format-Seg $w.SegPuerto), (Format-Seg $w.SegHealth), $j.status, $j.database, $j.ready, $j.version)
-        if ($j.database -ne 'up') { Add-Check 'base_de_datos' 'AVISO' 'el daemon responde pero sin base de datos (esperable en una PC sin Postgres): las herramientas que la usan fallarian' }
+        if ($j.database -ne 'up') { Add-Check 'base_de_datos' 'AVISO' (Get-TextoBaseNoUp ([bool]$Conservar)) }
 
         $dirs = @(Get-Escuchas $ctx.Puerto | ForEach-Object { $_.Direccion })
         $esc = Select-Escucha $dirs $ctx.Ip
@@ -1086,12 +2005,16 @@ function Invoke-FaseAntes {
         $a.mediciones.repeticion_activa_probable = $repActiva
         $tMuerte = Get-Date
         $swMuerte = [System.Diagnostics.Stopwatch]::StartNew()
-        if (-not (Stop-Daemon $idDaemon)) {
-            Add-Check 'matar_daemon' 'FALLA' ('no se pudo terminar el proceso {0}' -f $idDaemon)
-            return
+        # Un fallo aqui se anota y el ensayo SIGUE: cortar a medias deja sin medir la
+        # idempotencia, doctor y el log, que es justo lo que hace falta para entender el fallo.
+        $mato = Stop-Daemon $idDaemon
+        $desaparece = [pscustomobject]@{ Cumplido = $false; Segundos = 0 }
+        if (-not $mato) { Add-Check 'matar_daemon' 'FALLA' ('no se pudo terminar el proceso {0}' -f $idDaemon) }
+        else {
+            $desaparece = Wait-Hasta { @(Get-Escuchas $ctx.Puerto | Where-Object { $_.IdProceso -eq $idDaemon }).Count -eq 0 } 20 250
+            if (-not $desaparece.Cumplido) { Add-Check 'matar_daemon' 'FALLA' 'el puerto siguio abierto 20 s despues de matar el proceso' }
         }
-        $desaparece = Wait-Hasta { @(Get-Escuchas $ctx.Puerto | Where-Object { $_.IdProceso -eq $idDaemon }).Count -eq 0 } 20 250
-        if (-not $desaparece.Cumplido) { Add-Check 'matar_daemon' 'FALLA' 'el puerto siguio abierto 20 s despues de matar el proceso'; return }
+        if ($mato -and $desaparece.Cumplido) {
         Write-Informe ('Proceso {0} terminado. Vigilando hasta {1} s...' -f $idDaemon, $script:LimiteReaparicionSeg)
         $resto = [int][math]::Max(5, $script:LimiteReaparicionSeg - $swMuerte.Elapsed.TotalSeconds)
         $w2 = Wait-Daemon $ctx $resto $idDaemon 2000
@@ -1112,8 +2035,15 @@ function Invoke-FaseAntes {
             Add-Check 'reaparicion' $cl.Resultado ('/health volvio a los {0} de matar el proceso; {1}' -f (Format-Seg $segReal), $cl.Lectura)
             if ($null -ne $deltaTarea) { Write-Informe ('  la tarea registra su ultimo arranque {0} despues de la muerte; ultimo resultado de la tarea: {1}' -f (Format-Seg $deltaTarea), $infoTarea.UltimoResultado) }
         }
-        else { Add-Check 'reaparicion' 'FALLA' ('{0}; {1}' -f $cl.Lectura, (Get-DiagnosticoArranque $ctx $logAntes $secretos)) }
-        if (-not $w2.Ok) { return }
+        else {
+            Add-Check 'reaparicion' 'FALLA' ('{0}; {1}' -f $cl.Lectura, (Get-DiagnosticoArranque $ctx $logAntes $secretos))
+            # Se levanta a mano para poder seguir con lo demas.
+            $run2 = Invoke-Nativo 'schtasks.exe' @('/Run', '/TN', $script:NombreTarea) 30
+            $w4 = Wait-Daemon $ctx $script:LimiteArranqueSeg
+            if ($w4.Ok) { Write-Informe ('  se arranco a mano con schtasks /Run (codigo {0}) y /health respondio a los {1}: el ensayo sigue' -f $run2.Codigo, (Format-Seg $w4.SegHealth)) 'Yellow' }
+            else { Add-Check 'revivir_a_mano' 'FALLA' ('tampoco arranco con schtasks /Run (codigo {0}); {1}' -f $run2.Codigo, (Get-DiagnosticoArranque $ctx $logAntes $secretos)) }
+        }
+        }
 
         # --- 9. Idempotencia -----------------------------------------------
         # Dos repeticiones, como el paso 3 de M1: con las mismas banderas y sin
@@ -1204,9 +2134,12 @@ function Invoke-FaseAntes {
             Write-Json (Join-Path $ctx.Salida 'antes.json') $a
             Write-Informe ''
             Write-Informe ('VEREDICTO: {0}' -f $a.veredicto) $(if ($a.veredicto -eq 'PASA') { 'Green' } else { 'Red' })
-            if ($a.veredicto -eq 'PASA' -and $a.armado_en) {
+            if ($script:ModoTodo) {
+                # Todo ya cuenta lo que sigue con sus propias palabras.
+            }
+            elseif ($a.veredicto -eq 'PASA' -and $a.armado_en) {
                 Write-Informe 'Siguiente paso (la comprobacion del reinicio ya esta armada):'
-                Write-Informe '  1. Reiniciar con "Restart-Computer" (REINICIAR; "Apagar" con Inicio rapido no reinicia el kernel).'
+                Write-Informe '  1. Reiniciar desde el menu de Windows (REINICIAR; "Apagar" con Inicio rapido no reinicia el kernel).'
                 Write-Informe '  2. En la pantalla de inicio de sesion, NO entrar. Esperar 6 minutos (la comprobacion termina antes si el daemon responde antes; vigila hasta 10).'
                 Write-Informe ('  3. Desde OTRA maquina de la LAN: curl http://{0}/health  (prueba el firewall de verdad; desde este equipo no se puede)' -f $direccion)
                 Write-Informe '  4. Entrar y ejecutar:  .\ensayo-madre.ps1 -Fase Despues'
@@ -1409,6 +2342,7 @@ function Invoke-FaseDespues {
             token_sha256 = (Get-HashToken $envTexto)
             errores_log  = $errores
             health_ahora = $salud.Ok
+            primera_sesion = (Get-PrimeraSesion)
         }
         if ($cola.Existe) {
             $ult = @(($cola.Texto -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 60)
@@ -1471,7 +2405,7 @@ function Invoke-FaseLimpiar {
         $ctx.Ip = [string]$estado.ip
     }
     if (($null -eq $estado -or [bool]$estado.preexistia) -and -not $Forzar) {
-        Stop-Rechazo ('no consta que esta instalacion sea solo del ensayo (estado-ensayo.json {0}). Limpiar quitaria la tarea y la regla de una instalacion que ya existia. Si es lo que quieres, repite con -Forzar.' -f $(if ($null -eq $estado) { 'no existe en ' + $ctx.Salida } else { 'dice que ya existia' }))
+        Stop-Rechazo ('no consta que esta instalacion sea solo del ensayo (estado-ensayo.json {0}). Limpiar quitaria la tarea y la regla de una instalacion que ya existia, y no se hace sin que alguien lo confirme. No se toco nada. Manda la carpeta ensayo-informe.' -f $(if ($null -eq $estado) { 'no existe en ' + $ctx.Salida } else { 'dice que ya existia' }))
     }
     $quitado = New-Object System.Collections.ArrayList
     try {
@@ -1483,8 +2417,10 @@ function Invoke-FaseLimpiar {
             Copy-Item -LiteralPath $origen -Destination (Join-Path $ctx.Salida 'despues-arranque.json') -Force
             Write-Informe '  se copio despues-arranque.json a la carpeta del informe antes de borrar nada'
         }
-        if ((Get-ConteoTarea $script:TareaReinicio) -gt 0) {
-            try { Unregister-ScheduledTask -TaskName $script:TareaReinicio -Confirm:$false -ErrorAction Stop; [void]$quitado.Add('tarea ' + $script:TareaReinicio) } catch { Add-Check 'limpiar_reinicio' 'FALLA' $_.Exception.Message }
+        foreach ($nombreTarea in @($script:TareaReinicio, $script:TareaDespues)) {
+            if ((Get-ConteoTarea $nombreTarea) -gt 0) {
+                try { Unregister-ScheduledTask -TaskName $nombreTarea -Confirm:$false -ErrorAction Stop; [void]$quitado.Add('tarea ' + $nombreTarea) } catch { Add-Check 'limpiar_reinicio' 'FALLA' $_.Exception.Message }
+            }
         }
         if (Test-Path -LiteralPath $ctx.Trabajo) {
             try { Remove-Item -LiteralPath $ctx.Trabajo -Recurse -Force -ErrorAction Stop; [void]$quitado.Add('carpeta ' + $ctx.Trabajo) } catch { Add-Check 'limpiar_trabajo' 'FALLA' $_.Exception.Message }
@@ -1544,6 +2480,7 @@ function Invoke-FaseLimpiar {
         $queda = New-Object System.Collections.ArrayList
         if ((Get-ConteoTarea $script:NombreTarea) -gt 0) { [void]$queda.Add('tarea ' + $script:NombreTarea) }
         if ((Get-ConteoTarea $script:TareaReinicio) -gt 0) { [void]$queda.Add('tarea ' + $script:TareaReinicio) }
+        if ((Get-ConteoTarea $script:TareaDespues) -gt 0) { [void]$queda.Add('tarea ' + $script:TareaDespues) }
         if (@(Get-DetalleRegla $script:NombreRegla).Count -gt 0) { [void]$queda.Add('regla ' + $script:NombreRegla) }
         foreach ($f in @($ctx.Launcher, $ctx.Xml)) { if (Test-Path -LiteralPath $f) { [void]$queda.Add($f) } }
         if ($ctx.Puerto -and @(Get-Escuchas $ctx.Puerto).Count -gt 0) { [void]$queda.Add(('algo escucha aun en el puerto {0}' -f $ctx.Puerto)) }
@@ -1566,6 +2503,217 @@ function Invoke-FaseLimpiar {
 }
 
 # ===========================================================================
+# Fase Todo (doble clic) y Final (al volver a iniciar sesion)
+# ===========================================================================
+
+function Get-ProblemasSumas {
+    # Compara lo que hay en disco con SHA256SUMS.txt, que viaja junto al script. Lee
+    # cada fichero que la lista nombra; el binario se busca donde diga -Binario.
+    param([string]$Carpeta, [string]$RutaBinario)
+    $texto = Read-Texto (Join-Path $Carpeta $script:ArchivoSumas)
+    if ($null -eq $texto) {
+        return @('no encuentro SHA256SUMS.txt junto al script: sin el no se puede comprobar que el .exe es el que se ensayo')
+    }
+    $sumas = Read-Sumas $texto
+    $reales = @{}
+    foreach ($nombre in @($sumas.Keys)) {
+        if ($nombre -eq 'memory-industry.exe') { $ruta = $RutaBinario }
+        else { $ruta = Join-Path $Carpeta ($nombre -replace '/', [string][System.IO.Path]::DirectorySeparatorChar) }
+        if (Test-Path -LiteralPath $ruta -PathType Leaf) {
+            $reales[$nombre] = (Get-FileHash -LiteralPath $ruta -Algorithm SHA256).Hash.ToLower()
+        }
+    }
+    return @(Compare-Sumas $sumas $reales)
+}
+
+function Install-TareaDespues {
+    # Una tarea de UN solo uso: al iniciar sesion ESTE usuario, con privilegios
+    # elevados y la consola a la vista, ejecuta la fase Final (Despues + Limpiar) y se
+    # borra a si misma. Corre como el usuario y no como SYSTEM: tiene que abrir una
+    # ventana en su escritorio, y no guarda ninguna clave.
+    param($Ctx)
+    if ([string]::IsNullOrEmpty($PSCommandPath)) {
+        Add-Check 'tarea_despues' 'FALLA' 'no se conoce la ruta de este script ($PSCommandPath vacio)'
+        return $false
+    }
+    # La persona sentada (resuelta en Humo), no quien haya elevado: la ventana del
+    # resultado tiene que abrirse en SU escritorio.
+    $usuario = $script:UsuarioInteractivo
+    if ([string]::IsNullOrEmpty($usuario)) { $usuario = Get-UsuarioActual }
+    $extra = ''
+    if ($Conservar) { $extra = ' -Conservar' }
+    $argumento = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Fase Final -Binario "{1}" -Salida "{2}"{3}' -f $PSCommandPath, $Ctx.Binario, $Ctx.Salida, $extra
+    try {
+        $accion = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argumento
+        $disparador = New-ScheduledTaskTrigger -AtLogOn -User $usuario
+        $principal = New-ScheduledTaskPrincipal -UserId $usuario -LogonType Interactive -RunLevel Highest
+        $ajustes = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 2) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        [void](Register-ScheduledTask -TaskName $script:TareaDespues -Action $accion -Trigger $disparador -Principal $principal -Settings $ajustes -Description 'Ensayo MemoryIndustry: comprueba el resultado al volver a iniciar sesion. Se borra sola.' -Force)
+    }
+    catch {
+        Add-Check 'tarea_despues' 'FALLA' ('no se pudo registrar {0}: {1}' -f $script:TareaDespues, $_.Exception.Message)
+        return $false
+    }
+    if ((Get-ConteoTarea $script:TareaDespues) -ne 1) {
+        Add-Check 'tarea_despues' 'FALLA' 'la tarea de resultado no figura tras registrarla'
+        return $false
+    }
+    Add-Check 'tarea_despues' 'PASA' ('tarea {0} armada para {1}: al iniciar sesion comprueba y muestra el resultado' -f $script:TareaDespues, $usuario)
+    return $true
+}
+
+function Reset-EstadoFase {
+    $script:Checks.Clear()
+    $script:Lineas.Clear()
+    $script:Codigo = 0
+}
+
+function Invoke-FaseTodo {
+    $ctx = $script:Ctx
+    Test-PrerequisitosComunes
+    $script:ModoTodo = $true
+    $real = [bool]$Conservar
+    Write-Informe 'MemoryIndustry - ensayo completo (un solo reinicio)' 'Cyan'
+    [void](New-Item -ItemType Directory -Path $ctx.Salida -Force)
+
+    Write-Paso 'Prueba de humo (no instala nada)'
+    # Un zip bajado de internet marca cada fichero como "de internet" y Windows pregunta
+    # o bloquea; esto lo quita en toda la carpeta del paquete.
+    try { Get-ChildItem -LiteralPath $PSScriptRoot -Recurse -File -Force -ErrorAction Stop | Unblock-File -ErrorAction SilentlyContinue } catch { }
+    $humo = Get-ResultadoHumo $ctx $true
+    Write-FilasHumo $humo.Filas
+    Write-Json (Join-Path $ctx.Salida 'humo.json') ([ordered]@{ fase = 'Humo'; fecha = (Get-AhoraTexto); veredicto = $humo.Veredicto; filas = @($humo.Filas) })
+    if ($humo.Veredicto -ne 'OK') {
+        Write-Informe ''
+        Write-Informe 'HUMO: PARA. No se instalo nada.' 'Red'
+        foreach ($f in @($humo.Filas | Where-Object { $_.estado -eq 'PARA' })) { Write-Informe ('  - {0}: {1}' -f $f.id, $f.accion) 'Red' }
+        Write-Informe ('Cuando lo hayas corregido, vuelve a hacer doble clic. Si no puedes, manda la carpeta {0}.' -f $ctx.Salida) 'Red'
+        Save-Informe $ctx -Anexar
+        $script:Codigo = 2
+        return
+    }
+    Write-Informe 'HUMO: OK. Se puede instalar.' 'Green'
+
+    if ([string]::IsNullOrWhiteSpace($ctx.Ip)) {
+        if ($real) { Resolve-IpReal $ctx $humo }
+        else { $ctx.Ip = $humo.Elegida.Ip; Write-Informe ('Direccion del ensayo: {0} ({1})' -f $humo.Elegida.Ip, $humo.Elegida.Alias) }
+    }
+    Resolve-BaseDatos $real
+
+    Invoke-FaseAntes
+    if ($script:Codigo -ne 0) {
+        Write-Informe ''
+        Write-Informe 'La primera parte NO salio bien, asi que NO se reinicia el equipo.' 'Red'
+        Write-Informe ('Manda la carpeta {0} (informe.txt dice que fallo).' -f $ctx.Salida) 'Red'
+        return
+    }
+
+    $antes = Read-Json (Join-Path $ctx.Salida 'antes.json')
+    $ajenas = @()
+    $listaAjenas = Get-SesionesAjenas (Get-TextoQuser)
+    if ($null -ne $listaAjenas) { $ajenas = @($listaAjenas) }
+    $pendientes = @(Get-RebootPendiente)
+    Write-Paso 'Falta el reinicio'
+    foreach ($linea in @(Get-ResumenTodo ([string]$antes.direccion) ([bool]$antes.autologon) $real $ctx.Salida (Get-AvisosAntes $antes) $ajenas $pendientes)) {
+        $color = ''
+        if ($linea -like 'AVISO*' -or $linea -like 'no podra*' -or $linea -like '*ATENCION*') { $color = 'Yellow' }
+        Write-Informe $linea $color
+    }
+    Write-Informe ''
+    if ($ajenas.Count -gt 0) { $respuesta = Read-Host 'Hay otras personas con sesion abierta. Escribe SI (entero) para reiniciar de todos modos' }
+    else { $respuesta = Read-Host 'Reiniciar ahora? (S/N)' }
+    if (-not (Test-ConfirmaReinicio $respuesta ($ajenas.Count -gt 0))) {
+        Write-Informe 'No se reinicio. Cuando quieras, haz doble clic otra vez en el lanzador: repite la primera parte (es segura) y vuelve a preguntar.' 'Yellow'
+        return
+    }
+    if (-not (Install-TareaDespues $ctx)) {
+        Write-Informe 'No se pudo preparar el resultado para despues del reinicio, asi que NO se reinicia.' 'Red'
+        $script:Codigo = 1
+        return
+    }
+    # shutdown.exe y no Restart-Computer -Force: da 60 segundos para cancelar y no cierra a
+    # la fuerza el trabajo de nadie sin aviso.
+    $sd = Invoke-Nativo 'shutdown.exe' @('/r', '/t', '60', '/c', 'MemoryIndustry: reinicio para comprobar que el servicio arranca solo. Cancela con: shutdown /a') 30
+    if ($sd.NoArranco -or $sd.Agotado -or $sd.Codigo -ne 0) {
+        Write-Informe ('No se pudo programar el reinicio (shutdown codigo {0}: {1}). Reinicia a mano desde el menu de Windows (Reiniciar, no Apagar).' -f $sd.Codigo, $sd.Error.Trim()) 'Red'
+        $script:Codigo = 1
+        return
+    }
+    Write-Informe 'El equipo se reiniciara en 60 segundos. Para CANCELARLO escribe:  shutdown /a' 'Yellow'
+}
+
+function Write-VeredictoGrande {
+    param([string]$Veredicto)
+    $fondo = 'DarkRed'
+    if ($Veredicto -eq 'PASA') { $fondo = 'DarkGreen' }
+    Write-Host ''
+    Write-Host '                                                        ' -BackgroundColor $fondo
+    Write-Host ('      RESULTADO DEL ENSAYO:   {0}                        ' -f $Veredicto) -ForegroundColor White -BackgroundColor $fondo
+    Write-Host '                                                        ' -BackgroundColor $fondo
+    Write-Host ''
+}
+
+function Invoke-FaseFinal {
+    # Lo ejecuta la tarea de inicio de sesion que armo Todo. Despues, luego Limpiar
+    # (salvo -Conservar) pase lo que pase: no se deja nada instalado por un ensayo
+    # fallido, y el informe se conserva.
+    $ctx = $script:Ctx
+    Test-PrerequisitosComunes
+    # Primero se borra la tarea: si algo de lo que sigue se cuelga o falla, no se repite
+    # en cada inicio de sesion.
+    try { Unregister-ScheduledTask -TaskName $script:TareaDespues -Confirm:$false -ErrorAction Stop } catch { }
+    Write-Host 'MemoryIndustry: comprobando el servicio despues del reinicio...' -ForegroundColor Cyan
+
+    # La medicion del arranque la hace otra tarea, independiente de quien inicie
+    # sesion y cuando: aqui se espera a que termine para no leerla a medias.
+    $archivo = Join-Path $ctx.Trabajo 'despues-arranque.json'
+    $espera = Wait-Hasta { $j = Read-Json $archivo; ($null -ne $j) -and ($j.estado -eq 'completo') } $script:EsperaMedicionSeg 3000
+    if (-not $espera.Cumplido) { Write-Host 'La medicion del arranque no termino a tiempo; se sigue con lo que haya.' -ForegroundColor Yellow }
+
+    $motivo = $null
+    try { Invoke-FaseDespues }
+    catch {
+        if ($_.Exception.Message -eq 'RECHAZO') { $motivo = [string]$script:Lineas[$script:Lineas.Count - 1] }
+        else { Add-Check 'excepcion' 'FALLA' ('error inesperado del script: {0}' -f $_.Exception.Message) }
+    }
+    $checks = @($script:Checks)
+    if ($script:Codigo -eq 2 -or $checks.Count -eq 0) {
+        $checks += [pscustomobject]@{ id = 'despues'; resultado = 'FALLA'; detalle = $(if ($motivo) { $motivo } else { 'la comprobacion no pudo correr' }) }
+    }
+    $veredicto = Get-Veredicto $checks
+    Reset-EstadoFase
+
+    if ($Conservar) {
+        $limpieza = 'el servicio se dejo instalado a proposito.'
+    }
+    else {
+        try { Invoke-FaseLimpiar }
+        catch { if ($_.Exception.Message -ne 'RECHAZO') { Add-Check 'excepcion' 'FALLA' ('error inesperado del script: {0}' -f $_.Exception.Message) } }
+        $malos = @($script:Checks | Where-Object { $_.resultado -eq 'FALLA' })
+        if ($script:Codigo -eq 0 -and $malos.Count -eq 0) {
+            $limpieza = 'se retiro la tarea, la regla de firewall y el aviso de reinicio. Quedan el archivo de configuracion (con la clave) y el registro, por si hay que mirar algo.'
+        }
+        else {
+            $limpieza = 'NO se pudo retirar todo: ' + $(if ($malos.Count) { (($malos | ForEach-Object { '{0}: {1}' -f $_.id, $_.detalle }) -join ' | ') } else { [string]$script:Lineas[$script:Lineas.Count - 1] })
+        }
+        Reset-EstadoFase
+    }
+
+    $arranque = Read-Json (Join-Path $ctx.Salida 'despues-arranque.json')
+    $antesJson = Read-Json (Join-Path $ctx.Salida 'antes.json')
+    $texto = Format-Resultado $veredicto $checks $limpieza $arranque $ctx.Salida $env:COMPUTERNAME (Get-Date -Format 'yyyy-MM-dd HH:mm') (Get-AvisosAntes $antesJson)
+    $ruta = Join-Path $ctx.Salida 'RESULTADO.txt'
+    Write-TextoArchivo $ruta $texto -ConBom
+    Write-VeredictoGrande $veredicto
+    foreach ($c in @($checks | Where-Object { $_.resultado -eq 'FALLA' })) { Write-Host ('  - {0}: {1}' -f $c.id, $c.detalle) -ForegroundColor Red }
+    Write-Host ('Limpieza: {0}' -f $limpieza)
+    Write-Host ('Detalle en {0}' -f $ruta)
+    try { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $ruta) } catch { }
+    [void](Read-Host 'Pulsa Enter para cerrar esta ventana')
+    if ($veredicto -eq 'PASA') { $script:Codigo = 0 } else { $script:Codigo = 1 }
+}
+
+# ===========================================================================
 # Principal
 # ===========================================================================
 
@@ -1574,20 +2722,31 @@ function Invoke-Principal {
     # fichero con "punto" para probar sus funciones no se toca la sesion de quien lo carga.
     Set-StrictMode -Version 1
     $ErrorActionPreference = 'Stop'
-    if (-not $Fase) {
-        Write-Host 'Uso: .\ensayo-madre.ps1 -Fase Antes|Despues|Limpiar [-Binario ruta] [-Ip ipv4] [-Puerto 8797] [-Salida carpeta]'
-        $script:Codigo = 2
-        return
-    }
     if ($Fase -eq 'Arranque') {
         # Corre como SYSTEM al arrancar: no necesita el contexto del operador, y
         # LOCALAPPDATA puede no estar definida para esa cuenta.
         Invoke-FaseArranque
         return
     }
+    # La transcripcion arranca antes que nada, en la carpeta del informe: todo rechazo,
+    # por temprano que sea, deja un fichero que se puede mandar. Solo recoge lo que se
+    # imprime, y nada de lo que se imprime lleva el token ni la URL de la base.
+    $transcrito = $false
+    try {
+        $sal = $Salida
+        if ([string]::IsNullOrWhiteSpace($sal)) { $sal = 'ensayo-informe' }
+        $sal = Get-RutaAbsoluta $sal
+        [void](New-Item -ItemType Directory -Path $sal -Force)
+        [void](Start-Transcript -Path (Join-Path $sal ('transcripcion-{0}.txt' -f $Fase.ToLower())) -Append -ErrorAction Stop)
+        $transcrito = $true
+    }
+    catch { }
     try {
         $script:Ctx = New-Contexto
         switch ($Fase) {
+            'Todo' { Invoke-FaseTodo }
+            'Humo' { Invoke-FaseHumo }
+            'Final' { Invoke-FaseFinal }
             'Antes' { Invoke-FaseAntes }
             'Despues' { Invoke-FaseDespues }
             'Limpiar' { Invoke-FaseLimpiar }
@@ -1597,7 +2756,17 @@ function Invoke-Principal {
         if ($_.Exception.Message -ne 'RECHAZO') {
             Write-Host ('ERROR inesperado: {0}' -f $_.Exception.Message) -ForegroundColor Red
             $script:Codigo = 1
+            if ($null -ne $script:Ctx) { try { Write-Informe ('ERROR inesperado: {0}' -f $_.Exception.Message); Save-Informe $script:Ctx -Anexar } catch { } }
         }
+        else {
+            # Un rechazo tambien deja informe: sin el, la persona solo tiene una ventana
+            # que se cierra.
+            if ($null -ne $script:Ctx) { try { Save-Informe $script:Ctx -Anexar } catch { } }
+            if ($Fase -eq 'Todo') { Write-Host 'El ensayo se detuvo y NO se reinicia el equipo.' -ForegroundColor Red }
+        }
+    }
+    finally {
+        if ($transcrito) { try { [void](Stop-Transcript) } catch { } }
     }
 }
 

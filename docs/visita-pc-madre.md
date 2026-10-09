@@ -7,10 +7,10 @@ minutos, más un reinicio.
 
 ## Antes de salir
 
-- La carpeta del paquete (`memory-industry-0.29-visita.zip`) en un USB, y su
+- El paquete `memory-industry-0.29-EQUIPO-REAL.zip` en un USB, y su
   suma SHA-256 anotada aparte.
-- Un administrador de la PC madre presente. El script se niega a correr sin
-  permisos de administrador y no deja nada a medias.
+- Un administrador de la PC madre presente (el aviso de administrador sale al
+  hacer doble clic). Sin ese permiso no se instala nada a medias.
 - La IP fija que tendrá la PC madre. Si aún no la tiene, el paso 1 la fija.
 - El nombre de la PC madre dentro de la empresa (el que ve en
   Sistema > Nombre del equipo).
@@ -22,30 +22,52 @@ minutos, más un reinicio.
    the host». La dirección tiene que quedar fuera del rango que reparte el
    DHCP: pregunta a quien administra la red, o mira `ipconfig /all` en otra
    máquina para ver el rango. Después de fijarla, `ipconfig` debe mostrarla.
-2. **Copiar y comprobar.** Descomprime el paquete en `C:\memory-industry-visita`
-   y compara la suma:
-   `Get-FileHash .\memory-industry.exe -Algorithm SHA256` contra `SHA256SUMS.txt`.
-   Si no coincide, para: el archivo se corrompió o no es el ensayado.
-3. **Antes del reinicio.** PowerShell como administrador, en esa carpeta:
-   `.\ensayo-madre.ps1 -Fase Antes -Ip <IP-FIJA>`.
-   Tarda unos 6 minutos (espera a que el servicio vuelva tras matarlo). Debe
-   terminar con `VEREDICTO: PASA`. Si dice `FALLA`, no sigas: manda la carpeta
-   `ensayo-informe` tal cual.
-4. **Reiniciar sin iniciar sesión.** Reinicia la PC, y cuando llegue a la pantalla
-   de inicio de sesión **espera 5 minutos sin entrar**. Eso es lo que prueba que
-   el servicio arranca con nadie conectado.
-5. **Después del reinicio.** Inicia sesión como administrador y ejecuta
-   `.\ensayo-madre.ps1 -Fase Despues`. Debe decir `VEREDICTO: PASA` y
-   mostrar cuántos segundos tardó el servicio en responder tras el arranque.
-   Copia la carpeta `ensayo-informe` al USB.
+2. **Copiar.** Usa el paquete `memory-industry-0.29-EQUIPO-REAL.zip` (no el de
+   ENSAYO) y descomprímelo en `C:\memory-industry-visita`. No hace falta comparar
+   la suma a mano: la prueba de humo del paso siguiente lo hace y, si el `.exe` no
+   es el ensayado, para antes de instalar nada.
+3. **Doble clic en `INSTALAR-EQUIPO-REAL.cmd`** y acepta el aviso de administrador
+   con **Sí**, sin escribir otra contraseña (el resultado se abre en el escritorio
+   de quien está sentado). Hace, en orden:
+   - **Prueba de humo** (2 minutos, solo lectura, no instala nada). Cada fila sale
+     `OK`, `AVISO` o `PARA`. Con un solo `PARA` se detiene y dice qué hacer: no
+     sigas, manda la carpeta `ensayo-informe` tal cual.
+   - **Dirección IP.** Muestra las direcciones del equipo numeradas y propone la de la
+     ruta principal. Comprueba que es la IP fija; si no, escribe el número de la
+     correcta. Si es de DHCP, avisa en rojo: fija la IP antes (paso 1).
+   - **Base de datos.** Enter usa `postgresql://cuba:…@127.0.0.1:5488/brain` (la del
+     repositorio); o escribe otra URL (no se muestra). La base está en Docker
+     Desktop de este mismo equipo, que arranca **al iniciar sesión, no al encender**:
+     tras un reinicio el servicio arranca degradado y recupera sus herramientas
+     solo cuando Docker está arriba (los bucles de fondo rem y sync, solo tras el
+     siguiente reinicio del servicio). Que la base no responda en ese momento es un
+     `AVISO`, no un fallo.
+   - **Instala y prueba** (incluye matarlo y ver que vuelve). Si la red es
+     **Pública**, ofrece cambiarla a Privada (`Set-NetConnectionProfile`) y, si no
+     se cambia, falla: con red Pública ningún cliente entra.
+   - **Reinicio.** Lista las sesiones de otras personas y los reinicios pendientes.
+     Pregunta «Reiniciar ahora? (S/N)»; si hay otras sesiones abiertas hay que
+     escribir **SI** entero. Reinicia con 60 segundos de margen; se cancela con
+     `shutdown /a`.
+4. **Inicia sesión cuando quieras.** Al volver, el propio equipo comprueba que el
+   servicio arrancó solo, antes de que nadie entrara, y abre `RESULTADO.txt` con
+   `PASA` o `FALLA` en grande. En la PC madre el servicio **se queda instalado**
+   aunque falle. Si el equipo inicia sesión solo (sin contraseña), esa prueba
+   concreta no vale y lo dice; lo demás sí. `RESULTADO.cmd` lo repite.
+5. **Desde otra máquina de la red**, abre `http://<IP-FIJA>:8797/health`: es la
+   única prueba real del firewall. Copia la carpeta `ensayo-informe` al USB.
+
+Para quitarlo todo: `QUITAR-TODO.cmd` (pide confirmación). El otro paquete,
+`ENSAYO`, es para una PC de prueba y se desinstala solo al final.
 
 ## Si algo falla
 
 - No improvises cambios en la configuración: manda `ensayo-informe` completa.
   No contiene el token (solo su largo y una huella de comparación).
-- Para dejar la PC como estaba: `.\ensayo-madre.ps1 -Fase Limpiar`. Quita la
-  tarea, la regla del cortafuegos y el aviso de reinicio, y deja los archivos de
-  datos.
+- Para dejar la PC como estaba: `QUITAR-TODO.cmd`, o `.\ensayo-madre.ps1 -Fase Limpiar` (como
+  administrador, desde `C:\ProgramData\MemoryIndustry\paquete`). Quita la tarea, la regla del cortafuegos y el aviso de reinicio,
+  y deja los archivos de datos. Si la instalación existía antes del ensayo, se
+  niega salvo `-Forzar`.
 - El registro del servicio está en
   `%LOCALAPPDATA%\MemoryIndustry\memory-industry.log` del usuario que instaló;
   su última línea de error suele decir la causa («is not assigned to this
