@@ -124,12 +124,26 @@ pub struct Discovery {
     pub attempts: Vec<Attempt>,
 }
 
-/// Lower is louder.
-fn failure_of(verdict: &Verdict) -> Option<(u8, Failure)> {
+/// Addresses the client itself pinned: the last good one, the stored ones, the one typed.
+/// Only there does another host id mean this host changed its fingerprint.
+fn pinned_by_the_client(source: Source) -> bool {
+    matches!(source, Source::LastGood | Source::Stored | Source::Explicit)
+}
+
+/// Lower is louder. Another host id found by the name, the announcement or the sweep is
+/// another installation on the LAN, not this host: it says nothing about why this one was not
+/// found, and telling the person to pair again would send them to the wrong machine. It stays
+/// in the report.
+fn failure_of(attempt: &Attempt) -> Option<(u8, Failure)> {
+    let Outcome::Checked(verdict) = &attempt.outcome else {
+        return None;
+    };
     match verdict {
         Verdict::Revoked => Some((0, Failure::Revoked)),
         Verdict::Unknown => Some((1, Failure::Unknown)),
-        Verdict::WrongHost { seen } => Some((2, Failure::WrongHost { seen: *seen })),
+        Verdict::WrongHost { seen } if pinned_by_the_client(attempt.candidate.source) => {
+            Some((2, Failure::WrongHost { seen: *seen }))
+        }
         Verdict::Impostor => Some((3, Failure::Impostor)),
         _ => None,
     }
@@ -144,10 +158,7 @@ impl Discovery {
         let loudest = self
             .attempts
             .iter()
-            .filter_map(|attempt| match &attempt.outcome {
-                Outcome::Checked(verdict) => failure_of(verdict),
-                Outcome::NotProbed(_) => None,
-            })
+            .filter_map(failure_of)
             .min_by_key(|(rank, _)| *rank);
         Some(loudest.map_or(Failure::NotFound, |(_, failure)| failure))
     }
