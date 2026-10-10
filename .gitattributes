@@ -57,3 +57,14 @@ scripts/lizard-baseline.txt text eol=lf
 # and libgit2 do not implement it, and a client without support would commit
 # the UTF-16 bytes as-is.
 packaging/windows/memory-industry-task.xml text eol=lf working-tree-encoding=UTF-16LE-BOM
+
+# The double-click launchers of the two visit packages. cmd.exe is the only reader, and a
+# batch file with bare LF line endings is the one thing it can misread (labels and
+# goto jump to the wrong place). They carry neither today, but the rule is cheap and
+# the zips are built from these bytes. Named by path, not `*.cmd`: that would also
+# reach packaging/windows/memory-industry.cmd, whose line endings are deliberately
+# left alone above.
+scripts/ENSAYO-se-desinstala-al-final.cmd text eol=crlf
+scripts/INSTALAR-EQUIPO-REAL.cmd text eol=crlf
+scripts/QUITAR-TODO.cmd text eol=crlf
+scripts/RESULTADO.cmd text eol=crlf

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Builds the visit package: the Windows binary, the rehearsal script and the sheets
-# somebody needs at a machine where nothing can be rebuilt.
+# Builds the TWO visit packages, so nobody has to choose between launchers:
+#   memory-industry-0.29-ENSAYO.zip       only ENSAYO-se-desinstala-al-final.cmd
+#   memory-industry-0.29-EQUIPO-REAL.zip  only INSTALAR-EQUIPO-REAL.cmd, QUITAR-TODO.cmd, RESULTADO.cmd
+# plus, in each, the Windows binary, the rehearsal script and the sheets somebody needs at
+# a machine where nothing can be rebuilt.
 #
-#   ./scripts/empaquetar-visita.sh                    dist-visita/memory-industry-0.29-visita.zip
+#   ./scripts/empaquetar-visita.sh                    dist-visita/memory-industry-0.29-{ENSAYO,EQUIPO-REAL}.zip
 #   ./scripts/empaquetar-visita.sh --aceptar-obsoleto build it although the .exe predates the sources
 #
 # The .exe is cross-compiled elsewhere and NEVER rebuilt here: this script only
@@ -18,10 +21,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PAQUETE="0.29"
-NOMBRE="memory-industry-${PAQUETE}-visita"
 EXE="${MEMORY_INDUSTRY_WIN_EXE:-$HOME/.cache/cargo-target/memory-industry-win/x86_64-pc-windows-msvc/release/memory-industry.exe}"
 SALIDA="$ROOT/dist-visita"
-ZIP="$SALIDA/$NOMBRE.zip"
 HOJA="$ROOT/docs/visita-pc-madre.md"
 GUIA="$ROOT/docs/despliegue-lan.md"
 SCRIPT_PS="$ROOT/scripts/ensayo-madre.ps1"
@@ -36,7 +37,7 @@ for arg in "$@"; do
   case "$arg" in
     --aceptar-obsoleto) aceptar_obsoleto=1 ;;
     -h | --help)
-      sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) die "argumento desconocido: $arg (ver --help)" ;;
@@ -46,6 +47,9 @@ done
 command -v python3 >/dev/null || die "falta python3 (escribe el zip)"
 command -v sha256sum >/dev/null || die "falta sha256sum"
 [[ -f "$SCRIPT_PS" ]] || die "no existe $SCRIPT_PS"
+for lanzador in ENSAYO-se-desinstala-al-final.cmd INSTALAR-EQUIPO-REAL.cmd QUITAR-TODO.cmd RESULTADO.cmd; do
+  [[ -f "$ROOT/scripts/$lanzador" ]] || die "no existe scripts/$lanzador"
+done
 [[ -f "$GUIA" ]] || die "no existe $GUIA"
 
 # --- El script de ensayo tiene que poder leerlo Windows PowerShell 5.1 ----------
@@ -120,19 +124,19 @@ else
 fi
 
 mkdir -p "$SALIDA"
-rm -f "$ZIP"
+rm -f "$SALIDA/memory-industry-$PAQUETE-ENSAYO.zip" "$SALIDA/memory-industry-$PAQUETE-EQUIPO-REAL.zip" "$SALIDA/memory-industry-$PAQUETE-visita.zip"
 
-# --- El zip ------------------------------------------------------------------------
+# --- Los zips ----------------------------------------------------------------------
 # Todo el trabajo esta en python para que el contenido, las sumas y el zip salgan de
-# UNA lectura de cada fichero: las sumas que lleva el paquete son las de los bytes
-# que lleva el zip.
-EXE="$EXE" ZIP="$ZIP" NOMBRE="$NOMBRE" SCRIPT_PS="$SCRIPT_PS" GUIA="$GUIA" HOJA="$HOJA" \
+# UNA lectura de cada fichero: las sumas que lleva cada paquete son las de los bytes
+# que lleva su zip.
+EXE="$EXE" SALIDA="$SALIDA" SCRIPT_PS="$SCRIPT_PS" SCRIPTS="$ROOT/scripts" GUIA="$GUIA" HOJA="$HOJA" \
   INCLUYE_HOJA="$incluye_hoja" PAQUETE="$PAQUETE" python3 -I - <<'PY'
 import hashlib
 import os
 import zipfile
 
-exe, destino, carpeta = os.environ["EXE"], os.environ["ZIP"], os.environ["NOMBRE"]
+exe, salida, paquete = os.environ["EXE"], os.environ["SALIDA"], os.environ["PAQUETE"]
 
 
 def leer(ruta):
@@ -141,107 +145,126 @@ def leer(ruta):
 
 
 def crlf(datos):
-    # Los .txt se abren en el Bloc de notas de cualquier Windows, tambien en los viejos
-    # que no entienden un salto de linea suelto.
+    # Los .txt y .cmd se abren en cualquier Windows, tambien en los viejos que no
+    # entienden un salto de linea suelto.
     return datos.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
 
 
-LEEME = """\
-MemoryIndustry {paquete} - paquete de visita
-=============================================
+def lanzador(nombre):
+    return (nombre, crlf(leer(os.path.join(os.environ["SCRIPTS"], nombre))))
 
-Esto instala MemoryIndustry como servicio de Windows (tarea programada que arranca
-con el equipo, regla de firewall) y comprueba que funciona. Sirve igual para ensayarlo
-en una PC propia y para repetirlo en el equipo real.
 
-Antes de empezar
-  1. Descomprimir el zip ENTERO en una carpeta local y fija, por ejemplo
-     C:\\memory-industry-visita  (no ejecutar desde dentro del zip, ni desde una
-     unidad de red, ni desde Descargas/Escritorio/OneDrive: la ruta del .exe queda
-     escrita en la tarea).
-  2. Comprobar el binario:  Get-FileHash .\\memory-industry.exe -Algorithm SHA256
-     y comparar con SHA256SUMS.txt (mayusculas o minusculas, da igual). Si no
-     coincide, parar.
-  3. Si el zip vino de internet o del correo, desbloquear:
-       Get-ChildItem -Recurse | Unblock-File
-  4. Abrir PowerShell COMO ADMINISTRADOR en esa carpeta. Sin administrador el script
-     se niega y no deja nada a medias.
+# LEEME.txt: seis lineas como mucho. Lo demas va en AYUDA.txt.
+LEEME_ENSAYO = """\
+1. Descomprime.
+2. Doble clic en ENSAYO-se-desinstala-al-final.cmd.
+3. Acepta el aviso de administrador y responde S a las preguntas.
+4. Inicia sesion cuando vuelva el equipo: el resultado se abre solo.
+5. Al final se desinstala todo; el informe queda en la carpeta ensayo-informe.
+6. Avisame.
+"""
 
-Los tres comandos
-  1) Antes del reinicio  (unos minutos; en el peor caso, unos 20)
-       .\\ensayo-madre.ps1 -Fase Antes
-     Si la directiva de ejecucion de scripts lo impide:
-       powershell -NoProfile -ExecutionPolicy Bypass -File .\\ensayo-madre.ps1 -Fase Antes
-     Opciones: -Ip <ipv4 de este equipo> (por omision, la primera IPv4 privada de un
-     adaptador activo), -Puerto <n> (8797 por omision), -Salida <carpeta>
-     (.\\ensayo-informe por omision).
-     Tiene que terminar con  VEREDICTO: PASA.  Si dice FALLA, no seguir: mandar la
-     carpeta ensayo-informe tal cual.
+LEEME_REAL = """\
+1. Descomprime.
+2. Doble clic en INSTALAR-EQUIPO-REAL.cmd, acepta el aviso de administrador.
+3. Confirma la direccion IP y la base de datos; responde S al reinicio.
+4. Inicia sesion cuando quieras: el resultado se abre solo (RESULTADO.cmd lo repite).
+5. Si algo sale mal: QUITAR-TODO.cmd lo deja como estaba.
+6. Avisame.
+"""
 
-  2) Reiniciar SIN iniciar sesion
-       Restart-Computer
-     Reiniciar, no apagar (con Inicio rapido, "Apagar" no reinicia el kernel). Al
-     llegar a la pantalla de inicio de sesion, NO entrar: esperar 6 minutos. Desde
-     OTRA maquina de la LAN:  curl http://<ip>:<puerto>/health  (es la unica prueba
-     real del firewall; desde el propio equipo no se puede).
+AYUDA_COMUN = """\
+Antes de instalar, el lanzador hace una PRUEBA DE HUMO de solo lectura (no instala nada):
+cuenta, paquete, .exe, directivas, Task Scheduler, red, base de datos y sesiones. Si algo
+esta en PARA, se detiene y dice que hacer. Despues copia el paquete a
+C:\\ProgramData\\MemoryIndustry\\paquete (solo SYSTEM y administradores pueden modificarlo) y
+ejecuta todo desde alli.
 
-  3) Despues del reinicio
-       .\\ensayo-madre.ps1 -Fase Despues
-     Tiene que terminar con  VEREDICTO: PASA  y muestra cuantos segundos tardo el
-     servicio en responder desde el arranque.
-
-Para dejar el equipo como estaba (SOLO en un ensayo; en el equipo real no)
-       .\\ensayo-madre.ps1 -Fase Limpiar            quita la tarea, la regla y el aviso
-                                                    de reinicio; deja el env file
-       .\\ensayo-madre.ps1 -Fase Limpiar -BorrarEnv  borra tambien el env file (token) y el log
+Fases sueltas (PowerShell COMO ADMINISTRADOR, en C:\\ProgramData\\MemoryIndustry\\paquete)
+  .\\ensayo-madre.ps1 -Fase Humo       la prueba de humo, sola
+  .\\ensayo-madre.ps1 -Fase Antes      primera parte
+  .\\ensayo-madre.ps1 -Fase Despues    comprobacion tras el reinicio
+  .\\ensayo-madre.ps1 -Fase Limpiar    retira tarea, regla y avisos (deja el env file)
+  Si la directiva de ejecucion lo impide:
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\\ensayo-madre.ps1 -Fase Humo
 
 Que se lleva de vuelta
-  La carpeta ensayo-informe: informe.txt (lectura humana), antes.json,
-  despues-arranque.json y despues.json (maquina), mas las salidas de cada comando.
-  No contiene el token: solo su largo y una huella SHA-256 para comparar antes y
-  despues. El log se copia con el token redactado.
+  La carpeta ensayo-informe (junto a los lanzadores): RESULTADO.txt (lectura humana),
+  informe.txt, humo.json, antes.json, despues.json y la transcripcion de cada fase.
+  No contiene el token ni la clave de la base de datos: solo el largo del token y una
+  huella para comparar.
 
-Contenido
-  memory-industry.exe     el binario (suma en SHA256SUMS.txt)
-  ensayo-madre.ps1        el ensayo
-  README-VISITA.txt       la hoja de 5 pasos
-  docs\\despliegue-lan.md  la guia de despliegue
-  SHA256SUMS.txt          sumas SHA-256 de lo anterior
-""".format(paquete=os.environ["PAQUETE"])
+Prueba que ningun ensayo puede hacer desde el propio equipo
+  El firewall: desde OTRA maquina de la red, abrir http://<ip>:<puerto>/health.
+"""
 
-archivos = [("memory-industry.exe", leer(exe))]
-archivos.append(("ensayo-madre.ps1", leer(os.environ["SCRIPT_PS"])))
-if os.environ["INCLUYE_HOJA"] == "1":
-    archivos.append(("README-VISITA.txt", crlf(leer(os.environ["HOJA"]))))
-archivos.append(("docs/despliegue-lan.md", leer(os.environ["GUIA"])))
+AYUDA_ENSAYO = """\
+MemoryIndustry {p} - ENSAYO
+===========================
+Un solo lanzador: ENSAYO-se-desinstala-al-final.cmd. Pregunta "Es un equipo de PRUEBA?",
+hace la prueba de humo, instala, reinicia una vez y, al volver a iniciar sesion, comprueba
+que el servicio arranco solo y RETIRA todo lo instalado. El informe se conserva.
+La base de datos del ensayo es una URL inalcanzable a proposito: el servicio arranca
+degradado y no toca Docker ni ninguna base real.
 
-sumas = "".join(
-    "{}  {}\n".format(hashlib.sha256(datos).hexdigest(), nombre) for nombre, datos in archivos
-)
-archivos.append(("leeme.txt", crlf(LEEME.encode("ascii"))))
-archivos.append(("SHA256SUMS.txt", sumas.encode("ascii")))
+""" + AYUDA_COMUN
 
-with zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-    for nombre, datos in archivos:
-        info = zipfile.ZipInfo(carpeta + "/" + nombre, date_time=(2026, 1, 1, 0, 0, 0))
-        info.compress_type = zipfile.ZIP_DEFLATED
-        info.external_attr = 0o644 << 16
-        z.writestr(info, datos)
+AYUDA_REAL = """\
+MemoryIndustry {p} - EQUIPO REAL
+================================
+INSTALAR-EQUIPO-REAL.cmd   prueba de humo, elegir la IP y la base, instalar, reiniciar una
+                           vez y comprobar. El servicio SE QUEDA instalado.
+RESULTADO.cmd              vuelve a comprobar y mostrar el resultado.
+QUITAR-TODO.cmd            quita el servicio (tarea y regla de firewall). Pide confirmacion.
 
-with zipfile.ZipFile(destino) as z:
-    malo = z.testzip()
-    if malo:
-        raise SystemExit("el zip recien escrito tiene un fichero corrupto: " + malo)
-    print("Contenido de {}:".format(os.path.basename(destino)))
-    for i in z.infolist():
-        print("  {:>12}  {}".format(i.file_size, i.filename))
+Con Docker Desktop, la base arranca al INICIAR SESION, no al encender el equipo: despues
+de un reinicio el servicio arranca degradado y recupera sus herramientas solo cuando Docker
+este arriba (los bucles de fondo rem y sync, solo tras el siguiente reinicio del servicio).
+
+""" + AYUDA_COMUN
+
+
+def paquete_zip(sufijo, lanzadores, leeme, ayuda, con_hoja):
+    carpeta = "memory-industry-{}-{}".format(paquete, sufijo)
+    archivos = [("memory-industry.exe", leer(exe)), ("ensayo-madre.ps1", leer(os.environ["SCRIPT_PS"]))]
+    archivos += [lanzador(n) for n in lanzadores]
+    if con_hoja and os.environ["INCLUYE_HOJA"] == "1":
+        archivos.append(("README-VISITA.txt", crlf(leer(os.environ["HOJA"]))))
+    archivos.append(("docs/despliegue-lan.md", leer(os.environ["GUIA"])))
+    archivos.append(("LEEME.txt", crlf(leeme.encode("ascii"))))
+    archivos.append(("AYUDA.txt", crlf(ayuda.format(p=paquete).encode("ascii"))))
+    # SHA256SUMS.txt lista todo lo anterior, calculado sobre los bytes que van en el zip.
+    # La prueba de humo lo lee y se niega a instalar si el .exe (o cualquiera de estos
+    # ficheros) no coincide.
+    sumas = "".join("{}  {}\n".format(hashlib.sha256(d).hexdigest(), n) for n, d in archivos)
+    archivos.append(("SHA256SUMS.txt", sumas.encode("ascii")))
+    destino = os.path.join(salida, carpeta + ".zip")
+    with zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for nombre, datos in archivos:
+            info = zipfile.ZipInfo(carpeta + "/" + nombre, date_time=(2026, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            z.writestr(info, datos)
+    with zipfile.ZipFile(destino) as z:
+        malo = z.testzip()
+        if malo:
+            raise SystemExit("el zip recien escrito tiene un fichero corrupto: " + malo)
+        print("Contenido de {}:".format(os.path.basename(destino)))
+        for i in z.infolist():
+            print("  {:>12}  {}".format(i.file_size, i.filename))
+
+
+paquete_zip("ENSAYO", ["ENSAYO-se-desinstala-al-final.cmd"], LEEME_ENSAYO, AYUDA_ENSAYO, False)
+paquete_zip("EQUIPO-REAL", ["INSTALAR-EQUIPO-REAL.cmd", "QUITAR-TODO.cmd", "RESULTADO.cmd"], LEEME_REAL, AYUDA_REAL, True)
 PY
 
-zip_bytes="$(stat -c %s "$ZIP")"
-zip_sha="$(sha256sum "$ZIP" | cut -d' ' -f1)"
 echo
-echo "Paquete : $ZIP"
-echo "Tamano  : $zip_bytes bytes ($((zip_bytes / 1024 / 1024)) MiB)"
-echo "SHA-256 : $zip_sha"
-echo "Binario : $(sha256sum "$EXE" | cut -d' ' -f1)  (la que lleva SHA256SUMS.txt)"
-echo "Anota la suma del zip aparte (en el USB no): es lo que se compara al llegar."
+for z in "$SALIDA/memory-industry-$PAQUETE-ENSAYO.zip" "$SALIDA/memory-industry-$PAQUETE-EQUIPO-REAL.zip"; do
+  zip_bytes="$(stat -c %s "$z")"
+  echo "Paquete : $z"
+  echo "Tamano  : $zip_bytes bytes ($((zip_bytes / 1024 / 1024)) MiB)"
+  echo "SHA-256 : $(sha256sum "$z" | cut -d' ' -f1)"
+  echo
+done
+echo "Binario : $(sha256sum "$EXE" | cut -d' ' -f1)  (el que lleva SHA256SUMS.txt)"
+echo "Anota las sumas de los zips aparte (en el USB no): es lo que se compara al llegar."
