@@ -22,6 +22,15 @@ use crate::accounts;
 /// The daemon's own cap on a request body.
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+/// A reconnect carries no more than a host name or address.
+const MAX_RECONNECT_BODY: usize = 4 * 1024;
+
+/// The header `POST /bridge/reconnect` demands. A web page cannot add a custom header to a
+/// cross-origin request without a preflight this bridge never answers, and cannot leave out
+/// `Origin`: either is enough to refuse it.
+pub const RECONNECT_HEADER: &str = "x-memoryindustry-bridge";
+pub const RECONNECT_VALUE: &str = "reconnect";
+
 /// The JSON-RPC code the bridge uses for everything it cannot do itself.
 const BRIDGE_ERROR_CODE: i32 = -32003;
 
@@ -308,6 +317,55 @@ async fn relay(bridge: &Bridge, request: Request) -> Response {
     }
 }
 
+/// Only this PC's own programs: no `Origin` at all, and the bridge's own header.
+fn asked_by_this_pc(headers: &HeaderMap) -> bool {
+    let own = headers
+        .get(RECONNECT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(RECONNECT_VALUE);
+    own && !headers.contains_key(header::ORIGIN)
+}
+
+/// `{"host": "nombre|ip[:puerto]"}`, or an empty body (or `{}`) to search what is known.
+fn typed_host(body: &[u8]) -> Result<Option<String>, ()> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(fields)) => match fields.get("host") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(host)) if !host.trim().is_empty() => Ok(Some(host.clone())),
+            Some(_) => Err(()),
+        },
+        _ => Err(()),
+    }
+}
+
+async fn reconnect(bridge: &Bridge, request: Request) -> Response {
+    if !asked_by_this_pc(request.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "reconnect is for this PC's own programs: no Origin, and the bridge's header",
+        )
+            .into_response();
+    }
+    let Ok(body) = to_bytes(request.into_body(), MAX_RECONNECT_BODY).await else {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the reconnect body is too large",
+        )
+            .into_response();
+    };
+    let Ok(host) = typed_host(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            r#"the body is {"host": "name or ip[:port]"}, or empty"#,
+        )
+            .into_response();
+    };
+    axum::Json(bridge.reconnect(host.as_deref()).await).into_response()
+}
+
 #[derive(Clone)]
 struct App {
     bridge: Arc<Bridge>,
@@ -323,6 +381,9 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
     match path.as_str() {
         "/mcp" => relay(&app.bridge, request).await,
         "/bridge/health" if reading => axum::Json(app.bridge.health()).into_response(),
+        "/bridge/reconnect" if *request.method() == Method::POST => {
+            reconnect(&app.bridge, request).await
+        }
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }

@@ -8,11 +8,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use self::discovery::{Discovery, Failure, Freshness, discover, subnet_candidates};
+use self::discovery::{
+    Discovery, Failure, Freshness, Verdict, check_identity, discover, subnet_candidates,
+};
+use self::notify::SystemNotifier;
 use self::pair::pair;
 use self::state::{BridgeState, read_state, state_dir, write_state};
+use self::supervisor::Supervisor;
 use crate::accounts;
 use crate::service::Target;
 use crate::service_apply::CommandRunner;
@@ -31,7 +36,7 @@ pub mod supervisor;
 #[cfg(test)]
 pub(crate) mod fake_host;
 
-const USAGE: &str = "usage: memory-industry bridge <pair|run|status|doctor|install|uninstall> …\n\n\
+const USAGE: &str = "usage: memory-industry bridge <pair|run|status|doctor|install|uninstall|reconnect> …\n\n\
 Run on a client PC. The bridge listens on 127.0.0.1 only and holds the credential.";
 
 pub const DEFAULT_BRIDGE_PORT: u16 = 8797;
@@ -195,6 +200,14 @@ impl Refusal {
         matches!(self, Refusal::Revoked | Refusal::Unknown)
     }
 
+    /// Only a new pairing fixes it; retrying, or looking at the network, does not.
+    pub(crate) fn needs_pair(&self) -> bool {
+        matches!(
+            self,
+            Refusal::Revoked | Refusal::Unknown | Refusal::WrongHost { .. }
+        )
+    }
+
     pub(crate) fn message(&self) -> String {
         match self {
             Refusal::Revoked => "credencial revocada: empareja de nuevo con \
@@ -243,6 +256,26 @@ fn refusal_from(found: &Discovery, state: &BridgeState) -> Refusal {
 pub(crate) struct Route {
     pub(crate) addr: SocketAddr,
     pub(crate) state: Arc<BridgeState>,
+}
+
+/// The answer of `POST /bridge/reconnect`, and what `bridge reconnect` prints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Reconnection {
+    pub(crate) connected: bool,
+    pub(crate) address: Option<String>,
+    pub(crate) report: String,
+}
+
+impl Reconnection {
+    fn render(&self, host_name: &str) -> String {
+        match &self.address {
+            Some(address) if self.connected => format!(
+                "Conectado con {host_name} en {address}.\nLo probado: {}",
+                self.report
+            ),
+            _ => format!("No se encontró la madre {host_name}.\n{}", self.report),
+        }
+    }
 }
 
 struct Failed {
@@ -343,6 +376,100 @@ impl Bridge {
     /// it, or the host refused the credential. The next call asks `/identity` again first.
     pub(crate) async fn doubt(&self) {
         self.core.lock().await.freshness.transport_failed();
+    }
+
+    /// The watcher's check: like `route`, but a remembered failure is not an answer. How often
+    /// the watcher searches is its own backoff, not the cooldown that shields the host from a
+    /// burst of requests.
+    pub(crate) async fn check(&self) -> Result<Route, Refusal> {
+        let mut core = self.core.lock().await;
+        if core.failure.is_none()
+            && let Some(Ok(route)) = core.ready(self.clock.now(), &self.timing)
+        {
+            return Ok(route);
+        }
+        self.search(&mut core).await
+    }
+
+    /// What the bridge holds now: the pinned host's name and id, and the last good address.
+    pub(crate) async fn pinned(&self) -> Arc<BridgeState> {
+        self.core.lock().await.state.clone()
+    }
+
+    /// `POST /bridge/reconnect`: search now, whatever the cooldown says. A typed `host` is only
+    /// a candidate (principle 2): it is tried first and stored only once it proves to be the
+    /// host.
+    pub(crate) async fn reconnect(&self, host: Option<&str>) -> Reconnection {
+        let mut core = self.core.lock().await;
+        self.reload_state(&mut core);
+        let mut tried = Vec::new();
+        if let Some(host) = host {
+            for addr in self.typed(host, core.state.host_port).await {
+                let verdict = check_identity(
+                    &self.client,
+                    addr,
+                    &core.state,
+                    accounts::random_bytes(),
+                    self.timing.identity,
+                )
+                .await;
+                tried.push(format!("{addr} (indicada): {verdict}"));
+                if matches!(verdict, Verdict::Verified { .. }) {
+                    self.adopt(&mut core, addr, self.clock.now());
+                    return Reconnection {
+                        connected: true,
+                        address: Some(addr.to_string()),
+                        report: tried.join("; "),
+                    };
+                }
+            }
+            if tried.is_empty() {
+                tried.push(format!("{host} (indicada): no se pudo resolver"));
+            }
+        }
+        match self.search(&mut core).await {
+            Ok(route) => {
+                tried.push(format!("{} verificada", route.addr));
+                Reconnection {
+                    connected: true,
+                    address: Some(route.addr.to_string()),
+                    report: tried.join("; "),
+                }
+            }
+            Err(refusal) => {
+                tried.push(refusal.message());
+                Reconnection {
+                    connected: false,
+                    address: None,
+                    report: tried.join("; "),
+                }
+            }
+        }
+    }
+
+    /// The addresses a typed `nombre|ip[:puerto]` stands for. Without a port, the host's.
+    async fn typed(&self, host: &str, host_port: u16) -> Vec<SocketAddr> {
+        let host = host.trim();
+        if let Ok(addr) = host.parse::<SocketAddr>() {
+            return vec![addr];
+        }
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            return vec![SocketAddr::new(ip, host_port)];
+        }
+        let (name, port) = match host.rsplit_once(':') {
+            None => (host, host_port),
+            Some((name, port)) => match parse_port(port) {
+                Ok(port) => (name, port),
+                Err(_) => return Vec::new(),
+            },
+        };
+        tokio::time::timeout(self.timing.resolve, self.net.resolve(name))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect()
     }
 
     async fn search(&self, core: &mut Core) -> Result<Route, Refusal> {
@@ -588,6 +715,18 @@ fn parse_install(rest: &[String]) -> Result<Command> {
     }
 }
 
+fn parse_reconnect(rest: &[String]) -> Result<Command> {
+    let mut host = None;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--host" => host = Some(option_value(&mut args, "--host")?),
+            other => bail!("bridge reconnect: unknown option {other} (the only one is --host)"),
+        }
+    }
+    Ok(Command::Reconnect { host })
+}
+
 fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command> {
     match sub {
         "pair" => parse_pair(rest),
@@ -596,6 +735,7 @@ fn parse_subcommand(sub: &str, rest: &[String]) -> Result<Command> {
         "status" => no_arguments(rest, "status", Command::Status),
         "doctor" => no_arguments(rest, "doctor", Command::Doctor),
         "uninstall" => no_arguments(rest, "uninstall", Command::Uninstall),
+        "reconnect" => parse_reconnect(rest),
         other => bail!("bridge {other}: unknown subcommand\n{USAGE}"),
     }
 }
@@ -639,17 +779,23 @@ async fn cli_pair(
     Ok(())
 }
 
+/// Serves, and watches the host so the person hears when the link changes (B1).
 async fn cli_run(port: Option<u16>) -> Result<()> {
-    let handle = run(system_deps(default_state_path()?)?, port).await?;
+    let exe = std::env::current_exe().context("cannot resolve the path of this binary")?;
+    let bridge = Bridge::load(system_deps(default_state_path()?)?)?;
+    let port = port.unwrap_or(bridge.configured_port);
+    let handle = proxy::start(port, bridge.clone()).await?;
     println!("bridge listening on {}", handle.local_addr());
+    let watcher = Supervisor::new(bridge, Arc::new(SystemNotifier), exe).spawn();
     tokio::signal::ctrl_c()
         .await
         .context("cannot wait for Ctrl-C")?;
+    watcher.abort();
     handle.shutdown().await;
     Ok(())
 }
 
-fn cli_status() -> Result<()> {
+async fn cli_status() -> Result<()> {
     let path = default_state_path()?;
     let Some(paired) = read_state(&path)? else {
         println!("not paired: no state at {}", path.display());
@@ -667,7 +813,36 @@ fn cli_status() -> Result<()> {
         .map_or_else(|| "none".to_string(), |a| a.to_string());
     println!("last good:   {last}");
     println!("local port:  {}", paired.port);
+    println!("bridge:      {}", running_bridge(paired.port).await?);
     Ok(())
+}
+
+/// What the bridge on this PC's port says about itself, or that nothing answers there.
+async fn running_bridge(port: u16) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("cannot build the HTTP client")?;
+    let at = format!("127.0.0.1:{port}");
+    let Ok(response) = client
+        .get(format!("http://{at}/bridge/health"))
+        .send()
+        .await
+    else {
+        return Ok(format!("not running on {at}"));
+    };
+    let health = match response.error_for_status() {
+        Ok(response) => response.json::<Value>().await.ok(),
+        Err(_) => None,
+    };
+    Ok(match health {
+        Some(doc) => format!(
+            "running on {at} (state: {})",
+            doc["state"].as_str().unwrap_or("unknown")
+        ),
+        None => format!("{at} answers, but not as a bridge: another program holds the port"),
+    })
 }
 
 fn cli_install(print_only: bool) -> Result<()> {
@@ -689,8 +864,55 @@ fn cli_uninstall() -> Result<()> {
 
 /// `bridge reconnect [--host X]`: asks the running bridge to look again, or looks once itself
 /// when none runs.
-async fn cli_reconnect(_host: Option<&str>) -> Result<()> {
-    unimplemented!("pasada verde: B5")
+async fn cli_reconnect(host: Option<&str>) -> Result<()> {
+    let deps = system_deps(default_state_path()?)?;
+    let paired = read_state(&deps.state_path)?.context(NOT_PAIRED)?;
+    let answer = match ask_running_bridge(&deps, paired.port, host).await? {
+        Some(answer) => answer,
+        None => Bridge::load(deps)?.reconnect(host).await,
+    };
+    println!("{}", answer.render(&paired.host_name));
+    if !answer.connected {
+        bail!("no se conectó con la madre: el informe está arriba");
+    }
+    Ok(())
+}
+
+/// `POST /bridge/reconnect` to the bridge serving this pairing. `None` when nothing listens on
+/// its port: the one case where this process may search and write the state on its own
+/// without racing a running bridge.
+async fn ask_running_bridge(
+    deps: &BridgeDeps,
+    port: u16,
+    host: Option<&str>,
+) -> Result<Option<Reconnection>> {
+    let body = host.map_or_else(|| json!({}), |host| json!({ "host": host }));
+    let sent = deps
+        .client
+        .post(format!("http://127.0.0.1:{port}/bridge/reconnect"))
+        .header(proxy::RECONNECT_HEADER, proxy::RECONNECT_VALUE)
+        .json(&body)
+        .timeout(deps.timing.discovery_total * 2)
+        .send()
+        .await;
+    let response = match sent {
+        Ok(response) => response,
+        Err(err) if err.is_connect() => return Ok(None),
+        Err(err) => {
+            return Err(err).context(format!("the bridge on 127.0.0.1:{port} did not answer"));
+        }
+    };
+    if !response.status().is_success() {
+        bail!(
+            "the bridge on 127.0.0.1:{port} refused to reconnect: {}",
+            response.status()
+        );
+    }
+    let answer = response
+        .json::<Reconnection>()
+        .await
+        .context("the bridge's reconnect answer is not the expected JSON")?;
+    Ok(Some(answer))
 }
 
 /// Looks for the host the way the bridge does and prints what it tried. A bridge that
@@ -719,7 +941,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             port,
         } => cli_pair(&code, host.as_deref(), device, port).await,
         Command::Run { port } => cli_run(port).await,
-        Command::Status => cli_status(),
+        Command::Status => cli_status().await,
         Command::Install { print } => cli_install(print),
         Command::Uninstall => cli_uninstall(),
         Command::Doctor => cli_doctor().await,

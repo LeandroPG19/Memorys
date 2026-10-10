@@ -4,15 +4,35 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::Bridge;
-use super::notify::Notifier;
+use tokio::task::JoinHandle;
+
+use super::notify::{Notice, Notifier};
+use super::{Bridge, Refusal, Route};
+use crate::accounts;
+
+/// Connected: one light check a minute. Also the wait after a refusal only a new pairing fixes.
+const CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// Without the host: soon at first, so a network that comes up late is found in seconds, then
+/// once a minute, so a laptop away from the office costs one search a minute.
+const BACKOFF_SECS: [u64; 5] = [5, 10, 20, 40, 60];
+
+/// The network at logon often takes a minute to come up; a window for that would scare for
+/// nothing.
+const LOST_AFTER: Duration = Duration::from_secs(90);
 
 pub struct Supervisor {
     bridge: Arc<Bridge>,
     notifier: Arc<dyn Notifier>,
     exe: PathBuf,
+    started: Option<Instant>,
+    last_good: Option<Instant>,
+    failures: usize,
+    connected_once: bool,
+    lost_told: bool,
+    needs_pair_told: bool,
 }
 
 impl Supervisor {
@@ -22,13 +42,90 @@ impl Supervisor {
             bridge,
             notifier,
             exe,
+            started: None,
+            last_good: None,
+            failures: 0,
+            connected_once: false,
+            lost_told: false,
+            needs_pair_told: false,
         }
     }
 
     /// One check of the host, the notices it changes, and how long to wait before the next.
     /// The loop of `bridge run` sleeps that long; a test moves its clock by it instead.
     pub async fn tick(&mut self) -> Duration {
-        unimplemented!("pasada verde: B1")
+        let now = self.bridge.clock.now();
+        let started = *self.started.get_or_insert(now);
+        match self.bridge.check().await {
+            Ok(route) => self.found(&route, now),
+            Err(refusal) if refusal.needs_pair() => self.refused(&refusal).await,
+            Err(refusal) => self.missing(&refusal, now, started).await,
+        }
+    }
+
+    /// The loop of `bridge run`. It never ends on its own: the caller aborts it on shutdown.
+    pub fn spawn(mut self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let wait = self.tick().await;
+                tokio::time::sleep(wait).await;
+            }
+        })
+    }
+
+    fn found(&mut self, route: &Route, now: Instant) -> Duration {
+        let host_name = route.state.host_name.clone();
+        let address = route.addr;
+        if !self.connected_once {
+            self.notifier
+                .notify(Notice::Connected { host_name, address });
+        } else if self.lost_told {
+            self.notifier
+                .notify(Notice::Reconnected { host_name, address });
+        }
+        self.connected_once = true;
+        self.lost_told = false;
+        self.needs_pair_told = false;
+        self.failures = 0;
+        self.last_good = Some(now);
+        CHECK_EVERY
+    }
+
+    /// Lost once per loss, and only after 90 s without a success since the start or since the
+    /// last good check.
+    async fn missing(&mut self, refusal: &Refusal, now: Instant, started: Instant) -> Duration {
+        let wait = BACKOFF_SECS[self.failures.min(BACKOFF_SECS.len() - 1)];
+        self.failures += 1;
+        let down_for = now.saturating_duration_since(self.last_good.unwrap_or(started));
+        if down_for >= LOST_AFTER && !self.lost_told {
+            self.lost_told = true;
+            let pinned = self.bridge.pinned().await;
+            self.notifier.notify(Notice::Lost {
+                host_name: pinned.host_name.clone(),
+                last_good: pinned.last_good,
+                fingerprint: accounts::fingerprint(&pinned.host_id),
+                down_for_secs: down_for.as_secs(),
+                report: refusal.message(),
+                exe: self.exe.clone(),
+            });
+        }
+        Duration::from_secs(wait)
+    }
+
+    /// A revoked or unknown credential, or another installation: not a lost host. Told once,
+    /// until a success shows the person paired again.
+    async fn refused(&mut self, refusal: &Refusal) -> Duration {
+        if !self.needs_pair_told {
+            self.needs_pair_told = true;
+            let pinned = self.bridge.pinned().await;
+            self.notifier.notify(Notice::NeedsPair {
+                host_name: pinned.host_name.clone(),
+                fingerprint: accounts::fingerprint(&pinned.host_id),
+                reason: refusal.message(),
+                exe: self.exe.clone(),
+            });
+        }
+        CHECK_EVERY
     }
 }
 

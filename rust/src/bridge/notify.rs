@@ -51,18 +51,100 @@ pub trait Notifier: Send + Sync {
     fn notify(&self, notice: Notice);
 }
 
-/// PowerShell on Windows, a log line elsewhere.
+/// Windows' CreateProcess refuses a command line of 32 767 characters or more. The margin is
+/// for nothing in particular: a notice cut a little short still says what matters.
+const COMMAND_LINE_LIMIT: usize = 32_000;
+
+/// The flags of every notice, before the encoded command. `-EncodedCommand` is not subject to
+/// the execution policy; `-WindowStyle Hidden` is the second guard against a console.
+const FLAGS: [&str; 6] = [
+    "-NoProfile",
+    "-WindowStyle",
+    "Hidden",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand",
+];
+
+/// PowerShell on Windows, a log line elsewhere. Logged on Windows too, so a notice the desktop
+/// swallowed (focus assist, a policy) is still in the bridge's log.
 pub struct SystemNotifier;
 
 impl Notifier for SystemNotifier {
-    fn notify(&self, _notice: Notice) {
-        unimplemented!("pasada verde: B2")
+    fn notify(&self, notice: Notice) {
+        let shown = serde_json::to_string(&notice).unwrap_or_default();
+        tracing::info!(notice = %shown, "bridge notice");
+        #[cfg(windows)]
+        show_on_windows(&notice);
     }
 }
 
-/// The arguments `powershell.exe` is started with for `notice`.
-pub fn powershell_argv(_notice: &Notice) -> Vec<String> {
-    unimplemented!("pasada verde: B2")
+/// Starts PowerShell and lets go of it: the bridge never waits for a window the person may
+/// leave open all day. `CREATE_NO_WINDOW` keeps the console from existing at all; the forms
+/// and toasts of the script are not consoles and still show.
+#[cfg(windows)]
+fn show_on_windows(notice: &Notice) {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let started = Command::new(POWERSHELL)
+        .args(powershell_argv(notice))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+    if let Err(err) = started {
+        tracing::warn!(error = %err, "the notice could not start powershell.exe");
+    }
+}
+
+/// The arguments `powershell.exe` is started with for `notice`. A `Lost` whose report would not
+/// fit Windows' command line has its report cut, never its name, address or path.
+pub fn powershell_argv(notice: &Notice) -> Vec<String> {
+    let mut argv = argv_for(notice);
+    let Notice::Lost { report, .. } = notice else {
+        return argv;
+    };
+    let mut keep = report.chars().count();
+    while line_len(&argv) >= COMMAND_LINE_LIMIT && keep > 0 {
+        keep /= 2;
+        let mut cut = notice.clone();
+        if let Notice::Lost { report: shown, .. } = &mut cut {
+            let head: String = report.chars().take(keep).collect();
+            *shown = format!("{head}… (informe recortado)");
+        }
+        argv = argv_for(&cut);
+    }
+    argv
+}
+
+fn line_len(argv: &[String]) -> usize {
+    POWERSHELL.len() + argv.iter().map(|arg| 1 + arg.len()).sum::<usize>()
+}
+
+fn argv_for(notice: &Notice) -> Vec<String> {
+    let mut argv: Vec<String> = FLAGS.iter().map(|flag| flag.to_string()).collect();
+    argv.push(encoded_command(&script_for(notice)));
+    argv
+}
+
+/// The notice reaches the script as the base64 of its UTF-8 JSON: base64 has no quote, `$` or
+/// backtick, so nothing the host sends (its name) can end the literal and run as code.
+/// PowerShell also takes the typographic quotes as quotes, which rules out escaping by hand.
+fn script_for(notice: &Notice) -> String {
+    let json = serde_json::to_vec(notice).unwrap_or_else(|_| b"{}".to_vec());
+    format!(
+        "$aviso = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}')) | ConvertFrom-Json\n{AVISO_PS1}",
+        crate::db::base64(&json)
+    )
+}
+
+/// What `-EncodedCommand` takes: the base64 of the script in UTF-16LE.
+fn encoded_command(text: &str) -> String {
+    let utf16: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    crate::db::base64(&utf16)
 }
 
 #[cfg(test)]
@@ -101,8 +183,10 @@ mod tests {
     fn utf16le(bytes: &[u8]) -> String {
         assert_eq!(bytes.len() % 2, 0, "UTF-16LE comes in pairs of bytes");
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         String::from_utf16(&units).expect("the encoded command is valid UTF-16")
     }
