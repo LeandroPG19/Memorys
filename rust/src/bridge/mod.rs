@@ -22,9 +22,11 @@ pub mod client_config;
 pub mod discovery;
 pub mod doctor;
 pub mod install;
+pub mod notify;
 pub mod pair;
 pub mod proxy;
 pub mod state;
+pub mod supervisor;
 
 #[cfg(test)]
 pub(crate) mod fake_host;
@@ -541,6 +543,9 @@ pub enum Command {
     },
     Uninstall,
     Doctor,
+    Reconnect {
+        host: Option<String>,
+    },
     Help,
 }
 
@@ -682,6 +687,12 @@ fn cli_uninstall() -> Result<()> {
     Ok(())
 }
 
+/// `bridge reconnect [--host X]`: asks the running bridge to look again, or looks once itself
+/// when none runs.
+async fn cli_reconnect(_host: Option<&str>) -> Result<()> {
+    unimplemented!("pasada verde: B5")
+}
+
 /// Looks for the host the way the bridge does and prints what it tried. A bridge that
 /// finds nothing fails, so a script can tell.
 async fn cli_doctor() -> Result<()> {
@@ -712,6 +723,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         Command::Install { print } => cli_install(print),
         Command::Uninstall => cli_uninstall(),
         Command::Doctor => cli_doctor().await,
+        Command::Reconnect { host } => cli_reconnect(host.as_deref()).await,
     }
 }
 
@@ -1127,10 +1139,56 @@ mod parse_tests {
         );
     }
 
+    /// B5: the button «Reintentar ahora» runs `bridge reconnect`, and «Escribir nombre o IP»
+    /// runs it with `--host`.
+    #[test]
+    fn reconnect_parses_with_and_without_a_host() {
+        assert_eq!(parsed("reconnect"), Command::Reconnect { host: None });
+        assert_eq!(
+            parsed("reconnect --host madre"),
+            Command::Reconnect {
+                host: Some("madre".to_string())
+            },
+            "a name typed in the window"
+        );
+        assert_eq!(
+            parsed("reconnect --host 192.168.1.20:8787"),
+            Command::Reconnect {
+                host: Some("192.168.1.20:8787".to_string())
+            },
+            "or an address with its port, kept as typed for the bridge to resolve"
+        );
+    }
+
+    /// B5: what the window could pass wrong is refused by name, not ignored.
+    #[test]
+    fn reconnect_refuses_what_it_does_not_take() {
+        assert!(
+            refused("reconnect --bogus").contains("--bogus"),
+            "an option nobody defined is named"
+        );
+        assert!(
+            refused("reconnect --host").contains("--host"),
+            "`--host` without its value says which flag is missing it"
+        );
+        assert!(
+            refused("reconnect ahora").contains("ahora"),
+            "a stray word is named: `reconnect` takes `--host` and nothing else"
+        );
+    }
+
     /// I2/I3 (the help names every subcommand the guide teaches)
     #[test]
     fn the_usage_names_every_subcommand() {
-        for sub in ["pair", "run", "status", "install", "uninstall", "doctor"] {
+        for sub in [
+            "pair",
+            "run",
+            "status",
+            "install",
+            "uninstall",
+            "doctor",
+            "reconnect",
+        ] {
             assert!(
                 USAGE.contains(sub),
                 "`memory-industry bridge --help` does not list `{sub}`: a command the page \

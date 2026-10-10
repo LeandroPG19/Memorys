@@ -28,6 +28,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use super::notify::{Notice, Notifier};
 use super::proxy::{self, BridgeHandle};
 use super::state::{BridgeState, STATE_VERSION, read_state};
 use super::{Bridge, BridgeDeps, Clock, Network, STATE_BASENAME, Timing};
@@ -277,6 +278,37 @@ impl ManualClock {
 
     pub fn advance(&self, by: Duration) {
         *lock(&self.offset) += by;
+    }
+
+    /// How far the test has moved the clock since it was made.
+    pub fn elapsed(&self) -> Duration {
+        *lock(&self.offset)
+    }
+}
+
+/// Every notice the code under test gave, with the clock's `elapsed` at that moment, so a
+/// test can say not only what was shown but when.
+pub(crate) struct RecordingNotifier {
+    clock: Arc<ManualClock>,
+    seen: Mutex<Vec<(Duration, Notice)>>,
+}
+
+impl RecordingNotifier {
+    pub fn new(clock: Arc<ManualClock>) -> Self {
+        RecordingNotifier {
+            clock,
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn notices(&self) -> Vec<(Duration, Notice)> {
+        lock(&self.seen).clone()
+    }
+}
+
+impl Notifier for RecordingNotifier {
+    fn notify(&self, notice: Notice) {
+        lock(&self.seen).push((self.clock.elapsed(), notice));
     }
 }
 
@@ -1017,6 +1049,7 @@ struct Shared {
     accepted: AtomicUsize,
     gate: Notify,
     stream_closed: AtomicBool,
+    down: AtomicBool,
 }
 
 pub(crate) struct FakeHost {
@@ -1049,6 +1082,7 @@ impl FakeHost {
             accepted: AtomicUsize::new(0),
             gate: Notify::new(),
             stream_closed: AtomicBool::new(false),
+            down: AtomicBool::new(false),
         });
         let task = tokio::spawn(accept_loop(listener, shared.clone()));
         FakeHost {
@@ -1102,6 +1136,14 @@ impl FakeHost {
         if let Some(cred) = lock(&self.shared.inner).creds.get_mut(&id) {
             cred.status = status;
         }
+    }
+
+    /// A host that is down but keeps its address: every connection is accepted and closed
+    /// at once, unread and unanswered, so a check fails fast (ci-rapido.md) and the same
+    /// address comes back with `set_down(false)`. `accepted` still counts each one, which is
+    /// how a test sees that a retry really reached the host.
+    pub fn set_down(&self, down: bool) {
+        self.shared.down.store(down, Ordering::SeqCst);
     }
 
     pub fn release_stream(&self) {
@@ -1168,6 +1210,10 @@ impl Drop for FakeHost {
 async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     while let Ok((stream, _)) = listener.accept().await {
         shared.accepted.fetch_add(1, Ordering::SeqCst);
+        if shared.down.load(Ordering::SeqCst) {
+            drop(stream);
+            continue;
+        }
         tokio::spawn(serve_connection(stream, shared.clone()));
     }
 }
