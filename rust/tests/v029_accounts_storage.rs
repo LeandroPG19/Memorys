@@ -407,14 +407,24 @@ async fn no_code_is_issued_for_an_unknown_or_revoked_account() {
             .await
             .expect("revoking ana");
 
-        for name in ["ana", "ghost"] {
-            db::issue_pairing_code(&pool, name, None, t0() + Duration::minutes(2))
-                .await
-                .expect_err(
-                    "a code for a revoked or unknown account would be a door into an account \
-                     that cannot be used",
-                );
-        }
+        let revoked = db::issue_pairing_code(&pool, "ana", None, t0() + Duration::minutes(2))
+            .await
+            .expect_err(
+                "a code for a revoked account would be a door into an account that cannot be used",
+            );
+        assert!(
+            format!("{revoked:#}").contains("is revoked"),
+            "the refusal names the reason, not the foreign key the insert would trip over: \
+             {revoked:#}"
+        );
+        let unknown = db::issue_pairing_code(&pool, "ghost", None, t0() + Duration::minutes(2))
+            .await
+            .expect_err("a code for an unknown account would be a door into nothing");
+        assert!(
+            format!("{unknown:#}").contains("does not exist"),
+            "the refusal names the reason, not the foreign key the insert would trip over: \
+             {unknown:#}"
+        );
         let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM brain_pairing_codes")
             .fetch_one(&pool)
             .await
@@ -451,6 +461,18 @@ async fn revoking_an_account_revokes_its_devices_deletes_its_unused_codes_and_ca
         let report = db::revoke_account(&pool, "ana", when)
             .await
             .expect("revoking ana");
+        let after_first = audit_payloads(&pool, "account.revoke").await;
+        assert_eq!(
+            after_first.len(),
+            1,
+            "the FIRST revocation writes its account.revoke event at once: a repeat that writes \
+             it instead is the bug the events check below would miss"
+        );
+        assert_eq!(
+            after_first[0]["account"],
+            json!("ana"),
+            "and that event names ana"
+        );
         assert_eq!(report.credentials_revoked, 3, "all three of ana's devices are revoked");
         assert_eq!(
             report.codes_deleted, 1,

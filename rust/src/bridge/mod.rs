@@ -908,6 +908,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_default_label_is_the_machine_name_as_labelled_and_device_without_one() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        {
+            let _host = crate::envs::ScopedEnv::set("HOSTNAME", "nodo-de-respaldo");
+            let _computer = crate::envs::ScopedEnv::set("COMPUTERNAME", "  caja-de-planta  ");
+            assert_eq!(
+                default_label(),
+                "caja-de-planta",
+                "the label is COMPUTERNAME trimmed the way label_from trims it, and COMPUTERNAME \
+                 wins over HOSTNAME. A default that returned a constant word or an empty string \
+                 would stop naming the machine at all"
+            );
+        }
+
+        let _host = crate::envs::ScopedEnv::cleared("HOSTNAME");
+        let _computer = crate::envs::ScopedEnv::cleared("COMPUTERNAME");
+        assert_eq!(
+            default_label(),
+            "device",
+            "with neither variable set there is no name to read, and the answer is the fixed \
+             fallback, not an empty label"
+        );
+    }
+
+    #[tokio::test]
     async fn a_literal_address_resolves_to_itself() {
         assert_eq!(
             SystemNetwork.resolve("127.0.0.1").await,

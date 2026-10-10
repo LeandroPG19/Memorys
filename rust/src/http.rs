@@ -4746,6 +4746,38 @@ mod admission_tests {
     }
 
     #[tokio::test]
+    async fn the_peer_token_keeps_the_peer_class_when_no_shared_token_is_configured() {
+        let mut open = state_with_clients(None, &[]);
+        open.peer_token = Some(Arc::new(PEER.to_string()));
+
+        assert_eq!(
+            classify_request(&open, &bearer(PEER), false),
+            BearerClass::Peer,
+            "with no shared token the peer bearer is still the peer class. The only other class \
+             an open daemon gives is NoAuthConfigured, which identify admits as Full, so a peer \
+             that fell through here would get the whole surface"
+        );
+        let peer = admitted(&open, &bearer(PEER))
+            .await
+            .expect("the peer token is admitted on a daemon with no shared token");
+        assert_eq!(
+            peer.scope,
+            Scope::Peer,
+            "and the scope it gets is the peer's reduced one, not the open daemon's Full"
+        );
+
+        let shared_too = state_with_policy(false);
+        for require_accounts in [false, true] {
+            assert_eq!(
+                classify_request(&shared_too, &bearer(PEER), require_accounts),
+                BearerClass::Peer,
+                "control: with the shared token configured as well the peer is still checked \
+                 first, with the knob off and on (require_accounts={require_accounts})"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_wrong_or_missing_token_is_a_401_that_says_invalid_bearer_token() {
         let state = state_with_policy(false);
 

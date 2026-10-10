@@ -857,4 +857,26 @@ mod tests {
             "the refusal must name the label rule: {err:#}"
         );
     }
+
+    /// `audit` is what puts a lifecycle change on the record. The change has already committed
+    /// when the append runs, so a refused append has to reach the caller: `audit -> Ok(())` would
+    /// report the change as recorded while the chain never took it. An empty action is refused by
+    /// the chain before it touches the database, so the pool is never dialled.
+    #[tokio::test]
+    async fn a_refused_append_is_an_error_and_not_a_silent_success() {
+        let pool = pool_that_is_never_dialled();
+        let err = audit(&pool, "", json!({}))
+            .await
+            .expect_err("an append the chain refuses must come back as an error");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("audit chain"),
+            "the error names the audit chain, so the operator knows the record is missing: \
+             {text}"
+        );
+        assert!(
+            text.contains("event_action is required"),
+            "and says which rule refused the append: {text}"
+        );
+    }
 }

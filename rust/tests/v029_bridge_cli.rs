@@ -19,6 +19,7 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -508,5 +509,60 @@ fn doctor_finds_a_live_host_on_loopback_and_exits_zero() {
         stdout.contains(&line),
         "doctor names the verified host and its fingerprint, the two things the operator compares \
          with the host's screen. Expected `{line}`. stdout: {stdout}"
+    );
+}
+
+// --- uninstall --------------------------------------------------------------------------------
+
+/// Kills the mutant that makes `cli_uninstall` a silent `Ok(())`: uninstall ends the task, then
+/// deletes it, and prints what each call answered. A fake `schtasks` on PATH records the calls, so
+/// no scheduled task of this machine is touched.
+#[test]
+fn uninstall_ends_then_deletes_the_task_and_says_what_it_did() {
+    let home = Home::new("uninstall");
+    let fake_dir = home.0.join("fake-bin");
+    fs::create_dir_all(&fake_dir).expect("a directory for the fake schtasks");
+    let calls = home.0.join("schtasks.calls");
+    let fake = fake_dir.join("schtasks");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            calls.display()
+        ),
+    )
+    .expect("the fake schtasks is written");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755))
+        .expect("the fake schtasks can run");
+    let path = format!(
+        "{}:{}",
+        fake_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let out = bridge(&home, &["uninstall"])
+        .env("PATH", path)
+        .output()
+        .expect("running bridge uninstall");
+    let stdout = text(&out.stdout);
+
+    assert!(
+        out.status.success(),
+        "both calls answered 0, so uninstall exits 0. stderr: {}",
+        text(&out.stderr)
+    );
+    assert!(
+        stdout.contains(r#"ok: schtasks /End /TN "MemoryIndustry Bridge""#)
+            && stdout.contains(r#"ok: schtasks /Delete /TN "MemoryIndustry Bridge" /F"#),
+        "each call that worked is reported as ok, in order. stdout: {stdout}"
+    );
+    let logged = fs::read_to_string(&calls).expect("the fake schtasks logged its calls");
+    assert_eq!(
+        logged.lines().collect::<Vec<_>>(),
+        [
+            "/End /TN MemoryIndustry Bridge",
+            "/Delete /TN MemoryIndustry Bridge /F"
+        ],
+        "the task is stopped and then deleted, in that order: a delete of a running task is refused"
     );
 }

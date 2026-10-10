@@ -589,4 +589,20 @@ mod tests {
             "the refusal must name the problem: {err:#}"
         );
     }
+
+    /// `account revoke` is the command that takes an account out of service, so the database has
+    /// to be the one that does it: `revoke -> Ok(())` would return success and touch nothing. A
+    /// name with a space is refused by the name rule before the first query, so the pool is never
+    /// dialled.
+    #[tokio::test]
+    async fn the_revoke_command_refuses_a_bad_name_before_the_database() {
+        let pool = pool_that_is_never_dialled();
+        let err = revoke(&pool, "a b", at(12, 0, 0))
+            .await
+            .expect_err("a name with a space must not revoke an account");
+        assert!(
+            format!("{err:#}").contains("account name"),
+            "`account revoke` must say which part was refused: {err:#}"
+        );
+    }
 }
