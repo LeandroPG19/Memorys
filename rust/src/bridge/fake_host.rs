@@ -65,6 +65,7 @@ pub(crate) fn tiny_timing() -> Timing {
         reverify_after: Duration::from_secs(30),
         revoked_recheck: Duration::from_secs(60),
         rescan_cooldown: Duration::from_secs(60),
+        beacon_wait: ms(150),
         probe_parallelism: 8,
         ..Timing::production()
     }
@@ -323,9 +324,13 @@ pub(crate) struct FakeNet {
     names: HashMap<String, Vec<IpAddr>>,
     own: Option<Ipv4Addr>,
     sweep: Vec<SocketAddr>,
+    announced: Vec<(SocketAddr, Uuid)>,
     resolves: AtomicUsize,
     sweeps: AtomicUsize,
     asked: Mutex<Vec<String>>,
+    beacon_asked: Mutex<Vec<(u16, Duration)>>,
+    /// `beacon`, `name` and `sweep`, in the order the code under test asked for them.
+    steps: Mutex<Vec<&'static str>>,
 }
 
 impl FakeNet {
@@ -348,8 +353,25 @@ impl FakeNet {
         self
     }
 
+    /// What the UDP announcement hears: the address each reply came from (with the TCP port
+    /// it announced) and the host id it claimed. Not a builder named `beacon`, which would
+    /// shadow the trait method of the same name.
+    pub fn announcing(mut self, replies: Vec<(SocketAddr, Uuid)>) -> Self {
+        self.announced = replies;
+        self
+    }
+
     pub fn resolves(&self) -> usize {
         self.resolves.load(Ordering::SeqCst)
+    }
+
+    /// Every `(port, wait)` the announcement was asked with.
+    pub fn beacon_asked(&self) -> Vec<(u16, Duration)> {
+        lock(&self.beacon_asked).clone()
+    }
+
+    pub fn steps(&self) -> Vec<&'static str> {
+        lock(&self.steps).clone()
     }
 
     pub fn sweeps(&self) -> usize {
@@ -366,6 +388,7 @@ impl Network for FakeNet {
     async fn resolve(&self, name: &str) -> Vec<IpAddr> {
         self.resolves.fetch_add(1, Ordering::SeqCst);
         lock(&self.asked).push(name.to_string());
+        lock(&self.steps).push("name");
         self.names.get(name).cloned().unwrap_or_default()
     }
 
@@ -375,7 +398,14 @@ impl Network for FakeNet {
 
     fn sweep_targets(&self, _port: u16) -> Vec<SocketAddr> {
         self.sweeps.fetch_add(1, Ordering::SeqCst);
+        lock(&self.steps).push("sweep");
         self.sweep.clone()
+    }
+
+    async fn beacon(&self, port: u16, wait: Duration) -> Vec<(SocketAddr, Uuid)> {
+        lock(&self.beacon_asked).push((port, wait));
+        lock(&self.steps).push("beacon");
+        self.announced.clone()
     }
 }
 

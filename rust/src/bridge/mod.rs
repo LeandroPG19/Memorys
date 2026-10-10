@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use self::discovery::{
     Discovery, Failure, Freshness, Verdict, check_identity, discover, subnet_candidates,
@@ -69,6 +70,8 @@ pub struct Timing {
     pub revoked_recheck: Duration,
     pub rescan_cooldown: Duration,
     pub upstream_headers: Duration,
+    /// How long the UDP announcement listens for replies (C1).
+    pub beacon_wait: Duration,
     pub probe_parallelism: usize,
 }
 
@@ -85,6 +88,7 @@ impl Timing {
             revoked_recheck: Duration::from_secs(60),
             rescan_cooldown: Duration::from_secs(60),
             upstream_headers: Duration::from_secs(600),
+            beacon_wait: Duration::ZERO,
             probe_parallelism: 32,
         }
     }
@@ -125,6 +129,13 @@ pub trait Network: Send + Sync {
             .find_map(|anchor| self.own_ipv4_towards(IpAddr::V4(*anchor)))
             .map(|own| subnet_candidates(own, port))
             .unwrap_or_default()
+    }
+
+    /// The hosts that answered the UDP announcement within `wait`: where each reply came
+    /// from, with the TCP port it announced, and the host id it claimed. Only candidates:
+    /// each one still has to pass `/identity`.
+    async fn beacon(&self, _port: u16, _wait: Duration) -> Vec<(SocketAddr, Uuid)> {
+        Vec::new()
     }
 }
 

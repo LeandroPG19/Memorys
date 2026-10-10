@@ -932,3 +932,137 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod beacon_tests {
+    use std::net::Ipv4Addr;
+
+    use super::super::fake_host::{FakeHost, FakeNet, RawRecorder, client, tiny_timing};
+    use super::*;
+
+    async fn host_with_code() -> (FakeHost, String) {
+        let host = FakeHost::start(uuid::Uuid::new_v4(), vec![]).await;
+        let code = accounts::generate_code();
+        host.add_code(&code, "ana", Some("pc-lab-1"));
+        (host, code)
+    }
+
+    fn lan() -> FakeNet {
+        FakeNet::new().own(Ipv4Addr::new(10, 0, 5, 7))
+    }
+
+    /// C2: without `--host`, the announcement first. A host that answers it is paired with,
+    /// and the 254 addresses of the /24 are left alone.
+    #[tokio::test]
+    async fn sin_host_el_aviso_va_primero_y_si_encuentra_la_madre_no_se_barre() {
+        let (host, code) = host_with_code().await;
+        let net = lan()
+            .announcing(vec![(host.addr(), host.host_id())])
+            .sweep(vec![host.addr()]);
+        let t = tiny_timing();
+
+        let state = pair(&code, None, "mi-pc", &net, &t, &client())
+            .await
+            .expect("the host that answered the announcement takes the code");
+
+        assert_eq!(state.host_id, host.host_id());
+        assert_eq!(
+            state.last_good,
+            Some(host.addr()),
+            "the address it answered from"
+        );
+        assert_eq!(
+            net.steps(),
+            vec!["beacon"],
+            "found by the announcement: no sweep"
+        );
+        assert_eq!(
+            net.beacon_asked(),
+            vec![(DEFAULT_HOST_PORT, t.beacon_wait)],
+            "asked on the host's default port, for beacon_wait"
+        );
+        assert_eq!(host.pair_requests().len(), 1, "the code is offered once");
+    }
+
+    /// C2: a network that blocks the broadcast still pairs, by the sweep, as before 0.29.
+    #[tokio::test]
+    async fn sin_host_y_sin_respuesta_al_aviso_se_barre_como_antes() {
+        let (host, code) = host_with_code().await;
+        let net = lan().sweep(vec![host.addr()]);
+
+        let state = pair(&code, None, "mi-pc", &net, &tiny_timing(), &client())
+            .await
+            .expect("the sweep finds the host");
+
+        assert_eq!(state.host_id, host.host_id());
+        assert_eq!(
+            net.steps(),
+            vec!["beacon", "sweep"],
+            "the announcement first, the sweep when nobody answered it"
+        );
+    }
+
+    /// C2 and principle 3: a UDP reply is cheap to forge. One that leads to something that
+    /// cannot pair does not stop the sweep from finding the host.
+    #[tokio::test]
+    async fn una_respuesta_falsa_al_aviso_no_impide_emparejar_por_el_barrido() {
+        let (host, code) = host_with_code().await;
+        let liar = RawRecorder::start(&[
+            (
+                "GET /identity",
+                serde_json::json!({
+                    "service": "memory-industry",
+                    "host_id": uuid::Uuid::new_v4(),
+                    "name": "x",
+                })
+                .to_string(),
+            ),
+            ("POST /pair", r#"{"v":1}"#.to_string()),
+        ])
+        .await;
+        let net = lan()
+            .announcing(vec![(liar.addr(), uuid::Uuid::new_v4())])
+            .sweep(vec![host.addr()]);
+
+        let state = pair(&code, None, "mi-pc", &net, &tiny_timing(), &client())
+            .await
+            .expect("the sweep still finds the host");
+
+        assert_eq!(state.host_id, host.host_id());
+        assert_eq!(
+            net.steps(),
+            vec!["beacon", "sweep"],
+            "the forged answer was heard and did not end the search"
+        );
+    }
+
+    /// C2: a host that refused the code over the announcement is not offered it again by the
+    /// sweep: every refusal spends the host's brake, and the answer would be the same.
+    #[tokio::test]
+    async fn un_codigo_rechazado_por_la_madre_del_aviso_no_se_le_ofrece_otra_vez_al_barrer() {
+        let host = FakeHost::start(uuid::Uuid::new_v4(), vec![]).await;
+        let code = accounts::generate_code();
+        let net = lan()
+            .announcing(vec![(host.addr(), host.host_id())])
+            .sweep(vec![host.addr()]);
+
+        let err = pair(&code, None, "mi-pc", &net, &tiny_timing(), &client())
+            .await
+            .expect_err("the host does not know this code");
+
+        assert!(
+            matches!(err, PairError::Refused),
+            "the host's refusal is what the person is told. Got: {err}"
+        );
+        assert_eq!(
+            net.steps(),
+            vec!["beacon", "sweep"],
+            "the sweep still runs, for another host that might know the code"
+        );
+        assert_eq!(
+            host.pair_requests().len(),
+            1,
+            "but the host that refused is not asked twice"
+        );
+    }
+}
