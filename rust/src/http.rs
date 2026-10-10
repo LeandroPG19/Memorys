@@ -59,6 +59,54 @@ struct AppState {
     require_accounts: bool,
     /// What `/identity` says about this host, read once when the daemon starts.
     host: Arc<HostInfo>,
+    /// Where the LAN listener is right now, as `/health` reports it.
+    lan: tokio::sync::watch::Receiver<LanStatus>,
+}
+
+/// `auto` when `CUBA_HTTP_ADDR=lan:<port>` lets the daemon pick and follow its private IP;
+/// `fixed` for an address written by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanMode {
+    Auto,
+    Fixed,
+}
+
+/// The LAN listener as `/health` reports it. `address` is `None` while an automatic daemon
+/// has no private IP and serves on loopback only; `since` is when `address` last changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanStatus {
+    pub mode: LanMode,
+    pub address: Option<SocketAddr>,
+    pub since: chrono::DateTime<chrono::Utc>,
+}
+
+/// The first of `candidates` that is a private RFC 1918 IPv4 address. The caller puts the
+/// source address of the default route first and the anchors' after it.
+pub fn private_lan_ip(candidates: &[std::net::IpAddr]) -> Option<std::net::Ipv4Addr> {
+    let _ = candidates;
+    unimplemented!("tajada A, pasada 2: private_lan_ip")
+}
+
+/// Serves `app` on `127.0.0.1:port` for the whole run and on `<own_ip()>:port` while there is
+/// one, asking `own_ip` again after every `sleep`: 5 s while there is no IP, 10 s while there
+/// is. When the IP changes it opens the new address, closes the old one without waiting for
+/// the requests in flight, and only then publishes the new address on `status`.
+pub async fn serve_following<P, S, SFut, F>(
+    port: u16,
+    app: Router,
+    own_ip: P,
+    sleep: S,
+    status: tokio::sync::watch::Sender<LanStatus>,
+    shutdown: F,
+) -> Result<()>
+where
+    P: FnMut() -> Option<std::net::Ipv4Addr> + Send,
+    S: FnMut(Duration) -> SFut + Send,
+    SFut: std::future::Future<Output = ()> + Send,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let _ = (port, app, own_ip, sleep, status, shutdown);
+    unimplemented!("tajada A, pasada 2: serve_following")
 }
 
 /// The failed-credential counter per address, shared by `/mcp`, `/pair` and every route that
@@ -315,6 +363,12 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
             .as_str(),
         require_accounts: require_accounts_for(&addr),
         host,
+        lan: tokio::sync::watch::channel(LanStatus {
+            mode: LanMode::Fixed,
+            address: Some(addr),
+            since: chrono::Utc::now(),
+        })
+        .1,
     };
 
     let reaper_seen = state.seen.clone();
@@ -2989,6 +3043,12 @@ mod tests {
                 host_id: uuid::Uuid::nil(),
                 name: String::new(),
             }),
+            lan: tokio::sync::watch::channel(LanStatus {
+                mode: LanMode::Fixed,
+                address: Some(SocketAddr::from(([127, 0, 0, 1], 8787))),
+                since: chrono::Utc::now(),
+            })
+            .1,
         }
     }
 

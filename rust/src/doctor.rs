@@ -346,6 +346,25 @@ fn service_facts() -> ServiceFacts {
     }
 }
 
+/// What doctor learned about the LAN listener of the running daemon, gathered before judging
+/// so that `lan_check` stays pure.
+pub struct LanFacts {
+    /// `CUBA_HTTP_ADDR` as the service reads it: `lan:<port>`, `ip:port` or the default.
+    pub configured: String,
+    /// The `lan` block of the daemon's `/health` on loopback; `None` when nothing answered.
+    pub health: Option<serde_json::Value>,
+    /// Whether the UDP announcement answered on loopback; `None` when it was not asked,
+    /// which is a loopback install.
+    pub beacon: Option<bool>,
+}
+
+/// The listener's mode, the address it serves on now, and whether the UDP announcement
+/// answers.
+pub fn lan_check(f: &LanFacts) -> Check {
+    let _ = f;
+    unimplemented!("tajada A, pasada 2: lan_check")
+}
+
 /// The port check, aimed at the address the service will really bind, and the
 /// service's own checks. Both read the env file the service loads, never only
 /// doctor's own process environment.
