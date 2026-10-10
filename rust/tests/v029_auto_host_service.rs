@@ -271,55 +271,63 @@ fn apply_moves_a_fixed_install_to_lan_auto_and_keeps_the_token() {
 #[test]
 fn register_opens_the_udp_announcement_beside_the_tcp_port() {
     let _host = windows_host();
+    let tcp_rule = (
+        "TCP".to_string(),
+        FIREWALL_RULE_NAME.to_string(),
+        "8787".to_string(),
+        "private,domain".to_string(),
+    );
 
-    for (what, unit) in [("automatic", lan_auto_unit()), ("fixed", fixed_lan_unit())] {
-        let calls = registered(&unit).calls;
-        let rules = added_rules(&calls);
+    let calls = registered(&lan_auto_unit()).calls;
+    let rules = added_rules(&calls);
+    assert!(
+        rules.contains(&tcp_rule),
+        "the TCP rule of today is still there: {rules:?}"
+    );
+    let udp: Vec<_> = rules
+        .iter()
+        .filter(|(protocol, ..)| protocol.eq_ignore_ascii_case("udp"))
+        .collect();
+    assert_eq!(udp.len(), 1, "exactly one UDP rule: {rules:?}");
+    let (_, name, port, profile) = udp[0];
+    assert_eq!(port, "8787", "the announcement listens on the same number");
+    assert_eq!(
+        profile, "private,domain",
+        "never on a public network, like the TCP rule"
+    );
+    assert!(
+        !name.is_empty() && name != FIREWALL_RULE_NAME,
+        "the UDP rule has a name of its own, or deleting one deletes both: {name:?}"
+    );
+    let udp_delete = calls.iter().position(|c| {
+        c.get(3).is_some_and(|v| v == "delete") && property(c, "name") == Some(name.as_str())
+    });
+    let udp_add = calls.iter().position(|c| {
+        c.get(3).is_some_and(|v| v == "add") && property(c, "name") == Some(name.as_str())
+    });
+    assert!(
+        matches!((udp_delete, udp_add), (Some(d), Some(a)) if d < a),
+        "delete then add, so a second run leaves one UDP rule and not two: {calls:?}"
+    );
+    assert_eq!(
+        calls.last().and_then(|c| c.first()).map(String::as_str),
+        Some("schtasks"),
+        "the task is registered after the firewall, as today: {calls:?}"
+    );
 
-        assert!(
-            rules.contains(&(
-                "TCP".to_string(),
-                FIREWALL_RULE_NAME.to_string(),
-                "8787".to_string(),
-                "private,domain".to_string()
-            )),
-            "{what}: the TCP rule of today is still there: {rules:?}"
-        );
-        let udp: Vec<_> = rules
-            .iter()
-            .filter(|(protocol, ..)| protocol.eq_ignore_ascii_case("udp"))
-            .collect();
-        assert_eq!(udp.len(), 1, "{what}: exactly one UDP rule: {rules:?}");
-        let (_, name, port, profile) = udp[0];
-        assert_eq!(
-            port, "8787",
-            "{what}: the announcement listens on the same number"
-        );
-        assert_eq!(
-            profile, "private,domain",
-            "{what}: never on a public network, like the TCP rule"
-        );
-        assert!(
-            !name.is_empty() && name != FIREWALL_RULE_NAME,
-            "{what}: the UDP rule has a name of its own, or deleting one deletes both: {name:?}"
-        );
-
-        let udp_delete = calls.iter().position(|c| {
-            c.get(3).is_some_and(|v| v == "delete") && property(c, "name") == Some(name.as_str())
-        });
-        let udp_add = calls.iter().position(|c| {
-            c.get(3).is_some_and(|v| v == "add") && property(c, "name") == Some(name.as_str())
-        });
-        assert!(
-            matches!((udp_delete, udp_add), (Some(d), Some(a)) if d < a),
-            "{what}: delete then add, so a second run leaves one UDP rule and not two: {calls:?}"
-        );
-        assert_eq!(
-            calls.last().and_then(|c| c.first()).map(String::as_str),
-            Some("schtasks"),
-            "{what}: the task is registered after the firewall, as today: {calls:?}"
-        );
-    }
+    // A fixed IP does not move, so its clients never need the announcement: no UDP rule.
+    let calls = registered(&fixed_lan_unit()).calls;
+    let rules = added_rules(&calls);
+    assert_eq!(
+        rules,
+        vec![tcp_rule],
+        "a fixed IP opens the TCP rule of today and nothing else: {calls:?}"
+    );
+    assert_eq!(
+        calls.last().and_then(|c| c.first()).map(String::as_str),
+        Some("schtasks"),
+        "the task is registered after the firewall, as today: {calls:?}"
+    );
 }
 
 #[test]

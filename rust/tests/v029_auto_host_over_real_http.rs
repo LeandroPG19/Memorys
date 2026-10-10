@@ -142,7 +142,12 @@ async fn daemon(addr: String, port: u16) -> tokio::task::JoinHandle<anyhow::Resu
 }
 
 async fn lan_block(port: u16) -> Value {
-    let body: Value = client()
+    // Above HEALTH_DB_TIMEOUT (5 s): with the database dead, /health spends all of it first.
+    let body: Value = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .no_proxy()
+        .build()
+        .unwrap()
         .get(format!("http://127.0.0.1:{port}/health"))
         .send()
         .await
@@ -184,7 +189,7 @@ fn is_rfc1918(ip: IpAddr) -> bool {
 }
 
 #[tokio::test]
-async fn a_lan_daemon_serves_loopback_says_auto_in_health_and_answers_the_announcement() {
+async fn a_lan_daemon_serves_loopback_says_auto_in_health_and_stays_silent_without_a_host_id() {
     let _one_at_a_time = ENV_GUARD.lock().await;
     let _env = quiet_machine(Some(TOKEN));
     let port = free_port();
@@ -211,25 +216,20 @@ async fn a_lan_daemon_serves_loopback_says_auto_in_health_and_answers_the_announ
         other => panic!("`address` is null or ip:port, not {other}"),
     }
 
+    // The database is dead, so the host id is nil and no client could verify this host: the
+    // announcement holds its port and stays silent. The answer with a real id is pinned by
+    // the beacon tests on sockets.
+    let held = std::net::UdpSocket::bind(("0.0.0.0", port));
+    assert!(
+        held.as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::AddrInUse),
+        "anchor: a lan daemon holds UDP {port} for the announcement, got {held:?}"
+    );
     let loopback = SocketAddr::from(([127, 0, 0, 1], port));
     let heard = beacon::probe(port, BEACON_WAIT, &[loopback]).await;
-    let (from, reply) = heard
-        .first()
-        .unwrap_or_else(|| panic!("a lan daemon answers the UDP announcement on its own port"));
-    assert_eq!(
-        from.port(),
-        port,
-        "the announcement listens on the TCP port's number"
-    );
-    assert_eq!(reply.service, "memory-industry");
-    assert_eq!(reply.v, 1);
-    assert_eq!(
-        reply.port, port,
-        "the reply names the TCP port to connect to"
-    );
-    assert_eq!(
-        reply.host_name, HOST_NAME,
-        "the reply carries the same name /identity gives"
+    assert!(
+        heard.is_empty(),
+        "with a nil host id the announcement must not answer: {heard:?}"
     );
 }
 

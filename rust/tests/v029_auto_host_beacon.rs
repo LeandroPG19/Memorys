@@ -277,44 +277,56 @@ fn drain(socket: &UdpSocket) -> Vec<Vec<u8>> {
     got
 }
 
-/// The second origin's answer is the barrier: the responder handles datagrams one at a time
-/// in arrival order, and on loopback the first origin's twenty are queued before the
-/// sentinel, so when the sentinel is answered every answer the first origin will ever get is
-/// already in its socket. That turns «no more answers» into something a test can read.
+/// Waits for `count` answers on `socket`, or fails naming why they did not come.
+async fn answers(
+    socket: &UdpSocket,
+    task: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    count: usize,
+    why: &str,
+) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    while got.len() < count {
+        got.push(one_answer(socket, task, why).await);
+    }
+    got
+}
+
+/// How long a test listens for an answer that must not come, once the expected ones arrived.
+const QUIET: Duration = Duration::from_millis(300);
+
 #[tokio::test]
 async fn one_origin_asking_twenty_times_in_a_second_gets_at_most_four_answers() {
     let (host, mut task) = responder(None).await;
     let asker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let sentinel = UdpSocket::bind("127.0.0.2:0")
-        .await
-        .expect("127.0.0.2 is loopback on Linux; this test needs a second origin");
 
     for _ in 0..20 {
         asker.send_to(&request(64), host).await.unwrap();
     }
-    sentinel.send_to(&request(64), host).await.unwrap();
-    one_answer(
-        &sentinel,
+    answers(
+        &asker,
         &mut task,
-        "a second origin that asked once got no answer: the responder is not answering at all",
+        4,
+        "one origin asking 20 times got fewer than four answers",
     )
     .await;
 
-    let answers = drain(&asker);
-    assert_eq!(
-        answers.len(),
-        4,
-        "twenty requests from one origin got {} answers; the limit is four every ten seconds, \
-         and without it the host is an amplifier",
-        answers.len()
+    // A barrier from a second origin proves nothing here: measured on this kernel, loopback
+    // does not keep the order between different sockets. So the fifth answer gets a quiet window.
+    let mut buf = vec![0u8; 2048];
+    let fifth = tokio::time::timeout(QUIET, asker.recv_from(&mut buf)).await;
+    assert!(
+        fifth.is_err(),
+        "twenty requests from one origin got a fifth answer; the limit is four every ten \
+         seconds, and without it the host is an amplifier"
     );
 }
 
+/// The barrier is a second good request from the same socket: one flow keeps its order on
+/// loopback, so when its answer is in, every earlier answer the asker will get is in too.
 #[tokio::test]
 async fn the_responder_skips_what_it_must_not_answer_and_answers_the_rest() {
     let (host, mut task) = responder(None).await;
     let asker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let sentinel = UdpSocket::bind("127.0.0.2:0").await.unwrap();
 
     let mut oversized_but_parses = request(100);
     oversized_but_parses.resize(600, b' ');
@@ -327,18 +339,23 @@ async fn the_responder_skips_what_it_must_not_answer_and_answers_the_rest() {
         asker.send_to(&junk, host).await.unwrap();
     }
     asker.send_to(&request(64), host).await.unwrap();
-    sentinel.send_to(&request(64), host).await.unwrap();
-    one_answer(&sentinel, &mut task, "the sentinel got no answer").await;
+    asker.send_to(&request(64), host).await.unwrap();
 
-    let answers = drain(&asker);
-    assert_eq!(
-        answers.len(),
-        1,
-        "four malformed requests and one good one: exactly one answer, got {}",
-        answers.len()
+    let got = answers(
+        &asker,
+        &mut task,
+        2,
+        "two good requests after four malformed ones did not both get an answer",
+    )
+    .await;
+    for raw in &got {
+        let reply: Reply = serde_json::from_slice(raw).expect("the answer is a Reply");
+        assert_eq!(reply, me(host.port()));
+    }
+    assert!(
+        drain(&asker).is_empty(),
+        "four malformed requests and two good ones: exactly two answers, a third came"
     );
-    let reply: Reply = serde_json::from_slice(&answers[0]).expect("the answer is a Reply");
-    assert_eq!(reply, me(host.port()));
     assert!(
         !task.is_finished(),
         "malformed datagrams must not stop the responder"
