@@ -58,7 +58,7 @@ scripts/lizard-baseline.txt text eol=lf
 # the UTF-16 bytes as-is.
 packaging/windows/memory-industry-task.xml text eol=lf working-tree-encoding=UTF-16LE-BOM
 
-# The double-click launchers of the two visit packages. cmd.exe is the only reader, and a
+# The double-click launchers of the visit packages. cmd.exe is the only reader, and a
 # batch file with bare LF line endings is the one thing it can misread (labels and
 # goto jump to the wrong place). They carry neither today, but the rule is cheap and
 # the zips are built from these bytes. Named by path, not `*.cmd`: that would also
@@ -68,3 +68,5 @@ scripts/ENSAYO-se-desinstala-al-final.cmd text eol=crlf
 scripts/INSTALAR-EQUIPO-REAL.cmd text eol=crlf
 scripts/QUITAR-TODO.cmd text eol=crlf
 scripts/RESULTADO.cmd text eol=crlf
+scripts/CONECTAR-A-LA-MADRE.cmd text eol=crlf
+scripts/GENERAR-CODIGO.cmd text eol=crlf
