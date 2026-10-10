@@ -8,7 +8,7 @@
 #   .\ensayo-madre.ps1 -Fase Humo   (prueba de 2 minutos, solo lectura, no instala nada)
 #
 # Cada fase tambien se puede usar por separado:
-#   .\ensayo-madre.ps1 -Fase Antes   [-Ip 192.168.0.10] [-Puerto 8797]   (consola de administrador)
+#   .\ensayo-madre.ps1 -Fase Antes   [-Ip 192.168.0.10]                  (consola de administrador)
 #   (reiniciar desde el menu de Windows: Reiniciar, no Apagar)
 #   .\ensayo-madre.ps1 -Fase Despues                                      (consola de administrador)
 #   .\ensayo-madre.ps1 -Fase Limpiar [-BorrarEnv]                         (solo en el ensayo)
@@ -19,9 +19,11 @@
 # equipo. Los textos que escribe (informe.txt) salen en UTF-8; los JSON, en UTF-8
 # sin BOM.
 #
-# Que NO hace: no toca la tarea ni el firewall con comandos propios; los crea el
-# propio memory-industry.exe (`setup service --apply --register`) y se retiran con
-# lo que imprime `setup service --uninstall`. El ensayo solo mide y comprueba.
+# Que NO hace: no toca la tarea del servicio ni el firewall con comandos propios; los
+# crea el propio memory-industry.exe (`setup service --profile lan --apply --register`,
+# modo automatico: la madre escucha en su IP de cada momento) y se retiran con lo que
+# imprime `setup service --uninstall`. Lo unico que registra por su cuenta son sus
+# tareas: las dos del ensayo y "MemoryIndustry Madre aviso" (aviso-madre.ps1).
 #
 # Nunca escribe ni imprime el token: de el solo salen su LARGO y una huella SHA-256
 # para comparar antes y despues del reinicio.
@@ -37,10 +39,11 @@ param(
     [string]$Fase = 'Todo',
     [string]$Binario,
     [string]$Ip,
-    # 8797: lejos de 8787/8788, que la guia ya avisa que pueden estar ocupados en
-    # una estacion con otros daemons o con el editor.
+    # 8787: el que escribe `setup service` en modo lan (CUBA_HTTP_ADDR=lan:8787), el que
+    # barren los clientes y el del aviso UDP. Ya no se elige: un cambio aqui solo sirve
+    # para que las comprobaciones miren otro puerto.
     [ValidateRange(1024, 65535)]
-    [int]$Puerto = 8797,
+    [int]$Puerto = 8787,
     [string]$Salida,
     # Limpiar conserva el env file (lleva el token que los clientes ya usan) salvo
     # que se pida lo contrario: en el equipo real un Limpiar por error no debe
@@ -67,6 +70,9 @@ $script:NombreTarea = 'memory-industry'
 $script:NombreRegla = 'memory-industry'
 $script:TareaReinicio = 'memory-industry-ensayo-reinicio'
 $script:TareaDespues = 'memory-industry-ensayo-despues'
+# La tarea por usuario que, al iniciar sesion, dice si la madre esta activa y en que IP.
+$script:TareaAvisoMadre = 'MemoryIndustry Madre aviso'
+$script:ArchivoAviso = 'aviso-madre.ps1'
 $script:ArchivoSumas = 'SHA256SUMS.txt'
 $script:ArchivoEnv = 'memory-industry.env'
 $script:ArchivoLauncher = 'memory-industry.cmd'
@@ -192,6 +198,82 @@ function Select-Escucha {
         Todas        = $todas
         SoloLoopback = ($loop -and -not $enIp -and -not $todas)
     }
+}
+
+function Split-Direccion {
+    # "ip:puerto" (lo que da /health en lan.address) en sus dos partes, o $null.
+    param([string]$Direccion)
+    if ([string]::IsNullOrEmpty($Direccion) -or $Direccion -notmatch '^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$') { return $null }
+    return [pscustomobject]@{ Ip = $Matches[1]; Puerto = [int]$Matches[2] }
+}
+
+function Get-UrlSaludLocal {
+    param([int]$PuertoLan)
+    return ('http://127.0.0.1:{0}/health' -f $PuertoLan)
+}
+
+function Get-LanDeSalud {
+    # lan.address del /health ya leido, o $null (sin respuesta, sin bloque lan o sin IP).
+    param($Json)
+    if ($null -eq $Json -or -not $Json.PSObject.Properties['lan'] -or $null -eq $Json.lan) { return $null }
+    $d = [string]$Json.lan.address
+    if ([string]::IsNullOrEmpty($d)) { return $null }
+    return $d
+}
+
+function Get-ArgumentosSetup {
+    # Modo lan sin --addr: el binario escribe CUBA_HTTP_ADDR=lan:8787 y la madre escucha en
+    # su IP privada de cada momento (y en 127.0.0.1). La IP no la elige nadie.
+    param([switch]$Aplicar)
+    $a = @('setup', 'service', '--profile', 'lan')
+    if ($Aplicar) { $a += @('--apply', '--register') }
+    return $a
+}
+
+function Get-DireccionEsperada {
+    param([int]$PuertoLan)
+    return ('lan:{0}' -f $PuertoLan)
+}
+
+function Get-ChecksReglas {
+    # `Reglas`: las de entrada del puerto, como las devuelve Get-ReglasPuerto. Se juzgan
+    # por protocolo y puerto, no por nombre: el de la regla UDP lo decide el binario.
+    # Una regla que tambien abre la red Publica no vale aunque haya otra buena.
+    param($Reglas, [int]$PuertoLan)
+    $c = New-Object System.Collections.ArrayList
+    foreach ($p in @('TCP', 'UDP')) {
+        $id = 'regla_' + $p.ToLower()
+        $suyas = @($Reglas | Where-Object { $_.Protocolo -eq $p -and [string]$_.Puerto -eq [string]$PuertoLan })
+        $activas = @($suyas | Where-Object { $_.Habilitada -eq 'True' -and $_.Direccion -eq 'Inbound' -and $_.Accion -eq 'Allow' })
+        $publicas = @($activas | Where-Object { $_.Perfil -match 'Public|Any' })
+        $buenas = @($activas | Where-Object { $_.Perfil -match 'Private' -and $_.Perfil -match 'Domain' -and $_.Perfil -notmatch 'Public|Any' })
+        if ($suyas.Count -eq 0) { $res = 'FALLA'; $det = ('no hay regla de entrada {0} {1}' -f $p, $PuertoLan) }
+        elseif ($publicas.Count -gt 0) { $res = 'FALLA'; $det = ('la regla {0} {1} abre tambien la red Publica ({2})' -f $p, $PuertoLan, $publicas[0].Perfil) }
+        elseif ($buenas.Count -gt 0) { $res = 'PASA'; $det = ('entrada, permitir, {0} {1}, perfiles {2}' -f $p, $PuertoLan, $buenas[0].Perfil) }
+        else { $r = $suyas[0]; $res = 'FALLA'; $det = ('{0} {1}: habilitada={2} direccion={3} accion={4} perfil={5}' -f $p, $PuertoLan, $r.Habilitada, $r.Direccion, $r.Accion, $r.Perfil) }
+        [void]$c.Add([pscustomobject]@{ id = $id; resultado = $res; detalle = $det })
+    }
+    return @($c)
+}
+
+function Get-DefinicionTareaAviso {
+    # La tarea de aviso de la madre: por usuario, al iniciar sesion, sin elevar. Corre
+    # aviso-madre.ps1 de la copia protegida (solo SYSTEM y administradores la modifican).
+    param([string]$DirPaquete, [string]$Usuario)
+    $ruta = $DirPaquete.TrimEnd('\', '/') + '\' + $script:ArchivoAviso
+    return [pscustomobject]@{
+        Nombre     = $script:TareaAvisoMadre
+        Programa   = 'powershell.exe'
+        Argumentos = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $ruta)
+        Disparador = 'AlIniciarSesion'
+        Usuario    = $Usuario
+        Nivel      = 'Limited'
+    }
+}
+
+function Get-TareasPropias {
+    # Las tareas que crea este script (las del servicio las crea y retira el binario).
+    return @($script:TareaReinicio, $script:TareaDespues, $script:TareaAvisoMadre)
 }
 
 function Protect-Secreto {
@@ -403,6 +485,17 @@ function Get-ChecksDespues {
         }
     }
 
+    # En modo lan la IP puede cambiar con el reinicio (DHCP) y no es un fallo: la madre la
+    # sigue y los clientes la buscan. Lo que si es un fallo es que no tenga ninguna.
+    if (-not [string]::IsNullOrEmpty([string]$Actual.lan_direccion)) {
+        $nota = ''
+        if ($Antes.ip -and -not ([string]$Actual.lan_direccion).StartsWith([string]$Antes.ip + ':')) { $nota = (' (al instalar era {0}; cambio y la madre la siguio)' -f $Antes.ip) }
+        & $add 'lan_direccion' 'PASA' ('la madre escucha en la red en {0}{1}' -f $Actual.lan_direccion, $nota)
+    }
+    else {
+        & $add 'lan_direccion' 'FALLA' 'la madre no tiene ahora una IP de red privada (o no respondio): ningun otro equipo la ve. Revisa el cable o el wifi'
+    }
+
     if ($Actual.direccion -eq $Antes.direccion) {
         & $add 'misma_direccion' 'PASA' ('el env file sigue con {0}' -f $Antes.direccion)
     }
@@ -459,9 +552,9 @@ function Get-LineasServicioDoctor {
 }
 
 function Get-OrdenesDesinstalar {
-    # De la salida de `setup service --uninstall` toma SOLO las dos ordenes que ese
-    # comando imprime para retirar la tarea y la regla. Una lista blanca exacta: lo
-    # que no sea eso no se ejecuta, venga de donde venga.
+    # De la salida de `setup service --uninstall` toma SOLO las ordenes que ese comando
+    # imprime para retirar la tarea y las reglas (TCP y, desde 0.29, la UDP del aviso, con
+    # nombre propio). Una lista blanca: lo que no sea eso no se ejecuta, venga de donde venga.
     param([string]$Texto)
     $ordenes = New-Object System.Collections.ArrayList
     foreach ($linea in ($Texto -split "`r?`n")) {
@@ -470,7 +563,7 @@ function Get-OrdenesDesinstalar {
         $partes = @($Matches[2] -split '\s+')
         $permitida = $false
         if ($programa -eq 'schtasks' -and ($partes -join ' ') -eq ('/Delete /TN {0} /F' -f $script:NombreTarea)) { $permitida = $true }
-        if ($programa -eq 'netsh' -and ($partes -join ' ') -eq ('advfirewall firewall delete rule name={0}' -f $script:NombreRegla)) { $permitida = $true }
+        if ($programa -eq 'netsh' -and $partes.Count -eq 5 -and (($partes[0..3]) -join ' ') -eq 'advfirewall firewall delete rule' -and $partes[4] -match ('^name=' + [regex]::Escape($script:NombreRegla) + '[A-Za-z0-9._-]*$')) { $permitida = $true }
         if ($permitida) { [void]$ordenes.Add([pscustomobject]@{ Programa = $programa; Argumentos = $partes; Linea = $linea.Trim() }) }
     }
     return @($ordenes)
@@ -527,7 +620,7 @@ function Get-ResumenTodo {
     param([string]$Direccion, [bool]$AutoLogon, [bool]$Conservar, [string]$Salida, $Avisos = @(), $SesionesAjenas = @(), $Pendientes = @())
     $l = New-Object System.Collections.ArrayList
     [void]$l.Add('Primera parte lista: todo salio bien.')
-    [void]$l.Add(('  - Se instalo MemoryIndustry como servicio de Windows en {0} (tarea programada y regla de firewall).' -f $Direccion))
+    [void]$l.Add(('  - Se instalo MemoryIndustry como servicio de Windows en modo automatico ({0}): tarea programada, reglas de firewall TCP y UDP y el aviso de la madre al iniciar sesion.' -f $Direccion))
     [void]$l.Add('  - Se comprobo que responde, que vuelve solo si se detiene y que repetir la instalacion no la rompe.')
     [void]$l.Add('')
     [void]$l.Add('Ahora hay que REINICIAR el equipo, para comprobar que el servicio arranca solo.')
@@ -867,14 +960,16 @@ function Wait-Daemon {
     # Espera a que el daemon abra su puerto y responda /health. Mide los dos
     # tiempos por separado: `serve` abre el puerto y solo despues calienta, asi que
     # la distancia entre ambos es el calentamiento. `IdAnterior` excluye al proceso
-    # que se mato, para no dar por vivo al que ya no esta.
+    # que se mato, para no dar por vivo al que ya no esta. En modo lan la madre escucha
+    # siempre en 127.0.0.1 y en la IP privada del momento, que puede cambiar: se mira el
+    # puerto en cualquier direccion y /health por loopback.
     param($Ctx, [int]$LimiteSeg, [int]$IdAnterior = 0, [int]$PasoMs = 1000)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $tPuerto = $null
     $idNuevo = 0
-    $url = 'http://{0}:{1}/health' -f $Ctx.Ip, $Ctx.Puerto
+    $url = Get-UrlSaludLocal $Ctx.Puerto
     while ($true) {
-        $enIp = @(Get-Escuchas $Ctx.Puerto | Where-Object { $_.Direccion -eq $Ctx.Ip -and $_.IdProceso -ne $IdAnterior })
+        $enIp = @(Get-Escuchas $Ctx.Puerto | Where-Object { $_.IdProceso -ne $IdAnterior })
         if ($enIp.Count -gt 0) {
             $idNuevo = $enIp[0].IdProceso
             if ($null -eq $tPuerto) { $tPuerto = [math]::Round($sw.Elapsed.TotalSeconds, 1) }
@@ -929,6 +1024,31 @@ function Get-DetalleRegla {
             })
     }
     return @($res)
+}
+
+function Get-ReglasPuerto {
+    # Las reglas de entrada de un puerto, por su filtro de puerto y no por nombre: la UDP
+    # del aviso lleva un nombre que decide el binario.
+    param([int]$PuertoLocal)
+    $res = New-Object System.Collections.ArrayList
+    $filtros = @()
+    try { $filtros = @(Get-NetFirewallPortFilter -All -ErrorAction Stop | Where-Object { [string]$_.LocalPort -eq [string]$PuertoLocal }) } catch { return @() }
+    foreach ($pf in $filtros) {
+        $reglas = @()
+        try { $reglas = @(Get-NetFirewallRule -AssociatedNetFirewallPortFilter $pf -ErrorAction Stop) } catch { continue }
+        foreach ($r in $reglas) {
+            [void]$res.Add([pscustomobject]@{
+                    Nombre     = [string]$r.DisplayName
+                    Habilitada = [string]$r.Enabled
+                    Direccion  = [string]$r.Direction
+                    Accion     = [string]$r.Action
+                    Perfil     = [string]$r.Profile
+                    Protocolo  = [string]$pf.Protocol
+                    Puerto     = [string]$pf.LocalPort
+                })
+        }
+    }
+    return @($res | Where-Object { $_.Direccion -eq 'Inbound' })
 }
 
 function Test-Elevado {
@@ -1314,24 +1434,6 @@ function Format-UrlSinClave {
     return [regex]::Replace($Url, '(://[^:/\s]+:)[^@\s]+@', '$1***@')
 }
 
-function Resolve-EleccionIp {
-    # `Texto` es lo que escribio el operador: vacio confirma la propuesta; un numero elige
-    # de la lista que se le mostro. Una VPN o un adaptador virtual no se acepta.
-    param([string]$Texto, $Candidatas, $Propuesta)
-    $t = ''
-    if ($null -ne $Texto) { $t = $Texto.Trim() }
-    if ($t -eq '') {
-        if ($null -eq $Propuesta) { return [pscustomobject]@{ Candidata = $null; Error = 'no hay ninguna direccion propuesta; escribe el numero de una' } }
-        return [pscustomobject]@{ Candidata = $Propuesta; Error = $null }
-    }
-    $n = 0
-    if (-not [int]::TryParse($t, [ref]$n) -or $n -lt 1 -or $n -gt @($Candidatas).Count) { return [pscustomobject]@{ Candidata = $null; Error = ('"{0}" no es un numero de la lista' -f $t) } }
-    $c = @($Candidatas)[$n - 1]
-    if ($c.Excluida) { return [pscustomobject]@{ Candidata = $null; Error = 'esa es una VPN o un adaptador virtual: los clientes no llegan por ahi' } }
-    if (-not (Test-IpPrivada $c.Ip)) { return [pscustomobject]@{ Candidata = $null; Error = 'esa direccion no es privada (10.x, 172.16-31.x, 192.168.x)' } }
-    return [pscustomobject]@{ Candidata = $c; Error = $null }
-}
-
 # --- Lo que lee de Windows (cada sondeo es una funcion para poder simularlo) ---------
 
 function Test-EsWindows { return ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) }
@@ -1584,9 +1686,9 @@ function Get-ResultadoHumo {
     if ($null -eq $elegida) { [void]$filas.Add((New-Fila 'red_elegida' 'PARA' 'ninguna direccion es privada y de un adaptador real (no VPN ni virtual)' 'Conecta el equipo a la red de la planta y repite.')) }
     else {
         $esDhcp = ($elegida.Dhcp -eq $true)
-        $det = 'se usaria {0} ({1}), la de menor metrica de la ruta por omision' -f $elegida.Ip, $elegida.Alias
-        if ($esDhcp) { [void]$filas.Add((New-Fila 'red_elegida' 'AVISO' ($det + '. ATENCION: esta direccion la reparte el DHCP y PUEDE CAMBIAR; los clientes dejarian de encontrar el servicio') 'Fija la IP del equipo (despliegue-lan.md, seccion "Fixed address on the host") antes de instalar.')) }
-        else { [void]$filas.Add((New-Fila 'red_elegida' 'OK' $det)) }
+        $det = 'IP detectada {0} ({1}), la de menor metrica de la ruta por omision' -f $elegida.Ip, $elegida.Alias
+        if ($esDhcp) { $det += '. La reparte el DHCP: en modo automatico la madre la sigue si cambia y los equipos la encuentran solos' }
+        [void]$filas.Add((New-Fila 'red_elegida' 'OK' $det))
         if ($elegida.Perfil -eq 'Public') { [void]$filas.Add((New-Fila 'red_perfil' 'AVISO' 'la red de esa direccion es Publica: la regla de firewall solo abre Privada y Dominio' 'En el equipo real se te ofrecera cambiarla a Privada.')) }
     }
     $puertoLibre = $true
@@ -1684,30 +1786,15 @@ function Resolve-BaseDatos {
 }
 
 function Resolve-IpReal {
-    # En el equipo real la IP no se elige sola: se muestra la lista y se pide confirmar o
-    # elegir un numero ANTES de instalar. Una IP de DHCP se avisa en grande.
+    # Modo lan: la IP no se elige. Se muestra la que la prueba de humo detecto (la de la
+    # ruta por omision) solo para que conste; la madre escucha en la que tenga en cada
+    # momento y la sigue si el DHCP se la cambia.
     param($Ctx, $Humo)
-    $cands = @($Humo.Candidatas)
-    $n = 0
-    foreach ($c in $cands) { $n++; Write-Informe ('  ' + (Format-Candidato $c $n)) }
     $elegida = $Humo.Elegida
-    for ($i = 0; $i -lt 3; $i++) {
-        $ayuda = 'Escribe el numero de la direccion que usaran los clientes'
-        if ($elegida) { $ayuda += (' o pulsa Enter para confirmar {0}' -f $elegida.Ip) }
-        $t = Read-Host $ayuda
-        $r = Resolve-EleccionIp $t $cands $elegida
-        if ($r.Error) { Write-Informe $r.Error 'Yellow'; continue }
-        $c = $r.Candidata
-        if ($c.Dhcp -eq $true) {
-            Write-Informe ('ATENCION: {0} la reparte el DHCP y PUEDE CAMBIAR en cualquier momento. Si cambia, ningun cliente encontrara el servicio. Lo correcto es fijar la IP antes (despliegue-lan.md, "Fixed address on the host").' -f $c.Ip) 'Red'
-            $sigue = Read-Host 'Continuar igualmente con esta direccion? (S/N)'
-            if (-not (Test-RespuestaSi $sigue)) { continue }
-        }
-        $Ctx.Ip = $c.Ip
-        Write-Informe ('Direccion elegida: {0} ({1})' -f $c.Ip, $c.Alias) 'Green'
-        return
-    }
-    Stop-Rechazo 'no se confirmo ninguna direccion. No se instalo nada.'
+    if ($null -eq $elegida) { Stop-Rechazo 'no hay ninguna IP privada de un adaptador real: conecta el equipo a la red de la planta y repite. No se instalo nada.' }
+    $Ctx.Ip = $elegida.Ip
+    Write-Informe ('IP detectada: {0} ({1}). No hay que elegirla: la madre la sigue sola si cambia y los equipos la encuentran solos.' -f $elegida.Ip, $elegida.Alias) 'Green'
+    if ($elegida.Dhcp -eq $true) { Write-Informe '  La reparte el DHCP. Al iniciar sesion, la madre avisa si cambio y ofrece fijarla.' }
 }
 
 function Get-ComandoTarea {
@@ -1741,8 +1828,10 @@ function Invoke-FaseAntes {
         Stop-Rechazo ('rutas que el instalador no puede usar: {0}. Mueve el paquete a C:\memory-industry-visita o usa otro usuario, o manda la carpeta ensayo-informe.' -f ($rutasMalas -join '; '))
     }
     Resolve-Ip $ctx
-    $direccion = '{0}:{1}' -f $ctx.Ip, $ctx.Puerto
-    $url = 'http://{0}/health' -f $direccion
+    # Lo que queda en el env file (modo lan) y donde la madre escucha ahora en la red.
+    $direccion = Get-DireccionEsperada $ctx.Puerto
+    $dirRed = '{0}:{1}' -f $ctx.Ip, $ctx.Puerto
+    $url = Get-UrlSaludLocal $ctx.Puerto
     [void](New-Item -ItemType Directory -Path $ctx.Salida -Force)
     try { Unblock-File -LiteralPath $ctx.Binario -ErrorAction Stop } catch { }
 
@@ -1751,7 +1840,7 @@ function Invoke-FaseAntes {
         inicio = (Get-AhoraTexto); fin = $null
         equipo = $env:COMPUTERNAME; usuario = $env:USERNAME
         so = [System.Environment]::OSVersion.VersionString
-        ip = $ctx.Ip; puerto = $ctx.Puerto; direccion = $direccion
+        ip = $ctx.Ip; puerto = $ctx.Puerto; direccion = $direccion; lan_direccion = $null
         binario = [ordered]@{ ruta = $ctx.Binario; sha256 = $null; version = $null }
         raiz = $ctx.Raiz
         token = [ordered]@{ longitud = $null; sha256 = $null; sha256_tras_reaplicar = $null }
@@ -1764,7 +1853,7 @@ function Invoke-FaseAntes {
     try {
         Write-Informe ('MemoryIndustry - ensayo de instalacion (Antes) - {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
         Write-Informe ('Equipo {0}, usuario {1}, {2}' -f $env:COMPUTERNAME, $env:USERNAME, $a.so)
-        Write-Informe ('Direccion del ensayo: {0}' -f $direccion)
+        Write-Informe ('Modo automatico ({0}); IP detectada ahora: {1}' -f $direccion, $ctx.Ip)
 
         # --- 0. El binario -------------------------------------------------
         Write-Paso '0. Binario'
@@ -1840,7 +1929,7 @@ function Invoke-FaseAntes {
 
         # --- 2. El plan ----------------------------------------------------
         Write-Paso '2. Plan (no escribe nada)'
-        $plan = Invoke-Nativo $ctx.Binario @('setup', 'service', '--profile', 'lan', '--addr', $direccion) 60 -Utf8
+        $plan = Invoke-Nativo $ctx.Binario (Get-ArgumentosSetup) 60 -Utf8
         Write-TextoArchivo (Join-Path $ctx.Salida 'plan.txt') (Protect-Secreto ($plan.Salida + $plan.Error) $secretos)
         if ($plan.NoArranco -or $plan.Agotado -or $plan.Codigo -ne 0) {
             Add-Check 'plan' 'FALLA' ('setup service (sin --apply) termino con codigo {0}: {1}' -f $plan.Codigo, ($plan.Error.Trim()))
@@ -1850,7 +1939,7 @@ function Invoke-FaseAntes {
 
         # --- 3. Instalar y registrar ---------------------------------------
         Write-Paso '3. setup service --apply --register'
-        $ap = Invoke-Nativo $ctx.Binario @('setup', 'service', '--profile', 'lan', '--addr', $direccion, '--apply', '--register') 120 -Utf8
+        $ap = Invoke-Nativo $ctx.Binario (Get-ArgumentosSetup -Aplicar) 120 -Utf8
         $textoAp = Protect-Secreto ($ap.Salida + $ap.Error) $secretos
         Write-TextoArchivo (Join-Path $ctx.Salida 'apply.txt') $textoAp
         foreach ($l in ((Protect-Secreto $ap.Salida $secretos) -split "`r?`n")) { if ($l.Trim()) { Write-Informe ('  | {0}' -f $l.TrimEnd()) } }
@@ -1921,17 +2010,14 @@ function Invoke-FaseAntes {
         else { Add-Check 'tarea_definicion' 'FALLA' ($dif -join '; ') }
 
         # --- 6. Firewall ----------------------------------------------------
-        Write-Paso '6. Regla de firewall'
+        Write-Paso '6. Reglas de firewall (TCP del servicio y UDP del aviso)'
         $ns1 = Invoke-Nativo 'netsh.exe' @('advfirewall', 'firewall', 'show', 'rule', ('name=' + $script:NombreRegla)) 30
         if ($ns1.Codigo -eq 0) { Add-Check 'regla_existe' 'PASA' 'netsh show rule devuelve 0' } else { Add-Check 'regla_existe' 'FALLA' ('netsh show rule devolvio {0}' -f $ns1.Codigo) }
         $reglas = @(Get-DetalleRegla $script:NombreRegla)
         if ($reglas.Count -eq 1) { Add-Check 'regla_unica' 'PASA' 'exactamente una regla con ese nombre' } else { Add-Check 'regla_unica' 'FALLA' ('{0} reglas con ese nombre' -f $reglas.Count) }
-        if ($reglas.Count -ge 1) {
-            $r = $reglas[0]
-            $bien = ($r.Habilitada -eq 'True') -and ($r.Direccion -eq 'Inbound') -and ($r.Accion -eq 'Allow') -and ($r.Protocolo -eq 'TCP') -and ($r.Puerto -eq [string]$ctx.Puerto) -and ($r.Perfil -match 'Private') -and ($r.Perfil -match 'Domain') -and ($r.Perfil -notmatch 'Public')
-            if ($bien) { Add-Check 'regla_definicion' 'PASA' ('entrada, permitir, TCP {0}, perfiles {1}' -f $r.Puerto, $r.Perfil) }
-            else { Add-Check 'regla_definicion' 'FALLA' ('habilitada={0} direccion={1} accion={2} protocolo={3} puerto={4} perfil={5}' -f $r.Habilitada, $r.Direccion, $r.Accion, $r.Protocolo, $r.Puerto, $r.Perfil) }
-        }
+        $reglasPuerto = @(Get-ReglasPuerto $ctx.Puerto)
+        $a.reglas = @($reglasPuerto | ForEach-Object { '{0} {1} {2} {3}' -f $_.Nombre, $_.Protocolo, $_.Puerto, $_.Perfil })
+        foreach ($c in @(Get-ChecksReglas $reglasPuerto $ctx.Puerto)) { Add-Check $c.id $c.resultado $c.detalle }
         try {
             $idx = (Get-NetIPAddress -IPAddress $ctx.Ip -ErrorAction Stop).InterfaceIndex
             $cat = [string](Get-NetConnectionProfile -InterfaceIndex $idx -ErrorAction Stop).NetworkCategory
@@ -1978,12 +2064,27 @@ function Invoke-FaseAntes {
         Add-Check 'arranque_health' 'PASA' ('puerto a los {0}, /health a los {1}: status={2} database={3} ready={4} version={5}' -f (Format-Seg $w.SegPuerto), (Format-Seg $w.SegHealth), $j.status, $j.database, $j.ready, $j.version)
         if ($j.database -ne 'up') { Add-Check 'base_de_datos' 'AVISO' (Get-TextoBaseNoUp ([bool]$Conservar)) }
 
+        # La madre dice en /health donde escucha en la red; es esa IP, y no la que detecto el
+        # ensayo, la que tiene que figurar entre las escuchas.
+        $lan = Get-LanDeSalud $j
+        $a.lan_direccion = $lan
+        $partesLan = Split-Direccion $lan
+        if ($null -eq $partesLan) {
+            Add-Check 'lan_direccion' 'FALLA' ('/health no da una direccion de red (lan.address vacio): la madre solo escucha en este equipo. Modo: {0}' -f $(if ($j.lan) { $j.lan.mode } else { 'sin bloque lan (binario anterior a 0.29?)' }))
+        }
+        else {
+            $dirRed = $lan
+            $extra = ''
+            if ($partesLan.Ip -ne $ctx.Ip) { $extra = (' (el ensayo habia detectado {0}; la madre eligio otra)' -f $ctx.Ip) }
+            Add-Check 'lan_direccion' 'PASA' ('modo {0}, escucha en la red en {1}{2}' -f $j.lan.mode, $lan, $extra)
+            $ctx.Ip = $partesLan.Ip
+        }
         $dirs = @(Get-Escuchas $ctx.Puerto | ForEach-Object { $_.Direccion })
         $esc = Select-Escucha $dirs $ctx.Ip
         $a.mediciones.escucha = ($dirs -join ',')
-        if (-not $esc.EnIp) { Add-Check 'escucha' 'FALLA' ('no escucha en {0}; direcciones: {1}' -f $direccion, ($dirs -join ', ')) }
-        elseif ($esc.Todas) { Add-Check 'escucha' 'AVISO' ('escucha en {0} pero tambien en todas las interfaces ({1})' -f $direccion, ($dirs -join ', ')) }
-        else { Add-Check 'escucha' 'PASA' ('escucha en {0}; direcciones del puerto: {1}' -f $direccion, ($dirs -join ', ')) }
+        if (-not $esc.EnIp) { Add-Check 'escucha' 'FALLA' ('no escucha en {0}; direcciones: {1}' -f $dirRed, ($dirs -join ', ')) }
+        elseif ($esc.Todas) { Add-Check 'escucha' 'FALLA' ('escucha en todas las interfaces ({0}): en modo lan solo debe escuchar en 127.0.0.1 y en su IP privada' -f ($dirs -join ', ')) }
+        else { Add-Check 'escucha' 'PASA' ('escucha en {0}; direcciones del puerto: {1}' -f $dirRed, ($dirs -join ', ')) }
         if ($esc.SoloLoopback) { Add-Check 'escucha_no_solo_loopback' 'FALLA' 'solo escucha en loopback: otras maquinas no entrarian' }
         else { Add-Check 'escucha_no_solo_loopback' 'PASA' 'no escucha solo en 127.0.0.1' }
 
@@ -2051,7 +2152,7 @@ function Invoke-FaseAntes {
         # 127.0.0.1).
         Write-Paso '9. Idempotencia: --apply --register otra vez'
         $variantes = @(
-            [pscustomobject]@{ N = '2'; Que = 'con las mismas banderas'; Argumentos = @('setup', 'service', '--profile', 'lan', '--addr', $direccion, '--apply', '--register') },
+            [pscustomobject]@{ N = '2'; Que = 'con las mismas banderas'; Argumentos = (Get-ArgumentosSetup -Aplicar) },
             [pscustomobject]@{ N = '3'; Que = 'sin banderas'; Argumentos = @('setup', 'service', '--apply', '--register') }
         )
         foreach ($vr in $variantes) {
@@ -2066,8 +2167,10 @@ function Invoke-FaseAntes {
             if ($texto2 -match '(?m)^conservado\s') { Add-Check ($id + '_conserva_env') 'PASA' 'el env file figura como "conservado"' }
             else { Add-Check ($id + '_conserva_env') 'FALLA' 'la salida no dice que el env file se conservo' }
             $n2 = Get-ConteoTarea $script:NombreTarea
-            $r2 = @(Get-DetalleRegla $script:NombreRegla).Count
-            if ($n2 -eq 1 -and $r2 -eq 1) { Add-Check ($id + '_unicos') 'PASA' 'una tarea y una regla tras repetir' } else { Add-Check ($id + '_unicos') 'FALLA' ('tareas={0} reglas={1}' -f $n2, $r2) }
+            $rp2 = @(Get-ReglasPuerto $ctx.Puerto)
+            $tcp2 = @($rp2 | Where-Object { $_.Protocolo -eq 'TCP' }).Count
+            $udp2 = @($rp2 | Where-Object { $_.Protocolo -eq 'UDP' }).Count
+            if ($n2 -eq 1 -and $tcp2 -eq 1 -and $udp2 -eq 1) { Add-Check ($id + '_unicos') 'PASA' 'una tarea, una regla TCP y una UDP tras repetir' } else { Add-Check ($id + '_unicos') 'FALLA' ('tareas={0} reglas TCP={1} UDP={2} en el puerto {3}' -f $n2, $tcp2, $udp2, $ctx.Puerto) }
             $envDespues = Read-Texto $ctx.Env
             $hashDespues = Get-HashToken $envDespues
             $a.token.sha256_tras_reaplicar = $hashDespues
@@ -2116,8 +2219,12 @@ function Invoke-FaseAntes {
             $a.log_bytes = $cola.Longitud
         }
 
-        # --- 12. Armar la comprobacion del reinicio -------------------------
-        Write-Paso '12. Armar la comprobacion del reinicio'
+        # --- 12. Aviso de la madre al iniciar sesion ------------------------
+        Write-Paso '12. Aviso de la madre al iniciar sesion'
+        Install-TareaAvisoMadre
+
+        # --- 13. Armar la comprobacion del reinicio -------------------------
+        Write-Paso '13. Armar la comprobacion del reinicio'
         Install-ComprobacionReinicio $ctx $a
     }
     catch {
@@ -2141,7 +2248,7 @@ function Invoke-FaseAntes {
                 Write-Informe 'Siguiente paso (la comprobacion del reinicio ya esta armada):'
                 Write-Informe '  1. Reiniciar desde el menu de Windows (REINICIAR; "Apagar" con Inicio rapido no reinicia el kernel).'
                 Write-Informe '  2. En la pantalla de inicio de sesion, NO entrar. Esperar 6 minutos (la comprobacion termina antes si el daemon responde antes; vigila hasta 10).'
-                Write-Informe ('  3. Desde OTRA maquina de la LAN: curl http://{0}/health  (prueba el firewall de verdad; desde este equipo no se puede)' -f $direccion)
+                Write-Informe ('  3. Desde OTRA maquina de la LAN: curl http://{0}/health  (prueba el firewall de verdad; desde este equipo no se puede)' -f $dirRed)
                 Write-Informe '  4. Entrar y ejecutar:  .\ensayo-madre.ps1 -Fase Despues'
             }
             elseif ($a.veredicto -eq 'PASA') {
@@ -2215,6 +2322,34 @@ function Install-ComprobacionReinicio {
     else { Add-Check 'reinicio_armado' 'FALLA' 'la tarea de comprobacion no figura tras registrarla' }
 }
 
+function Install-TareaAvisoMadre {
+    # La tarea por usuario "MemoryIndustry Madre aviso": al iniciar sesion dice si la madre
+    # esta activa y en que IP, y si la IP cambio ofrece fijarla. Corre aviso-madre.ps1 de
+    # esta misma carpeta, que con los lanzadores es la copia protegida.
+    $ruta = Join-Path $PSScriptRoot $script:ArchivoAviso
+    if (-not (Test-Path -LiteralPath $ruta)) {
+        Add-Check 'tarea_aviso' 'FALLA' ('no encuentro {0} junto a este script: el paquete esta incompleto' -f $ruta)
+        return
+    }
+    $usuario = $script:UsuarioInteractivo
+    if ([string]::IsNullOrEmpty($usuario)) { $usuario = Get-UsuarioActual }
+    $def = Get-DefinicionTareaAviso -DirPaquete $PSScriptRoot -Usuario $usuario
+    try {
+        $accion = New-ScheduledTaskAction -Execute $def.Programa -Argument $def.Argumentos
+        $disparador = New-ScheduledTaskTrigger -AtLogOn -User $def.Usuario
+        $principal = New-ScheduledTaskPrincipal -UserId $def.Usuario -LogonType Interactive -RunLevel $def.Nivel
+        # Sin limite corto: la ventana de "la IP cambio" espera a que alguien la lea.
+        $ajustes = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 8) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        [void](Register-ScheduledTask -TaskName $def.Nombre -Action $accion -Trigger $disparador -Principal $principal -Settings $ajustes -Description 'MemoryIndustry: al iniciar sesion avisa si la madre esta activa y en que IP.' -Force)
+    }
+    catch {
+        Add-Check 'tarea_aviso' 'FALLA' ('no se pudo registrar {0}: {1}' -f $def.Nombre, $_.Exception.Message)
+        return
+    }
+    if ((Get-ConteoTarea $def.Nombre) -eq 1) { Add-Check 'tarea_aviso' 'PASA' ('tarea "{0}" para {1}: al iniciar sesion corre {2}' -f $def.Nombre, $def.Usuario, $ruta) }
+    else { Add-Check 'tarea_aviso' 'FALLA' ('la tarea "{0}" no figura tras registrarla' -f $def.Nombre) }
+}
+
 function Invoke-FaseArranque {
     # Corre como SYSTEM al arrancar el equipo. Sin elevacion que comprobar y sin
     # consola: todo lo que dice va a un fichero de traza.
@@ -2228,7 +2363,7 @@ function Invoke-FaseArranque {
         segundos_arranque_hasta_puerto = $null; segundos_arranque_hasta_health = $null
         segundos_tarea_hasta_health = $null
         sesion_al_iniciar = $null; sesion_al_primer_health = $null; detalle_sesion = $null
-        proceso = $null; salud = $null; error = $null
+        proceso = $null; salud = $null; lan_direccion = $null; error = $null
     }
     $guardar = { Write-Json (Join-Path $wd 'despues-arranque.json') $res }
     try {
@@ -2241,10 +2376,12 @@ function Invoke-FaseArranque {
         $res.sesion_al_iniciar = $s0.Hay
         & $guardar
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $url = 'http://{0}:{1}/health' -f $ctx.Ip, $ctx.Puerto
+        # Por loopback: en modo lan la IP puede ser otra tras el reinicio, y la madre la dice
+        # en /health (lan.address).
+        $url = Get-UrlSaludLocal $ctx.Puerto
         while ($sw.Elapsed.TotalSeconds -lt $limite) {
             if ($null -eq $res.primer_puerto) {
-                $e = @(Get-Escuchas $ctx.Puerto | Where-Object { $_.Direccion -eq $ctx.Ip })
+                $e = @(Get-Escuchas $ctx.Puerto)
                 if ($e.Count -gt 0) {
                     $ahora = [DateTimeOffset]::Now
                     $res.primer_puerto = $ahora.ToString('o')
@@ -2261,7 +2398,8 @@ function Invoke-FaseArranque {
                 $res.sesion_al_primer_health = $s1.Hay
                 $res.detalle_sesion = [ordered]@{ explorer = $s1.Explorer; quser = $s1.Quser; consola_con_usuario = $s1.ConsolaTieneUsuario }
                 $res.salud = [ordered]@{ status = $h.Json.status; database = $h.Json.database; ready = $h.Json.ready; version = $h.Json.version }
-                $esc = @(Get-Escuchas $ctx.Puerto | Where-Object { $_.Direccion -eq $ctx.Ip })
+                $res.lan_direccion = Get-LanDeSalud $h.Json
+                $esc = @(Get-Escuchas $ctx.Puerto)
                 if ($esc.Count -gt 0) {
                     $info = Get-InfoProceso $esc[0].IdProceso
                     if ($info) {
@@ -2310,11 +2448,11 @@ function Invoke-FaseDespues {
         $ctx.Xml = Join-Path $ctx.Raiz $script:ArchivoXml
     }
     $direccion = '{0}:{1}' -f $ctx.Ip, $ctx.Puerto
-    $url = 'http://{0}/health' -f $direccion
+    $url = Get-UrlSaludLocal $ctx.Puerto
     $secretos = @()
     try {
         Write-Informe ('MemoryIndustry - ensayo de instalacion (Despues) - {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
-        Write-Informe ('Direccion del ensayo: {0}' -f $direccion)
+        Write-Informe ('Direccion al instalar: {0} ({1})' -f $direccion, $antes.direccion)
 
         Write-Paso 'Lo que midio la comprobacion al arrancar'
         $origen = Join-Path $ctx.Trabajo 'despues-arranque.json'
@@ -2337,7 +2475,10 @@ function Invoke-FaseDespues {
         if ($token) { $secretos = @($token) }
         $errores = @($errores | ForEach-Object { Protect-Secreto $_ $secretos })
         $salud = Get-Salud $url $script:TimeoutSaludMs
+        $lanAhora = Get-LanDeSalud $salud.Json
+        if ($lanAhora) { $direccion = $lanAhora }
         $actual = [pscustomobject]@{
+            lan_direccion = $lanAhora
             direccion    = (Get-ValorEnv $envTexto $script:ClaveDireccion)
             token_sha256 = (Get-HashToken $envTexto)
             errores_log  = $errores
@@ -2355,7 +2496,7 @@ function Invoke-FaseDespues {
 
         if ($MatarTrasReinicio) {
             Write-Paso 'Matar el daemon con la repeticion de 5 min ya activa'
-            $escuchas = @(Get-Escuchas $ctx.Puerto | Where-Object { $_.Direccion -eq $ctx.Ip })
+            $escuchas = @(Get-Escuchas $ctx.Puerto | Where-Object { Test-ProcesoEsNuestro (Get-InfoProceso $_.IdProceso) $ctx.Binario })
             if ($escuchas.Count -eq 0) { Add-Check 'reaparicion_tras_reinicio' 'FALLA' 'no hay daemon que matar' }
             else {
                 $idm = $escuchas[0].IdProceso
@@ -2417,7 +2558,7 @@ function Invoke-FaseLimpiar {
             Copy-Item -LiteralPath $origen -Destination (Join-Path $ctx.Salida 'despues-arranque.json') -Force
             Write-Informe '  se copio despues-arranque.json a la carpeta del informe antes de borrar nada'
         }
-        foreach ($nombreTarea in @($script:TareaReinicio, $script:TareaDespues)) {
+        foreach ($nombreTarea in @(Get-TareasPropias)) {
             if ((Get-ConteoTarea $nombreTarea) -gt 0) {
                 try { Unregister-ScheduledTask -TaskName $nombreTarea -Confirm:$false -ErrorAction Stop; [void]$quitado.Add('tarea ' + $nombreTarea) } catch { Add-Check 'limpiar_reinicio' 'FALLA' $_.Exception.Message }
             }
@@ -2458,7 +2599,7 @@ function Invoke-FaseLimpiar {
             if ($r.Codigo -eq 0) { Add-Check ('retirar_' + $o.Programa) 'PASA' ('{0} -> 0' -f $o.Linea); [void]$quitado.Add($o.Linea) }
             else {
                 # Un codigo != 0 es normal si ya no estaba: se comprueba que NO esta.
-                $sigue = if ($o.Programa -eq 'schtasks') { (Get-ConteoTarea $script:NombreTarea) -gt 0 } else { @(Get-DetalleRegla $script:NombreRegla).Count -gt 0 }
+                $sigue = if ($o.Programa -eq 'schtasks') { (Get-ConteoTarea $script:NombreTarea) -gt 0 } else { @(Get-DetalleRegla (($o.Argumentos[4]) -replace '^name=', '')).Count -gt 0 }
                 if ($sigue) { Add-Check ('retirar_' + $o.Programa) 'FALLA' ('{0} -> {1}: {2}' -f $o.Linea, $r.Codigo, $r.Error.Trim()) }
                 else { Add-Check ('retirar_' + $o.Programa) 'PASA' ('{0} -> {1}, pero ya no estaba' -f $o.Linea, $r.Codigo) }
             }
@@ -2481,10 +2622,12 @@ function Invoke-FaseLimpiar {
         if ((Get-ConteoTarea $script:NombreTarea) -gt 0) { [void]$queda.Add('tarea ' + $script:NombreTarea) }
         if ((Get-ConteoTarea $script:TareaReinicio) -gt 0) { [void]$queda.Add('tarea ' + $script:TareaReinicio) }
         if ((Get-ConteoTarea $script:TareaDespues) -gt 0) { [void]$queda.Add('tarea ' + $script:TareaDespues) }
+        if ((Get-ConteoTarea $script:TareaAvisoMadre) -gt 0) { [void]$queda.Add('tarea ' + $script:TareaAvisoMadre) }
         if (@(Get-DetalleRegla $script:NombreRegla).Count -gt 0) { [void]$queda.Add('regla ' + $script:NombreRegla) }
+        if ($ctx.Puerto -and @(Get-ReglasPuerto $ctx.Puerto | Where-Object { $_.Protocolo -eq 'UDP' }).Count -gt 0) { [void]$queda.Add(('regla UDP del puerto {0} (el aviso)' -f $ctx.Puerto)) }
         foreach ($f in @($ctx.Launcher, $ctx.Xml)) { if (Test-Path -LiteralPath $f) { [void]$queda.Add($f) } }
         if ($ctx.Puerto -and @(Get-Escuchas $ctx.Puerto).Count -gt 0) { [void]$queda.Add(('algo escucha aun en el puerto {0}' -f $ctx.Puerto)) }
-        if ($queda.Count -eq 0) { Add-Check 'limpieza' 'PASA' 'no quedan tarea, regla, launcher, XML ni daemon del ensayo' }
+        if ($queda.Count -eq 0) { Add-Check 'limpieza' 'PASA' 'no quedan tareas, reglas, launcher, XML ni daemon del ensayo' }
         else { Add-Check 'limpieza' 'FALLA' ('queda: {0}' -f ($queda -join '; ')) }
         Write-Informe ('Quitado: {0}' -f $(if ($quitado.Count) { $quitado -join ' | ' } else { 'nada' }))
     }
@@ -2594,10 +2737,7 @@ function Invoke-FaseTodo {
     }
     Write-Informe 'HUMO: OK. Se puede instalar.' 'Green'
 
-    if ([string]::IsNullOrWhiteSpace($ctx.Ip)) {
-        if ($real) { Resolve-IpReal $ctx $humo }
-        else { $ctx.Ip = $humo.Elegida.Ip; Write-Informe ('Direccion del ensayo: {0} ({1})' -f $humo.Elegida.Ip, $humo.Elegida.Alias) }
-    }
+    if ([string]::IsNullOrWhiteSpace($ctx.Ip)) { Resolve-IpReal $ctx $humo }
     Resolve-BaseDatos $real
 
     Invoke-FaseAntes

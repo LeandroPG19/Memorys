@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Builds the TWO visit packages, so nobody has to choose between launchers:
+# Builds the THREE visit packages, so nobody has to choose between launchers:
 #   memory-industry-0.29-ENSAYO.zip       only ENSAYO-se-desinstala-al-final.cmd
-#   memory-industry-0.29-EQUIPO-REAL.zip  only INSTALAR-EQUIPO-REAL.cmd, QUITAR-TODO.cmd, RESULTADO.cmd
-# plus, in each, the Windows binary, the rehearsal script and the sheets somebody needs at
-# a machine where nothing can be rebuilt.
+#   memory-industry-0.29-EQUIPO-REAL.zip  INSTALAR-EQUIPO-REAL.cmd, QUITAR-TODO.cmd, RESULTADO.cmd
+#                                         and GENERAR-CODIGO.cmd
+#   memory-industry-0.29-CLIENTE.zip      CONECTAR-A-LA-MADRE.cmd, conectar-cliente.ps1, the
+#                                         binary and a LEEME: nothing that needs administrator
+# The two host packages also carry the binary, ensayo-madre.ps1, aviso-madre.ps1 and the
+# sheets somebody needs at a machine where nothing can be rebuilt.
+#
+# Before packaging it runs scripts/visita-contratos.ps1 and refuses if one fails. Those
+# contracts run this script on a copy of the tree; that inner run sets
+# MEMORY_INDUSTRY_VISITA_CONTRATOS=en-curso and does not run them a second time.
 #
 #   ./scripts/empaquetar-visita.sh                    dist-visita/memory-industry-0.29-{ENSAYO,EQUIPO-REAL}.zip
 #   ./scripts/empaquetar-visita.sh --aceptar-obsoleto build it although the .exe predates the sources
@@ -26,6 +33,10 @@ SALIDA="$ROOT/dist-visita"
 HOJA="$ROOT/docs/visita-pc-madre.md"
 GUIA="$ROOT/docs/despliegue-lan.md"
 SCRIPT_PS="$ROOT/scripts/ensayo-madre.ps1"
+AVISO_PS="$ROOT/scripts/aviso-madre.ps1"
+CLIENTE_PS="$ROOT/scripts/conectar-cliente.ps1"
+CONTRATOS="$ROOT/scripts/visita-contratos.ps1"
+GUIONES_PS=("$SCRIPT_PS" "$AVISO_PS" "$CLIENTE_PS")
 
 die() {
   echo "NO SE EMPAQUETA: $*" >&2
@@ -37,7 +48,7 @@ for arg in "$@"; do
   case "$arg" in
     --aceptar-obsoleto) aceptar_obsoleto=1 ;;
     -h | --help)
-      sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) die "argumento desconocido: $arg (ver --help)" ;;
@@ -46,27 +57,42 @@ done
 
 command -v python3 >/dev/null || die "falta python3 (escribe el zip)"
 command -v sha256sum >/dev/null || die "falta sha256sum"
-[[ -f "$SCRIPT_PS" ]] || die "no existe $SCRIPT_PS"
-for lanzador in ENSAYO-se-desinstala-al-final.cmd INSTALAR-EQUIPO-REAL.cmd QUITAR-TODO.cmd RESULTADO.cmd; do
+for guion in "${GUIONES_PS[@]}"; do
+  [[ -f "$guion" ]] || die "no existe $guion"
+done
+for lanzador in ENSAYO-se-desinstala-al-final.cmd INSTALAR-EQUIPO-REAL.cmd QUITAR-TODO.cmd RESULTADO.cmd GENERAR-CODIGO.cmd CONECTAR-A-LA-MADRE.cmd; do
   [[ -f "$ROOT/scripts/$lanzador" ]] || die "no existe scripts/$lanzador"
 done
 [[ -f "$GUIA" ]] || die "no existe $GUIA"
 
-# --- El script de ensayo tiene que poder leerlo Windows PowerShell 5.1 ----------
+# --- Los guiones tiene que poder leerlos Windows PowerShell 5.1 -----------------
 # Un .ps1 sin BOM se lee con la pagina de codigos ANSI: cualquier byte fuera de
 # ASCII cambia de significado de un equipo a otro.
-if LC_ALL=C grep -nP '[^\x00-\x7F]' "$SCRIPT_PS" >/dev/null; then
-  die "$SCRIPT_PS tiene caracteres fuera de ASCII; Windows PowerShell 5.1 los leeria segun la pagina de codigos del equipo"
-fi
-if command -v pwsh >/dev/null; then
+command -v pwsh >/dev/null || die "falta pwsh: sin el no se comprueba que los guiones parseen ni se corren sus contratos"
+for guion in "${GUIONES_PS[@]}"; do
+  if LC_ALL=C grep -nP '[^\x00-\x7F]' "$guion" >/dev/null; then
+    die "$guion tiene caracteres fuera de ASCII; Windows PowerShell 5.1 los leeria segun la pagina de codigos del equipo"
+  fi
   # shellcheck disable=SC2016  # the PowerShell code is meant to reach pwsh unexpanded
-  errores="$(PS_ARCHIVO="$SCRIPT_PS" pwsh -NoProfile -Command '
+  errores="$(PS_ARCHIVO="$guion" pwsh -NoProfile -Command '
     $e = $null; $t = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile($env:PS_ARCHIVO, [ref]$t, [ref]$e)
     @($e).Count' 2>/dev/null || echo "?")"
-  [[ "$errores" == "0" ]] || die "ensayo-madre.ps1 no pasa el analizador de PowerShell ($errores errores)"
+  [[ "$errores" == "0" ]] || die "$(basename "$guion") no pasa el analizador de PowerShell ($errores errores)"
+done
+
+# --- Los contratos de los guiones ------------------------------------------------
+if [[ "${MEMORY_INDUSTRY_VISITA_CONTRATOS:-}" == "en-curso" ]]; then
+  echo "contratos: no se repiten (este empaquetado es uno de sus casos)"
 else
-  echo "AVISO: no hay pwsh aqui; no se comprobo que ensayo-madre.ps1 parsee" >&2
+  [[ -f "$CONTRATOS" ]] || die "no existe $CONTRATOS"
+  registro="$(mktemp)"
+  if ! MEMORY_INDUSTRY_VISITA_CONTRATOS=en-curso pwsh -NoProfile -File "$CONTRATOS" >"$registro" 2>&1; then
+    grep -A1 '^\[FALLA' "$registro" >&2 || tail -n 40 "$registro" >&2
+    die "los contratos de los guiones fallan (scripts/visita-contratos.ps1; salida completa en $registro)"
+  fi
+  echo "contratos: $(tail -n 1 "$registro")"
+  rm -f "$registro"
 fi
 
 # --- El binario -----------------------------------------------------------------
@@ -124,13 +150,13 @@ else
 fi
 
 mkdir -p "$SALIDA"
-rm -f "$SALIDA/memory-industry-$PAQUETE-ENSAYO.zip" "$SALIDA/memory-industry-$PAQUETE-EQUIPO-REAL.zip" "$SALIDA/memory-industry-$PAQUETE-visita.zip"
+rm -f "$SALIDA/memory-industry-$PAQUETE-ENSAYO.zip" "$SALIDA/memory-industry-$PAQUETE-EQUIPO-REAL.zip" "$SALIDA/memory-industry-$PAQUETE-CLIENTE.zip" "$SALIDA/memory-industry-$PAQUETE-visita.zip"
 
 # --- Los zips ----------------------------------------------------------------------
 # Todo el trabajo esta en python para que el contenido, las sumas y el zip salgan de
 # UNA lectura de cada fichero: las sumas que lleva cada paquete son las de los bytes
 # que lleva su zip.
-EXE="$EXE" SALIDA="$SALIDA" SCRIPT_PS="$SCRIPT_PS" SCRIPTS="$ROOT/scripts" GUIA="$GUIA" HOJA="$HOJA" \
+EXE="$EXE" SALIDA="$SALIDA" SCRIPTS="$ROOT/scripts" GUIA="$GUIA" HOJA="$HOJA" \
   INCLUYE_HOJA="$incluye_hoja" PAQUETE="$PAQUETE" python3 -I - <<'PY'
 import hashlib
 import os
@@ -167,10 +193,19 @@ LEEME_ENSAYO = """\
 LEEME_REAL = """\
 1. Descomprime.
 2. Doble clic en INSTALAR-EQUIPO-REAL.cmd, acepta el aviso de administrador.
-3. Confirma la direccion IP y la base de datos; responde S al reinicio.
+3. Confirma la base de datos y responde S al reinicio. La IP la detecta solo.
 4. Inicia sesion cuando quieras: el resultado se abre solo (RESULTADO.cmd lo repite).
-5. Si algo sale mal: QUITAR-TODO.cmd lo deja como estaba.
-6. Avisame.
+5. Cada persona: GENERAR-CODIGO.cmd aqui, y CONECTAR-A-LA-MADRE.cmd en su equipo.
+6. Si algo sale mal: QUITAR-TODO.cmd lo deja como estaba. Avisame.
+"""
+
+# El paquete CLIENTE no pide administrador y no nombra nada que lo pida.
+LEEME_CLIENTE = """\
+1. Descomprime en una carpeta tuya (por ejemplo el Escritorio).
+2. Doble clic en CONECTAR-A-LA-MADRE.cmd.
+3. Escribe el codigo que te dieron en la PC madre.
+4. Si no encuentra la madre sola, escribe su nombre o su IP.
+5. Al terminar dice si quedo conectado: reinicia Claude Code o Cursor.
 """
 
 AYUDA_COMUN = """\
@@ -179,6 +214,11 @@ cuenta, paquete, .exe, directivas, Task Scheduler, red, base de datos y sesiones
 esta en PARA, se detiene y dice que hacer. Despues copia el paquete a
 C:\\ProgramData\\MemoryIndustry\\paquete (solo SYSTEM y administradores pueden modificarlo) y
 ejecuta todo desde alli.
+
+La madre queda en modo automatico (CUBA_HTTP_ADDR=lan:8787): escucha en su IP de cada
+momento y en 127.0.0.1, y los equipos la encuentran solos (aviso UDP, nombre, barrido).
+Al iniciar sesion, la tarea "MemoryIndustry Madre aviso" dice si esta activa y en que IP,
+y si la IP cambio ofrece fijarla.
 
 Fases sueltas (PowerShell COMO ADMINISTRADOR, en C:\\ProgramData\\MemoryIndustry\\paquete)
   .\\ensayo-madre.ps1 -Fase Humo       la prueba de humo, sola
@@ -195,7 +235,7 @@ Que se lleva de vuelta
   huella para comparar.
 
 Prueba que ningun ensayo puede hacer desde el propio equipo
-  El firewall: desde OTRA maquina de la red, abrir http://<ip>:<puerto>/health.
+  El firewall: desde OTRA maquina de la red, abrir http://<ip>:8787/health.
 """
 
 AYUDA_ENSAYO = """\
@@ -212,10 +252,13 @@ degradado y no toca Docker ni ninguna base real.
 AYUDA_REAL = """\
 MemoryIndustry {p} - EQUIPO REAL
 ================================
-INSTALAR-EQUIPO-REAL.cmd   prueba de humo, elegir la IP y la base, instalar, reiniciar una
-                           vez y comprobar. El servicio SE QUEDA instalado.
+INSTALAR-EQUIPO-REAL.cmd   prueba de humo, elegir la base, instalar (la IP la detecta solo),
+                           reiniciar una vez y comprobar. El servicio SE QUEDA instalado.
 RESULTADO.cmd              vuelve a comprobar y mostrar el resultado.
-QUITAR-TODO.cmd            quita el servicio (tarea y regla de firewall). Pide confirmacion.
+GENERAR-CODIGO.cmd         el codigo de una persona para su equipo, con el nombre y la IP
+                           de la madre. Sin administrador, con el usuario que instalo.
+QUITAR-TODO.cmd            quita el servicio (tarea, reglas de firewall y aviso de la
+                           madre). Pide confirmacion.
 
 Con Docker Desktop, la base arranca al INICIAR SESION, no al encender el equipo: despues
 de un reinicio el servicio arranca degradado y recupera sus herramientas solo cuando Docker
@@ -224,9 +267,12 @@ este arriba (los bucles de fondo rem y sync, solo tras el siguiente reinicio del
 """ + AYUDA_COMUN
 
 
-def paquete_zip(sufijo, lanzadores, leeme, ayuda, con_hoja):
-    carpeta = "memory-industry-{}-{}".format(paquete, sufijo)
-    archivos = [("memory-industry.exe", leer(exe)), ("ensayo-madre.ps1", leer(os.environ["SCRIPT_PS"]))]
+def guion(nombre):
+    return (nombre, leer(os.path.join(os.environ["SCRIPTS"], nombre)))
+
+
+def paquete_madre(sufijo, lanzadores, leeme, ayuda, con_hoja):
+    archivos = [("memory-industry.exe", leer(exe)), guion("ensayo-madre.ps1"), guion("aviso-madre.ps1")]
     archivos += [lanzador(n) for n in lanzadores]
     if con_hoja and os.environ["INCLUYE_HOJA"] == "1":
         archivos.append(("README-VISITA.txt", crlf(leer(os.environ["HOJA"]))))
@@ -238,6 +284,23 @@ def paquete_zip(sufijo, lanzadores, leeme, ayuda, con_hoja):
     # ficheros) no coincide.
     sumas = "".join("{}  {}\n".format(hashlib.sha256(d).hexdigest(), n) for n, d in archivos)
     archivos.append(("SHA256SUMS.txt", sumas.encode("ascii")))
+    escribir_zip(sufijo, archivos)
+
+
+def paquete_cliente():
+    # Lo justo para un equipo cliente: sin la prueba de humo de la madre ni nada que pida
+    # administrador.
+    archivos = [
+        lanzador("CONECTAR-A-LA-MADRE.cmd"),
+        guion("conectar-cliente.ps1"),
+        ("memory-industry.exe", leer(exe)),
+        ("LEEME.txt", crlf(LEEME_CLIENTE.encode("ascii"))),
+    ]
+    escribir_zip("CLIENTE", archivos)
+
+
+def escribir_zip(sufijo, archivos):
+    carpeta = "memory-industry-{}-{}".format(paquete, sufijo)
     destino = os.path.join(salida, carpeta + ".zip")
     with zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for nombre, datos in archivos:
@@ -254,12 +317,13 @@ def paquete_zip(sufijo, lanzadores, leeme, ayuda, con_hoja):
             print("  {:>12}  {}".format(i.file_size, i.filename))
 
 
-paquete_zip("ENSAYO", ["ENSAYO-se-desinstala-al-final.cmd"], LEEME_ENSAYO, AYUDA_ENSAYO, False)
-paquete_zip("EQUIPO-REAL", ["INSTALAR-EQUIPO-REAL.cmd", "QUITAR-TODO.cmd", "RESULTADO.cmd"], LEEME_REAL, AYUDA_REAL, True)
+paquete_madre("ENSAYO", ["ENSAYO-se-desinstala-al-final.cmd"], LEEME_ENSAYO, AYUDA_ENSAYO, False)
+paquete_madre("EQUIPO-REAL", ["INSTALAR-EQUIPO-REAL.cmd", "QUITAR-TODO.cmd", "RESULTADO.cmd", "GENERAR-CODIGO.cmd"], LEEME_REAL, AYUDA_REAL, True)
+paquete_cliente()
 PY
 
 echo
-for z in "$SALIDA/memory-industry-$PAQUETE-ENSAYO.zip" "$SALIDA/memory-industry-$PAQUETE-EQUIPO-REAL.zip"; do
+for z in "$SALIDA/memory-industry-$PAQUETE-ENSAYO.zip" "$SALIDA/memory-industry-$PAQUETE-EQUIPO-REAL.zip" "$SALIDA/memory-industry-$PAQUETE-CLIENTE.zip"; do
   zip_bytes="$(stat -c %s "$z")"
   echo "Paquete : $z"
   echo "Tamano  : $zip_bytes bytes ($((zip_bytes / 1024 / 1024)) MiB)"

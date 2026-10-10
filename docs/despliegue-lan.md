@@ -119,6 +119,49 @@ when the router is not yours to change.
 > depending on version. That is a fact about that machine, not about
 > MemoryIndustry. If it bites, move the daemon and update the clients.
 
+### Automatic address and discovery (0.29)
+
+Since 0.29 the host can pick its address itself. `setup service` with the LAN
+profile and **without** `--addr` writes
+
+    CUBA_HTTP_ADDR=lan:8787
+
+and from then on the daemon listens on `127.0.0.1:8787` and on the private address
+(10/8, 172.16/12, 192.168/16) the host uses to reach its default route, whatever it
+is today. Every 10 seconds it looks again; when the DHCP hands the host a new
+address it opens the new one, closes the old one and logs `lan address changed`.
+It never listens on `0.0.0.0`. `/health` says where it is now, in
+`"lan": {"mode", "address", "since"}`, and `doctor` prints the same. An explicit
+`--addr 192.168.0.10:8787` keeps the fixed behaviour described above.
+
+    memory-industry setup service --profile lan --apply --register
+
+On Windows `--register` opens two firewall rules on the same port, both for the
+private and domain profiles only: TCP for the service and UDP for the
+**announcement**. A client that asks on the LAN (a broadcast to UDP 8787) gets back
+the host's identity and port, and only from private addresses, with a rate limit.
+The answer is just a candidate: the client still asks for the proof of identity
+before it sends anything, exactly as with a saved address or a name.
+
+A client looks for its host in this order: the last address that worked, the saved
+ones, the UDP announcement, the host's name, and a sweep of its own /24. If the
+company network drops broadcasts, the name and the sweep still work; if the host is
+on another subnet, type its name or address once (the bridge's window offers it),
+and there a fixed address on the host (section 10) is the sensible choice.
+
+The Windows visit packages do all of this without commands:
+
+- On the host, `INSTALAR-EQUIPO-REAL.cmd` installs in automatic mode (it shows the
+  detected address but does not ask for one) and registers the per-user task
+  `MemoryIndustry Madre aviso`, which tells whoever signs in that the host is up and
+  at which address, and offers to fix the address when it changed.
+  `GENERAR-CODIGO.cmd` runs `account pair` for a person and shows the code, the
+  host's name and its address.
+- On each client, `memory-industry-0.29-CLIENTE.zip` holds `CONECTAR-A-LA-MADRE.cmd`:
+  it copies the binary to `%LOCALAPPDATA%\MemoryIndustry\bin`, asks for the code,
+  pairs (asking for the host's name or address only if it is not found), installs
+  the bridge and configures Claude Code and Cursor when present. No administrator.
+
 ## 6. Firewall
 
 Allow inbound TCP on the chosen port **from the client addresses only**. Do not
