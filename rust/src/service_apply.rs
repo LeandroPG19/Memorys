@@ -13,8 +13,9 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 
 use crate::service::{
-    FIREWALL_RULE_NAME, TASK_NAME, TASK_XML_BASENAME, Target, Unit, firewall_add_argv,
-    firewall_commands, firewall_delete_argv, manual_steps, schtasks_create_argv,
+    FIREWALL_RULE_NAME, FIREWALL_UDP_RULE_NAME, TASK_NAME, TASK_XML_BASENAME, Target, Unit,
+    firewall_add_argv, firewall_commands, firewall_delete_argv, firewall_udp_add_argv,
+    firewall_udp_delete_argv, is_auto, listen_value, manual_steps, schtasks_create_argv,
 };
 
 const ADDR_KEY: &str = "CUBA_HTTP_ADDR";
@@ -93,7 +94,7 @@ pub fn set_env_value(text: &str, key: &str, value: &str) -> String {
 /// The address line, brought to what the unit resolved, and the report line
 /// that says so when it moved.
 fn sync_address(text: &str, unit: &Unit) -> (String, Option<String>) {
-    let want = unit.addr.to_string();
+    let want = listen_value(&unit.addr);
     let have = env_value(text, ADDR_KEY).filter(|value| !value.is_empty());
     if have.as_deref() == Some(want.as_str()) {
         return (text.to_string(), None);
@@ -239,6 +240,21 @@ fn open_port(runner: &mut dyn CommandRunner, port: u16) -> Result<String> {
     ))
 }
 
+/// The UDP announcement's rule, delete then add like the TCP one. Only the automatic mode
+/// opens it: a fixed IP does not move, so its clients have no reason to look for it.
+fn open_announcement(runner: &mut dyn CommandRunner, port: u16) -> Result<String> {
+    let _ = run_checked(runner, &firewall_udp_delete_argv());
+    run_checked(runner, &firewall_udp_add_argv(port)).map_err(|why| {
+        anyhow!(
+            "no se pudo crear la regla de firewall del aviso UDP {port} ({why}). La regla TCP \
+             quedó puesta y la tarea NO se registró; repetir --register es seguro"
+        )
+    })?;
+    Ok(format!(
+        "firewall: regla {FIREWALL_UDP_RULE_NAME} abierta en UDP {port} para el aviso (redes privada y de dominio)"
+    ))
+}
+
 fn create_task(runner: &mut dyn CommandRunner, xml: &Path, port_opened: bool) -> Result<String> {
     run_checked(runner, &schtasks_create_argv(xml)).map_err(|why| {
         let firewall = if port_opened {
@@ -290,8 +306,12 @@ pub fn register(
             unit.addr
         )
     };
-    let task = create_task(runner, xml, routable)?;
-    Ok(vec![firewall, task])
+    let mut report = vec![firewall];
+    if is_auto(&unit.addr) {
+        report.push(open_announcement(runner, unit.addr.port())?);
+    }
+    report.push(create_task(runner, xml, routable)?);
+    Ok(report)
 }
 
 #[cfg(test)]

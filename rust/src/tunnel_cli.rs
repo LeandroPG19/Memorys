@@ -132,6 +132,11 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     }
     let token = token.unwrap_or_default();
 
+    // `lan:<port>` names a mode, not a host: the daemon in that mode always serves loopback.
+    if let Ok(crate::http::Listen::Auto(port)) = crate::http::parse_listen(&addr) {
+        addr = format!("127.0.0.1:{port}");
+    }
+
     if let Some(refusal) = refuse_unprotected_daemon(probe_mcp(&addr).await, &addr) {
         anyhow::bail!(refusal);
     }

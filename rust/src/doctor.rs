@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use sqlx::{PgPool, Row};
 
 use crate::embeddings::onnx;
+use crate::http::Listen;
 use crate::service_apply::env_value;
 
 /// `brain%` tables in a freshly migrated database: 36 through 0064 and the four of 0065
@@ -79,12 +80,21 @@ impl Check {
 /// What is true anywhere is whether the port is free, so that is what this
 /// reports.
 pub fn http_port_check(addr: Option<&str>) -> Check {
-    let addr = addr.unwrap_or(crate::http::DEFAULT_ADDR);
-    let probe = match std::net::TcpListener::bind(addr) {
+    let addr = probed_addr(addr.unwrap_or(crate::http::DEFAULT_ADDR));
+    let probe = match std::net::TcpListener::bind(&addr) {
         Ok(_) => BindProbe::Free,
         Err(e) => probe_of_failed_bind(&e),
     };
-    port_verdict(addr, probe)
+    port_verdict(&addr, probe)
+}
+
+/// The address a port check binds: `lan:<port>` is not a host name to resolve, and the one
+/// socket a daemon in that mode always holds is `127.0.0.1:<port>`.
+fn probed_addr(configured: &str) -> String {
+    match crate::http::parse_listen(configured) {
+        Ok(Listen::Auto(port)) => format!("127.0.0.1:{port}"),
+        _ => configured.to_string(),
+    }
 }
 
 /// What trying to bind an address told us. `NotAssigned` is the one that used
@@ -192,18 +202,22 @@ pub fn service_checks(f: &ServiceFacts) -> Vec<Check> {
 /// Profile and token as `serve` will judge them. Only the token's LENGTH is
 /// ever reported: doctor output is pasted into issues and chats.
 fn address_check(addr: &str, token: &str, env_path: &std::path::Path) -> Check {
-    let Ok(socket) = addr.parse::<std::net::SocketAddr>() else {
+    let Ok(listen) = crate::http::parse_listen(addr) else {
         return Check::fail(
             "service_address",
-            format!("{addr} no es una dirección ip:puerto"),
+            format!("{addr} no es una dirección ip:puerto ni lan:<puerto>"),
             format!(
                 "`serve` no puede enlazarla. Corregí CUBA_HTTP_ADDR en {}",
                 env_path.display()
             ),
         );
     };
-    let loopback = socket.ip().is_loopback();
-    let profile = if loopback { "loopback" } else { "lan" };
+    let loopback = listen.is_loopback();
+    let profile = match listen {
+        Listen::Auto(_) => "lan · modo automático",
+        Listen::Fixed(_) if loopback => "loopback",
+        Listen::Fixed(_) => "lan",
+    };
     let detail = format!("{addr} · perfil {profile} · {}", env_path.display());
     let chars = token.chars().count();
     let floor = crate::http::MIN_ROUTABLE_TOKEN_CHARS;
@@ -346,17 +360,139 @@ fn service_facts() -> ServiceFacts {
     }
 }
 
+/// What doctor learned about the LAN listener of the running daemon, gathered before judging
+/// so that `lan_check` stays pure.
+pub struct LanFacts {
+    /// `CUBA_HTTP_ADDR` as the service reads it: `lan:<port>`, `ip:port` or the default.
+    pub configured: String,
+    /// The `lan` block of the daemon's `/health` on loopback; `None` when nothing answered.
+    pub health: Option<serde_json::Value>,
+    /// Whether the UDP announcement answered on loopback; `None` when it was not asked,
+    /// which is a loopback install.
+    pub beacon: Option<bool>,
+}
+
+/// The listener's mode, the address it serves on now, and whether the UDP announcement
+/// answers.
+pub fn lan_check(f: &LanFacts) -> Check {
+    let configured = f.configured.as_str();
+    let mode = match crate::http::parse_listen(configured) {
+        Ok(listen) if listen.is_loopback() => {
+            return Check::ok(
+                "lan",
+                format!("{configured} · loopback: solo esta máquina, sin aviso UDP"),
+            );
+        }
+        Ok(Listen::Auto(_)) => "modo automático",
+        Ok(Listen::Fixed(_)) => "IP fija",
+        Err(_) => {
+            return Check::fail(
+                "lan",
+                format!("{configured} no es una dirección ip:puerto ni lan:<puerto>"),
+                "corregí CUBA_HTTP_ADDR en el env file del servicio",
+            );
+        }
+    };
+    let Some(health) = f.health.as_ref() else {
+        return Check::warn(
+            "lan",
+            format!("{configured} · {mode} · el daemon no responde"),
+            "arrancá el servicio y repetí doctor; si no arranca, la causa está en el log junto al env file",
+        );
+    };
+    let address = health.get("address").and_then(serde_json::Value::as_str);
+    let udp = match f.beacon {
+        Some(true) => "aviso UDP: responde",
+        Some(false) => "aviso UDP: no responde",
+        None => "aviso UDP: no se preguntó",
+    };
+    let detail = format!(
+        "{configured} · {mode} · sirve en {} · {udp}",
+        address.unwrap_or("solo 127.0.0.1")
+    );
+    if address.is_none() {
+        return Check::warn(
+            "lan",
+            detail,
+            "ninguna otra máquina lo alcanza: esta máquina no tiene ahora una IP privada (10/8, 172.16/12, 192.168/16). Conectala a la red de la oficina; el daemon la toma solo en unos segundos",
+        );
+    }
+    if f.beacon == Some(false) {
+        return Check::warn(
+            "lan",
+            detail,
+            "los clientes nuevos no la encuentran por el aviso UDP y pasan al nombre y al barrido. Causas: la base no se pudo leer al arrancar (el aviso calla hasta tener el host_id) u otro programa tiene ese puerto UDP",
+        );
+    }
+    Check::ok("lan", detail)
+}
+
+/// How long doctor waits for the daemon's `/health` and for the UDP announcement. Both are
+/// on this machine; a daemon slower than this is a daemon in trouble.
+const LAN_HEALTH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+const LAN_BEACON_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// What the running daemon says about its LAN listener: `/health` where it serves, and the
+/// UDP announcement asked on loopback, which the responder answers like any private origin.
+async fn lan_facts(configured: String) -> LanFacts {
+    let Ok(listen) = crate::http::parse_listen(&configured) else {
+        return LanFacts {
+            configured,
+            health: None,
+            beacon: None,
+        };
+    };
+    if listen.is_loopback() {
+        return LanFacts {
+            configured,
+            health: None,
+            beacon: None,
+        };
+    }
+    let port = listen.port();
+    let reach = match listen {
+        Listen::Fixed(addr) => addr,
+        Listen::Auto(_) => std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+    };
+    let health = match reqwest::Client::builder()
+        .timeout(LAN_HEALTH_BUDGET)
+        .no_proxy()
+        .build()
+    {
+        Ok(client) => match client.get(format!("http://{reach}/health")).send().await {
+            Ok(response) => response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| body.get("lan").cloned()),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let beacon = Some(
+        !crate::beacon::probe(port, LAN_BEACON_WAIT, &[loopback])
+            .await
+            .is_empty(),
+    );
+    LanFacts {
+        configured,
+        health,
+        beacon,
+    }
+}
+
 /// The port check, aimed at the address the service will really bind, and the
 /// service's own checks. Both read the env file the service loads, never only
-/// doctor's own process environment.
-fn service_report() -> (Check, Vec<Check>) {
+/// doctor's own process environment. The address comes back too, for the LAN check.
+fn service_report() -> (Check, Vec<Check>, String) {
     let facts = service_facts();
     let from_file = facts
         .env_text
         .as_deref()
         .and_then(|text| env_value(text, ADDR_KEY));
     let (addr, _) = effective_http_addr(facts.process_addr.as_deref(), from_file.as_deref());
-    (http_port_check(Some(&addr)), service_checks(&facts))
+    (http_port_check(Some(&addr)), service_checks(&facts), addr)
 }
 
 pub fn redact_url(url: &str) -> String {
@@ -834,9 +970,8 @@ async fn accounts_report(pool: &PgPool) -> Vec<Check> {
             )];
         }
     };
-    let loopback = crate::http::bind_addr()
-        .parse::<std::net::SocketAddr>()
-        .map(|a| a.ip().is_loopback())
+    let loopback = crate::http::parse_listen(&crate::http::bind_addr())
+        .map(|listen| listen.is_loopback())
         .unwrap_or(true);
     let knob = std::env::var("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS").ok();
     facts.require_accounts =
@@ -860,9 +995,10 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     ));
 
     checks.push(Check::ok("database_url", redact_url(url)));
-    let (port, service) = service_report();
+    let (port, service, addr) = service_report();
     checks.push(port);
     checks.extend(service);
+    checks.push(lan_check(&lan_facts(addr).await));
 
     let machine = crate::resources::probe();
     let resource_plan = crate::resources::plan(&machine);

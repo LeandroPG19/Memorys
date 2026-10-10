@@ -82,6 +82,38 @@ pub const LOG_ROTATE_BYTES: u64 = 5_242_880;
 pub const FIREWALL_RULE_NAME: &str = "memory-industry";
 pub const TASK_NAME: &str = "memory-industry";
 
+/// The UDP announcement's rule. A name of its own, because `netsh … delete rule name=` takes
+/// every rule of that name and the TCP one must not go with it.
+pub const FIREWALL_UDP_RULE_NAME: &str = "memory-industry-aviso";
+
+/// The automatic LAN mode, `CUBA_HTTP_ADDR=lan:<port>`, is carried in `Unit::addr` as the
+/// unspecified address on that port. Nothing binds it: `addr_for` refuses 0.0.0.0 typed by
+/// hand, so this value only ever comes from the automatic mode, and everything that writes or
+/// shows the address goes through `listen_value`.
+pub fn is_auto(addr: &SocketAddr) -> bool {
+    addr.ip().is_unspecified()
+}
+
+/// `CUBA_HTTP_ADDR` for this address, as the env file and every message spell it.
+pub fn listen_value(addr: &SocketAddr) -> String {
+    if is_auto(addr) {
+        format!("{}{}", crate::http::LAN_PREFIX, addr.port())
+    } else {
+        addr.to_string()
+    }
+}
+
+fn auto_addr(port: u16) -> SocketAddr {
+    SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port))
+}
+
+fn default_port() -> u16 {
+    DEFAULT_LOOPBACK_ADDR
+        .parse::<SocketAddr>()
+        .expect("DEFAULT_LOOPBACK_ADDR is a literal this crate owns")
+        .port()
+}
+
 fn joined(lines: Vec<String>) -> String {
     let mut out = lines.join("\n");
     out.push('\n');
@@ -420,7 +452,7 @@ impl Unit {
             env_file: root.join(ENV_BASENAME),
             computed: measured_keys(),
             chosen: vec![
-                ("CUBA_HTTP_ADDR".to_string(), addr.to_string()),
+                ("CUBA_HTTP_ADDR".to_string(), listen_value(&addr)),
                 ("CUBA_MODE".to_string(), read_or_empty("CUBA_MODE")),
                 // `std::env::var`, never `setup::resolve_database_url()`: that
                 // one is async and resolves against the database, and every
@@ -479,12 +511,16 @@ fn resolve_address(
         && addr_flag.is_none()
         && let Some(raw) = installed_addr
     {
-        let addr: SocketAddr = raw.parse().with_context(|| {
+        let listen = crate::http::parse_listen(&raw).with_context(|| {
             format!(
                 "{ENV_BASENAME} guarda CUBA_HTTP_ADDR={raw}, que no es una dirección ip:puerto. \
                  No instalo encima de un valor que no entiendo: corregilo en el fichero"
             )
         })?;
+        let addr = match listen {
+            crate::http::Listen::Fixed(addr) => addr,
+            crate::http::Listen::Auto(port) => auto_addr(port),
+        };
         let kept = if addr.ip().is_loopback() {
             Profile::Loopback
         } else {
@@ -493,6 +529,10 @@ fn resolve_address(
         return Ok((kept, addr));
     }
     let profile = profile.unwrap_or(Profile::Loopback);
+    // `lan` with no address is the automatic mode: the program picks the IP, not a person.
+    if profile == Profile::Lan && addr_flag.is_none() {
+        return Ok((profile, auto_addr(default_port())));
+    }
     Ok((profile, addr_for(profile, addr_flag)?))
 }
 
@@ -698,6 +738,7 @@ pub fn refuse_unsafe(profile: Profile, addr: &SocketAddr, token: Option<&str>) -
         return None;
     }
     let floor = crate::http::MIN_ROUTABLE_TOKEN_CHARS;
+    let addr = listen_value(addr);
     let Some(token) = token else {
         return Some(format!(
             "--profile {} publica en {addr}, que otras máquinas alcanzan, y no hay token. El \
@@ -835,12 +876,23 @@ pub fn render_socket(u: &Unit) -> String {
         format!("Documentation={REPO_URL}"),
         String::new(),
         "[Socket]".to_string(),
-        format!("ListenStream={}", u.addr),
     ];
+    // The automatic mode follows an IP that systemd cannot know, so the socket holds
+    // loopback only and the daemon opens the LAN address itself. Never 0.0.0.0.
+    let held = if is_auto(&u.addr) {
+        socket.push(
+            "# Automatic LAN mode: loopback only; the daemon opens and follows its LAN address."
+                .to_string(),
+        );
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, u.addr.port()))
+    } else {
+        u.addr
+    };
+    socket.push(format!("ListenStream={held}"));
     // At boot the LAN interface may not have its address yet, and without
     // FreeBind systemd cannot open the socket on it. Loopback always exists, so
     // there it would only hide a typo in the address.
-    if !u.addr.ip().is_loopback() {
+    if !held.ip().is_loopback() {
         socket.push("FreeBind=yes".to_string());
     }
     socket.extend([
@@ -1196,16 +1248,41 @@ pub fn firewall_add_argv(port: u16) -> Vec<String> {
     )
 }
 
+pub fn firewall_udp_delete_argv() -> Vec<String> {
+    netsh_firewall_rule("delete", &[format!("name={FIREWALL_UDP_RULE_NAME}")])
+}
+
+/// Inbound UDP for the announcement, on the same number and the same profiles as the TCP rule.
+pub fn firewall_udp_add_argv(port: u16) -> Vec<String> {
+    netsh_firewall_rule(
+        "add",
+        &[
+            format!("name={FIREWALL_UDP_RULE_NAME}"),
+            "dir=in".to_string(),
+            "action=allow".to_string(),
+            "protocol=UDP".to_string(),
+            format!("localport={port}"),
+            "profile=private,domain".to_string(),
+        ],
+    )
+}
+
 /// `[]` when nothing outside this machine can reach the address; otherwise
-/// `[delete, add]`, as the lines the plan prints and `--register` runs.
+/// `[delete, add]`, as the lines the plan prints and `--register` runs, and in the
+/// automatic mode the same pair again for the UDP announcement.
 pub fn firewall_commands(addr: &SocketAddr) -> Vec<String> {
     if addr.ip().is_loopback() {
         return Vec::new();
     }
-    vec![
+    let mut commands = vec![
         firewall_delete_argv().join(" "),
         firewall_add_argv(addr.port()).join(" "),
-    ]
+    ];
+    if is_auto(addr) {
+        commands.push(firewall_udp_delete_argv().join(" "));
+        commands.push(firewall_udp_add_argv(addr.port()).join(" "));
+    }
+    commands
 }
 
 fn basename(relative: &str) -> &str {
@@ -1385,6 +1462,7 @@ pub fn uninstall_hints(target: Target) -> Vec<String> {
     vec![
         format!("schtasks /Delete /TN {TASK_NAME} /F"),
         firewall_delete_argv().join(" "),
+        firewall_udp_delete_argv().join(" "),
     ]
 }
 
