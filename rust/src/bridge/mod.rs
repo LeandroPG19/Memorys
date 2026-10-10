@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use self::discovery::{
     Discovery, Failure, Freshness, Verdict, check_identity, discover, subnet_candidates,
@@ -48,8 +49,8 @@ const NOT_PAIRED: &str =
     "no está emparejado: ejecuta bridge pair <código> (el código te lo da el operador de la madre)";
 
 /// Private-range addresses used only to ask the OS which interface leads to a LAN: a UDP
-/// `connect` sends nothing.
-const SWEEP_ANCHORS: [Ipv4Addr; 3] = [
+/// `connect` sends nothing. The host's automatic mode (`http::lan_ip`) asks with the same ones.
+pub(crate) const SWEEP_ANCHORS: [Ipv4Addr; 3] = [
     Ipv4Addr::new(192, 168, 0, 1),
     Ipv4Addr::new(10, 0, 0, 1),
     Ipv4Addr::new(172, 16, 0, 1),
@@ -69,6 +70,8 @@ pub struct Timing {
     pub revoked_recheck: Duration,
     pub rescan_cooldown: Duration,
     pub upstream_headers: Duration,
+    /// How long the UDP announcement listens for replies (C1).
+    pub beacon_wait: Duration,
     pub probe_parallelism: usize,
 }
 
@@ -85,6 +88,8 @@ impl Timing {
             revoked_recheck: Duration::from_secs(60),
             rescan_cooldown: Duration::from_secs(60),
             upstream_headers: Duration::from_secs(600),
+            // Inside the 3 s Windows keeps a reply to a broadcast open by default.
+            beacon_wait: Duration::from_millis(1500),
             probe_parallelism: 32,
         }
     }
@@ -120,11 +125,27 @@ pub trait Network: Send + Sync {
     /// The addresses a sweep would try: the own /24 on `port`, nothing when the own
     /// address cannot be learned. A fake overrides it with loopback listeners.
     fn sweep_targets(&self, port: u16) -> Vec<SocketAddr> {
+        self.own_lan_ipv4()
+            .map(|own| subnet_candidates(own, port))
+            .unwrap_or_default()
+    }
+
+    /// The address this machine has on the LAN, as the sweep and the announcement see it.
+    fn own_lan_ipv4(&self) -> Option<Ipv4Addr> {
         SWEEP_ANCHORS
             .iter()
             .find_map(|anchor| self.own_ipv4_towards(IpAddr::V4(*anchor)))
-            .map(|own| subnet_candidates(own, port))
-            .unwrap_or_default()
+    }
+
+    /// The hosts that answered the UDP announcement within `wait`: where each reply came
+    /// from, with the TCP port it announced, and the host id it claimed. Only candidates:
+    /// each one still has to pass `/identity`. Without an own LAN address nothing is sent
+    /// and nothing is waited for.
+    async fn beacon(&self, port: u16, wait: Duration) -> Vec<(SocketAddr, Uuid)> {
+        let Some(own) = self.own_lan_ipv4() else {
+            return Vec::new();
+        };
+        discovery::announced(port, wait, &crate::beacon::broadcast_targets(own, port)).await
     }
 }
 

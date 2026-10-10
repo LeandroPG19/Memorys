@@ -29,6 +29,7 @@ pub enum Source {
     Explicit,
     LastGood,
     Stored,
+    Beacon,
     Name,
     Sweep,
 }
@@ -39,6 +40,7 @@ impl fmt::Display for Source {
             Source::Explicit => "indicada",
             Source::LastGood => "última buena",
             Source::Stored => "guardada",
+            Source::Beacon => "aviso",
             Source::Name => "por nombre",
             Source::Sweep => "barrido",
         })
@@ -122,12 +124,26 @@ pub struct Discovery {
     pub attempts: Vec<Attempt>,
 }
 
-/// Lower is louder.
-fn failure_of(verdict: &Verdict) -> Option<(u8, Failure)> {
+/// Addresses the client itself pinned: the last good one, the stored ones, the one typed.
+/// Only there does another host id mean this host changed its fingerprint.
+fn pinned_by_the_client(source: Source) -> bool {
+    matches!(source, Source::LastGood | Source::Stored | Source::Explicit)
+}
+
+/// Lower is louder. Another host id found by the name, the announcement or the sweep is
+/// another installation on the LAN, not this host: it says nothing about why this one was not
+/// found, and telling the person to pair again would send them to the wrong machine. It stays
+/// in the report.
+fn failure_of(attempt: &Attempt) -> Option<(u8, Failure)> {
+    let Outcome::Checked(verdict) = &attempt.outcome else {
+        return None;
+    };
     match verdict {
         Verdict::Revoked => Some((0, Failure::Revoked)),
         Verdict::Unknown => Some((1, Failure::Unknown)),
-        Verdict::WrongHost { seen } => Some((2, Failure::WrongHost { seen: *seen })),
+        Verdict::WrongHost { seen } if pinned_by_the_client(attempt.candidate.source) => {
+            Some((2, Failure::WrongHost { seen: *seen }))
+        }
         Verdict::Impostor => Some((3, Failure::Impostor)),
         _ => None,
     }
@@ -142,10 +158,7 @@ impl Discovery {
         let loudest = self
             .attempts
             .iter()
-            .filter_map(|attempt| match &attempt.outcome {
-                Outcome::Checked(verdict) => failure_of(verdict),
-                Outcome::NotProbed(_) => None,
-            })
+            .filter_map(failure_of)
             .min_by_key(|(rank, _)| *rank);
         Some(loudest.map_or(Failure::NotFound, |(_, failure)| failure))
     }
@@ -367,6 +380,20 @@ pub(crate) async fn sweep_services(
         .collect()
 }
 
+/// `beacon::probe` sent to `targets`, read as candidates: the address each valid reply came
+/// from with the TCP port it announced, and the host id it claimed.
+pub async fn announced(
+    port: u16,
+    wait: Duration,
+    targets: &[SocketAddr],
+) -> Vec<(SocketAddr, Uuid)> {
+    crate::beacon::probe(port, wait, targets)
+        .await
+        .into_iter()
+        .map(|(from, reply)| (SocketAddr::new(from.ip(), reply.port), reply.host_id))
+        .collect()
+}
+
 /// What to do after a verdict.
 enum Flow {
     Found(SocketAddr),
@@ -444,12 +471,33 @@ impl Search<'_> {
         if let Some(done) = settle(self.in_turn(stored).await) {
             return done;
         }
+        let heard = self.announced().await;
+        if let Some(done) = settle(self.in_turn(heard).await) {
+            return done;
+        }
         let named = self.named().await;
         if let Some(done) = settle(self.in_turn(named).await) {
             return done;
         }
         let swept = self.swept();
         settle(self.in_parallel(swept).await).flatten()
+    }
+
+    /// The hosts that answered the UDP announcement and claimed the pinned id. A reply with
+    /// another id is another installation: dropped here, before it is asked anything.
+    async fn announced(&mut self) -> Vec<Candidate> {
+        let wait = self.ctx.t.beacon_wait.min(self.remaining());
+        let heard = self.ctx.net.beacon(self.ctx.s.host_port, wait).await;
+        let pinned = self.ctx.s.host_id;
+        let candidates = heard
+            .into_iter()
+            .filter(|(_, host_id)| *host_id == pinned)
+            .map(|(addr, _)| Candidate {
+                addr,
+                source: Source::Beacon,
+            })
+            .collect();
+        self.fresh(candidates)
     }
 
     async fn named(&mut self) -> Vec<Candidate> {
@@ -536,9 +584,9 @@ impl Search<'_> {
     }
 }
 
-/// Finds the host: stored addresses, then the name, then the bounded sweep. Every
-/// candidate is accepted only after its identity check; a revoked or unknown credential
-/// ends the search, a wrong host id is a finding and the search goes on.
+/// Finds the host: stored addresses, then the UDP announcement, then the name, then the
+/// bounded sweep. Every candidate is accepted only after its identity check; a revoked or
+/// unknown credential ends the search, a wrong host id is a finding and the search goes on.
 pub async fn discover(
     s: &BridgeState,
     net: &dyn Network,
@@ -1387,5 +1435,242 @@ mod tests {
             1,
             "the stored and named candidates found nothing, so the sweep ran"
         );
+    }
+}
+
+#[cfg(test)]
+mod beacon_tests {
+    use std::time::Duration;
+
+    use super::super::fake_host::{
+        Closer, FakeHost, FakeNet, Harness, Identity, client, eventually, tiny_timing,
+    };
+    use super::super::{Timing, state::BridgeState};
+    use super::*;
+
+    const CALL: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+    fn sources(found: &Discovery) -> Vec<(SocketAddr, Source)> {
+        found
+            .attempts
+            .iter()
+            .map(|a| (a.candidate.addr, a.candidate.source))
+            .collect()
+    }
+
+    /// The host moved: its old address still accepts and hangs up, as a PC that took the old
+    /// IP would; it now serves elsewhere and says so when asked over UDP.
+    async fn moved_host(id: &Identity) -> (Closer, FakeHost, BridgeState) {
+        let old = Closer::start().await;
+        let host = FakeHost::start(id.host_id, vec![id.fake_cred()]).await;
+        let state = id.state(host.addr().port(), vec![old.addr()], Some(old.addr()));
+        (old, host, state)
+    }
+
+    /// C1: LastGood → Stored → Beacon → Name → Sweep. The announcement costs one wait of
+    /// 1.5 s, the sweep up to 254 connections: it goes before the sweep, and after the
+    /// addresses that are free to ask.
+    #[tokio::test]
+    async fn el_aviso_va_despues_de_lo_guardado_y_antes_del_nombre_y_el_barrido() {
+        let id = Identity::new();
+        let last = Closer::start().await;
+        let stored = Closer::start().await;
+        let announced = Closer::start().await;
+        let state = id.state(8787, vec![last.addr(), stored.addr()], Some(last.addr()));
+        let net = FakeNet::new().announcing(vec![(announced.addr(), id.host_id)]);
+        let t = tiny_timing();
+
+        let found = discover(&state, &net, &t, &client()).await;
+
+        assert_eq!(found.verified, None, "nobody here is the host");
+        assert_eq!(
+            sources(&found),
+            vec![
+                (last.addr(), Source::LastGood),
+                (stored.addr(), Source::Stored),
+                (announced.addr(), Source::Beacon),
+            ],
+            "the announced address is a candidate of its own, after the stored ones"
+        );
+        assert_eq!(
+            net.steps(),
+            vec!["beacon", "name", "sweep"],
+            "the announcement is heard before the name is resolved and the LAN is swept"
+        );
+        assert_eq!(
+            net.beacon_asked(),
+            vec![(8787, t.beacon_wait)],
+            "asked once, on the host's port, for beacon_wait"
+        );
+        assert!(
+            found
+                .report()
+                .contains(&format!("{} (aviso)", announced.addr())),
+            "the report says where the candidate came from. Got: {}",
+            found.report()
+        );
+    }
+
+    /// C3, the discovery: the last good address is dead, the announcement names the new one,
+    /// and that is where the search ends, before the name and the sweep.
+    #[tokio::test]
+    async fn la_madre_que_cambio_de_ip_la_encuentra_el_aviso_antes_que_el_barrido() {
+        let id = Identity::new();
+        let (old, host, state) = moved_host(&id).await;
+        let net = FakeNet::new()
+            .announcing(vec![(host.addr(), id.host_id)])
+            .sweep(vec![host.addr()]);
+
+        let found = discover(&state, &net, &tiny_timing(), &client()).await;
+
+        assert_eq!(found.verified, Some(host.addr()), "the moved host is found");
+        assert_eq!(
+            sources(&found).last(),
+            Some(&(host.addr(), Source::Beacon)),
+            "found by the announcement. Attempts: {:?}",
+            sources(&found)
+        );
+        assert!(
+            old.accepted() >= 1,
+            "anchor: the old address was tried first"
+        );
+        assert_eq!(net.resolves(), 0, "no name lookup after the host was found");
+        assert_eq!(net.sweeps(), 0, "and no sweep of the LAN");
+    }
+
+    /// C3, the bridge: the address the announcement found is kept, so the next start asks it
+    /// first.
+    #[tokio::test]
+    async fn el_puente_guarda_la_direccion_nueva_que_encontro_el_aviso() {
+        let id = Identity::new();
+        let (_old, host, state) = moved_host(&id).await;
+        let net = FakeNet::new()
+            .announcing(vec![(host.addr(), id.host_id)])
+            .sweep(vec![host.addr()]);
+        let h = Harness::start(&state, net).await;
+
+        let reply = h.post_mcp(CALL).await;
+
+        assert_eq!(reply.status, 200, "the call reaches the moved host");
+        assert_eq!(
+            h.net.sweeps(),
+            0,
+            "found by the announcement, not the sweep"
+        );
+        eventually(
+            "the new address is stored first and as the last good one",
+            || {
+                h.stored().is_some_and(|s| {
+                    s.last_good == Some(host.addr()) && s.addresses.first() == Some(&host.addr())
+                })
+            },
+        )
+        .await;
+    }
+
+    /// C1: a reply that claims another host id is another installation. It is dropped where
+    /// it is heard: asked, it would come back as a WrongHost finding, and the person would be
+    /// told to pair again with a host they never left.
+    #[tokio::test]
+    async fn una_respuesta_del_aviso_con_otra_huella_no_es_candidata() {
+        let id = Identity::new();
+        let other = FakeHost::start(uuid::Uuid::new_v4(), vec![id.fake_cred()]).await;
+        let old = Closer::start().await;
+        let state = id.state(other.addr().port(), vec![old.addr()], Some(old.addr()));
+        let net = FakeNet::new().announcing(vec![(other.addr(), other.host_id())]);
+
+        let found = discover(&state, &net, &tiny_timing(), &client()).await;
+
+        assert_eq!(
+            net.beacon_asked().len(),
+            1,
+            "anchor: the announcement was heard, and the other installation answered it"
+        );
+        assert!(
+            other.seen().is_empty(),
+            "the other installation was not even asked who it is"
+        );
+        assert!(
+            sources(&found)
+                .iter()
+                .all(|(addr, _)| *addr != other.addr()),
+            "nor listed as a candidate: {:?}",
+            sources(&found)
+        );
+        assert_eq!(
+            found.failure(),
+            Some(Failure::NotFound),
+            "not finding the host is NotFound, not WrongHost"
+        );
+    }
+
+    /// C1: 1.5 s, inside the 3 s Windows keeps a reply to a broadcast open by default.
+    #[test]
+    fn el_aviso_espera_un_segundo_y_medio_en_produccion() {
+        assert_eq!(
+            Timing::production().beacon_wait,
+            Duration::from_millis(1500)
+        );
+    }
+}
+
+#[cfg(test)]
+mod other_install_tests {
+    use super::super::fake_host::{Closer, FakeHost, FakeNet, Identity, client, tiny_timing};
+    use super::super::refusal_from;
+    use super::*;
+
+    /// The pinned host does not answer, and another installation on the LAN does. Only the
+    /// addresses the client itself pinned (last good, stored, typed) can report a changed
+    /// fingerprint; one found by the name, the announcement or the sweep is somebody else's
+    /// host, and the search simply did not find this one. Telling the person to pair again
+    /// would send them to the wrong machine.
+    async fn search_meeting_another_install(net: FakeNet) -> (FakeHost, Discovery, BridgeState) {
+        let id = Identity::new();
+        let gone = Closer::start().await;
+        let other = FakeHost::start(Uuid::new_v4(), vec![id.fake_cred()]).await;
+        let state = id.state(other.addr().port(), vec![gone.addr()], Some(gone.addr()));
+        let net = net.sweep(vec![other.addr()]);
+        let found = discover(&state, &net, &tiny_timing(), &client()).await;
+        (other, found, state)
+    }
+
+    fn not_found_and_no_repair(other: &FakeHost, found: &Discovery, state: &BridgeState) {
+        assert!(
+            !other.identity_requests().is_empty(),
+            "anchor: the search reached the other installation and asked it who it is"
+        );
+        assert!(
+            found.report().contains(&other.addr().to_string()),
+            "it stays in the report, so an operator sees what answered. Got: {}",
+            found.report()
+        );
+        assert_eq!(
+            found.failure(),
+            Some(Failure::NotFound),
+            "another installation is not this host with a new fingerprint"
+        );
+        let refusal = refusal_from(found, state);
+        assert!(
+            !refusal.needs_pair(),
+            "and the person is not told to pair again: {}",
+            refusal.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn otra_instalacion_encontrada_al_barrer_cuenta_como_no_encontrada() {
+        let (other, found, state) = search_meeting_another_install(FakeNet::new()).await;
+
+        not_found_and_no_repair(&other, &found, &state);
+    }
+
+    #[tokio::test]
+    async fn otra_instalacion_encontrada_por_el_nombre_cuenta_como_no_encontrada() {
+        let net = FakeNet::new().resolving("madre", &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+
+        let (other, found, state) = search_meeting_another_install(net).await;
+
+        not_found_and_no_repair(&other, &found, &state);
     }
 }

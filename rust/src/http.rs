@@ -133,20 +133,14 @@ pub fn private_lan_ip(candidates: &[std::net::IpAddr]) -> Option<std::net::Ipv4A
 /// system picks to reach it is the default route's. `connect` on UDP sends nothing.
 const DEFAULT_ROUTE_PROBE: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 0, 2, 1);
 
-/// The same anchors the bridge sweeps from (`bridge::SWEEP_ANCHORS`): with no default route,
-/// the interface that reaches a usual LAN gateway is the LAN.
-const LAN_ANCHORS: [std::net::Ipv4Addr; 3] = [
-    std::net::Ipv4Addr::new(192, 168, 0, 1),
-    std::net::Ipv4Addr::new(10, 0, 0, 1),
-    std::net::Ipv4Addr::new(172, 16, 0, 1),
-];
-
 /// This machine's private LAN address right now, as the automatic mode picks it.
 pub(crate) fn lan_ip() -> Option<std::net::Ipv4Addr> {
     use crate::bridge::Network;
 
     let candidates: Vec<std::net::IpAddr> = std::iter::once(DEFAULT_ROUTE_PROBE)
-        .chain(LAN_ANCHORS)
+        // With no default route, the interface that reaches a usual LAN gateway is the LAN:
+        // the same anchors the bridge sweeps from.
+        .chain(crate::bridge::SWEEP_ANCHORS)
         .filter_map(|peer| {
             crate::bridge::SystemNetwork.own_ipv4_towards(std::net::IpAddr::V4(peer))
         })

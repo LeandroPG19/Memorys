@@ -173,6 +173,63 @@ async fn swept_hosts(
     Ok(serving)
 }
 
+/// Without `--host`, first: whoever answered the UDP announcement on the host's default
+/// port and speaks MemoryIndustry. Any host id: the pairing has none pinned yet, and the
+/// code's MAC is the proof.
+async fn announced_hosts(net: &dyn Network, t: &Timing, c: &reqwest::Client) -> Vec<SocketAddr> {
+    let heard = net.beacon(DEFAULT_HOST_PORT, t.beacon_wait).await;
+    let mut serving = Vec::new();
+    for (addr, _) in heard {
+        if !serving.contains(&addr) && probe_service(c, addr, t.identity).await.is_ok() {
+            serving.push(addr);
+        }
+    }
+    serving
+}
+
+/// Of two failures, the one the person should read: a brake always, else the heavier.
+fn most_telling(first: Option<PairError>, last: PairError) -> PairError {
+    match first {
+        Some(first) if !matches!(last, PairError::Braked(_)) && first.weight() > last.weight() => {
+            first
+        }
+        _ => last,
+    }
+}
+
+/// Without `--host`: the announcement, then the sweep. A forged announcement does not stop
+/// the sweep, and an address already offered the code is not offered it again: a refusal
+/// spends the host's brake and would be the same refusal.
+async fn pair_on_the_lan(
+    key: &[u8; 32],
+    label: &str,
+    net: &dyn Network,
+    t: &Timing,
+    c: &reqwest::Client,
+) -> Result<BridgeState, PairError> {
+    let heard = announced_hosts(net, t, c).await;
+    let mut first = None;
+    if !heard.is_empty() {
+        match offer_to_each(&heard, key, label, t, c).await {
+            Ok(state) => return Ok(state),
+            Err(braked @ PairError::Braked(_)) => return Err(braked),
+            Err(err) => first = Some(err),
+        }
+    }
+    let swept: Vec<SocketAddr> = match swept_hosts(net, t, c).await {
+        Ok(found) => found.into_iter().filter(|a| !heard.contains(a)).collect(),
+        Err(err) => return Err(most_telling(first, err)),
+    };
+    if swept.is_empty() {
+        return Err(first.unwrap_or_else(|| {
+            PairError::NotFound("solo contestó lo que ya se probó".to_string())
+        }));
+    }
+    offer_to_each(&swept, key, label, t, c)
+        .await
+        .map_err(|err| most_telling(first, err))
+}
+
 /// Where the host answered: the `POST /pair` and what it said. A 401 and a 429 are
 /// answers; so is anything else that is not a 2xx.
 async fn exchange(
@@ -307,11 +364,13 @@ pub async fn pair(
     let label = accounts::validate_device_label(label)
         .map_err(|e| PairError::BadLabel(format!("{e:#}")))?;
     let key = accounts::code_key(&normalized);
-    let hosts = match host {
-        Some(raw) => named_hosts(raw, net, t, c).await?,
-        None => swept_hosts(net, t, c).await?,
-    };
-    offer_to_each(&hosts, &key, &label, t, c).await
+    match host {
+        Some(raw) => {
+            let hosts = named_hosts(raw, net, t, c).await?;
+            offer_to_each(&hosts, &key, &label, t, c).await
+        }
+        None => pair_on_the_lan(&key, &label, net, t, c).await,
+    }
 }
 
 #[cfg(test)]
@@ -929,6 +988,140 @@ mod tests {
         assert!(
             matches!(err, PairError::Impostor),
             "an answer past the limit is refused as an impostor's. Got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod beacon_tests {
+    use std::net::Ipv4Addr;
+
+    use super::super::fake_host::{FakeHost, FakeNet, RawRecorder, client, tiny_timing};
+    use super::*;
+
+    async fn host_with_code() -> (FakeHost, String) {
+        let host = FakeHost::start(uuid::Uuid::new_v4(), vec![]).await;
+        let code = accounts::generate_code();
+        host.add_code(&code, "ana", Some("pc-lab-1"));
+        (host, code)
+    }
+
+    fn lan() -> FakeNet {
+        FakeNet::new().own(Ipv4Addr::new(10, 0, 5, 7))
+    }
+
+    /// C2: without `--host`, the announcement first. A host that answers it is paired with,
+    /// and the 254 addresses of the /24 are left alone.
+    #[tokio::test]
+    async fn sin_host_el_aviso_va_primero_y_si_encuentra_la_madre_no_se_barre() {
+        let (host, code) = host_with_code().await;
+        let net = lan()
+            .announcing(vec![(host.addr(), host.host_id())])
+            .sweep(vec![host.addr()]);
+        let t = tiny_timing();
+
+        let state = pair(&code, None, "mi-pc", &net, &t, &client())
+            .await
+            .expect("the host that answered the announcement takes the code");
+
+        assert_eq!(state.host_id, host.host_id());
+        assert_eq!(
+            state.last_good,
+            Some(host.addr()),
+            "the address it answered from"
+        );
+        assert_eq!(
+            net.steps(),
+            vec!["beacon"],
+            "found by the announcement: no sweep"
+        );
+        assert_eq!(
+            net.beacon_asked(),
+            vec![(DEFAULT_HOST_PORT, t.beacon_wait)],
+            "asked on the host's default port, for beacon_wait"
+        );
+        assert_eq!(host.pair_requests().len(), 1, "the code is offered once");
+    }
+
+    /// C2: a network that blocks the broadcast still pairs, by the sweep, as before 0.29.
+    #[tokio::test]
+    async fn sin_host_y_sin_respuesta_al_aviso_se_barre_como_antes() {
+        let (host, code) = host_with_code().await;
+        let net = lan().sweep(vec![host.addr()]);
+
+        let state = pair(&code, None, "mi-pc", &net, &tiny_timing(), &client())
+            .await
+            .expect("the sweep finds the host");
+
+        assert_eq!(state.host_id, host.host_id());
+        assert_eq!(
+            net.steps(),
+            vec!["beacon", "sweep"],
+            "the announcement first, the sweep when nobody answered it"
+        );
+    }
+
+    /// C2 and principle 3: a UDP reply is cheap to forge. One that leads to something that
+    /// cannot pair does not stop the sweep from finding the host.
+    #[tokio::test]
+    async fn una_respuesta_falsa_al_aviso_no_impide_emparejar_por_el_barrido() {
+        let (host, code) = host_with_code().await;
+        let liar = RawRecorder::start(&[
+            (
+                "GET /identity",
+                serde_json::json!({
+                    "service": "memory-industry",
+                    "host_id": uuid::Uuid::new_v4(),
+                    "name": "x",
+                })
+                .to_string(),
+            ),
+            ("POST /pair", r#"{"v":1}"#.to_string()),
+        ])
+        .await;
+        let net = lan()
+            .announcing(vec![(liar.addr(), uuid::Uuid::new_v4())])
+            .sweep(vec![host.addr()]);
+
+        let state = pair(&code, None, "mi-pc", &net, &tiny_timing(), &client())
+            .await
+            .expect("the sweep still finds the host");
+
+        assert_eq!(state.host_id, host.host_id());
+        assert_eq!(
+            net.steps(),
+            vec!["beacon", "sweep"],
+            "the forged answer was heard and did not end the search"
+        );
+    }
+
+    /// C2: a host that refused the code over the announcement is not offered it again by the
+    /// sweep: every refusal spends the host's brake, and the answer would be the same.
+    #[tokio::test]
+    async fn un_codigo_rechazado_por_la_madre_del_aviso_no_se_le_ofrece_otra_vez_al_barrer() {
+        let host = FakeHost::start(uuid::Uuid::new_v4(), vec![]).await;
+        let code = accounts::generate_code();
+        let net = lan()
+            .announcing(vec![(host.addr(), host.host_id())])
+            .sweep(vec![host.addr()]);
+
+        let err = pair(&code, None, "mi-pc", &net, &tiny_timing(), &client())
+            .await
+            .expect_err("the host does not know this code");
+
+        assert!(
+            matches!(err, PairError::Refused),
+            "the host's refusal is what the person is told. Got: {err}"
+        );
+        assert_eq!(
+            net.steps(),
+            vec!["beacon", "sweep"],
+            "the sweep still runs, for another host that might know the code"
+        );
+        assert_eq!(
+            host.pair_requests().len(),
+            1,
+            "but the host that refused is not asked twice"
         );
     }
 }
