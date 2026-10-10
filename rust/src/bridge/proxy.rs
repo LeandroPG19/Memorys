@@ -22,6 +22,15 @@ use crate::accounts;
 /// The daemon's own cap on a request body.
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+/// A reconnect carries no more than a host name or address.
+const MAX_RECONNECT_BODY: usize = 4 * 1024;
+
+/// The header `POST /bridge/reconnect` demands. A web page cannot add a custom header to a
+/// cross-origin request without a preflight this bridge never answers, and cannot leave out
+/// `Origin`: either is enough to refuse it.
+pub const RECONNECT_HEADER: &str = "x-memoryindustry-bridge";
+pub const RECONNECT_VALUE: &str = "reconnect";
+
 /// The JSON-RPC code the bridge uses for everything it cannot do itself.
 const BRIDGE_ERROR_CODE: i32 = -32003;
 
@@ -308,6 +317,55 @@ async fn relay(bridge: &Bridge, request: Request) -> Response {
     }
 }
 
+/// Only this PC's own programs: no `Origin` at all, and the bridge's own header.
+fn asked_by_this_pc(headers: &HeaderMap) -> bool {
+    let own = headers
+        .get(RECONNECT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(RECONNECT_VALUE);
+    own && !headers.contains_key(header::ORIGIN)
+}
+
+/// `{"host": "nombre|ip[:puerto]"}`, or an empty body (or `{}`) to search what is known.
+fn typed_host(body: &[u8]) -> Result<Option<String>, ()> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(fields)) => match fields.get("host") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(host)) if !host.trim().is_empty() => Ok(Some(host.clone())),
+            Some(_) => Err(()),
+        },
+        _ => Err(()),
+    }
+}
+
+async fn reconnect(bridge: &Bridge, request: Request) -> Response {
+    if !asked_by_this_pc(request.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "reconnect is for this PC's own programs: no Origin, and the bridge's header",
+        )
+            .into_response();
+    }
+    let Ok(body) = to_bytes(request.into_body(), MAX_RECONNECT_BODY).await else {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the reconnect body is too large",
+        )
+            .into_response();
+    };
+    let Ok(host) = typed_host(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            r#"the body is {"host": "name or ip[:port]"}, or empty"#,
+        )
+            .into_response();
+    };
+    axum::Json(bridge.reconnect(host.as_deref()).await).into_response()
+}
+
 #[derive(Clone)]
 struct App {
     bridge: Arc<Bridge>,
@@ -323,6 +381,9 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
     match path.as_str() {
         "/mcp" => relay(&app.bridge, request).await,
         "/bridge/health" if reading => axum::Json(app.bridge.health()).into_response(),
+        "/bridge/reconnect" if *request.method() == Method::POST => {
+            reconnect(&app.bridge, request).await
+        }
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
@@ -1549,6 +1610,237 @@ mod tests {
         assert_eq!(
             named_by_connection(&headers),
             vec!["close", "x-hop-tag", "x-more"],
+        );
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use serde_json::{Value, json};
+
+    use super::super::fake_host::{
+        Closer, FakeHost, FakeNet, Harness, Identity, RawRecorder, Reply, contains_ci, eventually,
+    };
+
+    const CALL: &[u8] = br#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#;
+    const OWN: (&str, &str) = ("X-MemoryIndustry-Bridge", "reconnect");
+
+    async fn reconnect(h: &Harness, headers: &[(&str, &str)], body: &Value) -> Reply {
+        let mut all = vec![("Content-Type", "application/json")];
+        all.extend_from_slice(headers);
+        h.send(
+            "POST",
+            "/bridge/reconnect",
+            &all,
+            body.to_string().as_bytes(),
+        )
+        .await
+    }
+
+    fn doc(reply: &Reply) -> Value {
+        serde_json::from_slice(&reply.body).unwrap_or_else(|_| {
+            panic!(
+                "the reconnect answer is JSON. Status {}, body: {}",
+                reply.status,
+                reply.text()
+            )
+        })
+    }
+
+    /// Escenario: una web no puede mover el puente. A page can send a cross-origin POST
+    /// without a preflight; it cannot leave out `Origin` and it cannot add a custom header
+    /// without one. Either is enough to refuse, and the refusal comes before any search.
+    #[tokio::test]
+    async fn una_web_no_puede_mover_el_puente_y_el_puente_no_busca() {
+        let id = Identity::new();
+        let host = FakeHost::start(id.host_id, vec![id.fake_cred()]).await;
+        let state = id.state(host.addr().port(), vec![host.addr()], Some(host.addr()));
+        let h = Harness::start(&state, FakeNet::new()).await;
+        let own_origin = format!("http://127.0.0.1:{}", h.handle.local_addr().port());
+        let body = json!({ "host": host.addr().to_string() });
+        let cases: [(&str, Vec<(&str, &str)>); 5] = [
+            (
+                "a foreign Origin",
+                vec![("Origin", "https://malo.example"), OWN],
+            ),
+            (
+                "the bridge's own Origin: a page served by this very port is still a page",
+                vec![("Origin", own_origin.as_str()), OWN],
+            ),
+            ("Origin: null", vec![("Origin", "null"), OWN]),
+            ("no header of its own", vec![]),
+            (
+                "its own header with another value",
+                vec![("X-MemoryIndustry-Bridge", "otra-cosa")],
+            ),
+        ];
+
+        for (name, headers) in &cases {
+            let reply = reconnect(&h, headers, &body).await;
+            assert_eq!(reply.status, 403, "{name}: must be refused");
+        }
+
+        assert!(
+            host.seen().is_empty(),
+            "a refused reconnect must not cost the host even an identity check. Saw: {:?}",
+            host.seen()
+                .iter()
+                .map(|s| s.target.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(h.net.resolves(), 0, "nor a name lookup");
+        assert_eq!(h.net.sweeps(), 0, "nor a sweep of the LAN");
+
+        let allowed = reconnect(&h, &[OWN], &body).await;
+        assert_eq!(
+            allowed.status,
+            200,
+            "control: the same request with the bridge's header and no Origin is served, so the \
+             403s above are the guard and not a missing route. Body: {}",
+            allowed.text()
+        );
+        assert!(!host.seen().is_empty(), "and that one does reach the host");
+    }
+
+    /// B4: «Reintentar ahora» must not wait out the cooldown a failed search left behind.
+    #[tokio::test]
+    async fn reconnect_borra_el_enfriamiento_y_busca_ya() {
+        let id = Identity::new();
+        let host = FakeHost::start(id.host_id, vec![id.fake_cred()]).await;
+        host.set_down(true);
+        let state = id.state(host.addr().port(), vec![host.addr()], Some(host.addr()));
+        let h = Harness::start(&state, FakeNet::new()).await;
+        assert_eq!(
+            h.post_mcp(CALL).await.status,
+            502,
+            "anchor: the host is down"
+        );
+        host.set_down(false);
+        assert_eq!(
+            h.post_mcp(CALL).await.status,
+            502,
+            "anchor: inside the cooldown the remembered failure is still the answer"
+        );
+
+        let reply = reconnect(&h, &[OWN], &json!({})).await;
+
+        assert_eq!(reply.status, 200, "body: {}", reply.text());
+        let answer = doc(&reply);
+        assert_eq!(
+            answer["connected"], true,
+            "the host is back and found: {answer}"
+        );
+        assert_eq!(answer["address"], host.addr().to_string(), "{answer}");
+        assert!(
+            answer["report"].is_string(),
+            "the report travels too: {answer}"
+        );
+        assert_eq!(
+            h.post_mcp(CALL).await.status,
+            200,
+            "and the next call goes through at once, with the clock where it was"
+        );
+    }
+
+    /// B4: «Escribir nombre o IP»: the typed address is tried first and, once it proves to be
+    /// the host, kept for the next start.
+    #[tokio::test]
+    async fn reconnect_con_host_prueba_ese_primero_y_lo_guarda() {
+        let id = Identity::new();
+        let dead = Closer::start().await;
+        let moved = FakeHost::start(id.host_id, vec![id.fake_cred()]).await;
+        let state = id.state(8787, vec![dead.addr()], Some(dead.addr()));
+        let h = Harness::start(&state, FakeNet::new()).await;
+
+        let reply = reconnect(&h, &[OWN], &json!({ "host": moved.addr().to_string() })).await;
+
+        assert_eq!(reply.status, 200, "body: {}", reply.text());
+        let answer = doc(&reply);
+        assert_eq!(answer["connected"], true, "{answer}");
+        assert_eq!(answer["address"], moved.addr().to_string(), "{answer}");
+        assert_eq!(
+            dead.accepted(),
+            0,
+            "the typed address is tried first: the dead last-good address was not needed"
+        );
+        eventually("the typed address is stored as the last good one", || {
+            h.stored().is_some_and(|s| {
+                s.last_good == Some(moved.addr()) && s.addresses.contains(&moved.addr())
+            })
+        })
+        .await;
+        assert!(
+            moved.mcp_requests().is_empty(),
+            "reconnecting proves who the host is; it sends no call"
+        );
+    }
+
+    /// B4: a name without a port is the host's port, the one in the pairing.
+    #[tokio::test]
+    async fn reconnect_con_un_nombre_sin_puerto_usa_el_puerto_de_la_madre() {
+        let id = Identity::new();
+        let dead = Closer::start().await;
+        let moved = FakeHost::start(id.host_id, vec![id.fake_cred()]).await;
+        let state = id.state(moved.addr().port(), vec![dead.addr()], Some(dead.addr()));
+        let net = FakeNet::new().resolving("madre-nueva", &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        let h = Harness::start(&state, net).await;
+
+        let reply = reconnect(&h, &[OWN], &json!({ "host": "madre-nueva" })).await;
+
+        let answer = doc(&reply);
+        assert_eq!(answer["connected"], true, "{answer}");
+        assert_eq!(answer["address"], moved.addr().to_string(), "{answer}");
+        assert!(
+            h.net.asked().iter().any(|name| name == "madre-nueva"),
+            "the typed name was resolved. Asked: {:?}",
+            h.net.asked()
+        );
+        eventually("the address behind the name is stored", || {
+            h.stored()
+                .is_some_and(|s| s.addresses.contains(&moved.addr()))
+        })
+        .await;
+    }
+
+    /// B4 and principle 2: a typed address is only a candidate. Something there that cannot
+    /// prove it is the host gets no credential and is not remembered.
+    #[tokio::test]
+    async fn reconnect_con_algo_que_no_es_la_madre_no_lo_guarda_y_lo_dice() {
+        let id = Identity::new();
+        let dead = Closer::start().await;
+        let impostor = RawRecorder::start(&[(
+            "GET /identity",
+            json!({
+                "service": "memory-industry", "host_id": id.host_id, "name": "x",
+                "credential": "active", "proof": "00".repeat(32),
+            })
+            .to_string(),
+        )])
+        .await;
+        let state = id.state(8787, vec![dead.addr()], Some(dead.addr()));
+        let h = Harness::start(&state, FakeNet::new()).await;
+        let before = h.stored().expect("the state file");
+
+        let reply = reconnect(&h, &[OWN], &json!({ "host": impostor.addr().to_string() })).await;
+
+        let answer = doc(&reply);
+        assert_eq!(answer["connected"], false, "{answer}");
+        let report = answer["report"].as_str().expect("a report").to_string();
+        assert!(
+            report.contains(&impostor.addr().to_string()),
+            "the report names the typed address and why it was not taken. Got: {report}"
+        );
+        let after = h.stored().expect("the state file");
+        assert!(
+            !after.addresses.contains(&impostor.addr()) && after.last_good == before.last_good,
+            "an address that did not prove itself is not stored"
+        );
+        assert!(
+            !contains_ci(&impostor.received(), "authorization")
+                && !contains_ci(&impostor.received(), &id.secret_hex()),
+            "and it never saw the credential"
         );
     }
 }
