@@ -1461,8 +1461,9 @@ mod tests {
         assert_eq!(w.host.mcp_requests().len(), 3);
     }
 
-    /// `shutdown` returns only once the listener is gone, so the same port can be bound at
-    /// once. The bind is tried straight after the call, with no yield in between.
+    /// `shutdown` returns only once the listener is gone, so a connection to the port is refused
+    /// at once, with no yield in between. A bind is not the check: it also fails on any client
+    /// socket that holds the port as its local port.
     #[tokio::test]
     async fn shutdown_releases_the_port_before_it_returns() {
         let id = Identity::new();
@@ -1475,16 +1476,19 @@ mod tests {
 
         handle.shutdown().await;
 
+        let attempt = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await;
+
         assert!(
-            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
-            "a bridge that was shut down still holds 127.0.0.1:{port}: a restart on the same \
-             port would fail with `address in use`"
+            matches!(&attempt, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
+            "a bridge that was shut down still answers on 127.0.0.1:{port}: the connection must \
+             be refused, got {attempt:?}"
         );
     }
 
     /// Dropping the handle stops the listener without a `shutdown`. The aborted task releases
     /// the port only when the runtime runs it, so the check yields between tries (no sleep),
-    /// for a bounded number of tries.
+    /// for a bounded number of tries. The proof is a refused connection, not a bind: a bind
+    /// also fails on a client socket that holds the port.
     #[tokio::test]
     async fn dropping_the_handle_stops_the_listener() {
         let id = Identity::new();
@@ -1499,7 +1503,8 @@ mod tests {
 
         let mut released = false;
         for _ in 0..100 {
-            if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            let attempt = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await;
+            if matches!(&attempt, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused) {
                 released = true;
                 break;
             }
