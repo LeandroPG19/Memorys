@@ -104,6 +104,11 @@ impl Listen {
 
 pub(crate) const LAN_PREFIX: &str = "lan:";
 
+/// Whether `serve` can listen on `raw`: `ip:port`, or `lan:<port>` for the automatic mode.
+pub fn is_listen_address(raw: &str) -> bool {
+    parse_listen(raw).is_ok()
+}
+
 pub(crate) fn parse_listen(raw: &str) -> Result<Listen> {
     let Some(port) = raw.strip_prefix(LAN_PREFIX) else {
         return raw

@@ -421,6 +421,8 @@ fn serve_addr(arg: Option<&str>) -> Option<String> {
             "usage: memory-industry serve [addr]\n\n\
              Runs one shared MCP daemon over HTTP for every client, so the ONNX\n\
              models load once. addr defaults to CUBA_HTTP_ADDR, else 127.0.0.1:8787.\n\
+             addr is ip:port, or lan:<port> for the automatic LAN mode: the daemon\n\
+             serves 127.0.0.1:<port> and follows this machine's private IP.\n\
              CUBA_HTTP_TOKEN requires a bearer token; without one only a loopback\n\
              address is accepted. On start it connects to DATABASE_URL and applies\n\
              pending migrations unless CUBA_SKIP_MIGRATIONS=1."
@@ -428,7 +430,7 @@ fn serve_addr(arg: Option<&str>) -> Option<String> {
         return None;
     }
     let addr = arg.map_or_else(memory_industry::http::bind_addr, str::to_string);
-    if addr.parse::<std::net::SocketAddr>().is_err() {
+    if !memory_industry::http::is_listen_address(&addr) {
         let source = if arg.is_some() {
             "the argument"
         } else {
@@ -436,7 +438,7 @@ fn serve_addr(arg: Option<&str>) -> Option<String> {
         };
         eprintln!(
             "memory-industry serve: {source} '{addr}' is not a listen address \
-             (expected ip:port, e.g. 127.0.0.1:8787); see `memory-industry serve --help`"
+             (expected ip:port, e.g. 127.0.0.1:8787, or lan:<port>); see `memory-industry serve --help`"
         );
         std::process::exit(2);
     }
