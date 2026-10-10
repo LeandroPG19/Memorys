@@ -80,11 +80,209 @@ pub struct LanStatus {
     pub since: chrono::DateTime<chrono::Utc>,
 }
 
+/// What `CUBA_HTTP_ADDR` asks for: one address written by hand, or `lan:<port>`, where the
+/// daemon picks its private IP itself and follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Listen {
+    Fixed(SocketAddr),
+    Auto(u16),
+}
+
+impl Listen {
+    pub(crate) fn port(self) -> u16 {
+        match self {
+            Listen::Fixed(addr) => addr.port(),
+            Listen::Auto(port) => port,
+        }
+    }
+
+    /// Only a fixed loopback address is out of reach of other machines.
+    pub(crate) fn is_loopback(self) -> bool {
+        matches!(self, Listen::Fixed(addr) if addr.ip().is_loopback())
+    }
+}
+
+pub(crate) const LAN_PREFIX: &str = "lan:";
+
+pub(crate) fn parse_listen(raw: &str) -> Result<Listen> {
+    let Some(port) = raw.strip_prefix(LAN_PREFIX) else {
+        return raw
+            .parse()
+            .map(Listen::Fixed)
+            .with_context(|| format!("invalid listen address: {raw}"));
+    };
+    match port.trim().parse::<u16>() {
+        Ok(port) if port != 0 => Ok(Listen::Auto(port)),
+        _ => anyhow::bail!(
+            "invalid listen address: {raw}. The automatic LAN mode is lan:<port>, for example \
+             lan:8787"
+        ),
+    }
+}
+
 /// The first of `candidates` that is a private RFC 1918 IPv4 address. The caller puts the
 /// source address of the default route first and the anchors' after it.
 pub fn private_lan_ip(candidates: &[std::net::IpAddr]) -> Option<std::net::Ipv4Addr> {
-    let _ = candidates;
-    unimplemented!("tajada A, pasada 2: private_lan_ip")
+    candidates.iter().find_map(|ip| match ip {
+        std::net::IpAddr::V4(v4) if v4.is_private() => Some(*v4),
+        _ => None,
+    })
+}
+
+/// TEST-NET-1 (RFC 5737): never a real host and never on a local route, so the source the
+/// system picks to reach it is the default route's. `connect` on UDP sends nothing.
+const DEFAULT_ROUTE_PROBE: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 0, 2, 1);
+
+/// The same anchors the bridge sweeps from (`bridge::SWEEP_ANCHORS`): with no default route,
+/// the interface that reaches a usual LAN gateway is the LAN.
+const LAN_ANCHORS: [std::net::Ipv4Addr; 3] = [
+    std::net::Ipv4Addr::new(192, 168, 0, 1),
+    std::net::Ipv4Addr::new(10, 0, 0, 1),
+    std::net::Ipv4Addr::new(172, 16, 0, 1),
+];
+
+/// This machine's private LAN address right now, as the automatic mode picks it.
+pub(crate) fn lan_ip() -> Option<std::net::Ipv4Addr> {
+    use crate::bridge::Network;
+
+    let candidates: Vec<std::net::IpAddr> = std::iter::once(DEFAULT_ROUTE_PROBE)
+        .chain(LAN_ANCHORS)
+        .filter_map(|peer| {
+            crate::bridge::SystemNetwork.own_ipv4_towards(std::net::IpAddr::V4(peer))
+        })
+        .map(std::net::IpAddr::V4)
+        .collect();
+    private_lan_ip(&candidates)
+}
+
+/// Between two looks at the IP while there is none, and while there is one.
+const LAN_LOOK_WITHOUT_IP: Duration = Duration::from_secs(5);
+const LAN_LOOK_WITH_IP: Duration = Duration::from_secs(10);
+
+/// What `/health` says about the LAN listener. Where and since when; nothing that is a secret.
+fn lan_json(status: &LanStatus) -> Value {
+    serde_json::json!({
+        "mode": match status.mode {
+            LanMode::Auto => "auto",
+            LanMode::Fixed => "fixed",
+        },
+        "address": status.address.map(|addr| addr.to_string()),
+        "since": status.since.to_rfc3339(),
+    })
+}
+
+/// A listener that says when its socket is closed. axum drops the listener as soon as a
+/// graceful shutdown stops accepting, before it waits for the connections in flight; that
+/// drop is the moment the old address starts refusing, and the one worth waiting for.
+struct Closing {
+    inner: Option<tokio::net::TcpListener>,
+    closed: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        // The socket first: whoever hears `closed` may connect at once and must be refused.
+        drop(self.inner.take());
+        if let Some(closed) = self.closed.take() {
+            let _ = closed.send(());
+        }
+    }
+}
+
+impl axum::serve::Listener for Closing {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let Some(inner) = self.inner.as_ref() else {
+                return std::future::pending().await;
+            };
+            match inner.accept().await {
+                Ok(accepted) => return accepted,
+                // One client that hung up while being accepted; the next one is fine.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionRefused
+                    ) => {}
+                // Out of descriptors and the like: back off instead of spinning on it.
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        match self.inner.as_ref() {
+            Some(inner) => inner.local_addr(),
+            None => Err(std::io::Error::other("the listener is closed")),
+        }
+    }
+}
+
+/// One address being served, and the two ends needed to close it.
+struct Served {
+    addr: SocketAddr,
+    stop: tokio::sync::oneshot::Sender<()>,
+    closed: tokio::sync::oneshot::Receiver<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Served {
+    fn start(listener: tokio::net::TcpListener, addr: SocketAddr, app: &Router) -> Self {
+        use axum::serve::ListenerExt;
+
+        let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (closed_tx, closed) = tokio::sync::oneshot::channel();
+        // `tap_io` only to reach the `ConnectInfo<SocketAddr>` impl axum gives a tapped
+        // listener; a bare custom one has none and every handler that reads the peer fails.
+        let listener = Closing {
+            inner: Some(listener),
+            closed: Some(closed_tx),
+        }
+        .tap_io(|_: &mut tokio::net::TcpStream| {});
+        let service = app
+            .clone()
+            .into_make_service_with_connect_info::<SocketAddr>();
+        let task = tokio::spawn(async move {
+            let served = axum::serve(listener, service).with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+            });
+            if let Err(e) = served.await {
+                tracing::error!(%addr, error = %e, "the listener stopped");
+            }
+        });
+        Served {
+            addr,
+            stop,
+            closed,
+            task,
+        }
+    }
+
+    /// Stops accepting and returns once the socket is closed. The requests in flight finish
+    /// on their own; the returned task ends when they have.
+    async fn close(self) -> tokio::task::JoinHandle<()> {
+        let _ = self.stop.send(());
+        let _ = self.closed.await;
+        self.task
+    }
+}
+
+async fn bind_loopback(port: u16) -> Result<tokio::net::TcpListener> {
+    let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!(bind_failure_message(&addr, &e)))
+}
+
+fn shown(addr: Option<SocketAddr>) -> String {
+    addr.map_or_else(|| "none".to_string(), |addr| addr.to_string())
 }
 
 /// Serves `app` on `127.0.0.1:port` for the whole run and on `<own_ip()>:port` while there is
@@ -105,9 +303,128 @@ where
     SFut: std::future::Future<Output = ()> + Send,
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let _ = (port, app, own_ip, sleep, status, shutdown);
-    unimplemented!("tajada A, pasada 2: serve_following")
+    let loopback = bind_loopback(port).await?;
+    follow(loopback, app, own_ip, sleep, status, shutdown).await
 }
+
+/// `serve_following` once the loopback socket is open, whoever opened it.
+async fn follow<P, S, SFut, F>(
+    loopback: tokio::net::TcpListener,
+    app: Router,
+    mut own_ip: P,
+    mut sleep: S,
+    status: tokio::sync::watch::Sender<LanStatus>,
+    shutdown: F,
+) -> Result<()>
+where
+    P: FnMut() -> Option<std::net::Ipv4Addr> + Send,
+    S: FnMut(Duration) -> SFut + Send,
+    SFut: std::future::Future<Output = ()> + Send,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let loopback_addr = loopback
+        .local_addr()
+        .context("cannot read the loopback address")?;
+    let port = loopback_addr.port();
+    let local = Served::start(loopback, loopback_addr, &app);
+    let mut lan: Option<Served> = None;
+    let mut published = false;
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    loop {
+        let wanted = own_ip().map(|ip| SocketAddr::from((ip, port)));
+        let had = lan.as_ref().map(|served| served.addr);
+        if wanted != had {
+            lan = match wanted {
+                Some(addr) => match tokio::net::TcpListener::bind(addr).await {
+                    Ok(listener) => {
+                        let opened = Served::start(listener, addr, &app);
+                        if let Some(old) = lan.take() {
+                            let _draining = old.close().await;
+                        }
+                        Some(opened)
+                    }
+                    // Keep what serves now and try again on the next look.
+                    Err(e) => {
+                        tracing::warn!(%addr, error = %e, "cannot listen on the new lan address yet");
+                        lan
+                    }
+                },
+                None => {
+                    if let Some(old) = lan.take() {
+                        let _draining = old.close().await;
+                    }
+                    None
+                }
+            };
+        }
+        let now = lan.as_ref().map(|served| served.addr);
+        if !published || now != had {
+            if published {
+                tracing::warn!("lan address changed {} -> {}", shown(had), shown(now));
+            } else {
+                tracing::info!("lan address {}", shown(now));
+            }
+            status.send_replace(LanStatus {
+                mode: LanMode::Auto,
+                address: now,
+                since: chrono::Utc::now(),
+            });
+            published = true;
+        }
+
+        let nap = if now.is_some() && now == wanted {
+            LAN_LOOK_WITH_IP
+        } else {
+            LAN_LOOK_WITHOUT_IP
+        };
+        tokio::select! {
+            _ = sleep(nap) => {}
+            _ = &mut shutdown => break,
+        }
+    }
+
+    let mut draining = vec![local.close().await];
+    if let Some(served) = lan {
+        draining.push(served.close().await);
+    }
+    for task in draining {
+        let _ = task.await;
+    }
+    Ok(())
+}
+
+/// The UDP announcement of an automatic-mode daemon, for as long as the daemon runs.
+///
+/// It does not answer while the host id is nil — the database was not readable at start —
+/// because no client could verify that host. It asks the database again until it can.
+fn announce(port: u16, pool: PgPool, host: Arc<HostInfo>) {
+    tokio::spawn(async move {
+        let socket = match crate::beacon::bind(port).await {
+            Ok(socket) => socket,
+            Err(e) => {
+                tracing::warn!(port, error = %e, "the UDP announcement cannot listen; clients still find this host by name, sweep or a typed address");
+                return;
+            }
+        };
+        let mut host_id = host.host_id;
+        while host_id.is_nil() {
+            tokio::time::sleep(ANNOUNCE_RETRY).await;
+            if let Ok(Ok(identity)) =
+                tokio::time::timeout(HOST_IDENTITY_BUDGET, accounts_db::host_identity(&pool)).await
+            {
+                host_id = identity.host_id;
+            }
+        }
+        let me = crate::beacon::Reply::new(host_id, host.name.clone(), port);
+        if let Err(e) = crate::beacon::respond(socket, me, Instant::now).await {
+            tracing::warn!(port, error = %e, "the UDP announcement stopped");
+        }
+    });
+}
+
+/// Between two reads of the host id while the database is not answering.
+const ANNOUNCE_RETRY: Duration = Duration::from_secs(30);
 
 /// The failed-credential counter per address, shared by `/mcp`, `/pair` and every route that
 /// admits a bearer. One type so `pair_core` borrows the very counter `admit` writes; the tests age
@@ -281,14 +598,27 @@ pub(crate) fn token_too_weak(addr_is_loopback: bool, token: Option<&str>) -> Opt
 }
 
 fn ensure_loopback(addr: &SocketAddr) -> Result<()> {
-    if let Some(why) = token_too_weak(addr.ip().is_loopback(), auth_token().as_deref()) {
-        anyhow::bail!("refusing to bind {addr}: {why}");
+    ensure_token_for(&addr.to_string(), addr.ip().is_loopback())
+}
+
+/// The token rule for what `CUBA_HTTP_ADDR` asked: `lan:<port>` is reachable from other
+/// machines by definition, so it is judged like any LAN address.
+fn ensure_listen(listen: Listen) -> Result<()> {
+    match listen {
+        Listen::Fixed(addr) => ensure_loopback(&addr),
+        Listen::Auto(port) => ensure_token_for(&format!("{LAN_PREFIX}{port}"), false),
     }
-    if addr.ip().is_loopback() || auth_token().is_some() {
+}
+
+fn ensure_token_for(shown: &str, loopback: bool) -> Result<()> {
+    if let Some(why) = token_too_weak(loopback, auth_token().as_deref()) {
+        anyhow::bail!("refusing to bind {shown}: {why}");
+    }
+    if loopback || auth_token().is_some() {
         return Ok(());
     }
     anyhow::bail!(
-        "refusing to bind {addr}: the daemon serves the whole brain with no auth. \
+        "refusing to bind {shown}: the daemon serves the whole brain with no auth. \
          Use a 127.0.0.1 address, or set CUBA_HTTP_TOKEN to require a bearer token"
     )
 }
@@ -328,11 +658,19 @@ pub async fn serve(addr: &str) -> Result<()> {
 }
 
 pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()> {
-    let addr: SocketAddr = addr
-        .parse()
-        .with_context(|| format!("invalid listen address: {addr}"))?;
-    ensure_loopback(&addr)?;
+    let listen = parse_listen(addr)?;
+    ensure_listen(listen)?;
     ensure_tokens_differ()?;
+    // Where a person on this machine reaches it: the automatic mode always has loopback.
+    let local = match listen {
+        Listen::Fixed(addr) => addr,
+        Listen::Auto(port) => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+    };
+    // What the rules about reachability judge: the automatic mode is never loopback.
+    let judged = match listen {
+        Listen::Fixed(addr) => addr,
+        Listen::Auto(port) => SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),
+    };
 
     crate::session::enable_daemon_mode();
 
@@ -347,6 +685,20 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
 
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let host = Arc::new(host_info(&pool).await);
+    let (lan_tx, lan_rx) = tokio::sync::watch::channel(match listen {
+        Listen::Fixed(addr) => LanStatus {
+            mode: LanMode::Fixed,
+            address: Some(addr),
+            since: chrono::Utc::now(),
+        },
+        Listen::Auto(_) => LanStatus {
+            mode: LanMode::Auto,
+            address: None,
+            since: chrono::Utc::now(),
+        },
+    });
+    let beacon_pool = pool.clone();
+    let beacon_host = host.clone();
     let state = AppState {
         pool,
         token: auth_token().map(Arc::new),
@@ -356,19 +708,14 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         seen: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         last_activity: Arc::new(Mutex::new(Instant::now())),
         ready: ready.clone(),
-        port: addr.port(),
+        port: listen.port(),
         auth_failures: Brake::default(),
         resource_tier: crate::resources::plan(&crate::resources::probe())
             .tier
             .as_str(),
-        require_accounts: require_accounts_for(&addr),
+        require_accounts: require_accounts_for(&judged),
         host,
-        lan: tokio::sync::watch::channel(LanStatus {
-            mode: LanMode::Fixed,
-            address: Some(addr),
-            since: chrono::Utc::now(),
-        })
-        .1,
+        lan: lan_rx,
     };
 
     let reaper_seen = state.seen.clone();
@@ -390,11 +737,11 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         .route("/identity", get(identity))
         .route("/pair", post(pair));
     if panel_route_enabled(
-        addr.ip().is_loopback(),
+        listen.is_loopback(),
         panel_enabled(),
         panel_allows_forwarded(),
     ) {
-        tracing::info!("control panel at http://{addr}/panel");
+        tracing::info!("control panel at http://{local}/panel");
         app = app.route("/panel", get(panel));
     } else if panel_enabled() {
         tracing::warn!(
@@ -402,7 +749,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
             "CUBA_PANEL=1 pero esta dirección es alcanzable desde otras máquinas: /panel NO se registra. El panel muestra estado, clientes conectados y llamadas recientes. Si de verdad lo querés publicado, CUBA_PANEL_PUBLIC=1"
         );
     }
-    tracing::info!("connect page at http://{addr}/connect");
+    tracing::info!("connect page at http://{local}/connect");
 
     // The timeout is attached here, before `/events` is merged in, because
     // `Router::layer` only wraps the routes already registered. An SSE stream
@@ -415,7 +762,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state);
 
-    let listener = bind_listener(addr).await?;
+    let listener = bind_listener(listen).await?;
 
     // Bind first: a port already taken, a non-loopback address without a token
     // or a weak one all fail here, in a second, instead of after two minutes of
@@ -428,23 +775,43 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
     //
     // Between bind and serve the kernel queues connections, so a client that
     // arrives early waits and then gets a real answer rather than a 200 with an
-    // unreranked ranking in it.
+    // unreranked ranking in it. In the automatic mode that is the loopback
+    // socket; the LAN one opens when the IP is known.
     warm_before_serving(ready.clone()).await;
 
     tracing::info!(
         %addr,
         auth = auth_token().is_some(),
         ready = ready.load(Ordering::Relaxed),
-        "MemoryIndustry daemon listening — point clients at http://{addr}/mcp (connect: /connect)"
+        "MemoryIndustry daemon listening — point clients at http://{local}/mcp (connect: /connect)"
     );
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal(idle_shutdown))
-    .await
-    .context("http server failed")?;
+    // Only the automatic mode announces itself: a fixed IP does not move, so its clients
+    // never need to look for it.
+    if let Listen::Auto(port) = listen {
+        announce(port, beacon_pool, beacon_host);
+    }
+
+    match listen {
+        Listen::Fixed(_) => axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal(idle_shutdown))
+        .await
+        .context("http server failed")?,
+        Listen::Auto(_) => {
+            follow(
+                listener,
+                app,
+                lan_ip,
+                tokio::time::sleep,
+                lan_tx,
+                shutdown_signal(idle_shutdown),
+            )
+            .await?
+        }
+    }
 
     tracing::info!("daemon shut down");
     Ok(())
@@ -465,7 +832,36 @@ fn note_activity(state: &AppState, key: &str) {
 /// Kept first in `serve_pool` on purpose: a port already taken, a routable
 /// address with no token and a token too weak to be one all fail here in a
 /// second, rather than after two minutes of loading models.
-async fn bind_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+async fn bind_listener(listen: Listen) -> Result<tokio::net::TcpListener> {
+    match listen {
+        Listen::Fixed(addr) => bind_fixed(addr).await,
+        Listen::Auto(port) => bind_auto_loopback(port).await,
+    }
+}
+
+/// The loopback half of the automatic mode, from systemd when it handed one over. Only
+/// loopback is taken: the LAN address is the daemon's to pick and follow, and a socket systemd
+/// opened on every interface is exactly what this mode exists to avoid.
+async fn bind_auto_loopback(port: u16) -> Result<tokio::net::TcpListener> {
+    let Some(std_listener) = systemd_listener() else {
+        return bind_loopback(port).await;
+    };
+    let adopted = std_listener
+        .local_addr()
+        .context("cannot read the address of the systemd-activated socket")?;
+    if !adopted.ip().is_loopback() {
+        anyhow::bail!(
+            "refusing the socket systemd handed over on {adopted}: with \
+             CUBA_HTTP_ADDR={LAN_PREFIX}{port} the .socket unit may only hold \
+             127.0.0.1:{port}, and the daemon opens its LAN address itself. Set \
+             ListenStream=127.0.0.1:{port} in memory-industry.socket"
+        );
+    }
+    tokio::net::TcpListener::from_std(std_listener)
+        .context("failed to adopt systemd-activated socket")
+}
+
+async fn bind_fixed(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
     let Some(std_listener) = systemd_listener() else {
         return bind_retrying(
             addr,
@@ -2468,6 +2864,7 @@ async fn health(
         "ready": runtime.ready,
         "connect": "/connect",
         "events": "/events",
+        "lan": lan_json(&state.lan.borrow()),
     });
 
     if full_scope {
