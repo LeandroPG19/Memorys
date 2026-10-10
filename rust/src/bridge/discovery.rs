@@ -372,11 +372,15 @@ pub(crate) async fn sweep_services(
 /// `beacon::probe` sent to `targets`, read as candidates: the address each valid reply came
 /// from with the TCP port it announced, and the host id it claimed.
 pub async fn announced(
-    _port: u16,
-    _wait: Duration,
-    _targets: &[SocketAddr],
+    port: u16,
+    wait: Duration,
+    targets: &[SocketAddr],
 ) -> Vec<(SocketAddr, Uuid)> {
-    unimplemented!("pasada verde: C1")
+    crate::beacon::probe(port, wait, targets)
+        .await
+        .into_iter()
+        .map(|(from, reply)| (SocketAddr::new(from.ip(), reply.port), reply.host_id))
+        .collect()
 }
 
 /// What to do after a verdict.
@@ -456,12 +460,33 @@ impl Search<'_> {
         if let Some(done) = settle(self.in_turn(stored).await) {
             return done;
         }
+        let heard = self.announced().await;
+        if let Some(done) = settle(self.in_turn(heard).await) {
+            return done;
+        }
         let named = self.named().await;
         if let Some(done) = settle(self.in_turn(named).await) {
             return done;
         }
         let swept = self.swept();
         settle(self.in_parallel(swept).await).flatten()
+    }
+
+    /// The hosts that answered the UDP announcement and claimed the pinned id. A reply with
+    /// another id is another installation: dropped here, before it is asked anything.
+    async fn announced(&mut self) -> Vec<Candidate> {
+        let wait = self.ctx.t.beacon_wait.min(self.remaining());
+        let heard = self.ctx.net.beacon(self.ctx.s.host_port, wait).await;
+        let pinned = self.ctx.s.host_id;
+        let candidates = heard
+            .into_iter()
+            .filter(|(_, host_id)| *host_id == pinned)
+            .map(|(addr, _)| Candidate {
+                addr,
+                source: Source::Beacon,
+            })
+            .collect();
+        self.fresh(candidates)
     }
 
     async fn named(&mut self) -> Vec<Candidate> {
@@ -548,9 +573,9 @@ impl Search<'_> {
     }
 }
 
-/// Finds the host: stored addresses, then the name, then the bounded sweep. Every
-/// candidate is accepted only after its identity check; a revoked or unknown credential
-/// ends the search, a wrong host id is a finding and the search goes on.
+/// Finds the host: stored addresses, then the UDP announcement, then the name, then the
+/// bounded sweep. Every candidate is accepted only after its identity check; a revoked or
+/// unknown credential ends the search, a wrong host id is a finding and the search goes on.
 pub async fn discover(
     s: &BridgeState,
     net: &dyn Network,
@@ -1577,3 +1602,4 @@ mod beacon_tests {
         );
     }
 }
+

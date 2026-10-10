@@ -173,6 +173,63 @@ async fn swept_hosts(
     Ok(serving)
 }
 
+/// Without `--host`, first: whoever answered the UDP announcement on the host's default
+/// port and speaks MemoryIndustry. Any host id: the pairing has none pinned yet, and the
+/// code's MAC is the proof.
+async fn announced_hosts(net: &dyn Network, t: &Timing, c: &reqwest::Client) -> Vec<SocketAddr> {
+    let heard = net.beacon(DEFAULT_HOST_PORT, t.beacon_wait).await;
+    let mut serving = Vec::new();
+    for (addr, _) in heard {
+        if !serving.contains(&addr) && probe_service(c, addr, t.identity).await.is_ok() {
+            serving.push(addr);
+        }
+    }
+    serving
+}
+
+/// Of two failures, the one the person should read: a brake always, else the heavier.
+fn most_telling(first: Option<PairError>, last: PairError) -> PairError {
+    match first {
+        Some(first) if !matches!(last, PairError::Braked(_)) && first.weight() > last.weight() => {
+            first
+        }
+        _ => last,
+    }
+}
+
+/// Without `--host`: the announcement, then the sweep. A forged announcement does not stop
+/// the sweep, and an address already offered the code is not offered it again: a refusal
+/// spends the host's brake and would be the same refusal.
+async fn pair_on_the_lan(
+    key: &[u8; 32],
+    label: &str,
+    net: &dyn Network,
+    t: &Timing,
+    c: &reqwest::Client,
+) -> Result<BridgeState, PairError> {
+    let heard = announced_hosts(net, t, c).await;
+    let mut first = None;
+    if !heard.is_empty() {
+        match offer_to_each(&heard, key, label, t, c).await {
+            Ok(state) => return Ok(state),
+            Err(braked @ PairError::Braked(_)) => return Err(braked),
+            Err(err) => first = Some(err),
+        }
+    }
+    let swept: Vec<SocketAddr> = match swept_hosts(net, t, c).await {
+        Ok(found) => found.into_iter().filter(|a| !heard.contains(a)).collect(),
+        Err(err) => return Err(most_telling(first, err)),
+    };
+    if swept.is_empty() {
+        return Err(first.unwrap_or_else(|| {
+            PairError::NotFound("solo contestó lo que ya se probó".to_string())
+        }));
+    }
+    offer_to_each(&swept, key, label, t, c)
+        .await
+        .map_err(|err| most_telling(first, err))
+}
+
 /// Where the host answered: the `POST /pair` and what it said. A 401 and a 429 are
 /// answers; so is anything else that is not a 2xx.
 async fn exchange(
@@ -307,11 +364,13 @@ pub async fn pair(
     let label = accounts::validate_device_label(label)
         .map_err(|e| PairError::BadLabel(format!("{e:#}")))?;
     let key = accounts::code_key(&normalized);
-    let hosts = match host {
-        Some(raw) => named_hosts(raw, net, t, c).await?,
-        None => swept_hosts(net, t, c).await?,
-    };
-    offer_to_each(&hosts, &key, &label, t, c).await
+    match host {
+        Some(raw) => {
+            let hosts = named_hosts(raw, net, t, c).await?;
+            offer_to_each(&hosts, &key, &label, t, c).await
+        }
+        None => pair_on_the_lan(&key, &label, net, t, c).await,
+    }
 }
 
 #[cfg(test)]
