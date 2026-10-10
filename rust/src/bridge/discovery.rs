@@ -1603,3 +1603,63 @@ mod beacon_tests {
     }
 }
 
+#[cfg(test)]
+mod other_install_tests {
+    use super::super::fake_host::{Closer, FakeHost, FakeNet, Identity, client, tiny_timing};
+    use super::super::refusal_from;
+    use super::*;
+
+    /// The pinned host does not answer, and another installation on the LAN does. Only the
+    /// addresses the client itself pinned (last good, stored, typed) can report a changed
+    /// fingerprint; one found by the name, the announcement or the sweep is somebody else's
+    /// host, and the search simply did not find this one. Telling the person to pair again
+    /// would send them to the wrong machine.
+    async fn search_meeting_another_install(net: FakeNet) -> (FakeHost, Discovery, BridgeState) {
+        let id = Identity::new();
+        let gone = Closer::start().await;
+        let other = FakeHost::start(Uuid::new_v4(), vec![id.fake_cred()]).await;
+        let state = id.state(other.addr().port(), vec![gone.addr()], Some(gone.addr()));
+        let net = net.sweep(vec![other.addr()]);
+        let found = discover(&state, &net, &tiny_timing(), &client()).await;
+        (other, found, state)
+    }
+
+    fn not_found_and_no_repair(other: &FakeHost, found: &Discovery, state: &BridgeState) {
+        assert!(
+            !other.identity_requests().is_empty(),
+            "anchor: the search reached the other installation and asked it who it is"
+        );
+        assert!(
+            found.report().contains(&other.addr().to_string()),
+            "it stays in the report, so an operator sees what answered. Got: {}",
+            found.report()
+        );
+        assert_eq!(
+            found.failure(),
+            Some(Failure::NotFound),
+            "another installation is not this host with a new fingerprint"
+        );
+        let refusal = refusal_from(found, state);
+        assert!(
+            !refusal.needs_pair(),
+            "and the person is not told to pair again: {}",
+            refusal.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn otra_instalacion_encontrada_al_barrer_cuenta_como_no_encontrada() {
+        let (other, found, state) = search_meeting_another_install(FakeNet::new()).await;
+
+        not_found_and_no_repair(&other, &found, &state);
+    }
+
+    #[tokio::test]
+    async fn otra_instalacion_encontrada_por_el_nombre_cuenta_como_no_encontrada() {
+        let net = FakeNet::new().resolving("madre", &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+
+        let (other, found, state) = search_meeting_another_install(net).await;
+
+        not_found_and_no_repair(&other, &found, &state);
+    }
+}
