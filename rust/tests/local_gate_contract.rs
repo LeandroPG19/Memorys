@@ -1430,7 +1430,11 @@ fn the_exit_file_holds_the_whole_gates_verdict_and_says_running_until_then() {
 /// code, and the words its refusal must contain. `run-all-tests.sh` derives
 /// `brain_gate`, `brain_gate_peer` and `postgres` by replacing what follows the
 /// last slash, which only works for a URL that ends in `/<database>`.
-const DATABASE_URL_GUARD: [(&str, i32, &[&str]); 15] = [
+/// libpq ends the user and the password at the first `@` and sqlx at the last, so
+/// more than one `@` before the host is refused: the readiness check and the
+/// binary would ask different servers, and libpq would print the rest of the
+/// password as the host. An `@` after the authority (`/br@in`) is not one of them.
+const DATABASE_URL_GUARD: [(&str, i32, &[&str]); 23] = [
     ("postgresql://cuba:memorys2026@127.0.0.1:5488/brain", 0, &[]),
     ("postgres://gate:pw0@127.0.0.1:5575/brain", 0, &[]),
     ("postgresql://gate:pw0@db.example.invalid/brain", 0, &[]),
@@ -1478,6 +1482,34 @@ const DATABASE_URL_GUARD: [(&str, i32, &[&str]); 15] = [
         &["postgresql://"],
     ),
     ("", 2, &["postgresql://"]),
+    ("postgresql://127.0.0.1:5575/brain", 0, &[]),
+    ("postgresql://gate@127.0.0.1:5575/brain", 0, &[]),
+    ("postgresql://gate:pw0@127.0.0.1:5575/br@in", 0, &[]),
+    (
+        "postgresql://gate:x@S3cr3tW2@127.0.0.1:5575/brain",
+        2,
+        &["%40", "more than one '@'"],
+    ),
+    (
+        "postgresql://gate:S3cr3tW2@@127.0.0.1:5575/brain",
+        2,
+        &["%40", "more than one '@'"],
+    ),
+    (
+        "postgresql://ga@S3cr3tW2@127.0.0.1:5575/brain",
+        2,
+        &["%40", "more than one '@'"],
+    ),
+    (
+        "postgresql://gate:x@S3cr3tW2@[::1]:5434/brain",
+        2,
+        &["%40", "more than one '@'"],
+    ),
+    (
+        "postgresql://gate:x@S3cr3tW2@%2Frun%2Fpostgresql:5433/brain",
+        2,
+        &["%40", "more than one '@'"],
+    ),
 ];
 
 /// The head of the script that drives the table: one bash for all of it, since

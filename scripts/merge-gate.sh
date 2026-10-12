@@ -362,6 +362,25 @@ if [[ "${1:-}" == "--self-test" ]]; then
   pg_refused pg_no_db 'postgresql://gate:S3cr3tW2@127.0.0.1:5575' '%2F' '%3F' '%40'
   pg_refused pg_conninfo 'host=127.0.0.1 port=5575 dbname=brain password=S3cr3tW2' 'postgresql://'
 
+  # More than one '@' before the host: libpq ends the user and the password at
+  # the FIRST one and sqlx at the LAST, so the readiness check and the binary
+  # would ask different servers, and libpq prints the rest of the password as
+  # the host (measured with libpq 16.15 on 127.0.0.1:5499, nothing listening:
+  # postgresql://u:x@S3cr3tW2@127.0.0.1:5499/brain answers
+  # 'S3cr3tW2@127.0.0.1:5499 - no response'). The stand-in answers what libpq
+  # did; the gate has to refuse with 2 before asking, and not print it.
+  fake_tree pg_two_at "echo \"$ran_marker\""
+  run_copy pg_two_at "" DATABASE_URL='postgresql://gate:x@S3cr3tW2@127.0.0.1:5575/brain' \
+    FAKE_PG_ANSWER='S3cr3tW2@127.0.0.1:5575 - no response' FAKE_PG_EXIT=2
+  pg_stopped pg_two_at 2
+  [[ "$(grep -c '^FAIL: ' "$tmp/pg_two_at.out")" == 1 ]] \
+    || self_fail "pg_two_at: the refusal is not one FAIL line: $(cat "$tmp/pg_two_at.out")"
+  grep -qF '%40' "$tmp/pg_two_at.out" && grep -qF "more than one '@'" "$tmp/pg_two_at.out" \
+    || self_fail "pg_two_at: the refusal does not say %40 and more than one '@': $(cat "$tmp/pg_two_at.out")"
+  [[ ! -e "$tmp/pg_two_at/home/pg_isready.args" ]] \
+    || self_fail "pg_two_at: pg_isready was asked about a URL with two '@': $(pg_args pg_two_at)"
+  pg_refused pg_double_at 'postgresql://gate:S3cr3tW2@@127.0.0.1:5575/brain' '%40' "more than one '@'"
+
   # gate_linux_env (gate-lock.sh): what a gate run on Linux hands to cargo, to the
   # mutation tool and to node. Each row runs it in a fresh bash with an empty
   # environment but HOME and a PATH of stand-ins, so every answer comes from the
@@ -466,6 +485,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "    libpq cannot read the URL or its answer has no port, never prints what libpq"
   echo "    wrote about the URL, and refuses with 2, before asking, a URL that"
   echo "    brain_gate cannot be derived from"
+  echo "    or that holds more than one '@' before the host."
   exit 0
 fi
 
