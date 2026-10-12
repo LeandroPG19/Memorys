@@ -7,7 +7,7 @@ versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI
 
 ## [0.29.0] — 2026-10-12 (Cargo `0.29.0` · npm `0.29.0` · PyPI `1.31.0`)
 
-The first run on native Windows since the gate moved to WSL2 (2026-10-03): Windows 11, an RTX 4070 Ti, Docker Desktop, WSL2 with `networkingMode=mirrored`. The core of the gate (`run-all-tests.sh`, no fail-fast) took 20 min 35 s on 0.28.0 and came back with the E2E of the 25 tools, the live session, the GPU placement check and the eval smoke green — and with four defects that a judge without a card, on one host, cannot see. Specified in `backlog/0.29-windows-y-verdad-de-salud.md`.
+The first run on native Windows since the gate moved to WSL2 (2026-10-03): Windows 11, an RTX 4070 Ti, Docker Desktop, WSL2 with `networkingMode=mirrored`. The core of the gate (`run-all-tests.sh`, no fail-fast) took 20 min 35 s on 0.28.0 and came back with the E2E of the 25 tools, the live session, the GPU placement check and the eval smoke green — and with defects that a judge without a card, on one host, cannot see: a `/health` that said GPU over a CPU session, a ceiling of 2048 MB under every GPU caller that is not `main`, a gate that checked another host's Postgres, and two of its own contracts red on Windows. Reading the fixes (the review of the diff, the second judge and the real `pg_isready`) found three more, closed in the same release: a user name with spaces left in `/health`, the tail of a password in the gate's log, and a redaction loop that a mutant could hang. The first full gate run then stopped on five advisories in the lockfile. Specified, slice by slice, in `backlog/0.29-windows-y-verdad-de-salud.md`; each slice has its red commit before its green one.
 
 ### Behaviour changes — read before deploying
 
