@@ -243,30 +243,26 @@ fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionB
         .map_err(|e| anyhow::anyhow!("registrando CPU execution provider: {e}"))
 }
 
-/// The one reading of the arena ceiling. Pass 1 of W5 keeps today's behaviour
-/// (a fixed 2048 MiB when nothing is set, no `trim`) so the tests next to it are
-/// red for the right reason; pass 2 makes it `None` without a variable.
+/// The arena ceiling in MiB that the operator or the resource plan published, or
+/// `None` when none did. Without one ONNX Runtime keeps its own limit, the card.
+/// A number written here would be one nobody measured on this machine: 2048 was
+/// that number, and it could not hold the 4,23 GiB reranker.
 pub fn arena_limit_mb() -> Option<usize> {
-    Some(
-        crate::envs::alias("MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB", "CUBA_GPU_MEM_LIMIT_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2048),
-    )
+    crate::envs::alias("MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB", "CUBA_GPU_MEM_LIMIT_MB")
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
 }
 
 #[cfg(feature = "cuda")]
 fn cuda_provider() -> ort::ep::ExecutionProviderDispatch {
-    let limit_mb: usize =
-        crate::envs::alias("MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB", "CUBA_GPU_MEM_LIMIT_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2048);
+    let cuda = ort::ep::CUDA::default()
+        .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested);
+    let cuda = match arena_limit_mb() {
+        Some(mb) => cuda.with_memory_limit(mb * 1024 * 1024),
+        None => cuda,
+    };
 
-    ort::ep::CUDA::default()
-        .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
-        .with_memory_limit(limit_mb * 1024 * 1024)
-        .build()
+    cuda.build()
         // ORT defaults this to false and falls back to the CPU inside the
         // session, which is how a daemon ends up reporting a GPU it is not
         // using. Reaching here means the card and the provider libraries are
