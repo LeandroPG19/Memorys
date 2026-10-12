@@ -474,8 +474,12 @@ async fn failures_the_daemon_recorded(port: u16) -> u32 {
 }
 
 async fn refuses_connections(addr: SocketAddr) -> bool {
+    // Windows takes ~2 s to refuse a connect to a port with no listener (measured 2047 ms), and
+    // Linux refuses at once. 6 s gives Windows room to refuse on its own; a timer that fires first
+    // still counts as "not refused", because only a real `Err` from connect matches below.
+    const REFUSAL_WAIT: Duration = Duration::from_secs(6);
     matches!(
-        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await,
+        tokio::time::timeout(REFUSAL_WAIT, TcpStream::connect(addr)).await,
         Ok(Err(_))
     )
 }
