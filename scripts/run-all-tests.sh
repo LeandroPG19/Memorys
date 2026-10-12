@@ -463,6 +463,11 @@ inherit_gate_lock "$GATE_LOCK" || acquire_gate_lock "$GATE_LOCK" || exit 1
 [[ -z "$GATE_LOCK_HELD" ]] || exit_file_running
 trap on_exit EXIT
 
+# The three database URLs below are the live one with its last segment replaced;
+# gate-lock.sh refuses a URL for which that is not the database name. Under
+# merge-gate.sh this repeats its check, which costs nothing.
+gate_require_database_url "$LIVE_DATABASE_URL"
+
 # Under HOME/.cache and nowhere else, because that is where the binary keeps
 # them: envs::home() joins `.cache` to HOME, and nothing in the crate reads
 # XDG_CACHE_HOME. This used to honour it, as gpu-placement-check.sh did until

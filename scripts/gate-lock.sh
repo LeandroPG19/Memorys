@@ -323,12 +323,28 @@ gate_refuse() {
   exit 2
 }
 
-# W2, pass 1 of 2: a stand-in that refuses nothing, so the contract and the
-# fixtures fail on what they check and not on a missing function (bash says 127
-# for that, which is neither of the answers a guard gives). Pass 2 replaces it
-# with the rules.
+# run-all-tests.sh derives brain_gate, brain_gate_peer and postgres from
+# DATABASE_URL by replacing what follows its last slash (${url%/*}), which is only
+# right for postgresql://user:pass@host:port/<database> and nothing after it. A
+# `?host=` socket would send those names to another server, a `dbname=` in the
+# query would make the live corpus the throwaway database, and a URL with no
+# database would turn the host into one. So merge-gate.sh and a run-all-tests.sh
+# on its own refuse any other shape, with exit 2, before a single step runs.
+# The reason never carries the URL or a piece of it: the password can be in it.
 gate_require_database_url() {
-  return 0
+  local url="${1:-}" rest database
+  case "$url" in
+    postgresql://*|postgres://*) ;;
+    *) gate_refuse "DATABASE_URL has to be a postgresql:// (or postgres://) URL: the gate reads it with libpq and derives brain_gate from it, which a key=value string or another scheme does not allow." ;;
+  esac
+  if [[ "$url" == *\?* ]]; then
+    gate_refuse "DATABASE_URL carries a query (a '?'), and brain_gate is derived by replacing what follows its last '/', so the query would point the throwaway databases at another server or at the live one. Write a socket as the encoded host (postgresql://cuba@%2Frun%2Fpostgresql/brain) and the options in the environment (PGSSLMODE, ...), which libpq and sqlx both read."
+  fi
+  rest="${url#*://}"
+  database="${rest#*/}"
+  if [[ "$rest" != */* || -z "$database" || "$database" == */* ]]; then
+    gate_refuse "DATABASE_URL has to end in exactly one non-empty segment after the host, the database (postgresql://user:password@host:port/<database>). A '/', '?' or '@' inside the user or the password has to be encoded (%2F, %3F, %40)."
+  fi
 }
 
 gate_is_ram_backed() {

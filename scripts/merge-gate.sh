@@ -611,10 +611,28 @@ echo ""
 gate_linux_env
 
 export DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
+# A shape run-all-tests.sh cannot derive brain_gate from is refused here, before
+# libpq is asked, for the same reason gate-lock.sh gives: it would judge one
+# server ready and create the throwaway databases on another.
+gate_require_database_url "$DATABASE_URL"
 if command -v pg_isready >/dev/null 2>&1; then
-  pg_isready -h 127.0.0.1 -p 5488 -U cuba -d brain >/dev/null \
-    || { echo "FAIL: Postgres not ready on :5488"; exit 1; }
-  echo "OK  Postgres :5488"
+  # libpq reads the URL, so host, port, socket, IPv6 and PGPORT mean here what
+  # they mean to psql, pg_dump and sqlx, and the port printed is the one libpq
+  # went to ("<host>:<port> - <status>"; the port is after the LAST colon, for
+  # IPv6). Its stderr is dropped: libpq quotes the piece of the URL it cannot
+  # read, and that piece can be the password.
+  pg_rc=0
+  pg_answer="$(pg_isready -d "$DATABASE_URL" 2>/dev/null)" || pg_rc=$?
+  if (( pg_rc == 3 )); then
+    gate_refuse "pg_isready could not read DATABASE_URL, so no server was asked. Run pg_isready -d \"\$DATABASE_URL\" by hand to see libpq's own words (they can quote the password, so not in this log)."
+  fi
+  pg_port="${pg_answer% - *}"
+  pg_port="${pg_port##*:}"
+  [[ "$pg_answer" == *" - "* && "$pg_port" =~ ^[0-9]+$ ]] \
+    || gate_refuse "pg_isready answered '$pg_answer', which names no port, so this gate cannot say which server it asked. It will not guess one."
+  (( pg_rc == 0 )) \
+    || { echo "FAIL: Postgres not ready on :$pg_port (pg_isready: $pg_answer)"; exit 1; }
+  echo "OK  Postgres :$pg_port"
 else
   docker exec memory-industry-db pg_isready -U cuba -d brain >/dev/null \
     || docker exec cuba-memorys-db pg_isready -U cuba -d brain >/dev/null \
