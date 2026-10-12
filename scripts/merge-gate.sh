@@ -48,7 +48,19 @@ if [[ "${1:-}" == "--self-test" ]]; then
     printf '%s\n' '#!/bin/sh' \
       'echo "mutants caught=9 missed=1 timeout=0 unviable=0 kill_rate=0.900 min=0.800"' \
       >"$t/scripts/mutants-gate.sh"
-    printf '#!/bin/sh\nexit 0\n' >"$t/bin/pg_isready"
+    # pg_isready: the row picks what it answers on stdout, the line it writes on
+    # stderr and its exit code (FAKE_PG_ANSWER, FAKE_PG_EXIT, FAKE_PG_STDERR),
+    # and each call leaves its arguments, one per line, in $HOME/pg_isready.args.
+    # Unless the row says otherwise it answers as a server on the default port
+    # does, and its stderr carries a word that no line of the gate's output may
+    # carry: libpq quotes the piece of the URL it cannot read, and that piece
+    # can be the password.
+    printf '%s\n' '#!/bin/sh' \
+      'for a in "$@"; do printf "%s\n" "$a"; done >>"$HOME/pg_isready.args"' \
+      'echo "${FAKE_PG_STDERR-pg_isready: stderr noise carrying S3cr3tW2}" >&2' \
+      'answer="${FAKE_PG_ANSWER-127.0.0.1:5488 - accepting connections}"' \
+      '[ -z "$answer" ] || echo "$answer"' \
+      'exit "${FAKE_PG_EXIT:-0}"' >"$t/bin/pg_isready"
     # gate_linux_env reads the version of node, and package.json says which one
     # is the oldest the gate accepts.
     printf '#!/bin/sh\necho v20.0.0\n' >"$t/bin/node"
@@ -61,9 +73,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
     chmod +x "$t"/scripts/*.sh "$t"/bin/*
     printf '0\n' >"$t/home/.cache/cuba-gate/run.exit"
   }
-  # run_copy NAME [FAIL_AT]: the copy's exit code lands in $rc. The braces
-  # keep bash's own "Killed" job notice, for the fixture that kills the copy,
-  # off this script's stderr; everything the copy prints is in NAME.out.
+  # run_copy NAME [FAIL_AT [VAR=value ...]]: the copy's exit code lands in $rc.
+  # The braces keep bash's own "Killed" job notice, for the fixture that kills
+  # the copy, off this script's stderr; everything the copy prints is in
+  # NAME.out. The VAR=value pairs reach the copy as they are. DATABASE_URL is
+  # never inherited from whoever runs this test, so that no row's verdict
+  # depends on the shell it was started from: a row that needs one names it,
+  # and VAR= defines it empty.
   # git's own directory is on the copy's PATH: on Git Bash it is /mingw64/bin,
   # not /usr/bin. It runs with a scratch global config, so nobody's signing or
   # hooks settings reach the fixture repos.
@@ -75,10 +91,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
   git config --global init.defaultBranch main
   git config --global core.autocrlf false
   run_copy() {
+    local name="$1" fail_at="${2:-}"
+    shift $(( $# > 1 ? 2 : 1 ))
     rc=0
-    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/$1/home" \
-        PATH="$tmp/$1/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="${2:-}" \
-        "$BASH" "$tmp/$1/scripts/merge-gate.sh" >"$tmp/$1.out" 2>&1 || rc=$?; } 2>/dev/null
+    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/$name/home" \
+        PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" "$@" \
+        "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 || rc=$?; } 2>/dev/null
   }
   exit_file() { cat "$tmp/$1/home/.cache/cuba-gate/run.exit" 2>/dev/null || true; }
   # git_tree NAME RUN_ALL_TESTS_BODY: a fake_tree committed whole, its home
@@ -193,6 +211,157 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ -z "$(receipts_of reddened)" ]] \
     || self_fail "a red gate on $sha left the receipt of an earlier pass on it: $(receipts_of reddened)"
 
+  # The readiness check: libpq reads DATABASE_URL, and the gate says which port
+  # it answered on. With WSL2 in mirrored mode the localhost:5488 of Windows is
+  # the live corpus of WSL, so a check that asked :5488 whatever the URL said
+  # judged the wrong server and still printed an OK. Each row is a copy of the
+  # gate whose run-all-tests.sh stand-in prints a marker, so "what came next" and
+  # "it never ran" can be read, and whose pg_isready stand-in (fake_tree) answers
+  # what the row says and records what it was asked.
+  ran_marker='stand-in run-all-tests: the next step ran'
+  pg_args() { cat "$tmp/$1/home/pg_isready.args" 2>/dev/null || true; }
+  # pg_stopped NAME CODE [PASSWORD]: the gate stopped with CODE, never reached
+  # the next step, wrote CODE in its own exit file, freed its lock, and nothing
+  # it printed carries the stand-in's stderr word or the URL's password.
+  pg_stopped() {
+    local name="$1" want="$2" password="${3:-}"
+    (( rc == want )) || self_fail "$name: the gate exited $rc, not $want: $(cat "$tmp/$name.out")"
+    if grep -qF "$ran_marker" "$tmp/$name.out"; then
+      self_fail "$name: the gate went on to run-all-tests.sh: $(cat "$tmp/$name.out")"
+    fi
+    [[ "$(exit_file "$name")" == "$want" ]] \
+      || self_fail "$name: the exit file says '$(exit_file "$name")', not $want"
+    [[ ! -e "$tmp/$name/home/.cache/cuba-gate/lock" ]] || self_fail "$name: the gate left its lock behind"
+    if grep -q 'S3cr3tW2' "$tmp/$name.out"; then
+      self_fail "$name: what the gate printed carries S3cr3tW2: $(cat "$tmp/$name.out")"
+    fi
+    if [[ -n "$password" ]] && grep -qF "$password" "$tmp/$name.out"; then
+      self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
+    fi
+  }
+  # pg_green NAME URL ANSWER PORT PASSWORD: URL is what the row defines as
+  # DATABASE_URL, or `unset` and `empty` for the gate's own default. pg_isready
+  # gets exactly -d and that URL, and the line after the banner is the OK for
+  # PORT, the one pg_isready's ANSWER names, with nothing printed in between.
+  pg_green() {
+    local name="$1" url="$2" answer="$3" port="$4" password="$5" i at=-1
+    local default_url='postgresql://cuba:memorys2026@127.0.0.1:5488/brain' want="$2"
+    local -a lines var=()
+    case "$url" in
+      unset) want="$default_url" ;;
+      empty)
+        want="$default_url"
+        var=(DATABASE_URL=)
+        ;;
+      *) var=(DATABASE_URL="$url") ;;
+    esac
+    fake_tree "$name" "echo \"$ran_marker\""
+    run_copy "$name" "" FAKE_PG_ANSWER="$answer" ${var[@]+"${var[@]}"}
+    (( rc == 0 )) || self_fail "$name: a gate whose pg_isready answered '$answer' exited $rc: $(cat "$tmp/$name.out")"
+    [[ "$(pg_args "$name")" == $'-d\n'"$want" ]] \
+      || self_fail "$name: pg_isready was called with '$(pg_args "$name" | tr '\n' ' ')', not with exactly -d and DATABASE_URL as it is ('$want')"
+    mapfile -t lines < <(tr -d '\r' <"$tmp/$name.out")
+    for i in "${!lines[@]}"; do
+      if [[ "${lines[i]}" == "OK  Postgres :"* ]]; then
+        at=$i
+        break
+      fi
+    done
+    (( at >= 2 )) || self_fail "$name: no 'OK  Postgres :<port>' line after the banner: $(cat "$tmp/$name.out")"
+    [[ "${lines[at]}" == "OK  Postgres :$port" ]] \
+      || self_fail "$name: the line said '${lines[at]}', not the port pg_isready answered on ($port)"
+    [[ -z "${lines[at-1]}" && "${lines[at-2]}" == *"a second time."* ]] \
+      || self_fail "$name: something was printed between the banner and the OK line: '${lines[at-2]}' / '${lines[at-1]}'"
+    [[ "${lines[at+1]:-}" == "$ran_marker" ]] \
+      || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the first one of the next step"
+    if grep -qxF "$answer" "$tmp/$name.out"; then
+      self_fail "$name: pg_isready's own answer is a line of the output: $(cat "$tmp/$name.out")"
+    fi
+    if [[ "$port" != 5488 ]] && grep -q ':5488' "$tmp/$name.out"; then
+      self_fail "$name: the output names :5488, and the server answered on :$port: $(cat "$tmp/$name.out")"
+    fi
+    if grep -q 'S3cr3tW2' "$tmp/$name.out"; then
+      self_fail "$name: what the gate printed carries the stand-in's stderr: $(cat "$tmp/$name.out")"
+    fi
+    if [[ -n "$password" ]] && grep -qF "$password" "$tmp/$name.out"; then
+      self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
+    fi
+  }
+  pg_green pg_default unset "127.0.0.1:5488 - accepting connections" 5488 memorys2026
+  pg_green pg_empty empty "127.0.0.1:5488 - accepting connections" 5488 memorys2026
+  pg_green pg_port 'postgresql://gate:pw0@127.0.0.1:5575/brain' \
+    "127.0.0.1:5575 - accepting connections" 5575 pw0
+  # No port in the URL: it is libpq that puts 5432 (or PGPORT), not the gate.
+  pg_green pg_postgres_scheme 'postgres://gate:pw0@db.example.invalid/brain' \
+    "db.example.invalid:5432 - accepting connections" 5432 pw0
+  pg_green pg_encoded 'postgresql://ga%40te:p%40ss%2Fw%3Frd@127.0.0.1:6543/brain' \
+    "127.0.0.1:6543 - accepting connections" 6543 'p%40ss%2Fw%3Frd'
+  pg_green pg_socket 'postgresql://gate@%2Frun%2Fpostgresql:5433/brain' \
+    "/run/postgresql:5433 - accepting connections" 5433 ''
+  pg_green pg_ipv6 'postgresql://gate:pw0@[::1]:5434/brain' \
+    "::1:5434 - accepting connections" 5434 pw0
+
+  # Nothing answers on the port of the URL: the gate says which one, with what
+  # libpq said, and stops with 1.
+  fake_tree pg_down "echo \"$ran_marker\""
+  run_copy pg_down "" DATABASE_URL='postgresql://gate:pw0@127.0.0.1:5575/brain' \
+    FAKE_PG_ANSWER='127.0.0.1:5575 - no response' FAKE_PG_EXIT=2
+  pg_stopped pg_down 1 pw0
+  grep -qxF 'FAIL: Postgres not ready on :5575 (pg_isready: 127.0.0.1:5575 - no response)' "$tmp/pg_down.out" \
+    || self_fail "a Postgres that did not answer was not named with the port of the URL and libpq's own answer: $(cat "$tmp/pg_down.out")"
+  if grep -q ':5488' "$tmp/pg_down.out"; then
+    self_fail "the refusal for :5575 names :5488: $(cat "$tmp/pg_down.out")"
+  fi
+
+  # libpq cannot read the URL: pg_isready exits 3 and its stderr quotes the piece
+  # it could not read, which here is the password. The gate says that it could
+  # not read DATABASE_URL and how to see libpq's own words, and says nothing of
+  # the URL.
+  fake_tree pg_unreadable "echo \"$ran_marker\""
+  run_copy pg_unreadable "" DATABASE_URL='postgresql://gate:S3cr3tW2%zz@127.0.0.1:5575/brain' \
+    FAKE_PG_ANSWER= FAKE_PG_EXIT=3 \
+    FAKE_PG_STDERR='pg_isready: error: invalid percent-encoded token: "S3cr3tW2%zz"'
+  pg_stopped pg_unreadable 2
+  grep -q '^FAIL: ' "$tmp/pg_unreadable.out" \
+    || self_fail "a gate whose pg_isready could not read DATABASE_URL did not refuse in a FAIL line: $(cat "$tmp/pg_unreadable.out")"
+  grep -qF 'pg_isready -d "$DATABASE_URL"' "$tmp/pg_unreadable.out" \
+    || self_fail "the refusal did not say how to see libpq's own words: $(cat "$tmp/pg_unreadable.out")"
+
+  # An answer with no port in it: the gate does not know which server answered,
+  # and does not guess the one it used to ask.
+  fake_tree pg_no_port "echo \"$ran_marker\""
+  run_copy pg_no_port "" DATABASE_URL='postgresql://gate:pw0@127.0.0.1:abc/brain' \
+    FAKE_PG_ANSWER='127.0.0.1:abc - no response' FAKE_PG_EXIT=2
+  pg_stopped pg_no_port 2 pw0
+  grep -Eq "[\"']127\.0\.0\.1:abc - no response[\"']" "$tmp/pg_no_port.out" \
+    || self_fail "the refusal for an answer with no port did not quote the answer: $(cat "$tmp/pg_no_port.out")"
+  if grep -q ':5488' "$tmp/pg_no_port.out"; then
+    self_fail "an answer with no port was read as :5488: $(cat "$tmp/pg_no_port.out")"
+  fi
+
+  # A URL the gate cannot derive brain_gate from (run-all-tests.sh builds that
+  # URL by replacing what follows the last slash): refused with 2 before
+  # pg_isready is asked, and the reason carries none of the URL.
+  # pg_refused NAME URL WORD...: every WORD is in what the gate printed.
+  pg_refused() {
+    local name="$1" url="$2" word
+    shift 2
+    fake_tree "$name" "echo \"$ran_marker\""
+    run_copy "$name" "" DATABASE_URL="$url"
+    pg_stopped "$name" 2
+    grep -q '^FAIL: ' "$tmp/$name.out" \
+      || self_fail "$name: the refusal is not a FAIL line: $(cat "$tmp/$name.out")"
+    [[ ! -e "$tmp/$name/home/pg_isready.args" ]] \
+      || self_fail "$name: pg_isready was asked about a URL the gate cannot derive brain_gate from: $(pg_args "$name")"
+    for word in "$@"; do
+      grep -qF -- "$word" "$tmp/$name.out" \
+        || self_fail "$name: the refusal does not say '$word': $(cat "$tmp/$name.out")"
+    done
+  }
+  pg_refused pg_query 'postgresql://gate:S3cr3tW2@/brain?host=%2Frun%2Fpostgresql' '%2F'
+  pg_refused pg_no_db 'postgresql://gate:S3cr3tW2@127.0.0.1:5575' '%2F' '%3F' '%40'
+  pg_refused pg_conninfo 'host=127.0.0.1 port=5575 dbname=brain password=S3cr3tW2' 'postgresql://'
+
   # gate_linux_env (gate-lock.sh): what a gate run on Linux hands to cargo, to the
   # mutation tool and to node. Each row runs it in a fresh bash with an empty
   # environment but HOME and a PATH of stand-ins, so every answer comes from the
@@ -206,11 +375,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '#!/bin/sh\necho "${FAKE_NODE:-v20.0.0}"\n' >"$tmp/env/bin/node"
   chmod +x "$tmp"/env/bin/*
   cp "$tmp/env/bin/uname" "$tmp/env/bin/stat" "$tmp/env/bare/"
-  # Envoltorios y no enlaces: Git Bash, sin MSYS=winsymlinks, hace que `ln -s`
-  # COPIE el .exe, y un binario MSYS copiado fuera de /usr/bin no encuentra
-  # msys-2.0.dll. dirname moría, GATE_REPO_ROOT quedaba en `/`, y la fila sin node
-  # rechazaba por «//package.json» en vez de por node (medido 2026-10-12). Un PATH
-  # con los directorios reales tampoco vale: en Linux /usr/bin puede tener node.
+  # Wrappers, not links: on Git Bash, without MSYS=winsymlinks, `ln -s` COPIES
+  # the .exe, and an MSYS binary copied outside /usr/bin cannot find
+  # msys-2.0.dll. dirname died, GATE_REPO_ROOT ended up as `/`, and the row
+  # without node was refused for "//package.json" instead of for node (measured
+  # on Windows, 2026-10-12). A PATH of the real directories would not do either:
+  # on Linux /usr/bin may hold a node.
   for tool in dirname sed head mkdir; do
     path="$(command -v "$tool")"
     [[ "$path" == /* ]] || self_fail "env/bare needs $tool as a program on PATH, and command -v said '$path'"
@@ -290,7 +460,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "    gate_linux_env keeps a CARGO_TARGET_DIR that was set and otherwise puts it"
   echo "    outside the tree, moves a TMPDIR that is unset or tmpfs under the cache, keeps"
   echo "    one on a disk, refuses with 2 a node that is missing, older than engines.node"
-  echo "    or unreadable, and does nothing off Linux"
+  echo "    or unreadable, and does nothing off Linux. In the gate itself"
+  echo "    the readiness check hands DATABASE_URL to pg_isready -d as it is, names the"
+  echo "    port libpq answered on, stops with 1 when nothing answers and with 2 when"
+  echo "    libpq cannot read the URL or its answer has no port, never prints what libpq"
+  echo "    wrote about the URL, and refuses with 2, before asking, a URL that"
+  echo "    brain_gate cannot be derived from"
   exit 0
 fi
 

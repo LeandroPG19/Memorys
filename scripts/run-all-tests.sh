@@ -280,7 +280,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   mkdir -p "$tmp/home/.cache/cuba-gate/lock"
   printf '%s\n' "$live_record" >"$tmp/home/.cache/cuba-gate/lock/owner"
   second_exit=0
-  env -u CUBA_GATE_EXIT_FILE HOME="$tmp/home" PATH="/usr/bin:/bin" \
+  env -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/home" PATH="/usr/bin:/bin" \
       CUBA_GATE_LOCK_OWNER="$live_record" \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$ROOT/scripts/run-all-tests.sh" >"$tmp/second.out" 2>&1 || second_exit=$?
@@ -293,7 +293,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # merge-gate.sh as the second gate: refused before it has checked, backed
   # up or built anything.
   second_exit=0
-  env -u CUBA_GATE_LOCK_OWNER HOME="$tmp/home" PATH="/usr/bin:/bin" \
+  env -u CUBA_GATE_LOCK_OWNER -u DATABASE_URL HOME="$tmp/home" PATH="/usr/bin:/bin" \
       "$BASH" "$ROOT/scripts/merge-gate.sh" >"$tmp/merge-second.out" 2>&1 || second_exit=$?
   grep -q "another gate is running: pid $live" "$tmp/merge-second.out" \
     || self_fail "a second merge-gate did not refuse at once, naming the first (exit $second_exit): $(cat "$tmp/merge-second.out")"
@@ -315,7 +315,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # it starts and writes the whole gate's verdict when it ends.
   mkdir -p "$tmp/home2/.cache/cuba-gate" "$tmp/bin"
   printf '0\n' >"$tmp/home2/.cache/cuba-gate/run.exit"
-  printf '#!/bin/sh\nexit 0\n' >"$tmp/bin/pg_isready"
+  # merge-gate.sh reads the answer of pg_isready for the port it prints, so the
+  # stand-in answers the way a server on the default port does.
+  printf '#!/bin/sh\necho "127.0.0.1:5488 - accepting connections"\nexit 0\n' >"$tmp/bin/pg_isready"
   printf '#!/bin/sh\nexit 1\n' >"$tmp/bin/psql"
   # merge-gate.sh asks for a node as new as package.json says before its first step.
   printf '#!/bin/sh\necho v20.0.0\n' >"$tmp/bin/node"
@@ -327,7 +329,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     'exit 1' >"$tmp/bin/cargo"
   chmod +x "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin/cargo" "$tmp/bin/node"
   held_exit=0
-  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home2" \
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/home2" \
       PATH="$tmp/bin:/usr/bin:/bin" SKIP_BACKUP=1 \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$ROOT/scripts/merge-gate.sh" >"$tmp/merge-held.out" 2>&1 || held_exit=$?
@@ -353,7 +355,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   mkdir -p "$tmp/home3/.cache/cuba-gate"
   printf '0\n' >"$tmp/home3/.cache/cuba-gate/run.exit"
   alone_exit=0
-  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home3" \
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/home3" \
       PATH="$tmp/bin:/usr/bin:/bin" \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$ROOT/scripts/run-all-tests.sh" >"$tmp/alone.out" 2>&1 || alone_exit=$?
@@ -377,7 +379,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     'kill -9 "$(printf "%s\n" "$CUBA_GATE_LOCK_OWNER" | sed -n "s/^pid=\([0-9]*\) .*/\1/p")"' \
     'exit 1' >"$tmp/bin4/cargo"
   chmod +x "$tmp/bin4/cargo"
-  { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home4" \
+  { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/home4" \
       PATH="$tmp/bin4:/usr/bin:/bin" SKIP_BACKUP=1 \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$ROOT/scripts/merge-gate.sh" >"$tmp/merge-killed.out" 2>&1 || true; } 2>/dev/null
@@ -404,7 +406,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     'exit 1' >"$tmp/bin5/cargo"
   chmod +x "$tmp/bin5/cargo"
   cache_exit=0
-  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u ONNX_MODEL_PATH \
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u ONNX_MODEL_PATH -u DATABASE_URL \
       HOME="$tmp/home5" XDG_CACHE_HOME="$tmp/xdg5" \
       PATH="$tmp/bin5:/usr/bin:/bin" \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
@@ -412,12 +414,47 @@ if [[ "${1:-}" == "--self-test" ]]; then
   grep -qxF "stand-in cargo: ONNX_MODEL_PATH=$tmp/home5/.cache/cuba-memorys/models" "$tmp/cache.out" \
     || self_fail "with XDG_CACHE_HOME set, the gate looked for the models where the binary does not (exit $cache_exit): $(grep 'ONNX_MODEL_PATH=' "$tmp/cache.out" || cat "$tmp/cache.out")"
 
+  # The script launched on its own derives brain_gate, brain_gate_peer and
+  # postgres from DATABASE_URL by replacing what follows its last slash. A URL
+  # that ends in a query (here the socket given as ?host=) puts those names on
+  # another server, or on the live corpus, so it is refused with 2 before any
+  # step runs: the stand-in psql and cargo record every call, and neither may
+  # have been called. The exit file starts at 0, as an earlier green gate would
+  # have left it, and must end at 2 with the lock released.
+  mkdir -p "$tmp/home6/.cache/cuba-gate" "$tmp/bin6"
+  printf '0\n' >"$tmp/home6/.cache/cuba-gate/run.exit"
+  printf '%s\n' '#!/bin/sh' 'echo psql >>"$HOME/tools.calls"' 'exit 1' >"$tmp/bin6/psql"
+  printf '%s\n' '#!/bin/sh' 'echo cargo >>"$HOME/tools.calls"' 'exit 1' >"$tmp/bin6/cargo"
+  chmod +x "$tmp/bin6/psql" "$tmp/bin6/cargo"
+  query_exit=0
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE \
+      HOME="$tmp/home6" PATH="$tmp/bin6:/usr/bin:/bin" \
+      DATABASE_URL='postgresql://gate:S3cr3tW2@/brain?host=%2Frun%2Fpostgresql' \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      "$BASH" "$ROOT/scripts/run-all-tests.sh" >"$tmp/query.out" 2>&1 || query_exit=$?
+  (( query_exit == 2 )) \
+    || self_fail "run-all-tests.sh alone exited $query_exit, not 2, over a DATABASE_URL that ends in a query: $(cat "$tmp/query.out")"
+  grep -q '^FAIL: ' "$tmp/query.out" \
+    || self_fail "the refusal of a DATABASE_URL with a query is not a FAIL line: $(cat "$tmp/query.out")"
+  grep -qF '%2F' "$tmp/query.out" \
+    || self_fail "the refusal does not say how the socket is written without a query (%2F in the host): $(cat "$tmp/query.out")"
+  [[ ! -e "$tmp/home6/tools.calls" ]] \
+    || self_fail "a DATABASE_URL it cannot derive brain_gate from reached a step, and called: $(cat "$tmp/home6/tools.calls")"
+  if grep -q 'S3cr3tW2' "$tmp/query.out"; then
+    self_fail "the refusal carries the password of DATABASE_URL: $(cat "$tmp/query.out")"
+  fi
+  [[ "$(cat "$tmp/home6/.cache/cuba-gate/run.exit" 2>/dev/null)" == 2 ]] \
+    || self_fail "the refusal exited 2 and its exit file says '$(cat "$tmp/home6/.cache/cuba-gate/run.exit" 2>/dev/null)'"
+  [[ ! -e "$tmp/home6/.cache/cuba-gate/lock" ]] || self_fail "the refusal left its lock behind"
+
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
   echo "    else; the run-all-tests.sh merge-gate launches works under its lock and"
   echo "    leaves the exit file to it; a dead or reused-pid lock is taken over, a"
   echo "    foreign one is not; an exit drops only the databases whose record is"
-  echo "    still its own; the models are looked for under HOME/.cache, where the"
+  echo "    still its own; a run on its own"
+  echo "    refuses a DATABASE_URL it cannot derive brain_gate from, before any step;"
+  echo "    the models are looked for under HOME/.cache, where the"
   echo "    binary keeps them, whatever XDG_CACHE_HOME says"
   exit 0
 fi

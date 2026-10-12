@@ -323,6 +323,14 @@ gate_refuse() {
   exit 2
 }
 
+# W2, pass 1 of 2: a stand-in that refuses nothing, so the contract and the
+# fixtures fail on what they check and not on a missing function (bash says 127
+# for that, which is neither of the answers a guard gives). Pass 2 replaces it
+# with the rules.
+gate_require_database_url() {
+  return 0
+}
+
 gate_is_ram_backed() {
   case "$(stat -f -c %T "$1" 2>/dev/null || true)" in
     tmpfs|ramfs) return 0 ;;
