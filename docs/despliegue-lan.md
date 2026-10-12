@@ -251,6 +251,13 @@ the firewall rule. Without `--register` it only prints the commands it would
 have run. Without an elevated shell, `--register` refuses and says which right
 is missing; it never half-installs.
 
+Run `memory-industry doctor` with **the same account that ran `setup service`**.
+The three files live under that account's `%LOCALAPPDATA%`, and `doctor` reads
+them from the `%LOCALAPPDATA%` of whoever runs it: if IT installed the service
+with its own administrator account and an operator runs `doctor` from theirs, it
+says there is no service install under the operator's profile — the service is
+running, `doctor` is looking in another user's folder.
+
 What the task does, and what it implies:
 
 - It starts **at boot**, with nobody logged in, and again at logon; every five
@@ -498,6 +505,8 @@ and a count of the silent addresses it left out.
     madre: 192.168.0.10:8787 (huella 5F3A-91C2-77D0-AB14)
 
 The report never contains the credential.
+
+On a Windows client the word for a host that does not answer can read `tiempo agotado` where the example above shows `conexión rechazada o sin ruta`: Windows refuses a connection to a port where nobody listens after about two seconds, and the bridge gives up at two. It is the same fact — that address did not answer — and either word means the same next step (is the host up, is the firewall rule there, did its address change). It was measured on loopback only; the remote case is scenario M2.
 
 ### What the proof of identity does and does not cover
 
