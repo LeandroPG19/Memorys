@@ -206,9 +206,17 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '#!/bin/sh\necho "${FAKE_NODE:-v20.0.0}"\n' >"$tmp/env/bin/node"
   chmod +x "$tmp"/env/bin/*
   cp "$tmp/env/bin/uname" "$tmp/env/bin/stat" "$tmp/env/bare/"
+  # Envoltorios y no enlaces: Git Bash, sin MSYS=winsymlinks, hace que `ln -s`
+  # COPIE el .exe, y un binario MSYS copiado fuera de /usr/bin no encuentra
+  # msys-2.0.dll. dirname moría, GATE_REPO_ROOT quedaba en `/`, y la fila sin node
+  # rechazaba por «//package.json» en vez de por node (medido 2026-10-12). Un PATH
+  # con los directorios reales tampoco vale: en Linux /usr/bin puede tener node.
   for tool in dirname sed head mkdir; do
-    ln -s "$(command -v "$tool")" "$tmp/env/bare/$tool"
+    path="$(command -v "$tool")"
+    [[ "$path" == /* ]] || self_fail "env/bare needs $tool as a program on PATH, and command -v said '$path'"
+    printf '#!/bin/sh\nexec "%s" "$@"\n' "$path" >"$tmp/env/bare/$tool"
   done
+  chmod +x "$tmp"/env/bare/*
   # env_run NAME [VAR=value ...]: $rc is the exit code of gate_linux_env, NAME.out
   # what it printed and then the two variables it leaves behind.
   env_run() {
