@@ -243,6 +243,18 @@ fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionB
         .map_err(|e| anyhow::anyhow!("registrando CPU execution provider: {e}"))
 }
 
+/// The one reading of the arena ceiling. Pass 1 of W5 keeps today's behaviour
+/// (a fixed 2048 MiB when nothing is set, no `trim`) so the tests next to it are
+/// red for the right reason; pass 2 makes it `None` without a variable.
+pub fn arena_limit_mb() -> Option<usize> {
+    Some(
+        crate::envs::alias("MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB", "CUBA_GPU_MEM_LIMIT_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048),
+    )
+}
+
 #[cfg(feature = "cuda")]
 fn cuda_provider() -> ort::ep::ExecutionProviderDispatch {
     let limit_mb: usize =
@@ -1159,6 +1171,133 @@ mod placement_tests {
              registry. Without it `/health` and `doctor` go on reporting the device that was \
              asked for on a session that opened on the other one, which is the defect W1 exists \
              to stop"
+        );
+    }
+
+    /// Without a plan nothing measured this card, so this crate has no number of
+    /// its own to put on the arena. The constant that used to stand in for one
+    /// (2048 MiB) was calibrated for `NextPowerOfTwo` growth, which
+    /// `SameAsRequested` replaced; kept, it made the real reranker (4.23 GiB of
+    /// weights) fail inside `commit_from_file` on every machine that opens it
+    /// without `main`, which is every test, example and library user. Through
+    /// the daemon `resources::apply` publishes the measured ceiling under the
+    /// legacy name, and the `legacy` rows below are what keep that path alive.
+    #[tokio::test]
+    async fn without_a_published_plan_the_arena_has_no_ceiling_of_ours() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        const PREFERRED: &str = "MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB";
+        const LEGACY: &str = "CUBA_GPU_MEM_LIMIT_MB";
+
+        // (preferred, legacy, wanted, why).
+        let table: [(Option<&str>, Option<&str>, Option<usize>, &str); 7] = [
+            (
+                None,
+                None,
+                None,
+                "no variable means no plan ran, and then nobody measured this card. Some(2048) is a \
+                 number from another machine, and it is the one that makes the reranker fail \
+                 inside the BFCArena",
+            ),
+            (
+                Some("6000"),
+                None,
+                Some(6000),
+                "the documented name has to be honoured: this is the control that the reader \
+                 reads the variables at all",
+            ),
+            (
+                None,
+                Some("6000"),
+                Some(6000),
+                "`resources::apply` publishes the planned ceiling under the legacy name. A reader \
+                 that only looked at the preferred one would drop the daemon's ceiling",
+            ),
+            (
+                Some("7000"),
+                Some("512"),
+                Some(7000),
+                "the preferred name wins when both are set, the same precedence `apply` uses",
+            ),
+            (
+                Some(" 9000 "),
+                None,
+                Some(9000),
+                "`resources::apply` trims before it parses, so the same text has to be a ceiling \
+                 for the session too. Two readers of one variable cannot disagree",
+            ),
+            (
+                Some("lots"),
+                None,
+                None,
+                "an unreadable value is not a ceiling. It used to fall back to 2048 without a \
+                 word",
+            ),
+            (
+                None,
+                Some("lots"),
+                None,
+                "the same holds through the legacy name",
+            ),
+        ];
+
+        assert!(
+            table.iter().any(|(_, _, wanted, _)| wanted.is_none())
+                && table.iter().any(|(_, _, wanted, _)| wanted.is_some()),
+            "the table has to carry both answers. With every row expecting the same one the \
+             reader could be a constant and the table would still be green"
+        );
+
+        for (preferred, legacy, wanted, why) in table {
+            let _cleared = [ScopedEnv::cleared(PREFERRED), ScopedEnv::cleared(LEGACY)];
+            let _set: Vec<ScopedEnv> = [(PREFERRED, preferred), (LEGACY, legacy)]
+                .into_iter()
+                .filter_map(|(name, value)| value.map(|v| ScopedEnv::set(name, v)))
+                .collect();
+
+            assert_eq!(
+                arena_limit_mb(),
+                wanted,
+                "{PREFERRED}={preferred:?} {LEGACY}={legacy:?}: {why}"
+            );
+        }
+    }
+
+    /// Structural, like the one above for `error_on_failure`: `cuda_provider`
+    /// only compiles with `cuda` and only runs on a machine with a card, so
+    /// neither the mutation build nor the WSL2 judge ever executes it. What it
+    /// can be held to is where it gets its ceiling: from the one reader that
+    /// the table above judges, and never from a number of its own.
+    #[test]
+    fn the_cuda_provider_takes_its_ceiling_from_the_one_reader() {
+        let source = include_str!("gpu.rs");
+        let body = source
+            .split_once("fn cuda_provider()")
+            .expect("cuda_provider is in this file")
+            .1;
+        let body = body.split_once("\n}").expect("the function ends").0;
+
+        assert!(
+            body.contains("arena_limit_mb()"),
+            "cuda_provider has to ask `arena_limit_mb()` for its ceiling. Reading the variable \
+             by itself, or not reading it, leaves a second reader that the table in \
+             `without_a_published_plan_the_arena_has_no_ceiling_of_ours` does not judge"
+        );
+        assert!(
+            !body.contains("unwrap_or("),
+            "a default inside cuda_provider is a ceiling nobody measured on this card: that is \
+             the 2048 that made the real reranker fail in the BFCArena on every machine \
+             without a plan"
+        );
+        assert!(
+            body.contains("SameAsRequested"),
+            "with the extend strategy that grows by what is asked, a ceiling below what the \
+             model needs saves no memory and only moves the failure into the load"
+        );
+        assert!(
+            body.contains("error_on_failure()"),
+            "dropping this turns a provider that will not start into a silent CPU session \
+             again: the registration has to fail so `configure` can say so"
         );
     }
 

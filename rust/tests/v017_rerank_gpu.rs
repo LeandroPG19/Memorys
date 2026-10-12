@@ -177,13 +177,18 @@ fn is_configured_reports_whether_a_model_is_on_disk_without_loading_it() {
 #[tokio::test]
 #[ignore]
 async fn warming_up_leaves_the_reranker_ready() {
+    no_arena_ceiling_in_the_environment();
     assert!(
         memory_industry::search::rerank::is_configured(),
         "no reranker model on disk: this suite measures the model path and cannot report on it"
     );
     let started = std::time::Instant::now();
     let warm = memory_industry::search::rerank::warm_up().await;
-    assert!(warm, "a configured reranker must warm up successfully");
+    assert!(
+        warm,
+        "a configured reranker must warm up successfully, and it did not: {:?}",
+        memory_industry::search::rerank::failure_reason()
+    );
     assert!(
         memory_industry::search::rerank::enabled(),
         "after warm-up the reranker must report enabled, so searches take the model path"
@@ -216,9 +221,30 @@ async fn warming_up_leaves_the_reranker_ready() {
     eprintln!("warm-up took {:.2}s", started.elapsed().as_secs_f32());
 }
 
+/// The two tests below open the real reranker without `main`, so no plan
+/// published a ceiling for the arena and the crate adds none of its own. A
+/// ceiling left in the shell would load the model under somebody else's number
+/// and turn this into a BFCArena failure that reads like a product defect.
+///
+/// It only reads, and fails saying what to remove. Clearing the variable here
+/// would be a `set_var` racing the other test, and holding a lock across their
+/// `.await` is what `clippy::await_holding_lock` refuses.
+fn no_arena_ceiling_in_the_environment() {
+    for name in ["MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB", "CUBA_GPU_MEM_LIMIT_MB"] {
+        if let Some(value) = std::env::var_os(name) {
+            panic!(
+                "{name}={value:?} is set in this shell. This test measures the path with no \
+                 plan, where the arena has no ceiling of ours; with one set it would measure \
+                 somebody else's number. Remove it from the shell and run again"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn reranking_reorders_candidates_by_relevance() {
+    no_arena_ceiling_in_the_environment();
     assert!(
         memory_industry::search::rerank::is_configured(),
         "no reranker model on disk: this suite measures the model path and cannot report on it"
@@ -226,9 +252,10 @@ async fn reranking_reorders_candidates_by_relevance() {
     memory_industry::search::rerank::warm_up().await;
     assert!(
         memory_industry::search::rerank::enabled(),
-        "the reranker is configured but did not load. That is the failure this test exists to \
-         catch — the identity fallback returns the RRF order unchanged and every search looks \
-         like it worked"
+        "the reranker is configured but did not load: {:?}. That is the failure this test \
+         exists to catch — the identity fallback returns the RRF order unchanged and every \
+         search looks like it worked",
+        memory_industry::search::rerank::failure_reason()
     );
 
     let query = "how does the REM consolidation cycle decay old memories";
