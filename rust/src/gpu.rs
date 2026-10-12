@@ -164,9 +164,7 @@ where
     .collect();
 
     if providers.is_empty() {
-        let cpu = configure_cpu(builder, workload)?;
-        record(workload, Placement::Cpu);
-        return Ok(cpu);
+        return record_if_built(workload, Placement::Cpu, configure_cpu(builder, workload));
     }
 
     match builder.with_execution_providers(providers) {
@@ -193,9 +191,11 @@ where
                 error = %e,
                 "el provider GPU no inicializó pese a haber tarjeta y librerías: esta sesión corre en CPU. Revisá que las DLL/so de CUDA estén en PATH/LD_LIBRARY_PATH junto al runtime de ONNX"
             );
-            let cpu = configure_cpu(make_builder()?, workload)?;
-            record(workload, Placement::CpuAfterProviderFailed(e.to_string()));
-            Ok(cpu)
+            record_if_built(
+                workload,
+                Placement::CpuAfterProviderFailed(e.to_string()),
+                configure_cpu(make_builder()?, workload),
+            )
         }
     }
 }
@@ -224,9 +224,18 @@ fn fall_back_to_cpu(
             "se pidió GPU para este modelo y no está disponible — sigue en CPU"
         );
     }
-    let cpu = configure_cpu(builder, workload)?;
-    record(workload, Placement::Cpu);
-    Ok(cpu)
+    record_if_built(workload, Placement::Cpu, configure_cpu(builder, workload))
+}
+
+/// Annotates the placement only once the builder was configured: a builder that
+/// could not be configured is not a session that opened, and must not leave a
+/// `Cpu` behind for `/health` to report.
+fn record_if_built(
+    workload: Workload,
+    placement: Placement,
+    built: Result<SessionBuilder>,
+) -> Result<SessionBuilder> {
+    built.inspect(|_| record(workload, placement))
 }
 
 fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {
@@ -563,6 +572,13 @@ fn nvidia_driver_present() -> bool {
 mod placement_tests {
     use super::*;
     use crate::envs::{ScopedEnv, scratch_root};
+
+    type Row = (
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<usize>,
+        &'static str,
+    );
 
     /// Whether this binary can place anything on a card at all.
     ///
@@ -1186,7 +1202,7 @@ mod placement_tests {
         const LEGACY: &str = "CUBA_GPU_MEM_LIMIT_MB";
 
         // (preferred, legacy, wanted, why).
-        let table: [(Option<&str>, Option<&str>, Option<usize>, &str); 7] = [
+        let table: [Row; 7] = [
             (
                 None,
                 None,

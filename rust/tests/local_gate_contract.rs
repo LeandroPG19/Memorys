@@ -1559,14 +1559,14 @@ fn the_database_url_guard_refuses_what_the_gate_cannot_derive_brain_gate_from() 
         else {
             continue;
         };
-        if let (Ok(index), Ok(code)) = (index.parse::<usize>(), code.parse::<i32>()) {
-            if let Some(slot) = answers.get_mut(index) {
-                *slot = Some((
-                    code,
-                    said.trim_end_matches('~').to_string(),
-                    err.trim_end_matches('~').to_string(),
-                ));
-            }
+        if let (Ok(index), Ok(code)) = (index.parse::<usize>(), code.parse::<i32>())
+            && let Some(slot) = answers.get_mut(index)
+        {
+            *slot = Some((
+                code,
+                said.trim_end_matches('~').to_string(),
+                err.trim_end_matches('~').to_string(),
+            ));
         }
     }
 
