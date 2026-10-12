@@ -3667,18 +3667,32 @@ mod health_report_tests {
     /// sending the operator to `CUBA_RERANKER_PATH` would be the wrong knob.
     #[test]
     fn a_session_that_opened_on_the_cpu_after_the_provider_refused_says_why_without_its_path() {
-        const CANARY_USER: &str = "canaryoperator";
+        assert_provider_refusal_redacted("canaryoperator", &["canaryoperator"]);
+        // The same sentence with a user name that has spaces in it, which is what
+        // `C:\Users\<name>` is made of for anyone whose Windows account carries
+        // their full name. The canary above is one word, so a redaction that cut
+        // the sentence at its spaces never had a word between two separators to
+        // let through.
+        assert_provider_refusal_redacted(
+            "Canaryuno Canarydos Canarytres",
+            &["Canaryuno", "Canarydos", "Canarytres"],
+        );
+    }
+
+    /// One run of the caught case above for one operator name: `canaries` are the
+    /// words of `user`, and none of them may be served.
+    fn assert_provider_refusal_redacted(user: &str, canaries: &[&str]) {
         const RUNTIME_DIR: &str = "the ONNX Runtime directory (see ORT_DYLIB_PATH)";
-        let cause = provider_refusal(CANARY_USER);
+        let cause = provider_refusal(user);
 
         // Positive controls. Without them «the canary is not in the reason» also
         // passes on a reason that never carried the cause.
-        for needle in [
-            CANARY_USER,
+        let fixed_needles = [
             ".cache",
             "onnxruntime_providers_cuda.dll",
             "cublasLt64_12.dll",
-        ] {
+        ];
+        for needle in canaries.iter().chain(fixed_needles.iter()) {
             assert!(
                 cause.contains(needle),
                 "the fixture is broken: the sentence this test scrubs has no {needle:?} in it"
@@ -3701,12 +3715,27 @@ mod health_report_tests {
             ),
         ];
 
+        // The first path is cut at the `:` of `.cc:1962`: an unquoted path ends
+        // where its clause does, and what follows is the line number in ONNX
+        // Runtime's own source, from the machine Microsoft built it on.
         let expected = format!(
-            "the GPU provider did not start; this session runs on the CPU: {RUNTIME_DIR} \
+            "the GPU provider did not start; this session runs on the CPU: {RUNTIME_DIR}:1962 \
              onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading \
              {RUNTIME_DIR} which depends on \"cublasLt64_12.dll\" which is missing. (Error 126: \
              \"No se puede encontrar el módulo especificado.\")"
         );
+
+        // Beside the words of the operator's name: what is inventory about the
+        // machine whatever the name is, and the variables of the other models.
+        let fixed_leaks = [
+            ".cache",
+            "onnxruntime_providers_cuda.dll",
+            "C:\\Users",
+            "provider_bridge_ort.cc",
+            "CUBA_RERANKER_PATH",
+            "CUBA_NLI_PATH",
+            "ONNX_MODEL_PATH",
+        ];
 
         for (model, state) in &opened {
             assert_eq!(state.state, "loaded", "{model}");
@@ -3741,16 +3770,7 @@ mod health_report_tests {
                      {reason}"
                 );
             }
-            for leaked in [
-                CANARY_USER,
-                ".cache",
-                "onnxruntime_providers_cuda.dll",
-                "C:\\Users",
-                "provider_bridge_ort.cc",
-                "CUBA_RERANKER_PATH",
-                "CUBA_NLI_PATH",
-                "ONNX_MODEL_PATH",
-            ] {
+            for leaked in canaries.iter().chain(fixed_leaks.iter()) {
                 assert!(
                     !reason.contains(leaked),
                     "{model}: {leaked:?} reached the reason. The paths in this error are the \
@@ -3772,7 +3792,8 @@ mod health_report_tests {
             "positive control: the cause has to reach the served block at all, or every canary \
              below passes on a block that says nothing: {served}"
         );
-        for canary in [CANARY_USER, ".cache", "onnxruntime_providers_cuda.dll"] {
+        let fixed_served = [".cache", "onnxruntime_providers_cuda.dll"];
+        for canary in canaries.iter().chain(fixed_served.iter()) {
             assert!(
                 !served.contains(canary),
                 "{canary:?} was served in the runtime block: {served}"
@@ -3834,6 +3855,381 @@ mod health_report_tests {
                 !served.contains(canary),
                 "{canary:?} was served in the runtime block: {served}"
             );
+        }
+    }
+
+    /// What every row of the two tables below puts where a path was. It is the
+    /// runtime's, which is what the cause of a provider refusal is built from.
+    const TABLE_R: &str = "the ONNX Runtime directory (see ORT_DYLIB_PATH)";
+
+    /// The rows of a table written as a line with the id, then `IN :` and
+    /// `OUT:`, in the shape of the W6 specification. `<R>` in an output stands
+    /// for `TABLE_R` and `<NL>` for a line break, which a table that is one raw
+    /// string cannot carry any other way: a `\n` in it would be a backslash and
+    /// an `n`, and the Windows paths in these rows have plenty of those.
+    ///
+    /// The tables are a string and not an array of tuples so that no formatter
+    /// ever reflows a row: the exact text is the whole test.
+    fn table_rows(table: &str) -> Vec<(&str, String, String)> {
+        let mut rows = Vec::new();
+        let (mut id, mut input) = ("", String::new());
+        for line in table.lines() {
+            if let Some(text) = line.strip_prefix("IN : ") {
+                input = text.replace("<NL>", "\n");
+            } else if let Some(text) = line.strip_prefix("OUT: ") {
+                let output = text.replace("<NL>", "\n").replace("<R>", TABLE_R);
+                rows.push((id, input.clone(), output));
+            } else if !line.trim().is_empty() {
+                id = line.trim();
+            }
+        }
+        rows
+    }
+
+    /// A: the paths and the sentences that are redacted differently since W6.
+    /// U: sentences with no path in them, which must not change by a character.
+    /// K: what was already redacted well and must come out as it did.
+    ///
+    /// The ids are the specification's (§2.1 of the W6 handoff).
+    const REDACTION_TABLE: &str = r#"
+A1 ORT on Windows, the literal of 2026-10-12, a user name without spaces
+IN : E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Users\canaryoperator\.cache\cuba-memorys\onnxruntime\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+OUT: <R>:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading <R> which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+A2 the same, user "Juan Carlos Pérez"
+IN : E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Users\Juan Carlos Pérez\.cache\cuba-memorys\onnxruntime\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+OUT: <R>:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading <R> which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+A3 the same, under Program Files
+IN : E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+OUT: <R>:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading <R> which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+A4 Display without quotes, onnx.rs, Windows
+IN : loading ONNX Runtime from C:\Users\Juan Carlos Pérez\.cache\memory-industry\onnxruntime\onnxruntime.dll: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+A5 Windows with forward slashes
+IN : loading ONNX Runtime from C:/Users/Juan Carlos Pérez/.cache/memory-industry/onnxruntime/onnxruntime.dll: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+A6 Program Files without quotes
+IN : loading ONNX Runtime from C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\onnxruntime.dll: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+A7 Linux, libloading plus dlerror, two paths with spaces
+IN : loading ONNX Runtime from /home/juan carlos/.cache/memory-industry/onnxruntime/libonnxruntime.so: /home/juan carlos/.cache/memory-industry/onnxruntime/libonnxruntime.so: invalid ELF header
+OUT: loading ONNX Runtime from <R>: <R>: invalid ELF header
+A8 Linux, ORT, provider
+IN : Failed to load library /home/juan carlos/.cache/memory-industry/onnxruntime/libonnxruntime_providers_cuda.so with error: libcublasLt.so.12: cannot open shared object file: No such file or directory
+OUT: Failed to load library <R>: libcublasLt.so.12: cannot open shared object file: No such file or directory
+A9 Linux, cannot open the file itself
+IN : loading ONNX Runtime from /opt/memory industry/lib/libonnxruntime.so: /opt/memory industry/lib/libonnxruntime.so: cannot open shared object file: No such file or directory
+OUT: loading ONNX Runtime from <R>: <R>: cannot open shared object file: No such file or directory
+A10 UNC
+IN : loading ONNX Runtime from \\servidor\recurso\Juan Carlos\onnxruntime.dll: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+A11 verbatim \\?\
+IN : resolving the ONNX Runtime path \\?\C:\Users\Juan Carlos\ort\onnxruntime.dll: El sistema no puede encontrar la ruta especificada. (os error 3)
+OUT: resolving the ONNX Runtime path <R>: El sistema no puede encontrar la ruta especificada. (os error 3)
+A12a ~ with a slash
+IN : tokenizer.json not found at ~/Juan Carlos/models/tokenizer.json
+OUT: tokenizer.json not found at <R>
+A12b ~ with a backslash
+IN : tokenizer.json not found at ~\Juan Carlos\models\tokenizer.json
+OUT: tokenizer.json not found at <R>
+A13 single quotes
+IN : cannot open 'C:\Users\Juan Carlos\.cache\memory-industry\models\model.onnx': Acceso denegado. (os error 5)
+OUT: cannot open <R>: Acceso denegado. (os error 5)
+A14 backticks, ort lib.rs:107
+IN : failed to load from `C:\Users\Juan Carlos\.cache\memory-industry\onnxruntime\onnxruntime.dll`: LoadLibraryExW failed
+OUT: failed to load from <R>: LoadLibraryExW failed
+A15 Debug with spaces, nli.rs
+IN : no hay model.onnx ni model_quantized.onnx en "C:\\Users\\Juan Carlos Pérez\\.cache\\models-nli"
+OUT: no hay model.onnx ni model_quantized.onnx en <R>
+A16 an apostrophe in the name, no quotes
+IN : loading ONNX Runtime from C:\Users\O'Brien Smith\ort\onnxruntime.dll: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+A17 an apostrophe inside single quotes
+IN : cannot open 'C:\Users\O'Brien\x.dll': denied
+OUT: cannot open <R>: denied
+A18 the sentence of its own after the path is lost
+IN : the ONNX Runtime at C:\Users\Juan Carlos\ort\onnxruntime.dll is version 1.16.3, and this build needs 1.22 or newer: run `memory-industry models runtime` or point ORT_DYLIB_PATH at a newer library
+OUT: the ONNX Runtime at <R>: run `memory-industry models runtime` or point ORT_DYLIB_PATH at a newer library
+A19 ORT, Load model from ... failed: with no space after the colon
+IN : load model: Load model from C:\Users\Juan Carlos\.cache\memory-industry\models\model.onnx failed:Protobuf parsing failed.
+OUT: load model: Load model from <R>:Protobuf parsing failed.
+A20 a line break ends the clause
+IN : loading ONNX Runtime from /home/juan carlos/x/libonnxruntime.so<NL>second line
+OUT: loading ONNX Runtime from <R> second line
+A21 two paths in one clause
+IN : copy C:\a b\x.dll to D:\c d\y.dll: failed
+OUT: copy <R>: failed
+A22 the apostrophe of a word opens nothing
+IN : it doesn't load 'C:\x\y.dll' here
+OUT: it doesn't load <R> here
+A23 an unquoted path followed by a quoted name: the double quote ends the clause
+IN : Error loading C:\Users\Juan Carlos\.cache\x\onnxruntime_providers_cuda.dll which depends on "cublasLt64_12.dll" which is missing.
+OUT: Error loading <R> "cublasLt64_12.dll" which is missing.
+A24 the old form of ORT, with an empty ""
+IN : LoadLibrary failed with error 126 "" when trying to load "C:\Users\Juan Carlos\.cache\memory-industry\onnxruntime\onnxruntime_providers_cuda.dll"
+OUT: LoadLibrary failed with error 126 "" when trying to load <R>
+U1
+IN : the session did not open
+OUT: the session did not open
+U2
+IN : no model.onnx / model_quantized.onnx found
+OUT: no model.onnx / model_quantized.onnx found
+U3
+IN : onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error 126: "No se puede encontrar el módulo especificado."
+OUT: onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error 126: "No se puede encontrar el módulo especificado."
+U4
+IN : which depends on "cublasLt64_12.dll" which is missing.
+OUT: which depends on "cublasLt64_12.dll" which is missing.
+U5
+IN : run `memory-industry models runtime` or point ORT_DYLIB_PATH at a newer library
+OUT: run `memory-industry models runtime` or point ORT_DYLIB_PATH at a newer library
+U6
+IN : it doesn't open: it's 3:00
+OUT: it doesn't open: it's 3:00
+U7 quoted text needs a separator and an alphanumeric to be a path
+IN : see "/" here
+OUT: see "/" here
+K1 Debug without spaces, rerank.rs
+IN : no model.onnx / model_quantized.onnx found in "C:\\Users\\canaryoperator\\.cache\\memory-industry\\reranker"
+OUT: no model.onnx / model_quantized.onnx found in <R>
+K2 Debug without spaces, nli.rs
+IN : no hay model.onnx ni model_quantized.onnx en "C:\\Users\\canaryoperator\\.cache\\models-nli"
+OUT: no hay model.onnx ni model_quantized.onnx en <R>
+K3 Display at the end, onnx.rs
+IN : tokenizer.json not found at C:\Users\canaryoperator\.cache\models\tokenizer.json
+OUT: tokenizer.json not found at <R>
+K4 a relative path with no anchor: the word layer
+IN : load model: models/e5/model.onnx is truncated
+OUT: load model: <R> is truncated
+K5 a URL: the word layer
+IN : download from https://huggingface.co/intfloat/e5 failed
+OUT: download from <R> failed
+"#;
+
+    /// The redaction of one string as a table, so a row that moves is a row that
+    /// names itself. Today every A row differs from what the function did before
+    /// W6 except A22; the U and K rows are the guards that it did not start
+    /// swallowing what it used to leave alone.
+    #[test]
+    fn a_path_is_redacted_whole_whatever_its_spaces_quotes_or_root() {
+        let rows = table_rows(REDACTION_TABLE);
+        assert_eq!(
+            rows.len(),
+            37,
+            "the table lost a row: A1-A24 (A12 has two), U1-U7 and K1-K5. A table that quietly \
+             shrinks passes with whatever is left"
+        );
+
+        for (id, input, expected) in rows {
+            assert_eq!(
+                reason_without_a_model_path(&input, TABLE_R),
+                expected,
+                "{id}: the redaction of {input:?}"
+            );
+        }
+    }
+
+    /// The templates of the sentences ONNX Runtime, `libloading` and this crate
+    /// write around a path, and what each one must come out as. `{p}` is the
+    /// path, and `{p:?}` the path as `nli.rs` writes it, with the quotes and the
+    /// doubled backslashes of `Debug`.
+    const TEMPLATE_TABLE: &str = r#"
+P-T1
+IN : Error loading "{p}" which depends on "cublasLt64_12.dll" which is missing.
+OUT: Error loading <R> which depends on "cublasLt64_12.dll" which is missing.
+P-T2
+IN : cannot open '{p}': denied
+OUT: cannot open <R>: denied
+P-T3
+IN : failed to load from `{p}`: LoadLibraryExW failed
+OUT: failed to load from <R>: LoadLibraryExW failed
+P-T4
+IN : loading ONNX Runtime from {p}: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+P-T5
+IN : tokenizer.json not found at {p}
+OUT: tokenizer.json not found at <R>
+P-T6
+IN : load model: Load model from {p} failed:Protobuf parsing failed.
+OUT: load model: Load model from <R>:Protobuf parsing failed.
+P-T7
+IN : {p}: cannot open shared object file: No such file or directory
+OUT: <R>: cannot open shared object file: No such file or directory
+P-T8
+IN : no hay model.onnx ni model_quantized.onnx en {p:?}
+OUT: no hay model.onnx ni model_quantized.onnx en <R>
+"#;
+
+    /// The output may not depend on the path. Eight sentences by nine paths, and
+    /// each of the 72 has to come out as the sentence does, with nothing of the
+    /// path in it.
+    ///
+    /// Every component of every path carries `zq`, so «nothing of the path» is
+    /// one check. The last path is the one a rule of «up to the last word with a
+    /// separator» would let through: its final component has the space in it.
+    /// It is a product and not `proptest` on purpose: the crate does not use it,
+    /// and the part that varies is a handful of shapes, not a space of values.
+    #[test]
+    fn the_redacted_reason_does_not_depend_on_the_path() {
+        let paths = [
+            r"C:\Users\Zqa Zqb Zqc\.cache\zqd\onnxruntime_providers_cuda.dll",
+            r"C:\Program Files\Zqa Zqb Zqc\Zqd Zqe\zq.dll",
+            r"C:/Users/Zqa Zqb/zqc.dll",
+            r"\\Zqserver\Zqa Zqb\zq.dll",
+            r"\\?\C:\Users\Zqa Zqb\zq.dll",
+            "/home/zqa zqb zqc/.cache/zqd/libzq.so",
+            "~/Zqa Zqb/zq.so",
+            r"C:\Users\O'Zqa Zqb\zq.dll",
+            r"C:\Users\Zqa Zqb",
+        ];
+        let templates = table_rows(TEMPLATE_TABLE);
+        assert_eq!(
+            templates.len(),
+            8,
+            "the template table lost a row, and with it a third of what this test crosses"
+        );
+
+        for (name, template, expected) in &templates {
+            for path in paths {
+                let input = template
+                    .replace("{p:?}", &format!("{path:?}"))
+                    .replace("{p}", path);
+                // Positive control. Without it «nothing of the path is left» also
+                // passes on a template that never carried the path.
+                assert!(
+                    input.to_lowercase().contains("zq"),
+                    "the fixture is broken: {name} with {path} has no path in it: {input:?}"
+                );
+
+                let got = reason_without_a_model_path(&input, TABLE_R);
+                assert_eq!(
+                    &got, expected,
+                    "{name} with {path}: the output is the sentence's and not the path's"
+                );
+                assert!(
+                    !got.to_lowercase().contains("zq"),
+                    "{name} with {path}: a piece of the path was served: {got:?}"
+                );
+                assert_eq!(
+                    reason_without_a_model_path(&got, TABLE_R),
+                    got,
+                    "{name} with {path}: redacting what was already redacted changed it"
+                );
+            }
+        }
+    }
+
+    /// If a replacement had a separator in it, the word layer would take it for
+    /// a path the next time the sentence went through, and the redaction would
+    /// stop being idempotent.
+    #[test]
+    fn no_replacement_names_a_path_itself() {
+        for constant in [
+            RERANKER_DIR_INSTEAD_OF_A_PATH,
+            NLI_DIR_INSTEAD_OF_A_PATH,
+            EMBEDDER_DIR_INSTEAD_OF_A_PATH,
+            RUNTIME_DIR_INSTEAD_OF_A_PATH,
+        ] {
+            assert!(
+                constant.contains("(see "),
+                "the fixture is broken: {constant:?} is not the sentence that names a variable"
+            );
+            assert!(
+                !constant.contains(['/', '\\']),
+                "{constant:?} has a path separator in it. The word layer of the redaction would \
+                 swallow it the next time the sentence went through, and it is the variable an \
+                 operator reads to know which knob to change"
+            );
+        }
+    }
+
+    /// What `onnx.rs` writes when the runtime will not load, on Windows: the
+    /// path with no quotes around it, ending in the `:` before the cause.
+    fn failed_load(user: &str) -> String {
+        format!(
+            r"loading ONNX Runtime from C:\Users\{user}\.cache\memory-industry\onnxruntime\onnxruntime.dll: LoadLibraryExW failed"
+        )
+    }
+
+    /// `state` placed in the row of `which` in a report, as `/health` serves it.
+    fn served_with(which: Which, state: ModelState) -> String {
+        let mut runtime = report(true, false, ["loaded", "loaded", "loaded"]);
+        match which {
+            Which::Embedder => runtime.embedder = state,
+            Which::Reranker => runtime.reranker = state,
+            Which::Nli => runtime.nli = state,
+        }
+        runtime_json(&runtime).to_string()
+    }
+
+    /// The row of `which` with a failure, or, with none, with the session opened
+    /// where the registry holds `placement`. The facts that put each model on
+    /// `loaded` are the ones `row` uses.
+    fn site(
+        which: Which,
+        failure: Option<String>,
+        placement: Option<&crate::gpu::Placement>,
+    ) -> ModelState {
+        match which {
+            Which::Embedder => embedder_state_from(failure, placement, true, true),
+            Which::Reranker => reranker_state_from(failure, placement, true, true, true),
+            Which::Nli => nli_state_from(failure, placement, false, true, true),
+        }
+    }
+
+    /// Each of the six places that serve a reason calls the redaction on its
+    /// own: three `failed` arms and the one `loaded_on` that the three models
+    /// share, reached through each of them. A copy of the old redaction in any
+    /// one of them leaves that model's row leaking while the others pass.
+    #[test]
+    fn every_site_that_serves_a_reason_redacts_paths_with_spaces() {
+        let failed_reason = failed_load("Zqa Zqb Zqc");
+        let refused =
+            crate::gpu::Placement::CpuAfterProviderFailed(provider_refusal("Zqa Zqb Zqc"));
+
+        for which in [Which::Embedder, Which::Reranker, Which::Nli] {
+            let model_variable = match which {
+                Which::Embedder => "ONNX_MODEL_PATH",
+                Which::Reranker => "CUBA_RERANKER_PATH",
+                Which::Nli => "CUBA_NLI_PATH",
+            };
+            let failed = site(which, Some(failed_reason.clone()), None);
+            let loaded = site(which, None, Some(&refused));
+            assert_eq!(failed.state, "failed", "{which:?}: the fixture is broken");
+            assert_eq!(loaded.state, "loaded", "{which:?}: the fixture is broken");
+
+            // The variable differs by site: a failed model names its own
+            // directory, and a provider refusal names the runtime's.
+            for (served, variable, control) in [
+                (
+                    served_with(which, failed),
+                    model_variable,
+                    "LoadLibraryExW failed",
+                ),
+                (
+                    served_with(which, loaded),
+                    "ORT_DYLIB_PATH",
+                    "cublasLt64_12.dll",
+                ),
+            ] {
+                // Positive controls. Without them «none of the words are in the
+                // block» also passes on a block that never carried the reason.
+                assert!(
+                    served.contains(control),
+                    "{which:?}: {control:?} has to reach the block, or every check below is \
+                     about a block that says nothing: {served}"
+                );
+                assert!(
+                    served.contains(variable),
+                    "{which:?}: the replacement names {variable}: {served}"
+                );
+                for word in ["Zqa", "Zqb", "Zqc"] {
+                    assert!(
+                        !served.contains(word),
+                        "{which:?}: {word:?} is a word of the operator's name, and it was \
+                         served in a path with spaces in it: {served}"
+                    );
+                }
+            }
         }
     }
 }
