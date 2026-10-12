@@ -329,8 +329,10 @@ gate_refuse() {
 # `?host=` socket would send those names to another server, a `dbname=` in the
 # query would make the live corpus the throwaway database, and a URL with no
 # database would turn the host into one. So merge-gate.sh and a run-all-tests.sh
-# on its own refuse any other shape, with exit 2, before a single step runs.
-# The reason never carries the URL or a piece of it: the password can be in it.
+# on its own refuse any other shape, with exit 2, before a single step runs. A second
+# '@' before the host is refused too (rule 4): libpq and sqlx end the user and the
+# password at different '@'. The reason never carries the URL or a piece of it: the
+# password can be in it.
 gate_require_database_url() {
   local url="${1:-}" rest database
   case "$url" in
@@ -344,6 +346,16 @@ gate_require_database_url() {
   database="${rest#*/}"
   if [[ "$rest" != */* || -z "$database" || "$database" == */* ]]; then
     gate_refuse "DATABASE_URL has to end in exactly one non-empty segment after the host, the database (postgresql://user:password@host:port/<database>). A '/', '?' or '@' inside the user or the password has to be encoded (%2F, %3F, %40)."
+  fi
+  # Rule 4: at most one '@' in the authority. libpq ends the user and the password
+  # at the FIRST '@' and takes the rest as the host, so with a second '@' it prints
+  # the tail of the password in the readiness line. sqlx (WHATWG) ends them at the
+  # LAST '@', so the check and the binary would also ask different servers. An '@'
+  # in the database name is after the first '/', outside the authority, and is fine.
+  local authority="${rest%%/*}" ats
+  ats="${authority//[^@]/}"
+  if (( ${#ats} > 1 )); then
+    gate_refuse "DATABASE_URL has more than one '@' before the host: libpq ends the user and the password at the first one and sqlx at the last, so the readiness check and the binary would ask different servers, and libpq would print the rest of the password as the host. Write an '@' inside the user or the password as %40."
   fi
 }
 
