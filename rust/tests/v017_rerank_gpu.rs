@@ -177,23 +177,74 @@ fn is_configured_reports_whether_a_model_is_on_disk_without_loading_it() {
 #[tokio::test]
 #[ignore]
 async fn warming_up_leaves_the_reranker_ready() {
+    no_arena_ceiling_in_the_environment();
     assert!(
         memory_industry::search::rerank::is_configured(),
         "no reranker model on disk: this suite measures the model path and cannot report on it"
     );
     let started = std::time::Instant::now();
     let warm = memory_industry::search::rerank::warm_up().await;
-    assert!(warm, "a configured reranker must warm up successfully");
+    assert!(
+        warm,
+        "a configured reranker must warm up successfully, and it did not: {:?}",
+        memory_industry::search::rerank::failure_reason()
+    );
     assert!(
         memory_industry::search::rerank::enabled(),
         "after warm-up the reranker must report enabled, so searches take the model path"
     );
+
+    // The session is open, so `configure` has said where it opened. This is the
+    // one test in the gate that opens the real reranker under `--features cuda`,
+    // and the only place a provider that refuses to start can be seen: the
+    // daemon logs it, and until the registry existed nothing else recorded it.
+    let placement = memory_industry::gpu::placement(memory_industry::gpu::Workload::Reranker);
+    assert!(
+        placement.is_some(),
+        "the reranker is open and `gpu::configure` wrote nothing about where. `/health` and \
+         `doctor` would go on reporting the device that was asked for on a session nobody \
+         measured"
+    );
+    if let Some(memory_industry::gpu::Placement::CpuAfterProviderFailed(cause)) = &placement {
+        assert!(
+            memory_industry::gpu::status().degraded,
+            "the registry holds a refusal and `gpu::status()` still says the machine is fine"
+        );
+        panic!(
+            "the reranker opened on the CPU because the GPU provider did not start: {cause}. \
+             The card and the provider libraries are there; the CUDA runtime beside them is not \
+             usable (cudart64_12, cublas64_12, cublasLt64_12, cudnn64_9 on PATH or beside \
+             onnxruntime). The session is slow, not broken, and this gate says so instead of \
+             passing on it"
+        );
+    }
     eprintln!("warm-up took {:.2}s", started.elapsed().as_secs_f32());
+}
+
+/// The two tests below open the real reranker without `main`, so no plan
+/// published a ceiling for the arena and the crate adds none of its own. A
+/// ceiling left in the shell would load the model under somebody else's number
+/// and turn this into a BFCArena failure that reads like a product defect.
+///
+/// It only reads, and fails saying what to remove. Clearing the variable here
+/// would be a `set_var` racing the other test, and holding a lock across their
+/// `.await` is what `clippy::await_holding_lock` refuses.
+fn no_arena_ceiling_in_the_environment() {
+    for name in ["MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB", "CUBA_GPU_MEM_LIMIT_MB"] {
+        if let Some(value) = std::env::var_os(name) {
+            panic!(
+                "{name}={value:?} is set in this shell. This test measures the path with no \
+                 plan, where the arena has no ceiling of ours; with one set it would measure \
+                 somebody else's number. Remove it from the shell and run again"
+            );
+        }
+    }
 }
 
 #[tokio::test]
 #[ignore]
 async fn reranking_reorders_candidates_by_relevance() {
+    no_arena_ceiling_in_the_environment();
     assert!(
         memory_industry::search::rerank::is_configured(),
         "no reranker model on disk: this suite measures the model path and cannot report on it"
@@ -201,9 +252,10 @@ async fn reranking_reorders_candidates_by_relevance() {
     memory_industry::search::rerank::warm_up().await;
     assert!(
         memory_industry::search::rerank::enabled(),
-        "the reranker is configured but did not load. That is the failure this test exists to \
-         catch — the identity fallback returns the RRF order unchanged and every search looks \
-         like it worked"
+        "the reranker is configured but did not load: {:?}. That is the failure this test \
+         exists to catch — the identity fallback returns the RRF order unchanged and every \
+         search looks like it worked",
+        memory_industry::search::rerank::failure_reason()
     );
 
     let query = "how does the REM consolidation cycle decay old memories";

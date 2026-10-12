@@ -100,8 +100,12 @@ impl Drop for Env {
 
 /// A directory that holds a runtime and a model, neither of which is one.
 ///
-/// Its name is the needle: the load failures format the path they could not
-/// open, and none of it may reach `/health`.
+/// Its name has spaces in it, and every word of the name is a needle: the load
+/// failures format the path they could not open, and none of it may reach
+/// `/health`. A name with no spaces is one word, and a redaction that cut the
+/// sentence at its spaces removes it whole while serving the words between the
+/// first separator and the last of a name that has them (W6) — which is what
+/// `C:\Users\Juan Carlos Pérez` is.
 struct BrokenInstall {
     dir: PathBuf,
     runtime: PathBuf,
@@ -110,7 +114,10 @@ struct BrokenInstall {
 impl BrokenInstall {
     fn new() -> Self {
         // One test per process, so the process id is unique enough.
-        let dir = std::env::temp_dir().join(format!("v045-broken-install-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "v045 canaryuno canarydos-{} canarytres",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("the temp dir is writable");
         // The name the loader would look for on this platform, so the file is
         // a runtime that is there and will not load — not one that is missing.
@@ -129,13 +136,16 @@ impl BrokenInstall {
         Self { dir, runtime }
     }
 
-    /// The part of the path no other directory on the machine has.
-    fn needle(&self) -> String {
+    /// The words of the directory name, none of which may be served: each is
+    /// a piece of the path that a cut at the first space would let through.
+    fn needles(&self) -> Vec<String> {
         self.dir
             .file_name()
             .expect("a directory under temp has a name")
             .to_string_lossy()
-            .into_owned()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
     }
 }
 
@@ -243,7 +253,12 @@ async fn a_model_that_would_not_open_is_failed_in_health_and_its_path_stays_home
     let runtime = body
         .get("runtime")
         .unwrap_or_else(|| panic!("a caller with the admin token gets the runtime block: {body}"));
-    let needle = install.needle();
+    let needles = install.needles();
+    assert!(
+        needles.len() > 1,
+        "the fixture is broken: the install directory has no spaces in its name, which is the \
+         case this file covered before W6 and not the one it covers now: {needles:?}"
+    );
 
     for model in ["embedder", "reranker", "nli"] {
         let report = &runtime[model];
@@ -256,6 +271,13 @@ async fn a_model_that_would_not_open_is_failed_in_health_and_its_path_stays_home
         let reason = report["reason"]
             .as_str()
             .unwrap_or_else(|| panic!("{model}: a failed model says why: {report}"));
+        assert_eq!(
+            report.get("device"),
+            Some(&Value::Null),
+            "{model}: a session that did not open runs on no device. `cpu` or `gpu` here is the \
+             placement path's choice, not a measurement, and it sat next to `failed` as if the \
+             model were running somewhere: {report}"
+        );
         assert!(
             !reason.trim().is_empty(),
             "{model}: an empty reason is a failure nobody can act on: {report}"
@@ -266,17 +288,28 @@ async fn a_model_that_would_not_open_is_failed_in_health_and_its_path_stays_home
              that sets it. Without the replacement either the path went out whole or the \
              sentence lost the one thing the operator can change: {reason}"
         );
-        assert!(
-            !reason.contains(&needle),
-            "{model}: the reason carries the path it could not open. On Windows that path has \
-             the operator's user name in it, and /health goes out over a socket a LAN bind makes \
-             reachable: {reason}"
-        );
+        // Word by word: the whole name is never contiguous in a path that was
+        // cut at its spaces, so asking for it whole passes on the very bug.
+        for needle in &needles {
+            assert!(
+                !reason.contains(needle.as_str()),
+                "{model}: the reason carries {needle:?}, a word of the path it could not open. \
+                 On Windows that path has the operator's user name in it, and /health goes out \
+                 over a socket a LAN bind makes reachable: {reason}"
+            );
+        }
     }
 
     let anonymous = health(PORT, None).await;
     assert!(
-        anonymous.get("runtime").is_none() && !anonymous.to_string().contains(&needle),
+        anonymous.get("runtime").is_none(),
         "a caller without the token gets the verdict and nothing of the inventory: {anonymous}"
     );
+    let anonymous_body = anonymous.to_string();
+    for needle in &needles {
+        assert!(
+            !anonymous_body.contains(needle.as_str()),
+            "a caller without the token got {needle:?}, a word of the install path: {anonymous}"
+        );
+    }
 }

@@ -769,7 +769,8 @@ fn the_gpu_placement_check_can_actually_fail() {
 /// now refused by a lock that names the first, and an exit drops only the
 /// databases that still carry its own record. The `--self-test` builds each
 /// case with real processes, and ends by launching the script itself as a
-/// second gate against a live one.
+/// second gate against a live one, and on its own against a `DATABASE_URL`
+/// that `brain_gate` cannot be derived from.
 #[test]
 fn a_second_gate_is_refused_and_an_exit_drops_only_its_own_databases() {
     let out = std::process::Command::new(git_bash())
@@ -792,6 +793,14 @@ fn a_second_gate_is_refused_and_an_exit_drops_only_its_own_databases() {
         stdout.contains("self-test:"),
         "the self-test exited 0 without saying it ran. Without the mode, this script \
          ignores the flag and starts a whole gate. stdout: {stdout}"
+    );
+    // The sentence of the row for a DATABASE_URL it cannot derive brain_gate
+    // from, which only that verdict prints.
+    assert!(
+        stdout.contains("refuses a DATABASE_URL it cannot derive brain_gate from"),
+        "the self-test passed without its row for a DATABASE_URL that ends in a query, so \
+         nothing shows that a run on its own stops before it provisions its databases on a \
+         server the URL does not name. stdout: {stdout}"
     );
 }
 
@@ -1371,7 +1380,10 @@ fn the_two_pass_guard_can_actually_fail() {
 /// written: an old 0 read as this run's green. `merge-gate.sh --self-test`
 /// copies the script into a throwaway tree whose every step is a stand-in, and
 /// reads the file after a green run, after a step past the tests fails, after
-/// the gate is killed in the middle, and after a second gate is refused.
+/// the gate is killed in the middle, and after a second gate is refused. Its
+/// rows for the readiness check give a stand-in `pg_isready` each `DATABASE_URL`
+/// and read back what the gate asked it, which port it printed and what it
+/// refused before asking.
 #[test]
 fn the_exit_file_holds_the_whole_gates_verdict_and_says_running_until_then() {
     // Checked before the script is launched, not after: without the mode,
@@ -1403,6 +1415,241 @@ fn the_exit_file_holds_the_whole_gates_verdict_and_says_running_until_then() {
         stdout.contains("self-test:"),
         "the self-test exited 0 without saying it ran. An exit code alone is what let \
          codigo-muerto.sh pass for months while doing nothing. stdout: {stdout}"
+    );
+    // The sentence of the readiness rows, which only its verdict prints: without
+    // it a self-test that lost those rows would still exit 0 and say `self-test:`.
+    assert!(
+        stdout.contains("the readiness check hands DATABASE_URL to pg_isready -d as it is"),
+        "the self-test passed without its rows for the readiness check, so nothing shows that \
+         the gate asks libpq about the DATABASE_URL it was given and not about :5488. stdout: \
+         {stdout}"
+    );
+}
+
+/// What `gate_require_database_url` has to say to each URL: the URL, the exit
+/// code, and the words its refusal must contain. `run-all-tests.sh` derives
+/// `brain_gate`, `brain_gate_peer` and `postgres` by replacing what follows the
+/// last slash, which only works for a URL that ends in `/<database>`.
+/// libpq ends the user and the password at the first `@` and sqlx at the last, so
+/// more than one `@` before the host is refused: the readiness check and the
+/// binary would ask different servers, and libpq would print the rest of the
+/// password as the host. An `@` after the authority (`/br@in`) is not one of them.
+const DATABASE_URL_GUARD: [(&str, i32, &[&str]); 23] = [
+    ("postgresql://cuba:memorys2026@127.0.0.1:5488/brain", 0, &[]),
+    ("postgres://gate:pw0@127.0.0.1:5575/brain", 0, &[]),
+    ("postgresql://gate:pw0@db.example.invalid/brain", 0, &[]),
+    (
+        "postgresql://ga%40te:p%40ss%2Fw%3Frd@127.0.0.1:6543/brain",
+        0,
+        &[],
+    ),
+    ("postgresql://gate@%2Frun%2Fpostgresql:5433/brain", 0, &[]),
+    ("postgresql://gate:pw0@[::1]:5434/brain", 0, &[]),
+    ("postgresql:///brain", 0, &[]),
+    (
+        "postgresql://gate:S3cr3tW2@/brain?host=%2Frun%2Fpostgresql",
+        2,
+        &["%2F"],
+    ),
+    (
+        "postgresql://gate:S3cr3tW2@127.0.0.1:5575/brain?sslmode=require",
+        2,
+        &["%2F"],
+    ),
+    (
+        "postgresql://gate:S3cr3tW2@127.0.0.1:5575",
+        2,
+        &["%2F", "%3F", "%40"],
+    ),
+    (
+        "postgresql://gate:S3cr3tW2@127.0.0.1:5575/",
+        2,
+        &["%2F", "%3F", "%40"],
+    ),
+    (
+        "postgresql://gate:S3/cr3tW2@127.0.0.1:5575/brain",
+        2,
+        &["%2F", "%3F", "%40"],
+    ),
+    (
+        "host=127.0.0.1 port=5575 dbname=brain password=S3cr3tW2",
+        2,
+        &["postgresql://"],
+    ),
+    (
+        "mysql://gate:S3cr3tW2@127.0.0.1/brain",
+        2,
+        &["postgresql://"],
+    ),
+    ("", 2, &["postgresql://"]),
+    ("postgresql://127.0.0.1:5575/brain", 0, &[]),
+    ("postgresql://gate@127.0.0.1:5575/brain", 0, &[]),
+    ("postgresql://gate:pw0@127.0.0.1:5575/br@in", 0, &[]),
+    (
+        "postgresql://gate:x@S3cr3tW2@127.0.0.1:5575/brain",
+        2,
+        &["%40", "more than one '@'"],
+    ),
+    (
+        "postgresql://gate:S3cr3tW2@@127.0.0.1:5575/brain",
+        2,
+        &["%40", "more than one '@'"],
+    ),
+    (
+        "postgresql://ga@S3cr3tW2@127.0.0.1:5575/brain",
+        2,
+        &["%40", "more than one '@'"],
+    ),
+    (
+        "postgresql://gate:x@S3cr3tW2@[::1]:5434/brain",
+        2,
+        &["%40", "more than one '@'"],
+    ),
+    (
+        "postgresql://gate:x@S3cr3tW2@%2Frun%2Fpostgresql:5433/brain",
+        2,
+        &["%40", "more than one '@'"],
+    ),
+];
+
+/// The head of the script that drives the table: one bash for all of it, since
+/// on Windows each costs about 0.1 s. `row N URL` runs the guard in a subshell,
+/// so that the `exit 2` of a refusal ends the row and not the script, and prints
+/// `ROW|N|exit code|stdout|stderr` with the line breaks turned into `~`. The
+/// marker after the call is how a row shows that bash went on after the guard
+/// said yes, and that it did not after a no.
+const DATABASE_URL_GUARD_SCRIPT: [&str; 8] = [
+    r#"source scripts/gate-lock.sh"#,
+    r#"d="$(mktemp -d)""#,
+    r#"trap 'rm -rf "$d"' EXIT"#,
+    r#"row() {"#,
+    r#"  local rc=0"#,
+    r#"  ( gate_require_database_url "$2" && echo AFTER ) >"$d/out" 2>"$d/err" </dev/null || rc=$?"#,
+    r#"  printf 'ROW|%s|%s|%s|%s\n' "$1" "$rc" "$(tr '\n' '~' <"$d/out")" "$(tr '\n' '~' <"$d/err")""#,
+    r#"}"#,
+];
+
+/// `merge-gate.sh` and a run of `run-all-tests.sh` on its own both refuse a
+/// `DATABASE_URL` that `brain_gate` cannot be derived from, with the one
+/// function `gate-lock.sh` gives them. A `?host=` that passed the readiness
+/// check would send the gate to create `brain_gate` on another server, and a
+/// `dbname=` in the query would make the live corpus the throwaway database.
+/// This sources `gate-lock.sh` in a bash and calls the function on every row of
+/// the table. A refusal is `FAIL: <reason>` and exit 2, with nothing on stdout
+/// and no piece of the password in the reason; an accepted URL prints nothing
+/// and lets bash go on. The rows that must pass are the presence anchor: a
+/// function that does not exist makes bash say 127, which is neither answer.
+#[test]
+fn the_database_url_guard_refuses_what_the_gate_cannot_derive_brain_gate_from() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut script: Vec<String> = DATABASE_URL_GUARD_SCRIPT
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect();
+    for (index, (url, _, _)) in DATABASE_URL_GUARD.iter().enumerate() {
+        assert!(
+            !url.contains('\''),
+            "row {index} has a single quote, which the script that drives the table cannot carry"
+        );
+        script.push(format!("row {index} '{url}'"));
+    }
+    script.push(String::new());
+
+    let mut child = std::process::Command::new(git_bash())
+        .arg("-s")
+        .current_dir(repo_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    child
+        .stdin
+        .take()
+        .expect("bash was given a pipe for its script")
+        .write_all(script.join("\n").as_bytes())
+        .expect("hand the script to bash");
+    let out = child.wait_with_output().expect("bash finishes");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "the script that drives the table did not run to its end, so the rows below prove \
+         nothing. stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let mut answers: Vec<Option<(i32, String, String)>> = vec![None; DATABASE_URL_GUARD.len()];
+    for line in stdout.lines() {
+        let Some(rest) = line.trim_end_matches('\r').strip_prefix("ROW|") else {
+            continue;
+        };
+        let mut parts = rest.splitn(4, '|');
+        let (Some(index), Some(code), Some(said), Some(err)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if let (Ok(index), Ok(code)) = (index.parse::<usize>(), code.parse::<i32>())
+            && let Some(slot) = answers.get_mut(index)
+        {
+            *slot = Some((
+                code,
+                said.trim_end_matches('~').to_string(),
+                err.trim_end_matches('~').to_string(),
+            ));
+        }
+    }
+
+    let mut problems = Vec::new();
+    for (index, (url, want, words)) in DATABASE_URL_GUARD.iter().enumerate() {
+        let Some((code, said, err)) = &answers[index] else {
+            problems.push(format!("`{url}`: the table printed no answer for it"));
+            continue;
+        };
+        if code != want {
+            problems.push(format!(
+                "`{url}`: exit {code}, not {want} (127 is a function that does not exist). \
+                 stdout `{said}`, stderr `{err}`"
+            ));
+            continue;
+        }
+        if *want == 0 {
+            if said != "AFTER" || !err.is_empty() {
+                problems.push(format!(
+                    "`{url}` is a URL the gate can use, and the guard printed `{said}` / `{err}` \
+                     instead of nothing and letting bash go on"
+                ));
+            }
+            continue;
+        }
+        if !said.is_empty() {
+            problems.push(format!(
+                "`{url}`: bash went on after the refusal (`{said}`)"
+            ));
+        }
+        if !err.starts_with("FAIL: ") {
+            problems.push(format!("`{url}`: the refusal is `{err}`, not a FAIL line"));
+        }
+        if err.contains("cr3tW2") || (!url.is_empty() && err.contains(url)) {
+            problems.push(format!(
+                "`{url}`: the reason carries a piece of the URL: `{err}`"
+            ));
+        }
+        for word in *words {
+            if !err.contains(word) {
+                problems.push(format!(
+                    "`{url}`: the reason does not say `{word}`: `{err}`"
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "gate_require_database_url (scripts/gate-lock.sh) has to let through a URL that ends in \
+         /<database> and to refuse, with exit 2 and a reason that carries none of the URL, the \
+         ones run-all-tests.sh would cut at the wrong place: {problems:#?}"
     );
 }
 
@@ -1953,7 +2200,6 @@ fn the_e2e_entry_point_resolves_the_binary_under_cargo_target_dir() {
     let binary = release.join("memory-industry");
     std::fs::write(&binary, "").expect("write the stand-in binary");
     let target = dir.to_string_lossy().into_owned();
-    let expected = binary.to_string_lossy().into_owned();
 
     let by_hand = "/nowhere/by-hand/memory-industry";
     let kept = e2e_binary_path(&[
@@ -1968,10 +2214,17 @@ fn the_e2e_entry_point_resolves_the_binary_under_cargo_target_dir() {
         "a CUBA_BINARY_PATH exported by hand has to reach the E2E as it is: the stand-in \
          python3 is the anchor that proves what the script hands over is what is read here"
     );
+    // Compared as paths, not strings. On Windows the script prefixes
+    // CARGO_TARGET_DIR as it was given (`C:\...\target`) and appends
+    // `/release/memory-industry`: both separators name the same file there, and
+    // Path's equality compares components, so another directory, another file
+    // name or a `.exe` still fails. On Linux it is the string comparison it was.
     assert_eq!(
-        found, expected,
-        "with CARGO_TARGET_DIR={target} and a release binary there, the E2E was handed `{found}`. \
-         The entry point fixes rust/target/release/memory-industry, a directory the gate on this \
-         machine never builds into"
+        Path::new(&found),
+        binary.as_path(),
+        "with CARGO_TARGET_DIR={target} and a release binary there, the E2E was handed `{found}`, \
+         not `{}`. The entry point fixes rust/target/release/memory-industry, a directory the \
+         gate on this machine never builds into",
+        binary.display()
     );
 }

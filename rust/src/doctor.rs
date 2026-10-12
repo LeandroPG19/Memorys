@@ -1175,11 +1175,11 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
             .map(|roots| legacy_cache_check(&roots.legacy)),
     );
 
-    let gpu = crate::gpu::status();
-    checks.push(match gpu.hint {
-        Some(hint) if gpu.degraded => Check::warn("gpu", gpu.detail, hint),
-        _ => Check::ok("gpu", gpu.detail),
-    });
+    // The check keeps its place in the list but is read below, after the reranker
+    // and the NLI had their chance to open: a provider that refuses to start is
+    // written to the registry by the session that meets it, and read any earlier
+    // this line judged a machine none of them had touched yet.
+    let gpu_at = checks.len();
 
     let rerank_configured = crate::search::rerank::is_configured();
     let rerank_disabled_by_resources = std::env::var("CUBA_RERANKER_PATH").ok().as_deref()
@@ -1205,6 +1205,15 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     ));
 
     checks.push(nli_check(deep).await);
+
+    let gpu = crate::gpu::status();
+    checks.insert(
+        gpu_at,
+        match gpu.hint {
+            Some(hint) if gpu.degraded => Check::warn("gpu", gpu.detail, hint),
+            _ => Check::ok("gpu", gpu.detail),
+        },
+    );
 
     {
         use crate::llm_cli::LlmVerdict;

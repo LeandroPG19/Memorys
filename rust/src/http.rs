@@ -2402,9 +2402,13 @@ const STATE_ABSENT: &str = "absent";
 
 /// Where one model is and why it is not simply running.
 ///
-/// `reason` is a sentence for a human and is `None` when the state says
-/// everything. It never carries a filesystem path: a model path is inventory,
-/// and on Windows it has the operator's user name inside it. Every reason here
+/// `device` is where the session opened and is `None` for a model with no open
+/// session, or with one nobody recorded: it is not where the model was asked
+/// to go. `reason` is a sentence for a human and is `None` when the state says
+/// everything. It never carries a filesystem path, with or without spaces in
+/// it: a model path is inventory, and on Windows it has the operator's user
+/// name inside it. The one case it cannot promise is a Linux directory whose
+/// name has a `:` or a `"` (see `reason_without_a_model_path`). Every reason here
 /// is a literal except three — the load failure of each model, which comes
 /// from its loader and from ONNX Runtime — and each of those goes through
 /// `reason_without_a_model_path` first, with the variable that names *its*
@@ -2413,7 +2417,7 @@ const STATE_ABSENT: &str = "absent";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelState {
     pub state: &'static str,
-    pub device: &'static str,
+    pub device: Option<&'static str>,
     pub reason: Option<String>,
 }
 
@@ -2435,9 +2439,11 @@ pub struct RuntimeReport {
     pub nli: ModelState,
     /// The GPU provider this binary was compiled against, if any.
     pub gpu_build: Option<&'static str>,
-    /// `gpu::status()` — asked for a device and not using one.
+    /// `gpu::status()` — asked for a device and not using one, including a
+    /// session whose provider refused to start.
     pub gpu_degraded: bool,
-    /// `embedder=… reranker=… nli=…`, as the placement path decided it.
+    /// `embedder=… reranker=… nli=…`, as the placement path decided it: what was
+    /// asked for. Where each session opened is `device` in its own row.
     pub gpu_placement: String,
     pub llm: crate::llm_cli::LlmSummary,
 }
@@ -2480,15 +2486,6 @@ pub fn overall_status(db_ok: bool, runtime: &RuntimeReport) -> &'static str {
     STATUS_OK
 }
 
-/// Where the placement path put this workload.
-fn device_of(workload: crate::gpu::Workload) -> &'static str {
-    if crate::gpu::wants_gpu(workload) {
-        "gpu"
-    } else {
-        "cpu"
-    }
-}
-
 /// The GPU provider compiled in, for the one field that has to name it.
 ///
 /// This is the second reader of the feature flags after `gpu::compiled_provider`,
@@ -2521,11 +2518,11 @@ fn compiled_gpu_provider() -> Option<&'static str> {
 /// first would read an unresolved cell and report `fallback` on a machine
 /// whose session had actually failed.
 fn embedder_state(ready: bool) -> ModelState {
-    let device = device_of(crate::gpu::Workload::Embedder);
+    let placement = crate::gpu::placement(crate::gpu::Workload::Embedder);
     let loaded = ready && crate::embeddings::onnx::is_model_loaded();
     embedder_state_from(
         crate::embeddings::onnx::failure_reason(),
-        device,
+        placement.as_ref(),
         ready,
         loaded,
     )
@@ -2547,14 +2544,14 @@ fn embedder_state(ready: bool) -> ModelState {
 /// lives.
 fn embedder_state_from(
     failure: Option<String>,
-    device: &'static str,
+    placement: Option<&crate::gpu::Placement>,
     ready: bool,
     loaded: bool,
 ) -> ModelState {
     if let Some(reason) = failure {
         return ModelState {
             state: STATE_FAILED,
-            device,
+            device: None,
             reason: Some(reason_without_a_model_path(
                 &reason,
                 EMBEDDER_DIR_INSTEAD_OF_A_PATH,
@@ -2564,22 +2561,18 @@ fn embedder_state_from(
     if !ready {
         return ModelState {
             state: STATE_WARMING,
-            device,
+            device: None,
             reason: None,
         };
     }
     if loaded {
-        return ModelState {
-            state: STATE_LOADED,
-            device,
-            reason: None,
-        };
+        return loaded_on(placement);
     }
     ModelState {
         state: STATE_FALLBACK,
-        // The hash fallback runs on this CPU whatever the placement path was
-        // asked for, and `device` is where the model *would* have gone.
-        device: "cpu",
+        // The hash fallback runs on this CPU whatever the registry holds: there
+        // is no session for it to hold anything about.
+        device: Some("cpu"),
         reason: Some(
             "no ONNX embedder opened — vectors come from the hash fallback and search is \
              lexical only"
@@ -2604,7 +2597,7 @@ fn embedder_state_from(
 fn reranker_state() -> ModelState {
     reranker_state_from(
         crate::search::rerank::failure_reason(),
-        device_of(crate::gpu::Workload::Reranker),
+        crate::gpu::placement(crate::gpu::Workload::Reranker).as_ref(),
         crate::search::rerank::resolved_model_dir().is_some(),
         crate::search::rerank::is_configured(),
         crate::search::rerank::status_resolved(),
@@ -2619,7 +2612,7 @@ fn reranker_state() -> ModelState {
 /// something already tried to open a session.
 fn reranker_state_from(
     failure: Option<String>,
-    device: &'static str,
+    placement: Option<&crate::gpu::Placement>,
     dir_resolved: bool,
     configured: bool,
     status_resolved: bool,
@@ -2627,7 +2620,7 @@ fn reranker_state_from(
     if let Some(reason) = failure {
         return ModelState {
             state: STATE_FAILED,
-            device,
+            device: None,
             reason: Some(reason_without_a_model_path(
                 &reason,
                 RERANKER_DIR_INSTEAD_OF_A_PATH,
@@ -2637,7 +2630,7 @@ fn reranker_state_from(
     if !dir_resolved {
         return ModelState {
             state: STATE_OFF,
-            device,
+            device: None,
             reason: Some(
                 "the resource plan switched the reranker off on this machine; rankings come \
                  back in RRF order"
@@ -2648,7 +2641,7 @@ fn reranker_state_from(
     if !configured {
         return ModelState {
             state: STATE_ABSENT,
-            device,
+            device: None,
             reason: Some(
                 "no reranker model where this daemon looks — `memory-industry models reranker` \
                  installs it"
@@ -2657,15 +2650,11 @@ fn reranker_state_from(
         };
     }
     if status_resolved {
-        return ModelState {
-            state: STATE_LOADED,
-            device,
-            reason: None,
-        };
+        return loaded_on(placement);
     }
     ModelState {
         state: STATE_CONFIGURED,
-        device,
+        device: None,
         reason: Some("loads on its first batch".to_string()),
     }
 }
@@ -2679,6 +2668,37 @@ fn reranker_state_from(
 const RERANKER_DIR_INSTEAD_OF_A_PATH: &str = "the reranker directory (see CUBA_RERANKER_PATH)";
 const NLI_DIR_INSTEAD_OF_A_PATH: &str = "the NLI directory (see CUBA_NLI_PATH)";
 const EMBEDDER_DIR_INSTEAD_OF_A_PATH: &str = "the embedder directory (see ONNX_MODEL_PATH)";
+/// The odd one out: the paths in a provider refusal are the runtime's and its
+/// provider libraries', not any model's, so the variable has to be the
+/// runtime's too.
+const RUNTIME_DIR_INSTEAD_OF_A_PATH: &str = "the ONNX Runtime directory (see ORT_DYLIB_PATH)";
+
+/// A model whose session is open, from where `gpu::configure` says it opened.
+///
+/// With nothing in the registry the device is `None`: the answer `/health` used
+/// to give here was the placement *plan*, and on a machine where the provider
+/// refused the plan said `gpu` for a session on the CPU. Only that last case
+/// has something to explain, and the cause goes through the same redaction as
+/// every other sentence in this block.
+fn loaded_on(placement: Option<&crate::gpu::Placement>) -> ModelState {
+    let (device, reason) = match placement {
+        Some(crate::gpu::Placement::Gpu) => (Some("gpu"), None),
+        Some(crate::gpu::Placement::Cpu) => (Some("cpu"), None),
+        Some(crate::gpu::Placement::CpuAfterProviderFailed(cause)) => (
+            Some("cpu"),
+            Some(format!(
+                "the GPU provider did not start; this session runs on the CPU: {}",
+                reason_without_a_model_path(cause, RUNTIME_DIR_INSTEAD_OF_A_PATH)
+            )),
+        ),
+        None => (None, None),
+    };
+    ModelState {
+        state: STATE_LOADED,
+        device,
+        reason,
+    }
+}
 
 /// A load failure with the path taken out and the variable that names it put
 /// in its place.
@@ -2691,22 +2711,153 @@ const EMBEDDER_DIR_INSTEAD_OF_A_PATH: &str = "the embedder directory (see ONNX_M
 /// is already standing on, while this one goes out over a socket that a LAN
 /// bind makes reachable.
 ///
-/// A word is a path when it has a separator with a name around it, which
-/// leaves the actionable half of the sentence alone: the file names it looked
-/// for, `model.onnx` and `model_quantized.onnx`, and the bare `/` between
-/// them.
+/// Three layers, in this order, because a space inside a path says nothing:
+/// no rule that cuts on spaces can tell `Carlos` from a word of the sentence,
+/// and `C:\Users\Juan Carlos` left `Carlos` in the body before this.
+///
+/// 1. A segment in `"`, `'` or `` ` `` is replaced whole, quotes included,
+///    when what is inside has a separator and an alphanumeric. A quote opens
+///    only after a non-alphanumeric and closes only before one, so the `'` of
+///    `doesn't` and of `O'Brien` open and close nothing.
+/// 2. A path with no quotes starts at an anchor (`C:\`, `\\`, `/x`, `~/`,
+///    `./`, `../`) and runs to the end of its clause: a `:` not followed by
+///    `\` or `/`, a `"`, a line break or the end of the text. The output then
+///    does not depend on the path at all, which is the property that matters.
+///    Whatever the sentence says between the path and that `:` goes with it
+///    (`with error`, the runtime version): `doctor` still shows it, and this
+///    block is the one that leaves the machine.
+/// 3. What is left goes word by word. A word is a path when it has a separator
+///    with a name around it, which leaves the actionable half of the sentence
+///    alone: the file names it looked for, `model.onnx` and
+///    `model_quantized.onnx`, and the bare `/` between them. It is also what
+///    catches a relative path with no anchor and a URL.
+///
+/// Where it cannot be exact: on Linux a directory whose name has a `:` or a
+/// `"` ends the clause early, and layer 3 only takes the words of the rest
+/// that have a separator. Windows does not allow either in a name.
 fn reason_without_a_model_path(reason: &str, instead: &'static str) -> String {
-    reason
-        .split_whitespace()
-        .map(|word| {
-            if word.contains(['/', '\\']) && word.chars().any(char::is_alphanumeric) {
-                instead
-            } else {
-                word
-            }
-        })
+    let chars: Vec<char> = reason.chars().collect();
+    let mut redacted = String::with_capacity(reason.len());
+    let mut at = 0;
+    // A step that works moves at least one character, so `chars.len()` steps
+    // cover the text, and a step taken past the end writes nothing. The bound
+    // is a count and not a comparison on `at` on purpose: it ends the loop
+    // whatever a step returns, so a step that stopped moving would fail an
+    // assertion on its output instead of growing `redacted` until the process
+    // died, and there is no `at < len` to turn into `at <= len`, a mutant that
+    // changes nothing because that extra step is the one that writes nothing.
+    for _ in 0..chars.len() {
+        at = redact_at(&chars, at, instead, &mut redacted);
+    }
+    redact_words(&redacted, instead)
+}
+
+/// Layers 1 and 2 at one position: writes what stands there into `out` and
+/// returns where to go on from, which is past `at` for every position inside
+/// the text and is never relied on to be.
+fn redact_at(chars: &[char], at: usize, instead: &str, out: &mut String) -> usize {
+    if let Some(close) = quoted_span_end(chars, at) {
+        // The quotes stay in the span that is judged: they are neither a
+        // separator nor alphanumeric, so the verdict is the one for what is
+        // inside, and no `at + 1` has to cut the opening one off.
+        let span: String = chars.get(at..=close).unwrap_or_default().iter().collect();
+        out.push_str(if is_path_like(&span) {
+            instead
+        } else {
+            span.as_str()
+        });
+        return close + 1;
+    }
+    if path_anchor_at(chars, at) {
+        let end = clause_end(chars, at);
+        out.push_str(instead);
+        out.extend(trailing_blanks(chars.get(at..end).unwrap_or_default()));
+        return end;
+    }
+    out.extend(chars.get(at));
+    at + 1
+}
+
+/// Layer 3, the rule the function had before paths with spaces.
+fn redact_words(text: &str, instead: &'static str) -> String {
+    text.split_whitespace()
+        .map(|word| if is_path_like(word) { instead } else { word })
         .collect::<Vec<&str>>()
         .join(" ")
+}
+
+/// A separator and an alphanumeric: the same predicate for a word and for the
+/// inside of a quote, so `"/"` is left alone as `/` is.
+fn is_path_like(text: &str) -> bool {
+    text.contains(['/', '\\']) && text.chars().any(char::is_alphanumeric)
+}
+
+fn alphanumeric_at(chars: &[char], at: usize) -> bool {
+    chars.get(at).is_some_and(|c| c.is_alphanumeric())
+}
+
+/// Where the quote that opens at `at` closes, if one does. It opens only after
+/// a non-alphanumeric and closes only before one.
+fn quoted_span_end(chars: &[char], at: usize) -> Option<usize> {
+    let quote = *chars.get(at).filter(|c| matches!(**c, '"' | '\'' | '`'))?;
+    if at
+        .checked_sub(1)
+        .is_some_and(|before| alphanumeric_at(chars, before))
+    {
+        return None;
+    }
+    (at + 1..chars.len())
+        .find(|&close| chars.get(close) == Some(&quote) && !alphanumeric_at(chars, close + 1))
+}
+
+/// An unquoted path starts at the beginning of the text or after a blank or
+/// one of the characters that punctuation puts in front of it.
+fn path_anchor_at(chars: &[char], at: usize) -> bool {
+    let after_boundary = at.checked_sub(1).is_none_or(|before| {
+        chars
+            .get(before)
+            .is_some_and(|c| c.is_whitespace() || "([{=,;'\"`".contains(*c))
+    });
+    after_boundary && anchor_shape(chars.get(at..).unwrap_or_default())
+}
+
+/// A drive (`C:\`, `C:/`), a UNC or verbatim prefix, a POSIX root, or a
+/// home-relative or dot-relative start. A lone `/` followed by a blank is not
+/// one: it is the one between `model.onnx / model_quantized.onnx`.
+fn anchor_shape(rest: &[char]) -> bool {
+    match rest {
+        [drive, ':', '\\' | '/', ..] => drive.is_ascii_alphabetic(),
+        ['\\', '\\', next, ..] | ['/', next, ..] => !next.is_whitespace(),
+        ['~' | '.', '\\' | '/', ..] | ['.', '.', '\\' | '/', ..] => true,
+        _ => false,
+    }
+}
+
+/// The clause of an unquoted path ends at a `:` that is not the one in `C:\`,
+/// at a `"`, at a line break or at the end of the text.
+fn clause_end(chars: &[char], start: usize) -> usize {
+    (start..chars.len())
+        .find(|&at| ends_clause(chars, at))
+        .unwrap_or(chars.len())
+}
+
+fn ends_clause(chars: &[char], at: usize) -> bool {
+    match chars.get(at) {
+        Some('"' | '\n' | '\r') => true,
+        Some(':') => !matches!(chars.get(at + 1), Some('\\' | '/')),
+        _ => false,
+    }
+}
+
+/// The blanks a path swallowed before its clause ended. They are the
+/// sentence's, not the path's, and stay: `"` follows them in
+/// `…dll which depends on "cublasLt64_12.dll"`.
+fn trailing_blanks(path: &[char]) -> &[char] {
+    let kept = path
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+        .map_or(0, |last| last + 1);
+    path.get(kept..).unwrap_or_default()
 }
 
 /// The NLI model, read from the cell rather than forced into it.
@@ -2725,7 +2876,7 @@ fn reason_without_a_model_path(reason: &str, instead: &'static str) -> String {
 fn nli_state() -> ModelState {
     nli_state_from(
         crate::cognitive::nli::failure_reason(),
-        device_of(crate::gpu::Workload::Nli),
+        crate::gpu::placement(crate::gpu::Workload::Nli).as_ref(),
         crate::cognitive::nli::deferred_by_resource_plan(),
         crate::cognitive::nli::available(),
         crate::cognitive::nli::status_resolved(),
@@ -2741,7 +2892,7 @@ fn nli_state() -> ModelState {
 /// one here.
 fn nli_state_from(
     failure: Option<String>,
-    device: &'static str,
+    placement: Option<&crate::gpu::Placement>,
     deferred: bool,
     available: bool,
     status_resolved: bool,
@@ -2749,7 +2900,7 @@ fn nli_state_from(
     if let Some(reason) = failure {
         return ModelState {
             state: STATE_FAILED,
-            device,
+            device: None,
             reason: Some(reason_without_a_model_path(
                 &reason,
                 NLI_DIR_INSTEAD_OF_A_PATH,
@@ -2759,7 +2910,7 @@ fn nli_state_from(
     if deferred {
         return ModelState {
             state: STATE_OFF,
-            device,
+            device: None,
             reason: Some(
                 "the resource plan switched NLI off on this machine; contradictions fall back \
                  to the judge"
@@ -2770,20 +2921,16 @@ fn nli_state_from(
     if !available {
         return ModelState {
             state: STATE_ABSENT,
-            device,
+            device: None,
             reason: Some("no NLI model where this daemon looks".to_string()),
         };
     }
     if status_resolved {
-        return ModelState {
-            state: STATE_LOADED,
-            device,
-            reason: None,
-        };
+        return loaded_on(placement);
     }
     ModelState {
         state: STATE_CONFIGURED,
-        device,
+        device: None,
         reason: Some("loads on its first use; this endpoint does not force it".to_string()),
     }
 }
@@ -4271,7 +4418,7 @@ mod health_report_tests {
     fn report(ready: bool, gpu_degraded: bool, states: [&'static str; 3]) -> RuntimeReport {
         let at = |state: &'static str| ModelState {
             state,
-            device: "cpu",
+            device: Some("cpu"),
             reason: None,
         };
         RuntimeReport {
@@ -4382,35 +4529,6 @@ mod health_report_tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_device_word_is_the_one_the_placement_path_chose() {
-        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
-
-        {
-            let _asked_for_cpu = crate::envs::ScopedEnv::set("CUBA_EMBED_DEVICE", "cpu");
-            assert_eq!(
-                device_of(crate::gpu::Workload::Embedder),
-                "cpu",
-                "this is the word `/health` prints, and the question it answers is the one an \
-                 operator reconstructed by reading the source: where is this model running"
-            );
-        }
-        {
-            let _asked_for_gpu = crate::envs::ScopedEnv::set("CUBA_EMBED_DEVICE", "gpu");
-            // `wants_gpu` returns false before it ever reads the variable on a
-            // build with no execution provider compiled in, which is the build
-            // the gate runs. Under `--features cuda` this row is the one that
-            // proves the other word exists.
-            let compiled_with_a_gpu = cfg!(any(feature = "cuda", feature = "directml"));
-            assert_eq!(
-                device_of(crate::gpu::Workload::Embedder),
-                if compiled_with_a_gpu { "gpu" } else { "cpu" },
-                "a field that said `gpu` on a CPU-only binary would be the placement summary \
-                 disagreeing with the placement"
-            );
-        }
-    }
-
     #[test]
     fn the_embedder_is_warming_while_the_models_are_still_loading() {
         assert_eq!(
@@ -4467,7 +4585,7 @@ mod health_report_tests {
     fn a_model_block_carries_its_state_its_device_and_its_reason() {
         let broken = ModelState {
             state: "failed",
-            device: "gpu",
+            device: Some("gpu"),
             reason: Some("the session did not open".to_string()),
         };
         let json = model_json(&broken);
@@ -4481,7 +4599,7 @@ mod health_report_tests {
 
         let quiet = ModelState {
             state: "loaded",
-            device: "cpu",
+            device: Some("cpu"),
             reason: None,
         };
         assert_eq!(
@@ -4489,6 +4607,35 @@ mod health_report_tests {
             Value::Null,
             "a model that is simply running says nothing, and the key stays so a reader never \
              has to tell «no reason» from «this daemon is too old to report one»"
+        );
+    }
+
+    #[test]
+    fn a_model_with_no_measured_device_serves_the_key_as_null_and_does_not_drop_it() {
+        let unmeasured = ModelState {
+            state: "configured",
+            device: None,
+            reason: Some("loads on its first batch".to_string()),
+        };
+        let json = model_json(&unmeasured);
+
+        assert!(
+            json.as_object()
+                .is_some_and(|block| block.contains_key("device")),
+            "the key stays when nobody measured the device. A reader, and the monitor that \
+             matches on `runtime.reranker.device`, must never have to tell «null» from «this \
+             daemon is too old to say»: {json}"
+        );
+        assert_eq!(
+            json["device"],
+            Value::Null,
+            "and what it holds is `null`, not a guess: a session that never opened runs on no \
+             device at all"
+        );
+        assert_eq!(
+            json["state"], "configured",
+            "control: the rest of the block is still there, so the missing device is the \
+             decision and not an empty block"
         );
     }
 
@@ -4555,7 +4702,7 @@ mod health_report_tests {
         for (failure, dir_resolved, configured, status_resolved, expected) in table {
             let state = reranker_state_from(
                 failure.map(String::from),
-                "cpu",
+                None,
                 dir_resolved,
                 configured,
                 status_resolved,
@@ -4566,14 +4713,36 @@ mod health_report_tests {
                  status_resolved={status_resolved}"
             );
             assert_eq!(
-                state.device, "cpu",
-                "whichever branch answers, the device word is the one the placement path chose \
-                 — that is the question an operator came to this endpoint with"
+                state.device, None,
+                "no session was measured, so no branch may name a device. The word used to be \
+                 the one the placement path *chose*, in every branch, which is where `cpu` on a \
+                 model that never opened came from: failure={failure:?} \
+                 dir_resolved={dir_resolved} configured={configured} \
+                 status_resolved={status_resolved}"
+            );
+
+            let measured = reranker_state_from(
+                failure.map(String::from),
+                Some(&crate::gpu::Placement::Gpu),
+                dir_resolved,
+                configured,
+                status_resolved,
+            );
+            assert_eq!(
+                measured.device,
+                if expected == "loaded" {
+                    Some("gpu")
+                } else {
+                    None
+                },
+                "a placement that exists is read only by the row whose session is open; every \
+                 other row keeps `null` even though the registry can already hold a value (it is \
+                 written while `commit_from_file` is still loading): expected={expected}"
             );
         }
 
         assert_eq!(
-            reranker_state_from(None, "cpu", true, true, true).reason,
+            reranker_state_from(None, None, true, true, true).reason,
             None,
             "a reranker that is loaded says nothing more. «loads on its first batch» on a model \
              that already loaded leaves someone waiting for a load that has happened"
@@ -4616,7 +4785,7 @@ mod health_report_tests {
         for (failure, deferred, available, status_resolved, expected) in table {
             let state = nli_state_from(
                 failure.map(String::from),
-                "cpu",
+                None,
                 deferred,
                 available,
                 status_resolved,
@@ -4627,13 +4796,31 @@ mod health_report_tests {
                  status_resolved={status_resolved}"
             );
             assert_eq!(
-                state.device, "cpu",
-                "whichever branch answers, the device word is the one the placement path chose"
+                state.device, None,
+                "no session was measured, so no branch may name a device: failure={failure:?} \
+                 deferred={deferred} available={available} status_resolved={status_resolved}"
+            );
+
+            let measured = nli_state_from(
+                failure.map(String::from),
+                Some(&crate::gpu::Placement::Gpu),
+                deferred,
+                available,
+                status_resolved,
+            );
+            assert_eq!(
+                measured.device,
+                if expected == "loaded" {
+                    Some("gpu")
+                } else {
+                    None
+                },
+                "only the row whose session is open reads the registry: expected={expected}"
             );
         }
 
         assert_eq!(
-            nli_state_from(None, "cpu", false, true, true).reason,
+            nli_state_from(None, None, false, true, true).reason,
             None,
             "an NLI model that already loaded says nothing more. «loads on its first use» on a \
              model that has loaded leaves someone waiting for a load that has happened"
@@ -4662,34 +4849,56 @@ mod health_report_tests {
         ];
 
         for (failure, ready, loaded, expected) in table {
-            let state = embedder_state_from(failure.map(String::from), "gpu", ready, loaded);
+            let measured = embedder_state_from(
+                failure.map(String::from),
+                Some(&crate::gpu::Placement::Gpu),
+                ready,
+                loaded,
+            );
             assert_eq!(
-                state.state, expected,
+                measured.state, expected,
                 "failure={failure:?} ready={ready} loaded={loaded}"
             );
             assert_eq!(
-                state.device,
-                if expected == "fallback" { "cpu" } else { "gpu" },
-                "the hash fallback runs on this CPU whatever the placement path was asked for, \
-                 and every other branch reports where the model went: failure={failure:?} \
+                measured.device,
+                match expected {
+                    "fallback" => Some("cpu"),
+                    "loaded" => Some("gpu"),
+                    _ => None,
+                },
+                "the hash fallback runs on this CPU whatever the registry says, an open \
+                 session is where it opened, and a model that failed or is still warming runs \
+                 nowhere yet: failure={failure:?} ready={ready} loaded={loaded}"
+            );
+
+            let unmeasured = embedder_state_from(failure.map(String::from), None, ready, loaded);
+            assert_eq!(
+                unmeasured.device,
+                if expected == "fallback" {
+                    Some("cpu")
+                } else {
+                    None
+                },
+                "with nothing in the registry only the fallback names a device, because it is \
+                 the one answer that does not depend on a session: failure={failure:?} \
                  ready={ready} loaded={loaded}"
             );
         }
 
         assert_eq!(
-            embedder_state_from(None, "gpu", true, true).reason,
+            embedder_state_from(None, Some(&crate::gpu::Placement::Gpu), true, true).reason,
             None,
             "an embedder that is running says nothing more"
         );
         assert!(
-            embedder_state_from(None, "gpu", true, false)
+            embedder_state_from(None, None, true, false)
                 .reason
                 .is_some_and(|why| why.contains("hash fallback")),
             "and a machine on the hash fallback has to say so: «search is lexical only» is the \
              sentence that explains results an operator would otherwise file as a ranking bug"
         );
         assert_eq!(
-            embedder_state_from(None, "gpu", false, false).reason,
+            embedder_state_from(None, Some(&crate::gpu::Placement::Gpu), false, false).reason,
             None,
             "«warming» says everything there is to say; a reason here would be a sentence that \
              stops being true a second later"
@@ -4717,8 +4926,8 @@ mod health_report_tests {
         }
 
         let mut runtime = report(true, false, ["failed", "loaded", "failed"]);
-        runtime.nli = nli_state_from(Some(nli_failure), "cpu", false, true, true);
-        runtime.embedder = embedder_state_from(Some(embedder_failure), "cpu", true, false);
+        runtime.nli = nli_state_from(Some(nli_failure), None, false, true, true);
+        runtime.embedder = embedder_state_from(Some(embedder_failure), None, true, false);
 
         assert_eq!(
             runtime.nli.reason.as_deref(),
@@ -4773,7 +4982,7 @@ mod health_report_tests {
         );
 
         let mut runtime = report(true, false, ["loaded", "failed", "loaded"]);
-        runtime.reranker = reranker_state_from(Some(failure), "cpu", true, true, false);
+        runtime.reranker = reranker_state_from(Some(failure), None, true, true, false);
 
         assert_eq!(
             runtime.reranker.reason.as_deref(),
@@ -4799,6 +5008,765 @@ mod health_report_tests {
                  Windows it carries the operator's user name; the sentence with the path in it \
                  belongs to `doctor`, which runs on their machine: {served}"
             );
+        }
+    }
+
+    /// What ONNX Runtime said on this machine on 2026-10-12, word for word,
+    /// with the operator's name left as a parameter so a test can demand that
+    /// it is absent from whatever is served.
+    fn provider_refusal(user: &str) -> String {
+        format!(
+            r#"E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Users\{user}\.cache\cuba-memorys\onnxruntime\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")"#
+        )
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Which {
+        Embedder,
+        Reranker,
+        Nli,
+    }
+
+    /// The row of `which` that lands on `state`, with the facts that put a real
+    /// machine there, and the registry entry the caller wants to try on it.
+    fn row(which: Which, state: &str, placement: Option<&crate::gpu::Placement>) -> ModelState {
+        let failure = || Some("the session did not open".to_string());
+        match (which, state) {
+            (Which::Embedder, "failed") => embedder_state_from(failure(), placement, true, false),
+            (Which::Embedder, "warming") => embedder_state_from(None, placement, false, false),
+            (Which::Embedder, "loaded") => embedder_state_from(None, placement, true, true),
+            (Which::Embedder, "fallback") => embedder_state_from(None, placement, true, false),
+            (Which::Reranker, "failed") => {
+                reranker_state_from(failure(), placement, true, true, false)
+            }
+            (Which::Reranker, "off") => reranker_state_from(None, placement, false, false, false),
+            (Which::Reranker, "absent") => reranker_state_from(None, placement, true, false, false),
+            (Which::Reranker, "configured") => {
+                reranker_state_from(None, placement, true, true, false)
+            }
+            (Which::Reranker, "loaded") => reranker_state_from(None, placement, true, true, true),
+            (Which::Nli, "failed") => nli_state_from(failure(), placement, false, true, false),
+            (Which::Nli, "off") => nli_state_from(None, placement, true, true, false),
+            (Which::Nli, "absent") => nli_state_from(None, placement, false, false, false),
+            (Which::Nli, "configured") => nli_state_from(None, placement, false, true, false),
+            (Which::Nli, "loaded") => nli_state_from(None, placement, false, true, true),
+            _ => panic!("the fixture is broken: {which:?} has no row that lands on {state:?}"),
+        }
+    }
+
+    /// The device `/health` prints is where the session *opened*, and only a
+    /// session that is open has one.
+    ///
+    /// The old word was the placement path's choice, copied into every branch:
+    /// a reranker that never opened said `cpu`, a reranker that was asked for
+    /// the card and opened on the CPU said `gpu`, and on the build the gate
+    /// runs both were the same word. Every column below is a literal for that
+    /// reason, and the table crosses all three models with every entry the
+    /// registry can hold, because a row that only tried `Gpu` would pass a
+    /// function that hard-coded it.
+    #[test]
+    fn the_device_is_where_the_session_opened_and_only_an_open_session_has_one() {
+        let refused = crate::gpu::Placement::CpuAfterProviderFailed(provider_refusal("canary"));
+        // none, Gpu, Cpu, CpuAfterProviderFailed — the order of the device columns.
+        let placements: [(&str, Option<&crate::gpu::Placement>); 4] = [
+            ("nothing recorded", None),
+            ("Gpu", Some(&crate::gpu::Placement::Gpu)),
+            ("Cpu", Some(&crate::gpu::Placement::Cpu)),
+            ("CpuAfterProviderFailed", Some(&refused)),
+        ];
+        let devices: [(&str, [Option<&str>; 4]); 7] = [
+            ("loaded", [None, Some("gpu"), Some("cpu"), Some("cpu")]),
+            ("fallback", [Some("cpu"); 4]),
+            ("failed", [None; 4]),
+            ("warming", [None; 4]),
+            ("configured", [None; 4]),
+            ("off", [None; 4]),
+            ("absent", [None; 4]),
+        ];
+        let models: [(Which, &[&str]); 3] = [
+            (
+                Which::Embedder,
+                &["failed", "warming", "loaded", "fallback"],
+            ),
+            (
+                Which::Reranker,
+                &["failed", "off", "absent", "configured", "loaded"],
+            ),
+            (
+                Which::Nli,
+                &["failed", "off", "absent", "configured", "loaded"],
+            ),
+        ];
+
+        for (which, states) in models {
+            for &state in states {
+                let (_, expected) = devices
+                    .iter()
+                    .find(|(name, _)| *name == state)
+                    .unwrap_or_else(|| panic!("the table has no column for {state:?}"));
+                let unrecorded = row(which, state, None);
+                assert_eq!(
+                    unrecorded.state, state,
+                    "the fixture is broken: {which:?} does not land on {state:?} with the facts \
+                     this row gives it, so every device assertion below would be about another row"
+                );
+
+                for (index, (recorded, placement)) in placements.iter().enumerate() {
+                    let got = row(which, state, *placement);
+                    assert_eq!(got.state, state, "{which:?} with {recorded}");
+                    assert_eq!(
+                        got.device, expected[index],
+                        "{which:?} in `{state}` with {recorded} in the registry. `loaded` says \
+                         where the session opened and `null` when nobody measured it; `fallback` \
+                         is the hash on this CPU; `failed`, `warming`, `configured`, `off` and \
+                         `absent` have no session and so no device, even when the registry \
+                         already holds a value (it is written while the model is still loading)"
+                    );
+                    if state == "loaded" {
+                        assert_eq!(
+                            got.reason.is_some(),
+                            index == 3,
+                            "{which:?} loaded with {recorded}: only a session that opened on the \
+                             CPU after the provider refused has something to explain, and a \
+                             healthy one says nothing: {:?}",
+                            got.reason
+                        );
+                    } else {
+                        assert_eq!(
+                            got.reason, unrecorded.reason,
+                            "{which:?} in `{state}`: the registry must not change what a model \
+                             that is not open says about itself. A `failed` model keeps the \
+                             loader's reason, redacted with the variable that names *its* \
+                             directory, and does not borrow the provider's"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The caught case: the card, the runtime and the provider library are on
+    /// disk, `cublasLt64_12.dll` is not, and the session opened on the CPU.
+    ///
+    /// The cause is the sentence ONNX Runtime wrote, and it is full of paths:
+    /// the source file it was built from, and the provider DLL under the
+    /// operator's home. They go the way every other path goes, but the variable
+    /// that replaces them is the *runtime's*, not the model's — the directory
+    /// in that error is where `onnxruntime.dll` and its providers live, and
+    /// sending the operator to `CUBA_RERANKER_PATH` would be the wrong knob.
+    #[test]
+    fn a_session_that_opened_on_the_cpu_after_the_provider_refused_says_why_without_its_path() {
+        assert_provider_refusal_redacted("canaryoperator", &["canaryoperator"]);
+        // The same sentence with a user name that has spaces in it, which is what
+        // `C:\Users\<name>` is made of for anyone whose Windows account carries
+        // their full name. The canary above is one word, so a redaction that cut
+        // the sentence at its spaces never had a word between two separators to
+        // let through.
+        assert_provider_refusal_redacted(
+            "Canaryuno Canarydos Canarytres",
+            &["Canaryuno", "Canarydos", "Canarytres"],
+        );
+    }
+
+    /// One run of the caught case above for one operator name: `canaries` are the
+    /// words of `user`, and none of them may be served.
+    fn assert_provider_refusal_redacted(user: &str, canaries: &[&str]) {
+        const RUNTIME_DIR: &str = "the ONNX Runtime directory (see ORT_DYLIB_PATH)";
+        let cause = provider_refusal(user);
+
+        // Positive controls. Without them «the canary is not in the reason» also
+        // passes on a reason that never carried the cause.
+        let fixed_needles = [
+            ".cache",
+            "onnxruntime_providers_cuda.dll",
+            "cublasLt64_12.dll",
+        ];
+        for needle in canaries.iter().chain(fixed_needles.iter()) {
+            assert!(
+                cause.contains(needle),
+                "the fixture is broken: the sentence this test scrubs has no {needle:?} in it"
+            );
+        }
+
+        let refused = crate::gpu::Placement::CpuAfterProviderFailed(cause);
+        let opened = [
+            (
+                "embedder",
+                embedder_state_from(None, Some(&refused), true, true),
+            ),
+            (
+                "reranker",
+                reranker_state_from(None, Some(&refused), true, true, true),
+            ),
+            (
+                "nli",
+                nli_state_from(None, Some(&refused), false, true, true),
+            ),
+        ];
+
+        // The first path is cut at the `:` of `.cc:1962`: an unquoted path ends
+        // where its clause does, and what follows is the line number in ONNX
+        // Runtime's own source, from the machine Microsoft built it on.
+        let expected = format!(
+            "the GPU provider did not start; this session runs on the CPU: {RUNTIME_DIR}:1962 \
+             onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading \
+             {RUNTIME_DIR} which depends on \"cublasLt64_12.dll\" which is missing. (Error 126: \
+             \"No se puede encontrar el módulo especificado.\")"
+        );
+
+        // Beside the words of the operator's name: what is inventory about the
+        // machine whatever the name is, and the variables of the other models.
+        let fixed_leaks = [
+            ".cache",
+            "onnxruntime_providers_cuda.dll",
+            "C:\\Users",
+            "provider_bridge_ort.cc",
+            "CUBA_RERANKER_PATH",
+            "CUBA_NLI_PATH",
+            "ONNX_MODEL_PATH",
+        ];
+
+        for (model, state) in &opened {
+            assert_eq!(state.state, "loaded", "{model}");
+            assert_eq!(
+                state.device,
+                Some("cpu"),
+                "{model}: the session opened, and opened on the CPU. The registry says so even \
+                 though the placement path asked for the card"
+            );
+            let reason = state.reason.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "{model}: a session that fell to the CPU after the provider refused has to \
+                     say why — `device: cpu` alone is indistinguishable from a machine that \
+                     asked for it"
+                )
+            });
+
+            assert_eq!(
+                reason, expected,
+                "{model}: the sentence is fixed — what happened, where it landed, then ONNX \
+                 Runtime's own words with each path replaced by the runtime directory"
+            );
+            for kept in [
+                "CPU",
+                "(see ORT_DYLIB_PATH)",
+                "cublasLt64_12.dll",
+                "Error 126",
+            ] {
+                assert!(
+                    reason.contains(kept),
+                    "{model}: {kept:?} is the half an operator can act on, and it was cut: \
+                     {reason}"
+                );
+            }
+            for leaked in canaries.iter().chain(fixed_leaks.iter()) {
+                assert!(
+                    !reason.contains(leaked),
+                    "{model}: {leaked:?} reached the reason. The paths in this error are the \
+                     runtime's and `/health` goes out over a socket a LAN bind makes reachable; \
+                     and a model-directory variable would send the operator to change the wrong \
+                     one: {reason}"
+                );
+            }
+        }
+
+        let mut runtime = report(true, false, ["loaded", "loaded", "loaded"]);
+        let [(_, embedder), (_, reranker), (_, nli)] = opened;
+        runtime.embedder = embedder;
+        runtime.reranker = reranker;
+        runtime.nli = nli;
+        let served = runtime_json(&runtime).to_string();
+        assert!(
+            served.contains("cublasLt64_12.dll"),
+            "positive control: the cause has to reach the served block at all, or every canary \
+             below passes on a block that says nothing: {served}"
+        );
+        let fixed_served = [".cache", "onnxruntime_providers_cuda.dll"];
+        for canary in canaries.iter().chain(fixed_served.iter()) {
+            assert!(
+                !served.contains(canary),
+                "{canary:?} was served in the runtime block: {served}"
+            );
+        }
+    }
+
+    /// Three rows, three answers: a reranker that fell to the CPU, an embedder
+    /// that opened where it was asked, and an NLI nobody has used yet.
+    #[test]
+    fn each_model_row_tells_its_own_truth_in_the_served_block() {
+        const CANARY_USER: &str = "canaryoperator";
+        let refused = crate::gpu::Placement::CpuAfterProviderFailed(provider_refusal(CANARY_USER));
+
+        let mut runtime = report(true, false, ["loaded", "loaded", "configured"]);
+        runtime.reranker = reranker_state_from(None, Some(&refused), true, true, true);
+        runtime.embedder = embedder_state_from(None, Some(&crate::gpu::Placement::Cpu), true, true);
+        runtime.nli = nli_state_from(None, None, false, true, false);
+        let json = runtime_json(&runtime);
+
+        assert_eq!(json["reranker"]["state"], "loaded");
+        assert_eq!(
+            json["reranker"]["device"], "cpu",
+            "the one that fell: {json}"
+        );
+        assert!(
+            json["reranker"]["reason"]
+                .as_str()
+                .is_some_and(|why| why.contains("cublasLt64_12.dll")),
+            "and it says why, in its own row: {json}"
+        );
+
+        assert_eq!(json["embedder"]["state"], "loaded");
+        assert_eq!(json["embedder"]["device"], "cpu");
+        assert_eq!(
+            json["embedder"]["reason"],
+            Value::Null,
+            "an embedder that opened on the CPU because it was asked to has nothing to explain, \
+             and must not inherit the reranker's cause: {json}"
+        );
+
+        assert_eq!(json["nli"]["state"], "configured");
+        assert!(
+            json["nli"]
+                .as_object()
+                .is_some_and(|block| block.contains_key("device")),
+            "the key stays: {json}"
+        );
+        assert_eq!(
+            json["nli"]["device"],
+            Value::Null,
+            "a model nobody has opened runs on no device, and saying `cpu` or `gpu` for it is \
+             the guess this block used to make: {json}"
+        );
+
+        let served = json.to_string();
+        for canary in [CANARY_USER, ".cache"] {
+            assert!(
+                !served.contains(canary),
+                "{canary:?} was served in the runtime block: {served}"
+            );
+        }
+    }
+
+    /// What every row of the two tables below puts where a path was. It is the
+    /// runtime's, which is what the cause of a provider refusal is built from.
+    const TABLE_R: &str = "the ONNX Runtime directory (see ORT_DYLIB_PATH)";
+
+    /// The rows of a table written as a line with the id, then `IN :` and
+    /// `OUT:`, in the shape of the W6 specification. `<R>` in an output stands
+    /// for `TABLE_R` and `<NL>` for a line break, which a table that is one raw
+    /// string cannot carry any other way: a `\n` in it would be a backslash and
+    /// an `n`, and the Windows paths in these rows have plenty of those.
+    ///
+    /// The tables are a string and not an array of tuples so that no formatter
+    /// ever reflows a row: the exact text is the whole test.
+    fn table_rows(table: &str) -> Vec<(&str, String, String)> {
+        let mut rows = Vec::new();
+        let (mut id, mut input) = ("", String::new());
+        for line in table.lines() {
+            if let Some(text) = line.strip_prefix("IN : ") {
+                input = text.replace("<NL>", "\n");
+            } else if let Some(text) = line.strip_prefix("OUT: ") {
+                let output = text.replace("<NL>", "\n").replace("<R>", TABLE_R);
+                rows.push((id, input.clone(), output));
+            } else if !line.trim().is_empty() {
+                id = line.trim();
+            }
+        }
+        rows
+    }
+
+    /// A: the paths and the sentences that are redacted differently since W6.
+    /// U: sentences with no path in them, which must not change by a character.
+    /// K: what was already redacted well and must come out as it did.
+    ///
+    /// The ids are the specification's (§2.1 of the W6 handoff).
+    const REDACTION_TABLE: &str = r#"
+A1 ORT on Windows, the literal of 2026-10-12, a user name without spaces
+IN : E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Users\canaryoperator\.cache\cuba-memorys\onnxruntime\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+OUT: <R>:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading <R> which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+A2 the same, user "Juan Carlos Pérez"
+IN : E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Users\Juan Carlos Pérez\.cache\cuba-memorys\onnxruntime\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+OUT: <R>:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading <R> which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+A3 the same, under Program Files
+IN : E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+OUT: <R>:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading <R> which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")
+A4 Display without quotes, onnx.rs, Windows
+IN : loading ONNX Runtime from C:\Users\Juan Carlos Pérez\.cache\memory-industry\onnxruntime\onnxruntime.dll: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+A5 Windows with forward slashes
+IN : loading ONNX Runtime from C:/Users/Juan Carlos Pérez/.cache/memory-industry/onnxruntime/onnxruntime.dll: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+A6 Program Files without quotes
+IN : loading ONNX Runtime from C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\onnxruntime.dll: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+A7 Linux, libloading plus dlerror, two paths with spaces
+IN : loading ONNX Runtime from /home/juan carlos/.cache/memory-industry/onnxruntime/libonnxruntime.so: /home/juan carlos/.cache/memory-industry/onnxruntime/libonnxruntime.so: invalid ELF header
+OUT: loading ONNX Runtime from <R>: <R>: invalid ELF header
+A8 Linux, ORT, provider
+IN : Failed to load library /home/juan carlos/.cache/memory-industry/onnxruntime/libonnxruntime_providers_cuda.so with error: libcublasLt.so.12: cannot open shared object file: No such file or directory
+OUT: Failed to load library <R>: libcublasLt.so.12: cannot open shared object file: No such file or directory
+A9 Linux, cannot open the file itself
+IN : loading ONNX Runtime from /opt/memory industry/lib/libonnxruntime.so: /opt/memory industry/lib/libonnxruntime.so: cannot open shared object file: No such file or directory
+OUT: loading ONNX Runtime from <R>: <R>: cannot open shared object file: No such file or directory
+A10 UNC
+IN : loading ONNX Runtime from \\servidor\recurso\Juan Carlos\onnxruntime.dll: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+A11 verbatim \\?\
+IN : resolving the ONNX Runtime path \\?\C:\Users\Juan Carlos\ort\onnxruntime.dll: El sistema no puede encontrar la ruta especificada. (os error 3)
+OUT: resolving the ONNX Runtime path <R>: El sistema no puede encontrar la ruta especificada. (os error 3)
+A12a ~ with a slash
+IN : tokenizer.json not found at ~/Juan Carlos/models/tokenizer.json
+OUT: tokenizer.json not found at <R>
+A12b ~ with a backslash
+IN : tokenizer.json not found at ~\Juan Carlos\models\tokenizer.json
+OUT: tokenizer.json not found at <R>
+A13 single quotes
+IN : cannot open 'C:\Users\Juan Carlos\.cache\memory-industry\models\model.onnx': Acceso denegado. (os error 5)
+OUT: cannot open <R>: Acceso denegado. (os error 5)
+A14 backticks, ort lib.rs:107
+IN : failed to load from `C:\Users\Juan Carlos\.cache\memory-industry\onnxruntime\onnxruntime.dll`: LoadLibraryExW failed
+OUT: failed to load from <R>: LoadLibraryExW failed
+A15 Debug with spaces, nli.rs
+IN : no hay model.onnx ni model_quantized.onnx en "C:\\Users\\Juan Carlos Pérez\\.cache\\models-nli"
+OUT: no hay model.onnx ni model_quantized.onnx en <R>
+A16 an apostrophe in the name, no quotes
+IN : loading ONNX Runtime from C:\Users\O'Brien Smith\ort\onnxruntime.dll: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+A17 an apostrophe inside single quotes
+IN : cannot open 'C:\Users\O'Brien\x.dll': denied
+OUT: cannot open <R>: denied
+A18 the sentence of its own after the path is lost
+IN : the ONNX Runtime at C:\Users\Juan Carlos\ort\onnxruntime.dll is version 1.16.3, and this build needs 1.22 or newer: run `memory-industry models runtime` or point ORT_DYLIB_PATH at a newer library
+OUT: the ONNX Runtime at <R>: run `memory-industry models runtime` or point ORT_DYLIB_PATH at a newer library
+A19 ORT, Load model from ... failed: with no space after the colon
+IN : load model: Load model from C:\Users\Juan Carlos\.cache\memory-industry\models\model.onnx failed:Protobuf parsing failed.
+OUT: load model: Load model from <R>:Protobuf parsing failed.
+A20 a line break ends the clause
+IN : loading ONNX Runtime from /home/juan carlos/x/libonnxruntime.so<NL>second line
+OUT: loading ONNX Runtime from <R> second line
+A21 two paths in one clause
+IN : copy C:\a b\x.dll to D:\c d\y.dll: failed
+OUT: copy <R>: failed
+A22 the apostrophe of a word opens nothing
+IN : it doesn't load 'C:\x\y.dll' here
+OUT: it doesn't load <R> here
+A23 an unquoted path followed by a quoted name: the double quote ends the clause
+IN : Error loading C:\Users\Juan Carlos\.cache\x\onnxruntime_providers_cuda.dll which depends on "cublasLt64_12.dll" which is missing.
+OUT: Error loading <R> "cublasLt64_12.dll" which is missing.
+A24 the old form of ORT, with an empty ""
+IN : LoadLibrary failed with error 126 "" when trying to load "C:\Users\Juan Carlos\.cache\memory-industry\onnxruntime\onnxruntime_providers_cuda.dll"
+OUT: LoadLibrary failed with error 126 "" when trying to load <R>
+U1
+IN : the session did not open
+OUT: the session did not open
+U2
+IN : no model.onnx / model_quantized.onnx found
+OUT: no model.onnx / model_quantized.onnx found
+U3
+IN : onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error 126: "No se puede encontrar el módulo especificado."
+OUT: onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error 126: "No se puede encontrar el módulo especificado."
+U4
+IN : which depends on "cublasLt64_12.dll" which is missing.
+OUT: which depends on "cublasLt64_12.dll" which is missing.
+U5
+IN : run `memory-industry models runtime` or point ORT_DYLIB_PATH at a newer library
+OUT: run `memory-industry models runtime` or point ORT_DYLIB_PATH at a newer library
+U6
+IN : it doesn't open: it's 3:00
+OUT: it doesn't open: it's 3:00
+U7 quoted text needs a separator and an alphanumeric to be a path
+IN : see "/" here
+OUT: see "/" here
+K1 Debug without spaces, rerank.rs
+IN : no model.onnx / model_quantized.onnx found in "C:\\Users\\canaryoperator\\.cache\\memory-industry\\reranker"
+OUT: no model.onnx / model_quantized.onnx found in <R>
+K2 Debug without spaces, nli.rs
+IN : no hay model.onnx ni model_quantized.onnx en "C:\\Users\\canaryoperator\\.cache\\models-nli"
+OUT: no hay model.onnx ni model_quantized.onnx en <R>
+K3 Display at the end, onnx.rs
+IN : tokenizer.json not found at C:\Users\canaryoperator\.cache\models\tokenizer.json
+OUT: tokenizer.json not found at <R>
+K4 a relative path with no anchor: the word layer
+IN : load model: models/e5/model.onnx is truncated
+OUT: load model: <R> is truncated
+K5 a URL: the word layer
+IN : download from https://huggingface.co/intfloat/e5 failed
+OUT: download from <R> failed
+"#;
+
+    /// The redaction of one string as a table, so a row that moves is a row that
+    /// names itself. Today every A row differs from what the function did before
+    /// W6 except A22; the U and K rows are the guards that it did not start
+    /// swallowing what it used to leave alone.
+    #[test]
+    fn a_path_is_redacted_whole_whatever_its_spaces_quotes_or_root() {
+        let rows = table_rows(REDACTION_TABLE);
+        assert_eq!(
+            rows.len(),
+            37,
+            "the table lost a row: A1-A24 (A12 has two), U1-U7 and K1-K5. A table that quietly \
+             shrinks passes with whatever is left"
+        );
+
+        for (id, input, expected) in rows {
+            assert_eq!(
+                reason_without_a_model_path(&input, TABLE_R),
+                expected,
+                "{id}: the redaction of {input:?}"
+            );
+        }
+    }
+
+    /// The templates of the sentences ONNX Runtime, `libloading` and this crate
+    /// write around a path, and what each one must come out as. `{p}` is the
+    /// path, and `{p:?}` the path as `nli.rs` writes it, with the quotes and the
+    /// doubled backslashes of `Debug`.
+    const TEMPLATE_TABLE: &str = r#"
+P-T1
+IN : Error loading "{p}" which depends on "cublasLt64_12.dll" which is missing.
+OUT: Error loading <R> which depends on "cublasLt64_12.dll" which is missing.
+P-T2
+IN : cannot open '{p}': denied
+OUT: cannot open <R>: denied
+P-T3
+IN : failed to load from `{p}`: LoadLibraryExW failed
+OUT: failed to load from <R>: LoadLibraryExW failed
+P-T4
+IN : loading ONNX Runtime from {p}: LoadLibraryExW failed
+OUT: loading ONNX Runtime from <R>: LoadLibraryExW failed
+P-T5
+IN : tokenizer.json not found at {p}
+OUT: tokenizer.json not found at <R>
+P-T6
+IN : load model: Load model from {p} failed:Protobuf parsing failed.
+OUT: load model: Load model from <R>:Protobuf parsing failed.
+P-T7
+IN : {p}: cannot open shared object file: No such file or directory
+OUT: <R>: cannot open shared object file: No such file or directory
+P-T8
+IN : no hay model.onnx ni model_quantized.onnx en {p:?}
+OUT: no hay model.onnx ni model_quantized.onnx en <R>
+"#;
+
+    /// The output may not depend on the path. Eight sentences by nine paths, and
+    /// each of the 72 has to come out as the sentence does, with nothing of the
+    /// path in it.
+    ///
+    /// Every component of every path carries `zq`, so «nothing of the path» is
+    /// one check. The last path is the one a rule of «up to the last word with a
+    /// separator» would let through: its final component has the space in it.
+    /// It is a product and not `proptest` on purpose: the crate does not use it,
+    /// and the part that varies is a handful of shapes, not a space of values.
+    #[test]
+    fn the_redacted_reason_does_not_depend_on_the_path() {
+        let paths = [
+            r"C:\Users\Zqa Zqb Zqc\.cache\zqd\onnxruntime_providers_cuda.dll",
+            r"C:\Program Files\Zqa Zqb Zqc\Zqd Zqe\zq.dll",
+            r"C:/Users/Zqa Zqb/zqc.dll",
+            r"\\Zqserver\Zqa Zqb\zq.dll",
+            r"\\?\C:\Users\Zqa Zqb\zq.dll",
+            "/home/zqa zqb zqc/.cache/zqd/libzq.so",
+            "~/Zqa Zqb/zq.so",
+            r"C:\Users\O'Zqa Zqb\zq.dll",
+            r"C:\Users\Zqa Zqb",
+        ];
+        let templates = table_rows(TEMPLATE_TABLE);
+        assert_eq!(
+            templates.len(),
+            8,
+            "the template table lost a row, and with it a third of what this test crosses"
+        );
+
+        for (name, template, expected) in &templates {
+            for path in paths {
+                let input = template
+                    .replace("{p:?}", &format!("{path:?}"))
+                    .replace("{p}", path);
+                // Positive control. Without it «nothing of the path is left» also
+                // passes on a template that never carried the path.
+                assert!(
+                    input.to_lowercase().contains("zq"),
+                    "the fixture is broken: {name} with {path} has no path in it: {input:?}"
+                );
+
+                let got = reason_without_a_model_path(&input, TABLE_R);
+                assert_eq!(
+                    &got, expected,
+                    "{name} with {path}: the output is the sentence's and not the path's"
+                );
+                assert!(
+                    !got.to_lowercase().contains("zq"),
+                    "{name} with {path}: a piece of the path was served: {got:?}"
+                );
+                assert_eq!(
+                    reason_without_a_model_path(&got, TABLE_R),
+                    got,
+                    "{name} with {path}: redacting what was already redacted changed it"
+                );
+            }
+        }
+    }
+
+    /// If a replacement had a separator in it, the word layer would take it for
+    /// a path the next time the sentence went through, and the redaction would
+    /// stop being idempotent.
+    #[test]
+    fn no_replacement_names_a_path_itself() {
+        for constant in [
+            RERANKER_DIR_INSTEAD_OF_A_PATH,
+            NLI_DIR_INSTEAD_OF_A_PATH,
+            EMBEDDER_DIR_INSTEAD_OF_A_PATH,
+            RUNTIME_DIR_INSTEAD_OF_A_PATH,
+        ] {
+            assert!(
+                constant.contains("(see "),
+                "the fixture is broken: {constant:?} is not the sentence that names a variable"
+            );
+            assert!(
+                !constant.contains(['/', '\\']),
+                "{constant:?} has a path separator in it. The word layer of the redaction would \
+                 swallow it the next time the sentence went through, and it is the variable an \
+                 operator reads to know which knob to change"
+            );
+        }
+    }
+
+    /// A quote opens after a non-alphanumeric, and that character can be a
+    /// separator: it is the sentence's, not what the quote holds. Here the
+    /// quoted text is `a b`, which is not a path, so the quotes stay and only
+    /// the word that the separator is in goes (layer 3), and `b'` is left. A
+    /// verdict taken over the character before the quote as well would swallow
+    /// the whole span and with it the `b`.
+    #[test]
+    fn what_a_quote_holds_is_judged_without_the_character_before_it() {
+        for (input, expected) in [
+            ("from/'a b' here", format!("{TABLE_R} b' here")),
+            (r#"from\"a b" here"#, format!(r#"{TABLE_R} b" here"#)),
+        ] {
+            assert_eq!(
+                reason_without_a_model_path(input, TABLE_R),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// The text that starts or ends on a character each rule looks at: nothing,
+    /// a quote with no partner, a lone separator, half a drive, a drive and no
+    /// more, and a quote that never closes in front of a path. Every one is
+    /// also an input where a step that stopped moving would sit on the same
+    /// position until the end of the loop, so the output would be the wrong one
+    /// and not just a slow one.
+    #[test]
+    fn the_edges_of_the_text_come_out_as_they_went_in_or_as_one_replacement() {
+        let cases = [
+            ("", String::new()),
+            ("\"", "\"".to_string()),
+            ("\"\"", "\"\"".to_string()),
+            ("say \"", "say \"".to_string()),
+            ("/", "/".to_string()),
+            ("/ x", "/ x".to_string()),
+            ("C:", "C:".to_string()),
+            (r"C:\", TABLE_R.to_string()),
+            (r"'C:\a b\x.dll", format!("'{TABLE_R}")),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                reason_without_a_model_path(input, TABLE_R),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// What `onnx.rs` writes when the runtime will not load, on Windows: the
+    /// path with no quotes around it, ending in the `:` before the cause.
+    fn failed_load(user: &str) -> String {
+        format!(
+            r"loading ONNX Runtime from C:\Users\{user}\.cache\memory-industry\onnxruntime\onnxruntime.dll: LoadLibraryExW failed"
+        )
+    }
+
+    /// `state` placed in the row of `which` in a report, as `/health` serves it.
+    fn served_with(which: Which, state: ModelState) -> String {
+        let mut runtime = report(true, false, ["loaded", "loaded", "loaded"]);
+        match which {
+            Which::Embedder => runtime.embedder = state,
+            Which::Reranker => runtime.reranker = state,
+            Which::Nli => runtime.nli = state,
+        }
+        runtime_json(&runtime).to_string()
+    }
+
+    /// The row of `which` with a failure, or, with none, with the session opened
+    /// where the registry holds `placement`. The facts that put each model on
+    /// `loaded` are the ones `row` uses.
+    fn site(
+        which: Which,
+        failure: Option<String>,
+        placement: Option<&crate::gpu::Placement>,
+    ) -> ModelState {
+        match which {
+            Which::Embedder => embedder_state_from(failure, placement, true, true),
+            Which::Reranker => reranker_state_from(failure, placement, true, true, true),
+            Which::Nli => nli_state_from(failure, placement, false, true, true),
+        }
+    }
+
+    /// Each of the six places that serve a reason calls the redaction on its
+    /// own: three `failed` arms and the one `loaded_on` that the three models
+    /// share, reached through each of them. A copy of the old redaction in any
+    /// one of them leaves that model's row leaking while the others pass.
+    #[test]
+    fn every_site_that_serves_a_reason_redacts_paths_with_spaces() {
+        let failed_reason = failed_load("Zqa Zqb Zqc");
+        let refused =
+            crate::gpu::Placement::CpuAfterProviderFailed(provider_refusal("Zqa Zqb Zqc"));
+
+        for which in [Which::Embedder, Which::Reranker, Which::Nli] {
+            let model_variable = match which {
+                Which::Embedder => "ONNX_MODEL_PATH",
+                Which::Reranker => "CUBA_RERANKER_PATH",
+                Which::Nli => "CUBA_NLI_PATH",
+            };
+            let failed = site(which, Some(failed_reason.clone()), None);
+            let loaded = site(which, None, Some(&refused));
+            assert_eq!(failed.state, "failed", "{which:?}: the fixture is broken");
+            assert_eq!(loaded.state, "loaded", "{which:?}: the fixture is broken");
+
+            // The variable differs by site: a failed model names its own
+            // directory, and a provider refusal names the runtime's.
+            for (served, variable, control) in [
+                (
+                    served_with(which, failed),
+                    model_variable,
+                    "LoadLibraryExW failed",
+                ),
+                (
+                    served_with(which, loaded),
+                    "ORT_DYLIB_PATH",
+                    "cublasLt64_12.dll",
+                ),
+            ] {
+                // Positive controls. Without them «none of the words are in the
+                // block» also passes on a block that never carried the reason.
+                assert!(
+                    served.contains(control),
+                    "{which:?}: {control:?} has to reach the block, or every check below is \
+                     about a block that says nothing: {served}"
+                );
+                assert!(
+                    served.contains(variable),
+                    "{which:?}: the replacement names {variable}: {served}"
+                );
+                for word in ["Zqa", "Zqb", "Zqc"] {
+                    assert!(
+                        !served.contains(word),
+                        "{which:?}: {word:?} is a word of the operator's name, and it was \
+                         served in a path with spaces in it: {served}"
+                    );
+                }
+            }
         }
     }
 }

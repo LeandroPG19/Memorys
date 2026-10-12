@@ -164,7 +164,7 @@ where
     .collect();
 
     if providers.is_empty() {
-        return configure_cpu(builder, workload);
+        return record_if_built(workload, Placement::Cpu, configure_cpu(builder, workload));
     }
 
     match builder.with_execution_providers(providers) {
@@ -173,6 +173,7 @@ where
             // first, so a log could claim the session was on the GPU while ONNX
             // Runtime had quietly fallen back to the CPU underneath it.
             tracing::info!(model = workload.label(), "sesión ONNX en GPU");
+            record(workload, Placement::Gpu);
             Ok(configured)
         }
         // The card and the provider libraries are both there and the provider
@@ -190,7 +191,11 @@ where
                 error = %e,
                 "el provider GPU no inicializó pese a haber tarjeta y librerías: esta sesión corre en CPU. Revisá que las DLL/so de CUDA estén en PATH/LD_LIBRARY_PATH junto al runtime de ONNX"
             );
-            configure_cpu(make_builder()?, workload)
+            record_if_built(
+                workload,
+                Placement::CpuAfterProviderFailed(e.to_string()),
+                configure_cpu(make_builder()?, workload),
+            )
         }
     }
 }
@@ -219,7 +224,18 @@ fn fall_back_to_cpu(
             "se pidió GPU para este modelo y no está disponible — sigue en CPU"
         );
     }
-    configure_cpu(builder, workload)
+    record_if_built(workload, Placement::Cpu, configure_cpu(builder, workload))
+}
+
+/// Annotates the placement only once the builder was configured: a builder that
+/// could not be configured is not a session that opened, and must not leave a
+/// `Cpu` behind for `/health` to report.
+fn record_if_built(
+    workload: Workload,
+    placement: Placement,
+    built: Result<SessionBuilder>,
+) -> Result<SessionBuilder> {
+    built.inspect(|_| record(workload, placement))
 }
 
 fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {
@@ -236,18 +252,26 @@ fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionB
         .map_err(|e| anyhow::anyhow!("registrando CPU execution provider: {e}"))
 }
 
+/// The arena ceiling in MiB that the operator or the resource plan published, or
+/// `None` when none did. Without one ONNX Runtime keeps its own limit, the card.
+/// A number written here would be one nobody measured on this machine: 2048 was
+/// that number, and it could not hold the 4,23 GiB reranker.
+pub fn arena_limit_mb() -> Option<usize> {
+    crate::envs::alias("MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB", "CUBA_GPU_MEM_LIMIT_MB")
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+}
+
 #[cfg(feature = "cuda")]
 fn cuda_provider() -> ort::ep::ExecutionProviderDispatch {
-    let limit_mb: usize =
-        crate::envs::alias("MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB", "CUBA_GPU_MEM_LIMIT_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2048);
+    let cuda = ort::ep::CUDA::default()
+        .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested);
+    let cuda = match arena_limit_mb() {
+        Some(mb) => cuda.with_memory_limit(mb * 1024 * 1024),
+        None => cuda,
+    };
 
-    ort::ep::CUDA::default()
-        .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
-        .with_memory_limit(limit_mb * 1024 * 1024)
-        .build()
+    cuda.build()
         // ORT defaults this to false and falls back to the CPU inside the
         // session, which is how a daemon ends up reporting a GPU it is not
         // using. Reaching here means the card and the provider libraries are
@@ -260,6 +284,83 @@ pub struct GpuStatus {
     pub degraded: bool,
     pub detail: String,
     pub hint: Option<String>,
+}
+
+/// Where a session actually opened, as `configure` saw it, and not where
+/// `wants_gpu` said it should.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    Gpu,
+    Cpu,
+    /// The card and the provider libraries were there and the provider still
+    /// would not start. Carries what ONNX Runtime said, whole.
+    CpuAfterProviderFailed(String),
+}
+
+/// One slot per workload, in the order `slot` gives. The last write wins, so a
+/// session that opens again after the DLLs were installed replaces the refusal
+/// instead of sitting behind it for the life of the process. A poisoned lock is
+/// read through: the registry is a set of independent slots and a panic in
+/// another thread leaves each one whole.
+static PLACEMENTS: std::sync::Mutex<[Option<Placement>; 3]> =
+    std::sync::Mutex::new([None, None, None]);
+
+fn slot(workload: Workload) -> usize {
+    match workload {
+        Workload::Embedder => 0,
+        Workload::Reranker => 1,
+        Workload::Nli => 2,
+    }
+}
+
+fn record(workload: Workload, placement: Placement) {
+    PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(workload)] = Some(placement);
+}
+
+/// Where this workload's session opened, or `None` while nobody opened one.
+/// `wants_gpu` is the plan; this is what `configure` actually did.
+pub fn placement(workload: Workload) -> Option<Placement> {
+    PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(workload)].clone()
+}
+
+/// The workloads whose provider refused to start, in the fixed order embedder,
+/// reranker, nli so two runs of the same machine print the same sentence.
+fn refused_sessions() -> Vec<(Workload, String)> {
+    [Workload::Embedder, Workload::Reranker, Workload::Nli]
+        .into_iter()
+        .filter_map(|workload| match placement(workload) {
+            Some(Placement::CpuAfterProviderFailed(cause)) => Some((workload, cause)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Folds what the sessions did into what `status_from` judged from the
+/// machine. With nothing refused it is the identity. With a refusal the one
+/// healthy row of `status_from` stops being healthy: the card and the provider
+/// libraries were there and the session still opened on the CPU. The cause is
+/// carried whole because `doctor` runs on the machine of whoever has to read it.
+pub fn status_after_sessions(base: GpuStatus, refused: &[(Workload, String)]) -> GpuStatus {
+    if refused.is_empty() {
+        return base;
+    }
+    let sessions = refused
+        .iter()
+        .map(|(workload, cause)| format!("{}: {cause}", workload.label()))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    GpuStatus {
+        degraded: true,
+        detail: format!(
+            "el provider GPU no inicializó → estas sesiones corren en CPU · {sessions}"
+        ),
+        hint: Some(
+            "faltan DLL de CUDA 12 / cuDNN 9 junto al runtime de ONNX o en PATH (Windows) / \
+             LD_LIBRARY_PATH (Linux): cudart64_12, cublas64_12, cublasLt64_12, cudnn64_9. La \
+             colocación se decide al abrir la sesión: reiniciá el daemon después"
+                .to_string(),
+        ),
+    }
 }
 
 pub fn placement_summary() -> String {
@@ -399,7 +500,10 @@ fn status_without_a_gpu_build(runtime_gpu: bool, device_present: bool) -> GpuSta
 
 pub fn status() -> GpuStatus {
     let (runtime_gpu, device_present) = gpu_availability();
-    status_from(compiled_provider(), runtime_gpu, device_present)
+    status_after_sessions(
+        status_from(compiled_provider(), runtime_gpu, device_present),
+        &refused_sessions(),
+    )
 }
 
 pub fn active_provider() -> String {
@@ -468,6 +572,13 @@ fn nvidia_driver_present() -> bool {
 mod placement_tests {
     use super::*;
     use crate::envs::{ScopedEnv, scratch_root};
+
+    type Row = (
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<usize>,
+        &'static str,
+    );
 
     /// Whether this binary can place anything on a card at all.
     ///
@@ -1060,5 +1171,468 @@ mod placement_tests {
             body[failure..].contains("configure_cpu(make_builder()?"),
             "and it has to actually keep working. A machine without the CUDA runtime ran on CPU before and must keep doing so; failing the session there turns a slow daemon into a dead one."
         );
+        // Structural on purpose, like the two checks above: this arm only runs
+        // on a machine with a card whose provider refuses to start, and the
+        // gate has none. What it does with the refusal is judged by
+        // `status_after_sessions` and by the registry test below; that the arm
+        // writes it, and writes *this* variant and not `Gpu` or `Cpu`, is
+        // pinned here.
+        assert!(
+            body[failure..].contains("Placement::CpuAfterProviderFailed"),
+            "the arm that drops to the CPU after the provider refused has to say so in the \
+             registry. Without it `/health` and `doctor` go on reporting the device that was \
+             asked for on a session that opened on the other one, which is the defect W1 exists \
+             to stop"
+        );
+    }
+
+    /// Without a plan nothing measured this card, so this crate has no number of
+    /// its own to put on the arena. The constant that used to stand in for one
+    /// (2048 MiB) was calibrated for `NextPowerOfTwo` growth, which
+    /// `SameAsRequested` replaced; kept, it made the real reranker (4.23 GiB of
+    /// weights) fail inside `commit_from_file` on every machine that opens it
+    /// without `main`, which is every test, example and library user. Through
+    /// the daemon `resources::apply` publishes the measured ceiling under the
+    /// legacy name, and the `legacy` rows below are what keep that path alive.
+    #[tokio::test]
+    async fn without_a_published_plan_the_arena_has_no_ceiling_of_ours() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        const PREFERRED: &str = "MEMORY_INDUSTRY_GPU_MEM_LIMIT_MB";
+        const LEGACY: &str = "CUBA_GPU_MEM_LIMIT_MB";
+
+        // (preferred, legacy, wanted, why).
+        let table: [Row; 7] = [
+            (
+                None,
+                None,
+                None,
+                "no variable means no plan ran, and then nobody measured this card. Some(2048) is a \
+                 number from another machine, and it is the one that makes the reranker fail \
+                 inside the BFCArena",
+            ),
+            (
+                Some("6000"),
+                None,
+                Some(6000),
+                "the documented name has to be honoured: this is the control that the reader \
+                 reads the variables at all",
+            ),
+            (
+                None,
+                Some("6000"),
+                Some(6000),
+                "`resources::apply` publishes the planned ceiling under the legacy name. A reader \
+                 that only looked at the preferred one would drop the daemon's ceiling",
+            ),
+            (
+                Some("7000"),
+                Some("512"),
+                Some(7000),
+                "the preferred name wins when both are set, the same precedence `apply` uses",
+            ),
+            (
+                Some(" 9000 "),
+                None,
+                Some(9000),
+                "`resources::apply` trims before it parses, so the same text has to be a ceiling \
+                 for the session too. Two readers of one variable cannot disagree",
+            ),
+            (
+                Some("lots"),
+                None,
+                None,
+                "an unreadable value is not a ceiling. It used to fall back to 2048 without a \
+                 word",
+            ),
+            (
+                None,
+                Some("lots"),
+                None,
+                "the same holds through the legacy name",
+            ),
+        ];
+
+        assert!(
+            table.iter().any(|(_, _, wanted, _)| wanted.is_none())
+                && table.iter().any(|(_, _, wanted, _)| wanted.is_some()),
+            "the table has to carry both answers. With every row expecting the same one the \
+             reader could be a constant and the table would still be green"
+        );
+
+        for (preferred, legacy, wanted, why) in table {
+            let _cleared = [ScopedEnv::cleared(PREFERRED), ScopedEnv::cleared(LEGACY)];
+            let _set: Vec<ScopedEnv> = [(PREFERRED, preferred), (LEGACY, legacy)]
+                .into_iter()
+                .filter_map(|(name, value)| value.map(|v| ScopedEnv::set(name, v)))
+                .collect();
+
+            assert_eq!(
+                arena_limit_mb(),
+                wanted,
+                "{PREFERRED}={preferred:?} {LEGACY}={legacy:?}: {why}"
+            );
+        }
+    }
+
+    /// Structural, like the one above for `error_on_failure`: `cuda_provider`
+    /// only compiles with `cuda` and only runs on a machine with a card, so
+    /// neither the mutation build nor the WSL2 judge ever executes it. What it
+    /// can be held to is where it gets its ceiling: from the one reader that
+    /// the table above judges, and never from a number of its own.
+    #[test]
+    fn the_cuda_provider_takes_its_ceiling_from_the_one_reader() {
+        let source = include_str!("gpu.rs");
+        let body = source
+            .split_once("fn cuda_provider()")
+            .expect("cuda_provider is in this file")
+            .1;
+        let body = body.split_once("\n}").expect("the function ends").0;
+
+        assert!(
+            body.contains("arena_limit_mb()"),
+            "cuda_provider has to ask `arena_limit_mb()` for its ceiling. Reading the variable \
+             by itself, or not reading it, leaves a second reader that the table in \
+             `without_a_published_plan_the_arena_has_no_ceiling_of_ours` does not judge"
+        );
+        assert!(
+            !body.contains("unwrap_or("),
+            "a default inside cuda_provider is a ceiling nobody measured on this card: that is \
+             the 2048 that made the real reranker fail in the BFCArena on every machine \
+             without a plan"
+        );
+        assert!(
+            body.contains("SameAsRequested"),
+            "with the extend strategy that grows by what is asked, a ceiling below what the \
+             model needs saves no memory and only moves the failure into the load"
+        );
+        assert!(
+            body.contains("error_on_failure()"),
+            "dropping this turns a provider that will not start into a silent CPU session \
+             again: the registration has to fail so `configure` can say so"
+        );
+    }
+
+    /// What ONNX Runtime said on this machine on 2026-10-12, with the operator's
+    /// name swapped for a canary. `status_after_sessions` carries it whole
+    /// because `doctor` runs on the machine of the person who has to read it.
+    const PROVIDER_REFUSAL: &str = r#"E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Users\canaryoperator\.cache\cuba-memorys\onnxruntime\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")"#;
+
+    /// The eight sentences `status_from` can answer with: four machines under a
+    /// build with a provider and four under one without.
+    fn the_eight_rows() -> Vec<(Option<&'static str>, bool, bool)> {
+        [Some("cuda"), None]
+            .into_iter()
+            .flat_map(|compiled| {
+                [(false, false), (false, true), (true, false), (true, true)]
+                    .into_iter()
+                    .map(move |(runtime_gpu, device_present)| {
+                        (compiled, runtime_gpu, device_present)
+                    })
+            })
+            .collect()
+    }
+
+    /// With nothing refused the block says what it said before W1, on every row.
+    ///
+    /// Green on the unmodified tree on purpose: it is the guard against
+    /// `status_after_sessions` touching a machine whose sessions all opened
+    /// where they were asked to, which would turn every healthy daemon red.
+    #[tokio::test]
+    async fn with_no_refusal_the_gpu_block_says_exactly_what_it_said_before() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        for (compiled, runtime_gpu, device_present) in the_eight_rows() {
+            let before = status_from(compiled, runtime_gpu, device_present);
+            let after =
+                status_after_sessions(status_from(compiled, runtime_gpu, device_present), &[]);
+            let row =
+                format!("compiled={compiled:?} runtime_gpu={runtime_gpu} device={device_present}");
+            assert_eq!(after.degraded, before.degraded, "{row}");
+            assert_eq!(
+                after.detail, before.detail,
+                "{row}: a registry with no refusal in it must not rewrite the sentence"
+            );
+            assert_eq!(after.hint, before.hint, "{row}");
+        }
+    }
+
+    /// The case measured on this machine: the card, the runtime and the provider
+    /// library are all there, `cublasLt64_12.dll` is not, and the reranker opened
+    /// on the CPU. That row is the only healthy one, and it has to stop saying so.
+    #[tokio::test]
+    async fn a_provider_that_would_not_start_turns_the_healthy_row_degraded_and_gives_a_way_out() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let healthy = status_from(Some("cuda"), true, true);
+        assert!(
+            !healthy.degraded && healthy.hint.is_none(),
+            "the fixture is broken: with the card, the runtime and the provider library all \
+             present `status_from` is the one row that is not degraded, and without that control \
+             the assertions below would pass on a row that was already red"
+        );
+
+        let after = status_after_sessions(
+            status_from(Some("cuda"), true, true),
+            &[(Workload::Reranker, PROVIDER_REFUSAL.to_string())],
+        );
+
+        assert!(
+            after.degraded,
+            "a session that asked for the card and opened on the CPU is the thing `degraded` \
+             exists to say. Reported as ok, `doctor` prints a green «gpu» line on the machine \
+             whose reranker takes a minute per search"
+        );
+        assert!(
+            after.detail.contains("reranker") && after.detail.contains("CPU"),
+            "the sentence names which model fell and where it landed: {}",
+            after.detail
+        );
+        assert!(
+            after.detail.contains(PROVIDER_REFUSAL),
+            "and carries what ONNX Runtime said, whole: it names the DLL that is missing, and \
+             that is the one thing the operator can go and fetch. `doctor` runs on their \
+             machine, so there is nothing to redact: {}",
+            after.detail
+        );
+        let hint = after.hint.unwrap_or_default();
+        assert!(
+            !hint.trim().is_empty(),
+            "`doctor` only warns on `Some(hint) if degraded`; a degraded status with no hint is \
+             printed as ok, which is the defect again one level up"
+        );
+        assert!(
+            !hint.contains("cuba-memorys"),
+            "the binary is `memory-industry`; `cuba-memorys` is the compat alias and the hint \
+             is a command somebody will type: {hint}"
+        );
+    }
+
+    /// Every row, one refusal and two: each refused workload is named with its
+    /// own cause, the answer is degraded, and there is a hint exactly when there
+    /// is a degradation.
+    #[tokio::test]
+    async fn every_refused_workload_is_named_with_its_own_cause_on_every_row() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let embedder_cause = "refusal-of-the-embedder-4711";
+        let nli_cause = "refusal-of-the-nli-4712";
+        let cases: [(&str, Vec<(Workload, String)>); 2] = [
+            (
+                "embedder alone",
+                vec![(Workload::Embedder, embedder_cause.to_string())],
+            ),
+            (
+                "embedder and nli",
+                vec![
+                    (Workload::Embedder, embedder_cause.to_string()),
+                    (Workload::Nli, nli_cause.to_string()),
+                ],
+            ),
+        ];
+
+        for (compiled, runtime_gpu, device_present) in the_eight_rows() {
+            for (which, refused) in &cases {
+                let after = status_after_sessions(
+                    status_from(compiled, runtime_gpu, device_present),
+                    refused,
+                );
+                let row = format!(
+                    "{which} on compiled={compiled:?} runtime_gpu={runtime_gpu} \
+                     device={device_present}: {}",
+                    after.detail
+                );
+
+                assert!(after.degraded, "{row}");
+                assert_eq!(
+                    after.hint.is_some(),
+                    after.degraded,
+                    "a hint exists if and only if the status is degraded (`doctor` and \
+                     `every_hint_names_the_same_binary` both rely on it): {row}"
+                );
+                for (workload, cause) in refused {
+                    assert!(
+                        after.detail.contains(workload.label()),
+                        "{} is refused and not named: {row}",
+                        workload.label()
+                    );
+                    assert!(
+                        after.detail.contains(cause.as_str()),
+                        "{} is named without its cause: {row}",
+                        workload.label()
+                    );
+                }
+                if refused.len() == 1 {
+                    assert!(
+                        !after.detail.contains(nli_cause),
+                        "a cause that belongs to a workload nobody refused showed up: {row}"
+                    );
+                }
+                assert!(
+                    !after.hint.unwrap_or_default().contains("cuba-memorys"),
+                    "{row}"
+                );
+            }
+        }
+    }
+
+    /// Puts one slot of the registry back the way it was found when it drops,
+    /// panic or not. Without the restore in `Drop`, a red assertion leaves the
+    /// refusal for every later test in this binary, and
+    /// `status_reports_the_provider_this_binary_was_compiled_with` would be the
+    /// one to go red over it.
+    struct RestoredPlacement {
+        workload: Workload,
+        previous: Option<Placement>,
+    }
+
+    impl RestoredPlacement {
+        fn take(workload: Workload) -> Self {
+            let previous =
+                PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(workload)].clone();
+            Self { workload, previous }
+        }
+    }
+
+    impl Drop for RestoredPlacement {
+        fn drop(&mut self) {
+            PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(self.workload)] =
+                self.previous.take();
+        }
+    }
+
+    fn forget(workload: Workload) {
+        PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(workload)] = None;
+    }
+
+    /// `record`, `placement` and `status()` are one registry: what `configure`
+    /// writes is what `/health` reads and what `doctor` judges.
+    ///
+    /// Each assertion here is the one a mutant of those three functions fails:
+    /// a `placement` that answers `None`, a `record` that writes the wrong slot
+    /// or does not overwrite, and a `status()` that goes back to `status_from`
+    /// without the registry.
+    #[tokio::test]
+    async fn status_and_placement_read_the_one_registry_that_configure_writes() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let embedder = RestoredPlacement::take(Workload::Embedder);
+        let reranker = RestoredPlacement::take(Workload::Reranker);
+        let nli = RestoredPlacement::take(Workload::Nli);
+        let found = [
+            embedder.previous.clone(),
+            reranker.previous.clone(),
+            nli.previous.clone(),
+        ];
+        for workload in [Workload::Embedder, Workload::Reranker, Workload::Nli] {
+            forget(workload);
+        }
+
+        let before = status();
+        for workload in [Workload::Embedder, Workload::Reranker, Workload::Nli] {
+            assert_eq!(
+                placement(workload),
+                None,
+                "control: a session nobody opened has no placement, and `{}` says so with `None` \
+                 rather than with a device nobody measured",
+                workload.label()
+            );
+        }
+
+        let nli_cause = "the nli provider refusal 4713";
+        record(
+            Workload::Nli,
+            Placement::CpuAfterProviderFailed(nli_cause.to_string()),
+        );
+        record(Workload::Embedder, Placement::Cpu);
+        record(Workload::Reranker, Placement::Gpu);
+
+        assert_eq!(
+            placement(Workload::Nli),
+            Some(Placement::CpuAfterProviderFailed(nli_cause.to_string())),
+            "what `record` wrote is what `placement` reads back, cause included"
+        );
+        assert_eq!(
+            placement(Workload::Embedder),
+            Some(Placement::Cpu),
+            "one slot per workload: the embedder's answer is its own, not the last one written"
+        );
+        assert_eq!(placement(Workload::Reranker), Some(Placement::Gpu));
+
+        let refused = status();
+        assert!(
+            refused.degraded,
+            "`status()` has to read the same registry `placement()` does: one refusal in it and \
+             the block is degraded, whatever this machine has installed"
+        );
+        assert!(
+            refused.detail.contains("nli") && refused.detail.contains(nli_cause),
+            "and it names the workload and the cause that were written: {}",
+            refused.detail
+        );
+        assert!(refused.hint.is_some(), "a degraded status carries its hint");
+
+        record(Workload::Nli, Placement::Gpu);
+        assert_eq!(
+            placement(Workload::Nli),
+            Some(Placement::Gpu),
+            "the last write wins: a session that opens again, after the DLLs were installed, \
+             replaces the refusal instead of sitting behind it for the life of the process"
+        );
+        let healed = status();
+        assert_eq!(
+            (
+                healed.degraded,
+                healed.detail.as_str(),
+                healed.hint.as_deref()
+            ),
+            (
+                before.degraded,
+                before.detail.as_str(),
+                before.hint.as_deref()
+            ),
+            "with the refusal overwritten the block is the one it was with nothing in the \
+             registry"
+        );
+
+        let embedder_cause = "the embedder provider refusal 4714";
+        record(
+            Workload::Embedder,
+            Placement::CpuAfterProviderFailed(embedder_cause.to_string()),
+        );
+        record(
+            Workload::Nli,
+            Placement::CpuAfterProviderFailed(nli_cause.to_string()),
+        );
+        let both = status().detail;
+        match (both.find(embedder_cause), both.find(nli_cause)) {
+            (Some(first), Some(second)) => assert!(
+                first < second,
+                "the order is fixed — embedder, reranker, nli — so two runs of the same \
+                 machine print the same sentence: {both}"
+            ),
+            other => panic!("both refusals have to be in the sentence, got {other:?}: {both}"),
+        }
+
+        drop(embedder);
+        drop(reranker);
+        drop(nli);
+        let restored = status();
+        assert_eq!(
+            (restored.degraded, restored.detail.as_str()),
+            (before.degraded, before.detail.as_str()),
+            "after the restore the registry is what this test found, so the next test in the \
+             binary reads the machine and not this one's refusals"
+        );
+        for (workload, original) in [Workload::Embedder, Workload::Reranker, Workload::Nli]
+            .into_iter()
+            .zip(found)
+        {
+            assert_eq!(
+                PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(workload)],
+                original,
+                "{} was not put back",
+                workload.label()
+            );
+        }
     }
 }

@@ -275,6 +275,26 @@ async fn health_without_a_token_does_not_inventory_the_machine() {
         );
     }
 
+    // The anchor first: `quiet_machine()` points both paths at the resource-plan
+    // sentinel, so these two are `off`. The embedder is left alone on purpose —
+    // whether it is `warming`, `fallback` or `loaded` depends on the clock and on
+    // this developer's disk.
+    for model in ["reranker", "nli"] {
+        assert_eq!(
+            runtime[model]["state"], "off",
+            "the fixture is broken: {model} is not switched off by the plan, so the device \
+             assertion below is about some other state: {runtime}"
+        );
+        assert_eq!(
+            runtime[model].get("device"),
+            Some(&Value::Null),
+            "{model} never opened a session, so it runs on no device. The key has to be there \
+             and hold `null`: what this field used to say was the device the placement path \
+             would have chosen, and on a model switched off that is a word nobody measured: \
+             {runtime}"
+        );
+    }
+
     let (_, anonymous) = health(18851, None).await;
     assert!(
         anonymous.get("runtime").is_none(),
@@ -380,7 +400,7 @@ async fn a_daemon_whose_database_is_down_still_answers_200() {
 fn report(ready: bool, gpu_degraded: bool, states: [&'static str; 3]) -> RuntimeReport {
     let at = |state: &'static str| ModelState {
         state,
-        device: "cpu",
+        device: Some("cpu"),
         reason: None,
     };
     RuntimeReport {

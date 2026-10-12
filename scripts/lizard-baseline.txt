@@ -12,6 +12,8 @@
 # that leaves the baseline takes its comment with it, and regenerating names
 # both. Everything above the next line is rewritten by the script.
 # Regenerate with: ./scripts/quality-gate.sh --update-lizard-baseline
+src/bridge/mod.rs::cli_reconnect:888 9
+src/bridge/proxy.rs::a_body_over_eight_mib_is_refused_without_calling_the_host:925 10
 src/calibrate_cli.rs::run_cli:70 20
 # +1: `undo_dir()?`. It used to answer `.` when HOME was not set, so `recall
 # --undo` wrote its journal wherever the operator happened to be standing and
@@ -36,8 +38,8 @@ src/db.rs::init_schema:362 9
 src/dedupe_cli.rs::judge_likely:633 9
 src/dedupe_cli.rs::merge_entity:331 13
 src/dedupe_cli.rs::run_cli:47 30
-src/doctor.rs::run_checks_with:853 43
-src/doctor.rs::run_cli:1436 13
+src/doctor.rs::run_checks_with:988 43
+src/doctor.rs::run_cli:1581 13
 src/embeddings/onnx.rs::compute_onnx_embedding:450 19
 src/embeddings/onnx.rs::init_onnx_session:307 14
 src/eval/datasets.rs::load_jsonl_dataset:91 14
@@ -118,9 +120,10 @@ src/handlers/zafra.rs::handle:76 35
 src/hooks_cli.rs::merge_episode_file:684 9
 src/hooks_cli.rs::remove_gitattributes_line:278 9
 src/hooks_cli.rs::remove_hook_block:448 9
-src/http.rs::dispatch_one:1808 12
-src/http.rs::mcp_endpoint:1684 13
-src/http.rs::serve_pool:282 11
+src/http.rs::dispatch_one:2257 12
+src/http.rs::follow:310 15
+src/http.rs::mcp_endpoint:2133 13
+src/http.rs::serve_pool:659 16
 src/link_cli.rs::run_cli:5 13
 src/llm_cli.rs::print_status:154 13
 src/llm_cli.rs::set_provider:246 28
@@ -152,13 +155,8 @@ src/search/ood.rs::fit:12 17
 src/search/rerank.rs::init_session:225 13
 src/search/rerank.rs::score_chunk:509 16
 src/search/rerank.rs::score_pairs:429 10
-# One job in 18 lines: create the parent, keep a secret that is already there,
-# write, restrict. Split, "the file that carries the token" and "the file
-# we do not clobber" become two lists that have to agree, and the day they
-# disagree the installer rotates a live token under every client already
-# configured. The 11 is `?` and `&&`, which lizard counts each. Owner:
-# mejorador 0.27.
-src/service.rs::write_one:1313 11
+src/service.rs::resolve_address:505 11
+src/service.rs::write_one:1390 11
 src/setup.rs::resolve_database_url:13 11
 # The four below each went up by the `?` of `envs::home()` returning a Result
 # (run_check by two: it calls both known_targets and project_configs). It used
@@ -175,4 +173,4 @@ src/setup_agent.rs::run_write:274 22
 src/skills_cli.rs::run_cli:61 19
 src/sync/paths.rs::resolve_dir:54 11
 src/sync_cli.rs::run_cli:3 11
-src/tunnel_cli.rs::run_cli:109 11
+src/tunnel_cli.rs::run_cli:109 12

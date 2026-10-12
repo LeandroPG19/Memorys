@@ -323,6 +323,42 @@ gate_refuse() {
   exit 2
 }
 
+# run-all-tests.sh derives brain_gate, brain_gate_peer and postgres from
+# DATABASE_URL by replacing what follows its last slash (${url%/*}), which is only
+# right for postgresql://user:pass@host:port/<database> and nothing after it. A
+# `?host=` socket would send those names to another server, a `dbname=` in the
+# query would make the live corpus the throwaway database, and a URL with no
+# database would turn the host into one. So merge-gate.sh and a run-all-tests.sh
+# on its own refuse any other shape, with exit 2, before a single step runs. A second
+# '@' before the host is refused too (rule 4): libpq and sqlx end the user and the
+# password at different '@'. The reason never carries the URL or a piece of it: the
+# password can be in it.
+gate_require_database_url() {
+  local url="${1:-}" rest database
+  case "$url" in
+    postgresql://*|postgres://*) ;;
+    *) gate_refuse "DATABASE_URL has to be a postgresql:// (or postgres://) URL: the gate reads it with libpq and derives brain_gate from it, which a key=value string or another scheme does not allow." ;;
+  esac
+  if [[ "$url" == *\?* ]]; then
+    gate_refuse "DATABASE_URL carries a query (a '?'), and brain_gate is derived by replacing what follows its last '/', so the query would point the throwaway databases at another server or at the live one. Write a socket as the encoded host (postgresql://cuba@%2Frun%2Fpostgresql/brain) and the options in the environment (PGSSLMODE, ...), which libpq and sqlx both read."
+  fi
+  rest="${url#*://}"
+  database="${rest#*/}"
+  if [[ "$rest" != */* || -z "$database" || "$database" == */* ]]; then
+    gate_refuse "DATABASE_URL has to end in exactly one non-empty segment after the host, the database (postgresql://user:password@host:port/<database>). A '/', '?' or '@' inside the user or the password has to be encoded (%2F, %3F, %40)."
+  fi
+  # Rule 4: at most one '@' in the authority. libpq ends the user and the password
+  # at the FIRST '@' and takes the rest as the host, so with a second '@' it prints
+  # the tail of the password in the readiness line. sqlx (WHATWG) ends them at the
+  # LAST '@', so the check and the binary would also ask different servers. An '@'
+  # in the database name is after the first '/', outside the authority, and is fine.
+  local authority="${rest%%/*}" ats
+  ats="${authority//[^@]/}"
+  if (( ${#ats} > 1 )); then
+    gate_refuse "DATABASE_URL has more than one '@' before the host: libpq ends the user and the password at the first one and sqlx at the last, so the readiness check and the binary would ask different servers, and libpq would print the rest of the password as the host. Write an '@' inside the user or the password as %40."
+  fi
+}
+
 gate_is_ram_backed() {
   case "$(stat -f -c %T "$1" 2>/dev/null || true)" in
     tmpfs|ramfs) return 0 ;;
