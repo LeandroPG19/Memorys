@@ -1953,7 +1953,6 @@ fn the_e2e_entry_point_resolves_the_binary_under_cargo_target_dir() {
     let binary = release.join("memory-industry");
     std::fs::write(&binary, "").expect("write the stand-in binary");
     let target = dir.to_string_lossy().into_owned();
-    let expected = binary.to_string_lossy().into_owned();
 
     let by_hand = "/nowhere/by-hand/memory-industry";
     let kept = e2e_binary_path(&[
@@ -1968,10 +1967,17 @@ fn the_e2e_entry_point_resolves_the_binary_under_cargo_target_dir() {
         "a CUBA_BINARY_PATH exported by hand has to reach the E2E as it is: the stand-in \
          python3 is the anchor that proves what the script hands over is what is read here"
     );
+    // Compared as paths, not strings. On Windows the script prefixes
+    // CARGO_TARGET_DIR as it was given (`C:\...\target`) and appends
+    // `/release/memory-industry`: both separators name the same file there, and
+    // Path's equality compares components, so another directory, another file
+    // name or a `.exe` still fails. On Linux it is the string comparison it was.
     assert_eq!(
-        found, expected,
-        "with CARGO_TARGET_DIR={target} and a release binary there, the E2E was handed `{found}`. \
-         The entry point fixes rust/target/release/memory-industry, a directory the gate on this \
-         machine never builds into"
+        Path::new(&found),
+        binary.as_path(),
+        "with CARGO_TARGET_DIR={target} and a release binary there, the E2E was handed `{found}`, \
+         not `{}`. The entry point fixes rust/target/release/memory-industry, a directory the \
+         gate on this machine never builds into",
+        binary.display()
     );
 }
