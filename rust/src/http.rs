@@ -1676,26 +1676,33 @@ fn reason_without_a_model_path(reason: &str, instead: &'static str) -> String {
     let chars: Vec<char> = reason.chars().collect();
     let mut redacted = String::with_capacity(reason.len());
     let mut at = 0;
-    while at < chars.len() {
+    // A step that works moves at least one character, so `chars.len()` steps
+    // cover the text, and a step taken past the end writes nothing. The bound
+    // is a count and not a comparison on `at` on purpose: it ends the loop
+    // whatever a step returns, so a step that stopped moving would fail an
+    // assertion on its output instead of growing `redacted` until the process
+    // died, and there is no `at < len` to turn into `at <= len`, a mutant that
+    // changes nothing because that extra step is the one that writes nothing.
+    for _ in 0..chars.len() {
         at = redact_at(&chars, at, instead, &mut redacted);
     }
     redact_words(&redacted, instead)
 }
 
 /// Layers 1 and 2 at one position: writes what stands there into `out` and
-/// returns where to go on from. It always moves forward.
+/// returns where to go on from, which is past `at` for every position inside
+/// the text and is never relied on to be.
 fn redact_at(chars: &[char], at: usize, instead: &str, out: &mut String) -> usize {
     if let Some(close) = quoted_span_end(chars, at) {
-        let inside: String = chars
-            .get(at + 1..close)
-            .unwrap_or_default()
-            .iter()
-            .collect();
-        if is_path_like(&inside) {
-            out.push_str(instead);
+        // The quotes stay in the span that is judged: they are neither a
+        // separator nor alphanumeric, so the verdict is the one for what is
+        // inside, and no `at + 1` has to cut the opening one off.
+        let span: String = chars.get(at..=close).unwrap_or_default().iter().collect();
+        out.push_str(if is_path_like(&span) {
+            instead
         } else {
-            out.extend(chars.get(at..=close).unwrap_or_default());
-        }
+            span.as_str()
+        });
         return close + 1;
     }
     if path_anchor_at(chars, at) {
@@ -4264,6 +4271,54 @@ OUT: no hay model.onnx ni model_quantized.onnx en <R>
                 "{constant:?} has a path separator in it. The word layer of the redaction would \
                  swallow it the next time the sentence went through, and it is the variable an \
                  operator reads to know which knob to change"
+            );
+        }
+    }
+
+    /// A quote opens after a non-alphanumeric, and that character can be a
+    /// separator: it is the sentence's, not what the quote holds. Here the
+    /// quoted text is `a b`, which is not a path, so the quotes stay and only
+    /// the word that the separator is in goes (layer 3), and `b'` is left. A
+    /// verdict taken over the character before the quote as well would swallow
+    /// the whole span and with it the `b`.
+    #[test]
+    fn what_a_quote_holds_is_judged_without_the_character_before_it() {
+        for (input, expected) in [
+            ("from/'a b' here", format!("{TABLE_R} b' here")),
+            (r#"from\"a b" here"#, format!(r#"{TABLE_R} b" here"#)),
+        ] {
+            assert_eq!(
+                reason_without_a_model_path(input, TABLE_R),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// The text that starts or ends on a character each rule looks at: nothing,
+    /// a quote with no partner, a lone separator, half a drive, a drive and no
+    /// more, and a quote that never closes in front of a path. Every one is
+    /// also an input where a step that stopped moving would sit on the same
+    /// position until the end of the loop, so the output would be the wrong one
+    /// and not just a slow one.
+    #[test]
+    fn the_edges_of_the_text_come_out_as_they_went_in_or_as_one_replacement() {
+        let cases = [
+            ("", String::new()),
+            ("\"", "\"".to_string()),
+            ("\"\"", "\"\"".to_string()),
+            ("say \"", "say \"".to_string()),
+            ("/", "/".to_string()),
+            ("/ x", "/ x".to_string()),
+            ("C:", "C:".to_string()),
+            (r"C:\", TABLE_R.to_string()),
+            (r"'C:\a b\x.dll", format!("'{TABLE_R}")),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                reason_without_a_model_path(input, TABLE_R),
+                expected,
+                "{input:?}"
             );
         }
     }
