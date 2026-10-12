@@ -1342,8 +1342,10 @@ const STATE_ABSENT: &str = "absent";
 /// `device` is where the session opened and is `None` for a model with no open
 /// session, or with one nobody recorded: it is not where the model was asked
 /// to go. `reason` is a sentence for a human and is `None` when the state says
-/// everything. It never carries a filesystem path: a model path is inventory,
-/// and on Windows it has the operator's user name inside it. Every reason here
+/// everything. It never carries a filesystem path, with or without spaces in
+/// it: a model path is inventory, and on Windows it has the operator's user
+/// name inside it. The one case it cannot promise is a Linux directory whose
+/// name has a `:` or a `"` (see `reason_without_a_model_path`). Every reason here
 /// is a literal except three — the load failure of each model, which comes
 /// from its loader and from ONNX Runtime — and each of those goes through
 /// `reason_without_a_model_path` first, with the variable that names *its*
@@ -1646,22 +1648,146 @@ fn loaded_on(placement: Option<&crate::gpu::Placement>) -> ModelState {
 /// is already standing on, while this one goes out over a socket that a LAN
 /// bind makes reachable.
 ///
-/// A word is a path when it has a separator with a name around it, which
-/// leaves the actionable half of the sentence alone: the file names it looked
-/// for, `model.onnx` and `model_quantized.onnx`, and the bare `/` between
-/// them.
+/// Three layers, in this order, because a space inside a path says nothing:
+/// no rule that cuts on spaces can tell `Carlos` from a word of the sentence,
+/// and `C:\Users\Juan Carlos` left `Carlos` in the body before this.
+///
+/// 1. A segment in `"`, `'` or `` ` `` is replaced whole, quotes included,
+///    when what is inside has a separator and an alphanumeric. A quote opens
+///    only after a non-alphanumeric and closes only before one, so the `'` of
+///    `doesn't` and of `O'Brien` open and close nothing.
+/// 2. A path with no quotes starts at an anchor (`C:\`, `\\`, `/x`, `~/`,
+///    `./`, `../`) and runs to the end of its clause: a `:` not followed by
+///    `\` or `/`, a `"`, a line break or the end of the text. The output then
+///    does not depend on the path at all, which is the property that matters.
+///    Whatever the sentence says between the path and that `:` goes with it
+///    (`with error`, the runtime version): `doctor` still shows it, and this
+///    block is the one that leaves the machine.
+/// 3. What is left goes word by word. A word is a path when it has a separator
+///    with a name around it, which leaves the actionable half of the sentence
+///    alone: the file names it looked for, `model.onnx` and
+///    `model_quantized.onnx`, and the bare `/` between them. It is also what
+///    catches a relative path with no anchor and a URL.
+///
+/// Where it cannot be exact: on Linux a directory whose name has a `:` or a
+/// `"` ends the clause early, and layer 3 only takes the words of the rest
+/// that have a separator. Windows does not allow either in a name.
 fn reason_without_a_model_path(reason: &str, instead: &'static str) -> String {
-    reason
-        .split_whitespace()
-        .map(|word| {
-            if word.contains(['/', '\\']) && word.chars().any(char::is_alphanumeric) {
-                instead
-            } else {
-                word
-            }
-        })
+    let chars: Vec<char> = reason.chars().collect();
+    let mut redacted = String::with_capacity(reason.len());
+    let mut at = 0;
+    while at < chars.len() {
+        at = redact_at(&chars, at, instead, &mut redacted);
+    }
+    redact_words(&redacted, instead)
+}
+
+/// Layers 1 and 2 at one position: writes what stands there into `out` and
+/// returns where to go on from. It always moves forward.
+fn redact_at(chars: &[char], at: usize, instead: &str, out: &mut String) -> usize {
+    if let Some(close) = quoted_span_end(chars, at) {
+        let inside: String = chars
+            .get(at + 1..close)
+            .unwrap_or_default()
+            .iter()
+            .collect();
+        if is_path_like(&inside) {
+            out.push_str(instead);
+        } else {
+            out.extend(chars.get(at..=close).unwrap_or_default());
+        }
+        return close + 1;
+    }
+    if path_anchor_at(chars, at) {
+        let end = clause_end(chars, at);
+        out.push_str(instead);
+        out.extend(trailing_blanks(chars.get(at..end).unwrap_or_default()));
+        return end;
+    }
+    out.extend(chars.get(at));
+    at + 1
+}
+
+/// Layer 3, the rule the function had before paths with spaces.
+fn redact_words(text: &str, instead: &'static str) -> String {
+    text.split_whitespace()
+        .map(|word| if is_path_like(word) { instead } else { word })
         .collect::<Vec<&str>>()
         .join(" ")
+}
+
+/// A separator and an alphanumeric: the same predicate for a word and for the
+/// inside of a quote, so `"/"` is left alone as `/` is.
+fn is_path_like(text: &str) -> bool {
+    text.contains(['/', '\\']) && text.chars().any(char::is_alphanumeric)
+}
+
+fn alphanumeric_at(chars: &[char], at: usize) -> bool {
+    chars.get(at).is_some_and(|c| c.is_alphanumeric())
+}
+
+/// Where the quote that opens at `at` closes, if one does. It opens only after
+/// a non-alphanumeric and closes only before one.
+fn quoted_span_end(chars: &[char], at: usize) -> Option<usize> {
+    let quote = *chars.get(at).filter(|c| matches!(**c, '"' | '\'' | '`'))?;
+    if at
+        .checked_sub(1)
+        .is_some_and(|before| alphanumeric_at(chars, before))
+    {
+        return None;
+    }
+    (at + 1..chars.len())
+        .find(|&close| chars.get(close) == Some(&quote) && !alphanumeric_at(chars, close + 1))
+}
+
+/// An unquoted path starts at the beginning of the text or after a blank or
+/// one of the characters that punctuation puts in front of it.
+fn path_anchor_at(chars: &[char], at: usize) -> bool {
+    let after_boundary = at.checked_sub(1).is_none_or(|before| {
+        chars
+            .get(before)
+            .is_some_and(|c| c.is_whitespace() || "([{=,;'\"`".contains(*c))
+    });
+    after_boundary && anchor_shape(chars.get(at..).unwrap_or_default())
+}
+
+/// A drive (`C:\`, `C:/`), a UNC or verbatim prefix, a POSIX root, or a
+/// home-relative or dot-relative start. A lone `/` followed by a blank is not
+/// one: it is the one between `model.onnx / model_quantized.onnx`.
+fn anchor_shape(rest: &[char]) -> bool {
+    match rest {
+        [drive, ':', '\\' | '/', ..] => drive.is_ascii_alphabetic(),
+        ['\\', '\\', next, ..] | ['/', next, ..] => !next.is_whitespace(),
+        ['~' | '.', '\\' | '/', ..] | ['.', '.', '\\' | '/', ..] => true,
+        _ => false,
+    }
+}
+
+/// The clause of an unquoted path ends at a `:` that is not the one in `C:\`,
+/// at a `"`, at a line break or at the end of the text.
+fn clause_end(chars: &[char], start: usize) -> usize {
+    (start..chars.len())
+        .find(|&at| ends_clause(chars, at))
+        .unwrap_or(chars.len())
+}
+
+fn ends_clause(chars: &[char], at: usize) -> bool {
+    match chars.get(at) {
+        Some('"' | '\n' | '\r') => true,
+        Some(':') => !matches!(chars.get(at + 1), Some('\\' | '/')),
+        _ => false,
+    }
+}
+
+/// The blanks a path swallowed before its clause ended. They are the
+/// sentence's, not the path's, and stay: `"` follows them in
+/// `…dll which depends on "cublasLt64_12.dll"`.
+fn trailing_blanks(path: &[char]) -> &[char] {
+    let kept = path
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+        .map_or(0, |last| last + 1);
+    path.get(kept..).unwrap_or_default()
 }
 
 /// The NLI model, read from the cell rather than forced into it.
