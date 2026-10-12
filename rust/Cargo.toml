@@ -57,7 +57,7 @@ hex = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-lru = "0.12"
+lru = "0.18.2"
 
 zstd = "0.13"
 

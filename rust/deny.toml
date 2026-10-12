@@ -51,12 +51,6 @@ ignore = [
     # Confirmed via `cargo tree -i sqlx-mysql` → "nothing to print".
     # No fix available upstream (sqlx side). False positive for our binary.
     { id = "RUSTSEC-2023-0071", reason = "sqlx-mysql not compiled — no mysql feature enabled, confirmed via cargo tree" },
-
-    # RUSTSEC-2026-0002: lru 0.12.5 unsound IterMut.
-    # We ONLY call .iter() (immutable) and .get()/.put()/.pop()/.clear() in cache.rs.
-    # IterMut is never called. No patched version exists in 0.12.x range.
-    # Track: upgrade to lru 0.13+ or replace with quick_cache when available.
-    { id = "RUSTSEC-2026-0002", reason = "only .iter() used, not IterMut — not affected by the unsound API" },
 ]
 
 [bans]
