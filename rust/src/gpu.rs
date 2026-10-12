@@ -164,7 +164,9 @@ where
     .collect();
 
     if providers.is_empty() {
-        return configure_cpu(builder, workload);
+        let cpu = configure_cpu(builder, workload)?;
+        record(workload, Placement::Cpu);
+        return Ok(cpu);
     }
 
     match builder.with_execution_providers(providers) {
@@ -173,6 +175,7 @@ where
             // first, so a log could claim the session was on the GPU while ONNX
             // Runtime had quietly fallen back to the CPU underneath it.
             tracing::info!(model = workload.label(), "sesión ONNX en GPU");
+            record(workload, Placement::Gpu);
             Ok(configured)
         }
         // The card and the provider libraries are both there and the provider
@@ -190,7 +193,9 @@ where
                 error = %e,
                 "el provider GPU no inicializó pese a haber tarjeta y librerías: esta sesión corre en CPU. Revisá que las DLL/so de CUDA estén en PATH/LD_LIBRARY_PATH junto al runtime de ONNX"
             );
-            configure_cpu(make_builder()?, workload)
+            let cpu = configure_cpu(make_builder()?, workload)?;
+            record(workload, Placement::CpuAfterProviderFailed(e.to_string()));
+            Ok(cpu)
         }
     }
 }
@@ -219,7 +224,9 @@ fn fall_back_to_cpu(
             "se pidió GPU para este modelo y no está disponible — sigue en CPU"
         );
     }
-    configure_cpu(builder, workload)
+    let cpu = configure_cpu(builder, workload)?;
+    record(workload, Placement::Cpu);
+    Ok(cpu)
 }
 
 fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {
@@ -273,17 +280,14 @@ pub enum Placement {
     CpuAfterProviderFailed(String),
 }
 
-// W1 pasada 1 (solo tests): lo de abajo es el esqueleto que el test necesita
-// para compilar y no hace nada todavía. La pasada 2 lo implementa y lo llama
-// desde `configure`; los nombres `PLACEMENTS`, `slot`, `record`, `placement` y
-// `status_after_sessions` los usan los tests y no se renombran.
-
-/// One slot per workload, in the order `slot` gives. The last write wins.
-#[allow(dead_code)]
+/// One slot per workload, in the order `slot` gives. The last write wins, so a
+/// session that opens again after the DLLs were installed replaces the refusal
+/// instead of sitting behind it for the life of the process. A poisoned lock is
+/// read through: the registry is a set of independent slots and a panic in
+/// another thread leaves each one whole.
 static PLACEMENTS: std::sync::Mutex<[Option<Placement>; 3]> =
     std::sync::Mutex::new([None, None, None]);
 
-#[allow(dead_code)]
 fn slot(workload: Workload) -> usize {
     match workload {
         Workload::Embedder => 0,
@@ -292,15 +296,54 @@ fn slot(workload: Workload) -> usize {
     }
 }
 
-#[allow(dead_code)]
-fn record(_workload: Workload, _placement: Placement) {}
-
-pub fn placement(_workload: Workload) -> Option<Placement> {
-    None
+fn record(workload: Workload, placement: Placement) {
+    PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(workload)] = Some(placement);
 }
 
-pub fn status_after_sessions(base: GpuStatus, _refused: &[(Workload, String)]) -> GpuStatus {
-    base
+/// Where this workload's session opened, or `None` while nobody opened one.
+/// `wants_gpu` is the plan; this is what `configure` actually did.
+pub fn placement(workload: Workload) -> Option<Placement> {
+    PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(workload)].clone()
+}
+
+/// The workloads whose provider refused to start, in the fixed order embedder,
+/// reranker, nli so two runs of the same machine print the same sentence.
+fn refused_sessions() -> Vec<(Workload, String)> {
+    [Workload::Embedder, Workload::Reranker, Workload::Nli]
+        .into_iter()
+        .filter_map(|workload| match placement(workload) {
+            Some(Placement::CpuAfterProviderFailed(cause)) => Some((workload, cause)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Folds what the sessions did into what `status_from` judged from the
+/// machine. With nothing refused it is the identity. With a refusal the one
+/// healthy row of `status_from` stops being healthy: the card and the provider
+/// libraries were there and the session still opened on the CPU. The cause is
+/// carried whole because `doctor` runs on the machine of whoever has to read it.
+pub fn status_after_sessions(base: GpuStatus, refused: &[(Workload, String)]) -> GpuStatus {
+    if refused.is_empty() {
+        return base;
+    }
+    let sessions = refused
+        .iter()
+        .map(|(workload, cause)| format!("{}: {cause}", workload.label()))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    GpuStatus {
+        degraded: true,
+        detail: format!(
+            "el provider GPU no inicializó → estas sesiones corren en CPU · {sessions}"
+        ),
+        hint: Some(
+            "faltan DLL de CUDA 12 / cuDNN 9 junto al runtime de ONNX o en PATH (Windows) / \
+             LD_LIBRARY_PATH (Linux): cudart64_12, cublas64_12, cublasLt64_12, cudnn64_9. La \
+             colocación se decide al abrir la sesión: reiniciá el daemon después"
+                .to_string(),
+        ),
+    }
 }
 
 pub fn placement_summary() -> String {
@@ -440,7 +483,10 @@ fn status_without_a_gpu_build(runtime_gpu: bool, device_present: bool) -> GpuSta
 
 pub fn status() -> GpuStatus {
     let (runtime_gpu, device_present) = gpu_availability();
-    status_from(compiled_provider(), runtime_gpu, device_present)
+    status_after_sessions(
+        status_from(compiled_provider(), runtime_gpu, device_present),
+        &refused_sessions(),
+    )
 }
 
 pub fn active_provider() -> String {

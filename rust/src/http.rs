@@ -1339,7 +1339,9 @@ const STATE_ABSENT: &str = "absent";
 
 /// Where one model is and why it is not simply running.
 ///
-/// `reason` is a sentence for a human and is `None` when the state says
+/// `device` is where the session opened and is `None` for a model with no open
+/// session, or with one nobody recorded: it is not where the model was asked
+/// to go. `reason` is a sentence for a human and is `None` when the state says
 /// everything. It never carries a filesystem path: a model path is inventory,
 /// and on Windows it has the operator's user name inside it. Every reason here
 /// is a literal except three — the load failure of each model, which comes
@@ -1372,9 +1374,11 @@ pub struct RuntimeReport {
     pub nli: ModelState,
     /// The GPU provider this binary was compiled against, if any.
     pub gpu_build: Option<&'static str>,
-    /// `gpu::status()` — asked for a device and not using one.
+    /// `gpu::status()` — asked for a device and not using one, including a
+    /// session whose provider refused to start.
     pub gpu_degraded: bool,
-    /// `embedder=… reranker=… nli=…`, as the placement path decided it.
+    /// `embedder=… reranker=… nli=…`, as the placement path decided it: what was
+    /// asked for. Where each session opened is `device` in its own row.
     pub gpu_placement: String,
     pub llm: crate::llm_cli::LlmSummary,
 }
@@ -1475,17 +1479,14 @@ fn embedder_state(ready: bool) -> ModelState {
 /// lives.
 fn embedder_state_from(
     failure: Option<String>,
-    _placement: Option<&crate::gpu::Placement>,
+    placement: Option<&crate::gpu::Placement>,
     ready: bool,
     loaded: bool,
 ) -> ModelState {
-    // W1 pasada 1: todavía no lee el registro, solo compila contra la firma
-    // nueva. `Some("cpu")` es lo que esta función decía en la build sin GPU.
-    let device = Some("cpu");
     if let Some(reason) = failure {
         return ModelState {
             state: STATE_FAILED,
-            device,
+            device: None,
             reason: Some(reason_without_a_model_path(
                 &reason,
                 EMBEDDER_DIR_INSTEAD_OF_A_PATH,
@@ -1495,21 +1496,17 @@ fn embedder_state_from(
     if !ready {
         return ModelState {
             state: STATE_WARMING,
-            device,
+            device: None,
             reason: None,
         };
     }
     if loaded {
-        return ModelState {
-            state: STATE_LOADED,
-            device,
-            reason: None,
-        };
+        return loaded_on(placement);
     }
     ModelState {
         state: STATE_FALLBACK,
-        // The hash fallback runs on this CPU whatever the placement path was
-        // asked for, and `device` is where the model *would* have gone.
+        // The hash fallback runs on this CPU whatever the registry holds: there
+        // is no session for it to hold anything about.
         device: Some("cpu"),
         reason: Some(
             "no ONNX embedder opened — vectors come from the hash fallback and search is \
@@ -1550,16 +1547,15 @@ fn reranker_state() -> ModelState {
 /// something already tried to open a session.
 fn reranker_state_from(
     failure: Option<String>,
-    _placement: Option<&crate::gpu::Placement>,
+    placement: Option<&crate::gpu::Placement>,
     dir_resolved: bool,
     configured: bool,
     status_resolved: bool,
 ) -> ModelState {
-    let device = Some("cpu");
     if let Some(reason) = failure {
         return ModelState {
             state: STATE_FAILED,
-            device,
+            device: None,
             reason: Some(reason_without_a_model_path(
                 &reason,
                 RERANKER_DIR_INSTEAD_OF_A_PATH,
@@ -1569,7 +1565,7 @@ fn reranker_state_from(
     if !dir_resolved {
         return ModelState {
             state: STATE_OFF,
-            device,
+            device: None,
             reason: Some(
                 "the resource plan switched the reranker off on this machine; rankings come \
                  back in RRF order"
@@ -1580,7 +1576,7 @@ fn reranker_state_from(
     if !configured {
         return ModelState {
             state: STATE_ABSENT,
-            device,
+            device: None,
             reason: Some(
                 "no reranker model where this daemon looks — `memory-industry models reranker` \
                  installs it"
@@ -1589,15 +1585,11 @@ fn reranker_state_from(
         };
     }
     if status_resolved {
-        return ModelState {
-            state: STATE_LOADED,
-            device,
-            reason: None,
-        };
+        return loaded_on(placement);
     }
     ModelState {
         state: STATE_CONFIGURED,
-        device,
+        device: None,
         reason: Some("loads on its first batch".to_string()),
     }
 }
@@ -1611,6 +1603,37 @@ fn reranker_state_from(
 const RERANKER_DIR_INSTEAD_OF_A_PATH: &str = "the reranker directory (see CUBA_RERANKER_PATH)";
 const NLI_DIR_INSTEAD_OF_A_PATH: &str = "the NLI directory (see CUBA_NLI_PATH)";
 const EMBEDDER_DIR_INSTEAD_OF_A_PATH: &str = "the embedder directory (see ONNX_MODEL_PATH)";
+/// The odd one out: the paths in a provider refusal are the runtime's and its
+/// provider libraries', not any model's, so the variable has to be the
+/// runtime's too.
+const RUNTIME_DIR_INSTEAD_OF_A_PATH: &str = "the ONNX Runtime directory (see ORT_DYLIB_PATH)";
+
+/// A model whose session is open, from where `gpu::configure` says it opened.
+///
+/// With nothing in the registry the device is `None`: the answer `/health` used
+/// to give here was the placement *plan*, and on a machine where the provider
+/// refused the plan said `gpu` for a session on the CPU. Only that last case
+/// has something to explain, and the cause goes through the same redaction as
+/// every other sentence in this block.
+fn loaded_on(placement: Option<&crate::gpu::Placement>) -> ModelState {
+    let (device, reason) = match placement {
+        Some(crate::gpu::Placement::Gpu) => (Some("gpu"), None),
+        Some(crate::gpu::Placement::Cpu) => (Some("cpu"), None),
+        Some(crate::gpu::Placement::CpuAfterProviderFailed(cause)) => (
+            Some("cpu"),
+            Some(format!(
+                "the GPU provider did not start; this session runs on the CPU: {}",
+                reason_without_a_model_path(cause, RUNTIME_DIR_INSTEAD_OF_A_PATH)
+            )),
+        ),
+        None => (None, None),
+    };
+    ModelState {
+        state: STATE_LOADED,
+        device,
+        reason,
+    }
+}
 
 /// A load failure with the path taken out and the variable that names it put
 /// in its place.
@@ -1673,16 +1696,15 @@ fn nli_state() -> ModelState {
 /// one here.
 fn nli_state_from(
     failure: Option<String>,
-    _placement: Option<&crate::gpu::Placement>,
+    placement: Option<&crate::gpu::Placement>,
     deferred: bool,
     available: bool,
     status_resolved: bool,
 ) -> ModelState {
-    let device = Some("cpu");
     if let Some(reason) = failure {
         return ModelState {
             state: STATE_FAILED,
-            device,
+            device: None,
             reason: Some(reason_without_a_model_path(
                 &reason,
                 NLI_DIR_INSTEAD_OF_A_PATH,
@@ -1692,7 +1714,7 @@ fn nli_state_from(
     if deferred {
         return ModelState {
             state: STATE_OFF,
-            device,
+            device: None,
             reason: Some(
                 "the resource plan switched NLI off on this machine; contradictions fall back \
                  to the judge"
@@ -1703,20 +1725,16 @@ fn nli_state_from(
     if !available {
         return ModelState {
             state: STATE_ABSENT,
-            device,
+            device: None,
             reason: Some("no NLI model where this daemon looks".to_string()),
         };
     }
     if status_resolved {
-        return ModelState {
-            state: STATE_LOADED,
-            device,
-            reason: None,
-        };
+        return loaded_on(placement);
     }
     ModelState {
         state: STATE_CONFIGURED,
-        device,
+        device: None,
         reason: Some("loads on its first use; this endpoint does not force it".to_string()),
     }
 }
