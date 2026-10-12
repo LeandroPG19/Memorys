@@ -188,6 +188,31 @@ async fn warming_up_leaves_the_reranker_ready() {
         memory_industry::search::rerank::enabled(),
         "after warm-up the reranker must report enabled, so searches take the model path"
     );
+
+    // The session is open, so `configure` has said where it opened. This is the
+    // one test in the gate that opens the real reranker under `--features cuda`,
+    // and the only place a provider that refuses to start can be seen: the
+    // daemon logs it, and until the registry existed nothing else recorded it.
+    let placement = memory_industry::gpu::placement(memory_industry::gpu::Workload::Reranker);
+    assert!(
+        placement.is_some(),
+        "the reranker is open and `gpu::configure` wrote nothing about where. `/health` and \
+         `doctor` would go on reporting the device that was asked for on a session nobody \
+         measured"
+    );
+    if let Some(memory_industry::gpu::Placement::CpuAfterProviderFailed(cause)) = &placement {
+        assert!(
+            memory_industry::gpu::status().degraded,
+            "the registry holds a refusal and `gpu::status()` still says the machine is fine"
+        );
+        panic!(
+            "the reranker opened on the CPU because the GPU provider did not start: {cause}. \
+             The card and the provider libraries are there; the CUDA runtime beside them is not \
+             usable (cudart64_12, cublas64_12, cublasLt64_12, cudnn64_9 on PATH or beside \
+             onnxruntime). The session is slow, not broken, and this gate says so instead of \
+             passing on it"
+        );
+    }
     eprintln!("warm-up took {:.2}s", started.elapsed().as_secs_f32());
 }
 

@@ -262,6 +262,47 @@ pub struct GpuStatus {
     pub hint: Option<String>,
 }
 
+/// Where a session actually opened, as `configure` saw it, and not where
+/// `wants_gpu` said it should.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    Gpu,
+    Cpu,
+    /// The card and the provider libraries were there and the provider still
+    /// would not start. Carries what ONNX Runtime said, whole.
+    CpuAfterProviderFailed(String),
+}
+
+// W1 pasada 1 (solo tests): lo de abajo es el esqueleto que el test necesita
+// para compilar y no hace nada todavía. La pasada 2 lo implementa y lo llama
+// desde `configure`; los nombres `PLACEMENTS`, `slot`, `record`, `placement` y
+// `status_after_sessions` los usan los tests y no se renombran.
+
+/// One slot per workload, in the order `slot` gives. The last write wins.
+#[allow(dead_code)]
+static PLACEMENTS: std::sync::Mutex<[Option<Placement>; 3]> =
+    std::sync::Mutex::new([None, None, None]);
+
+#[allow(dead_code)]
+fn slot(workload: Workload) -> usize {
+    match workload {
+        Workload::Embedder => 0,
+        Workload::Reranker => 1,
+        Workload::Nli => 2,
+    }
+}
+
+#[allow(dead_code)]
+fn record(_workload: Workload, _placement: Placement) {}
+
+pub fn placement(_workload: Workload) -> Option<Placement> {
+    None
+}
+
+pub fn status_after_sessions(base: GpuStatus, _refused: &[(Workload, String)]) -> GpuStatus {
+    base
+}
+
 pub fn placement_summary() -> String {
     [Workload::Embedder, Workload::Reranker, Workload::Nli]
         .iter()
@@ -1060,5 +1101,341 @@ mod placement_tests {
             body[failure..].contains("configure_cpu(make_builder()?"),
             "and it has to actually keep working. A machine without the CUDA runtime ran on CPU before and must keep doing so; failing the session there turns a slow daemon into a dead one."
         );
+        // Structural on purpose, like the two checks above: this arm only runs
+        // on a machine with a card whose provider refuses to start, and the
+        // gate has none. What it does with the refusal is judged by
+        // `status_after_sessions` and by the registry test below; that the arm
+        // writes it, and writes *this* variant and not `Gpu` or `Cpu`, is
+        // pinned here.
+        assert!(
+            body[failure..].contains("Placement::CpuAfterProviderFailed"),
+            "the arm that drops to the CPU after the provider refused has to say so in the \
+             registry. Without it `/health` and `doctor` go on reporting the device that was \
+             asked for on a session that opened on the other one, which is the defect W1 exists \
+             to stop"
+        );
+    }
+
+    /// What ONNX Runtime said on this machine on 2026-10-12, with the operator's
+    /// name swapped for a canary. `status_after_sessions` carries it whole
+    /// because `doctor` runs on the machine of the person who has to read it.
+    const PROVIDER_REFUSAL: &str = r#"E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Users\canaryoperator\.cache\cuba-memorys\onnxruntime\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")"#;
+
+    /// The eight sentences `status_from` can answer with: four machines under a
+    /// build with a provider and four under one without.
+    fn the_eight_rows() -> Vec<(Option<&'static str>, bool, bool)> {
+        [Some("cuda"), None]
+            .into_iter()
+            .flat_map(|compiled| {
+                [(false, false), (false, true), (true, false), (true, true)]
+                    .into_iter()
+                    .map(move |(runtime_gpu, device_present)| {
+                        (compiled, runtime_gpu, device_present)
+                    })
+            })
+            .collect()
+    }
+
+    /// With nothing refused the block says what it said before W1, on every row.
+    ///
+    /// Green on the unmodified tree on purpose: it is the guard against
+    /// `status_after_sessions` touching a machine whose sessions all opened
+    /// where they were asked to, which would turn every healthy daemon red.
+    #[tokio::test]
+    async fn with_no_refusal_the_gpu_block_says_exactly_what_it_said_before() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        for (compiled, runtime_gpu, device_present) in the_eight_rows() {
+            let before = status_from(compiled, runtime_gpu, device_present);
+            let after =
+                status_after_sessions(status_from(compiled, runtime_gpu, device_present), &[]);
+            let row =
+                format!("compiled={compiled:?} runtime_gpu={runtime_gpu} device={device_present}");
+            assert_eq!(after.degraded, before.degraded, "{row}");
+            assert_eq!(
+                after.detail, before.detail,
+                "{row}: a registry with no refusal in it must not rewrite the sentence"
+            );
+            assert_eq!(after.hint, before.hint, "{row}");
+        }
+    }
+
+    /// The case measured on this machine: the card, the runtime and the provider
+    /// library are all there, `cublasLt64_12.dll` is not, and the reranker opened
+    /// on the CPU. That row is the only healthy one, and it has to stop saying so.
+    #[tokio::test]
+    async fn a_provider_that_would_not_start_turns_the_healthy_row_degraded_and_gives_a_way_out() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let healthy = status_from(Some("cuda"), true, true);
+        assert!(
+            !healthy.degraded && healthy.hint.is_none(),
+            "the fixture is broken: with the card, the runtime and the provider library all \
+             present `status_from` is the one row that is not degraded, and without that control \
+             the assertions below would pass on a row that was already red"
+        );
+
+        let after = status_after_sessions(
+            status_from(Some("cuda"), true, true),
+            &[(Workload::Reranker, PROVIDER_REFUSAL.to_string())],
+        );
+
+        assert!(
+            after.degraded,
+            "a session that asked for the card and opened on the CPU is the thing `degraded` \
+             exists to say. Reported as ok, `doctor` prints a green «gpu» line on the machine \
+             whose reranker takes a minute per search"
+        );
+        assert!(
+            after.detail.contains("reranker") && after.detail.contains("CPU"),
+            "the sentence names which model fell and where it landed: {}",
+            after.detail
+        );
+        assert!(
+            after.detail.contains(PROVIDER_REFUSAL),
+            "and carries what ONNX Runtime said, whole: it names the DLL that is missing, and \
+             that is the one thing the operator can go and fetch. `doctor` runs on their \
+             machine, so there is nothing to redact: {}",
+            after.detail
+        );
+        let hint = after.hint.unwrap_or_default();
+        assert!(
+            !hint.trim().is_empty(),
+            "`doctor` only warns on `Some(hint) if degraded`; a degraded status with no hint is \
+             printed as ok, which is the defect again one level up"
+        );
+        assert!(
+            !hint.contains("cuba-memorys"),
+            "the binary is `memory-industry`; `cuba-memorys` is the compat alias and the hint \
+             is a command somebody will type: {hint}"
+        );
+    }
+
+    /// Every row, one refusal and two: each refused workload is named with its
+    /// own cause, the answer is degraded, and there is a hint exactly when there
+    /// is a degradation.
+    #[tokio::test]
+    async fn every_refused_workload_is_named_with_its_own_cause_on_every_row() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let embedder_cause = "refusal-of-the-embedder-4711";
+        let nli_cause = "refusal-of-the-nli-4712";
+        let cases: [(&str, Vec<(Workload, String)>); 2] = [
+            (
+                "embedder alone",
+                vec![(Workload::Embedder, embedder_cause.to_string())],
+            ),
+            (
+                "embedder and nli",
+                vec![
+                    (Workload::Embedder, embedder_cause.to_string()),
+                    (Workload::Nli, nli_cause.to_string()),
+                ],
+            ),
+        ];
+
+        for (compiled, runtime_gpu, device_present) in the_eight_rows() {
+            for (which, refused) in &cases {
+                let after = status_after_sessions(
+                    status_from(compiled, runtime_gpu, device_present),
+                    refused,
+                );
+                let row = format!(
+                    "{which} on compiled={compiled:?} runtime_gpu={runtime_gpu} \
+                     device={device_present}: {}",
+                    after.detail
+                );
+
+                assert!(after.degraded, "{row}");
+                assert_eq!(
+                    after.hint.is_some(),
+                    after.degraded,
+                    "a hint exists if and only if the status is degraded (`doctor` and \
+                     `every_hint_names_the_same_binary` both rely on it): {row}"
+                );
+                for (workload, cause) in refused {
+                    assert!(
+                        after.detail.contains(workload.label()),
+                        "{} is refused and not named: {row}",
+                        workload.label()
+                    );
+                    assert!(
+                        after.detail.contains(cause.as_str()),
+                        "{} is named without its cause: {row}",
+                        workload.label()
+                    );
+                }
+                if refused.len() == 1 {
+                    assert!(
+                        !after.detail.contains(nli_cause),
+                        "a cause that belongs to a workload nobody refused showed up: {row}"
+                    );
+                }
+                assert!(
+                    !after.hint.unwrap_or_default().contains("cuba-memorys"),
+                    "{row}"
+                );
+            }
+        }
+    }
+
+    /// Puts one slot of the registry back the way it was found when it drops,
+    /// panic or not. Without the restore in `Drop`, a red assertion leaves the
+    /// refusal for every later test in this binary, and
+    /// `status_reports_the_provider_this_binary_was_compiled_with` would be the
+    /// one to go red over it.
+    struct RestoredPlacement {
+        workload: Workload,
+        previous: Option<Placement>,
+    }
+
+    impl RestoredPlacement {
+        fn take(workload: Workload) -> Self {
+            let previous =
+                PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(workload)].clone();
+            Self { workload, previous }
+        }
+    }
+
+    impl Drop for RestoredPlacement {
+        fn drop(&mut self) {
+            PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(self.workload)] =
+                self.previous.take();
+        }
+    }
+
+    fn forget(workload: Workload) {
+        PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(workload)] = None;
+    }
+
+    /// `record`, `placement` and `status()` are one registry: what `configure`
+    /// writes is what `/health` reads and what `doctor` judges.
+    ///
+    /// Each assertion here is the one a mutant of those three functions fails:
+    /// a `placement` that answers `None`, a `record` that writes the wrong slot
+    /// or does not overwrite, and a `status()` that goes back to `status_from`
+    /// without the registry.
+    #[tokio::test]
+    async fn status_and_placement_read_the_one_registry_that_configure_writes() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let embedder = RestoredPlacement::take(Workload::Embedder);
+        let reranker = RestoredPlacement::take(Workload::Reranker);
+        let nli = RestoredPlacement::take(Workload::Nli);
+        let found = [
+            embedder.previous.clone(),
+            reranker.previous.clone(),
+            nli.previous.clone(),
+        ];
+        for workload in [Workload::Embedder, Workload::Reranker, Workload::Nli] {
+            forget(workload);
+        }
+
+        let before = status();
+        for workload in [Workload::Embedder, Workload::Reranker, Workload::Nli] {
+            assert_eq!(
+                placement(workload),
+                None,
+                "control: a session nobody opened has no placement, and `{}` says so with `None` \
+                 rather than with a device nobody measured",
+                workload.label()
+            );
+        }
+
+        let nli_cause = "the nli provider refusal 4713";
+        record(
+            Workload::Nli,
+            Placement::CpuAfterProviderFailed(nli_cause.to_string()),
+        );
+        record(Workload::Embedder, Placement::Cpu);
+        record(Workload::Reranker, Placement::Gpu);
+
+        assert_eq!(
+            placement(Workload::Nli),
+            Some(Placement::CpuAfterProviderFailed(nli_cause.to_string())),
+            "what `record` wrote is what `placement` reads back, cause included"
+        );
+        assert_eq!(
+            placement(Workload::Embedder),
+            Some(Placement::Cpu),
+            "one slot per workload: the embedder's answer is its own, not the last one written"
+        );
+        assert_eq!(placement(Workload::Reranker), Some(Placement::Gpu));
+
+        let refused = status();
+        assert!(
+            refused.degraded,
+            "`status()` has to read the same registry `placement()` does: one refusal in it and \
+             the block is degraded, whatever this machine has installed"
+        );
+        assert!(
+            refused.detail.contains("nli") && refused.detail.contains(nli_cause),
+            "and it names the workload and the cause that were written: {}",
+            refused.detail
+        );
+        assert!(refused.hint.is_some(), "a degraded status carries its hint");
+
+        record(Workload::Nli, Placement::Gpu);
+        assert_eq!(
+            placement(Workload::Nli),
+            Some(Placement::Gpu),
+            "the last write wins: a session that opens again, after the DLLs were installed, \
+             replaces the refusal instead of sitting behind it for the life of the process"
+        );
+        let healed = status();
+        assert_eq!(
+            (
+                healed.degraded,
+                healed.detail.as_str(),
+                healed.hint.as_deref()
+            ),
+            (
+                before.degraded,
+                before.detail.as_str(),
+                before.hint.as_deref()
+            ),
+            "with the refusal overwritten the block is the one it was with nothing in the \
+             registry"
+        );
+
+        let embedder_cause = "the embedder provider refusal 4714";
+        record(
+            Workload::Embedder,
+            Placement::CpuAfterProviderFailed(embedder_cause.to_string()),
+        );
+        record(
+            Workload::Nli,
+            Placement::CpuAfterProviderFailed(nli_cause.to_string()),
+        );
+        let both = status().detail;
+        match (both.find(embedder_cause), both.find(nli_cause)) {
+            (Some(first), Some(second)) => assert!(
+                first < second,
+                "the order is fixed — embedder, reranker, nli — so two runs of the same \
+                 machine print the same sentence: {both}"
+            ),
+            other => panic!("both refusals have to be in the sentence, got {other:?}: {both}"),
+        }
+
+        drop(embedder);
+        drop(reranker);
+        drop(nli);
+        let restored = status();
+        assert_eq!(
+            (restored.degraded, restored.detail.as_str()),
+            (before.degraded, before.detail.as_str()),
+            "after the restore the registry is what this test found, so the next test in the \
+             binary reads the machine and not this one's refusals"
+        );
+        for (workload, original) in [Workload::Embedder, Workload::Reranker, Workload::Nli]
+            .into_iter()
+            .zip(found)
+        {
+            assert_eq!(
+                PLACEMENTS.lock().unwrap_or_else(|p| p.into_inner())[slot(workload)],
+                original,
+                "{} was not put back",
+                workload.label()
+            );
+        }
     }
 }

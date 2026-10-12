@@ -256,6 +256,13 @@ async fn a_model_that_would_not_open_is_failed_in_health_and_its_path_stays_home
         let reason = report["reason"]
             .as_str()
             .unwrap_or_else(|| panic!("{model}: a failed model says why: {report}"));
+        assert_eq!(
+            report.get("device"),
+            Some(&Value::Null),
+            "{model}: a session that did not open runs on no device. `cpu` or `gpu` here is the \
+             placement path's choice, not a measurement, and it sat next to `failed` as if the \
+             model were running somewhere: {report}"
+        );
         assert!(
             !reason.trim().is_empty(),
             "{model}: an empty reason is a failure nobody can act on: {report}"

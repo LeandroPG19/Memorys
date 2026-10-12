@@ -1350,7 +1350,7 @@ const STATE_ABSENT: &str = "absent";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelState {
     pub state: &'static str,
-    pub device: &'static str,
+    pub device: Option<&'static str>,
     pub reason: Option<String>,
 }
 
@@ -1417,15 +1417,6 @@ pub fn overall_status(db_ok: bool, runtime: &RuntimeReport) -> &'static str {
     STATUS_OK
 }
 
-/// Where the placement path put this workload.
-fn device_of(workload: crate::gpu::Workload) -> &'static str {
-    if crate::gpu::wants_gpu(workload) {
-        "gpu"
-    } else {
-        "cpu"
-    }
-}
-
 /// The GPU provider compiled in, for the one field that has to name it.
 ///
 /// This is the second reader of the feature flags after `gpu::compiled_provider`,
@@ -1458,11 +1449,11 @@ fn compiled_gpu_provider() -> Option<&'static str> {
 /// first would read an unresolved cell and report `fallback` on a machine
 /// whose session had actually failed.
 fn embedder_state(ready: bool) -> ModelState {
-    let device = device_of(crate::gpu::Workload::Embedder);
+    let placement = crate::gpu::placement(crate::gpu::Workload::Embedder);
     let loaded = ready && crate::embeddings::onnx::is_model_loaded();
     embedder_state_from(
         crate::embeddings::onnx::failure_reason(),
-        device,
+        placement.as_ref(),
         ready,
         loaded,
     )
@@ -1484,10 +1475,13 @@ fn embedder_state(ready: bool) -> ModelState {
 /// lives.
 fn embedder_state_from(
     failure: Option<String>,
-    device: &'static str,
+    _placement: Option<&crate::gpu::Placement>,
     ready: bool,
     loaded: bool,
 ) -> ModelState {
+    // W1 pasada 1: todavía no lee el registro, solo compila contra la firma
+    // nueva. `Some("cpu")` es lo que esta función decía en la build sin GPU.
+    let device = Some("cpu");
     if let Some(reason) = failure {
         return ModelState {
             state: STATE_FAILED,
@@ -1516,7 +1510,7 @@ fn embedder_state_from(
         state: STATE_FALLBACK,
         // The hash fallback runs on this CPU whatever the placement path was
         // asked for, and `device` is where the model *would* have gone.
-        device: "cpu",
+        device: Some("cpu"),
         reason: Some(
             "no ONNX embedder opened — vectors come from the hash fallback and search is \
              lexical only"
@@ -1541,7 +1535,7 @@ fn embedder_state_from(
 fn reranker_state() -> ModelState {
     reranker_state_from(
         crate::search::rerank::failure_reason(),
-        device_of(crate::gpu::Workload::Reranker),
+        crate::gpu::placement(crate::gpu::Workload::Reranker).as_ref(),
         crate::search::rerank::resolved_model_dir().is_some(),
         crate::search::rerank::is_configured(),
         crate::search::rerank::status_resolved(),
@@ -1556,11 +1550,12 @@ fn reranker_state() -> ModelState {
 /// something already tried to open a session.
 fn reranker_state_from(
     failure: Option<String>,
-    device: &'static str,
+    _placement: Option<&crate::gpu::Placement>,
     dir_resolved: bool,
     configured: bool,
     status_resolved: bool,
 ) -> ModelState {
+    let device = Some("cpu");
     if let Some(reason) = failure {
         return ModelState {
             state: STATE_FAILED,
@@ -1662,7 +1657,7 @@ fn reason_without_a_model_path(reason: &str, instead: &'static str) -> String {
 fn nli_state() -> ModelState {
     nli_state_from(
         crate::cognitive::nli::failure_reason(),
-        device_of(crate::gpu::Workload::Nli),
+        crate::gpu::placement(crate::gpu::Workload::Nli).as_ref(),
         crate::cognitive::nli::deferred_by_resource_plan(),
         crate::cognitive::nli::available(),
         crate::cognitive::nli::status_resolved(),
@@ -1678,11 +1673,12 @@ fn nli_state() -> ModelState {
 /// one here.
 fn nli_state_from(
     failure: Option<String>,
-    device: &'static str,
+    _placement: Option<&crate::gpu::Placement>,
     deferred: bool,
     available: bool,
     status_resolved: bool,
 ) -> ModelState {
+    let device = Some("cpu");
     if let Some(reason) = failure {
         return ModelState {
             state: STATE_FAILED,
@@ -2915,7 +2911,7 @@ mod health_report_tests {
     fn report(ready: bool, gpu_degraded: bool, states: [&'static str; 3]) -> RuntimeReport {
         let at = |state: &'static str| ModelState {
             state,
-            device: "cpu",
+            device: Some("cpu"),
             reason: None,
         };
         RuntimeReport {
@@ -3026,35 +3022,6 @@ mod health_report_tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_device_word_is_the_one_the_placement_path_chose() {
-        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
-
-        {
-            let _asked_for_cpu = crate::envs::ScopedEnv::set("CUBA_EMBED_DEVICE", "cpu");
-            assert_eq!(
-                device_of(crate::gpu::Workload::Embedder),
-                "cpu",
-                "this is the word `/health` prints, and the question it answers is the one an \
-                 operator reconstructed by reading the source: where is this model running"
-            );
-        }
-        {
-            let _asked_for_gpu = crate::envs::ScopedEnv::set("CUBA_EMBED_DEVICE", "gpu");
-            // `wants_gpu` returns false before it ever reads the variable on a
-            // build with no execution provider compiled in, which is the build
-            // the gate runs. Under `--features cuda` this row is the one that
-            // proves the other word exists.
-            let compiled_with_a_gpu = cfg!(any(feature = "cuda", feature = "directml"));
-            assert_eq!(
-                device_of(crate::gpu::Workload::Embedder),
-                if compiled_with_a_gpu { "gpu" } else { "cpu" },
-                "a field that said `gpu` on a CPU-only binary would be the placement summary \
-                 disagreeing with the placement"
-            );
-        }
-    }
-
     #[test]
     fn the_embedder_is_warming_while_the_models_are_still_loading() {
         assert_eq!(
@@ -3111,7 +3078,7 @@ mod health_report_tests {
     fn a_model_block_carries_its_state_its_device_and_its_reason() {
         let broken = ModelState {
             state: "failed",
-            device: "gpu",
+            device: Some("gpu"),
             reason: Some("the session did not open".to_string()),
         };
         let json = model_json(&broken);
@@ -3125,7 +3092,7 @@ mod health_report_tests {
 
         let quiet = ModelState {
             state: "loaded",
-            device: "cpu",
+            device: Some("cpu"),
             reason: None,
         };
         assert_eq!(
@@ -3133,6 +3100,35 @@ mod health_report_tests {
             Value::Null,
             "a model that is simply running says nothing, and the key stays so a reader never \
              has to tell «no reason» from «this daemon is too old to report one»"
+        );
+    }
+
+    #[test]
+    fn a_model_with_no_measured_device_serves_the_key_as_null_and_does_not_drop_it() {
+        let unmeasured = ModelState {
+            state: "configured",
+            device: None,
+            reason: Some("loads on its first batch".to_string()),
+        };
+        let json = model_json(&unmeasured);
+
+        assert!(
+            json.as_object()
+                .is_some_and(|block| block.contains_key("device")),
+            "the key stays when nobody measured the device. A reader, and the monitor that \
+             matches on `runtime.reranker.device`, must never have to tell «null» from «this \
+             daemon is too old to say»: {json}"
+        );
+        assert_eq!(
+            json["device"],
+            Value::Null,
+            "and what it holds is `null`, not a guess: a session that never opened runs on no \
+             device at all"
+        );
+        assert_eq!(
+            json["state"], "configured",
+            "control: the rest of the block is still there, so the missing device is the \
+             decision and not an empty block"
         );
     }
 
@@ -3199,7 +3195,7 @@ mod health_report_tests {
         for (failure, dir_resolved, configured, status_resolved, expected) in table {
             let state = reranker_state_from(
                 failure.map(String::from),
-                "cpu",
+                None,
                 dir_resolved,
                 configured,
                 status_resolved,
@@ -3210,14 +3206,36 @@ mod health_report_tests {
                  status_resolved={status_resolved}"
             );
             assert_eq!(
-                state.device, "cpu",
-                "whichever branch answers, the device word is the one the placement path chose \
-                 — that is the question an operator came to this endpoint with"
+                state.device, None,
+                "no session was measured, so no branch may name a device. The word used to be \
+                 the one the placement path *chose*, in every branch, which is where `cpu` on a \
+                 model that never opened came from: failure={failure:?} \
+                 dir_resolved={dir_resolved} configured={configured} \
+                 status_resolved={status_resolved}"
+            );
+
+            let measured = reranker_state_from(
+                failure.map(String::from),
+                Some(&crate::gpu::Placement::Gpu),
+                dir_resolved,
+                configured,
+                status_resolved,
+            );
+            assert_eq!(
+                measured.device,
+                if expected == "loaded" {
+                    Some("gpu")
+                } else {
+                    None
+                },
+                "a placement that exists is read only by the row whose session is open; every \
+                 other row keeps `null` even though the registry can already hold a value (it is \
+                 written while `commit_from_file` is still loading): expected={expected}"
             );
         }
 
         assert_eq!(
-            reranker_state_from(None, "cpu", true, true, true).reason,
+            reranker_state_from(None, None, true, true, true).reason,
             None,
             "a reranker that is loaded says nothing more. «loads on its first batch» on a model \
              that already loaded leaves someone waiting for a load that has happened"
@@ -3260,7 +3278,7 @@ mod health_report_tests {
         for (failure, deferred, available, status_resolved, expected) in table {
             let state = nli_state_from(
                 failure.map(String::from),
-                "cpu",
+                None,
                 deferred,
                 available,
                 status_resolved,
@@ -3271,13 +3289,31 @@ mod health_report_tests {
                  status_resolved={status_resolved}"
             );
             assert_eq!(
-                state.device, "cpu",
-                "whichever branch answers, the device word is the one the placement path chose"
+                state.device, None,
+                "no session was measured, so no branch may name a device: failure={failure:?} \
+                 deferred={deferred} available={available} status_resolved={status_resolved}"
+            );
+
+            let measured = nli_state_from(
+                failure.map(String::from),
+                Some(&crate::gpu::Placement::Gpu),
+                deferred,
+                available,
+                status_resolved,
+            );
+            assert_eq!(
+                measured.device,
+                if expected == "loaded" {
+                    Some("gpu")
+                } else {
+                    None
+                },
+                "only the row whose session is open reads the registry: expected={expected}"
             );
         }
 
         assert_eq!(
-            nli_state_from(None, "cpu", false, true, true).reason,
+            nli_state_from(None, None, false, true, true).reason,
             None,
             "an NLI model that already loaded says nothing more. «loads on its first use» on a \
              model that has loaded leaves someone waiting for a load that has happened"
@@ -3306,34 +3342,56 @@ mod health_report_tests {
         ];
 
         for (failure, ready, loaded, expected) in table {
-            let state = embedder_state_from(failure.map(String::from), "gpu", ready, loaded);
+            let measured = embedder_state_from(
+                failure.map(String::from),
+                Some(&crate::gpu::Placement::Gpu),
+                ready,
+                loaded,
+            );
             assert_eq!(
-                state.state, expected,
+                measured.state, expected,
                 "failure={failure:?} ready={ready} loaded={loaded}"
             );
             assert_eq!(
-                state.device,
-                if expected == "fallback" { "cpu" } else { "gpu" },
-                "the hash fallback runs on this CPU whatever the placement path was asked for, \
-                 and every other branch reports where the model went: failure={failure:?} \
+                measured.device,
+                match expected {
+                    "fallback" => Some("cpu"),
+                    "loaded" => Some("gpu"),
+                    _ => None,
+                },
+                "the hash fallback runs on this CPU whatever the registry says, an open \
+                 session is where it opened, and a model that failed or is still warming runs \
+                 nowhere yet: failure={failure:?} ready={ready} loaded={loaded}"
+            );
+
+            let unmeasured = embedder_state_from(failure.map(String::from), None, ready, loaded);
+            assert_eq!(
+                unmeasured.device,
+                if expected == "fallback" {
+                    Some("cpu")
+                } else {
+                    None
+                },
+                "with nothing in the registry only the fallback names a device, because it is \
+                 the one answer that does not depend on a session: failure={failure:?} \
                  ready={ready} loaded={loaded}"
             );
         }
 
         assert_eq!(
-            embedder_state_from(None, "gpu", true, true).reason,
+            embedder_state_from(None, Some(&crate::gpu::Placement::Gpu), true, true).reason,
             None,
             "an embedder that is running says nothing more"
         );
         assert!(
-            embedder_state_from(None, "gpu", true, false)
+            embedder_state_from(None, None, true, false)
                 .reason
                 .is_some_and(|why| why.contains("hash fallback")),
             "and a machine on the hash fallback has to say so: «search is lexical only» is the \
              sentence that explains results an operator would otherwise file as a ranking bug"
         );
         assert_eq!(
-            embedder_state_from(None, "gpu", false, false).reason,
+            embedder_state_from(None, Some(&crate::gpu::Placement::Gpu), false, false).reason,
             None,
             "«warming» says everything there is to say; a reason here would be a sentence that \
              stops being true a second later"
@@ -3361,8 +3419,8 @@ mod health_report_tests {
         }
 
         let mut runtime = report(true, false, ["failed", "loaded", "failed"]);
-        runtime.nli = nli_state_from(Some(nli_failure), "cpu", false, true, true);
-        runtime.embedder = embedder_state_from(Some(embedder_failure), "cpu", true, false);
+        runtime.nli = nli_state_from(Some(nli_failure), None, false, true, true);
+        runtime.embedder = embedder_state_from(Some(embedder_failure), None, true, false);
 
         assert_eq!(
             runtime.nli.reason.as_deref(),
@@ -3417,7 +3475,7 @@ mod health_report_tests {
         );
 
         let mut runtime = report(true, false, ["loaded", "failed", "loaded"]);
-        runtime.reranker = reranker_state_from(Some(failure), "cpu", true, true, false);
+        runtime.reranker = reranker_state_from(Some(failure), None, true, true, false);
 
         assert_eq!(
             runtime.reranker.reason.as_deref(),
@@ -3442,6 +3500,321 @@ mod health_report_tests {
                 "{canary:?} was served in the runtime block. A model path is inventory, and on \
                  Windows it carries the operator's user name; the sentence with the path in it \
                  belongs to `doctor`, which runs on their machine: {served}"
+            );
+        }
+    }
+
+    /// What ONNX Runtime said on this machine on 2026-10-12, word for word,
+    /// with the operator's name left as a parameter so a test can demand that
+    /// it is absent from whatever is served.
+    fn provider_refusal(user: &str) -> String {
+        format!(
+            r#"E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Users\{user}\.cache\cuba-memorys\onnxruntime\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")"#
+        )
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Which {
+        Embedder,
+        Reranker,
+        Nli,
+    }
+
+    /// The row of `which` that lands on `state`, with the facts that put a real
+    /// machine there, and the registry entry the caller wants to try on it.
+    fn row(which: Which, state: &str, placement: Option<&crate::gpu::Placement>) -> ModelState {
+        let failure = || Some("the session did not open".to_string());
+        match (which, state) {
+            (Which::Embedder, "failed") => embedder_state_from(failure(), placement, true, false),
+            (Which::Embedder, "warming") => embedder_state_from(None, placement, false, false),
+            (Which::Embedder, "loaded") => embedder_state_from(None, placement, true, true),
+            (Which::Embedder, "fallback") => embedder_state_from(None, placement, true, false),
+            (Which::Reranker, "failed") => {
+                reranker_state_from(failure(), placement, true, true, false)
+            }
+            (Which::Reranker, "off") => reranker_state_from(None, placement, false, false, false),
+            (Which::Reranker, "absent") => reranker_state_from(None, placement, true, false, false),
+            (Which::Reranker, "configured") => {
+                reranker_state_from(None, placement, true, true, false)
+            }
+            (Which::Reranker, "loaded") => reranker_state_from(None, placement, true, true, true),
+            (Which::Nli, "failed") => nli_state_from(failure(), placement, false, true, false),
+            (Which::Nli, "off") => nli_state_from(None, placement, true, true, false),
+            (Which::Nli, "absent") => nli_state_from(None, placement, false, false, false),
+            (Which::Nli, "configured") => nli_state_from(None, placement, false, true, false),
+            (Which::Nli, "loaded") => nli_state_from(None, placement, false, true, true),
+            _ => panic!("the fixture is broken: {which:?} has no row that lands on {state:?}"),
+        }
+    }
+
+    /// The device `/health` prints is where the session *opened*, and only a
+    /// session that is open has one.
+    ///
+    /// The old word was the placement path's choice, copied into every branch:
+    /// a reranker that never opened said `cpu`, a reranker that was asked for
+    /// the card and opened on the CPU said `gpu`, and on the build the gate
+    /// runs both were the same word. Every column below is a literal for that
+    /// reason, and the table crosses all three models with every entry the
+    /// registry can hold, because a row that only tried `Gpu` would pass a
+    /// function that hard-coded it.
+    #[test]
+    fn the_device_is_where_the_session_opened_and_only_an_open_session_has_one() {
+        let refused = crate::gpu::Placement::CpuAfterProviderFailed(provider_refusal("canary"));
+        // none, Gpu, Cpu, CpuAfterProviderFailed — the order of the device columns.
+        let placements: [(&str, Option<&crate::gpu::Placement>); 4] = [
+            ("nothing recorded", None),
+            ("Gpu", Some(&crate::gpu::Placement::Gpu)),
+            ("Cpu", Some(&crate::gpu::Placement::Cpu)),
+            ("CpuAfterProviderFailed", Some(&refused)),
+        ];
+        let devices: [(&str, [Option<&str>; 4]); 7] = [
+            ("loaded", [None, Some("gpu"), Some("cpu"), Some("cpu")]),
+            ("fallback", [Some("cpu"); 4]),
+            ("failed", [None; 4]),
+            ("warming", [None; 4]),
+            ("configured", [None; 4]),
+            ("off", [None; 4]),
+            ("absent", [None; 4]),
+        ];
+        let models: [(Which, &[&str]); 3] = [
+            (
+                Which::Embedder,
+                &["failed", "warming", "loaded", "fallback"],
+            ),
+            (
+                Which::Reranker,
+                &["failed", "off", "absent", "configured", "loaded"],
+            ),
+            (
+                Which::Nli,
+                &["failed", "off", "absent", "configured", "loaded"],
+            ),
+        ];
+
+        for (which, states) in models {
+            for &state in states {
+                let (_, expected) = devices
+                    .iter()
+                    .find(|(name, _)| *name == state)
+                    .unwrap_or_else(|| panic!("the table has no column for {state:?}"));
+                let unrecorded = row(which, state, None);
+                assert_eq!(
+                    unrecorded.state, state,
+                    "the fixture is broken: {which:?} does not land on {state:?} with the facts \
+                     this row gives it, so every device assertion below would be about another row"
+                );
+
+                for (index, (recorded, placement)) in placements.iter().enumerate() {
+                    let got = row(which, state, *placement);
+                    assert_eq!(got.state, state, "{which:?} with {recorded}");
+                    assert_eq!(
+                        got.device, expected[index],
+                        "{which:?} in `{state}` with {recorded} in the registry. `loaded` says \
+                         where the session opened and `null` when nobody measured it; `fallback` \
+                         is the hash on this CPU; `failed`, `warming`, `configured`, `off` and \
+                         `absent` have no session and so no device, even when the registry \
+                         already holds a value (it is written while the model is still loading)"
+                    );
+                    if state == "loaded" {
+                        assert_eq!(
+                            got.reason.is_some(),
+                            index == 3,
+                            "{which:?} loaded with {recorded}: only a session that opened on the \
+                             CPU after the provider refused has something to explain, and a \
+                             healthy one says nothing: {:?}",
+                            got.reason
+                        );
+                    } else {
+                        assert_eq!(
+                            got.reason, unrecorded.reason,
+                            "{which:?} in `{state}`: the registry must not change what a model \
+                             that is not open says about itself. A `failed` model keeps the \
+                             loader's reason, redacted with the variable that names *its* \
+                             directory, and does not borrow the provider's"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The caught case: the card, the runtime and the provider library are on
+    /// disk, `cublasLt64_12.dll` is not, and the session opened on the CPU.
+    ///
+    /// The cause is the sentence ONNX Runtime wrote, and it is full of paths:
+    /// the source file it was built from, and the provider DLL under the
+    /// operator's home. They go the way every other path goes, but the variable
+    /// that replaces them is the *runtime's*, not the model's — the directory
+    /// in that error is where `onnxruntime.dll` and its providers live, and
+    /// sending the operator to `CUBA_RERANKER_PATH` would be the wrong knob.
+    #[test]
+    fn a_session_that_opened_on_the_cpu_after_the_provider_refused_says_why_without_its_path() {
+        const CANARY_USER: &str = "canaryoperator";
+        const RUNTIME_DIR: &str = "the ONNX Runtime directory (see ORT_DYLIB_PATH)";
+        let cause = provider_refusal(CANARY_USER);
+
+        // Positive controls. Without them «the canary is not in the reason» also
+        // passes on a reason that never carried the cause.
+        for needle in [
+            CANARY_USER,
+            ".cache",
+            "onnxruntime_providers_cuda.dll",
+            "cublasLt64_12.dll",
+        ] {
+            assert!(
+                cause.contains(needle),
+                "the fixture is broken: the sentence this test scrubs has no {needle:?} in it"
+            );
+        }
+
+        let refused = crate::gpu::Placement::CpuAfterProviderFailed(cause);
+        let opened = [
+            (
+                "embedder",
+                embedder_state_from(None, Some(&refused), true, true),
+            ),
+            (
+                "reranker",
+                reranker_state_from(None, Some(&refused), true, true, true),
+            ),
+            (
+                "nli",
+                nli_state_from(None, Some(&refused), false, true, true),
+            ),
+        ];
+
+        let expected = format!(
+            "the GPU provider did not start; this session runs on the CPU: {RUNTIME_DIR} \
+             onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading \
+             {RUNTIME_DIR} which depends on \"cublasLt64_12.dll\" which is missing. (Error 126: \
+             \"No se puede encontrar el módulo especificado.\")"
+        );
+
+        for (model, state) in &opened {
+            assert_eq!(state.state, "loaded", "{model}");
+            assert_eq!(
+                state.device,
+                Some("cpu"),
+                "{model}: the session opened, and opened on the CPU. The registry says so even \
+                 though the placement path asked for the card"
+            );
+            let reason = state.reason.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "{model}: a session that fell to the CPU after the provider refused has to \
+                     say why — `device: cpu` alone is indistinguishable from a machine that \
+                     asked for it"
+                )
+            });
+
+            assert_eq!(
+                reason, expected,
+                "{model}: the sentence is fixed — what happened, where it landed, then ONNX \
+                 Runtime's own words with each path replaced by the runtime directory"
+            );
+            for kept in [
+                "CPU",
+                "(see ORT_DYLIB_PATH)",
+                "cublasLt64_12.dll",
+                "Error 126",
+            ] {
+                assert!(
+                    reason.contains(kept),
+                    "{model}: {kept:?} is the half an operator can act on, and it was cut: \
+                     {reason}"
+                );
+            }
+            for leaked in [
+                CANARY_USER,
+                ".cache",
+                "onnxruntime_providers_cuda.dll",
+                "C:\\Users",
+                "provider_bridge_ort.cc",
+                "CUBA_RERANKER_PATH",
+                "CUBA_NLI_PATH",
+                "ONNX_MODEL_PATH",
+            ] {
+                assert!(
+                    !reason.contains(leaked),
+                    "{model}: {leaked:?} reached the reason. The paths in this error are the \
+                     runtime's and `/health` goes out over a socket a LAN bind makes reachable; \
+                     and a model-directory variable would send the operator to change the wrong \
+                     one: {reason}"
+                );
+            }
+        }
+
+        let mut runtime = report(true, false, ["loaded", "loaded", "loaded"]);
+        let [(_, embedder), (_, reranker), (_, nli)] = opened;
+        runtime.embedder = embedder;
+        runtime.reranker = reranker;
+        runtime.nli = nli;
+        let served = runtime_json(&runtime).to_string();
+        assert!(
+            served.contains("cublasLt64_12.dll"),
+            "positive control: the cause has to reach the served block at all, or every canary \
+             below passes on a block that says nothing: {served}"
+        );
+        for canary in [CANARY_USER, ".cache", "onnxruntime_providers_cuda.dll"] {
+            assert!(
+                !served.contains(canary),
+                "{canary:?} was served in the runtime block: {served}"
+            );
+        }
+    }
+
+    /// Three rows, three answers: a reranker that fell to the CPU, an embedder
+    /// that opened where it was asked, and an NLI nobody has used yet.
+    #[test]
+    fn each_model_row_tells_its_own_truth_in_the_served_block() {
+        const CANARY_USER: &str = "canaryoperator";
+        let refused = crate::gpu::Placement::CpuAfterProviderFailed(provider_refusal(CANARY_USER));
+
+        let mut runtime = report(true, false, ["loaded", "loaded", "configured"]);
+        runtime.reranker = reranker_state_from(None, Some(&refused), true, true, true);
+        runtime.embedder = embedder_state_from(None, Some(&crate::gpu::Placement::Cpu), true, true);
+        runtime.nli = nli_state_from(None, None, false, true, false);
+        let json = runtime_json(&runtime);
+
+        assert_eq!(json["reranker"]["state"], "loaded");
+        assert_eq!(
+            json["reranker"]["device"], "cpu",
+            "the one that fell: {json}"
+        );
+        assert!(
+            json["reranker"]["reason"]
+                .as_str()
+                .is_some_and(|why| why.contains("cublasLt64_12.dll")),
+            "and it says why, in its own row: {json}"
+        );
+
+        assert_eq!(json["embedder"]["state"], "loaded");
+        assert_eq!(json["embedder"]["device"], "cpu");
+        assert_eq!(
+            json["embedder"]["reason"],
+            Value::Null,
+            "an embedder that opened on the CPU because it was asked to has nothing to explain, \
+             and must not inherit the reranker's cause: {json}"
+        );
+
+        assert_eq!(json["nli"]["state"], "configured");
+        assert!(
+            json["nli"]
+                .as_object()
+                .is_some_and(|block| block.contains_key("device")),
+            "the key stays: {json}"
+        );
+        assert_eq!(
+            json["nli"]["device"],
+            Value::Null,
+            "a model nobody has opened runs on no device, and saying `cpu` or `gpu` for it is \
+             the guess this block used to make: {json}"
+        );
+
+        let served = json.to_string();
+        for canary in [CANARY_USER, ".cache"] {
+            assert!(
+                !served.contains(canary),
+                "{canary:?} was served in the runtime block: {served}"
             );
         }
     }
