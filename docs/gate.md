@@ -10,7 +10,7 @@ Second judge, chained, not a substitute: `./scripts/quality-gate.sh` (lizard + `
 
 | Step | What it proves |
 |---|---|
-| Postgres :5488 | The cluster is up before anything mutates |
+| Postgres at `DATABASE_URL` (default `:5488`) | The cluster that URL names is up before anything mutates, and the gate prints the port that answered |
 | Optional backup | Live corpus is snapshotted unless `SKIP_BACKUP=1` |
 | `scripts/run-all-tests.sh` | fmt, clippy `-D warnings`, unit + ignored integration on throwaway `brain_gate` / peer, e2e MCP + live (no soft-skip), GPU placement vs `doctor --json`, eval smoke |
 | `--features docs` | clippy + tests of the docs feature |
@@ -86,6 +86,16 @@ pesado -m 36G -w 7200 -n memory-industry-release -- bash ./scripts/release.sh v0
 With a receipt for `HEAD` it runs nothing heavy and does not need it.
 
 Every script that another script calls directly (`"$ROOT/scripts/mutants-gate.sh"`) has to be `100755` in the index: Windows creates `100644`, Git Bash does not mind, and Linux answers `Permission denied` at the first step. `every_gate_entry_point_is_executable_in_the_index` reads `git ls-files -s` and lists the ones that are not (`gate-lock.sh`, only ever sourced, is the one exception). `no_gate_script_points_into_a_windows_drive` keeps `/mnt/c/` and `/mnt/d/` out of `scripts/`.
+
+## Running the gate on Windows
+
+The gate was written on Windows under Git Bash and moved to WSL2 on 2026-10-03. Run natively again on 2026-10-12 (Windows 11, RTX 4070 Ti 12 GB), the core `run-all-tests.sh` took 20 min 35 s on 0.28.0 and found what a CPU-only Linux judge cannot see. This is what the machine has to be:
+
+- **Git Bash, not WSL.** Launch every `.sh` with `C:\Program Files\Git\bin\bash.exe`; the `bash` on `PATH` is WSL. `cargo`, `cargo-mutants`, `cargo-deny`, `cargo-audit`, `cargo-machete`, `cargo-llvm-cov`, `lizard`, `psql` and a `node` of at least the major in `engines.node` have to be on `PATH`, as on Linux.
+- **CUDA 12 and cuDNN 9, on `PATH`.** The ONNX Runtime CUDA provider (`onnxruntime_providers_cuda.dll`) depends on `cublasLt64_12.dll`, `cudart64_12.dll`, `cudnn64_9.dll` and their neighbours. A machine with only the CUDA 13 toolkit has none of them: the provider fails to register, the session runs on the CPU, `/health` says so (`gpu.degraded: true`, the reranker's `device: cpu` with the provider's cause) and `gpu-placement-check.sh` fails the gate, which is the gate telling the truth. The DLLs come from NVIDIA's `nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cudnn-cu12`, `nvidia-cufft-cu12` and `nvidia-curand-cu12` wheels (the `.dll` files under `nvidia/*/bin/` in each); put them in one directory and that directory on `PATH` for the shell that launches the gate and for the daemon.
+- **A Postgres of its own, on its own port, and `DATABASE_URL` pointing at it.** `pgvector/pgvector:pg18`, as `docker-compose.yml` has it. With `networkingMode=mirrored` in `.wslconfig`, Windows and WSL2 share `localhost`: the `:5488` that Windows reaches can be the Postgres of WSL, and the container of Docker Desktop then cannot publish that port at all. Ask the server which one answers: `psql "$DATABASE_URL" -Atc "select inet_server_addr()"` gives a `172.17.x.x` address for Docker Desktop and the WSL network's for WSL. Give the Windows container another port (`5489` was used) and export `DATABASE_URL=postgresql://cuba:…@127.0.0.1:5489/brain`; the gate reads host, port, user and database from it (`pg_isready -d "$DATABASE_URL"`) and prints the port that answered. A `DATABASE_URL` with a query (`?host=`, `?port=`) or without exactly one database segment is refused with exit 2, because `brain_gate` is derived from its tail: write a Unix socket as a percent-encoded host (`postgresql://cuba@%2Frun%2Fpostgresql/brain`) and pass options through `PG*` variables. `fsync=off`, `synchronous_commit=off` and `full_page_writes=off` are fine on this server and on no other: it is disposable.
+- **One gate at a time, across both hosts.** The lock, the exit file and the receipts live in each host's own `~/.cache/cuba-gate`, so a gate in WSL and one in Windows do not see each other, and with mirrored networking they share `localhost`, the ports and, if they were given the same `DATABASE_URL`, `brain_gate`. Give them different servers, or never start both. A receipt written on Windows is a receipt for Windows: `release.sh` run from WSL does not find it.
+- **No daemon needed.** A daemon holding the reranker on the card does not stop the gate (the card has room for two), but `target/release/memory-industry.exe` cannot be rebuilt while a process runs from it: run a daemon from a copy outside `target/`.
 
 ## Isolation extras (0.26)
 
