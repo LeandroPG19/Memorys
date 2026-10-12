@@ -831,7 +831,12 @@ mod tests {
             ScratchHome {
                 _home: ScopedEnv::cleared("HOME"),
                 _profile: ScopedEnv::set("USERPROFILE", &root),
-                _local_app_data: ScopedEnv::cleared("LOCALAPPDATA"),
+                // Pointed at the scratch directory, never cleared: on Windows the bridge state
+                // directory is required to come from LOCALAPPDATA and an absent one is an error
+                // (`state_dir`), so clearing it only worked on the Linux runner, where the
+                // variable means nothing. Pointing it also keeps a developer's real
+                // `bridge.json` out of these tests on a paired PC.
+                _local_app_data: ScopedEnv::set("LOCALAPPDATA", &root),
                 dir,
             }
         }
@@ -841,12 +846,44 @@ mod tests {
         }
     }
 
-    fn bridge_block_with(client_id: &str) -> Value {
+    fn bridge_block_on(port: u16, client_id: &str) -> Value {
         json!({
             "type": "http",
-            "url": "http://127.0.0.1:8797/mcp",
+            "url": format!("http://127.0.0.1:{port}/mcp"),
             "headers": {"Mcp-Client-Id": client_id}
         })
+    }
+
+    fn bridge_block_with(client_id: &str) -> Value {
+        bridge_block_on(8797, client_id)
+    }
+
+    /// The scratch home is only an isolation if the bridge's state path lands inside it on
+    /// the platform that runs the test, and if the environment it changed comes back as it was.
+    #[tokio::test]
+    async fn scratch_home_keeps_the_bridge_state_inside_itself_and_gives_the_environment_back() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let before = std::env::var_os("LOCALAPPDATA");
+        {
+            let home = ScratchHome::new("scratch-home-state");
+
+            let state_path = crate::bridge::default_state_path()
+                .expect("the state path resolves inside the scratch home on every platform");
+
+            assert!(
+                state_path.starts_with(home.dir.path()),
+                "the bridge state would be read from {} and not from the scratch home {}: \
+                 a test would see the developer's real bridge.json",
+                state_path.display(),
+                home.dir.path().display()
+            );
+        }
+
+        assert_eq!(
+            std::env::var_os("LOCALAPPDATA"),
+            before,
+            "dropping the scratch home must give LOCALAPPDATA back as it was, absent included"
+        );
     }
 
     /// I4/I5 (the wiring: flags reach the writer, the writer reaches the right file)
@@ -928,6 +965,32 @@ mod tests {
                 "{relative} must hold the bridge block after `client all`. Got: {written:?}"
             );
         }
+    }
+
+    /// I4: the port in the block is the one the paired bridge listens on, read from the
+    /// state file the pairing left, and the block carries no credential or host address.
+    #[tokio::test]
+    async fn setup_client_writes_the_port_of_the_bridge_this_pc_is_paired_with() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = ScratchHome::new("setup-client-paired");
+        let mut paired = crate::bridge::fake_host::Identity::new().state(8787, vec![], None);
+        paired.port = 8799;
+        let state_path = crate::bridge::default_state_path()
+            .expect("the state path resolves inside the scratch home");
+        std::fs::create_dir_all(state_path.parent().expect("the state file has a directory"))
+            .expect("the state directory");
+        crate::bridge::fake_host::write_state_json(&state_path, &paired);
+
+        run_cli(&words("client claude --client-id planta --apply"))
+            .expect("`setup client claude --apply` works on a paired PC");
+
+        let after = read_json(&home.path(".claude.json")).expect("the config is JSON");
+        assert_eq!(
+            after["mcpServers"]["memory-industry"],
+            bridge_block_on(8799, "planta"),
+            "the client must talk to the port this PC's bridge listens on, not the default. \
+             Got: {after}"
+        );
     }
 
     /// I5

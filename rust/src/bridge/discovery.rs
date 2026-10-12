@@ -1236,12 +1236,16 @@ mod tests {
         );
     }
 
-    /// An address nothing listens on: bound and let go, so a connect to it is refused at once.
-    fn refused_address() -> SocketAddr {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
-        let at = probe.local_addr().expect("the bound address");
-        drop(probe);
-        at
+    /// An address a connect cannot be opened to, and that says so at once on both systems.
+    /// Port 0 never listens: Linux answers ECONNREFUSED, and Windows refuses it before it
+    /// sends a SYN (WSAEADDRNOTAVAIL 10049, 0 ms measured). A port that was bound and let go
+    /// is refused too, but Windows retries the SYN after the RST and reports it only at
+    /// ~2 s (2047 ms measured), longer than any limit a test can afford: the limit would
+    /// win and the word would be the timeout's, not the refusal's. Binding nothing also
+    /// closes the window where another process could take the port between the drop and the
+    /// connect.
+    fn unconnectable_address() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 0))
     }
 
     /// One answer, with the status line and body given, to the one request it reads. A
@@ -1323,9 +1327,16 @@ mod tests {
             "a host that holds the connection past the limit is a timeout"
         );
         assert_eq!(
-            check_identity(&client(), refused_address(), &state, [7u8; 16], ms(300)).await,
+            check_identity(
+                &client(),
+                unconnectable_address(),
+                &state,
+                [7u8; 16],
+                ms(300)
+            )
+            .await,
             Verdict::NoAnswer("conexión rechazada o sin ruta".to_string()),
-            "nothing listens at the address: the connect is refused"
+            "no connection can be opened to the address: the connect fails before a byte is sent"
         );
         assert_eq!(
             check_identity(&client(), hung_up.addr(), &state, [7u8; 16], ms(300)).await,
@@ -1339,14 +1350,20 @@ mod tests {
     #[tokio::test]
     async fn reachable_tells_a_listening_port_from_a_refused_one() {
         let listening = Closer::start().await;
+        let limit = ms(500);
 
         assert!(
-            reachable(listening.addr(), ms(500)).await,
+            reachable(listening.addr(), limit).await,
             "a port that accepts a connect is reachable"
         );
+        let asked_at = Instant::now();
+        let answer = reachable(unconnectable_address(), limit).await;
+        let took = asked_at.elapsed();
+        assert!(!answer, "a port nothing listens on is not reachable");
         assert!(
-            !reachable(refused_address(), ms(500)).await,
-            "a port nothing listens on is not reachable"
+            took < limit,
+            "the `no` came after {took:?}, at the {limit:?} limit: that is the timer winning, \
+             not the connect failing, so the wrong branch of `reachable` answered"
         );
     }
 
