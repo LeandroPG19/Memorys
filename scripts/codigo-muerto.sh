@@ -22,8 +22,11 @@ CI="$ROOT/.github/workflows/ci.yml"
 # Two-way ratchets. They fail when the number goes up *and* when it goes down
 # without this line being updated, so removing an #[ignore] is a deliberate
 # edit with a reviewer rather than slack somebody can spend later.
-IGNORE_MAX=144
-IGNORE_WITHOUT_REASON_MAX=142
+# +1 in 0.29: v029_doctor_reads_the_installed_service.rs needs a server (DATABASE_URL) like the other 142,
+# is run by name under run-all-tests.sh --ignored, and passed there on 2026-10-12. Owner: orquestador 0.29.
+# To retire it: make the test create its own scratch database, the way the tests that carry no #[ignore] do.
+IGNORE_MAX=145
+IGNORE_WITHOUT_REASON_MAX=143
 
 # awk, not `sed -n '/start/,/end/p'`: sed looks for the range end starting at
 # the line *after* the start, so a single-line RUN_ELSEWHERE=(a b) swallows the
