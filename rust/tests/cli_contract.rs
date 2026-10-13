@@ -1,11 +1,11 @@
 use std::process::Command;
 
-const DEAD_DB: &str = "postgresql://nobody@127.0.0.1:1/nothing";
+mod dead_db;
 
 fn run(args: &[&str]) -> (String, String, i32) {
     let out = Command::new(env!("CARGO_BIN_EXE_cuba-memorys"))
         .args(args)
-        .env("DATABASE_URL", DEAD_DB)
+        .env("DATABASE_URL", dead_db::url())
         .output()
         .expect("binary runs");
     (
@@ -337,7 +337,7 @@ fn nothing_can_exit_a_draining_command_without_draining_first() {
     );
 }
 
-/// Runs `serve <arg>` against DEAD_DB and kills it if it is still alive after
+/// Runs `serve <arg>` against the dead database and kills it if it is still alive after
 /// `budget`: a serve that got past its checks listens forever, and a contract
 /// that hangs the suite reports nothing.
 fn run_serve(arg: &str, budget: std::time::Duration) -> (String, Option<i32>) {
@@ -345,7 +345,7 @@ fn run_serve(arg: &str, budget: std::time::Duration) -> (String, Option<i32>) {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_cuba-memorys"))
         .args(["serve", arg])
-        .env("DATABASE_URL", DEAD_DB)
+        .env("DATABASE_URL", dead_db::url())
         .env_remove("CUBA_HTTP_TOKEN")
         .env_remove("CUBA_PEER_TOKEN")
         .env_remove("LISTEN_FDS")
@@ -382,7 +382,7 @@ fn serve_refuses_an_address_it_cannot_read_before_it_touches_postgres() {
     // Presence anchor. A port this test already holds is a valid address that
     // gets through every check before the bind and then fails at the bind, so
     // serve does all its pre-listen work — including the connection attempt
-    // to DEAD_DB — and still exits instead of listening forever.
+    // to the dead database — and still exits instead of listening forever.
     let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
     let valid = taken.local_addr().expect("bound address").to_string();
     let (stderr, code) = run_serve(&valid, budget);
@@ -451,7 +451,7 @@ fn cache_migrate_moves_the_legacy_cache_and_a_second_run_has_nothing_to_do() {
             .args(args)
             .env("HOME", &home)
             .env("USERPROFILE", &home)
-            .env("DATABASE_URL", DEAD_DB)
+            .env("DATABASE_URL", dead_db::url())
             .output()
             .expect("binary runs");
         (

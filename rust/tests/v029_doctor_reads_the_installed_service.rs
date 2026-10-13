@@ -2,8 +2,13 @@
 //! and `effective_http_addr` are right, and nothing else proves doctor feeds them
 //! the env file the service loads instead of its own process environment.
 //!
-//! 192.0.2.10 is TEST-NET-1 (RFC 5737), documentation space that no machine owns,
-//! so the assertions do not depend on what this box has assigned.
+//! The env file holds a loopback address on a port this test keeps bound. Loopback because
+//! `doctor::lan_facts` goes to the network for anything else: a `GET /health` it waits 2 s for
+//! and a UDP announcement it waits 0.8 s for, against a machine that never answers (3.06 s
+//! measured with 192.0.2.10, the TEST-NET-1 address this test used to write). A bound port
+//! because `http_port` then says the same on every machine, and it is not `DEFAULT_ADDR`
+//! (127.0.0.1:8787), so following the env file stays distinguishable from reading the
+//! process's own environment.
 
 use memory_industry::service_apply::{CommandOutcome, CommandRunner};
 
@@ -30,6 +35,9 @@ async fn doctor_reports_the_address_the_installed_env_file_holds_not_its_own_env
         .await
         .expect("connect to test database");
 
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
+    let addr = held.local_addr().expect("bound address").to_string();
+
     // Both variables doctor resolves the install root from point inside the
     // scratch directory on either platform, so doctor never reads the developer's
     // own profile: HOME for Linux (and `envs::home()`, which Windows reads first),
@@ -50,7 +58,7 @@ async fn doctor_reports_the_address_the_installed_env_file_holds_not_its_own_env
     std::fs::write(
         &env_file,
         format!(
-            "CUBA_HTTP_ADDR=192.0.2.10:8787\nCUBA_HTTP_TOKEN={}\n",
+            "CUBA_HTTP_ADDR={addr}\nCUBA_HTTP_TOKEN={}\n",
             "a".repeat(64)
         ),
     )
@@ -80,6 +88,7 @@ async fn doctor_reports_the_address_the_installed_env_file_holds_not_its_own_env
             None => std::env::remove_var("CUBA_HTTP_ADDR"),
         }
     }
+    drop(held);
     let _ = std::fs::remove_dir_all(&root);
 
     let installed = checks
@@ -97,7 +106,7 @@ async fn doctor_reports_the_address_the_installed_env_file_holds_not_its_own_env
         .find(|c| c.name == "service_address")
         .expect("with an env file installed doctor reports service_address");
     assert!(
-        address.detail.contains("192.0.2.10:8787"),
+        address.detail.contains(&addr),
         "doctor has to report the address the installed env file holds: {}",
         address.detail
     );
@@ -106,9 +115,21 @@ async fn doctor_reports_the_address_the_installed_env_file_holds_not_its_own_env
         .find(|c| c.name == "http_port")
         .expect("doctor always reports http_port");
     assert!(
-        port.detail.contains("192.0.2.10:8787"),
+        port.detail.contains(&addr),
         "the port probe has to follow the address the service will bind, not the default doctor's own environment gives: {}",
         port.detail
+    );
+    let lan = checks
+        .iter()
+        .find(|c| c.name == "lan")
+        .expect("doctor always reports lan");
+    assert!(
+        lan.detail.contains("loopback"),
+        "the env file holds a loopback address, so doctor must not go to the network for the LAN \
+         facts. An address that is not loopback makes it wait 2 s for a GET /health and 0.8 s for \
+         a UDP announcement (doctor.rs, LAN_HEALTH_BUDGET and LAN_BEACON_WAIT) that nobody is \
+         going to answer: {}",
+        lan.detail
     );
     if cfg!(windows) {
         assert!(

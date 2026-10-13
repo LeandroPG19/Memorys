@@ -2,7 +2,7 @@
 //! serves on loopback whatever the machine's network is, says in `/health` where its LAN
 //! listener is, answers the UDP announcement, and still demands a real token.
 //!
-//! No database: the pool points at a port nothing listens on, and nothing here asks the
+//! No database: the pool points at a listener that hangs up at once, and nothing here asks the
 //! daemon anything a database would answer. The private IP is whatever this machine has, so
 //! the assertions accept both «it has one» and «it has none» and pin what must hold in both.
 
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use memory_industry::beacon;
 use serde_json::Value;
 
-const DEAD_DB: &str = "postgresql://cuba:canarypass-db@127.0.0.1:1/nowhere";
+mod dead_db;
 
 const TOKEN: &str = "lan-auto-token-0123456789abcdef0123456789";
 
@@ -119,7 +119,7 @@ fn client() -> reqwest::Client {
 /// Start `serve_pool(addr)` and wait until `127.0.0.1:port` serves, or fail with the
 /// daemon's own reason for stopping.
 async fn daemon(addr: String, port: u16) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-    let pool = memory_industry::db::create_lazy_pool(DEAD_DB);
+    let pool = memory_industry::db::create_lazy_pool(&dead_db::url());
     let mut task =
         tokio::spawn(async move { memory_industry::http::serve_pool(&addr, pool, false).await });
 
@@ -142,7 +142,9 @@ async fn daemon(addr: String, port: u16) -> tokio::task::JoinHandle<anyhow::Resu
 }
 
 async fn lan_block(port: u16) -> Value {
-    // Above HEALTH_DB_TIMEOUT (5 s): with the database dead, /health spends all of it first.
+    // Above HEALTH_DB_TIMEOUT (5 s) on purpose: a dead database that answers at once leaves this
+    // far under it, so a regression of the fixture shows up slow here and red in the guardian
+    // of v042_health_says_what_degraded.
     let body: Value = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .no_proxy()
@@ -263,7 +265,7 @@ async fn lan_mode_still_demands_a_real_token_before_it_binds_anything() {
 
     for (token, must_name) in [(None, "CUBA_HTTP_TOKEN"), (Some("corto"), "at least 32")] {
         let _env = quiet_machine(token);
-        let pool = memory_industry::db::create_lazy_pool(DEAD_DB);
+        let pool = memory_industry::db::create_lazy_pool(&dead_db::url());
         let outcome = tokio::time::timeout(
             PROBE_BUDGET,
             memory_industry::http::serve_pool(&format!("lan:{port}"), pool, false),

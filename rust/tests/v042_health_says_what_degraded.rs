@@ -9,11 +9,11 @@
 //! the answer by reading the source.
 //!
 //! Every test here runs in the ordinary suite and none of them needs
-//! `DATABASE_URL`. The pool points at a port nothing listens on, which is not
-//! a limitation: "the database is down" is one of the two states being pinned,
-//! and every other assertion is about what this process says about *itself*.
-//! That also keeps this file inside the plain `cargo test` run, where a test
-//! that needed a database could not go.
+//! `DATABASE_URL`. The pool points at a listener that hangs up at once, which
+//! is not a limitation: "the database is down" is one of the two states being
+//! pinned, and every other assertion is about what this process says about
+//! *itself*. That also keeps this file inside the plain `cargo test` run, where
+//! a test that needed a database could not go.
 
 use std::ffi::OsString;
 use std::time::{Duration, Instant};
@@ -22,8 +22,11 @@ use memory_industry::http::{ModelState, RuntimeReport, overall_status};
 use memory_industry::llm_cli::LlmSummary;
 use serde_json::Value;
 
-/// A database that is certainly not there, and whose password is a canary.
-const DEAD_DB: &str = "postgresql://cuba:canarypass-db@127.0.0.1:1/nowhere";
+// A database that is certainly not there, and whose password is a canary.
+mod dead_db;
+
+/// Under HOST_IDENTITY_BUDGET (2 s), the shortest budget a dead database used to eat.
+const DEAD_DB_CEILING: Duration = Duration::from_secs(1);
 
 /// Long enough to be a real bearer token, so nothing in the bind guard has an
 /// opinion about it and the assertions are about `/health` alone.
@@ -158,10 +161,9 @@ async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
 
 /// Start a daemon and wait until it answers, or fail saying it never did.
 ///
-/// The readiness probe goes to `/connect`, not to `/health`: `/health` asks a
-/// database that is deliberately not there and spends its five-second budget
-/// finding out, and paying that once per test to learn something `/connect`
-/// answers instantly would be five seconds of gate time for nothing.
+/// The readiness probe goes to `/connect`, not to `/health`: `/connect` is a
+/// page compiled into the binary and needs nothing, so a probe that only asks
+/// whether the port is served does not have to ask the database.
 ///
 /// Polling rather than sleeping a fixed number: any number is right on an idle
 /// machine and wrong on the busy one that actually failed. The condition is
@@ -170,7 +172,7 @@ async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
 /// so a wait on that flag could outlive a daemon that was working — and two of
 /// the tests below are written against exactly that daemon.
 async fn daemon(port: u16) {
-    let pool = memory_industry::db::create_lazy_pool(DEAD_DB);
+    let pool = memory_industry::db::create_lazy_pool(&dead_db::url());
     let addr = format!("127.0.0.1:{port}");
     let serve_task = tokio::spawn(async move {
         // Printed rather than dropped: when it is the bind that failed, the
@@ -326,7 +328,7 @@ async fn health_without_a_token_does_not_inventory_the_machine() {
 async fn health_never_prints_a_secret() {
     let _one_at_a_time = ENV_GUARD.lock().await;
     let mut env = quiet_machine();
-    env.push(Env::set("DATABASE_URL", DEAD_DB));
+    env.push(Env::set("DATABASE_URL", &dead_db::url()));
     env.push(Env::cleared("MEMORY_INDUSTRY_LLM_PROVIDER"));
     env.push(Env::cleared("CUBA_LLM_PROVIDER"));
     env.push(Env::set(
@@ -367,6 +369,35 @@ async fn health_never_prints_a_secret() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn the_dead_database_hangs_up_at_once_instead_of_timing_out() {
+    let pool = memory_industry::db::create_lazy_pool(&dead_db::url());
+    let started = Instant::now();
+    let refused = pool
+        .acquire()
+        .await
+        .map(drop)
+        .expect_err("nothing serves PostgreSQL behind the dead database");
+    let took = started.elapsed();
+
+    assert!(
+        matches!(refused, sqlx::Error::Io(_)),
+        "the dead database must fail with an I/O error from a peer that hung up, and got \
+         {refused:?} after {took:?}. sqlx 0.8 retries a refused connection until the pool's \
+         acquire_timeout (5 s, db.rs) and then returns PoolTimedOut, so a port with no \
+         listener, or a listener that never answers, is slow and ends in that error. A URL \
+         that does not parse is no better: create_lazy_pool falls back to localhost:5432 and \
+         the PG* variables, which could reach a real server"
+    );
+    assert!(
+        took < DEAD_DB_CEILING,
+        "the dead database took {took:?} to fail, over {DEAD_DB_CEILING:?}. Every daemon this \
+         suite starts pays 2 s of it before it binds (host identity) and every /health pays \
+         up to 5 s, on Linux as well as Windows: v042 alone measured 31 s of waiting for a \
+         database that was never going to answer. Error: {refused:?}"
+    );
 }
 
 #[tokio::test]

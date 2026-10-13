@@ -34,9 +34,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// A database that is certainly not there. Nothing asserted here is about the
-/// database; `/health` just has to be able to ask one.
-const DEAD_DB: &str = "postgresql://cuba:canarypass-db@127.0.0.1:1/nowhere";
+// A database that is certainly not there. Nothing asserted here is about the
+// database; `/health` just has to be able to ask one.
+mod dead_db;
 
 /// Long enough to be a real bearer token, so nothing in the bind guard has an
 /// opinion about it.
@@ -180,7 +180,7 @@ fn broken_machine(install: &BrokenInstall) -> Vec<Env> {
 
 /// Start a daemon and wait until it answers, or fail saying it never did.
 async fn daemon(port: u16) {
-    let pool = memory_industry::db::create_lazy_pool(DEAD_DB);
+    let pool = memory_industry::db::create_lazy_pool(&dead_db::url());
     let addr = format!("127.0.0.1:{port}");
     let serve_task = tokio::spawn(async move {
         if let Err(why) = memory_industry::http::serve_pool(&addr, pool, false).await {

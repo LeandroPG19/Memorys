@@ -192,6 +192,17 @@ async fn what_one_machine_learns_offline_reaches_the_other_when_the_link_comes_b
             "MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS",
             PEER_WARM_CEILING.as_secs().to_string(),
         );
+        // And the models stay off: a daemon warming this developer's models cost ~40 s a test in
+        // a debug build (v026: 41.7 s -> 0.69 s a test), and the runtime waits for the warm-up
+        // when the test ends. `cuba_sync` moves rows and asks no model anything. The same set as
+        // `v042::quiet_machine`.
+        std::env::set_var("CUBA_RERANKER_PATH", "disabled-by-resource-plan");
+        std::env::set_var("CUBA_NLI_PATH", "disabled-by-resource-plan");
+        std::env::set_var(
+            "ONNX_MODEL_PATH",
+            std::env::temp_dir().join("v025-two-machines-no-such-model"),
+        );
+        std::env::set_var("CUBA_WARM_RERANKER", "0");
     }
 
     let marker = format!("offline_{}", &Uuid::new_v4().to_string()[..8]);
@@ -293,5 +304,9 @@ async fn what_one_machine_learns_offline_reaches_the_other_when_the_link_comes_b
         std::env::remove_var("CUBA_HTTP_TOKEN");
         std::env::remove_var("CUBA_HTTP_ADDR");
         std::env::remove_var("MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS");
+        std::env::remove_var("CUBA_RERANKER_PATH");
+        std::env::remove_var("CUBA_NLI_PATH");
+        std::env::remove_var("ONNX_MODEL_PATH");
+        std::env::remove_var("CUBA_WARM_RERANKER");
     }
 }

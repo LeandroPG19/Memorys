@@ -4,16 +4,16 @@
 //! start: the end-to-end run with real processes exited 2 with «is not a listen address».
 //!
 //! No daemon is left listening: without `CUBA_HTTP_TOKEN` the daemon refuses `lan:` at its
-//! own token check, after it has tried `DEAD_DB`, and exits 1. That refusal is the proof the
-//! address got past the binary's check.
+//! own token check, after it has tried the dead database, and exits 1. That refusal is the
+//! proof the address got past the binary's check.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const DEAD_DB: &str = "postgresql://nobody@127.0.0.1:1/nothing";
+mod dead_db;
 
-/// The same ceiling `cli_contract` gives a serve that ends by itself against `DEAD_DB`.
+/// The same ceiling `cli_contract` gives a serve that ends by itself against the dead database.
 const BUDGET: Duration = Duration::from_secs(60);
 
 fn free_port() -> u16 {
@@ -37,7 +37,7 @@ fn run_serve(arg: Option<&str>, env_addr: Option<&str>) -> (String, Option<i32>)
         None => command.env_remove("CUBA_HTTP_ADDR"),
     };
     let mut child = command
-        .env("DATABASE_URL", DEAD_DB)
+        .env("DATABASE_URL", dead_db::url())
         .env_remove("CUBA_HTTP_TOKEN")
         .env_remove("CUBA_PEER_TOKEN")
         .env_remove("LISTEN_FDS")

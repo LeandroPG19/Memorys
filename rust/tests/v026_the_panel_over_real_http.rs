@@ -131,6 +131,17 @@ async fn daemon(port: u16, panel: bool, public: bool) -> sqlx::PgPool {
             "MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS",
             WARM_CEILING.as_secs().to_string(),
         );
+        // The models stay off: a daemon warming this developer's models cost ~40 s a test in a
+        // debug build (126.98 s for the three tests, 2.24 s with these four set, all green).
+        // `rerank::warm_up` runs a whole batch at every start and the runtime waits for it when
+        // the test ends. The same set as `v042::quiet_machine`.
+        std::env::set_var("CUBA_RERANKER_PATH", "disabled-by-resource-plan");
+        std::env::set_var("CUBA_NLI_PATH", "disabled-by-resource-plan");
+        std::env::set_var(
+            "ONNX_MODEL_PATH",
+            std::env::temp_dir().join("v026-panel-no-such-model"),
+        );
+        std::env::set_var("CUBA_WARM_RERANKER", "0");
         if panel {
             std::env::set_var("CUBA_PANEL", "1");
         } else {
