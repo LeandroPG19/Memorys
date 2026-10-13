@@ -69,14 +69,34 @@ fn gpu_really_active(compiled_with_gpu: bool, gpu_degraded: bool, placed_on_gpu:
 
 static RERANK_GPU_ACTIVE: OnceLock<bool> = OnceLock::new();
 
+// Only an answer given once the reranker's session is placed is kept: before that,
+// `gpu::status()` cannot yet know whether the GPU provider will refuse, so the answer
+// is a prediction. `reranker_placed` is read before judging, so a refusal recorded
+// during the judgement cannot be kept as a stale `true`.
+fn rerank_gpu_active_in(
+    cell: &OnceLock<bool>,
+    reranker_placed: bool,
+    judge: impl FnOnce() -> bool,
+) -> bool {
+    if reranker_placed {
+        *cell.get_or_init(judge)
+    } else {
+        cell.get().copied().unwrap_or_else(judge)
+    }
+}
+
 fn rerank_gpu_active() -> bool {
-    *RERANK_GPU_ACTIVE.get_or_init(|| {
-        gpu_really_active(
-            cfg!(any(feature = "cuda", feature = "directml")),
-            crate::gpu::status().degraded,
-            crate::gpu::wants_gpu(crate::gpu::Workload::Reranker),
-        )
-    })
+    rerank_gpu_active_in(
+        &RERANK_GPU_ACTIVE,
+        crate::gpu::placement(crate::gpu::Workload::Reranker).is_some(),
+        || {
+            gpu_really_active(
+                cfg!(any(feature = "cuda", feature = "directml")),
+                crate::gpu::status().degraded,
+                crate::gpu::wants_gpu(crate::gpu::Workload::Reranker),
+            )
+        },
+    )
 }
 
 pub fn env_toggle(name: &str) -> Option<bool> {
