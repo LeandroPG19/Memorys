@@ -95,8 +95,12 @@ pub fn env_toggle(name: &str) -> Option<bool> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn completo_turns_capabilities_on_others_leave_them_off() {
+    #[tokio::test]
+    async fn completo_turns_capabilities_on_others_leave_them_off() {
+        // `rerank_gpu_active()` fills a process-wide cell once the reranker has a
+        // placement, and `gpu::placement_tests` write that registry under this guard.
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
         assert!(Mode::Completo.docs_default());
         assert!(!Mode::Local.docs_default());
 
@@ -123,6 +127,32 @@ mod tests {
 
         assert!(Mode::Red.is_cloud());
         assert!(!Mode::Local.is_cloud());
+    }
+
+    #[tokio::test]
+    async fn the_daemon_keeps_no_answer_while_the_reranker_has_no_placement() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        assert!(
+            crate::gpu::placement(crate::gpu::Workload::Reranker).is_none(),
+            "nobody opens the reranker in the lib test binary (`rerank::identity_when_disabled` \
+             fails before `configure`) and every test that writes the placement registry \
+             restores it under this same guard; if this is no longer so, say what opened it"
+        );
+
+        let answer = rerank_gpu_active();
+
+        assert_eq!(
+            RERANK_GPU_ACTIVE.get(),
+            None,
+            "with the registry empty the answer is a prediction that cannot know whether the \
+             GPU provider will refuse; keeping it leaves the rerank on the CPU for good \
+             (60-110s per search) while /health says degraded"
+        );
+        assert!(
+            cfg!(any(feature = "cuda", feature = "directml")) || !answer,
+            "a build without a GPU feature never has the reranker on a card"
+        );
     }
 
     #[test]
