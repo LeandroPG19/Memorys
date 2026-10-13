@@ -66,10 +66,62 @@ if [[ "${1:-}" == "--self-test" ]]; then
     printf '#!/bin/sh\necho v20.0.0\n' >"$t/bin/node"
     printf '{"engines":{"node":">=18"}}\n' >"$t/package.json"
     # cargo fails the one subcommand named in FAIL_AT, and not its --version
-    # probe, so the gate gets past "is cargo-deny installed" to the check.
+    # probe, so the gate gets past "is cargo-deny installed" to the check. Each
+    # call leaves its arguments in $HOME/steps, which is how a row reads the
+    # order of the steps. cargo audit has two ways to fail that the gate has to
+    # tell apart: a database it could not fetch (FAKE_AUDIT_NOFETCH=1, the three
+    # lines cargo-audit 0.22.2 printed with no route to github.com) and an
+    # advisory it found (FAIL_AT=audit).
     printf '%s\n' '#!/bin/sh' \
+      'echo "cargo $*" >>"$HOME/steps"' \
+      'if [ "$1" = audit ] && [ "${FAKE_AUDIT_NOFETCH:-}" = 1 ]; then' \
+      '  echo "error: couldn'"'"'t fetch advisory database: git operation failed: An IO error occurred when talking to the server" >&2' \
+      '  echo "Caused by:" >&2' \
+      '  echo "  -> error sending request for url (https://github.com/RustSec/advisory-db.git/info/refs?service=git-upload-pack)" >&2' \
+      '  exit 1' \
+      'fi' \
+      'if [ "$1" = audit ] && [ "$FAIL_AT" = audit ]; then' \
+      '  echo "stand-in cargo audit: 1 vulnerability found"' \
+      '  exit 1' \
+      'fi' \
       'if [ "$1" = "$FAIL_AT" ] && [ "$2" != "--version" ]; then exit 1; fi' \
       'exit 0' >"$t/bin/cargo"
+    # timeout, as in GNU coreutils, takes the limit and then the command. It leaves
+    # what it was given in $HOME/timeout.args, and FAKE_TIMEOUT_EXPIRES=1 makes
+    # it say what coreutils says when the limit is reached (124) without running
+    # anything, so no row waits 120 s.
+    printf '%s\n' '#!/bin/sh' \
+      'echo "$*" >>"$HOME/timeout.args"' \
+      'if [ "${FAKE_TIMEOUT_EXPIRES:-}" = 1 ]; then exit 124; fi' \
+      'shift' \
+      'exec "$@"' >"$t/bin/timeout"
+    # docker answers the two calls the readiness fallback makes and records them
+    # in $HOME/docker.args. `ps` lists FAKE_DOCKER_NAMES (space separated, one
+    # per line) when its publish= filter names FAKE_DOCKER_PORT, nothing for any
+    # other port, and exits FAKE_DOCKER_PS_EXIT when that is defined. `exec`
+    # answers as a ready Postgres for the names in FAKE_DOCKER_HEALTHY, and as
+    # docker does for a container that is not there for any other.
+    printf '%s\n' '#!/bin/sh' \
+      'echo "$*" >>"$HOME/docker.args"' \
+      'case "$1" in' \
+      '  ps)' \
+      '    [ -z "${FAKE_DOCKER_PS_EXIT+x}" ] || exit "$FAKE_DOCKER_PS_EXIT"' \
+      '    port=' \
+      '    for a in "$@"; do' \
+      '      case "$a" in *publish=*) port="${a#*publish=}" ;; esac' \
+      '    done' \
+      '    if [ -n "$port" ] && [ "$port" = "${FAKE_DOCKER_PORT:-}" ]; then' \
+      '      for n in $FAKE_DOCKER_NAMES; do echo "$n"; done' \
+      '    fi' \
+      '    exit 0 ;;' \
+      '  exec)' \
+      '    for n in ${FAKE_DOCKER_HEALTHY:-}; do' \
+      '      if [ "$n" = "$2" ]; then echo "/var/run/postgresql:5432 - accepting connections"; exit 0; fi' \
+      '    done' \
+      '    echo "Error response from daemon: No such container: $2" >&2' \
+      '    exit 1 ;;' \
+      'esac' \
+      'exit 0' >"$t/bin/docker"
     chmod +x "$t"/scripts/*.sh "$t"/bin/*
     printf '0\n' >"$t/home/.cache/cuba-gate/run.exit"
   }
@@ -82,7 +134,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # and VAR= defines it empty.
   # git's own directory is on the copy's PATH: on Git Bash it is /mingw64/bin,
   # not /usr/bin. It runs with a scratch global config, so nobody's signing or
-  # hooks settings reach the fixture repos.
+  # hooks settings reach the fixture repos. PGPORT is not inherited either: it
+  # is the port libpq falls back to, and the rows of the readiness fallback
+  # that name none have to get the default, not the shell's.
   gitdir="$(dirname "$(command -v git)")"
   export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$tmp/gitconfig"
   : >"$GIT_CONFIG_GLOBAL"
@@ -94,7 +148,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     local name="$1" fail_at="${2:-}"
     shift $(( $# > 1 ? 2 : 1 ))
     rc=0
-    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/$name/home" \
+    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT HOME="$tmp/$name/home" \
         PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" "$@" \
         "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 || rc=$?; } 2>/dev/null
   }
@@ -211,6 +265,122 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ -z "$(receipts_of reddened)" ]] \
     || self_fail "a red gate on $sha left the receipt of an earlier pass on it: $(receipts_of reddened)"
 
+  # The order of the steps, read from $HOME/steps (one line per cargo call, and
+  # one for run-all-tests.sh). cargo audit is the only step that judges RustSec
+  # advisories, and it refreshes the database it reads, so a judge idle for days
+  # used to learn of a new advisory after ~20 min of tests, when 3 s would do. It
+  # runs first, under `timeout 120`; a database it cannot refresh is exit 2 and
+  # says what is missing, and an advisory it finds is exit 1 with cargo-audit's
+  # own lines. Neither lets cargo deny or the tests start. cargo deny is the
+  # next step, still before the tests.
+  tests_step='echo run-all-tests >>"$HOME/steps"'
+  steps_of() { cat "$tmp/$1/home/steps" 2>/dev/null || true; }
+  # step_at NAME PATTERN: the line of $HOME/steps where PATTERN first appears, or nothing.
+  step_at() {
+    local hit
+    hit="$(grep -nm1 -- "$2" "$tmp/$1/home/steps" 2>/dev/null || true)"
+    printf '%s' "${hit%%:*}"
+  }
+  # fail_line_with NAME WORD...: some line of the gate's output starts with FAIL:
+  # and holds every WORD.
+  fail_line_with() {
+    local name="$1" line word ok
+    shift
+    while IFS= read -r line; do
+      ok=1
+      for word in "$@"; do
+        [[ "$line" == *"$word"* ]] || { ok=0; break; }
+      done
+      if (( ok )); then return 0; fi
+    done < <(grep '^FAIL: ' "$tmp/$name.out" | tr -d '\r' || true)
+    return 1
+  }
+  # adv_stopped NAME CODE: the gate stopped with CODE, in its exit file too, and
+  # freed its lock.
+  adv_stopped() {
+    local name="$1" want="$2"
+    (( rc == want )) || self_fail "$name: the gate exited $rc, not $want: $(cat "$tmp/$name.out")"
+    [[ "$(exit_file "$name")" == "$want" ]] \
+      || self_fail "$name: the exit file says '$(exit_file "$name")', not $want"
+    [[ ! -e "$tmp/$name/home/.cache/cuba-gate/lock" ]] || self_fail "$name: the gate left its lock behind"
+  }
+  # adv_never NAME STEP...: no line of $HOME/steps starts with any STEP.
+  adv_never() {
+    local name="$1" step
+    shift
+    for step in "$@"; do
+      if [[ -n "$(step_at "$name" "^$step")" ]]; then
+        self_fail "$name: '$step' ran, and it must not have: $(steps_of "$name")"
+      fi
+    done
+  }
+
+  fake_tree adv_order "$tests_step"
+  run_copy adv_order
+  (( rc == 0 )) || self_fail "adv_order: a gate whose every step passed exited $rc: $(cat "$tmp/adv_order.out")"
+  grep -qxF '120 cargo audit' "$tmp/adv_order/home/timeout.args" 2>/dev/null \
+    || self_fail "adv_order: cargo audit was not run as 'timeout 120 cargo audit' (timeout was given: '$(cat "$tmp/adv_order/home/timeout.args" 2>/dev/null || true)')"
+  audit_at="$(step_at adv_order '^cargo audit$')"
+  deny_at="$(step_at adv_order '^cargo deny check')"
+  tests_at="$(step_at adv_order '^run-all-tests$')"
+  [[ -n "$audit_at" && -n "$deny_at" && -n "$tests_at" ]] \
+    || self_fail "adv_order: a step is missing from the order (audit '$audit_at', deny '$deny_at', tests '$tests_at'): $(steps_of adv_order)"
+  (( audit_at < deny_at && deny_at < tests_at )) \
+    || self_fail "adv_order: the order is not cargo audit, then cargo deny, then the tests: $(steps_of adv_order)"
+
+  # No route to github.com: cargo-audit fails to refresh its database. The gate
+  # does not judge advisories against the copy on disk, and it says which
+  # database and where it lives.
+  fake_tree adv_nofetch "$tests_step"
+  run_copy adv_nofetch "" FAKE_AUDIT_NOFETCH=1
+  adv_stopped adv_nofetch 2
+  [[ "$(steps_of adv_nofetch)" == "cargo audit" ]] \
+    || self_fail "adv_nofetch: cargo was called for more than the audit: $(steps_of adv_nofetch)"
+  fail_line_with adv_nofetch 'advisory database' 'https://github.com/RustSec/advisory-db' \
+    || self_fail "adv_nofetch: no FAIL line names the advisory database and where it is fetched from: $(cat "$tmp/adv_nofetch.out")"
+  if grep -q 'MERGE GATE PASSED' "$tmp/adv_nofetch.out"; then
+    self_fail "adv_nofetch: a gate that could not refresh its advisories passed: $(cat "$tmp/adv_nofetch.out")"
+  fi
+
+  # A refresh that does not end within the ceiling is the same refusal, and it
+  # names the ceiling.
+  fake_tree adv_timeout "$tests_step"
+  run_copy adv_timeout "" FAKE_TIMEOUT_EXPIRES=1
+  adv_stopped adv_timeout 2
+  adv_never adv_timeout 'cargo audit' 'cargo deny' 'run-all-tests'
+  fail_line_with adv_timeout '120 s' 'advisory database' \
+    || self_fail "adv_timeout: no FAIL line names the 120 s ceiling and the advisory database: $(cat "$tmp/adv_timeout.out")"
+
+  # An advisory found is the verdict, not a missing database: exit 1, with what
+  # cargo-audit itself said, and nothing after it.
+  fake_tree adv_found "$tests_step"
+  run_copy adv_found audit
+  adv_stopped adv_found 1
+  grep -q 'stand-in cargo audit: 1 vulnerability found' "$tmp/adv_found.out" \
+    || self_fail "adv_found: the gate did not print the lines of cargo audit: $(cat "$tmp/adv_found.out")"
+  adv_never adv_found 'cargo deny check' 'run-all-tests'
+  if fail_line_with adv_found 'advisory database'; then
+    self_fail "adv_found: an advisory that was found was reported as a database that could not be refreshed: $(cat "$tmp/adv_found.out")"
+  fi
+
+  # cargo deny judges licenses, bans and sources, and it is red before the tests.
+  fake_tree deny_before_tests "$tests_step"
+  run_copy deny_before_tests deny
+  (( rc == 1 )) || self_fail "deny_before_tests: a gate whose cargo deny failed exited $rc, not 1: $(cat "$tmp/deny_before_tests.out")"
+  audit_at="$(step_at deny_before_tests '^cargo audit$')"
+  deny_at="$(step_at deny_before_tests '^cargo deny check')"
+  [[ -n "$audit_at" && -n "$deny_at" ]] && (( audit_at < deny_at )) \
+    || self_fail "deny_before_tests: cargo deny did not come after cargo audit: $(steps_of deny_before_tests)"
+  adv_never deny_before_tests 'run-all-tests'
+
+  # A step after the tests, with the first half past, still writes the whole
+  # gate's verdict, and the file said running while the tests ran.
+  fake_tree after_tests "$reads_while_running; $tests_step"
+  run_copy after_tests clippy
+  adv_stopped after_tests 1
+  grep -q 'run.exit reads: running pid=[0-9]' "$tmp/after_tests.out" \
+    || self_fail "after_tests: while the tests ran, the exit file did not say so: $(grep 'run.exit reads' "$tmp/after_tests.out")"
+
   # The readiness check: libpq reads DATABASE_URL, and the gate says which port
   # it answered on. With WSL2 in mirrored mode the localhost:5488 of Windows is
   # the live corpus of WSL, so a check that asked :5488 whatever the URL said
@@ -232,6 +402,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
     [[ "$(exit_file "$name")" == "$want" ]] \
       || self_fail "$name: the exit file says '$(exit_file "$name")', not $want"
     [[ ! -e "$tmp/$name/home/.cache/cuba-gate/lock" ]] || self_fail "$name: the gate left its lock behind"
+    # The readiness check comes before every step, cargo audit included: a gate
+    # that asks cargo before it knows Postgres is up has the order wrong.
+    if grep -q 'cargo' "$tmp/$name/home/steps" 2>/dev/null; then
+      self_fail "$name: cargo was called before Postgres was known to be ready: $(cat "$tmp/$name/home/steps")"
+    fi
     if grep -q 'S3cr3tW2' "$tmp/$name.out"; then
       self_fail "$name: what the gate printed carries S3cr3tW2: $(cat "$tmp/$name.out")"
     fi
@@ -243,6 +418,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # DATABASE_URL, or `unset` and `empty` for the gate's own default. pg_isready
   # gets exactly -d and that URL, and the line after the banner is the OK for
   # PORT, the one pg_isready's ANSWER names, with nothing printed in between.
+  # The line after the OK is the banner of cargo audit, the first step that
+  # follows the readiness check.
   pg_green() {
     local name="$1" url="$2" answer="$3" port="$4" password="$5" i at=-1
     local default_url='postgresql://cuba:memorys2026@127.0.0.1:5488/brain' want="$2"
@@ -272,8 +449,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
       || self_fail "$name: the line said '${lines[at]}', not the port pg_isready answered on ($port)"
     [[ -z "${lines[at-1]}" && "${lines[at-2]}" == *"a second time."* ]] \
       || self_fail "$name: something was printed between the banner and the OK line: '${lines[at-2]}' / '${lines[at-1]}'"
-    [[ "${lines[at+1]:-}" == "$ran_marker" ]] \
-      || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the first one of the next step"
+    [[ "${lines[at+1]:-}" == "=== cargo audit ===" ]] \
+      || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the banner of cargo audit, the first step after the readiness check"
     if grep -qxF "$answer" "$tmp/$name.out"; then
       self_fail "$name: pg_isready's own answer is a line of the output: $(cat "$tmp/$name.out")"
     fi
@@ -381,6 +558,156 @@ if [[ "${1:-}" == "--self-test" ]]; then
     || self_fail "pg_two_at: pg_isready was asked about a URL with two '@': $(pg_args pg_two_at)"
   pg_refused pg_double_at 'postgresql://gate:S3cr3tW2@@127.0.0.1:5575/brain' '%40' "more than one '@'"
 
+  # Without pg_isready the gate asks docker, and the container is the one that
+  # publishes the port of DATABASE_URL, not one picked by its name: on Windows the
+  # judge's container was memory-industry-dbwin-20261012 on :5489, and a check by
+  # name judged memory-industry-db, a server DATABASE_URL did not name. A host
+  # that is not this machine, or a gate with no docker, cannot be judged this way
+  # and is refused with 2. Each row runs with a PATH of the tree's stand-ins and
+  # of wrappers for every program the system has except pg_isready and docker:
+  # a pg_isready of the machine running this test would turn every row green
+  # (Debian puts one in /usr/bin).
+  mkdir -p "$tmp/sysbin"
+  for d in "$gitdir" /usr/bin /bin; do
+    for f in "$d"/*; do
+      [[ -f "$f" && -x "$f" ]] || continue
+      tool="${f##*/}"
+      tool="${tool%.exe}"
+      case "$tool" in pg_isready* | docker*) continue ;; esac
+      [[ -e "$tmp/sysbin/$tool" ]] && continue
+      printf '#!/bin/sh\nexec "%s" "$@"\n' "$f" >"$tmp/sysbin/$tool"
+    done
+  done
+  chmod +x "$tmp"/sysbin/*
+  ran_body="echo run-all-tests >>\"\$HOME/steps\"; echo \"$ran_marker\""
+  # dk_prepare NAME: the tree, with no pg_isready, and a check that the PATH of
+  # the row finds none and still finds git.
+  dk_prepare() {
+    local name="$1" probe="$tmp/$1/bin:$tmp/sysbin"
+    fake_tree "$name" "$ran_body"
+    rm -f "$tmp/$name/bin/pg_isready"
+    if (PATH="$probe"; command -v pg_isready >/dev/null 2>&1); then
+      self_fail "the fixture cannot hide pg_isready: $name finds one on $probe"
+    fi
+    (PATH="$probe"; command -v git >/dev/null 2>&1) \
+      || self_fail "the fixture hides git: $name finds none on $probe"
+  }
+  # dk_go NAME URL [VAR=value ...]: the gate with that DATABASE_URL.
+  dk_go() {
+    local name="$1" url="$2"
+    shift 2
+    if [[ ! -e "$tmp/$name/bin/docker" ]] && (PATH="$tmp/$name/bin:$tmp/sysbin"; command -v docker >/dev/null 2>&1); then
+      self_fail "the fixture cannot hide docker: $name finds one"
+    fi
+    run_copy "$name" "" PATH="$tmp/$name/bin:$tmp/sysbin" DATABASE_URL="$url" "$@"
+  }
+  docker_args() { cat "$tmp/$1/home/docker.args" 2>/dev/null || true; }
+  # dk_green NAME URL PORT CONTAINER [PASSWORD] [VAR=value ...]: the gate asked
+  # docker which container publishes PORT, ran pg_isready in that one (and in none
+  # picked by name), said which it was, and went on to cargo audit.
+  dk_green() {
+    local name="$1" url="$2" port="$3" container="$4" password="$5" i at=-1 asked
+    local -a lines
+    shift 5
+    dk_prepare "$name"
+    dk_go "$name" "$url" FAKE_DOCKER_PORT="$port" FAKE_DOCKER_NAMES="$container" \
+      FAKE_DOCKER_HEALTHY="$container" "$@"
+    (( rc == 0 )) || self_fail "$name: a gate whose container for :$port was ready exited $rc: $(cat "$tmp/$name.out")"
+    asked="$(docker_args "$name")"
+    grep -Eq "^ps .*publish=$port( |\$)" <<<"$asked" \
+      || self_fail "$name: docker ps was not asked for the container that publishes $port: $asked"
+    grep -q "^exec $container pg_isready" <<<"$asked" \
+      || self_fail "$name: pg_isready was not run in $container: $asked"
+    if grep -Eq '^exec (memory-industry-db|cuba-memorys-db)( |$)' <<<"$asked"; then
+      self_fail "$name: a container was picked by its name: $asked"
+    fi
+    mapfile -t lines < <(tr -d '\r' <"$tmp/$name.out")
+    for i in "${!lines[@]}"; do
+      if [[ "${lines[i]}" == "OK  Postgres"* ]]; then
+        at=$i
+        break
+      fi
+    done
+    (( at >= 0 )) || self_fail "$name: no 'OK  Postgres' line: $(cat "$tmp/$name.out")"
+    [[ "${lines[at]}" == "OK  Postgres :$port (container $container)" ]] \
+      || self_fail "$name: the line said '${lines[at]}', not the port and the container that answered"
+    [[ "${lines[at+1]:-}" == "=== cargo audit ===" ]] \
+      || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the banner of cargo audit"
+    if [[ -n "$password" ]] && grep -qF "$password" "$tmp/$name.out"; then
+      self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
+    fi
+  }
+  # dk_refused NAME CODE PASSWORD WORD...: the gate stopped with CODE (pg_stopped),
+  # asked docker no `exec`, and a FAIL line holds every WORD.
+  dk_refused() {
+    local name="$1" want="$2" password="$3"
+    shift 3
+    pg_stopped "$name" "$want" "$password"
+    if grep -q '^exec ' <<<"$(docker_args "$name")"; then
+      self_fail "$name: the gate ran something in a container it should not have judged: $(docker_args "$name")"
+    fi
+    fail_line_with "$name" "$@" \
+      || self_fail "$name: no FAIL line holds all of: $* : $(cat "$tmp/$name.out")"
+  }
+
+  # The container is picked by the port, whatever it is called.
+  dk_green dk_port 'postgresql://gate:pw0@127.0.0.1:5489/brain' 5489 memory-industry-dbwin-20261012 pw0
+  # The port is read the way libpq reads it.
+  dk_green dk_ipv6 'postgresql://gate:pw0@[::1]:5434/brain' 5434 c6 pw0
+  dk_green dk_default_port 'postgresql://gate:pw0@localhost/brain' 5432 c4 pw0
+  dk_green dk_pgport 'postgresql://gate:pw0@localhost/brain' 5433 c5 pw0 PGPORT=5433
+
+  # The name the gate used to trust, ready, on another port: nothing publishes
+  # :5489, so the gate says that and asks no container.
+  dk_prepare dk_name_trap
+  dk_go dk_name_trap 'postgresql://gate:pw0@127.0.0.1:5489/brain' FAKE_DOCKER_PORT=5488 \
+    FAKE_DOCKER_NAMES=memory-industry-db FAKE_DOCKER_HEALTHY="memory-industry-db cuba-memorys-db"
+  pg_stopped dk_name_trap 1 pw0
+  grep -qF 'no running container publishes :5489' "$tmp/dk_name_trap.out" \
+    || self_fail "dk_name_trap: the gate did not say that no running container publishes :5489: $(cat "$tmp/dk_name_trap.out")"
+  if grep -q '^exec ' <<<"$(docker_args dk_name_trap)"; then
+    self_fail "dk_name_trap: a container was asked by its name: $(docker_args dk_name_trap)"
+  fi
+
+  # Two containers publish the port: the gate does not choose, it names both.
+  dk_prepare dk_two
+  dk_go dk_two 'postgresql://gate:pw0@127.0.0.1:5489/brain' FAKE_DOCKER_PORT=5489 \
+    FAKE_DOCKER_NAMES="pgone pgtwo" FAKE_DOCKER_HEALTHY="pgone pgtwo"
+  dk_refused dk_two 2 pw0 pgone pgtwo
+
+  # The one container is there and its Postgres does not answer.
+  dk_prepare dk_not_ready
+  dk_go dk_not_ready 'postgresql://gate:pw0@127.0.0.1:5489/brain' FAKE_DOCKER_PORT=5489 \
+    FAKE_DOCKER_NAMES=pgdown FAKE_DOCKER_HEALTHY=
+  pg_stopped dk_not_ready 1 pw0
+  fail_line_with dk_not_ready ':5489' pgdown \
+    || self_fail "dk_not_ready: no FAIL line names :5489 and the container: $(cat "$tmp/dk_not_ready.out")"
+
+  # A server that is not this machine, or a socket, is no container's to judge:
+  # pg_isready is needed, and docker is not even asked.
+  dk_prepare dk_remote
+  dk_go dk_remote 'postgresql://gate:pw0@db.example.invalid:5489/brain'
+  dk_refused dk_remote 2 pw0 pg_isready
+  [[ ! -e "$tmp/dk_remote/home/docker.args" ]] \
+    || self_fail "dk_remote: docker was asked about a server that is not this machine: $(docker_args dk_remote)"
+  dk_prepare dk_socket
+  dk_go dk_socket 'postgresql://gate@%2Frun%2Fpostgresql:5433/brain'
+  dk_refused dk_socket 2 '' pg_isready
+  [[ ! -e "$tmp/dk_socket/home/docker.args" ]] \
+    || self_fail "dk_socket: docker was asked about a socket: $(docker_args dk_socket)"
+
+  # No pg_isready and no docker: the refusal names both.
+  dk_prepare dk_no_docker
+  rm -f "$tmp/dk_no_docker/bin/docker"
+  dk_go dk_no_docker 'postgresql://gate:pw0@127.0.0.1:5489/brain'
+  dk_refused dk_no_docker 2 pw0 pg_isready docker
+
+  # docker is there and does not answer: that is not "no container".
+  dk_prepare dk_daemon_down
+  dk_go dk_daemon_down 'postgresql://gate:pw0@127.0.0.1:5489/brain' FAKE_DOCKER_PS_EXIT=1 \
+    FAKE_DOCKER_PORT=5489 FAKE_DOCKER_NAMES=pgone FAKE_DOCKER_HEALTHY=pgone
+  dk_refused dk_daemon_down 2 pw0 docker
+
   # gate_linux_env (gate-lock.sh): what a gate run on Linux hands to cargo, to the
   # mutation tool and to node. Each row runs it in a fresh bash with an empty
   # environment but HOME and a PATH of stand-ins, so every answer comes from the
@@ -486,6 +813,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "    wrote about the URL, and refuses with 2, before asking, a URL that"
   echo "    brain_gate cannot be derived from"
   echo "    or that holds more than one '@' before the host."
+  echo "    cargo audit runs first, before cargo deny and before the tests, under timeout 120;"
+  echo "    a database it cannot refresh is exit 2, never a skip; without pg_isready the"
+  echo "    readiness check asks the container that publishes the port of DATABASE_URL, never one by name."
   exit 0
 fi
 

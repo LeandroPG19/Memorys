@@ -275,6 +275,10 @@ fn gate_psql_puts_options_before_the_url() {
     }
 }
 
+/// Only the scripts that back up and restore the live corpus name its container.
+/// `merge-gate.sh` left the list: without `pg_isready` it asks the container that
+/// publishes the port of `DATABASE_URL`, whatever that container is called, and
+/// a name would judge a server `DATABASE_URL` does not name.
 #[test]
 fn backup_scripts_name_the_compose_container() {
     let compose = read("docker-compose.yml");
@@ -282,11 +286,7 @@ fn backup_scripts_name_the_compose_container() {
         compose.contains("container_name: memory-industry-db"),
         "docker-compose.yml is the source of the live-cluster name"
     );
-    for rel in [
-        "scripts/backup-db.sh",
-        "scripts/restore-db.sh",
-        "scripts/merge-gate.sh",
-    ] {
+    for rel in ["scripts/backup-db.sh", "scripts/restore-db.sh"] {
         let s = read(rel);
         assert!(
             s.contains("memory-industry-db"),
@@ -1423,6 +1423,20 @@ fn the_exit_file_holds_the_whole_gates_verdict_and_says_running_until_then() {
         "the self-test passed without its rows for the readiness check, so nothing shows that \
          the gate asks libpq about the DATABASE_URL it was given and not about :5488. stdout: \
          {stdout}"
+    );
+    // The sentences of the rows for the order of the advisory check and for the
+    // readiness fallback, in the same way.
+    assert!(
+        stdout.contains("cargo audit runs first"),
+        "the self-test passed without its rows for the order of the steps, so nothing shows \
+         that cargo audit judges the RustSec advisories before cargo deny and before the \
+         tests, under a ceiling. stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("the container that publishes the port of DATABASE_URL"),
+        "the self-test passed without its rows for the readiness fallback, so nothing shows \
+         that, without pg_isready, the gate asks the container that publishes the port of \
+         DATABASE_URL and not one picked by its name. stdout: {stdout}"
     );
 }
 

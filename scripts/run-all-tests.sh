@@ -321,7 +321,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '#!/bin/sh\nexit 1\n' >"$tmp/bin/psql"
   # merge-gate.sh asks for a node as new as package.json says before its first step.
   printf '#!/bin/sh\necho v20.0.0\n' >"$tmp/bin/node"
+  # merge-gate.sh runs cargo audit and cargo deny before this script, so those
+  # two pass here and the first cargo that fails is still this script's own.
   printf '%s\n' '#!/bin/sh' \
+    'case "$1" in audit|deny) exit 0;; esac' \
     'if [ -n "$CUBA_GATE_LOCK_OWNER" ] && [ "$(cat "$HOME/.cache/cuba-gate/lock/owner" 2>/dev/null)" = "$CUBA_GATE_LOCK_OWNER" ]; then' \
     '  echo "stand-in cargo: the lock is still the one merge-gate took"' \
     'fi' \
@@ -375,6 +378,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '0\n' >"$tmp/home4/.cache/cuba-gate/run.exit"
   cp "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin/node" "$tmp/bin4/"
   printf '%s\n' '#!/bin/sh' \
+    'case "$1" in audit|deny) exit 0;; esac' \
     'echo "$PPID" >"$HOME/child.pid"' \
     'kill -9 "$(printf "%s\n" "$CUBA_GATE_LOCK_OWNER" | sed -n "s/^pid=\([0-9]*\) .*/\1/p")"' \
     'exit 1' >"$tmp/bin4/cargo"
