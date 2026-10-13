@@ -135,15 +135,16 @@ fn gpu_availability() -> (bool, bool) {
 
 /// The one door a session opens through: configures the builder and hands it to
 /// `commit`, which is the `commit_from_file` that makes the session exist.
-/// The registry belongs here, once `commit` has an answer, because `configure`
-/// cannot know whether the commit will work. For now `configure` still writes
-/// it before the commit; K3 moves that write here.
+/// The registry is written here, once `commit` has an answer, because
+/// `configure` cannot know whether the commit will work: a refusal recorded
+/// for a session that never opened would turn `gpu.degraded` true over nothing.
 pub fn open<F, C, T>(make_builder: F, workload: Workload, commit: C) -> Result<T>
 where
     F: Fn() -> Result<SessionBuilder>,
     C: FnOnce(SessionBuilder) -> Result<T>,
 {
-    commit(configure(make_builder, workload)?)
+    let (builder, placement) = configure(make_builder, workload)?;
+    record_if_built(workload, placement, commit(builder))
 }
 
 /// Takes a factory rather than a builder: when the GPU provider refuses to
@@ -155,7 +156,10 @@ where
 /// `locate_onnxruntime` found. Left to `ort`, whichever model opened first
 /// decided: the reranker, which never searched, got the bare
 /// `onnxruntime.dll` — on Windows the Windows ML 1.17 in System32.
-pub fn configure<F>(make_builder: F, workload: Workload) -> Result<SessionBuilder>
+///
+/// Returns where the session is going to open next to the builder and writes
+/// nothing: `open` records it once the commit has worked.
+fn configure<F>(make_builder: F, workload: Workload) -> Result<(SessionBuilder, Placement)>
 where
     F: Fn() -> Result<SessionBuilder>,
 {
@@ -171,13 +175,13 @@ where
         #[cfg(feature = "cuda")]
         cuda_provider(),
         #[cfg(feature = "directml")]
-        ort::ep::DirectML::default().build(),
+        directml_provider(),
     ]
     .into_iter()
     .collect();
 
     if providers.is_empty() {
-        return record_if_built(workload, Placement::Cpu, configure_cpu(builder, workload));
+        return configure_cpu(builder, workload).map(|b| (b, Placement::Cpu));
     }
 
     match builder.with_execution_providers(providers) {
@@ -186,8 +190,7 @@ where
             // first, so a log could claim the session was on the GPU while ONNX
             // Runtime had quietly fallen back to the CPU underneath it.
             tracing::info!(model = workload.label(), "sesión ONNX en GPU");
-            record(workload, Placement::Gpu);
-            Ok(configured)
+            Ok((configured, Placement::Gpu))
         }
         // The card and the provider libraries are both there and the provider
         // still would not start: the CUDA runtime itself is unusable here,
@@ -204,11 +207,8 @@ where
                 error = %e,
                 "el provider GPU no inicializó pese a haber tarjeta y librerías: esta sesión corre en CPU. Revisá que las DLL/so de CUDA estén en PATH/LD_LIBRARY_PATH junto al runtime de ONNX"
             );
-            record_if_built(
-                workload,
-                Placement::CpuAfterProviderFailed(e.to_string()),
-                configure_cpu(make_builder()?, workload),
-            )
+            configure_cpu(make_builder()?, workload)
+                .map(|b| (b, Placement::CpuAfterProviderFailed(e.to_string())))
         }
     }
 }
@@ -229,7 +229,7 @@ fn fall_back_to_cpu(
     builder: SessionBuilder,
     workload: Workload,
     reason: CpuReason,
-) -> Result<SessionBuilder> {
+) -> Result<(SessionBuilder, Placement)> {
     if worth_warning(reason) {
         tracing::warn!(
             model = workload.label(),
@@ -237,12 +237,13 @@ fn fall_back_to_cpu(
             "se pidió GPU para este modelo y no está disponible — sigue en CPU"
         );
     }
-    record_if_built(workload, Placement::Cpu, configure_cpu(builder, workload))
+    configure_cpu(builder, workload).map(|b| (b, Placement::Cpu))
 }
 
-/// Annotates the placement only once the builder was configured: a builder that
-/// could not be configured is not a session that opened, and must not leave a
-/// `Cpu` behind for `/health` to report.
+/// Annotates the placement only once the session was committed: a builder that
+/// could not become a session did not open, and must not leave a placement
+/// behind for `/health` to report. A failed commit changes nothing, so the slot
+/// stays as it was.
 fn record_if_built<T>(workload: Workload, placement: Placement, built: Result<T>) -> Result<T> {
     built.inspect(|_| record(workload, placement))
 }
@@ -287,6 +288,21 @@ fn cuda_provider() -> ort::ep::ExecutionProviderDispatch {
         // both present, so a registration that still fails is a broken
         // configuration somebody has to see.
         .error_on_failure()
+}
+
+/// DirectML asks to fail loudly only when it is the provider that decides.
+/// With `cuda` in the build it registers behind a CUDA that already opened, so
+/// a machine without `DirectML.dll` must keep its GPU session through CUDA
+/// instead of turning into a refusal; without `cuda` nothing stands behind it
+/// and a registration ORT swallows is a CPU session that reports as GPU.
+#[cfg(feature = "directml")]
+fn directml_provider() -> ort::ep::ExecutionProviderDispatch {
+    let directml = ort::ep::DirectML::default().build();
+    if cfg!(feature = "cuda") {
+        directml
+    } else {
+        directml.error_on_failure()
+    }
 }
 
 pub struct GpuStatus {
