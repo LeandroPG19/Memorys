@@ -5,6 +5,36 @@ All notable changes to MemoryIndustry (formerly cuba-memorys) are documented her
 [SemVer](https://semver.org/) for the Rust crate (`Cargo.toml`). PyPI
 versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI 1.28.0).
 
+## [0.30.0] — unreleased (Cargo `0.30.0` · npm `0.30.0` · PyPI `1.32.0`)
+
+What 0.29.0 shipped knowing about and judged not blocking, closed: everything here is a defect found by the 0.29
+reviews or by the first Windows and Linux runs, none needs a real host.
+
+### Behaviour changes — read before deploying
+
+- **`/health` never shows a model `loaded` without the device it opened on, nor `loaded` on a model that failed.** `reranker_state` and `nli_state` read the model's cell, then its failure, then its placement, in that order: `gpu::open` publishes the placement inside the cell's initialisation, so a resolved cell already has it. Read the other way round, a poll that crossed the load saw `loaded` with `device: null`, or `loaded` over a failure. (K3b)
+- **The GPU placement registry is written once the session is committed.** `gpu::open` configures, commits and only then records; `configure` is private and writes nothing, so a commit that fails leaves the slot as it was instead of a placement for a session that never existed. A build with DirectML and no CUDA registers DirectML with `error_on_failure`, so a provider ORT would degrade in silence is no longer recorded as `gpu`; the Windows release (`cuda,directml`) is unchanged. (K3a)
+- **The rerank default no longer freezes on an empty registry.** With `CUBA_WARM_RERANKER=0`, or a search during the warm-up, `mode.rs` cached «the GPU is not degraded» before the reranker had a placement, and a reranker that later opened on the CPU kept `rerank_default() == true` (60–110 s a search) while `/health` said degraded. The answer is kept only once the reranker has a placement; the default eager warm-up keeps it at the same moment as before. One search, the one that opens the reranker, still judges without a registry (declared, see the 0.30 backlog). (K2)
+- **`doctor` no longer copies the saved `llm.env` into the process environment.** `doctor_line` called `load_saved_config_into_env`, which `main` already does for every binary; inside the daemon (`admin/status`, `admin/problems`) it was a `set_var` with the workers alive. `run_checks_with` takes the `CommandRunner` it must use (`run_checks` and `run_cli` pass the real one), so a test no longer asks the real `schtasks`. (T1)
+
+### Fixed
+
+- **A model reply with a `}` before its first `{` no longer panics the judge or the dedupe check.** `loose_json` and `parse_same_entity` sliced `&s[find('{')..=rfind('}')]` backwards on `"} x {"`. One shared `outer_braces` answers `None` there; `extract_json_object` uses it too. An `is_error` reply from the CLI is still read as no answer, but its cause is now logged, redacted, at `warn`. (K1)
+- **The tests that read the developer's machine run in a world of their own.** `g16` (`v029_accounts_over_real_http`, four tests) and `v032_reranker_says_why_its_off` read the real `.env`, asked the real `schtasks` and fetched the real daemon's `/health`, and passed only because they asserted so little; they now build their home, their `LOCALAPPDATA` and their listener (`tests/doctor_world`), and a hostile environment (`CUBA_HTTP_ADDR=lan:9`, an LLM URL on `192.0.2.10`, a graph on `192.0.2.10`) neither moves them nor slows them (the four `g16` tests took 2.7 s under it). The W9 test only takes the new command runner. (T1)
+
+### Gate
+
+- **The advisories are judged first, with a ceiling.** `merge-gate.sh` runs readiness, then `timeout 120 cargo audit`, then `cargo deny`, then the backup and the 20-minute test run: a stale advisory database now fails in seconds, not twenty minutes in. Exit 2 when the database could not be fetched or the 120 s ran out (never `--no-fetch` or `--stale`), exit 1 for an advisory. Measured on 2026-10-13: `cargo audit` takes 2.4 s with the database current, 11.6 s from a cold clone, 20.2 s against a host that does not answer. The 0.29 backlog said `deny` and `audit` share the database; they do not (`deny` here checks `licenses bans sources` and keeps its own clone), so `audit` is the only judge of advisories. (G2)
+- **Without `pg_isready` the Postgres container is the one that publishes the port of `DATABASE_URL`**, not the one found by name (IPv6, `PGPORT` and the default 5432 included; a remote host or a socket is exit 2). The Windows judge's container was `memory-industry-dbwin-20261012` on `:5489`. (G2)
+- **The lizard baseline is keyed by function name, not by start line, and its ratchet is exact in both directions.** `path::function#n` (n is the ordinal among the functions of that name in the file): a function that only moved is not red, one whose complexity changed is, up or down. Before, three functions went down unnoticed (`nli init` 16→15, `init_onnx_session` 14→13, `init_session` 13→12), and `which_in_path` (CC 18) had left the measurement altogether because a raw string `r#"…\"…"#` made lizard's Rust reader close a test where it does not. (G1, mejorador)
+
+- **The mutation step no longer fills the disk halfway.** On 2026-10-13 the Windows judge ran out of disk in the middle of `cargo mutants` (`os error 112`, «the machine stopped 42 of 49 unviable builds»). Measured the same day: with cargo-mutants 27.1.0 the copy does not apply `.gitignore` here (`git_ignore: false` with or without `--gitignore=false`), so each copy carried 25.8 GB of foreign `target-*` directories left inside `rust/` by manual runs, plus its own 14.1 GB build. Now: the step refuses a cargo target inside `rust/` other than `target` (`CACHEDIR.TAG`), plans its jobs by free disk as well as RAM (12 GB a copy, reserve `CUBA_GATE_MIN_FREE_GB`, 8 by default) and fails before copying anything when not one fits, keeps its scratch in its own directory and sweeps only what is provably its own after 6 h, builds with `CARGO_PROFILE_DEV_DEBUG=0` (−37 % a copy, the `.pdb` were 54 % of it), and reads `os error 112/28` as a build the machine stopped, never as an unviable mutant. (G3)
+
+### Not verified
+
+- The disk numbers of G3 are Windows numbers; Linux was not measured and uses them.
+- The real-card case of K3a (a CUDA provider that refuses and then a commit that fails) and the DirectML-only build: no test in the gate has such a card or build; the structural tests and `clippy --features directml` / `cuda,directml` cover what a machine without it can.
+
 ## [0.29.0] — 2026-10-12 (Cargo `0.29.0` · npm `0.29.0` · PyPI `1.31.0`)
 
 A LAN install that comes back after the host reboots, with accounts and a local bridge.
