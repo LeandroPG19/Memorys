@@ -5809,6 +5809,150 @@ OUT: no hay model.onnx ni model_quantized.onnx en <R>
         }
     }
 
+    /// What a model's load can leave behind, and the row a poll that starts
+    /// after it has to serve.
+    struct LoadOutcome {
+        name: &'static str,
+        failure: Option<String>,
+        placement: Option<crate::gpu::Placement>,
+        state: &'static str,
+        device: Option<&'static str>,
+    }
+
+    fn load_outcomes() -> [LoadOutcome; 5] {
+        [
+            LoadOutcome {
+                name: "Loaded+Gpu",
+                failure: None,
+                placement: Some(crate::gpu::Placement::Gpu),
+                state: "loaded",
+                device: Some("gpu"),
+            },
+            LoadOutcome {
+                name: "Loaded+Cpu",
+                failure: None,
+                placement: Some(crate::gpu::Placement::Cpu),
+                state: "loaded",
+                device: Some("cpu"),
+            },
+            LoadOutcome {
+                name: "Loaded+CpuAfterProviderFailed",
+                failure: None,
+                placement: Some(crate::gpu::Placement::CpuAfterProviderFailed(
+                    "refusal k3".to_string(),
+                )),
+                state: "loaded",
+                device: Some("cpu"),
+            },
+            LoadOutcome {
+                name: "Failed, the commit refused",
+                failure: Some("load model: k3".to_string()),
+                placement: None,
+                state: "failed",
+                device: None,
+            },
+            LoadOutcome {
+                name: "Failed, the tokenizer after the commit",
+                failure: Some("tokenizer.json missing k3".to_string()),
+                placement: Some(crate::gpu::Placement::Cpu),
+                state: "failed",
+                device: None,
+            },
+        ]
+    }
+
+    /// A world that flips at an exact read: read number `flip`, counting from 0,
+    /// is the first one to see the resolved world.
+    struct FlippingWorld {
+        reads: std::cell::Cell<usize>,
+        flip: usize,
+    }
+
+    impl FlippingWorld {
+        fn resolved(&self) -> bool {
+            let k = self.reads.get();
+            self.reads.set(k + 1);
+            k >= self.flip
+        }
+
+        fn seen<T: Clone>(&self, in_the_resolved_world: &Option<T>) -> Option<T> {
+            if self.resolved() {
+                in_the_resolved_world.clone()
+            } else {
+                None
+            }
+        }
+    }
+
+    /// The reranker's and the NLI's rows from a poll whose reads cross the load
+    /// at `flip`.
+    fn rows_of_a_poll_that_crosses_the_load(
+        outcome: &LoadOutcome,
+        flip: usize,
+    ) -> [(&'static str, ModelState); 2] {
+        let world = FlippingWorld {
+            reads: std::cell::Cell::new(0),
+            flip,
+        };
+        let (resolved, failure, placement) = read_cell_first(
+            || world.resolved(),
+            || world.seen(&outcome.failure),
+            || world.seen(&outcome.placement),
+        );
+        assert_eq!(
+            world.reads.get(),
+            3,
+            "{}, flip={flip}: read_cell_first has to read the resolved flag, the failure \
+             and the placement, once each",
+            outcome.name
+        );
+        [
+            (
+                "reranker",
+                reranker_state_from(failure.clone(), placement.as_ref(), true, true, resolved),
+            ),
+            (
+                "nli",
+                nli_state_from(failure, placement.as_ref(), false, true, resolved),
+            ),
+        ]
+    }
+
+    fn assert_the_row_was_true_at_some_instant(
+        model: &str,
+        row: &ModelState,
+        outcome: &LoadOutcome,
+        flip: usize,
+    ) {
+        let at = format!("{model}, {}, flip={flip}: {row:?}", outcome.name);
+        if row.state == "loaded" {
+            assert!(
+                row.device.is_some(),
+                "a loaded model with no device is a poll that read the registry \
+                 before the load wrote it and the cell after it resolved: {at}"
+            );
+        }
+        if outcome.state == "failed" {
+            assert_ne!(
+                row.state, "loaded",
+                "a model that failed to open was reported as loaded: {at}"
+            );
+        }
+        assert!(
+            row.state == "configured" || row.state == outcome.state,
+            "the row is neither the one before the load nor the one the load \
+             produced: {at}"
+        );
+        if flip == 0 {
+            assert_eq!(
+                (row.state, row.device),
+                (outcome.state, outcome.device),
+                "a poll that starts after the load has to say exactly what the \
+                 load did: {at}"
+            );
+        }
+    }
+
     /// A poll that is already running when a model's cell resolves reads the
     /// cell and the registry at two different instants. The world is made to
     /// flip at an exact read, so every position the load can land in is tried
@@ -5822,130 +5966,10 @@ OUT: no hay model.onnx ni model_quantized.onnx en <R>
     /// model that failed.
     #[test]
     fn a_poll_that_crosses_the_load_never_shows_a_loaded_model_without_its_device() {
-        struct Outcome {
-            name: &'static str,
-            failure: Option<String>,
-            placement: Option<crate::gpu::Placement>,
-            state: &'static str,
-            device: Option<&'static str>,
-        }
-        let outcomes = [
-            Outcome {
-                name: "Loaded+Gpu",
-                failure: None,
-                placement: Some(crate::gpu::Placement::Gpu),
-                state: "loaded",
-                device: Some("gpu"),
-            },
-            Outcome {
-                name: "Loaded+Cpu",
-                failure: None,
-                placement: Some(crate::gpu::Placement::Cpu),
-                state: "loaded",
-                device: Some("cpu"),
-            },
-            Outcome {
-                name: "Loaded+CpuAfterProviderFailed",
-                failure: None,
-                placement: Some(crate::gpu::Placement::CpuAfterProviderFailed(
-                    "refusal k3".to_string(),
-                )),
-                state: "loaded",
-                device: Some("cpu"),
-            },
-            Outcome {
-                name: "Failed, the commit refused",
-                failure: Some("load model: k3".to_string()),
-                placement: None,
-                state: "failed",
-                device: None,
-            },
-            Outcome {
-                name: "Failed, the tokenizer after the commit",
-                failure: Some("tokenizer.json missing k3".to_string()),
-                placement: Some(crate::gpu::Placement::Cpu),
-                state: "failed",
-                device: None,
-            },
-        ];
-
-        for outcome in &outcomes {
+        for outcome in &load_outcomes() {
             for flip in 0..=3usize {
-                let reads = std::cell::Cell::new(0usize);
-                let sees_resolved_world = || {
-                    let k = reads.get();
-                    reads.set(k + 1);
-                    k >= flip
-                };
-                let (resolved, failure, placement) = read_cell_first(
-                    sees_resolved_world,
-                    || {
-                        if sees_resolved_world() {
-                            outcome.failure.clone()
-                        } else {
-                            None
-                        }
-                    },
-                    || {
-                        if sees_resolved_world() {
-                            outcome.placement.clone()
-                        } else {
-                            None
-                        }
-                    },
-                );
-                assert_eq!(
-                    reads.get(),
-                    3,
-                    "{}, flip={flip}: read_cell_first has to read the resolved flag, the failure \
-                     and the placement, once each",
-                    outcome.name
-                );
-
-                let rows = [
-                    (
-                        "reranker",
-                        reranker_state_from(
-                            failure.clone(),
-                            placement.as_ref(),
-                            true,
-                            true,
-                            resolved,
-                        ),
-                    ),
-                    (
-                        "nli",
-                        nli_state_from(failure, placement.as_ref(), false, true, resolved),
-                    ),
-                ];
-                for (model, row) in rows {
-                    let at = format!("{model}, {}, flip={flip}: {row:?}", outcome.name);
-                    if row.state == "loaded" {
-                        assert!(
-                            row.device.is_some(),
-                            "a loaded model with no device is a poll that read the registry \
-                             before the load wrote it and the cell after it resolved: {at}"
-                        );
-                    }
-                    if outcome.state == "failed" {
-                        assert_ne!(
-                            row.state, "loaded",
-                            "a model that failed to open was reported as loaded: {at}"
-                        );
-                    }
-                    assert!(
-                        row.state == "configured" || row.state == outcome.state,
-                        "the row is neither the one before the load nor the one the load \
-                         produced: {at}"
-                    );
-                    if flip == 0 {
-                        assert_eq!(
-                            (row.state, row.device),
-                            (outcome.state, outcome.device),
-                            "a poll that starts after the load has to say exactly what the \
-                             load did: {at}"
-                        );
-                    }
+                for (model, row) in rows_of_a_poll_that_crosses_the_load(outcome, flip) {
+                    assert_the_row_was_true_at_some_instant(model, &row, outcome, flip);
                 }
             }
         }

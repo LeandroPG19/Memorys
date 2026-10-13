@@ -1347,7 +1347,9 @@ mod parse_tests {
 
     #[test]
     fn a_reply_that_is_not_an_error_logs_no_warning() {
-        let success = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":5488,"result":"```json\n{\"verdict\": \"supports\", \"confidence\": 0.9}\n```","session_id":"f9ded9ef"}"#;
+        // Not r#"…"#: lizard's Rust reader pairs the quotes of a raw string with
+        // backslash-escaped quotes wrongly and swallows the code that follows.
+        let success = "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"duration_ms\":5488,\"result\":\"```json\\n{\\\"verdict\\\": \\\"supports\\\", \\\"confidence\\\": 0.9}\\n```\",\"session_id\":\"f9ded9ef\"}";
         let bare_facts = r#"[{"entity_name":"X","content":"did Y","observation_type":"decision"}]"#;
         let max_turns_without_text = events(&[
             r#"{"type":"result","subtype":"error_max_turns","is_error":false,"num_turns":3}"#
