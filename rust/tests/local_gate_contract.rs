@@ -2088,7 +2088,7 @@ fn sets_up_the_linux_environment_before(script: &str, first_step: &str) -> bool 
 
 /// What each entry point of the gate does first, as the text of that line.
 const GATE_ENTRY_POINTS: [(&str, &str); 4] = [
-    ("scripts/merge-gate.sh", r#"command -v pg_isready"#),
+    ("scripts/merge-gate.sh", r#"if command -v pg_isready"#),
     (
         "scripts/quality-gate.sh",
         r#"echo "=== exclusions of the mutation step"#,
