@@ -1140,7 +1140,7 @@ function Resolve-Ip {
 # Humo: prueba de 2 minutos, de SOLO LECTURA, antes de instalar nada
 # ===========================================================================
 
-$script:VersionEsperada = 'memory-industry 0.29.0'
+$script:VersionEsperada = 'memory-industry 0.30.0'
 # Ensayo: una base que no existe, a proposito. `serve` arranca degradado y no toca
 # Docker ni ninguna base real del equipo.
 $script:UrlEnsayo = 'postgresql://ensayo:ensayo@127.0.0.1:1/brain'
