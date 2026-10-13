@@ -1201,6 +1201,161 @@ mod parse_tests {
             "last event of an array with is_error true"
         );
     }
+
+    /// What `f` returned, and what it logged at WARN or above on this thread.
+    ///
+    /// A local copy of `protocol.rs::tests::warnings_while`, which is private to
+    /// that module. The subscriber is the thread's default, not the global one,
+    /// so a test running beside this one can neither write into the capture nor
+    /// see it. Two copies are one too many: the place to unify them is
+    /// `crate::envs`, next to `ScopedEnv` and `scratch_root`.
+    fn warnings_while<T>(f: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let answer = tracing::subscriber::with_default(subscriber, f);
+        let logged = String::from_utf8_lossy(&capture.0.lock().expect("capture lock")).into_owned();
+        (answer, logged)
+    }
+
+    // A panic here is the red: no `should_panic`, no `catch_unwind`. The cut from the
+    // first `{` to the last `}` sliced `&s[start..=end]` with `end < start`.
+    #[test]
+    fn a_closing_brace_before_the_first_opening_one_is_unknown_not_a_panic() {
+        let rows: [(&str, String); 6] = [
+            ("closing then opening, spaced", "} x {".to_string()),
+            ("closing then opening, adjacent", "}{".to_string()),
+            ("two closing then one opening", "}}{".to_string()),
+            (
+                "prose with the braces the wrong way round",
+                "fin } y luego { sin cerrar".to_string(),
+            ),
+            (
+                "inside a single CLI envelope",
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"} x {"}"#
+                    .to_string(),
+            ),
+            (
+                "inside the last result event of a verbose array",
+                events(&[result_event("} x {")]),
+            ),
+        ];
+        for (row, raw) in rows {
+            let j = parse_judgment(&raw);
+            assert_eq!(j.verdict, "unknown", "row: {row}");
+            assert_eq!(j.confidence, 0.0, "row: {row}");
+        }
+    }
+
+    #[test]
+    fn a_stray_closing_brace_before_a_good_verdict_does_not_hide_it() {
+        let j = parse_judgment("} {\"verdict\":\"supports\",\"confidence\":0.9}");
+        assert_eq!(j.verdict, "supports");
+        assert_eq!(j.confidence, 0.9);
+    }
+
+    #[test]
+    fn an_error_reply_is_empty_and_its_redacted_cause_is_logged() {
+        let leaky = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": true,
+            "result": "Invalid API key - please run /login (sent token ghp_abcdefghijklmnop)"
+        })
+        .to_string();
+        let as_last_event = events(std::slice::from_ref(&leaky));
+        let without_text =
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#.to_string();
+        let rows: [(&str, String, &str); 3] = [
+            (
+                "single object",
+                leaky,
+                "Invalid API key - please run /login",
+            ),
+            (
+                "last event of an array",
+                as_last_event,
+                "Invalid API key - please run /login",
+            ),
+            (
+                "no text, only a subtype",
+                without_text,
+                "error_during_execution",
+            ),
+        ];
+        for (row, raw, cause) in rows {
+            let (text, logged) = warnings_while(|| unwrap_cli_reply(&raw));
+            assert_eq!(text, "", "an error reply is no answer ({row})");
+            assert!(
+                logged.contains("WARN"),
+                "the error reply leaves a warning ({row}); logged: {logged:?}"
+            );
+            assert!(
+                logged.contains(cause),
+                "the cause the CLI gave is in the log ({row}); logged: {logged:?}"
+            );
+            assert!(
+                !logged.contains("ghp_abcdefghijklmnop"),
+                "the token is redacted before it is logged ({row}); logged: {logged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_that_is_not_an_error_logs_no_warning() {
+        let success = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":5488,"result":"```json\n{\"verdict\": \"supports\", \"confidence\": 0.9}\n```","session_id":"f9ded9ef"}"#;
+        let bare_facts = r#"[{"entity_name":"X","content":"did Y","observation_type":"decision"}]"#;
+        let max_turns_without_text = events(&[
+            r#"{"type":"result","subtype":"error_max_turns","is_error":false,"num_turns":3}"#
+                .to_string(),
+        ]);
+        let replies = [
+            VERBOSE_JUDGE.to_string(),
+            success.to_string(),
+            "the model rambled".to_string(),
+            bare_facts.to_string(),
+            // an array with no result event
+            events(&[assistant_text("{}")]),
+            // a result event with no text and is_error false
+            max_turns_without_text,
+        ];
+        let ((), logged) = warnings_while(|| {
+            // Presence anchor: if the capture caught nothing, the absence below
+            // would say nothing.
+            tracing::warn!("k1-capture-anchor");
+            for raw in &replies {
+                unwrap_cli_reply(raw);
+            }
+        });
+        assert!(
+            logged.contains("k1-capture-anchor"),
+            "the capture works; logged: {logged:?}"
+        );
+        assert_eq!(
+            logged.matches("WARN").count(),
+            1,
+            "only the anchor is a warning; a reply that is not an error leaves none; logged: {logged:?}"
+        );
+    }
 }
 
 pub fn which_in_path(cmd: &str) -> bool {
@@ -1594,6 +1749,8 @@ pub(crate) mod cli_tests {
     /// Windows the `cmd.exe` a timed-out test left behind can still hold it.
     pub(crate) struct FakeCli {
         pub(crate) path: PathBuf,
+        /// The file `fake_cli_printing` made its stdout from; `fake_cli` has none.
+        printed: Option<PathBuf>,
     }
 
     impl FakeCli {
@@ -1605,6 +1762,9 @@ pub(crate) mod cli_tests {
     impl Drop for FakeCli {
         fn drop(&mut self) {
             std::fs::remove_file(&self.path).ok();
+            if let Some(printed) = &self.printed {
+                std::fs::remove_file(printed).ok();
+            }
         }
     }
 
@@ -1662,7 +1822,54 @@ pub(crate) mod cli_tests {
                 .expect("making the fake CLI executable");
             settle_executable(&path);
         }
-        FakeCli { path }
+        FakeCli {
+            path,
+            printed: None,
+        }
+    }
+
+    /// A stand-in for `claude` that prints `stdout` and exits 0, after draining
+    /// stdin as `fake_cli` does.
+    ///
+    /// `fake_cli` only writes stderr, and echoes unquoted, so it cannot say a
+    /// JSON array: those are full of `"`. Here the text never passes through a
+    /// shell. It sits in a sibling file that the script `type`s (`cmd.exe`) or
+    /// `cat`s (`sh`), so the bytes come out as given. The name has no "gemini" in
+    /// it, which makes `cli_judge_for_bin` pick `ClaudeCodeJudge` and its stdout
+    /// go through `unwrap_cli_reply`.
+    pub(crate) fn fake_cli_printing(stdout: &str) -> FakeCli {
+        let stem = crate::envs::scratch_root("fake-cli");
+        let printed = stem.with_extension("out");
+        let shown = printed.to_string_lossy().into_owned();
+        assert!(
+            !shown.contains(['"', '\'']),
+            "the fake CLI cannot point at {shown:?} the same way on both shells"
+        );
+        std::fs::write(&printed, stdout).expect("writing what the fake CLI prints");
+        #[cfg(windows)]
+        let (path, script) = (
+            stem.with_extension("cmd"),
+            format!("@echo off\r\nmore >nul\r\ntype \"{shown}\"\r\nexit 0\r\n"),
+        );
+        #[cfg(not(windows))]
+        let (path, script) = (
+            stem,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = \"--fake-cli-settle\" ] && exit 0\ncat >/dev/null\ncat '{shown}'\nexit 0\n"
+            ),
+        );
+        std::fs::write(&path, script).expect("writing the fake CLI");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("making the fake CLI executable");
+            settle_executable(&path);
+        }
+        FakeCli {
+            path,
+            printed: Some(printed),
+        }
     }
 
     /// Linux refuses to exec a file that anybody still has open for writing

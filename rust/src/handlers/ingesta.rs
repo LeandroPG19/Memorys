@@ -1500,6 +1500,73 @@ mod tests {
         );
     }
 
+    // This cut already carries its guard (`close <= open`), but no test went through that
+    // branch: the day it is rewritten the slice would panic here, not return nothing.
+    #[test]
+    fn a_closing_brace_before_the_first_opening_one_yields_nothing() {
+        for raw in ["} x {", "}{"] {
+            let (facts, relations) = parse_extraction_reply(raw);
+            assert!(
+                facts.is_empty() && relations.is_empty(),
+                "reply {raw:?} has no object to read"
+            );
+        }
+    }
+
+    // The two tests above call `unwrap_cli_reply` by hand, so taking that call out of
+    // `extraction_reply_within` leaves them green. This one goes through `handle`, with the
+    // array on the stdout of a CLI. The reply carries only relations and `untrusted` is set,
+    // so the answer is written without touching the database, and its note says which branch
+    // the reply reached: an array nobody opened reads as «no durable facts».
+    #[tokio::test]
+    async fn auto_extract_reads_the_relations_out_of_the_verbose_event_array_the_cli_prints() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let extraction = json!({
+            "facts": [],
+            "relations": [{"from": "svc-k1", "to": "PostgreSQL", "relation_type": "depends_on"}]
+        })
+        .to_string();
+        let printed = json!([
+            {"type": "system", "subtype": "init", "mcp_servers": [], "tools": ["Task"]},
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": extraction}]}
+            },
+            {"type": "result", "subtype": "success", "is_error": false, "result": extraction}
+        ])
+        .to_string();
+        let cli = crate::cognitive::judge::cli_tests::fake_cli_printing(&printed);
+        let _env = only_this_cli(&cli);
+
+        let reply = handle(
+            &pool_that_cannot_connect(),
+            json!({
+                "action": "auto_extract",
+                "text": "el servicio svc-k1 depende de PostgreSQL",
+                "untrusted": true
+            }),
+        )
+        .await
+        .expect("relations only and untrusted never reach the database");
+
+        assert_eq!(
+            reply["backend"], "claude_cli",
+            "the fake CLI answered, so its stdout is what is being read: {reply}"
+        );
+        assert_ne!(
+            reply.get("degraded").and_then(Value::as_bool),
+            Some(true),
+            "the CLI answered; nothing degraded: {reply}"
+        );
+        let note = reply["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("relations the text implied were not written"),
+            "the relations in the last `result` event were read and quarantined. The other \
+             note, «the model returned no durable facts worth remembering», is what an array \
+             that nobody opened looks like: {reply}"
+        );
+    }
+
     /// The CLI judges redact their stderr, but an OpenAI-compat backend puts
     /// the vendor's response body in its error as it came, and that error is
     /// what `backend_failed` now sends back in its note.

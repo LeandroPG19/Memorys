@@ -987,6 +987,42 @@ mod tests {
         );
     }
 
+    // A panic here is the red: no `should_panic`, no `catch_unwind`. The cut from the first
+    // `{` to the last `}` sliced `inner[i..=j]` with `j < i`, and one panic loses every verdict
+    // the run had already decided, the same damage `an_accent_at_the_cut_does_not_kill_the_run`
+    // records for another cut.
+    #[test]
+    fn a_closing_brace_before_the_first_opening_one_never_merges_and_never_panics() {
+        let in_a_verbose_array = serde_json::json!([
+            {"type": "system", "subtype": "init", "mcp_servers": [], "tools": ["Task"]},
+            {"type": "result", "subtype": "success", "is_error": false, "result": "} x {"}
+        ])
+        .to_string();
+        let rows: [(&str, &str); 4] = [
+            ("closing then opening, spaced", "} x {"),
+            ("closing then opening, adjacent", "}{"),
+            (
+                "inside a single CLI envelope",
+                r#"{"type":"result","is_error":false,"result":"} x {"}"#,
+            ),
+            (
+                "inside the last result event of a verbose array",
+                in_a_verbose_array.as_str(),
+            ),
+        ];
+        for (row, raw) in rows {
+            assert_eq!(parse_same_entity(raw), (None, 0.0, None), "row: {row}");
+        }
+    }
+
+    #[test]
+    fn a_stray_closing_brace_before_a_good_verdict_is_still_read() {
+        assert_eq!(
+            parse_same_entity("} {\"verdict\":\"misma\",\"confidence\":0.95}"),
+            (Some(true), 0.95, None)
+        );
+    }
+
     #[test]
     fn a_confident_verdict_merges() {
         assert!(should_merge(Some(true), 0.95, false));
