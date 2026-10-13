@@ -24,6 +24,10 @@ reviews or by the first Windows and Linux runs, none needs a real host.
 
 - **A dead database fails at once in the tests instead of costing 5 s a call.** Five test files pointed their dead database at `127.0.0.1:1`; sqlx 0.8 retries a refused connection until the pool's `acquire_timeout` (5 s), on Linux as much as on Windows (the 0.29 backlog blamed Windows). They share `tests/dead_db`, a listener that accepts and closes, which sqlx reads as an I/O error and does not retry; a guard in `v042` pins that it fails with `Error::Io` in under a second. `v026`, `v025`, `v027` and `v029_two_agents` turn the models off, which they never used: each daemon they start no longer warms a reranker batch before it can exit (`v026`: 126.98 s → 2.24 s, measured). On Windows the five dead-database binaries went from 75.7 s to 8.6 s with the same verdicts. (T2)
 
+### Decided
+
+- **No arena ceiling of ours for an embedder or an NLI forced onto the GPU.** `CUBA_EMBED_DEVICE=gpu` / `CUBA_NLI_DEVICE=gpu` run their CUDA session with `SameAsRequested` and no limit (it used to be the fixed 2048 MB that 0.29 removed): the plan weighs only the reranker, a number for the other two would be invented, both are opt-in, and the INT8 embedder has no CUDA kernels. Documented in the README and `docs/despliegue-lan.md` §3. (K3c)
+
 ### Gate
 
 - **The advisories are judged first, with a ceiling.** `merge-gate.sh` runs readiness, then `timeout 120 cargo audit`, then `cargo deny`, then the backup and the 20-minute test run: a stale advisory database now fails in seconds, not twenty minutes in. Exit 2 when the database could not be fetched or the 120 s ran out (never `--no-fetch` or `--stale`), exit 1 for an advisory. Measured on 2026-10-13: `cargo audit` takes 2.4 s with the database current, 11.6 s from a cold clone, 20.2 s against a host that does not answer. The 0.29 backlog said `deny` and `audit` share the database; they do not (`deny` here checks `licenses bans sources` and keeps its own clone), so `audit` is the only judge of advisories. (G2)

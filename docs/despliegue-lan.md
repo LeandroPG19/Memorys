@@ -41,7 +41,10 @@ Only the reranker benefits. The embedder is INT8 and the CUDA execution
 provider has no kernel for `DynamicQuantizeLinear` / `MatMulInteger`, so it
 runs on CPU no matter what you set; the NLI model is FP32 and not worth the
 VRAM. Defaults are therefore `CUBA_EMBED_DEVICE=cpu`, `CUBA_RERANK_DEVICE=gpu`,
-`CUBA_NLI_DEVICE=cpu`.
+`CUBA_NLI_DEVICE=cpu`. If you force the embedder or the NLI onto the GPU anyway,
+its session runs with no arena ceiling of ours: the plan weighs only the
+reranker, and `SameAsRequested` grows only by what the session asks for
+(decided in 0.30).
 
 Build with the feature and point the runtime at the GPU libraries:
 
