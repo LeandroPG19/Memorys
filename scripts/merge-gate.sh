@@ -940,6 +940,7 @@ echo "                          (+ API key) OR MEMORY_INDUSTRY_LLM_BASE_URL=/v1"
 echo "                          (any OpenAI-compat: CN/US/EU clouds or Ollama)"
 echo "                          OR authenticated claude/gemini CLI OR MCP sampling"
 echo "  · cargo-deny, machete   install on the merge machine"
+echo "  · network to github.com cargo audit refreshes the RustSec advisory database first, at most 120 s"
 echo "  · node                  >= engines.node of package.json, on PATH (nvm use)"
 echo ""
 echo "WHERE IT WRITES:"
@@ -965,6 +966,58 @@ export DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:548
 # libpq is asked, for the same reason gate-lock.sh gives: it would judge one
 # server ready and create the throwaway databases on another.
 gate_require_database_url "$DATABASE_URL"
+
+# Without pg_isready the server is asked through the container that publishes the
+# port DATABASE_URL names, not through one picked by name: the name says nothing
+# about which server the URL points at (the judge's container on Windows was
+# memory-industry-dbwin-20261012 on :5489, and a memory-industry-db on another
+# port would have been judged ready in its place). publish= matches the host
+# port, not the container's (measured on Docker 29.7.2), and the role and the
+# database do not change what pg_isready answers, so it is asked with neither.
+# Nothing printed carries DATABASE_URL: the password lives in it.
+gate_container_ready() {
+  local authority hostport host port="" names name running=() answer rc=0
+  authority="${1#*://}"
+  authority="${authority%%/*}"
+  hostport="${authority##*@}"
+  if [[ "$hostport" == \[*\]* ]]; then
+    host="${hostport%%]*}]"
+    [[ "${hostport#*]}" == :* ]] && port="${hostport#*]:}"
+  else
+    host="${hostport%%:*}"
+    [[ "$hostport" == *:* ]] && port="${hostport##*:}"
+  fi
+  port="${port:-${PGPORT:-5432}}"
+  [[ "$port" =~ ^[0-9]+$ ]] \
+    || gate_refuse "DATABASE_URL (or PGPORT) names a port that is not a number, so no container can be asked for it."
+  case "$host" in
+    127.0.0.1|localhost|"[::1]") ;;
+    *) gate_refuse "pg_isready is not on PATH, and DATABASE_URL names a server that is not this machine, which no local container can answer for. Install the PostgreSQL client tools so pg_isready exists." ;;
+  esac
+  command -v docker >/dev/null 2>&1 \
+    || gate_refuse "pg_isready and docker are both missing from PATH, so nothing can say whether the Postgres on :$port is ready. Install the PostgreSQL client tools (pg_isready) or docker."
+  names="$(docker ps --filter "publish=$port" --format '{{.Names}}')" \
+    || gate_refuse "docker did not answer 'docker ps', so it cannot say which container publishes :$port. Start docker or install pg_isready."
+  while IFS= read -r name; do
+    name="${name%$'\r'}"
+    [[ -z "$name" ]] || running+=("$name")
+  done <<<"$names"
+  if (( ${#running[@]} == 0 )); then
+    echo "FAIL: Postgres not ready on :$port (no pg_isready on PATH, and no running container publishes :$port)"
+    exit 1
+  elif (( ${#running[@]} > 1 )); then
+    gate_refuse "more than one container publishes :$port (${running[*]}), so this gate will not choose one to judge. Stop the others or install pg_isready."
+  fi
+  name="${running[0]}"
+  answer="$(docker exec "$name" pg_isready 2>&1)" || rc=$?
+  answer="${answer//$'\r'/}"
+  if (( rc != 0 )); then
+    echo "FAIL: Postgres not ready on :$port (container $name: $answer)"
+    exit 1
+  fi
+  echo "OK  Postgres :$port (container $name)"
+}
+
 if command -v pg_isready >/dev/null 2>&1; then
   # libpq reads the URL, so host, port, socket, IPv6 and PGPORT mean here what
   # they mean to psql, pg_dump and sqlx, and the port printed is the one libpq
@@ -984,11 +1037,37 @@ if command -v pg_isready >/dev/null 2>&1; then
     || { echo "FAIL: Postgres not ready on :$pg_port (pg_isready: $pg_answer)"; exit 1; }
   echo "OK  Postgres :$pg_port"
 else
-  docker exec memory-industry-db pg_isready -U cuba -d brain >/dev/null \
-    || docker exec cuba-memorys-db pg_isready -U cuba -d brain >/dev/null \
-    || { echo "FAIL: memory-industry-db / cuba-memorys-db container not healthy"; exit 1; }
-  echo "OK  Postgres (docker)"
+  gate_container_ready "$DATABASE_URL"
 fi
+
+# The advisories are judged before the 20-minute test run: a judge idle for days
+# found its new advisory half an hour in, when 3 s would have said it. cargo audit
+# is the only judge of them (cargo deny below reads licenses, bans and sources,
+# never `advisories`): two judges would keep two ignore lists, and they already
+# differ. It fetches its database itself, so the ceiling is on the whole run;
+# measured here, 2.4 s with the database current, 11.6 s from a cold clone, and
+# 20.2 s to give up on a server that does not answer. A database that could not
+# be refreshed is exit 2, never a pass against the copy on disk and never a retry
+# with --no-fetch or --stale.
+echo "=== cargo audit ==="
+audit_rc=0
+audit_out="$(cd "$ROOT/rust" && timeout 120 cargo audit 2>&1)" || audit_rc=$?
+printf '%s\n' "$audit_out"
+if (( audit_rc == 124 )); then
+  gate_refuse "cargo audit did not finish refreshing the advisory database from https://github.com/RustSec/advisory-db in 120 s. This gate does not judge advisories against the copy on disk; restore the network to github.com and run it again."
+elif (( audit_rc != 0 )) && [[ "$audit_out" == *"couldn't fetch advisory database"* ]]; then
+  gate_refuse "cargo audit could not fetch the advisory database from https://github.com/RustSec/advisory-db. This gate does not judge advisories against the copy on disk; restore the network to github.com and run it again."
+elif (( audit_rc != 0 )); then
+  echo "FAIL: cargo audit exited $audit_rc (its output is above; with no advisory listed, check that timeout is GNU coreutils)"
+  exit 1
+fi
+
+echo "=== cargo deny ==="
+if ! command -v cargo-deny >/dev/null 2>&1 && ! (cd "$ROOT/rust" && cargo deny --version >/dev/null 2>&1); then
+  echo "FAIL: cargo-deny is not installed. Install it (cargo install cargo-deny) — the gate does not skip license policy." >&2
+  exit 1
+fi
+(cd "$ROOT/rust" && cargo deny check licenses bans sources)
 
 if [[ "${SKIP_BACKUP:-0}" != "1" ]]; then
   "$ROOT/scripts/backup-db.sh"
@@ -1001,18 +1080,8 @@ echo "=== cargo clippy/test --features docs ==="
 (cd "$ROOT/rust" && cargo clippy --all-targets --features docs -- -D warnings)
 (cd "$ROOT/rust" && cargo test --features docs)
 
-echo "=== cargo deny ==="
-if ! command -v cargo-deny >/dev/null 2>&1 && ! (cd "$ROOT/rust" && cargo deny --version >/dev/null 2>&1); then
-  echo "FAIL: cargo-deny is not installed. Install it (cargo install cargo-deny) — the gate does not skip license policy." >&2
-  exit 1
-fi
-(cd "$ROOT/rust" && cargo deny check licenses bans sources)
-
 echo "=== npm wrapper smoke ==="
 node npm/install.test.js
-
-echo "=== cargo audit ==="
-(cd "$ROOT/rust" && cargo audit)
 
 echo "=== codigo-muerto ==="
 "$ROOT/scripts/codigo-muerto.sh"
