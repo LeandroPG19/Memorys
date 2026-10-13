@@ -371,22 +371,24 @@ if [[ "${1:-}" == "--self-test" ]]; then
     echo '}'
   } > "$tmp/src/tangled.rs"
   got="$(lizard_warnings "$tmp" 8 src/tangled.rs)"
-  if [[ "$got" != "src/tangled.rs::tangled:1 13" ]]; then
+  if [[ "$got" != "src/tangled.rs::tangled#1 13" ]]; then
     echo "FAIL self-test: the filter lost a CC 13 function (got '$got')" >&2
     exit 1
   fi
-  if run_lizard "$tmp" src/tangled.rs 2>/dev/null; then
+  : > "$tmp/bl-empty.txt"
+  if BASELINE="$tmp/bl-empty.txt" run_lizard "$tmp" src/tangled.rs 2>/dev/null; then
     echo "FAIL self-test: run_lizard passed a CC 13 function that is not in the baseline" >&2
     exit 1
   fi
 
-  # The fixture for the reason the key carries a start line, in the shape the
-  # real defect had: judge.rs holds two `run_prompt`, one per judge, and until
-  # this release both collapsed onto `src/cognitive/judge.rs::run_prompt`. The
-  # lookup in run_lizard takes the first match in file order, so the CC 9 one
-  # was ratcheted against the CC 10 ceiling of the other and could gain a point
-  # with the gate still green. Two functions cannot begin on the same line of
-  # the same file, so the start line is what makes a key unique.
+  # The fixture for the reason the key carries an ordinal, in the shape the
+  # real defect had: judge.rs holds two `run_prompt`, one per judge, and once
+  # both collapsed onto `src/cognitive/judge.rs::run_prompt`. The lookup in
+  # run_lizard takes the first match in file order, so the CC 9 one was
+  # ratcheted against the CC 10 ceiling of the other and could gain a point
+  # with the gate still green. The ordinal (`#1`, `#2`, by start line, over every
+  # function of that name in the file) makes the key unique without tying it to
+  # a line number, so moving a function does not change it.
   {
     echo 'struct Cli;'
     echo 'struct Http;'
@@ -412,6 +414,174 @@ if [[ "${1:-}" == "--self-test" ]]; then
     echo "FAIL self-test: two same-named functions in one file came out as $twins line(s)" >&2
     echo "                on $keys key(s); the baseline needs one key each (got '$got')" >&2
     exit 1
+  fi
+  want="$(printf '%s\n' 'src/twins.rs::run_prompt#1 9' 'src/twins.rs::run_prompt#2 10')"
+  if [[ "$got" != "$want" ]]; then
+    echo "FAIL self-test: the two run_prompt were not keyed #1 and #2 in start order (got '$got')" >&2
+    exit 1
+  fi
+
+  # From here on each case hands run_lizard its own baseline: run_lizard reads
+  # $BASELINE when it is called, so a fixture never depends on the real
+  # scripts/lizard-baseline.txt and that file cannot move one of them.
+  st_fail() {
+    echo "FAIL self-test: $*" >&2
+    exit 1
+  }
+  # judged BASELINE_FILE FILE...: the exit status lands in $rc and what
+  # run_lizard said in $tmp/judged.err.
+  judged() {
+    local bl="$1"
+    shift
+    rc=0
+    BASELINE="$bl" run_lizard "$tmp" "$@" 2>"$tmp/judged.err" || rc=$?
+  }
+  said() { grep -qF -- "$1" "$tmp/judged.err"; }
+  # fn_with_ifs NAME K: a function of CC K+1, as the fixtures above write them.
+  fn_with_ifs() {
+    echo "fn $1(n: u32) -> u32 {"
+    echo '    let mut t = 0;'
+    for i in $(seq "$2"); do echo "    if n == $i { t += $i; }"; done
+    echo '    t'
+    echo '}'
+  }
+  # moved_file K: `steady` of CC K+1 under a 31-line `filler` of CC 1, so that
+  # it begins on line 32 and not on line 1.
+  moved_file() {
+    {
+      echo 'fn filler(n: u32) -> u32 {'
+      echo '    let mut t = n;'
+      for _ in $(seq 27); do echo '    t = t + 1;'; done
+      echo '    t'
+      echo '}'
+      fn_with_ifs steady "$1"
+    } > "$tmp/src/moved.rs"
+  }
+
+  # A function that only moved keeps its key and its verdict. The key used to
+  # carry the start line, so 31 lines of unrelated code above `steady` made the
+  # gate call it new work, and the third time that happened somebody
+  # regenerated the baseline by hand.
+  printf '%s\n' 'src/moved.rs::steady#1 13' > "$tmp/bl-moved.txt"
+  fn_with_ifs steady 12 > "$tmp/src/moved.rs"
+  at_top="$(lizard_warnings "$tmp" 8 src/moved.rs)"
+  moved_file 12
+  pushed_down="$(lizard_warnings "$tmp" 8 src/moved.rs)"
+  if [[ "$at_top" != "src/moved.rs::steady#1 13" || "$pushed_down" != "$at_top" ]]; then
+    st_fail "a function pushed down 31 lines changed its key (line 1: '$at_top', line 32: '$pushed_down')"
+  fi
+  judged "$tmp/bl-moved.txt" src/moved.rs
+  if (( rc != 0 )) || said 'CRAP:'; then
+    st_fail "a function that only moved was judged (exit $rc): $(cat "$tmp/judged.err")"
+  fi
+
+  # The ratchet is exact in both directions. Up was always red; down and
+  # "no longer over the ceiling" were silent, which leaves slack for the
+  # function to grow back into with nobody saying anything.
+  moved_file 13
+  judged "$tmp/bl-moved.txt" src/moved.rs
+  if (( rc == 0 )) || ! said 'src/moved.rs::steady#1 went from CC 13 to 14'; then
+    st_fail "a function that got worse was not reported as 'went from CC 13 to 14' (exit $rc): $(cat "$tmp/judged.err")"
+  fi
+  moved_file 11
+  judged "$tmp/bl-moved.txt" src/moved.rs
+  if (( rc == 0 )) || ! said 'src/moved.rs::steady#1 went down from CC 13 to 12'; then
+    st_fail "a function that got simpler, with the baseline left at 13, was not reported (exit $rc): $(cat "$tmp/judged.err")"
+  fi
+  # CC 8 is not over the ceiling of 8, so it leaves lizard_warnings altogether:
+  # its baseline entry is dead, not lower.
+  moved_file 7
+  judged "$tmp/bl-moved.txt" src/moved.rs
+  if (( rc == 0 )) || ! said 'src/moved.rs::steady#1 is in the baseline at CC 13'; then
+    st_fail "an entry whose function fell to the ceiling was not reported as dead (exit $rc): $(cat "$tmp/judged.err")"
+  fi
+
+  # A rename leaves both verdicts, and an entry of a file that is not being
+  # judged says nothing: the dead-entry check has the scope of the diff.
+  printf '%s\n' 'src/moved.rs::steady#1 13' 'src/not_in_diff.rs::untouched#1 20' > "$tmp/bl-renamed.txt"
+  fn_with_ifs settled 12 > "$tmp/src/moved.rs"
+  judged "$tmp/bl-renamed.txt" src/moved.rs
+  if (( rc == 0 )) \
+    || ! said 'src/moved.rs::settled#1 is at CC 13, over the ceiling of 8, and is not in the baseline' \
+    || ! said 'src/moved.rs::steady#1 is in the baseline at CC 13' \
+    || said 'not_in_diff'; then
+    st_fail "a renamed function did not give both reds, or an entry outside the judged files was named (exit $rc): $(cat "$tmp/judged.err")"
+  fi
+
+  # A deleted file is still in the diff, and what its entries said is gone.
+  printf '%s\n' 'src/deleted.rs::old#1 20' > "$tmp/bl-deleted.txt"
+  judged "$tmp/bl-deleted.txt" src/deleted.rs
+  if (( rc == 0 )) || ! said 'src/deleted.rs::old#1 is in the baseline at CC 20'; then
+    st_fail "the entries of a deleted file were not reported as dead (exit $rc): $(cat "$tmp/judged.err")"
+  fi
+
+  # The ordinal counts every function of the name, not only those over the
+  # ceiling. Counting only those would renumber the CC 10 one the moment its
+  # small twin crossed 8, and that is a red for a function nobody touched.
+  twins2() {
+    echo 'struct Cli;'
+    echo 'struct Http;'
+    echo 'impl Cli {'
+    echo '    fn run_prompt(&self, n: u32) -> u32 {'
+    echo '        let mut t = 0;'
+    for i in $(seq "$1"); do echo "        if n == $i { t += $i; }"; done
+    echo '        t'
+    echo '    }'
+    echo '}'
+    echo 'impl Http {'
+    echo '    fn run_prompt(&self, n: u32) -> u32 {'
+    echo '        let mut t = 0;'
+    for i in $(seq 9); do echo "        if n == $i { t += $i; }"; done
+    echo '        t'
+    echo '    }'
+    echo '}'
+  }
+  printf '%s\n' 'src/twins2.rs::run_prompt#2 10' > "$tmp/bl-twins2.txt"
+  twins2 2 > "$tmp/src/twins2.rs"
+  got="$(lizard_warnings "$tmp" 8 src/twins2.rs)"
+  if [[ "$got" != 'src/twins2.rs::run_prompt#2 10' ]]; then
+    st_fail "the second run_prompt was not #2 while the first was under the ceiling (got '$got')"
+  fi
+  twins2 8 > "$tmp/src/twins2.rs"
+  got="$(lizard_warnings "$tmp" 8 src/twins2.rs)"
+  want="$(printf '%s\n' 'src/twins2.rs::run_prompt#1 9' 'src/twins2.rs::run_prompt#2 10')"
+  if [[ "$got" != "$want" ]]; then
+    st_fail "the second run_prompt was renumbered when the first crossed the ceiling (got '$got')"
+  fi
+  judged "$tmp/bl-twins2.txt" src/twins2.rs
+  if (( rc == 0 )) || ! said 'src/twins2.rs::run_prompt#1 is at CC 9' || said 'run_prompt#2'; then
+    st_fail "the first run_prompt crossing the ceiling was not the only thing reported (exit $rc): $(cat "$tmp/judged.err")"
+  fi
+
+  # lizard prints a function when it closes it, so the inner `walk` (lines 2-4)
+  # comes out before the outer (1-16) that begins first. The ordinal follows
+  # the start line, not that order.
+  {
+    echo 'fn walk(n: u32) -> u32 {'
+    echo '    fn walk(m: u32) -> u32 {'
+    echo '        m'
+    echo '    }'
+    echo '    let mut t = walk(n);'
+    for i in $(seq 9); do echo "    if n == $i { t += $i; }"; done
+    echo '    t'
+    echo '}'
+  } > "$tmp/src/nested.rs"
+  got="$(lizard_warnings "$tmp" 8 src/nested.rs)"
+  if [[ "$got" != 'src/nested.rs::walk#1 10' ]]; then
+    st_fail "a nested function of the same name took the outer one's ordinal (got '$got')"
+  fi
+
+  # A baseline line in the old shape has to be red even though its key still
+  # matches what is measured today; and the guard must not refuse a good one.
+  printf '%s\n' 'src/tangled.rs::tangled:1 13' > "$tmp/bl-shape-old.txt"
+  printf '%s\n' 'src/tangled.rs::tangled#1 13' > "$tmp/bl-shape-new.txt"
+  judged "$tmp/bl-shape-old.txt" src/tangled.rs
+  if (( rc == 0 )) || ! said "baseline line 'src/tangled.rs::tangled:1 13'"; then
+    st_fail "a baseline line in the old <path>::<function>:<line> shape was accepted (exit $rc): $(cat "$tmp/judged.err")"
+  fi
+  judged "$tmp/bl-shape-new.txt" src/tangled.rs
+  if (( rc != 0 )) || said 'CRAP:'; then
+    st_fail "the shape check refused a well-formed baseline (exit $rc): $(cat "$tmp/judged.err")"
   fi
 
   # The expiry reader, judged as if today were 2026-09-22. One line per shape
@@ -489,11 +659,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
     "$marker" \
     '# grew: two lines of reason,' \
     '# and an owner. Owner: fixture.' \
-    'src/grew.rs::grew:1 9' \
+    'src/grew.rs::grew#1 9' \
     '# gone: the reason of a function that no longer exists.' \
-    'src/gone.rs::gone:1 20' \
+    'src/gone.rs::gone#1 20' \
     '# kept: one line. Owner: fixture.' \
-    'src/kept.rs::kept:1 13' > "$bt/scripts/lizard-baseline.txt"
+    'src/kept.rs::kept#1 13' > "$bt/scripts/lizard-baseline.txt"
   regen_rc=0
   bash "$bt/scripts/quality-gate.sh" --update-lizard-baseline >"$tmp/regen.out" 2>&1 || regen_rc=$?
   if (( regen_rc != 0 )); then
@@ -509,9 +679,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
   want="$(printf '%s\n' \
     '# grew: two lines of reason,' \
     '# and an owner. Owner: fixture.' \
-    'src/grew.rs::grew:1 11' \
+    'src/grew.rs::grew#1 11' \
     '# kept: one line. Owner: fixture.' \
-    'src/kept.rs::kept:1 13')"
+    'src/kept.rs::kept#1 13')"
   if [[ "$got" != "$want" ]]; then
     echo "FAIL self-test: regenerating the baseline did not keep each comment over its key." >&2
     echo "      wanted:" >&2; printf '        %s\n' "$want" >&2
@@ -522,8 +692,25 @@ if [[ "${1:-}" == "--self-test" ]]; then
     echo "FAIL self-test: the old header survived regeneration next to the new one" >&2
     exit 1
   fi
-  if ! grep -q 'src/gone.rs::gone:1' "$tmp/regen.out" || ! grep -q 'gone: the reason of a function' "$tmp/regen.out"; then
+  if ! grep -q 'src/gone.rs::gone#1' "$tmp/regen.out" || ! grep -q 'gone: the reason of a function' "$tmp/regen.out"; then
     echo "FAIL self-test: a key that left the baseline took its comment with it in silence: $(cat "$tmp/regen.out")" >&2
+    exit 1
+  fi
+  # The key no longer carries a start line, so the header that explains the
+  # file must not teach that it does.
+  if grep -qiE 'start[ -]line' "$bt/scripts/lizard-baseline.txt"; then
+    echo "FAIL self-test: the regenerated header still talks about the start line as the key:" >&2
+    cat "$bt/scripts/lizard-baseline.txt" >&2
+    exit 1
+  fi
+  # Regenerating twice over the same tree is a fixed point. Anything else would
+  # make every regeneration a diff, and hide the change that was meant.
+  cp "$bt/scripts/lizard-baseline.txt" "$tmp/regen-first.txt"
+  regen_rc=0
+  bash "$bt/scripts/quality-gate.sh" --update-lizard-baseline >"$tmp/regen2.out" 2>&1 || regen_rc=$?
+  if (( regen_rc != 0 )) || ! cmp -s "$tmp/regen-first.txt" "$bt/scripts/lizard-baseline.txt"; then
+    echo "FAIL self-test: a second --update-lizard-baseline changed the file (exit $regen_rc):" >&2
+    diff "$tmp/regen-first.txt" "$bt/scripts/lizard-baseline.txt" >&2 || true
     exit 1
   fi
 
@@ -587,9 +774,11 @@ PY
   fi
 
   echo "OK  self-test: the CRAP half reports CC violations, only CC violations, and"
-  echo "    keeps two same-named functions in one file on two separate keys; an"
-  echo "    exclusion goes red when it expires, loses its date, or matches no mutant;"
-  echo "    regenerating the baseline keeps each comment over its key; the mutation"
+  echo "    keys each function by name and ordinal, so moving one does not move its"
+  echo "    key and two same-named functions in one file keep two; the ratchet is exact"
+  echo "    in both directions and red on entries that are dead or in the wrong shape;"
+  echo "    an exclusion goes red when it expires, loses its date, or matches no mutant;"
+  echo "    regenerating the baseline keeps each comment over its key and is idempotent; the mutation"
   echo "    step hands cargo-mutants an output path it can see, and judges what it wrote"
   exit 0
 fi
