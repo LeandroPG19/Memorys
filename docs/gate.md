@@ -77,7 +77,7 @@ Do not nest `pesado` inside `pesado`: the inner one waits on the lock the outer 
 
 **`gate_linux_env`** (`scripts/gate-lock.sh`) sets them up, and `merge-gate.sh`, `quality-gate.sh`, `mutants-gate.sh` and `release.sh` call it before their first step (`local_gate_contract.rs` holds each to it). On a machine that is not Linux it does nothing.
 
-- **The cargo target is outside the tree.** `CARGO_TARGET_DIR` stays as you set it; unset, it becomes `${XDG_CACHE_HOME:-$HOME/.cache}/cargo-target/memory-industry`, absolute. `cargo mutants` copies the tree it mutates into a scratch directory, and with a target inside `rust/` (`rust/target-sil`) it copied 27.5 GB and the baseline of the mutants failed on binaries of two builds mixed. `--gitignore=false` stays in `quality-gate.sh` because `eval-datasets` is git-ignored and the tests read it. The mutation scripts still `unset CARGO_TARGET_DIR` for the mutants themselves, so each scratch copy builds in its own `target/`.
+- **The cargo target is outside the tree.** `CARGO_TARGET_DIR` stays as you set it; unset, it becomes `${XDG_CACHE_HOME:-$HOME/.cache}/cargo-target/memory-industry`, absolute. `cargo mutants` copies the tree it mutates into a scratch directory, and with a target inside `rust/` (`rust/target-sil`) it copied 27.5 GB and the baseline of the mutants failed on binaries of two builds mixed. `--gitignore=false` stays in `quality-gate.sh`, but not because `eval-datasets` is git-ignored: it is versioned (`git ls-files rust/eval-datasets` lists its five `.jsonl`). Measured on 2026-10-13 with cargo-mutants 27.1.0, the copy reads `git_ignore: false` with the flag or without it, so the flag changes nothing there and dropping it would not keep a `target-*` out of the copy; see [Disk for the mutation step](#disk-for-the-mutation-step). The mutation scripts still `unset CARGO_TARGET_DIR` for the mutants themselves, so each scratch copy builds in its own `target/`.
 - **`TMPDIR` is on the disk, not on tmpfs.** `/tmp` is tmpfs here and tmpfs is RAM: it counts against the `pesado` memory cap, and the scratch copy of every mutant would live in it. A `TMPDIR` that is already set and is not tmpfs is kept; otherwise it becomes `${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/tmp`, created. The filesystem is read with `stat -f -c %T`, so `tmpfs` and `ramfs` are the two it refuses.
 - **`node` is required, not assumed.** The `npm wrapper smoke` step runs `node npm/install.test.js`, and the `node` on `PATH` is whichever nvm last selected. `gate_linux_env` reads the oldest major from `engines.node` in `package.json` (`>=18` is 18) and exits **2** when `node` is missing, older, or does not print a version, saying what is wrong and the fix (`nvm use 18`, or put a newer `node` first on `PATH`). It never goes on without it: the alternative is a red step forty minutes in that does not say why.
 
@@ -101,6 +101,54 @@ The gate was written on Windows under Git Bash and moved to WSL2 on 2026-10-03. 
 - **`?sslmode=…` and every other query are refused, and the door that was open is closed.** `DATABASE_URL=…?sslmode=require` used to work, because `${url%/*}` does not cross the `?`; it is exit 2 now, with a reason that points at `PGSSLMODE` and never repeats the URL. Without `pg_isready` on `PATH`, the readiness check used to fall back to `docker exec memory-industry-db pg_isready`, a container judged by its name and not the server `DATABASE_URL` names. It now derives the port from `DATABASE_URL` as libpq does (`[::1]:5434`, else the last `:`, else `PGPORT`, else 5432) and asks `docker ps --filter publish=<port>`, which matches the host port whatever the container is called. Only a server of this machine (`127.0.0.1`, `localhost`, `::1`) can be judged that way. The verdicts: one container whose `pg_isready` answers is `OK  Postgres :<port> (container <name>)`; none publishing the port, or a Postgres that does not answer, is exit 1; more than one, a remote host or a socket, no `docker` on `PATH` or a `docker ps` that fails is exit 2, because nothing can say which server answers. Keep `pg_isready` on `PATH` anyway on a machine whose Postgres is not a local container.
 - **One gate at a time, across both hosts.** The lock, the exit file and the receipts live in each host's own `~/.cache/cuba-gate`, so a gate in WSL and one in Windows do not see each other, and with mirrored networking they share `localhost`, the ports and, if they were given the same `DATABASE_URL`, `brain_gate`. Give them different servers, or never start both. A receipt written on Windows is a receipt for Windows: `release.sh` run from WSL does not find it.
 - **No daemon needed.** A daemon holding the reranker on the card does not stop the gate (the card has room for two), but `target/release/memory-industry.exe` cannot be rebuilt while a process runs from it: run a daemon from a copy outside `target/`.
+
+## Disk for the mutation step
+
+`cargo mutants` copies `rust/` once per job and every copy compiles its own `target/`. On 2026-10-13 the step ran out of disk (`os error 112`) on this machine, and nothing had looked at the disk before copying. What was measured that day (Windows 11, Git Bash, cargo-mutants 27.1.0, a run of two mutants with `--jobs 2 --leak-dirs`):
+
+- A copy weighed **27.58 GB**, of which **25.8 GB** were `target-*` directories of other builds that lived inside `rust/` (cargo-mutants leaves out only its own `rust/target`; a reflink was not possible, `reflink_used=false`).
+- The build of each copy was another **14.1 GB**, 54 % of it `.pdb` files. With `CARGO_PROFILE_DEV_DEBUG=0` it is **8.94 GB**, 37 % less, and the baseline still passes.
+- Linux is not measured. The figures above stand for both until it is.
+
+`mutants-gate.sh` holds the rule in two modes that both judges call before `cargo mutants` (the main path of `mutants-gate.sh` inside the SIL, and `mutate_and_judge` in `quality-gate.sh`):
+
+```text
+jobs x GB per copy + reserve <= free GB on the scratch's volume
+```
+
+- `--disk-plan ROOT FREE_KB PER_COPY_KB RESERVE_KB WANT` is the pure rule. It prints `jobs=<n>` (the most that fit, at most `WANT`) and a `disk:` line; it adds `capped by disk: 3 wanted, 2 fit` when the disk cut them, and an explicit `MUTANTS_JOBS` is cut too. Not even one job fitting is **exit 1** with the numbers and `Nothing was copied or built`. A free space that could not be read is **exit 2**: not knowing is neither no room nor all the room there is.
+- `--prepare-scratch WANT` creates the scratch directory, sweeps it, reads the free space with `df -Pk`, applies the rule and prints `jobs=` and `scratch=`.
+- **The scratch is the judge's own directory**, `<temp>/memory-industry-mutants`, and `cargo mutants` gets it as `TMP`, `TEMP` and `TMPDIR`, for that command only. On Windows cargo-mutants reads `TMP`/`TEMP` and `TMPDIR` moves nothing; on Unix it reads `TMPDIR`. Everything the tests leave in it (`cuba-attrs-*`) is the judge's by construction.
+- **`CARGO_PROFILE_DEV_DEBUG=0`** goes into the environment of that one `cargo mutants` command in both scripts, and is exported nowhere else.
+- **A `target-*` inside `rust/` stops the step with exit 2**, naming the directory, before anything is copied: cargo writes a `CACHEDIR.TAG` in each, so it is seen instantly where `du` would take minutes. Delete it, or point `CARGO_TARGET_DIR` outside `rust/`.
+- `check_builds` treats `os error 112`, `os error 28`, `There is not enough space on the disk` and `No space left on device` in a build's compile phase as **the machine stopping the build**, not as rustc refusing a mutant, and says to free disk and not memory.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MUTANTS_SCRATCH_DIR` | `<temp>/memory-industry-mutants` | Another directory for the copies, the way out when `C:` is full and another volume has room. It has to be the judge's own: everything in it older than 6 h is swept, and it is refused if it is the system temp, `$HOME` or `/`. |
+| `MUTANTS_SCRATCH_GB_PER_COPY` | 12 | Whole GB per copy. 12 is ceil(8.94 x 1.25), measured on Windows with debug info off. |
+| `CUBA_GATE_MIN_FREE_GB` | 8 | The reserve that stays free; the same variable and value `run-all-tests.sh` uses. |
+| `MUTANTS_JOBS` | from cores and RAM | Jobs wanted. The disk can lower it, never raise it. |
+
+**What is swept**, before the disk is measured, so that what it frees counts:
+
+- In the scratch, every entry whose own mtime is more than 6 h old.
+- In the system temp, only leftovers from before the scratch existed, older than 6 h and provably the judge's: `cargo-mutants-rust-*.tmp` with a `Cargo.toml` that says `name = "memory-industry"`, `cuba-attrs-*`, and `tmp.*` holding a `mutants.out/`. A `cargo-mutants-rust-*.tmp` without that proof (a copy cut off halfway) is listed as `not provably the gate's, left alone`, with its size, and not touched.
+- Never through a link, and a `rm` that fails (a file open on Windows) is reported as `could not remove` without failing the step: the measurement that follows decides.
+- **Never while another gate is alive.** If `~/.cache/cuba-gate/lock` is held by a live process that is not this one's parent, it prints `another gate is running (...): sweep skipped` and carries on measuring. Under `merge-gate.sh`, which holds the lock and launches `mutants-gate.sh` as its direct child, it does sweep. `quality-gate.sh` takes no lock and is no different in that.
+- `rust/target*` is not swept: those are the developer's, or `run-all-tests.sh`'s, which sweeps its own.
+
+To measure the size per copy again, with no gate running and at least 60 GB free, from `rust/` in Git Bash:
+
+```bash
+unset CARGO_TARGET_DIR
+SCR="$(cygpath -u "$TEMP")/g3-measure"; OUT="$SCR/out"; mkdir -p "$OUT"
+TMP="$(cygpath -w "$SCR")" TEMP="$(cygpath -w "$SCR")" TMPDIR="$SCR" CARGO_PROFILE_DEV_DEBUG=0 \
+  cargo mutants --file src/search/rrf.rs -F '<regex of two mutants of cargo mutants --list>' \
+    --jobs 2 --timeout 90 --leak-dirs --output "$(cygpath -m "$OUT")" -- --lib
+du -sk "$SCR"/cargo-mutants-rust-*.tmp      # KB per copy; GB x 1.25, rounded up, is the default
+rm -rf "$SCR"
+```
 
 ## Isolation extras (0.26)
 

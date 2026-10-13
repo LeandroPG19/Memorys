@@ -404,13 +404,39 @@ unused_exclusions() {
 # script finds no outcomes.json in its /tmp, and a run nobody judged reads as
 # one with nothing to judge. Off Windows there is no cygpath and nothing to
 # rewrite.
+#
+# Disk, before anything is copied. cargo-mutants copies rust/ once per job and
+# each copy compiles its own target/: on 2026-10-13 that was 27.58 GB per copy
+# and the step died of os error 112. mutants-gate.sh --prepare-scratch holds the
+# rule: the jobs the free disk holds (an explicit MUTANTS_JOBS included), the
+# judge's own scratch directory, swept of its old copies, and a refusal with the
+# numbers when not even one job fits, or when a target-* of another build sits
+# inside rust/, since the copy takes it whole.
+#
+# --gitignore=false stays, but not for the reason it was written for:
+# eval-datasets is versioned. Measured on 2026-10-13 with cargo-mutants 27.1.0,
+# the copy reads git_ignore false with the flag or without it, so dropping it
+# keeps no target-* out of the copy.
+#
+# TMP and TEMP are what cargo-mutants reads as its temp dir on Windows, TMPDIR
+# what it reads on Unix. CARGO_PROFILE_DEV_DEBUG=0 is for that one command and
+# takes a copy's target from 14.1 to 8.94 GB (the .pdb files were 54 %).
 mutate_and_judge() {
-  local out native rc=0
+  local out native rc=0 plan jobs scratch scratch_native
+  plan="$("$ROOT/scripts/mutants-gate.sh" --prepare-scratch "${MUTANTS_JOBS:-$(qg_mutants_jobs)}")" || return $?
+  jobs="$(sed -n 's/^jobs=//p' <<<"$plan")"
+  scratch="$(sed -n 's/^scratch=//p' <<<"$plan")"
+  if [[ -z "$jobs" || -z "$scratch" ]]; then
+    echo "FAIL: mutants-gate.sh --prepare-scratch printed no jobs= and scratch= lines: $plan" >&2
+    return 2
+  fi
+  scratch_native="$(cygpath -w "$scratch" 2>/dev/null || printf '%s' "$scratch")"
   out="$(mktemp -d)"
   native="$(cygpath -m "$out" 2>/dev/null || printf '%s' "$out")"
-  (cd rust && cargo mutants "$@" \
+  (cd rust && TMP="$scratch_native" TEMP="$scratch_native" TMPDIR="$scratch" CARGO_PROFILE_DEV_DEBUG=0 \
+    cargo mutants "$@" \
     --exclude-re "$MUTANTS_EXCLUDE_RE" --output "$native" \
-    --timeout 90 --jobs "${MUTANTS_JOBS:-$(qg_mutants_jobs)}" --gitignore=false -- --lib) || rc=1
+    --timeout 90 --jobs "$jobs" --gitignore=false -- --lib) || rc=1
   if [[ -f "$out/mutants.out/outcomes.json" ]]; then
     "$ROOT/scripts/mutants-gate.sh" --check-builds "$out/mutants.out/outcomes.json" || rc=1
   else

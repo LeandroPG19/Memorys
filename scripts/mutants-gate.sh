@@ -4,6 +4,11 @@
 #   ./scripts/mutants-gate.sh --check-builds FILE   judge the unviable builds of an
 #                                                   outcomes.json (quality-gate.sh)
 #   ./scripts/mutants-gate.sh --self-test           that judge against its fixtures
+#   ./scripts/mutants-gate.sh --disk-plan ROOT FREE_KB PER_COPY_KB RESERVE_KB WANT
+#                                                   how many jobs the free disk holds
+#   ./scripts/mutants-gate.sh --prepare-scratch WANT
+#                                                   the judge's scratch dir, swept and
+#                                                   measured (quality-gate.sh)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -57,6 +62,13 @@ export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 #    which is the machine too. No readable log is a failure: nothing is judged
 #    blind.
 #
+# A disk that fills up is the machine too, and it starts its line with `error: `
+# like a diagnostic does: on 2026-10-13 the step ran out of disk (os error 112)
+# and `error: could not write output to ...: There is not enough space on the
+# disk.` would have passed for rustc refusing a mutant. A build whose phase holds
+# such a line is not judged by its diagnostics at all, and is counted apart so
+# that the refusal can say to free disk and not memory.
+#
 # The file's own `unviable` total is checked against the records too: a format
 # change that renamed `summary` would otherwise find zero unviable records,
 # judge nothing, and pass.
@@ -74,6 +86,7 @@ out_dir = os.path.dirname(os.path.abspath(path))
 
 DIAGNOSTIC = re.compile(r"^error(\[E\d{4}\])?: ")
 NOT_THE_COMPILER = ("error: could not compile", "error: build failed", "error: linking with")
+DISK_FULL = re.compile(r"\(os error (?:112|28)\)|There is not enough space on the disk|No space left on device")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 def exit_status(status):
@@ -97,15 +110,21 @@ def build_diagnostics(outcome):
             lines = log.read().splitlines()
     except OSError:
         return None
-    found, in_build = [], False
+    found, disk, in_build = [], [], False
     for line in (ANSI.sub("", raw) for raw in lines):
         if line.startswith("*** ") and " test --no-run" in line:
             in_build = True
         elif in_build and line.startswith("*** result:"):
             break
+        elif in_build and DISK_FULL.search(line):
+            disk.append(line)
         elif in_build and DIAGNOSTIC.match(line) and not line.startswith(NOT_THE_COMPILER):
             found.append(line)
-    return found
+    return found, disk
+
+def disk_cause(line):
+    code = re.search(r"os error (\d+)", line)
+    return f"os error {code.group(1)}" if code else "no space left"
 
 def mutant_name(outcome):
     scenario = outcome.get("scenario")
@@ -122,16 +141,19 @@ for field, records in (("unviable", unviable), ("caught", caught)):
         print("      The file changed shape, and a check that finds no records judges nothing.", file=sys.stderr)
         sys.exit(1)
 
-killed = []
+killed, out_of_disk = [], 0
 for outcome in unviable:
     build = next((p for p in outcome.get("phase_results") or [] if p.get("phase") == "Build"), None)
     status = build.get("process_status") if build else "no Build phase recorded"
     why = exit_status(status)
     if why is None:
-        diagnostics = build_diagnostics(outcome)
-        if diagnostics is None:
+        read = build_diagnostics(outcome)
+        if read is None:
             why = f"{json.dumps(status)}, no readable log at {outcome.get('log_path')!r}"
-        elif not diagnostics:
+        elif read[1]:
+            out_of_disk += 1
+            why = f"{json.dumps(status)}, the build ran out of disk ({disk_cause(read[1][0])})"
+        elif not read[0]:
             why = f"{json.dumps(status)} with no compiler diagnostic in the build phase"
     if why is not None:
         killed.append((mutant_name(outcome), why))
@@ -145,6 +167,8 @@ if killed:
     print("      again. First of them:", file=sys.stderr)
     for name, why in killed[:5]:
         print(f"        {why}  {name}", file=sys.stderr)
+    if out_of_disk:
+        print(f"      {out_of_disk} of them ran out of disk (os error 112/28): free disk, not memory, and run it again.", file=sys.stderr)
 else:
     print(f"OK  unviable builds: all {len(unviable)} refused by the compiler with a diagnostic, none by the machine")
 
@@ -189,6 +213,171 @@ else:
 if killed or stopped:
     sys.exit(1)
 PY
+}
+
+# --- the mutation step does not fill the disk ---------------------------------
+# On 2026-10-13 the step ran out of disk (os error 112). cargo-mutants copies
+# rust/ once per job and each copy compiles its own target/, and nothing looked at
+# the disk before copying. Measured that day on Windows: a copy weighed 27.58 GB,
+# 25.8 GB of it target-* directories of other builds that lived inside rust/, and
+# its own build another 14.1 GB. quality-gate.sh calls the two modes below before
+# its cargo mutants, and the main path of this script before its own.
+#
+#   --disk-plan ROOT FREE_KB PER_COPY_KB RESERVE_KB WANT   pure: no disk, no environment
+#   --prepare-scratch WANT   the judge's scratch dir, the sweep, the free space, the plan
+
+# Measured 2026-10-13 on Windows 11 under Git Bash: `cargo mutants --file
+# src/search/rrf.rs -F <two mutants> --jobs 2 --leak-dirs --output <dir> -- --lib`
+# with TMP, TEMP and TMPDIR on a scratch directory and CARGO_PROFILE_DEV_DEBUG=0:
+# a finished copy weighed 8.94 GB, and ceil(8.94 x 1.25) = 12. Without debug info
+# off it was 14.1 GB (54 % of it .pdb), which would have made 18. Linux is not
+# measured: this is the Windows figure for both until it is.
+MUTANTS_SCRATCH_GB_PER_COPY_MEASURED=12
+MUTANTS_SWEEP_MINUTES=360
+MUTANTS_KB_PER_GB=1048576
+
+mutants_gb() { awk -v kb="$1" -v per="$MUTANTS_KB_PER_GB" 'BEGIN { printf "%.1f", kb / per }'; }
+
+# What cargo-mutants reads as its temp dir: TMP/TEMP on Windows, TMPDIR on Unix.
+mutants_system_temp() {
+  local dir="${TMP:-${TEMP:-}}"
+  if [[ -n "$dir" ]] && command -v cygpath >/dev/null 2>&1; then
+    dir="$(cygpath -u "$dir")"
+  else
+    dir="${TMPDIR:-/tmp}"
+  fi
+  printf '%s\n' "${dir%/}"
+}
+
+mutants_scratch_dir() {
+  local dir="${MUTANTS_SCRATCH_DIR:-$(mutants_system_temp)/memory-industry-mutants}"
+  cygpath -u "$dir" 2>/dev/null || printf '%s\n' "$dir"
+}
+
+# jobs= on stdout, the human lines on stderr. 1: not even one job fits. 2: a number
+# is missing or not a number, and not knowing the free space is neither no room nor
+# all the room there is.
+mutants_disk_plan() {
+  local root="$1" free="$2" per="$3" reserve="$4" want="$5" value jobs
+  if ! [[ "$free" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: could not read the free space of $root (got '$free'), so nobody can say whether the mutation step fits." >&2
+    return 2
+  fi
+  for value in "$per" "$reserve" "$want"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || { echo "FAIL: --disk-plan wants whole numbers for the size per copy, the reserve and the jobs (got '$value')." >&2; return 2; }
+  done
+  free=$((10#$free)) per=$((10#$per)) reserve=$((10#$reserve)) want=$((10#$want))
+  (( per > 0 && want > 0 )) || { echo "FAIL: --disk-plan wants a size per copy and a number of jobs above 0." >&2; return 2; }
+  if (( free < per + reserve )); then
+    echo "FAIL: mutation needs $(mutants_gb $((per + reserve))) GB free on $root (1 job x $(mutants_gb "$per") GB per copy + $(mutants_gb "$reserve") GB reserve) and there are $(mutants_gb "$free") GB. Nothing was copied or built." >&2
+    echo "      Free disk, or point MUTANTS_SCRATCH_DIR at a volume with room." >&2
+    return 1
+  fi
+  jobs=$(( (free - reserve) / per ))
+  (( jobs < want )) || jobs=$want
+  printf 'jobs=%s\n' "$jobs"
+  echo "disk: $root $(mutants_gb "$free") GB free, $(mutants_gb "$per") GB per copy, $(mutants_gb "$reserve") GB reserve -> $jobs job(s)" >&2
+  (( jobs == want )) || echo "capped by disk: $want wanted, $jobs fit" >&2
+}
+
+# A cargo target inside rust/ is copied whole into every job: cargo-mutants leaves
+# out only its own target/, and cargo writes a CACHEDIR.TAG in each. Instant, where
+# measuring them with du would take minutes.
+mutants_refuse_targets_in_tree() {
+  local tag dir named=""
+  while IFS= read -r tag; do
+    dir="${tag%/CACHEDIR.TAG}"
+    [[ "$dir" == "$ROOT/rust/target" ]] || named+=" ${dir#"$ROOT"/}"
+  done < <(find -P "$ROOT/rust" -mindepth 2 -maxdepth 2 -name CACHEDIR.TAG 2>/dev/null | LC_ALL=C sort)
+  [[ -n "$named" ]] || return 0
+  echo "FAIL: cargo targets inside rust/:$named" >&2
+  echo "      cargo-mutants copies every one of them into every job's copy (it leaves out only its" >&2
+  echo "      own rust/target): on 2026-10-13 four of them were 25.8 GB of each copy and filled the" >&2
+  echo "      disk. Delete them, or point CARGO_TARGET_DIR outside rust/. Nothing was copied or built." >&2
+  return 2
+}
+
+mutants_remove() {
+  local path="$1" kb
+  kb="$(du -sk "$path" 2>/dev/null | cut -f1 || true)"
+  rm -rf "$path" 2>/dev/null || true
+  if [[ -e "$path" ]]; then
+    echo "could not remove ${path##*/}" >&2
+    return 0
+  fi
+  kb="${kb:-0}"
+  echo "swept ${path##*/} ($(mutants_gb "$kb") GB)" >&2
+  swept_n=$((swept_n + 1))
+  swept_kb=$((swept_kb + kb))
+}
+
+# Another gate's copies are in use. Under merge-gate.sh the lock is this process's
+# parent's, and inherit_gate_lock is what says so.
+mutants_sweep_allowed() {
+  local holder verdict=0
+  holder="$(cat "$GATE_LOCK/owner" 2>/dev/null || true)"
+  [[ -n "$holder" ]] || return 0
+  inherit_gate_lock "$GATE_LOCK" >&2 && return 0
+  owner_alive "$holder" || verdict=$?
+  case "$verdict" in
+    0) echo "another gate is running ($(describe_owner "$holder")): sweep skipped" >&2; return 1 ;;
+    2) echo "the gate lock was taken on $(record_field where "$holder"), whose process cannot be looked up from here: sweep skipped" >&2; return 1 ;;
+  esac
+}
+
+# Everything in the judge's own scratch older than 6 h; in the system temp only the
+# leftovers from before the scratch existed, and only what proves to be the judge's.
+mutants_sweep() {
+  local scr="$1" sys="$2" path name kb
+  swept_n=0 swept_kb=0
+  mutants_sweep_allowed || return 0
+  while IFS= read -r -d '' path; do
+    mutants_remove "$path"
+  done < <(find -P "$scr" -mindepth 1 -maxdepth 1 -mmin +"$MUTANTS_SWEEP_MINUTES" -print0 2>/dev/null)
+  while IFS= read -r -d '' path; do
+    name="${path##*/}"
+    if grep -q '^name = "memory-industry"[[:space:]]*$' "$path/Cargo.toml" 2>/dev/null; then
+      mutants_remove "$path"
+    else
+      kb="$(du -sk "$path" 2>/dev/null | cut -f1 || true)"
+      echo "not provably the gate's, left alone: $name ($(mutants_gb "${kb:-0}") GB)" >&2
+    fi
+  done < <(find -P "$sys" -mindepth 1 -maxdepth 1 -type d -name 'cargo-mutants-rust-*.tmp' -mmin +"$MUTANTS_SWEEP_MINUTES" -print0 2>/dev/null)
+  while IFS= read -r -d '' path; do
+    mutants_remove "$path"
+  done < <(find -P "$sys" -mindepth 1 -maxdepth 1 -type d -name 'cuba-attrs-*' -mmin +"$MUTANTS_SWEEP_MINUTES" -print0 2>/dev/null)
+  while IFS= read -r -d '' path; do
+    [[ ! -d "$path/mutants.out" ]] || mutants_remove "$path"
+  done < <(find -P "$sys" -mindepth 1 -maxdepth 1 -type d -name 'tmp.*' -mmin +"$MUTANTS_SWEEP_MINUTES" -print0 2>/dev/null)
+  echo "sweep: freed $(mutants_gb "$swept_kb") GB in $swept_n entries" >&2
+}
+
+# Sets MUTANTS_PLANNED_JOBS and MUTANTS_SCRATCH, and returns the rule's own code.
+# Sourced here and not at the top because the modes that judge a file need no lock.
+mutants_prepare_scratch() {
+  local want="$1" sys scr free per_gb reserve_gb value plan rc=0
+  # shellcheck source=scripts/gate-lock.sh
+  source "$ROOT/scripts/gate-lock.sh"
+  mutants_refuse_targets_in_tree || return $?
+  sys="$(mutants_system_temp)"
+  scr="$(mutants_scratch_dir)"
+  # Everything old in the scratch is swept, so it cannot be a directory of anybody else's.
+  if [[ "$scr" -ef "$sys" || "$scr" -ef "$HOME" || "$scr" -ef / ]]; then
+    echo "FAIL: the scratch directory $scr is a directory of everybody's, and the judge sweeps everything in its own that is older than 6 h. Point MUTANTS_SCRATCH_DIR at one of its own." >&2
+    return 2
+  fi
+  mkdir -p "$scr" || { echo "FAIL: could not create the scratch directory $scr" >&2; return 2; }
+  mutants_sweep "$scr" "$sys"
+  free="$(df -Pk "$scr" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  per_gb="${MUTANTS_SCRATCH_GB_PER_COPY:-$MUTANTS_SCRATCH_GB_PER_COPY_MEASURED}"
+  reserve_gb="${CUBA_GATE_MIN_FREE_GB:-8}"
+  for value in "$per_gb" "$reserve_gb"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || { echo "FAIL: MUTANTS_SCRATCH_GB_PER_COPY and CUBA_GATE_MIN_FREE_GB are whole numbers of GB (got '$value')." >&2; return 2; }
+  done
+  plan="$(mutants_disk_plan "$scr" "$free" $((10#$per_gb * MUTANTS_KB_PER_GB)) $((10#$reserve_gb * MUTANTS_KB_PER_GB)) "$want")" || rc=$?
+  (( rc == 0 )) || return "$rc"
+  MUTANTS_PLANNED_JOBS="${plan#jobs=}"
+  MUTANTS_SCRATCH="$scr"
 }
 
 # --- self-test: the build judge gets the fixtures that have to stop it --------
@@ -685,6 +874,15 @@ case "${1:-}" in
     check_builds "$2"
     exit $?
     ;;
+  "--disk-plan")
+    mutants_disk_plan "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
+    exit $?
+    ;;
+  "--prepare-scratch")
+    mutants_prepare_scratch "${2:-}" || exit $?
+    printf 'jobs=%s\nscratch=%s\n' "$MUTANTS_PLANNED_JOBS" "$MUTANTS_SCRATCH"
+    exit 0
+    ;;
   "") ;;
   *) echo "FAIL: unknown argument '$1'" >&2; exit 2 ;;
 esac
@@ -744,6 +942,12 @@ default_mutants_jobs() {
 MUTANTS_JOBS="${MUTANTS_JOBS:-$(default_mutants_jobs)}"
 echo "mutants jobs=$MUTANTS_JOBS (cores=$(machine_cores) ram=$(machine_ram_gb)GB)"
 
+# The disk has the last word on the jobs, an explicit MUTANTS_JOBS included, and
+# decides before anything is copied.
+mutants_prepare_scratch "$MUTANTS_JOBS" || exit $?
+MUTANTS_JOBS="$MUTANTS_PLANNED_JOBS"
+SCRATCH_NATIVE="$(cygpath -w "$MUTANTS_SCRATCH" 2>/dev/null || printf '%s' "$MUTANTS_SCRATCH")"
+
 echo "=== cargo mutants (search cores with dense unit tests) ==="
 # judge.rs / tools.rs / full search/* generate 655 mutants (~12h) and miss
 # almost every change in untested branches (LLM resolve, ONNX decode fallback).
@@ -768,6 +972,14 @@ unset CARGO_TARGET_DIR
 # between two backslash continuations ends the command, and the shell then
 # tries to run `--timeout` as a program. That is rc=127, and it is how this
 # script failed the gate once already.
+#
+# The scratch is the judge's own directory, in the three spellings of the temp
+# dir: TMP and TEMP are what cargo-mutants reads on Windows (TMPDIR moves
+# nothing there), TMPDIR what it reads on Unix. Debug info is off for this
+# command only: on 2026-10-13 7.6 of the 14.1 GB of a copy's target were .pdb,
+# and with it off the copy was 8.94 GB, 37 % smaller. Prefix assignments, so
+# nothing else in the gate sees them.
+TMP="$SCRATCH_NATIVE" TEMP="$SCRATCH_NATIVE" TMPDIR="$MUTANTS_SCRATCH" CARGO_PROFILE_DEV_DEBUG=0 \
 cargo mutants \
   --file 'src/search/mmr.rs' \
   --file 'src/search/rrf.rs' \
