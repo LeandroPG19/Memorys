@@ -2595,13 +2595,38 @@ fn embedder_state_from(
 /// decided by the order libtest happened to schedule them in — and a test that
 /// asserted here would go red on an unmutated tree half the time.
 fn reranker_state() -> ModelState {
+    let (resolved, failure, placement) = read_cell_first(
+        crate::search::rerank::status_resolved,
+        crate::search::rerank::failure_reason,
+        || crate::gpu::placement(crate::gpu::Workload::Reranker),
+    );
     reranker_state_from(
-        crate::search::rerank::failure_reason(),
-        crate::gpu::placement(crate::gpu::Workload::Reranker).as_ref(),
+        failure,
+        placement.as_ref(),
         crate::search::rerank::resolved_model_dir().is_some(),
         crate::search::rerank::is_configured(),
-        crate::search::rerank::status_resolved(),
+        resolved,
     )
+}
+
+/// The three reads that say whether a model's session exists and where, taken
+/// through one function so that the order they are taken in is written once.
+///
+/// Returns `(resolved, failure, placement)`.
+///
+/// This body reads in today's order, failure, then placement, then resolved.
+/// The order the poll needs is the reverse, and it is the next change: it has
+/// to be in this one place, with `reranker_state` and `nli_state` already
+/// calling it.
+fn read_cell_first(
+    status_resolved: impl FnOnce() -> bool,
+    failure_reason: impl FnOnce() -> Option<String>,
+    placement: impl FnOnce() -> Option<crate::gpu::Placement>,
+) -> (bool, Option<String>, Option<crate::gpu::Placement>) {
+    let failure = failure_reason();
+    let placement = placement();
+    let resolved = status_resolved();
+    (resolved, failure, placement)
 }
 
 /// The reranker's state, from the four facts that decide it and nothing else.
@@ -2874,12 +2899,17 @@ fn trailing_blanks(path: &[char]) -> &[char] {
 /// short-circuited version turns on a process-wide `OnceLock` that another
 /// test in this binary resolves.
 fn nli_state() -> ModelState {
+    let (resolved, failure, placement) = read_cell_first(
+        crate::cognitive::nli::status_resolved,
+        crate::cognitive::nli::failure_reason,
+        || crate::gpu::placement(crate::gpu::Workload::Nli),
+    );
     nli_state_from(
-        crate::cognitive::nli::failure_reason(),
-        crate::gpu::placement(crate::gpu::Workload::Nli).as_ref(),
+        failure,
+        placement.as_ref(),
         crate::cognitive::nli::deferred_by_resource_plan(),
         crate::cognitive::nli::available(),
-        crate::cognitive::nli::status_resolved(),
+        resolved,
     )
 }
 
@@ -5767,6 +5797,175 @@ OUT: no hay model.onnx ni model_quantized.onnx en <R>
                     );
                 }
             }
+        }
+    }
+
+    /// A poll that is already running when a model's cell resolves reads the
+    /// cell and the registry at two different instants. The world is made to
+    /// flip at an exact read, so every position the load can land in is tried
+    /// without a thread or a sleep: read number `flip`, counting from 0 in the
+    /// order `read_cell_first` takes them, is the first one to see the
+    /// resolved world. `flip == 3` is a load that lands after the poll.
+    ///
+    /// Whatever the order of the reads, the answer has to be one that was true
+    /// at some instant of the poll: the row before the load, or the row of the
+    /// result. «loaded» without a device is neither, and nor is «loaded» over a
+    /// model that failed.
+    #[test]
+    fn a_poll_that_crosses_the_load_never_shows_a_loaded_model_without_its_device() {
+        struct Outcome {
+            name: &'static str,
+            failure: Option<String>,
+            placement: Option<crate::gpu::Placement>,
+            state: &'static str,
+            device: Option<&'static str>,
+        }
+        let outcomes = [
+            Outcome {
+                name: "Loaded+Gpu",
+                failure: None,
+                placement: Some(crate::gpu::Placement::Gpu),
+                state: "loaded",
+                device: Some("gpu"),
+            },
+            Outcome {
+                name: "Loaded+Cpu",
+                failure: None,
+                placement: Some(crate::gpu::Placement::Cpu),
+                state: "loaded",
+                device: Some("cpu"),
+            },
+            Outcome {
+                name: "Loaded+CpuAfterProviderFailed",
+                failure: None,
+                placement: Some(crate::gpu::Placement::CpuAfterProviderFailed(
+                    "refusal k3".to_string(),
+                )),
+                state: "loaded",
+                device: Some("cpu"),
+            },
+            Outcome {
+                name: "Failed, the commit refused",
+                failure: Some("load model: k3".to_string()),
+                placement: None,
+                state: "failed",
+                device: None,
+            },
+            Outcome {
+                name: "Failed, the tokenizer after the commit",
+                failure: Some("tokenizer.json missing k3".to_string()),
+                placement: Some(crate::gpu::Placement::Cpu),
+                state: "failed",
+                device: None,
+            },
+        ];
+
+        for outcome in &outcomes {
+            for flip in 0..=3usize {
+                let reads = std::cell::Cell::new(0usize);
+                let sees_resolved_world = || {
+                    let k = reads.get();
+                    reads.set(k + 1);
+                    k >= flip
+                };
+                let (resolved, failure, placement) = read_cell_first(
+                    sees_resolved_world,
+                    || {
+                        if sees_resolved_world() {
+                            outcome.failure.clone()
+                        } else {
+                            None
+                        }
+                    },
+                    || {
+                        if sees_resolved_world() {
+                            outcome.placement.clone()
+                        } else {
+                            None
+                        }
+                    },
+                );
+                assert_eq!(
+                    reads.get(),
+                    3,
+                    "{}, flip={flip}: read_cell_first has to read the resolved flag, the failure \
+                     and the placement, once each",
+                    outcome.name
+                );
+
+                let rows = [
+                    (
+                        "reranker",
+                        reranker_state_from(
+                            failure.clone(),
+                            placement.as_ref(),
+                            true,
+                            true,
+                            resolved,
+                        ),
+                    ),
+                    (
+                        "nli",
+                        nli_state_from(failure, placement.as_ref(), false, true, resolved),
+                    ),
+                ];
+                for (model, row) in rows {
+                    let at = format!("{model}, {}, flip={flip}: {row:?}", outcome.name);
+                    if row.state == "loaded" {
+                        assert!(
+                            row.device.is_some(),
+                            "a loaded model with no device is a poll that read the registry \
+                             before the load wrote it and the cell after it resolved: {at}"
+                        );
+                    }
+                    if outcome.state == "failed" {
+                        assert_ne!(
+                            row.state, "loaded",
+                            "a model that failed to open was reported as loaded: {at}"
+                        );
+                    }
+                    assert!(
+                        row.state == "configured" || row.state == outcome.state,
+                        "the row is neither the one before the load nor the one the load \
+                         produced: {at}"
+                    );
+                    if flip == 0 {
+                        assert_eq!(
+                            (row.state, row.device),
+                            (outcome.state, outcome.device),
+                            "a poll that starts after the load has to say exactly what the \
+                             load did: {at}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The order of the reads only holds if there is one place that takes them.
+    /// A fourth caller that reads its own way, or one of these two going back to
+    /// reading in line, brings the mixed-instant answer back with every test of
+    /// `read_cell_first` still green.
+    #[test]
+    fn the_reranker_and_nli_rows_read_their_cell_through_the_one_ordered_reader() {
+        let source = include_str!("http.rs");
+        for header in ["fn reranker_state()", "fn nli_state()"] {
+            let body = source
+                .split_once(header)
+                .unwrap_or_else(|| panic!("{header} is in this file"))
+                .1
+                .split_once("\n}")
+                .unwrap_or_else(|| panic!("{header} ends"))
+                .0;
+            let code: Vec<&str> = body
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect();
+            assert!(
+                code.iter().any(|line| line.contains("read_cell_first(")),
+                "{header} has to take the cell and the registry through read_cell_first, or \
+                 the order they are read in is decided here again, by hand"
+            );
         }
     }
 }
