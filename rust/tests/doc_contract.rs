@@ -1674,15 +1674,6 @@ fn the_lan_guide_gives_the_fixed_address_steps_and_the_dhcp_warning() {
     );
 }
 
-/// The changelog block of the release in progress, and one `###` part of it. That block is the
-/// one headed `[Unreleased]` before the release commit renames it, and the one headed with the
-/// crate's own version after; following `CARGO_PKG_VERSION` keeps the check alive on both sides
-/// of the rename and across the next bump.
-fn changelog_part(changelog: &str, heading: &str) -> Option<String> {
-    changelog_part_of(changelog, "Unreleased", heading)
-        .or_else(|| changelog_part_of(changelog, env!("CARGO_PKG_VERSION"), heading))
-}
-
 /// One `###` part of the changelog block headed `[<version>]`. A contract that belongs to the
 /// release that introduced it names that release here instead of following the crate's version.
 fn changelog_part_of(changelog: &str, version: &str, heading: &str) -> Option<String> {
