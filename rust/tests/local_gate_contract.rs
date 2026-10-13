@@ -590,8 +590,12 @@ fn the_second_judge_can_look_at_a_branch_and_its_crap_gate_can_fail() {
         "lizard used to run as (cd .. && lizard \"$@\") || true, with no ceiling, so its exit code carried no information either way and the CRAP gate was printed text."
     );
     assert!(
-        q.contains("LIZARD_CC_MAX") && q.contains("lizard -C"),
-        "lizard only returns a meaningful exit code when it is given a ceiling."
+        q.contains("cc_max=\"${LIZARD_CC_MAX:-8}\""),
+        "the ceiling has to come from LIZARD_CC_MAX with a default: without one there is no line between a function that is allowed and one that is not."
+    );
+    assert!(
+        q.contains("-v max=\"$cc_max\"") && q.contains("if (ccn[i] <= max + 0) continue"),
+        "lizard is run once with --csv and no -C, so its exit code says nothing: the ceiling lives in the awk of lizard_warnings, which has to compare every CCN with cc_max. Take that comparison out and every function in the diff is reported, or none is."
     );
 
     let baseline = read("scripts/lizard-baseline.txt");
@@ -1160,9 +1164,10 @@ fn a_release_cargo_call_in_the_gate_carries_the_features_the_release_build_used(
 /// CRAP: src/service.rs::keys_offered is at CC 6, over the ceiling of 8
 /// ```
 ///
-/// Six is not over eight. `lizard -w` also warns on length and on NLOC, and
+/// Six is not over eight. `lizard -w` also warned on length and on NLOC, and
 /// every warning a CCN could be parsed out of was counted as a complexity
-/// violation. Its `--self-test` runs a fixture for each shape the filter has to
+/// violation; the script now reads the CCN from the `--csv` column and applies
+/// the ceiling itself. Its `--self-test` runs a fixture for each shape the filter has to
 /// tell apart — the warnings it must swallow whole, the violations it must
 /// report with their number — and says whether every direction held. Which
 /// fixtures those are is the script's business: counting them here is the same
