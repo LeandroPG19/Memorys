@@ -889,6 +889,30 @@ mod tests {
         assert!(r.unwrap().contains("typo"));
     }
 
+    // `"verbose": true` in the user's Claude Code settings makes the CLI print an array of
+    // events instead of the single envelope; the verdict is in the text of its last `result`.
+    #[test]
+    fn a_verdict_is_read_out_of_a_verbose_event_array() {
+        let raw = serde_json::json!([
+            {"type": "system", "subtype": "init", "mcp_servers": [], "tools": ["Task"]},
+            {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}},
+            {
+                "type": "result", "subtype": "success", "is_error": false,
+                "result": "```json\n{\"verdict\":\"misma\",\"confidence\":0.95,\"reason\":\"doble t es un typo\"}\n```"
+            }
+        ])
+        .to_string();
+        let (v, c, r) = parse_same_entity(&raw);
+        assert_eq!(
+            v,
+            Some(true),
+            "an array of events is not an envelope object; without the last `result` the pair \
+             stays «sin veredicto» and is never merged"
+        );
+        assert_eq!(c, 0.95);
+        assert!(r.unwrap().contains("typo"));
+    }
+
     #[test]
     fn a_contradicted_group_is_left_alone() {
         let base = distinct("mapupita-simulador", 11);

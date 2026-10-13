@@ -986,6 +986,199 @@ mod parse_tests {
             "unknown"
         );
     }
+
+    // Captured from `claude 2.1.296 --print --output-format json` with `"verbose": true` in the
+    // user's settings: the CLI then prints an array of events instead of one envelope object.
+    // Trimmed to six events; the text of the last `result` keeps its fences.
+    const VERBOSE_JUDGE: &str = r#"[{"type":"system","subtype":"init","cwd":"/home/leandro","session_id":"f9710f0a","tools":["Task","Bash","Read"],"mcp_servers":[],"model":"claude-haiku-4-5","permissionMode":"default","slash_commands":["compact","review"],"apiKeySource":"none","claude_code_version":"2.1.296","output_style":"default","agents":["general-purpose"]},
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1791871200,"rateLimitType":"five_hour","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.01,"resetsAt":1791871200}}},"uuid":"cbdc481f","session_id":"f9710f0a"},
+{"type":"system","subtype":"thinking_tokens","estimated_tokens":50,"estimated_tokens_delta":50,"session_id":"f9710f0a","uuid":"a4f5490a"},
+{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001","id":"msg_011C","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"EqEXCtAB"}],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":4}},"parent_tool_use_id":null,"session_id":"f9710f0a","uuid":"b1"},
+{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001","id":"msg_011C","type":"message","role":"assistant","content":[{"type":"text","text":"```json\n{\"verdict\": \"contradicts\", \"confidence\": 0.95, \"reason\": \"8080 vs 9090\"}\n```"}],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":31}},"parent_tool_use_id":null,"session_id":"f9710f0a","uuid":"b2"},
+{"type":"result","subtype":"success","is_error":false,"duration_ms":9670,"num_turns":1,"result":"```json\n{\"verdict\": \"contradicts\", \"confidence\": 0.95, \"reason\": \"8080 vs 9090\"}\n```","stop_reason":"end_turn","session_id":"f9710f0a","total_cost_usd":0.054,"usage":{"input_tokens":10,"output_tokens":31},"permission_denials":[],"terminal_reason":"completed"}]"#;
+
+    const INIT_EVENT: &str = r#"{"type":"system","subtype":"init","cwd":"/home/leandro","session_id":"f9710f0a","tools":["Task","Bash","Read"],"mcp_servers":[],"model":"claude-haiku-4-5"}"#;
+
+    fn events(tail: &[String]) -> String {
+        format!("[{INIT_EVENT},{}]", tail.join(","))
+    }
+
+    fn result_event(text: &str) -> String {
+        serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": text
+        })
+        .to_string()
+    }
+
+    fn assistant_text(text: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        })
+        .to_string()
+    }
+
+    fn error_result_event() -> String {
+        serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": true,
+            "result": r#"{"verdict":"supports","confidence":0.9}"#
+        })
+        .to_string()
+    }
+
+    const FENCED_UNRELATED_06: &str =
+        "```json\n{\"verdict\":\"unrelated\",\"confidence\":0.6}\n```";
+    const FENCED_CONTRADICTS_09: &str =
+        "```json\n{\"verdict\":\"contradicts\",\"confidence\":0.9}\n```";
+
+    #[test]
+    fn reads_the_verdict_from_the_last_result_event_of_a_verbose_array() {
+        let j = parse_judgment(VERBOSE_JUDGE);
+        assert_eq!(
+            j.verdict, "contradicts",
+            "with `verbose` the CLI prints an array of events; the verdict lives in the text of \
+             its last `result` event, and cutting from the first `{{` to the last `}}` of the \
+             whole array is not JSON"
+        );
+        assert_eq!(j.confidence, 0.95);
+        assert!(
+            j.reason.as_deref().is_some_and(|r| r.contains("8080")),
+            "the reason travels with the verdict: {:?}",
+            j.reason
+        );
+    }
+
+    #[test]
+    fn the_last_result_event_wins_and_what_follows_it_is_ignored() {
+        let hook = serde_json::json!({
+            "type": "system", "subtype": "hook_response",
+            "output": r#"{"verdict":"supports"}"#
+        })
+        .to_string();
+        let raw = events(&[
+            result_event(FENCED_UNRELATED_06),
+            result_event(FENCED_CONTRADICTS_09),
+            hook,
+        ]);
+        let j = parse_judgment(&raw);
+        assert_eq!(
+            j.verdict, "contradicts",
+            "the first result is an earlier turn and the hook after the last one is not the answer"
+        );
+        assert_eq!(j.confidence, 0.9);
+    }
+
+    #[test]
+    fn noise_events_with_braces_never_leak_into_the_verdict() {
+        let rows: [(&str, String); 4] = [
+            (
+                "assistant text that looks like a verdict",
+                assistant_text(r#"{"verdict":"supports","confidence":0.99}"#),
+            ),
+            (
+                "init with a nested mcp_servers object",
+                r#"{"type":"system","subtype":"init","mcp_servers":[{"name":"x","status":"failed"}]}"#
+                    .to_string(),
+            ),
+            (
+                "nested rate_limit_event",
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.01}}}}"#
+                    .to_string(),
+            ),
+            (
+                "system event whose text has unbalanced braces",
+                serde_json::json!({"type": "system", "subtype": "note", "text": "}{"}).to_string(),
+            ),
+        ];
+        for (row, noise) in rows {
+            let raw = events(&[
+                noise,
+                result_event(r#"{"verdict":"unrelated","confidence":0.7}"#),
+            ]);
+            let j = parse_judgment(&raw);
+            assert_eq!(j.verdict, "unrelated", "row: {row}");
+            assert_eq!(j.confidence, 0.7, "row: {row}");
+        }
+    }
+
+    #[test]
+    fn an_event_array_without_a_result_event_is_unknown() {
+        let raw = events(&[assistant_text(
+            r#"{"verdict":"contradicts","confidence":0.9}"#,
+        )]);
+        let j = parse_judgment(&raw);
+        assert_eq!(
+            j.verdict, "unknown",
+            "a stream that never reached `result` is an answer that did not finish; the text of \
+             an assistant event is not rescued"
+        );
+        assert_eq!(j.confidence, 0.0);
+    }
+
+    #[test]
+    fn an_error_result_is_never_read_as_a_verdict() {
+        let as_object = error_result_event();
+        let as_last_event = events(&[error_result_event()]);
+        for (shape, raw) in [
+            ("single object", as_object),
+            ("last event of an array", as_last_event),
+        ] {
+            let j = parse_judgment(&raw);
+            assert_eq!(
+                j.verdict, "unknown",
+                "the CLI's error message is not the model's answer ({shape})"
+            );
+            assert_eq!(j.confidence, 0.0, "({shape})");
+        }
+    }
+
+    #[test]
+    fn unwrap_cli_reply_returns_the_text_of_the_last_result_event() {
+        assert_eq!(
+            unwrap_cli_reply(VERBOSE_JUDGE),
+            "```json\n{\"verdict\": \"contradicts\", \"confidence\": 0.95, \"reason\": \"8080 vs 9090\"}\n```",
+            "the decoded string, fences included: whoever strips them is the next function"
+        );
+    }
+
+    #[test]
+    fn unwrap_cli_reply_leaves_a_bare_array_of_facts_alone() {
+        let facts = r#"[{"entity_name":"X","content":"did Y","observation_type":"decision"}]"#;
+        assert_eq!(
+            unwrap_cli_reply(facts),
+            facts,
+            "the old extraction format has no `result` event and must pass through untouched"
+        );
+        assert_eq!(unwrap_cli_reply("[]"), "[]");
+    }
+
+    #[test]
+    fn unwrap_cli_reply_of_a_result_event_without_text_is_empty() {
+        let raw = events(&[
+            r#"{"type":"result","subtype":"error_max_turns","is_error":false,"num_turns":3}"#
+                .to_string(),
+        ]);
+        assert_eq!(
+            unwrap_cli_reply(&raw),
+            "",
+            "a `result` event with no text is not an answer, and handing back the whole array \
+             would let its braces be read as one"
+        );
+    }
+
+    #[test]
+    fn unwrap_cli_reply_of_an_error_result_is_empty() {
+        assert_eq!(
+            unwrap_cli_reply(&error_result_event()),
+            "",
+            "single object with is_error true"
+        );
+        assert_eq!(
+            unwrap_cli_reply(&events(&[error_result_event()])),
+            "",
+            "last event of an array with is_error true"
+        );
+    }
 }
 
 pub fn which_in_path(cmd: &str) -> bool {

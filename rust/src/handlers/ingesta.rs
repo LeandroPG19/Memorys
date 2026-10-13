@@ -1457,6 +1457,49 @@ mod tests {
         );
     }
 
+    // With `"verbose": true` in the user's Claude Code settings the CLI prints an array of
+    // events; `extraction_reply_within` opens it with `unwrap_cli_reply` and then parses.
+    fn verbose_extraction(with_result: bool) -> String {
+        let facts = r#"{"facts":[{"entity_name":"svc-w11","content":"svc-w11 runs on PostgreSQL","observation_type":"fact"}],"relations":[{"from":"svc-w11","to":"PostgreSQL","relation_type":"depends_on"}]}"#;
+        let mut events = vec![
+            json!({"type": "system", "subtype": "init", "mcp_servers": [], "tools": ["Task"]}),
+            json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": facts}]}
+            }),
+        ];
+        if with_result {
+            events.push(json!({
+                "type": "result", "subtype": "success", "is_error": false, "result": facts
+            }));
+        }
+        Value::Array(events).to_string()
+    }
+
+    #[test]
+    fn facts_are_read_out_of_a_verbose_event_array() {
+        let reply = crate::cognitive::judge::unwrap_cli_reply(&verbose_extraction(true));
+        let (facts, relations) = parse_extraction_reply(&reply);
+        assert_eq!(
+            facts.len(),
+            1,
+            "the facts sit in the text of the last `result` event, not in the array of events"
+        );
+        assert_eq!(facts[0]["entity_name"], "svc-w11");
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].relation_type, "depends_on");
+    }
+
+    #[test]
+    fn an_event_array_without_a_result_yields_no_facts() {
+        let reply = crate::cognitive::judge::unwrap_cli_reply(&verbose_extraction(false));
+        let (facts, relations) = parse_extraction_reply(&reply);
+        assert!(
+            facts.is_empty() && relations.is_empty(),
+            "a stream that never reached `result` did not finish; the assistant text is not rescued"
+        );
+    }
+
     /// The CLI judges redact their stderr, but an OpenAI-compat backend puts
     /// the vendor's response body in its error as it came, and that error is
     /// what `backend_failed` now sends back in its note.
