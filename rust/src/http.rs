@@ -2594,6 +2594,9 @@ fn embedder_state_from(
 /// test in this binary resolves, so which branch a test even reached was
 /// decided by the order libtest happened to schedule them in — and a test that
 /// asserted here would go red on an unmutated tree half the time.
+///
+/// The cell goes before the registry (see `read_cell_first`): a poll that
+/// crosses the load must not see the session resolved but its device missing.
 fn reranker_state() -> ModelState {
     let (resolved, failure, placement) = read_cell_first(
         crate::search::rerank::status_resolved,
@@ -2614,18 +2617,24 @@ fn reranker_state() -> ModelState {
 ///
 /// Returns `(resolved, failure, placement)`.
 ///
-/// This body reads in today's order, failure, then placement, then resolved.
-/// The order the poll needs is the reverse, and it is the next change: it has
-/// to be in this one place, with `reranker_state` and `nli_state` already
-/// calling it.
+/// The order is the point: resolved, then failure, then placement.
+///
+/// `gpu::open` writes the registry inside the `get_or_init` closure that opens
+/// the session, so a cell that reads as resolved already has its placement
+/// published (`OnceLock::get` and the registry's `Mutex` both acquire). Reading
+/// the registry or the failure first lets the load finish between two reads and
+/// shows `loaded` without its device, or `loaded` over a model that failed.
+/// Reading the cell first can only be early: an unresolved cell is
+/// `configured`, or `failed` if the second read already sees the failure, and
+/// both were true at some instant of the poll.
 fn read_cell_first(
     status_resolved: impl FnOnce() -> bool,
     failure_reason: impl FnOnce() -> Option<String>,
     placement: impl FnOnce() -> Option<crate::gpu::Placement>,
 ) -> (bool, Option<String>, Option<crate::gpu::Placement>) {
+    let resolved = status_resolved();
     let failure = failure_reason();
     let placement = placement();
-    let resolved = status_resolved();
     (resolved, failure, placement)
 }
 
@@ -2698,7 +2707,7 @@ const EMBEDDER_DIR_INSTEAD_OF_A_PATH: &str = "the embedder directory (see ONNX_M
 /// runtime's too.
 const RUNTIME_DIR_INSTEAD_OF_A_PATH: &str = "the ONNX Runtime directory (see ORT_DYLIB_PATH)";
 
-/// A model whose session is open, from where `gpu::configure` says it opened.
+/// A model whose session is open, from where `gpu::open` says it opened.
 ///
 /// With nothing in the registry the device is `None`: the answer `/health` used
 /// to give here was the placement *plan*, and on a machine where the provider
