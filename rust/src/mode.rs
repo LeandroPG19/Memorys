@@ -156,6 +156,48 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_given_before_the_reranker_has_a_placement_is_not_kept() {
+        let cell = OnceLock::new();
+
+        assert!(
+            rerank_gpu_active_in(&cell, false, || true),
+            "with no placement the judge's answer is returned as it comes"
+        );
+        assert_eq!(
+            cell.get(),
+            None,
+            "an answer given before the reranker has a placement is a prediction and must \
+             not be kept"
+        );
+        assert!(
+            !rerank_gpu_active_in(&cell, true, || false),
+            "this is the second search with the reranker deferred: it already opened on the \
+             CPU after the provider refused, and the judgment now says no"
+        );
+        assert_eq!(
+            cell.get(),
+            Some(&false),
+            "the answer given once the reranker has a placement is the one kept"
+        );
+    }
+
+    #[test]
+    fn once_the_reranker_has_a_placement_the_answer_is_kept_and_not_judged_again() {
+        let cell = OnceLock::new();
+
+        assert!(rerank_gpu_active_in(&cell, true, || true));
+        assert_eq!(cell.get(), Some(&true));
+        assert!(
+            rerank_gpu_active_in(&cell, true, || panic!("a kept answer is not judged again")),
+            "a kept answer is returned without judging again"
+        );
+        assert!(
+            rerank_gpu_active_in(&cell, false, || panic!("a kept answer is not judged again")),
+            "a filled cell is final whatever the placement flag says"
+        );
+    }
+
+    #[test]
     fn a_real_gpu_turns_rerank_on_even_outside_completo_mode() {
         assert!(
             rerank_default_for(Mode::Local, true),
