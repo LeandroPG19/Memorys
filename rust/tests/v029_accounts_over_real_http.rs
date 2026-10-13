@@ -16,6 +16,7 @@
 //! so, and the manual check on the host covers the real bind.
 
 mod common;
+mod doctor_world;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -24,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use common::in_a_scratch_database;
+use doctor_world::DoctorWorld;
 use memory_industry::accounts::{
     self, PairRequest, PairResponse, Secret, code_key, fingerprint, generate_code, identity_proof,
     normalize_code, pair_request_mac, pair_response_mac, random_bytes, verify_mac,
@@ -1885,13 +1887,15 @@ fn accounts_check(checks: &[memory_industry::doctor::Check]) -> &memory_industry
 #[tokio::test]
 async fn g16_account_facts_count_what_the_database_holds_and_doctor_prints_them() {
     in_a_scratch_database("brain_g_facts", |url_| async move {
+        let _env = ENV_GUARD.lock().await;
+        let mut world = DoctorWorld::new("g16-facts");
         let pool = migrated(&url_).await;
         let host_id = db::host_identity(&pool)
             .await
             .expect("host identity")
             .host_id;
 
-        let fresh = memory_industry::doctor::run_checks(&pool, &url_).await;
+        let fresh = world.run_checks(&pool, &url_).await;
         let check = accounts_check(&fresh);
         assert_eq!(
             check.status,
@@ -1936,7 +1940,7 @@ async fn g16_account_facts_count_what_the_database_holds_and_doctor_prints_them(
         );
         assert_eq!(facts.fingerprint, fingerprint(&host_id));
 
-        let checks = memory_industry::doctor::run_checks(&pool, &url_).await;
+        let checks = world.run_checks(&pool, &url_).await;
         let check = accounts_check(&checks);
         assert!(
             check.detail.contains(&fingerprint(&host_id)),
@@ -1965,6 +1969,8 @@ async fn g16_account_facts_count_what_the_database_holds_and_doctor_prints_them(
 #[tokio::test]
 async fn g16_a_database_without_the_account_tables_is_a_doctor_failure_not_a_crash() {
     in_a_scratch_database("brain_g_no_tables", |url_| async move {
+        let _env = ENV_GUARD.lock().await;
+        let mut world = DoctorWorld::new("g16-no-tables");
         let pool = migrated(&url_).await;
         let mut owner = PgConnection::connect(&url_)
             .await
@@ -1985,7 +1991,7 @@ async fn g16_a_database_without_the_account_tables_is_a_doctor_failure_not_a_cra
             "account_facts must say the tables are missing: {facts:?}"
         );
 
-        let checks = memory_industry::doctor::run_checks(&pool, &url_).await;
+        let checks = world.run_checks(&pool, &url_).await;
         let check = accounts_check(&checks);
         assert_eq!(check.status, memory_industry::doctor::Status::Fail);
         assert!(
@@ -2002,6 +2008,8 @@ async fn g16_a_database_without_the_account_tables_is_a_doctor_failure_not_a_cra
 #[tokio::test]
 async fn g16_the_schema_check_counts_the_account_tables() {
     in_a_scratch_database("brain_g_schema_count", |url_| async move {
+        let _env = ENV_GUARD.lock().await;
+        let mut world = DoctorWorld::new("g16-schema");
         let pool = migrated(&url_).await;
         let schema = |checks: Vec<memory_industry::doctor::Check>| {
             checks
@@ -2010,7 +2018,7 @@ async fn g16_the_schema_check_counts_the_account_tables() {
                 .expect("doctor always reports `schema`")
         };
 
-        let complete = schema(memory_industry::doctor::run_checks(&pool, &url_).await);
+        let complete = schema(world.run_checks(&pool, &url_).await);
         assert_eq!(
             complete.status,
             memory_industry::doctor::Status::Ok,
@@ -2025,7 +2033,7 @@ async fn g16_the_schema_check_counts_the_account_tables() {
             .execute(&mut owner)
             .await
             .expect("removing one of the four tables 0065 added");
-        let short = schema(memory_industry::doctor::run_checks(&pool, &url_).await);
+        let short = schema(world.run_checks(&pool, &url_).await);
         assert_eq!(
             short.status,
             memory_industry::doctor::Status::Fail,
@@ -2035,6 +2043,113 @@ async fn g16_the_schema_check_counts_the_account_tables() {
             short.detail
         );
         owner.close().await.expect("closing the owner connection");
+        pool.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn g16_doctor_reads_only_the_world_the_test_built() {
+    in_a_scratch_database("brain_g_world", |url_| async move {
+        const CANARY: &str = "MEMORY_INDUSTRY_T1_CANARY";
+        const TOUCHED: [&str; 5] = [
+            "HOME",
+            "USERPROFILE",
+            "LOCALAPPDATA",
+            "CUBA_HTTP_ADDR",
+            "CUBA_RERANKER_PATH",
+        ];
+        let _env = ENV_GUARD.lock().await;
+        let pool = migrated(&url_).await;
+        let before: Vec<_> = TOUCHED.iter().map(std::env::var_os).collect();
+        let mut world = DoctorWorld::new("g16-world");
+
+        // Spelled out by hand, not through `llm_cli::config_path`: with the product's own
+        // function a sabotage of it would move the reader and the fixture together.
+        let config_dir = if cfg!(windows) {
+            world.root().join("home").join("AppData").join("Roaming")
+        } else {
+            world.root().join("home").join(".config")
+        }
+        .join("memory-industry");
+        std::fs::create_dir_all(&config_dir).expect("the world's config directory is creatable");
+        let llm_env = config_dir.join("llm.env");
+        std::fs::write(&llm_env, format!("{CANARY}=planted
+")).expect("planting the llm.env");
+
+        assert_eq!(
+            memory_industry::llm_cli::config_path().expect("HOME answers inside the world"),
+            llm_env,
+            "the planted file has to be the one doctor would read; anywhere else, the canary              check below would pass without doctor ever reaching the file"
+        );
+        assert!(
+            std::env::var_os(CANARY).is_none(),
+            "the canary is in the environment before doctor ran, so its absence afterwards              would prove nothing"
+        );
+
+        let checks = world.run_checks(&pool, &url_).await;
+
+        let leaked = std::env::var_os(CANARY);
+        unsafe { std::env::remove_var(CANARY) };
+        assert!(
+            leaked.is_none(),
+            "doctor wrote the llm.env of the home into the process environment ({leaked:?});              that is how the developer's own llm.env gets into every other test of this binary"
+        );
+
+        let check = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("doctor reports a `{name}` check, among {checks:?}"))
+        };
+        let root = world.root().display().to_string();
+        assert!(
+            check("service_install").detail.contains(&root),
+            "the service check names a path outside the world, so it read the machine's own              install: {}",
+            check("service_install").detail
+        );
+        assert!(
+            check("legacy_cache").detail.contains(&root),
+            "the legacy cache check names a path outside the world, so it read the machine's              own home: {}",
+            check("legacy_cache").detail
+        );
+
+        let addr = std::env::var("CUBA_HTTP_ADDR").expect("the world defines the daemon address");
+        assert!(addr.starts_with("127.0.0.1:"), "{addr}");
+        assert!(
+            check("http_port").detail.contains(&addr),
+            "the port check looks at an address that is not the world's, so it follows the              machine's CUBA_HTTP_ADDR or the default: {}",
+            check("http_port").detail
+        );
+        let lan = &check("lan").detail;
+        assert!(
+            lan.contains(&addr) && lan.contains("loopback"),
+            "a loopback address never sends doctor out to ask a daemon: {lan}"
+        );
+
+        assert!(
+            check("graph_db").detail.starts_with("projection disabled"),
+            "the graph backend of the machine reached doctor: {}",
+            check("graph_db").detail
+        );
+        assert!(
+            !check("generative_llm").detail.contains("openai_compat"),
+            "the LLM provider of the machine reached doctor: {}",
+            check("generative_llm").detail
+        );
+
+        let gone = world.root().to_path_buf();
+        drop(world);
+        let after: Vec<_> = TOUCHED.iter().map(std::env::var_os).collect();
+        assert_eq!(
+            after, before,
+            "the world left the process environment different from how it found it"
+        );
+        assert!(
+            !gone.exists(),
+            "the world left its directory behind: {}",
+            gone.display()
+        );
         pool.close().await;
     })
     .await;

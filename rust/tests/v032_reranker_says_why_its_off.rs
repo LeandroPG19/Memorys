@@ -1,3 +1,7 @@
+mod doctor_world;
+
+use doctor_world::DoctorWorld;
+
 #[tokio::test]
 #[ignore]
 async fn resources_starving_it_of_ram_reads_differently_from_no_model_installed() {
@@ -7,7 +11,7 @@ async fn resources_starving_it_of_ram_reads_differently_from_no_model_installed(
         .await
         .expect("connect to test database");
 
-    let original = std::env::var("CUBA_RERANKER_PATH").ok();
+    let mut world = DoctorWorld::new("v032");
 
     unsafe {
         std::env::set_var(
@@ -15,7 +19,7 @@ async fn resources_starving_it_of_ram_reads_differently_from_no_model_installed(
             memory_industry::resources::disabled_model_path(),
         )
     };
-    let starved = memory_industry::doctor::run_checks_with(&pool, &url, false).await;
+    let starved = world.run_checks(&pool, &url).await;
     let starved_reranker = starved
         .iter()
         .find(|c| c.name == "reranker")
@@ -37,13 +41,8 @@ async fn resources_starving_it_of_ram_reads_differently_from_no_model_installed(
         starved_reranker.hint
     );
 
-    unsafe {
-        std::env::set_var(
-            "CUBA_RERANKER_PATH",
-            std::env::temp_dir().join("cuba-v032-nothing-here-at-all"),
-        )
-    };
-    let never_installed = memory_industry::doctor::run_checks_with(&pool, &url, false).await;
+    unsafe { std::env::set_var("CUBA_RERANKER_PATH", world.root().join("no-reranker-here")) };
+    let never_installed = world.run_checks(&pool, &url).await;
     let never_installed_reranker = never_installed
         .iter()
         .find(|c| c.name == "reranker")
@@ -62,9 +61,4 @@ async fn resources_starving_it_of_ram_reads_differently_from_no_model_installed(
         "two different root causes producing the exact same sentence through the real \
          doctor code path is the bug this test exists to catch"
     );
-
-    match original {
-        Some(v) => unsafe { std::env::set_var("CUBA_RERANKER_PATH", v) },
-        None => unsafe { std::env::remove_var("CUBA_RERANKER_PATH") },
-    }
 }

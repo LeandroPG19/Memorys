@@ -5,6 +5,22 @@
 //! 192.0.2.10 is TEST-NET-1 (RFC 5737), documentation space that no machine owns,
 //! so the assertions do not depend on what this box has assigned.
 
+use memory_industry::service_apply::{CommandOutcome, CommandRunner};
+
+/// Answers every question with success, so the `service_task` check never depends on whether the
+/// machine running the test has a scheduled task of that name.
+struct TaskExists;
+
+impl CommandRunner for TaskExists {
+    fn run(&mut self, _program: &str, _args: &[String]) -> std::io::Result<CommandOutcome> {
+        Ok(CommandOutcome {
+            code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn doctor_reports_the_address_the_installed_env_file_holds_not_its_own_environment() {
@@ -48,7 +64,8 @@ async fn doctor_reports_the_address_the_installed_env_file_holds_not_its_own_env
         std::env::set_var("LOCALAPPDATA", &local_app_data);
         std::env::remove_var("CUBA_HTTP_ADDR");
     }
-    let checks = memory_industry::doctor::run_checks_with(&pool, &url, false).await;
+    let checks =
+        memory_industry::doctor::run_checks_with(&pool, &url, false, &mut TaskExists).await;
     unsafe {
         match saved_home {
             Some(v) => std::env::set_var("HOME", v),

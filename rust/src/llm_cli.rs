@@ -748,4 +748,49 @@ mod config_path_tests {
             }
         }
     }
+
+    /// `main` already loads `llm.env` once at startup; `doctor_line` runs later,
+    /// inside the daemon's workers (`admin/status`) and inside every test that
+    /// calls `doctor`, and a `set_var` there copies the developer's file into a
+    /// process other tests are reading. The first guard is the canary's own so
+    /// that today's leak is undone on drop even when the assertion fires.
+    #[tokio::test]
+    async fn doctor_line_reads_the_environment_and_never_writes_into_it() {
+        const CANARY: &str = "MEMORY_INDUSTRY_T1_CANARY";
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _canary = ScopedEnv::cleared(CANARY);
+        let world = scratch_root("llm-doctor-line");
+        let _h = ScopedEnv::set("HOME", &world.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &world.display().to_string());
+        let _llm = [
+            ScopedEnv::cleared("MEMORY_INDUSTRY_LLM_BASE_URL"),
+            ScopedEnv::cleared("CUBA_LLM_BASE_URL"),
+            ScopedEnv::cleared("MEMORY_INDUSTRY_LLM_PROVIDER"),
+            ScopedEnv::cleared("CUBA_LLM_PROVIDER"),
+        ];
+
+        let file = config_path().expect("HOME answers");
+        fs::create_dir_all(file.parent().expect("llm.env has a directory"))
+            .expect("the scratch config directory is creatable");
+        fs::write(&file, format!("{CANARY}=planted\n")).expect("the scratch llm.env is writable");
+
+        let _ = doctor_line().await;
+        let leaked = std::env::var_os(CANARY);
+        assert!(
+            leaked.is_none(),
+            "doctor_line copied the llm.env of this home into the process environment ({leaked:?}): \
+             that is how the developer's own file reaches every other test of the binary, and \
+             inside the daemon it is a set_var with the workers alive"
+        );
+
+        load_saved_config_into_env();
+        assert_eq!(
+            std::env::var(CANARY).as_deref(),
+            Ok("planted"),
+            "the fixture sits where the loader reads it, so the empty environment above was \
+             doctor_line's doing and not a file nobody could have found"
+        );
+
+        let _ = fs::remove_dir_all(&world);
+    }
 }
