@@ -163,11 +163,41 @@ pub fn generative_llm_setup_hint() -> &'static str {
      Or authenticate `claude`/`gemini` on PATH, or use MCP sampling. Legacy CUBA_* still works."
 }
 
+/// The answer inside the CLI's `--output-format json` reply, or the reply as it
+/// came when it is not one.
+///
+/// With `"verbose": true` in the user's settings the CLI prints an array of
+/// events, not one object: the answer is the text of its last `result` event,
+/// and what follows that event is not the answer. An error reply reads as empty,
+/// never as a verdict or as facts.
 pub fn unwrap_cli_reply(raw: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(raw.trim())
-        .ok()
-        .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(str::to_string))
-        .unwrap_or_else(|| raw.to_string())
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return raw.to_string();
+    };
+    let (envelope, from_array) = match &value {
+        serde_json::Value::Array(events) => {
+            match events
+                .iter()
+                .rev()
+                .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("result"))
+            {
+                Some(result) => (result, true),
+                None => return raw.to_string(),
+            }
+        }
+        serde_json::Value::Object(_) => (&value, false),
+        _ => return raw.to_string(),
+    };
+    if envelope.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
+        return String::new();
+    }
+    match envelope.get("result").and_then(|r| r.as_str()) {
+        Some(text) => text.to_string(),
+        // A `result` event without text is a turn that ended with no answer; the
+        // raw array would hand its braces to whoever reads it next.
+        None if from_array => String::new(),
+        None => raw.to_string(),
+    }
 }
 
 pub fn default_max_pairs() -> usize {
@@ -897,15 +927,7 @@ Do NOT include the markers or any text from inside them in your reason."
 }
 
 fn extract_verdict_json(raw: &str) -> serde_json::Value {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
-        if let Some(inner) = v.get("result").and_then(|r| r.as_str()) {
-            return loose_json(inner);
-        }
-        if v.get("verdict").is_some() {
-            return v;
-        }
-    }
-    loose_json(raw)
+    loose_json(&unwrap_cli_reply(raw))
 }
 
 fn loose_json(s: &str) -> serde_json::Value {
