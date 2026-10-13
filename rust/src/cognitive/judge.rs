@@ -189,6 +189,22 @@ pub fn unwrap_cli_reply(raw: &str) -> String {
         _ => return raw.to_string(),
     };
     if envelope.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
+        // Read as no answer, so this line is the only place its cause survives.
+        // Redacted: the text can echo a credential back.
+        let cause = envelope
+            .get("result")
+            .and_then(|r| r.as_str())
+            .map(crate::redact::redact_secrets)
+            .unwrap_or_default();
+        let subtype = envelope
+            .get("subtype")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default();
+        tracing::warn!(
+            cause = %cause,
+            subtype,
+            "el CLI respondió con error: se trata como sin respuesta"
+        );
         return String::new();
     }
     match envelope.get("result").and_then(|r| r.as_str()) {
@@ -930,10 +946,19 @@ fn extract_verdict_json(raw: &str) -> serde_json::Value {
     loose_json(&unwrap_cli_reply(raw))
 }
 
+/// The span from the first `{` to the last `}`. A `}` before the first `{`
+/// (`"} x {"`) has no span: cutting there would slice backwards and panic.
+pub(crate) fn outer_braces(s: &str) -> Option<&str> {
+    let open = s.find('{')?;
+    let close = s.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+    s.get(open..=close)
+}
+
 fn loose_json(s: &str) -> serde_json::Value {
-    let s = s.trim();
-    s.find('{')
-        .and_then(|start| s.rfind('}').map(|end| &s[start..=end]))
+    outer_braces(s.trim())
         .and_then(|body| serde_json::from_str(body).ok())
         .unwrap_or_else(|| serde_json::json!({}))
 }

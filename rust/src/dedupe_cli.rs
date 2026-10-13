@@ -728,9 +728,7 @@ async fn judge_likely(pool: &PgPool, pairs: Vec<(Entity, Entity, f64)>) -> Resul
 fn parse_same_entity(raw: &str) -> (Option<bool>, f64, Option<String>) {
     let inner = crate::cognitive::judge::unwrap_cli_reply(raw);
 
-    let body = inner
-        .find('{')
-        .and_then(|i| inner.rfind('}').map(|j| &inner[i..=j]))
+    let body = crate::cognitive::judge::outer_braces(&inner)
         .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok());
 
     let Some(v) = body else {

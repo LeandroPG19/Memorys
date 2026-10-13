@@ -388,11 +388,8 @@ fn extract_json_object(reply: &str) -> Option<Value> {
     if reply.find('[').is_some_and(|bracket| bracket < open) {
         return None;
     }
-    let close = reply.rfind('}')?;
-    if close <= open {
-        return None;
-    }
-    let parsed: Value = serde_json::from_str(&reply[open..=close]).ok()?;
+    let body = crate::cognitive::judge::outer_braces(reply)?;
+    let parsed: Value = serde_json::from_str(body).ok()?;
     parsed.is_object().then_some(parsed)
 }
 
