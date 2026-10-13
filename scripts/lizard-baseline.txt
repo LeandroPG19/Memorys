@@ -1,163 +1,168 @@
 # Functions already over CC 8 when this line was drawn.
-# The gate fails a function that is NOT here, or one here that got worse.
-# The key is path::function:start-line. The start line is what makes it
-# unique: judge.rs holds two run_prompt, the lookup took the first one in
-# file order, and so the CC 9 one sat behind the CC 10 ceiling of the other
-# and could gain a point with nobody saying anything.
-# The price, accepted: moving a function changes its key, and the gate then
-# says it is not in the baseline. That verdict is loud and obviously wrong,
-# which is the trade for the one it replaces: silent and invisibly wrong.
+# The key is path::function#n, where n counts every function of that name in
+# the file, over the ceiling or not, in the order they begin. The n is what
+# keeps two of the same name apart: judge.rs holds two run_prompt, and one
+# key for both let the CC 9 one gain a point behind the ceiling of the CC 10.
+# Moving a function, or growing or shrinking anything above it, keeps its key.
+# Renaming it, or adding or removing a function of the same name above it in
+# that file, changes the key.
+# Inside the diff the gate is red for: a function that is NOT here, one here
+# that got worse, one that got simpler while this file stayed behind, and an
+# entry here whose function is no longer measured over the ceiling (it fell
+# to it, was renamed or deleted, or lizard lost it inside a neighbour: read
+# lizard --csv on the file before removing the line). Any other shape of
+# line in this file is red too.
 # Every comment below sits over the key it explains, carrying the reason and
 # the owner of a deliberate deviation, and regenerating keeps it there. A key
 # that leaves the baseline takes its comment with it, and regenerating names
 # both. Everything above the next line is rewritten by the script.
 # Regenerate with: ./scripts/quality-gate.sh --update-lizard-baseline
-src/bridge/mod.rs::cli_reconnect:888 9
-src/bridge/proxy.rs::a_body_over_eight_mib_is_refused_without_calling_the_host:925 10
-src/calibrate_cli.rs::run_cli:70 20
+src/bridge/mod.rs::cli_reconnect#1 9
+src/bridge/proxy.rs::a_body_over_eight_mib_is_refused_without_calling_the_host#1 10
+src/calibrate_cli.rs::run_cli#1 20
 # +1: `undo_dir()?`. It used to answer `.` when HOME was not set, so `recall
 # --undo` wrote its journal wherever the operator happened to be standing and
 # the next run could not find it. Propagating instead of guessing is a branch.
 # Same cause as the four setup_agent.rs entries further down. Exact number, no
 # margin: the ratchet has to fail the next increase too.
 # Owner: mejorador 0.27.
-src/cli.rs::run_delete:263 15
-src/cli.rs::run_save:193 10
-src/cli.rs::run_search:71 15
-src/codegraph/mod.rs::walk:88 14
-src/codegraph/python_lang.rs::walk:27 11
-src/codegraph_cli.rs::run_cli:5 30
-src/cognitive/judge.rs::probe_health:583 9
-src/cognitive/judge.rs::resolve_judge:62 9
-src/cognitive/judge.rs::run_prompt:643 10
-src/cognitive/judge.rs::which_in_path:1206 18
-src/cognitive/nli.rs::classify:294 14
-src/cognitive/nli.rs::init:164 16
-src/dashboard.rs::render:44 12
-src/db.rs::init_schema:362 9
-src/dedupe_cli.rs::judge_likely:633 9
-src/dedupe_cli.rs::merge_entity:331 13
-src/dedupe_cli.rs::run_cli:47 30
-src/doctor.rs::run_checks_with:988 43
-src/doctor.rs::run_cli:1581 13
-src/embeddings/onnx.rs::compute_onnx_embedding:450 19
-src/embeddings/onnx.rs::init_onnx_session:307 14
-src/eval/datasets.rs::load_jsonl_dataset:91 14
-src/eval/harness.rs::run_faro_eval:135 21
-src/eval/mod.rs::compare_runs:45 15
-src/eval/mod.rs::run_cli:158 17
-src/eval/mod.rs::run_coverage:117 9
-src/export.rs::export_obsidian:131 38
-src/graph/centrality.rs::compute_bridges:5 19
-src/graph/community.rs::detect:8 11
-src/graph/community.rs::detect_and_persist:79 11
-src/graph/community.rs::louvain_local_move:124 11
-src/graph/community.rs::refine_communities:200 13
-src/graph/kcore.rs::compute_in_memory:6 13
-src/graph/pagerank.rs::compute_and_store:9 18
-src/graph/pagerank.rs::personalized:145 14
-src/graph_cli.rs::run_cli:7 12
-src/graph_cli.rs::set_backend:105 10
-src/graph_db.rs::explain_falkor:742 9
-src/graph_db.rs::parse_resp:166 18
-src/graph_db.rs::ppr_around_seeds:626 15
-src/graph_db.rs::reconcile:785 15
-src/handlers/alarma.rs::handle:7 12
-src/handlers/alma.rs::create:20 9
-src/handlers/alma.rs::get:141 9
-src/handlers/archivo.rs::append:131 15
-src/handlers/artefacto.rs::lock:359 10
-src/handlers/artefacto.rs::patch:313 10
-src/handlers/artefacto.rs::put:160 22
-src/handlers/artefacto.rs::unlock:424 10
-src/handlers/calibrar.rs::resolve:229 11
-src/handlers/cronica.rs::add:90 16
-src/handlers/cronica.rs::batch_add:376 21
-src/handlers/cronica.rs::check_dedup:689 11
-src/handlers/cronica.rs::episode_add:834 11
-src/handlers/decreto.rs::handle:5 9
-src/handlers/docs.rs::handle:57 12
-src/handlers/eco.rs::correct:398 10
-src/handlers/eco.rs::negative:345 9
-src/handlers/eco.rs::positive:290 9
-src/handlers/eco.rs::set_trust:119 14
-src/handlers/expediente.rs::handle:32 9
-src/handlers/faro.rs::check_ood:2020 14
-src/handlers/faro.rs::enrich_graphrag:1871 9
-src/handlers/faro.rs::handle:25 12
-src/handlers/faro.rs::hybrid_search:324 80
-src/handlers/faro.rs::text_search:1355 11
-src/handlers/faro.rs::verify_claim:1161 12
-src/handlers/forget.rs::handle:5 9
-src/handlers/ingesta.rs::auto_extract:23 16
-src/handlers/ingesta.rs::classify_paragraph:931 16
-src/handlers/ingesta.rs::ingest:800 14
-src/handlers/jornada.rs::handle:5 25
-src/handlers/mod.rs::dispatch:94 10
-src/handlers/proyecto.rs::merge:224 11
-src/handlers/proyecto.rs::stats:149 11
-src/handlers/puente.rs::create:19 11
-src/handlers/puente.rs::predict_links:348 14
-src/handlers/puente.rs::traverse:136 9
-src/handlers/receta.rs::add:74 9
-src/handlers/reflexion.rs::analyze:16 10
-src/handlers/remedio.rs::handle:7 9
-src/handlers/sync.rs::apply_tombstones:1581 26
-src/handlers/sync.rs::ask_peer:1008 11
-src/handlers/sync.rs::diff:2769 11
-src/handlers/sync.rs::drain_peer:1224 25
-src/handlers/sync.rs::export_into:278 59
-src/handlers/sync.rs::fetch:1088 16
-src/handlers/sync.rs::import:1826 139
-src/handlers/sync.rs::prune_stale_episode_files:125 14
-src/handlers/sync.rs::prune_stale_files:109 10
-src/handlers/sync.rs::pull_from_staging:1441 10
-src/handlers/sync.rs::recompute_digest:1494 11
-src/handlers/sync.rs::resolve_conflict:894 14
-src/handlers/sync.rs::validate_bundle:1710 36
-src/handlers/vigia.rs::health:100 12
-src/handlers/zafra.rs::handle:76 35
-src/hooks_cli.rs::merge_episode_file:684 9
-src/hooks_cli.rs::remove_gitattributes_line:278 9
-src/hooks_cli.rs::remove_hook_block:448 9
-src/http.rs::dispatch_one:2257 12
-src/http.rs::follow:310 15
-src/http.rs::mcp_endpoint:2133 13
-src/http.rs::serve_pool:659 16
-src/link_cli.rs::run_cli:5 13
-src/llm_cli.rs::print_status:154 13
-src/llm_cli.rs::set_provider:246 28
+src/cli.rs::run_delete#1 15
+src/cli.rs::run_save#1 10
+src/cli.rs::run_search#1 15
+src/codegraph/mod.rs::walk#1 14
+src/codegraph/python_lang.rs::walk#1 11
+src/codegraph_cli.rs::run_cli#1 30
+src/cognitive/judge.rs::probe_health#1 9
+src/cognitive/judge.rs::resolve_judge#1 9
+src/cognitive/judge.rs::run_prompt#4 10
+src/cognitive/judge.rs::which_in_path#1 18
+src/cognitive/nli.rs::classify#1 14
+src/cognitive/nli.rs::init#1 15
+src/dashboard.rs::render#1 12
+src/db.rs::init_schema#1 9
+src/dedupe_cli.rs::judge_likely#1 9
+src/dedupe_cli.rs::merge_entity#1 13
+src/dedupe_cli.rs::run_cli#1 30
+src/doctor.rs::run_checks_with#1 43
+src/doctor.rs::run_cli#1 13
+src/embeddings/onnx.rs::compute_onnx_embedding#1 19
+src/embeddings/onnx.rs::init_onnx_session#1 13
+src/eval/datasets.rs::load_jsonl_dataset#1 14
+src/eval/harness.rs::run_faro_eval#1 21
+src/eval/mod.rs::compare_runs#1 15
+src/eval/mod.rs::run_cli#1 17
+src/eval/mod.rs::run_coverage#1 9
+src/export.rs::export_obsidian#1 38
+src/graph/centrality.rs::compute_bridges#1 19
+src/graph/community.rs::detect#1 11
+src/graph/community.rs::detect_and_persist#1 11
+src/graph/community.rs::louvain_local_move#1 11
+src/graph/community.rs::refine_communities#1 13
+src/graph/kcore.rs::compute_in_memory#1 13
+src/graph/pagerank.rs::compute_and_store#1 18
+src/graph/pagerank.rs::personalized#1 14
+src/graph_cli.rs::run_cli#1 12
+src/graph_cli.rs::set_backend#1 10
+src/graph_db.rs::explain_falkor#1 9
+src/graph_db.rs::parse_resp#1 18
+src/graph_db.rs::ppr_around_seeds#1 15
+src/graph_db.rs::reconcile#1 15
+src/handlers/alarma.rs::handle#1 12
+src/handlers/alma.rs::create#1 9
+src/handlers/alma.rs::get#1 9
+src/handlers/archivo.rs::append#1 15
+src/handlers/artefacto.rs::lock#1 10
+src/handlers/artefacto.rs::patch#1 10
+src/handlers/artefacto.rs::put#1 22
+src/handlers/artefacto.rs::unlock#1 10
+src/handlers/calibrar.rs::resolve#1 11
+src/handlers/cronica.rs::add#1 16
+src/handlers/cronica.rs::batch_add#1 21
+src/handlers/cronica.rs::check_dedup#1 11
+src/handlers/cronica.rs::episode_add#1 11
+src/handlers/decreto.rs::handle#1 9
+src/handlers/docs.rs::handle#1 12
+src/handlers/eco.rs::correct#1 10
+src/handlers/eco.rs::negative#1 9
+src/handlers/eco.rs::positive#1 9
+src/handlers/eco.rs::set_trust#1 14
+src/handlers/expediente.rs::handle#1 9
+src/handlers/faro.rs::check_ood#1 14
+src/handlers/faro.rs::enrich_graphrag#1 9
+src/handlers/faro.rs::handle#1 12
+src/handlers/faro.rs::hybrid_search#1 80
+src/handlers/faro.rs::text_search#1 11
+src/handlers/faro.rs::verify_claim#1 12
+src/handlers/forget.rs::handle#1 9
+src/handlers/ingesta.rs::auto_extract#1 16
+src/handlers/ingesta.rs::classify_paragraph#1 16
+src/handlers/ingesta.rs::ingest#1 14
+src/handlers/jornada.rs::handle#1 25
+src/handlers/mod.rs::dispatch#1 10
+src/handlers/proyecto.rs::merge#1 11
+src/handlers/proyecto.rs::stats#1 11
+src/handlers/puente.rs::create#1 11
+src/handlers/puente.rs::predict_links#1 14
+src/handlers/puente.rs::traverse#1 9
+src/handlers/receta.rs::add#1 9
+src/handlers/reflexion.rs::analyze#1 10
+src/handlers/remedio.rs::handle#1 9
+src/handlers/sync.rs::apply_tombstones#1 26
+src/handlers/sync.rs::ask_peer#1 11
+src/handlers/sync.rs::diff#1 11
+src/handlers/sync.rs::drain_peer#1 25
+src/handlers/sync.rs::export_into#1 59
+src/handlers/sync.rs::fetch#1 16
+src/handlers/sync.rs::import#1 139
+src/handlers/sync.rs::prune_stale_episode_files#1 14
+src/handlers/sync.rs::prune_stale_files#1 10
+src/handlers/sync.rs::pull_from_staging#1 10
+src/handlers/sync.rs::recompute_digest#1 11
+src/handlers/sync.rs::resolve_conflict#1 14
+src/handlers/sync.rs::validate_bundle#1 36
+src/handlers/vigia.rs::health#1 12
+src/handlers/zafra.rs::handle#1 35
+src/hooks_cli.rs::merge_episode_file#1 9
+src/hooks_cli.rs::remove_gitattributes_line#1 9
+src/hooks_cli.rs::remove_hook_block#1 9
+src/http.rs::dispatch_one#1 12
+src/http.rs::follow#1 15
+src/http.rs::mcp_endpoint#1 13
+src/http.rs::serve_pool#1 16
+src/link_cli.rs::run_cli#1 13
+src/llm_cli.rs::print_status#1 13
+src/llm_cli.rs::set_provider#1 28
 # +2: the `account | bridge` arm of the command dispatcher (0.29.0). async_main is
 # the one place that has an arm per CLI command and each new command costs a
 # branch; the bodies live in accounts_cli::run_cli and bridge::run_cli, so no
 # decision was added here. Exact number, no margin: the ratchet has to fail the
 # next increase too. Owner: implementador 0.29.
-src/main.rs::async_main:129 26
-src/models_cli.rs::download_model:202 10
-src/models_cli.rs::download_runtime:293 13
-src/models_cli.rs::download_to:450 13
-src/models_cli.rs::extract_runtime:375 29
-src/models_cli.rs::wanted_runtime_lib:347 9
-src/net/fetch.rs::get:12 13
-src/net/guard.rs::check:38 10
-src/net/guard.rs::is_forbidden:5 18
-src/protocol.rs::handle_request:497 11
-src/protocol.rs::read_resource:1366 30
-src/protocol.rs::request_sampling_max:178 9
-src/protocol.rs::run_mcp:310 27
-src/protocol.rs::run_rem_consolidation_locked:730 15
-src/recall_cli.rs::build:60 18
-src/recall_cli.rs::run_cli:6 9
-src/reembed_cli.rs::run_cli:3 19
-src/resources.rs::plan:207 11
-src/search/bm25.rs::bm25_search:6 10
-src/search/ood.rs::fit:12 17
-src/search/rerank.rs::init_session:225 13
-src/search/rerank.rs::score_chunk:509 16
-src/search/rerank.rs::score_pairs:429 10
-src/service.rs::resolve_address:505 11
-src/service.rs::write_one:1390 11
-src/setup.rs::resolve_database_url:13 11
+src/main.rs::async_main#1 26
+src/models_cli.rs::download_model#1 10
+src/models_cli.rs::download_runtime#1 13
+src/models_cli.rs::download_to#1 13
+src/models_cli.rs::extract_runtime#1 29
+src/models_cli.rs::wanted_runtime_lib#1 9
+src/net/fetch.rs::get#1 13
+src/net/guard.rs::check#1 10
+src/net/guard.rs::is_forbidden#1 18
+src/protocol.rs::handle_request#1 11
+src/protocol.rs::read_resource#1 30
+src/protocol.rs::request_sampling_max#1 9
+src/protocol.rs::run_mcp#1 27
+src/protocol.rs::run_rem_consolidation_locked#1 15
+src/recall_cli.rs::build#1 18
+src/recall_cli.rs::run_cli#1 9
+src/reembed_cli.rs::run_cli#1 19
+src/resources.rs::plan#1 11
+src/search/bm25.rs::bm25_search#1 10
+src/search/ood.rs::fit#1 17
+src/search/rerank.rs::init_session#1 12
+src/search/rerank.rs::score_chunk#1 16
+src/search/rerank.rs::score_pairs#1 10
+src/service.rs::resolve_address#1 11
+src/service.rs::write_one#1 11
+src/setup.rs::resolve_database_url#1 11
 # The four below each went up by the `?` of `envs::home()` returning a Result
 # (run_check by two: it calls both known_targets and project_configs). It used
 # to be `std::env::var("HOME").map_or_else(|_| PathBuf::from("."), ..)`: with
@@ -166,11 +171,11 @@ src/setup.rs::resolve_database_url:13 11
 # be standing in. Propagating instead of guessing is a branch per call site, and
 # that is what these +1s and +2s buy. Exact numbers, no margin: the ratchet has
 # to fail the next increase too. Owner: mejorador 0.27.
-src/setup_agent.rs::project_configs:24 12
-src/setup_agent.rs::run_check:154 24
-src/setup_agent.rs::run_hook:580 21
-src/setup_agent.rs::run_write:274 22
-src/skills_cli.rs::run_cli:61 19
-src/sync/paths.rs::resolve_dir:54 11
-src/sync_cli.rs::run_cli:3 11
-src/tunnel_cli.rs::run_cli:109 12
+src/setup_agent.rs::project_configs#1 12
+src/setup_agent.rs::run_check#1 24
+src/setup_agent.rs::run_hook#1 21
+src/setup_agent.rs::run_write#1 22
+src/skills_cli.rs::run_cli#1 19
+src/sync/paths.rs::resolve_dir#1 11
+src/sync_cli.rs::run_cli#1 11
+src/tunnel_cli.rs::run_cli#1 12
