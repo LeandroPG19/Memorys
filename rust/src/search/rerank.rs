@@ -242,9 +242,15 @@ fn init_session(model_dir: &std::path::Path) -> Result<()> {
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("optimization level: {e}"))
     };
-    let session = crate::gpu::configure(make_builder, crate::gpu::Workload::Reranker)?
-        .commit_from_file(&model_file)
-        .map_err(|e| anyhow::anyhow!("load model: {e}"))?;
+    let session = crate::gpu::open(
+        make_builder,
+        crate::gpu::Workload::Reranker,
+        |mut builder| {
+            builder
+                .commit_from_file(&model_file)
+                .map_err(|e| anyhow::anyhow!("load model: {e}"))
+        },
+    )?;
     RERANKER_SESSION
         .set(std::sync::Mutex::new(session))
         .map_err(|_| anyhow::anyhow!("session already initialized"))?;

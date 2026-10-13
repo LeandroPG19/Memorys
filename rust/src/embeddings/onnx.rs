@@ -317,9 +317,15 @@ fn init_onnx_session(model_file: &std::path::Path, model_dir: &std::path::Path) 
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("optimization level: {e}"))
     };
-    let session = crate::gpu::configure(make_builder, crate::gpu::Workload::Embedder)?
-        .commit_from_file(model_file)
-        .map_err(|e| anyhow::anyhow!("load model: {e}"))?;
+    let session = crate::gpu::open(
+        make_builder,
+        crate::gpu::Workload::Embedder,
+        |mut builder| {
+            builder
+                .commit_from_file(model_file)
+                .map_err(|e| anyhow::anyhow!("load model: {e}"))
+        },
+    )?;
 
     ONNX_SESSION
         .set(std::sync::Mutex::new(session))

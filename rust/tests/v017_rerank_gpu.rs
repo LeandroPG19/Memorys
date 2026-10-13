@@ -218,6 +218,44 @@ async fn warming_up_leaves_the_reranker_ready() {
              passing on it"
         );
     }
+
+    // Lives here and not in a test of its own because this is the one binary the
+    // judge runs with the real ONNX runtime loaded, and a new test would have to
+    // be ignored by default like these two, which the hook refuses. Left
+    // running by default it would go to `ci.yml`, which has no runtime. It
+    // opens the NLI, never the reranker, so the slot asserted above is left
+    // alone.
+    let nli = memory_industry::gpu::Workload::Nli;
+    assert_eq!(
+        memory_industry::gpu::placement(nli),
+        None,
+        "algo abrió la NLI en este binario: sin el hueco vacío, lo que sigue no prueba nada"
+    );
+    let make_builder =
+        || ort::session::Session::builder().map_err(|e| anyhow::anyhow!("session builder: {e}"));
+    let refused = memory_industry::gpu::open(make_builder, nli, |_builder| {
+        Err::<(), _>(anyhow::anyhow!("commit refused k3-4718"))
+    });
+    assert_eq!(
+        format!("{:#}", refused.expect_err("el commit devolvió un error")),
+        "commit refused k3-4718",
+        "`open` no devolvió el error del commit tal cual. Un texto distinto quiere decir que \
+         falló antes el runtime o el builder, y entonces el `None` de abajo no prueba nada"
+    );
+    assert_eq!(
+        memory_industry::gpu::placement(nli),
+        None,
+        "un commit que falló dejó la colocación de una sesión que nunca existió: `/health` \
+         diría dónde corre una sesión que no se abrió"
+    );
+    memory_industry::gpu::open(make_builder, nli, |_builder| Ok(()))
+        .expect("control: un commit que funciona tiene que devolver Ok");
+    assert!(
+        memory_industry::gpu::placement(nli).is_some(),
+        "control: un commit que funcionó no dejó colocación, y entonces el `None` de arriba \
+         podía venir de que `open` nunca escribe"
+    );
+
     eprintln!("warm-up took {:.2}s", started.elapsed().as_secs_f32());
 }
 

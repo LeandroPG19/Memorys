@@ -133,6 +133,19 @@ fn gpu_availability() -> (bool, bool) {
     )
 }
 
+/// The one door a session opens through: configures the builder and hands it to
+/// `commit`, which is the `commit_from_file` that makes the session exist.
+/// The registry belongs here, once `commit` has an answer, because `configure`
+/// cannot know whether the commit will work. For now `configure` still writes
+/// it before the commit; K3 moves that write here.
+pub fn open<F, C, T>(make_builder: F, workload: Workload, commit: C) -> Result<T>
+where
+    F: Fn() -> Result<SessionBuilder>,
+    C: FnOnce(SessionBuilder) -> Result<T>,
+{
+    commit(configure(make_builder, workload)?)
+}
+
 /// Takes a factory rather than a builder: when the GPU provider refuses to
 /// start we need a second, clean builder for the CPU path, and a
 /// `SessionBuilder` is consumed by the attempt.
@@ -230,11 +243,7 @@ fn fall_back_to_cpu(
 /// Annotates the placement only once the builder was configured: a builder that
 /// could not be configured is not a session that opened, and must not leave a
 /// `Cpu` behind for `/health` to report.
-fn record_if_built(
-    workload: Workload,
-    placement: Placement,
-    built: Result<SessionBuilder>,
-) -> Result<SessionBuilder> {
+fn record_if_built<T>(workload: Workload, placement: Placement, built: Result<T>) -> Result<T> {
     built.inspect(|_| record(workload, placement))
 }
 
@@ -1147,7 +1156,7 @@ mod placement_tests {
         // fallback has to happen, and it has to be impossible to miss.
         let source = include_str!("gpu.rs");
         let body = source
-            .split_once("pub fn configure<F>(")
+            .split_once("fn configure<F>(")
             .expect("configure is in this file")
             .1;
         let body = body
@@ -1634,5 +1643,206 @@ mod placement_tests {
                 workload.label()
             );
         }
+    }
+
+    /// A commit that failed is not a session that opened, so whatever the
+    /// registry held stays exactly as it was: neither overwritten by the
+    /// placement that was attempted nor cleared.
+    ///
+    /// Green on the unmodified tree on purpose: it is the guard against
+    /// `record_if_built` writing before it has looked at the result, which is
+    /// the one change that would make the structural test below pass while the
+    /// registry went on lying. The sentinel is a refusal because that is the
+    /// one value `status()` turns into `degraded`.
+    #[tokio::test]
+    async fn a_commit_that_failed_leaves_the_registry_as_it_found_it() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _restored = RestoredPlacement::take(Workload::Nli);
+        let sentinel = Placement::CpuAfterProviderFailed("sentinel k3-4717".to_string());
+        record(Workload::Nli, sentinel.clone());
+
+        for attempted in [
+            Placement::Gpu,
+            Placement::Cpu,
+            Placement::CpuAfterProviderFailed("refusal".to_string()),
+        ] {
+            let refused = record_if_built(
+                Workload::Nli,
+                attempted.clone(),
+                Err::<(), _>(anyhow::anyhow!("commit refused k3-4716")),
+            );
+            let error = refused.expect_err("a failed commit has to come back as the error it was");
+            assert_eq!(
+                format!("{error:#}"),
+                "commit refused k3-4716",
+                "{attempted:?}: the caller reads the cause of the commit, not a rewording of it"
+            );
+            assert_eq!(
+                placement(Workload::Nli),
+                Some(sentinel.clone()),
+                "{attempted:?}: a commit that failed changed the registry. Written, it reports \
+                 a placement for a session that never existed; cleared, it forgets one that did"
+            );
+        }
+
+        let built = record_if_built(Workload::Nli, Placement::Cpu, Ok(42u8));
+        assert_eq!(
+            built.expect("a commit that worked is returned as it came"),
+            42,
+            "the value of the commit has to come through the registry write untouched"
+        );
+        assert_eq!(
+            placement(Workload::Nli),
+            Some(Placement::Cpu),
+            "control: a commit that worked is the one case that writes, and it writes what was \
+             decided when the builder was configured"
+        );
+    }
+
+    /// Production source of this file with the comment lines dropped, so a
+    /// sentence that names a call cannot satisfy or break a structural check.
+    fn production_without_comments() -> String {
+        include_str!("gpu.rs")
+            .split_once("#[cfg(test)]\nmod placement_tests")
+            .expect("the test module follows the production code")
+            .0
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// From `header` to the first closing brace in column 0, which is where a
+    /// top-level function of this file ends.
+    fn span_of(source: &str, header: &str, why: &str) -> std::ops::Range<usize> {
+        let start = source.find(header).expect(why);
+        let end = source[start..]
+            .find("\n}")
+            .map_or(source.len(), |at| start + at);
+        start..end
+    }
+
+    /// Structural, like its neighbours: what makes it worth anything is that
+    /// the registry is the only thing `/health` and `doctor` trust about where
+    /// a session opened, and the way it lies is a write that happens before
+    /// the commit has an answer. The runtime half is the K3-T6 block in
+    /// `tests/v017_rerank_gpu.rs`.
+    #[test]
+    fn only_open_writes_the_registry_and_only_after_the_commit() {
+        let production = production_without_comments();
+
+        let open = span_of(
+            &production,
+            "pub fn open<",
+            "`gpu::open` is the one door a session opens through and it is not in this file",
+        );
+        let writers: Vec<usize> = production
+            .match_indices("record_if_built(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            writers.len(),
+            1,
+            "`record_if_built(` is called {} times and has to be called once, from `open`. A \
+             call from `configure` writes a placement before the commit has run: a session that \
+             never existed shows up in `/health` and, when it is a refusal, turns \
+             `gpu.degraded` true",
+            writers.len()
+        );
+        assert!(
+            open.contains(&writers[0]),
+            "the one `record_if_built(` is not inside `open`: whoever calls it from elsewhere \
+             writes a placement for a session whose commit nobody has seen"
+        );
+        assert!(
+            production[open].contains("commit("),
+            "`open` does not call the commit, so what it hands to `record_if_built` is not the \
+             result of opening the session"
+        );
+
+        let record_body = span_of(
+            &production,
+            "fn record_if_built<",
+            "`record_if_built` is the one function that may call `record` and it is not here",
+        );
+        for (at, _) in production.match_indices("record(") {
+            let before = &production[..at];
+            let is_the_definition = before.ends_with("fn ");
+            let is_a_longer_name = before.ends_with(|c: char| c.is_alphanumeric() || c == '_');
+            if is_the_definition || is_a_longer_name {
+                continue;
+            }
+            assert!(
+                record_body.contains(&at),
+                "`record(` is called outside `record_if_built`, at byte {at}: a direct write \
+                 skips the check that the commit worked"
+            );
+        }
+
+        assert!(
+            !production.contains("pub fn configure"),
+            "`configure` is public again: a caller can configure a builder and never go \
+             through `open`, and the registry is back to being written by whoever remembers"
+        );
+
+        for (caller, source) in [
+            ("embeddings/onnx.rs", include_str!("embeddings/onnx.rs")),
+            ("search/rerank.rs", include_str!("search/rerank.rs")),
+            ("cognitive/nli.rs", include_str!("cognitive/nli.rs")),
+        ] {
+            assert!(
+                source.contains("crate::gpu::open("),
+                "{caller} does not open its session through `crate::gpu::open`: its placement \
+                 is written, if at all, by something that has not seen the commit"
+            );
+            assert!(
+                !source.contains("gpu::configure("),
+                "{caller} still calls `gpu::configure` directly: that is the door that wrote \
+                 the registry before the commit"
+            );
+        }
+    }
+
+    /// Structural, and in every build: `directml_provider` only compiles with
+    /// the feature, the gate never builds it alone and no machine here has a
+    /// card that is not NVIDIA, so the text is all that can be held to. In the
+    /// build that is published DirectML sits behind a CUDA that already
+    /// opened, and there `error_on_failure` would turn a machine without
+    /// `DirectML.dll` from a GPU session into a refusal.
+    #[test]
+    fn the_directml_provider_fails_loudly_when_it_is_the_one_that_decides() {
+        let production = production_without_comments();
+
+        let provider = span_of(
+            &production,
+            "fn directml_provider()",
+            "directml_provider is in this file: without it the list in `configure` registers \
+             DirectML as a bare provider, and ORT falls back to the CPU under a log that still \
+             says GPU",
+        );
+        let body = &production[provider];
+        assert!(
+            body.contains("error_on_failure()"),
+            "a DirectML registration that cannot fail is the CUDA defect again, on the machines \
+             whose only provider is DirectML: a session on the CPU that every check reports as GPU"
+        );
+        assert!(
+            body.contains("cfg!(feature = \"cuda\")"),
+            "with CUDA in the build DirectML must not carry `error_on_failure`: it only \
+             registers behind a CUDA that already opened, and failing there turns a working GPU \
+             session into a refusal on every NVIDIA machine without DirectML.dll"
+        );
+
+        let configure = span_of(&production, "fn configure<F>(", "configure is in this file");
+        let configure_body = &production[configure];
+        assert!(
+            configure_body.contains("directml_provider()"),
+            "the provider list in `configure` does not ask `directml_provider()`"
+        );
+        assert!(
+            !configure_body.contains("DirectML::default()"),
+            "`configure` builds DirectML by hand again, and the choice about `error_on_failure` \
+             is made in two places"
+        );
     }
 }

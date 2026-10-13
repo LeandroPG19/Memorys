@@ -199,9 +199,11 @@ fn init(dir: &std::path::Path) -> Result<()> {
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("optimization level: {e}"))
     };
-    let session = crate::gpu::configure(make_builder, crate::gpu::Workload::Nli)?
-        .commit_from_file(&model_file)
-        .map_err(|e| anyhow::anyhow!("cargando {model_file:?}: {e}"))?;
+    let session = crate::gpu::open(make_builder, crate::gpu::Workload::Nli, |mut builder| {
+        builder
+            .commit_from_file(&model_file)
+            .map_err(|e| anyhow::anyhow!("cargando {model_file:?}: {e}"))
+    })?;
 
     let wants = session
         .inputs()
