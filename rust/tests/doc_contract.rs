@@ -1679,25 +1679,34 @@ fn the_lan_guide_gives_the_fixed_address_steps_and_the_dhcp_warning() {
 /// crate's own version after; following `CARGO_PKG_VERSION` keeps the check alive on both sides
 /// of the rename and across the next bump.
 fn changelog_part(changelog: &str, heading: &str) -> Option<String> {
-    let released = format!("{}]", env!("CARGO_PKG_VERSION"));
-    let in_progress = changelog
+    changelog_part_of(changelog, "Unreleased", heading)
+        .or_else(|| changelog_part_of(changelog, env!("CARGO_PKG_VERSION"), heading))
+}
+
+/// One `###` part of the changelog block headed `[<version>]`. A contract that belongs to the
+/// release that introduced it names that release here instead of following the crate's version.
+fn changelog_part_of(changelog: &str, version: &str, heading: &str) -> Option<String> {
+    let opening = format!("{version}]");
+    let block = changelog
         .split("\n## [")
-        .find(|block| block.starts_with("Unreleased]") || block.starts_with(&released))?;
-    let mut parts = in_progress.split("\n### ");
+        .find(|block| block.starts_with(&opening))?;
+    let mut parts = block.split("\n### ");
     parts
         .find(|part| part.starts_with(heading))
         .map(str::to_string)
 }
 
-/// I8. The changelog says what a deployer has to know before updating: that accounts, pairing,
-/// the bridge and the knob change behaviour, and what has not been verified on a real host.
+/// I8, the contract of 0.29.0, the release that introduced accounts and the bridge. Its changelog
+/// block says what a deployer has to know before updating: that accounts, pairing, the bridge and
+/// the knob change behaviour, and what has not been verified on a real host. Pinned to `[0.29.0]`
+/// and not to the release in progress: from 0.30.0 on that block talks about something else.
 /// Presence anchors, declared as such.
 #[test]
 fn the_changelog_announces_accounts_and_the_bridge_and_what_is_not_verified() {
     let changelog = read("CHANGELOG.md");
-    let behaviour = changelog_part(&changelog, "Behaviour changes").expect(
-        "CHANGELOG.md has no `### Behaviour changes` inside the release in progress: the anchor \
-         for the checks below is gone",
+    let behaviour = changelog_part_of(&changelog, "0.29.0", "Behaviour changes").expect(
+        "CHANGELOG.md has no `### Behaviour changes` inside `## [0.29.0]`: the anchor for the \
+         checks below is gone",
     );
     let behaviour = flatten(&behaviour);
     let announced = [
@@ -1709,14 +1718,14 @@ fn the_changelog_announces_accounts_and_the_bridge_and_what_is_not_verified() {
     let missing = missing_from(&behaviour, &announced);
     assert!(
         missing.is_empty(),
-        "the release in progress → `Behaviour changes` does not mention {missing:?}: a deployer \
+        "0.29.0 → `Behaviour changes` does not mention {missing:?}: a deployer \
          reads that part before updating, and accounts, pairing, the bridge and the knob change \
          what the daemon accepts"
     );
 
-    let unverified = changelog_part(&changelog, "Not verified").expect(
-        "CHANGELOG.md has no `### Not verified` inside the release in progress: the unverified \
-         list is where the next person learns what only a real host can prove",
+    let unverified = changelog_part_of(&changelog, "0.29.0", "Not verified").expect(
+        "CHANGELOG.md has no `### Not verified` inside `## [0.29.0]`: the unverified list is \
+         where the next person learns what only a real host can prove",
     );
     let unverified = flatten(&unverified);
     let listed = [
@@ -1728,7 +1737,7 @@ fn the_changelog_announces_accounts_and_the_bridge_and_what_is_not_verified() {
     let missing = missing_from(&unverified, &listed);
     assert!(
         missing.is_empty(),
-        "the release in progress → `Not verified` does not list {missing:?}: the per-user logon \
+        "0.29.0 → `Not verified` does not list {missing:?}: the per-user logon \
          task, the hidden console, the fixed-address cmdlets and Cursor's `http` entry were never \
          run on a real machine, and the changelog must say so"
     );

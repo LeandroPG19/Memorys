@@ -755,7 +755,7 @@ mod config_path_tests {
     /// that today's leak is undone on drop even when the assertion fires.
     #[tokio::test]
     async fn doctor_line_reads_the_environment_and_never_writes_into_it() {
-        const CANARY: &str = "MEMORY_INDUSTRY_T1_CANARY";
+        const CANARY: &str = "T1_LLM_ENV_CANARY";
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         let _canary = ScopedEnv::cleared(CANARY);
         let world = scratch_root("llm-doctor-line");
