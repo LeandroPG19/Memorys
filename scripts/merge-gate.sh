@@ -373,6 +373,64 @@ if [[ "${1:-}" == "--self-test" ]]; then
     || self_fail "deny_before_tests: cargo deny did not come after cargo audit: $(steps_of deny_before_tests)"
   adv_never deny_before_tests 'run-all-tests'
 
+  # G4/A1: a cargo target inside rust/ is copied whole into every job of the mutation
+  # step, the last one of this gate, and it used to be refused only there: ~20 min of
+  # tests later. It is a look at the disk that takes milliseconds, so it comes first,
+  # with cargo audit. The tree has the real mutants-gate.sh, since where the rule
+  # lives is not this row's business, and a run-all-tests.sh that fails: a gate that
+  # misses the refusal then stops at the tests with exit 1, and never reaches the real
+  # mutation step. A target of CARGO_TARGET_DIR counts whether or not it exists yet:
+  # cargo creates it at the first build.
+  a1_tests='echo run-all-tests >>"$HOME/steps"; exit 1'
+  a1_tree() {
+    fake_tree "$1" "$a1_tests"
+    cp "$ROOT/scripts/mutants-gate.sh" "$tmp/$1/scripts/mutants-gate.sh"
+    chmod +x "$tmp/$1/scripts/mutants-gate.sh"
+  }
+  # a1_refused NAME WORD: exit 2, the exit file and the lock agree, no step ran
+  # that needs the target, and the refusal names WORD.
+  a1_refused() {
+    adv_stopped "$1" 2
+    adv_never "$1" 'cargo audit' 'cargo deny' 'run-all-tests'
+    grep -qF -- "$2" "$tmp/$1.out" || self_fail "$1: the refusal does not name '$2': $(cat "$tmp/$1.out")"
+    if grep -q 'MERGE GATE PASSED' "$tmp/$1.out"; then
+      self_fail "$1: a gate with a cargo target inside rust/ passed: $(cat "$tmp/$1.out")"
+    fi
+  }
+
+  a1_tree a1_tag
+  mkdir -p "$tmp/a1_tag/rust/target-x"
+  : >"$tmp/a1_tag/rust/target-x/CACHEDIR.TAG"
+  run_copy a1_tag
+  a1_refused a1_tag 'rust/target-x'
+
+  a1_tree a1_var
+  run_copy a1_var "" CARGO_TARGET_DIR="$tmp/a1_var/rust/target-sil"
+  a1_refused a1_var 'target-sil'
+  [[ ! -e "$tmp/a1_var/rust/target-sil" ]] || self_fail "a1_var: the gate created the target it refused"
+
+  a1_tree a1_var_there
+  mkdir -p "$tmp/a1_var_there/rust/target-sil"
+  : >"$tmp/a1_var_there/rust/target-sil/x"
+  run_copy a1_var_there "" CARGO_TARGET_DIR="$tmp/a1_var_there/rust/target-sil"
+  a1_refused a1_var_there 'target-sil'
+
+  # The presence anchor: rust/target is cargo-mutants' own to leave out of the copy, a
+  # directory named like a target without the tag is not one, and a target outside
+  # rust/ is nobody's business. The gate gets to cargo audit, and fails there on purpose.
+  a1_tree a1_ok
+  mkdir -p "$tmp/a1_ok/rust/target" "$tmp/a1_ok/rust/target-notes" "$tmp/a1_ok/outside-target"
+  : >"$tmp/a1_ok/rust/target/CACHEDIR.TAG"
+  run_copy a1_ok audit CARGO_TARGET_DIR="$tmp/a1_ok/rust/target"
+  adv_stopped a1_ok 1
+  [[ "$(steps_of a1_ok)" == "cargo audit" ]] \
+    || self_fail "a1_ok: rust/target, a target-notes without the tag and the gate's own target were refused, or the order broke: $(steps_of a1_ok) / $(cat "$tmp/a1_ok.out")"
+  rm -f "$tmp/a1_ok/home/steps"
+  run_copy a1_ok audit CARGO_TARGET_DIR="$tmp/a1_ok/outside-target"
+  adv_stopped a1_ok 1
+  [[ "$(steps_of a1_ok)" == "cargo audit" ]] \
+    || self_fail "a1_ok: a CARGO_TARGET_DIR outside rust/ was refused: $(steps_of a1_ok) / $(cat "$tmp/a1_ok.out")"
+
   # A step after the tests, with the first half past, still writes the whole
   # gate's verdict, and the file said running while the tests ran.
   fake_tree after_tests "$reads_while_running; $tests_step"
@@ -813,6 +871,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "    wrote about the URL, and refuses with 2, before asking, a URL that"
   echo "    brain_gate cannot be derived from"
   echo "    or that holds more than one '@' before the host."
+  echo "    a cargo target inside rust/ (a target-* with CACHEDIR.TAG, or a CARGO_TARGET_DIR there) is"
+  echo "    refused with 2 before cargo audit, not after the tests;"
   echo "    cargo audit runs first, before cargo deny and before the tests, under timeout 120;"
   echo "    a database it cannot refresh is exit 2, never a skip; without pg_isready the"
   echo "    readiness check asks the container that publishes the port of DATABASE_URL, never one by name."

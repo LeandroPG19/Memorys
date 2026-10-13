@@ -626,6 +626,11 @@ self_test() {
   home="$tmp/home"
   sys="$tmp/systemp"
   scr="$sys/memory-industry-mutants"
+  # G4/C1: the sweep deletes what is old in the scratch, so the scratch is never
+  # the directory MUTANTS_SCRATCH_DIR names (D:\ would be swept of everything older
+  # than 6 h): it is that directory's own subdirectory, and only one that carries
+  # the marker the script wrote when it made it is swept.
+  marker=".memory-industry-mutants"
   sys_native="$(cygpath -w "$sys" 2>/dev/null || printf '%s' "$sys")"
   avail=$((500 * kb))
   per_copy=10
@@ -656,6 +661,14 @@ self_test() {
     : > "$1/x"
     touch -d "$2" "$1"
   }
+  # mk_marker DIR AGE: the marker that makes DIR the judge's scratch. It is made
+  # old on purpose: a sweep that took the marker for one more old entry would
+  # delete the proof that the directory is its own, and the next run would sweep nothing.
+  mk_marker() {
+    mkdir -p "$1"
+    : > "$1/$marker"
+    touch -d "$2" "$1/$marker"
+  }
   ran_mutants() { [[ -f "$tmp/cargo.calls" ]] && grep -q '^mutants --file' "$tmp/cargo.calls"; }
 
   mk_tree clean
@@ -665,6 +678,7 @@ self_test() {
   mk_entry "$scr/cargo-mutants-rust-old.tmp" '7 hours ago'
   mk_entry "$scr/cargo-mutants-rust-new.tmp" '1 hour ago'
   mk_entry "$scr/cuba-attrs-x-1" '7 hours ago'
+  mk_marker "$scr" '7 hours ago'
   in_tree clean -- --prepare-scratch 2
   if (( rc != 0 )) || ! grep -qx 'jobs=2' "$tmp/run.out" || [[ "$(wc -l <"$tmp/run.out")" -ne 2 ]]; then
     self_fail "W1: --prepare-scratch 2 over 500 GB free did not print jobs=2 and scratch= alone on stdout (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
@@ -673,7 +687,65 @@ self_test() {
   [[ "$(norm "$got")" == "$(norm "$scr")" ]] || self_fail "W1: scratch= was '$got', not the judge's own directory under the system temp ($scr)"
   [[ ! -e "$scr/cargo-mutants-rust-old.tmp" && ! -e "$scr/cuba-attrs-x-1" ]] || self_fail "W1: an entry of 7 h in the judge's scratch was not swept"
   [[ -d "$scr/cargo-mutants-rust-new.tmp" ]] || self_fail "W1: an entry of 1 h in the judge's scratch was swept"
+  [[ -f "$scr/$marker" ]] || self_fail "W1: the sweep took the marker of the judge's scratch for one more old entry and deleted it"
   run_said 'swept cargo-mutants-rust-old.tmp' || self_fail "W1: the sweep did not say 'swept cargo-mutants-rust-old.tmp': $(cat "$tmp/run.err")"
+
+  # C1/S1: the scratch is MUTANTS_SCRATCH_DIR's own subdirectory, never the directory
+  # itself. The first version swept whatever the variable named, and the FAIL for a
+  # full disk tells people to point it at a volume with room: D:\ would lose every
+  # entry older than 6 h. The old entry beside the scratch is somebody else's.
+  xdir="$tmp/ex"
+  fresh
+  mk_entry "$xdir/viejo" '7 hours ago'
+  : > "$xdir/viejo.log"
+  touch -d '7 hours ago' "$xdir/viejo.log"
+  mk_entry "$xdir/memory-industry-mutants/cargo-mutants-rust-old.tmp" '7 hours ago'
+  mk_entry "$xdir/memory-industry-mutants/cargo-mutants-rust-new.tmp" '1 hour ago'
+  mk_marker "$xdir/memory-industry-mutants" '7 hours ago'
+  in_tree clean MUTANTS_SCRATCH_DIR="$xdir" -- --prepare-scratch 2
+  got="$(sed -n 's/^scratch=//p' "$tmp/run.out")"
+  if (( rc != 0 )) || [[ "$(norm "$got")" != "$(norm "$xdir/memory-industry-mutants")" ]]; then
+    self_fail "S1: with MUTANTS_SCRATCH_DIR=X the scratch was '$got', not X/memory-industry-mutants (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  if [[ ! -d "$xdir/viejo" || ! -f "$xdir/viejo.log" ]]; then
+    self_fail "S1: an entry of 7 h that sits in X and not in X/memory-industry-mutants was swept: $(ls -A "$xdir" 2>&1)"
+  fi
+  [[ ! -e "$xdir/memory-industry-mutants/cargo-mutants-rust-old.tmp" && -d "$xdir/memory-industry-mutants/cargo-mutants-rust-new.tmp" ]] \
+    || self_fail "S1: inside the marked scratch the 7 h entry was not swept, or the 1 h one was: $(ls -A "$xdir/memory-industry-mutants" 2>&1)"
+
+  # S2: a directory with the scratch's name and no marker is not provably the
+  # judge's, whatever is in it. It is left alone, said out loud, and not adopted by
+  # writing the marker into it (the next run would then sweep what was never ours).
+  fresh
+  rm -rf "$xdir"
+  mk_entry "$xdir/memory-industry-mutants/cargo-mutants-rust-old.tmp" '7 hours ago'
+  mk_entry "$xdir/memory-industry-mutants/mis-fotos" '7 hours ago'
+  in_tree clean MUTANTS_SCRATCH_DIR="$xdir" -- --prepare-scratch 2
+  if [[ ! -d "$xdir/memory-industry-mutants/cargo-mutants-rust-old.tmp" || ! -d "$xdir/memory-industry-mutants/mis-fotos" ]]; then
+    self_fail "S2: a directory named like the scratch but without the marker was swept: $(ls -A "$xdir/memory-industry-mutants" 2>&1)"
+  fi
+  run_said "not provably the gate's scratch, left alone" || self_fail "S2: it did not say \"not provably the gate's scratch, left alone\": $(cat "$tmp/run.err")"
+  [[ ! -e "$xdir/memory-industry-mutants/$marker" ]] || self_fail "S2: a directory that was not the judge's was given the marker"
+
+  # S3/S4: the scratch that results may not contain the repo or HOME, since the
+  # sweep would then reach into them. Refused with 2 before anything is swept: the
+  # old entry beside is in a marked scratch, which is what would be swept otherwise.
+  mk_tree "rooted/memory-industry-mutants/repo"
+  fresh
+  mk_entry "$tmp/rooted/memory-industry-mutants/otro" '7 hours ago'
+  mk_marker "$tmp/rooted/memory-industry-mutants" '7 hours ago'
+  in_tree "rooted/memory-industry-mutants/repo" MUTANTS_SCRATCH_DIR="$tmp/rooted" -- --prepare-scratch 2
+  if (( rc != 2 )) || grep -q '^jobs=' "$tmp/run.out" || [[ ! -d "$tmp/rooted/memory-industry-mutants/otro" ]]; then
+    self_fail "S3: a scratch that contains the repo did not exit 2 before sweeping (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  fresh
+  mkdir -p "$tmp/hrooted/memory-industry-mutants/home"
+  mk_entry "$tmp/hrooted/memory-industry-mutants/otro" '7 hours ago'
+  mk_marker "$tmp/hrooted/memory-industry-mutants" '7 hours ago'
+  in_tree clean HOME="$tmp/hrooted/memory-industry-mutants/home" MUTANTS_SCRATCH_DIR="$tmp/hrooted" -- --prepare-scratch 2
+  if (( rc != 2 )) || grep -q '^jobs=' "$tmp/run.out" || [[ ! -d "$tmp/hrooted/memory-industry-mutants/otro" ]]; then
+    self_fail "S4: a scratch that contains HOME did not exit 2 before sweeping (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
 
   # L1: in the system temp, only what proves to be the judge's, and only when old.
   fresh
@@ -704,6 +776,7 @@ self_test() {
   # disk is still measured.
   fresh
   mk_entry "$scr/cargo-mutants-rust-old.tmp" '7 hours ago'
+  mk_marker "$scr" '7 hours ago'
   sleeper=""
   trap 'kill "$sleeper" 2>/dev/null || true; rm -rf "$tmp"' EXIT
   sleep 300 &
@@ -729,6 +802,7 @@ self_test() {
   # child of a $( ) subshell, whose pid would not be the one the record names.
   fresh
   mk_entry "$scr/cargo-mutants-rust-old.tmp" '7 hours ago'
+  mk_marker "$scr" '7 hours ago'
   mkdir -p "$home/.cache/cuba-gate/lock"
   # shellcheck source=scripts/gate-lock.sh
   holder="$(source "$lock_lib"; owner_record "$$" k2)"
@@ -761,8 +835,8 @@ self_test() {
   fresh
   in_tree clean MUTANTS_SCRATCH_DIR="$tmp/otro" -- --prepare-scratch 2
   got="$(sed -n 's/^scratch=//p' "$tmp/run.out")"
-  if (( rc != 0 )) || [[ "$(norm "$got")" != "$(norm "$tmp/otro")" ]] || [[ ! -d "$tmp/otro" ]]; then
-    self_fail "Q4: MUTANTS_SCRATCH_DIR was not the scratch (scratch='$got', exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  if (( rc != 0 )) || [[ "$(norm "$got")" != "$(norm "$tmp/otro/memory-industry-mutants")" ]] || [[ ! -f "$tmp/otro/memory-industry-mutants/$marker" ]]; then
+    self_fail "Q4: MUTANTS_SCRATCH_DIR=X did not make X/memory-industry-mutants, with its marker, the scratch (scratch='$got', exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
   fi
   # The reserve is CUBA_GATE_MIN_FREE_GB, the variable run-all-tests.sh reads:
   # 29 GB fits one 10 GB copy over the default 8 GB reserve, and not over 20 GB.
@@ -863,7 +937,8 @@ self_test() {
   echo "    plans its jobs from the free disk before copying, refuses when not even one fits, reads"
   echo "    an unreadable free space as an error, sweeps only what is the judge's and old, leaves a"
   echo "    running gate's copies alone, refuses a cargo target inside rust/, and gives cargo mutants"
-  echo "    its own scratch directory"
+  echo "    its own scratch directory: always MUTANTS_SCRATCH_DIR's subdirectory memory-industry-mutants,"
+  echo "    swept only when it carries the marker, and refused if it holds the repo or HOME"
   exit 0
 }
 

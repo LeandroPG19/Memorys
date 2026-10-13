@@ -710,6 +710,46 @@ if [[ "${1:-}" == "--self-test" ]]; then
     st_fail "the shape check refused a well-formed baseline (exit $rc): $(cat "$tmp/judged.err")"
   fi
 
+  # G4/A4: lizard is the whole of the complexity judgement, and run_lizard used to
+  # ask for lizard OR python and then call lizard with `2>/dev/null ... || true`:
+  # with no lizard, or one that died, the list of functions over the ceiling came out
+  # empty, and an empty list reads as "nothing is over it". A new CC 30 function
+  # passed. The judgement that cannot be made is exit 2, never 0.
+  # The fixture hides lizard with a PATH of the directories that do not hold it, and a
+  # python stand-in at the front: the old test of "lizard or python" has to be
+  # satisfied, or the row would go red for the wrong reason on a machine whose
+  # python lives beside lizard (as it does on this one).
+  nolz="$tmp/nolizard"
+  mkdir -p "$nolz"
+  printf '#!/bin/sh\nexit 0\n' > "$nolz/python"
+  chmod +x "$nolz/python"
+  nolz_path="$nolz"
+  IFS=: read -ra nolz_dirs <<< "$PATH"
+  for nolz_d in "${nolz_dirs[@]}"; do
+    [[ -e "$nolz_d/lizard" || -e "$nolz_d/lizard.exe" ]] && continue
+    nolz_path+=":$nolz_d"
+  done
+  if (PATH="$nolz_path"; command -v lizard >/dev/null 2>&1); then
+    st_fail "A4: the fixture cannot hide lizard: it is still found on $nolz_path"
+  fi
+  if ! (PATH="$nolz_path"; command -v python >/dev/null 2>&1 && command -v awk >/dev/null 2>&1 && command -v sort >/dev/null 2>&1); then
+    st_fail "A4: the fixture hides more than lizard: python, awk or sort are gone from $nolz_path"
+  fi
+  rc=0
+  (PATH="$nolz_path"; BASELINE="$tmp/bl-empty.txt" run_lizard "$tmp" src/tangled.rs) >"$tmp/judged.err" 2>&1 || rc=$?
+  if (( rc != 2 )) || ! said 'lizard is not on PATH'; then
+    st_fail "A4: with no lizard on PATH run_lizard exited $rc, not 2 with 'lizard is not on PATH' (a CC 13 function not in the baseline went by in silence): $(cat "$tmp/judged.err")"
+  fi
+  # A lizard that dies and prints no CSV is not a list of nothing either.
+  mkdir -p "$tmp/badlizard"
+  printf '#!/bin/sh\necho "lizard: crashed" >&2\nexit 3\n' > "$tmp/badlizard/lizard"
+  chmod +x "$tmp/badlizard/lizard"
+  rc=0
+  (PATH="$tmp/badlizard:$PATH"; BASELINE="$tmp/bl-empty.txt" run_lizard "$tmp" src/tangled.rs) >"$tmp/judged.err" 2>&1 || rc=$?
+  if (( rc != 2 )); then
+    st_fail "A4: a lizard that exits 3 with no CSV left run_lizard at exit $rc, not 2 (an empty list was taken for green): $(cat "$tmp/judged.err")"
+  fi
+
   # The expiry reader, judged as if today were 2026-09-22. One line per shape
   # it has to tell apart: expired yesterday (red), expires today (still valid),
   # a date wrapped onto the next line (red, on the line that lost it), a line
@@ -1020,9 +1060,16 @@ PY
   : > "$q_scr/cargo-mutants-rust-new.tmp/x"
   touch -d '7 hours ago' "$q_scr/cargo-mutants-rust-old.tmp"
   touch -d '1 hour ago' "$q_scr/cargo-mutants-rust-new.tmp"
+  # Only a scratch that carries the marker mutants-gate.sh wrote is swept (G4/C1).
+  : > "$q_scr/.memory-industry-mutants"
+  touch -d '7 hours ago' "$q_scr/.memory-industry-mutants"
   mj FAKE_OUTCOME=genuine -- --file src/a.rs
   if [[ -e "$q_scr/cargo-mutants-rust-old.tmp" || ! -d "$q_scr/cargo-mutants-rust-new.tmp" ]]; then
     echo "FAIL self-test: QG4: the run did not sweep the 7 h old copy of the judge's scratch and leave the 1 h old one: $(ls "$q_scr" 2>&1)" >&2
+    exit 1
+  fi
+  if [[ ! -f "$q_scr/.memory-industry-mutants" ]]; then
+    echo "FAIL self-test: QG4: the sweep deleted the marker that makes the directory the judge's scratch" >&2
     exit 1
   fi
   # QG8: a cargo target inside rust/ other than target/ is copied whole by
