@@ -470,7 +470,6 @@ fn judge_is_sampling_from(mode: Option<&str>) -> bool {
 }
 
 pub async fn doctor_line() -> (LlmVerdict, String, String) {
-    load_saved_config_into_env();
     match resolve_offline_llm() {
         Some(j) => {
             if j.backend_name() == "openai_compat" {

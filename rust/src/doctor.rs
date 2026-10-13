@@ -339,7 +339,7 @@ pub fn scheduled_task_exists(
 
 /// Everything doctor needs from the machine about the service, gathered in one
 /// place so that judging it stays pure.
-fn service_facts() -> ServiceFacts {
+fn service_facts(runner: &mut dyn crate::service_apply::CommandRunner) -> ServiceFacts {
     let target = crate::service::Target::host();
     let home = crate::envs::home()
         .ok()
@@ -351,7 +351,7 @@ fn service_facts() -> ServiceFacts {
     ServiceFacts {
         env_text: crate::service::installed_env(target).ok().flatten(),
         process_addr: std::env::var(ADDR_KEY).ok(),
-        task_exists: scheduled_task_exists(&mut crate::setup_agent::SystemRunner, target),
+        task_exists: scheduled_task_exists(runner, target),
         log_tail: read_log_tail(
             &env_path.with_file_name(crate::service::LOG_BASENAME),
             LOG_TAIL_BYTES,
@@ -485,8 +485,10 @@ async fn lan_facts(configured: String) -> LanFacts {
 /// The port check, aimed at the address the service will really bind, and the
 /// service's own checks. Both read the env file the service loads, never only
 /// doctor's own process environment. The address comes back too, for the LAN check.
-fn service_report() -> (Check, Vec<Check>, String) {
-    let facts = service_facts();
+fn service_report(
+    runner: &mut dyn crate::service_apply::CommandRunner,
+) -> (Check, Vec<Check>, String) {
+    let facts = service_facts(runner);
     let from_file = facts
         .env_text
         .as_deref()
@@ -982,10 +984,18 @@ async fn accounts_report(pool: &PgPool) -> Vec<Check> {
 }
 
 pub async fn run_checks(pool: &PgPool, url: &str) -> Vec<Check> {
-    run_checks_with(pool, url, false).await
+    let mut runner = crate::setup_agent::SystemRunner;
+    run_checks_with(pool, url, false, &mut runner).await
 }
 
-pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check> {
+/// The runner is a parameter because Windows looks `schtasks` up in System32
+/// before PATH, so an environment variable cannot keep a test off the real task.
+pub async fn run_checks_with(
+    pool: &PgPool,
+    url: &str,
+    deep: bool,
+    runner: &mut (dyn crate::service_apply::CommandRunner + Send),
+) -> Vec<Check> {
     let mut checks = Vec::new();
 
     let mode = crate::mode::active();
@@ -995,7 +1005,7 @@ pub async fn run_checks_with(pool: &PgPool, url: &str, deep: bool) -> Vec<Check>
     ));
 
     checks.push(Check::ok("database_url", redact_url(url)));
-    let (port, service, addr) = service_report();
+    let (port, service, addr) = service_report(runner);
     checks.push(port);
     checks.extend(service);
     checks.push(lan_check(&lan_facts(addr).await));
@@ -1601,7 +1611,8 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         .await
         .context("connecting to database for doctor")?;
 
-    let mut checks = run_checks_with(&pool, &url, deep).await;
+    let mut runner = crate::setup_agent::SystemRunner;
+    let mut checks = run_checks_with(&pool, &url, deep, &mut runner).await;
 
     if check_updates {
         let current = env!("CARGO_PKG_VERSION");
