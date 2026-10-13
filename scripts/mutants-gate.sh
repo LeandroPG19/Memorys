@@ -9,6 +9,9 @@
 #   ./scripts/mutants-gate.sh --prepare-scratch WANT
 #                                                   the judge's scratch dir, swept and
 #                                                   measured (quality-gate.sh)
+#   ./scripts/mutants-gate.sh --refuse-targets      exit 2 if a cargo target is inside
+#                                                   rust/ or CARGO_TARGET_DIR points
+#                                                   there (merge-gate.sh, at the start)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -249,9 +252,28 @@ mutants_system_temp() {
   printf '%s\n' "${dir%/}"
 }
 
+# The scratch is always a directory of its own inside the one MUTANTS_SCRATCH_DIR
+# names, never that directory: the sweep deletes what is old in the scratch, and
+# MUTANTS_SCRATCH_DIR=D:\ (the advice of the disk FAIL) would have lost every entry of
+# D:\ older than 6 h. The marker is what proves a directory was made by this script.
+MUTANTS_MARKER=.memory-industry-mutants
+
 mutants_scratch_dir() {
-  local dir="${MUTANTS_SCRATCH_DIR:-$(mutants_system_temp)/memory-industry-mutants}"
-  cygpath -u "$dir" 2>/dev/null || printf '%s\n' "$dir"
+  local base="${MUTANTS_SCRATCH_DIR:-$(mutants_system_temp)}"
+  base="$(cygpath -u "$base" 2>/dev/null || printf '%s' "$base")"
+  printf '%s/memory-industry-mutants\n' "${base%/}"
+}
+
+# Is PATH_ the directory DIR or somewhere inside it? By identity, not by spelling,
+# so that /c/ and C:/ or a symlink do not hide it; a DIR that does not exist holds nothing.
+mutants_dir_holds() {
+  local dir="$1" path_="$2"
+  while [[ -n "$path_" && "$path_" != . ]]; do
+    [[ "$path_" -ef "$dir" ]] && return 0
+    [[ "$path_" != / ]] || return 1
+    path_="$(dirname "$path_")"
+  done
+  return 1
 }
 
 # jobs= on stdout, the human lines on stderr. 1: not even one job fits. 2: a number
@@ -270,7 +292,7 @@ mutants_disk_plan() {
   (( per > 0 && want > 0 )) || { echo "FAIL: --disk-plan wants a size per copy and a number of jobs above 0." >&2; return 2; }
   if (( free < per + reserve )); then
     echo "FAIL: mutation needs $(mutants_gb $((per + reserve))) GB free on $root (1 job x $(mutants_gb "$per") GB per copy + $(mutants_gb "$reserve") GB reserve) and there are $(mutants_gb "$free") GB. Nothing was copied or built." >&2
-    echo "      Free disk, or point MUTANTS_SCRATCH_DIR at a volume with room." >&2
+    echo "      Free disk, or point MUTANTS_SCRATCH_DIR at a volume with room (the scratch is its memory-industry-mutants subdirectory)." >&2
     return 1
   fi
   jobs=$(( (free - reserve) / per ))
@@ -294,6 +316,32 @@ mutants_refuse_targets_in_tree() {
   echo "      cargo-mutants copies every one of them into every job's copy (it leaves out only its" >&2
   echo "      own rust/target): on 2026-10-13 four of them were 25.8 GB of each copy and filled the" >&2
   echo "      disk. Delete them, or point CARGO_TARGET_DIR outside rust/. Nothing was copied or built." >&2
+  return 2
+}
+
+# The same copy, before cargo has made it: a CARGO_TARGET_DIR inside rust/ is a
+# target-to-be, and cargo writes it at the first build. Only merge-gate.sh asks
+# (--refuse-targets): the mutation step itself unsets CARGO_TARGET_DIR, so there
+# it names nothing that will be copied. A relative value is relative to rust/,
+# where the gate runs cargo.
+mutants_refuse_target_dir_in_tree() {
+  local dir="${CARGO_TARGET_DIR:-}"
+  [[ -n "$dir" ]] || return 0
+  dir="$(cygpath -u "$dir" 2>/dev/null || printf '%s' "$dir")"
+  case "$dir" in
+    /* | [A-Za-z]:*) ;;
+    *) dir="$ROOT/rust/$dir" ;;
+  esac
+  dir="${dir%/}"
+  case "$dir" in
+    "$ROOT/rust/target" | "$ROOT/rust/target/"*) return 0 ;;
+    "$ROOT/rust" | "$ROOT/rust/"*) ;;
+    *) return 0 ;;
+  esac
+  echo "FAIL: CARGO_TARGET_DIR points inside rust/: ${dir#"$ROOT"/}" >&2
+  echo "      cargo would build there and cargo-mutants would copy it into every job's copy (it leaves" >&2
+  echo "      out only its own rust/target), as it did with the four targets of 2026-10-13. Point" >&2
+  echo "      CARGO_TARGET_DIR outside rust/. Nothing was copied or built." >&2
   return 2
 }
 
@@ -325,15 +373,22 @@ mutants_sweep_allowed() {
   esac
 }
 
-# Everything in the judge's own scratch older than 6 h; in the system temp only the
-# leftovers from before the scratch existed, and only what proves to be the judge's.
+# Everything in the judge's own scratch older than 6 h, marker excepted (sweeping
+# it would delete the proof that the directory is the judge's); in the system temp
+# only the leftovers from before the scratch existed, and only what proves to be
+# the judge's. A scratch without the marker is left whole: the directory may
+# have been somebody's before this script ever named it.
 mutants_sweep() {
   local scr="$1" sys="$2" path name kb
   swept_n=0 swept_kb=0
   mutants_sweep_allowed || return 0
-  while IFS= read -r -d '' path; do
-    mutants_remove "$path"
-  done < <(find -P "$scr" -mindepth 1 -maxdepth 1 -mmin +"$MUTANTS_SWEEP_MINUTES" -print0 2>/dev/null)
+  if [[ -f "$scr/$MUTANTS_MARKER" ]]; then
+    while IFS= read -r -d '' path; do
+      mutants_remove "$path"
+    done < <(find -P "$scr" -mindepth 1 -maxdepth 1 ! -name "$MUTANTS_MARKER" -mmin +"$MUTANTS_SWEEP_MINUTES" -print0 2>/dev/null)
+  else
+    echo "$scr is not provably the gate's scratch, left alone" >&2
+  fi
   while IFS= read -r -d '' path; do
     name="${path##*/}"
     if grep -q '^name = "memory-industry"[[:space:]]*$' "$path/Cargo.toml" 2>/dev/null; then
@@ -361,12 +416,22 @@ mutants_prepare_scratch() {
   mutants_refuse_targets_in_tree || return $?
   sys="$(mutants_system_temp)"
   scr="$(mutants_scratch_dir)"
-  # Everything old in the scratch is swept, so it cannot be a directory of anybody else's.
+  # Everything old in the scratch is swept, so it cannot be a directory of anybody else's,
+  # nor one that holds the repo or HOME: the sweep would reach into them.
   if [[ "$scr" -ef "$sys" || "$scr" -ef "$HOME" || "$scr" -ef / ]]; then
     echo "FAIL: the scratch directory $scr is a directory of everybody's, and the judge sweeps everything in its own that is older than 6 h. Point MUTANTS_SCRATCH_DIR at one of its own." >&2
     return 2
   fi
+  if mutants_dir_holds "$scr" "$ROOT" || mutants_dir_holds "$scr" "$HOME"; then
+    echo "FAIL: the scratch directory $scr holds the repo ($ROOT) or HOME ($HOME), and the judge sweeps what is old in it. Point MUTANTS_SCRATCH_DIR somewhere that holds neither." >&2
+    return 2
+  fi
   mkdir -p "$scr" || { echo "FAIL: could not create the scratch directory $scr" >&2; return 2; }
+  # The marker is written only into a directory that is empty, which is to say
+  # one this script just made or one nobody has used.
+  if [[ -z "$(ls -A "$scr" 2>/dev/null)" ]]; then
+    : > "$scr/$MUTANTS_MARKER" || { echo "FAIL: could not write the marker into the scratch directory $scr" >&2; return 2; }
+  fi
   mutants_sweep "$scr" "$sys"
   free="$(df -Pk "$scr" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
   per_gb="${MUTANTS_SCRATCH_GB_PER_COPY:-$MUTANTS_SCRATCH_GB_PER_COPY_MEASURED}"
@@ -952,6 +1017,11 @@ case "${1:-}" in
   "--disk-plan")
     mutants_disk_plan "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
     exit $?
+    ;;
+  "--refuse-targets")
+    mutants_refuse_targets_in_tree || exit $?
+    mutants_refuse_target_dir_in_tree || exit $?
+    exit 0
     ;;
   "--prepare-scratch")
     mutants_prepare_scratch "${2:-}" || exit $?

@@ -108,10 +108,31 @@ rel_under() {
 # both quoted) and the 9th, the signature, can carry commas, so the start is read
 # from the end: $(NF-1). A name outside [A-Za-z0-9_:<>] (empty ones included) is
 # dropped, as it always was.
+#
+# An empty list means "nothing is over the ceiling", so a lizard that is absent or
+# died must never come out as one: it is exit 2, and the callers pass it on.
+# Neither `2>/dev/null` nor `|| true` may come back: a run that could not measure
+# printed nothing, and a new CC 30 function went by as green.
+require_lizard() {
+  command -v lizard >/dev/null 2>&1 && return 0
+  echo "FALTA lizard: lizard is not on PATH, so the complexity of the diff cannot be judged (pip install lizard)." >&2
+  return 2
+}
+
 lizard_warnings() {
-  local cwd="$1" cc_max="$2"
+  local cwd="$1" cc_max="$2" csv errs rc=0
   shift 2
-  (cd "$cwd" && lizard --csv "$@" 2>/dev/null) |
+  require_lizard || return $?
+  errs="$(mktemp)"
+  csv="$(cd "$cwd" && lizard --csv "$@" 2>"$errs")" || rc=$?
+  if (( rc != 0 )); then
+    echo "FAIL: lizard exited $rc, so the complexity of the diff was not measured:" >&2
+    sed 's/^/      /' "$errs" >&2
+    rm -f "$errs"
+    return 2
+  fi
+  rm -f "$errs"
+  printf '%s\n' "$csv" |
     awk -F, -v max="$cc_max" '
       NF >= 11 && $2 ~ /^[0-9]+$/ {
         file = $7; name = $8
@@ -135,7 +156,7 @@ lizard_warnings() {
           printf "%s::%s#%d %d\n", f[i], nm[i], ord, ccn[i]
         }
       }' |
-    LC_ALL=C sort -u || true
+    LC_ALL=C sort -u
 }
 
 # The header's last line. Everything above it in the baseline is this
@@ -246,10 +267,7 @@ run_lizard() {
   if [[ "$#" -eq 0 ]]; then return 0; fi
   local cc_max="${LIZARD_CC_MAX:-8}"
 
-  if ! command -v lizard >/dev/null && ! command -v python >/dev/null; then
-    echo "FALTA lizard (CRAP/cc). Puerta CRAP 6; CC <= 4 orienta."
-    return 2
-  fi
+  require_lizard || return $?
 
   local worse=0 key cc line was
   local -A base_cc=()
@@ -276,7 +294,7 @@ run_lizard() {
   fi
 
   local measured
-  measured="$(lizard_warnings "$cwd" "$cc_max" "$@")"
+  measured="$(lizard_warnings "$cwd" "$cc_max" "$@")" || return 2
   while read -r key cc; do
     [[ -z "$key" ]] && continue
     was="${base_cc[$key]:-}"
@@ -1974,13 +1992,13 @@ fi
 if [[ ${#py[@]} -gt 0 ]]; then
   if command -v radon >/dev/null; then
     radon cc "${py[@]}" -s -n D || true
-  elif command -v lizard >/dev/null || command -v python >/dev/null; then
+  elif command -v lizard >/dev/null; then
     echo "radon ausente; lizard mide los .py del diff (misma puerta CRAP/cc)."
     if ! run_lizard . "${py[@]}"; then
       [[ $fail -eq 0 ]] && fail=2
     fi
   else
-    echo "FALTA radon. Puerta CRAP 6; CC <= 4 orienta."
+    echo "FALTA radon y lizard. Puerta CRAP 6; CC <= 4 orienta."
     [[ $fail -eq 0 ]] && fail=2
   fi
 fi

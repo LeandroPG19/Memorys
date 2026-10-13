@@ -1021,6 +1021,17 @@ echo ""
 # is this gate's verdict: exit 2, in the exit file, with the lock released.
 gate_linux_env
 
+# A cargo target inside rust/ (or a CARGO_TARGET_DIR that will be one) is copied
+# whole into every job of the mutation step, the last of this gate: it used to be
+# refused there, ~20 min of tests later. Nothing is printed unless it refuses; the
+# rule lives in mutants-gate.sh, which is also where the step applies it.
+refuse_rc=0
+refuse_out="$("$ROOT/scripts/mutants-gate.sh" --refuse-targets 2>&1)" || refuse_rc=$?
+if (( refuse_rc != 0 )); then
+  printf '%s\n' "$refuse_out" >&2
+  exit "$refuse_rc"
+fi
+
 export DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
 # A shape run-all-tests.sh cannot derive brain_gate from is refused here, before
 # libpq is asked, for the same reason gate-lock.sh gives: it would judge one
