@@ -834,6 +834,15 @@ if [[ "${1:-}" == "--self-test" ]]; then
   cat > "$tmp/fake_mutants.py" <<'PY'
 import json, os, sys
 args = sys.argv[1:]
+# Before anything is looked at, so that a run which never got here leaves no
+# trace and the self-test can say "cargo mutants was not invoked". One line per
+# call: the arguments, then the variables the judge is supposed to set.
+calls = os.environ.get("FAKE_CALLS_DIR")
+if calls:
+    open(os.path.join(calls, "cargo.invoked"), "a").close()
+    seen = [os.environ.get(k, "") for k in ("TMP", "TEMP", "TMPDIR", "CARGO_PROFILE_DEV_DEBUG", "CARGO_INCREMENTAL")]
+    with open(os.path.join(calls, "cargo.calls"), "a", encoding="utf-8") as f:
+        f.write("\t".join([" ".join(args)] + seen) + "\n")
 out = args[args.index("--output") + 1] if "--output" in args else None
 if not out or not os.path.isdir(out):
     print(f"stand-in cargo-mutants: --output {out!r} is not a directory this process can see")
@@ -860,14 +869,160 @@ PY
   printf '%s\n' '#!/bin/sh' \
     "MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 exec \"$py\" \"$fake_py\" \"\$@\"" > "$tmp/bin/cargo"
   chmod +x "$tmp/bin/cargo"
-  mut_rc=0
-  FAKE_OUTCOME=genuine PATH="$tmp/bin:$PATH" mutate_and_judge --file src/a.rs >"$tmp/mut.out" 2>&1 || mut_rc=$?
+
+  # --- G3: the mutation step does not fill the disk -------------------------------
+  # On 2026-10-13 it ran out of disk (os error 112): every job copied rust/ with the
+  # cargo targets inside it, and nothing looked at the disk first. The rule is
+  # mutants-gate.sh --disk-plan / --prepare-scratch, whose own --self-test proves
+  # it; what is held here is that THIS step asks before it runs cargo mutants, hands
+  # it the jobs that fit and the judge's own scratch as its temp dir, and gives the
+  # df and the cargo of this fixture nothing to hide behind.
+  # The doubles are on PATH, as merge-gate.sh does with stat (FAKE_FS).
+  printf '%s\n' '#!/bin/sh' \
+    '[ "${FAKE_DF_FAIL:-}" = 1 ] && exit 1' \
+    'for last; do :; done' \
+    "echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'" \
+    'echo "fake 0 0 ${FAKE_DF_AVAIL_KB} 0% $last"' > "$tmp/bin/df"
+  chmod +x "$tmp/bin/df"
+  kb=1048576   # one GB, in the KB that df -Pk prints
+  q_home="$tmp/qhome"
+  q_sys="$tmp/qsystemp"
+  q_scr="$q_sys/memory-industry-mutants"
+  q_sys_native="$(cygpath -w "$q_sys" 2>/dev/null || printf '%s' "$q_sys")"
+  q_calls="$(cygpath -m "$tmp" 2>/dev/null || printf '%s' "$tmp")"
+  q_avail=$((500 * kb))
+  q_per=10
+  # The judge runs in a throwaway copy of its two scripts over an empty rust/:
+  # mutate_and_judge asks mutants-gate.sh to look at $ROOT/rust and at the temp
+  # dir, and the real checkout may hold a target-* a developer left behind, which
+  # would turn every row red for a reason that is not the row's. package.json
+  # comes along because gate_linux_env reads engines.node from it.
+  mk_qtree() {
+    mkdir -p "$tmp/$1/scripts" "$tmp/$1/rust"
+    cp "$ROOT/scripts/mutants-gate.sh" "$ROOT/scripts/gate-lock.sh" "$tmp/$1/scripts/"
+    [[ ! -f "$ROOT/package.json" ]] || cp "$ROOT/package.json" "$tmp/$1/"
+  }
+  mk_qtree qtree
+  q_tree="$tmp/qtree"
+  q_fresh() { rm -rf "$q_sys" "$q_home" "$tmp/cargo.invoked" "$tmp/cargo.calls" "$tmp/leak.debug"; mkdir -p "$q_sys" "$q_home"; }
+  # mj [VAR=value]... -- ARGS...: mutate_and_judge ARGS in that tree, with the
+  # fixture's HOME and temp dir and nothing of the caller's environment that
+  # the step is meant to set itself. Its output lands in $tmp/mut.out and its
+  # status in $mut_rc. It runs in a subshell, which is also where a variable the
+  # step exported would show: leak.debug is what CARGO_PROFILE_DEV_DEBUG was
+  # once the step had returned.
+  mj() {
+    local -a extra=()
+    while [[ "${1:-}" != -- ]]; do extra+=("$1"); shift; done
+    shift
+    mut_rc=0
+    (
+      ROOT="$q_tree"
+      cd "$q_tree"
+      unset CARGO_PROFILE_DEV_DEBUG CARGO_INCREMENTAL MUTANTS_JOBS MUTANTS_SCRATCH_DIR \
+        MUTANTS_SCRATCH_GB_PER_COPY CUBA_GATE_MIN_FREE_GB CUBA_GATE_LOCK_OWNER FAKE_DF_FAIL FAKE_OUTCOME
+      export HOME="$q_home" TMP="$q_sys_native" TEMP="$q_sys_native" TMPDIR="$q_sys" \
+        PATH="$tmp/bin:$PATH" FAKE_DF_AVAIL_KB="$q_avail" FAKE_CALLS_DIR="$q_calls"
+      [[ -z "$q_per" ]] || export MUTANTS_SCRATCH_GB_PER_COPY="$q_per"
+      for kv in ${extra[@]+"${extra[@]}"}; do export "${kv?}"; done
+      inner=0
+      mutate_and_judge "$@" || inner=$?
+      printf '%s' "${CARGO_PROFILE_DEV_DEBUG:-}" > "$tmp/leak.debug"
+      exit "$inner"
+    ) >"$tmp/mut.out" 2>&1 || mut_rc=$?
+  }
+  mj_said() { grep -qF -- "$1" "$tmp/mut.out"; }
+  mj_invoked() { [[ -f "$tmp/cargo.invoked" ]]; }
+  # Field N of the first call of cargo mutants the stand-in saw (tab-separated, and
+  # some are empty, which `read` would collapse).
+  mj_field() { grep -m1 '^mutants' "$tmp/cargo.calls" | awk -F'\t' -v n="$1" '{print $n}'; }
+  qnorm() { cygpath -m "$1" 2>/dev/null || printf '%s' "$1"; }
+
+  # QG1: not even one copy fits, so cargo mutants is never run.
+  q_fresh
+  q_avail=$((12 * kb))
+  mj MUTANTS_JOBS=3 -- --file src/a.rs
+  if (( mut_rc == 0 )) || mj_invoked || ! mj_said '12.0 GB' || ! mj_said '18.0 GB'; then
+    echo "FAIL self-test: QG1: with 12 GB free for a 10 GB copy and 8 GB reserve the step invoked cargo mutants, or did not say the 12.0 GB it had and the 18.0 GB it needed (exit $mut_rc, invoked: $(mj_invoked && echo yes || echo no)): $(cat "$tmp/mut.out")" >&2
+    exit 1
+  fi
+  # QG5: not knowing the free space is not having it.
+  q_fresh
+  q_avail=$((500 * kb))
+  mj FAKE_DF_FAIL=1 -- --file src/a.rs
+  if (( mut_rc == 0 )) || mj_invoked || ! mj_said 'could not read the free space'; then
+    echo "FAIL self-test: QG5: a df that prints nothing did not stop the step before cargo mutants with 'could not read the free space' (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+    exit 1
+  fi
+  # QG2: an explicit MUTANTS_JOBS does not pass over the disk: 30 GB hold two
+  # copies of 10 GB over the 8 GB reserve, not three.
+  q_fresh
+  q_avail=$((30 * kb))
+  mj FAKE_OUTCOME=genuine MUTANTS_JOBS=3 -- --file src/a.rs
+  if (( mut_rc != 0 )) || ! mj_invoked || ! mj_said 'capped by disk: 3 wanted, 2 fit' \
+    || ! [[ "$(mj_field 1)" == *' --jobs 2 '* ]]; then
+    echo "FAIL self-test: QG2: MUTANTS_JOBS=3 over disk for 2 did not reach cargo mutants as --jobs 2 with 'capped by disk: 3 wanted, 2 fit' (exit $mut_rc, argv: $(mj_field 1)): $(cat "$tmp/mut.out")" >&2
+    exit 1
+  fi
+  # QG3 and QG7: cargo mutants gets the judge's scratch as its temp dir, in the
+  # three spellings (TMP and TEMP are what Windows reads, TMPDIR what Unix does),
+  # and debug info off (7.6 of the 14.1 GB of a copy's target were .pdb). That
+  # variable is for that one command: it is not in the step's environment after.
+  q_fresh
+  q_avail=$((500 * kb))
+  mj FAKE_OUTCOME=genuine -- --file src/a.rs
+  mj_invoked || { echo "FAIL self-test: QG3: with 500 GB free the step did not run cargo mutants: $(cat "$tmp/mut.out")" >&2; exit 1; }
+  for field in 2 3 4; do
+    if [[ "$(qnorm "$(mj_field "$field")")" != "$(qnorm "$q_scr")" ]]; then
+      echo "FAIL self-test: QG3: field $field of the cargo mutants call (TMP, TEMP, TMPDIR) was '$(mj_field "$field")', not the judge's scratch $q_scr" >&2
+      exit 1
+    fi
+  done
+  if [[ "$(mj_field 5)" != 0 ]]; then
+    echo "FAIL self-test: QG7: cargo mutants did not get CARGO_PROFILE_DEV_DEBUG=0 (got '$(mj_field 5)')" >&2
+    exit 1
+  fi
+  if [[ -n "$(cat "$tmp/leak.debug" 2>/dev/null)" ]]; then
+    echo "FAIL self-test: QG7: CARGO_PROFILE_DEV_DEBUG was still exported after the step returned: it is for one cargo mutants call, not for the rest of the judge" >&2
+    exit 1
+  fi
+  # QG4: the judge's own scratch is swept of what is older than 6 h before the
+  # disk is measured, and what is newer stays.
+  q_fresh
+  mkdir -p "$q_scr/cargo-mutants-rust-old.tmp" "$q_scr/cargo-mutants-rust-new.tmp"
+  : > "$q_scr/cargo-mutants-rust-old.tmp/x"
+  : > "$q_scr/cargo-mutants-rust-new.tmp/x"
+  touch -d '7 hours ago' "$q_scr/cargo-mutants-rust-old.tmp"
+  touch -d '1 hour ago' "$q_scr/cargo-mutants-rust-new.tmp"
+  mj FAKE_OUTCOME=genuine -- --file src/a.rs
+  if [[ -e "$q_scr/cargo-mutants-rust-old.tmp" || ! -d "$q_scr/cargo-mutants-rust-new.tmp" ]]; then
+    echo "FAIL self-test: QG4: the run did not sweep the 7 h old copy of the judge's scratch and leave the 1 h old one: $(ls "$q_scr" 2>&1)" >&2
+    exit 1
+  fi
+  # QG8: a cargo target inside rust/ other than target/ is copied whole by
+  # cargo-mutants (25.8 GB of four of them on 2026-10-13), so the step stops
+  # before it, naming the directory.
+  mk_qtree qtaint
+  mkdir -p "$tmp/qtaint/rust/target-x"
+  : > "$tmp/qtaint/rust/target-x/CACHEDIR.TAG"
+  q_tree="$tmp/qtaint"
+  q_fresh
+  mj FAKE_OUTCOME=genuine -- --file src/a.rs
+  q_tree="$tmp/qtree"
+  if (( mut_rc == 0 )) || mj_invoked || ! mj_said 'target-x'; then
+    echo "FAIL self-test: QG8: a rust/target-x holding CACHEDIR.TAG did not stop the step before cargo mutants, naming it (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+    exit 1
+  fi
+
+  # The two runs that were here before G3, now in the fixture's tree and with room.
+  q_fresh
+  mj FAKE_OUTCOME=genuine -- --file src/a.rs
   if (( mut_rc != 0 )) || ! grep -q 'all 0 refused by the compiler' "$tmp/mut.out"; then
     echo "FAIL self-test: a mutation run with one genuine catch did not pass through the build check (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
     exit 1
   fi
-  mut_rc=0
-  FAKE_OUTCOME=killed PATH="$tmp/bin:$PATH" mutate_and_judge --file src/a.rs >"$tmp/mut.out" 2>&1 || mut_rc=$?
+  q_fresh
+  mj FAKE_OUTCOME=killed -- --file src/a.rs
   if (( mut_rc == 0 )) || ! grep -q 'stopped 1 of 1 unviable' "$tmp/mut.out"; then
     echo "FAIL self-test: a build the machine killed was not refused, so cargo-mutants and this script did not read the same outcomes.json (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
     exit 1
@@ -879,7 +1034,10 @@ PY
   echo "    in both directions and red on entries that are dead or in the wrong shape;"
   echo "    an exclusion goes red when it expires, loses its date, or matches no mutant;"
   echo "    regenerating the baseline keeps each comment over its key and is idempotent; the mutation"
-  echo "    step hands cargo-mutants an output path it can see, and judges what it wrote"
+  echo "    step hands cargo-mutants an output path it can see, and judges what it wrote; it asks"
+  echo "    for the jobs the disk holds before cargo mutants, an explicit MUTANTS_JOBS included,"
+  echo "    runs it in the judge's own scratch with debug info off, and stops at a cargo target"
+  echo "    inside rust/"
   exit 0
 fi
 

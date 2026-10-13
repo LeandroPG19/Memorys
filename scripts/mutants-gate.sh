@@ -203,7 +203,7 @@ self_test() {
   trap 'rm -rf "$tmp"' EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
 
-  # write_log FILE KIND: the build phase of a real log, ending one of five ways.
+  # write_log FILE KIND: the build phase of a real log, ending one of seven ways.
   #   e0308    rustc refuses the mutant with an error code
   #   plain    rustc refuses it with a plain `error: ` (a let-chain `||`)
   #   silent   the 2026-09-23 shape: cargo's summary and no diagnostic, plus an
@@ -212,6 +212,9 @@ self_test() {
   #            the build phase starts
   #   linker   the only error is link.exe dying of 0xc0000142: three of the
   #            seven 101s of 2026-09-23 read exactly like this
+  #   nospace112 / nospace28   the only error is the disk filling up (Windows
+  #            os error 112, Unix os error 28): rustc starts the line with
+  #            `error: ` like a diagnostic, and says nothing about the source
   write_log() {
     local file="$1" kind="$2"
     {
@@ -225,6 +228,8 @@ self_test() {
         e0308) echo 'error[E0308]: mismatched types' ;;
         plain) echo 'error: `||` operators are not supported in let chain conditions' ;;
         linker) echo 'error: linking with `link.exe` failed: exit code: 0xc0000142' ;;
+        nospace112) echo 'error: could not write output to C:\Users\x\AppData\Local\Temp\memory-industry-mutants\cargo-mutants-rust-Ab12.tmp\target\debug\deps\memory_industry-0a1b.rlib: There is not enough space on the disk. (os error 112)' ;;
+        nospace28) echo 'error: failed to write /tmp/x/target/debug/deps/libmemory_industry-0a1b.rlib: No space left on device (os error 28)' ;;
       esac
       echo 'error: could not compile `memory-industry` (lib test)'
       echo
@@ -343,10 +348,333 @@ self_test() {
   judge caught_miscount
   (( rc != 0 )) || self_fail "caught=2 over one CaughtMutant record was accepted"
 
+  # --- G3: the mutation step does not fill the disk ----------------------------
+  # On 2026-10-13 the step ran out of disk (os error 112) because every job copied
+  # rust/ with the cargo targets inside it (25.8 GB of other people's targets, plus
+  # the 14.1 GB build of each copy) and nothing looked at the disk before copying.
+  # Two modes carry the rule, and the two judges call them before cargo mutants:
+  #   --disk-plan ROOT FREE_KB PER_COPY_KB RESERVE_KB WANT   pure: how many jobs fit
+  #   --prepare-scratch WANT   the judge's own scratch dir, the sweep, the free
+  #                            space read, the plan; stdout is `jobs=` and `scratch=`
+  # They are called through the CLI, not as functions, so that before they exist
+  # the failure is `unknown argument` and not `command not found`.
+  # Doubles are put on PATH like merge-gate.sh does with stat (FAKE_FS): no
+  # variable of the code under test is invented for them.
+  kb=1048576   # one GB, in the KB that df -Pk prints
+  mkdir -p "$tmp/bin"
+  printf '%s\n' '#!/bin/sh' \
+    '[ "${FAKE_DF_FAIL:-}" = 1 ] && exit 1' \
+    'for last; do :; done' \
+    "echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'" \
+    'echo "fake 0 0 ${FAKE_DF_AVAIL_KB} 0% $last"' > "$tmp/bin/df"
+  printf '%s\n' '#!/bin/sh' \
+    'printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$*" "${TMP:-}" "${TEMP:-}" "${TMPDIR:-}" "${CARGO_PROFILE_DEV_DEBUG:-}" "${CARGO_INCREMENTAL:-}" >> "$FAKE_CALLS"' \
+    'exit 0' > "$tmp/bin/cargo"
+  chmod +x "$tmp/bin/df" "$tmp/bin/cargo"
+
+  # The pure rule.
+  plan() {
+    rc=0
+    bash "$ROOT/scripts/mutants-gate.sh" --disk-plan /scratch-root "$@" >"$tmp/plan.out" 2>"$tmp/plan.err" || rc=$?
+  }
+  plan_said() { grep -qF -- "$1" "$tmp/plan.out" "$tmp/plan.err"; }
+  plan_jobs() { grep -qx "jobs=$1" "$tmp/plan.out"; }
+
+  plan $((200 * kb)) $((20 * kb)) $((8 * kb)) 3
+  if (( rc != 0 )) || ! plan_jobs 3 || plan_said capped; then
+    self_fail "P1: 200 GB free for 3 jobs of 20 GB and 8 GB reserve was not jobs=3 with nothing capped (exit $rc): $(cat "$tmp/plan.out" "$tmp/plan.err")"
+  fi
+
+  plan $((100 * kb)) $((41 * kb)) $((8 * kb)) 3
+  if (( rc != 0 )) || ! plan_jobs 2 || ! plan_said 'capped by disk: 3 wanted, 2 fit'; then
+    self_fail "P2: 100 GB free, 41 GB per copy, 8 GB reserve did not cut 3 jobs to 2 out loud (exit $rc): $(cat "$tmp/plan.out" "$tmp/plan.err")"
+  fi
+
+  plan $((45 * kb)) $((41 * kb)) $((8 * kb)) 2
+  if (( rc != 1 )); then
+    self_fail "P3: 45 GB free for one 41 GB copy and 8 GB reserve exited $rc, not 1: $(cat "$tmp/plan.out" "$tmp/plan.err")"
+  fi
+  for want in '45.0 GB' '41.0 GB per copy' '8.0 GB reserve' '49.0 GB' '/scratch-root' 'Nothing was copied or built'; do
+    grep -qF -- "$want" "$tmp/plan.err" || self_fail "P3: the refusal did not say '$want': $(cat "$tmp/plan.err")"
+  done
+  ! grep -q '^jobs=' "$tmp/plan.out" || self_fail "P3: a refusal still printed a jobs= line: $(cat "$tmp/plan.out")"
+
+  # Fits exactly: <=, not <. One KB less does not.
+  plan $((49 * kb)) $((41 * kb)) $((8 * kb)) 1
+  if (( rc != 0 )) || ! plan_jobs 1; then
+    self_fail "P4: exactly 49 GB for 41 GB + 8 GB reserve was refused (exit $rc): $(cat "$tmp/plan.out" "$tmp/plan.err")"
+  fi
+  plan $((49 * kb - 1)) $((41 * kb)) $((8 * kb)) 1
+  (( rc == 1 )) || self_fail "P5: 1 KB under the 49 GB it needs exited $rc, not 1: $(cat "$tmp/plan.out" "$tmp/plan.err")"
+
+  # Not knowing the free space is neither zero nor infinite. Exit 2, and it must
+  # not claim that nothing was copied: nothing was measured either.
+  for free in '' abc; do
+    plan "$free" $((41 * kb)) $((8 * kb)) 2
+    if (( rc != 2 )) || ! plan_said 'could not read the free space' || grep -qF 'Nothing was copied' "$tmp/plan.err"; then
+      self_fail "P6: free space '$free' did not exit 2 with 'could not read the free space' (exit $rc): $(cat "$tmp/plan.out" "$tmp/plan.err")"
+    fi
+  done
+
+  plan $((100 * kb)) 0 $((8 * kb)) 2
+  (( rc == 2 )) || self_fail "P7: a size per copy of 0 exited $rc, not 2: $(cat "$tmp/plan.out" "$tmp/plan.err")"
+  plan $((100 * kb)) $((41 * kb)) $((8 * kb)) 0
+  (( rc == 2 )) || self_fail "P7: 0 jobs wanted exited $rc, not 2: $(cat "$tmp/plan.out" "$tmp/plan.err")"
+
+  # The impure half runs in a throwaway copy of the scripts over an empty rust/.
+  # It acts on $ROOT/rust (the guard against a cargo target inside the tree below)
+  # and on the machine's temp dir, and the real checkout may hold anything at the
+  # moment this runs: a target-* a developer left in rust/ would turn every row
+  # red for a reason that is not the row's. HOME, TMP, TEMP and TMPDIR are the
+  # fixture's, so the real temp dir and the real gate lock are never looked at.
+  # package.json comes along because gate_linux_env reads engines.node from it.
+  mk_tree() {
+    mkdir -p "$tmp/$1/scripts" "$tmp/$1/rust"
+    cp "$ROOT/scripts/mutants-gate.sh" "$ROOT/scripts/gate-lock.sh" "$tmp/$1/scripts/"
+    [[ ! -f "$ROOT/package.json" ]] || cp "$ROOT/package.json" "$tmp/$1/"
+  }
+  norm() { cygpath -m "$1" 2>/dev/null || printf '%s' "$1"; }
+  home="$tmp/home"
+  sys="$tmp/systemp"
+  scr="$sys/memory-industry-mutants"
+  sys_native="$(cygpath -w "$sys" 2>/dev/null || printf '%s' "$sys")"
+  avail=$((500 * kb))
+  per_copy=10
+  fresh() { rm -rf "$sys" "$home" "$tmp/cargo.calls"; mkdir -p "$sys" "$home"; }
+  # in_tree TREE [VAR=value]... -- ARGS...: the script of that tree, in the
+  # fixture's environment, its stdout and stderr in $tmp/run.out and run.err.
+  in_tree() {
+    local t="$1"
+    local -a extra=()
+    shift
+    while [[ "${1:-}" != -- ]]; do extra+=("$1"); shift; done
+    shift
+    local -a e=(HOME="$home" TMP="$sys_native" TEMP="$sys_native" TMPDIR="$sys"
+                PATH="$tmp/bin:$PATH" FAKE_DF_AVAIL_KB="$avail" FAKE_CALLS="$tmp/cargo.calls")
+    [[ -z "$per_copy" ]] || e+=(MUTANTS_SCRATCH_GB_PER_COPY="$per_copy")
+    rc=0
+    env -u MUTANTS_SCRATCH_GB_PER_COPY -u MUTANTS_SCRATCH_DIR -u CUBA_GATE_LOCK_OWNER \
+        -u CUBA_GATE_MIN_FREE_GB -u MUTANTS_JOBS -u FAKE_DF_FAIL \
+        -u CARGO_PROFILE_DEV_DEBUG -u CARGO_INCREMENTAL \
+        "${e[@]}" ${extra[@]+"${extra[@]}"} \
+        bash "$tmp/$t/scripts/mutants-gate.sh" "$@" >"$tmp/run.out" 2>"$tmp/run.err" || rc=$?
+  }
+  run_said() { grep -qF -- "$1" "$tmp/run.err"; }
+  # mk_entry DIR AGE: a directory with something in it, whose own mtime is AGE
+  # old, set last so that creating the contents does not make it new again.
+  mk_entry() {
+    mkdir -p "$1"
+    : > "$1/x"
+    touch -d "$2" "$1"
+  }
+  ran_mutants() { [[ -f "$tmp/cargo.calls" ]] && grep -q '^mutants --file' "$tmp/cargo.calls"; }
+
+  mk_tree clean
+
+  # W1: the judge's own scratch is swept of what is older than 6 h, and says so.
+  fresh
+  mk_entry "$scr/cargo-mutants-rust-old.tmp" '7 hours ago'
+  mk_entry "$scr/cargo-mutants-rust-new.tmp" '1 hour ago'
+  mk_entry "$scr/cuba-attrs-x-1" '7 hours ago'
+  in_tree clean -- --prepare-scratch 2
+  if (( rc != 0 )) || ! grep -qx 'jobs=2' "$tmp/run.out" || [[ "$(wc -l <"$tmp/run.out")" -ne 2 ]]; then
+    self_fail "W1: --prepare-scratch 2 over 500 GB free did not print jobs=2 and scratch= alone on stdout (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  got="$(sed -n 's/^scratch=//p' "$tmp/run.out")"
+  [[ "$(norm "$got")" == "$(norm "$scr")" ]] || self_fail "W1: scratch= was '$got', not the judge's own directory under the system temp ($scr)"
+  [[ ! -e "$scr/cargo-mutants-rust-old.tmp" && ! -e "$scr/cuba-attrs-x-1" ]] || self_fail "W1: an entry of 7 h in the judge's scratch was not swept"
+  [[ -d "$scr/cargo-mutants-rust-new.tmp" ]] || self_fail "W1: an entry of 1 h in the judge's scratch was swept"
+  run_said 'swept cargo-mutants-rust-old.tmp' || self_fail "W1: the sweep did not say 'swept cargo-mutants-rust-old.tmp': $(cat "$tmp/run.err")"
+
+  # L1: in the system temp, only what proves to be the judge's, and only when old.
+  fresh
+  mk_entry "$sys/cargo-mutants-rust-a.tmp" '7 hours ago'
+  printf 'name = "memory-industry"\n' > "$sys/cargo-mutants-rust-a.tmp/Cargo.toml"
+  touch -d '7 hours ago' "$sys/cargo-mutants-rust-a.tmp"
+  mk_entry "$sys/cargo-mutants-rust-b.tmp" '7 hours ago'
+  printf 'name = "somebody-else"\n' > "$sys/cargo-mutants-rust-b.tmp/Cargo.toml"
+  touch -d '7 hours ago' "$sys/cargo-mutants-rust-b.tmp"
+  mk_entry "$sys/cargo-mutants-rust-c.tmp" '7 hours ago'
+  mk_entry "$sys/cuba-attrs-test-0a1b2c3d" '7 hours ago'
+  mk_entry "$sys/cuba-attrs-fresh" '1 hour ago'
+  mkdir -p "$sys/tmp.AAAA/mutants.out"
+  touch -d '7 hours ago' "$sys/tmp.AAAA"
+  mk_entry "$sys/tmp.BBBB" '7 hours ago'
+  mk_entry "$sys/memory-industry-other" '7 hours ago'
+  in_tree clean -- --prepare-scratch 2
+  (( rc == 0 )) || self_fail "L1: --prepare-scratch over a system temp with old entries exited $rc: $(cat "$tmp/run.out" "$tmp/run.err")"
+  for gone in cargo-mutants-rust-a.tmp cuba-attrs-test-0a1b2c3d tmp.AAAA; do
+    [[ ! -e "$sys/$gone" ]] || self_fail "L1: $gone, of 7 h and provably the judge's, was not swept"
+  done
+  for stays in cargo-mutants-rust-b.tmp cargo-mutants-rust-c.tmp cuba-attrs-fresh tmp.BBBB memory-industry-other; do
+    [[ -e "$sys/$stays" ]] || self_fail "L1: $stays was swept, and nothing proves it is the judge's or old enough"
+  done
+  run_said "not provably the gate's, left alone: cargo-mutants-rust-c.tmp" || self_fail "L1: a half-made copy that was left alone was not listed: $(cat "$tmp/run.err")"
+
+  # K1: another gate is running. Its copies are in use: nothing is swept, and the
+  # disk is still measured.
+  fresh
+  mk_entry "$scr/cargo-mutants-rust-old.tmp" '7 hours ago'
+  sleeper=""
+  trap 'kill "$sleeper" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+  sleep 300 &
+  sleeper=$!
+  mkdir -p "$home/.cache/cuba-gate/lock"
+  # The record is the one gate-lock.sh writes, so it is made by its own function. The
+  # path goes through a variable: local_gate_contract.rs looks for the first line that
+  # sources gate-lock.sh to know where the gate's environment is set up, and it has
+  # to find the gate's, not this one.
+  lock_lib="$ROOT/scripts/gate-lock.sh"
+  # shellcheck source=scripts/gate-lock.sh
+  (source "$lock_lib"; owner_record "$sleeper" k1) > "$home/.cache/cuba-gate/lock/owner"
+  in_tree clean -- --prepare-scratch 2
+  kill "$sleeper" 2>/dev/null || true
+  (( rc == 0 )) || self_fail "K1: --prepare-scratch beside a live gate exited $rc: $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ -d "$scr/cargo-mutants-rust-old.tmp" ]] || self_fail "K1: an entry was swept while another gate held the lock"
+  if ! run_said 'another gate is running' || ! run_said 'sweep skipped' || ! grep -q '^jobs=' "$tmp/run.out"; then
+    self_fail "K1: with another gate running it did not say 'another gate is running' and 'sweep skipped', or stopped measuring the disk: $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+
+  # K2: under merge-gate.sh the lock is the PARENT's, and the sweep is its own
+  # business. This shell is the parent: the script is its direct child, not a
+  # child of a $( ) subshell, whose pid would not be the one the record names.
+  fresh
+  mk_entry "$scr/cargo-mutants-rust-old.tmp" '7 hours ago'
+  mkdir -p "$home/.cache/cuba-gate/lock"
+  # shellcheck source=scripts/gate-lock.sh
+  holder="$(source "$lock_lib"; owner_record "$$" k2)"
+  printf '%s\n' "$holder" > "$home/.cache/cuba-gate/lock/owner"
+  in_tree clean CUBA_GATE_LOCK_OWNER="$holder" -- --prepare-scratch 2
+  (( rc == 0 )) || self_fail "K2: --prepare-scratch under the gate that holds the lock exited $rc: $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ ! -e "$scr/cargo-mutants-rust-old.tmp" ]] || self_fail "K2: the parent that holds the lock did not sweep: $(cat "$tmp/run.err")"
+
+  # Q1..Q5: the free space decides, and it is read from the scratch's own volume.
+  fresh
+  avail=$((12 * kb))
+  in_tree clean -- --prepare-scratch 2
+  if (( rc != 1 )) || ! run_said '12.0 GB' || ! run_said '18.0 GB' || ! run_said 'memory-industry-mutants'; then
+    self_fail "Q1: 12 GB free for a 10 GB copy and 8 GB reserve was not a refusal with both numbers and the scratch path (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  avail=$((500 * kb))
+  fresh
+  in_tree clean FAKE_DF_FAIL=1 -- --prepare-scratch 2
+  if (( rc != 2 )) || ! run_said 'could not read the free space'; then
+    self_fail "Q2: a df that prints nothing was not exit 2 'could not read the free space' (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  # The size per copy that ships is the one measured on 2026-10-13 (A3).
+  fresh
+  per_copy=""
+  in_tree clean -- --prepare-scratch 2
+  per_copy=10
+  if (( rc != 0 )) || ! grep -qE 'disk:.*12\.0 GB per copy' "$tmp/run.err"; then
+    self_fail "Q3: without MUTANTS_SCRATCH_GB_PER_COPY the disk line did not say '12.0 GB per copy' (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  fresh
+  in_tree clean MUTANTS_SCRATCH_DIR="$tmp/otro" -- --prepare-scratch 2
+  got="$(sed -n 's/^scratch=//p' "$tmp/run.out")"
+  if (( rc != 0 )) || [[ "$(norm "$got")" != "$(norm "$tmp/otro")" ]] || [[ ! -d "$tmp/otro" ]]; then
+    self_fail "Q4: MUTANTS_SCRATCH_DIR was not the scratch (scratch='$got', exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  # The reserve is CUBA_GATE_MIN_FREE_GB, the variable run-all-tests.sh reads:
+  # 29 GB fits one 10 GB copy over the default 8 GB reserve, and not over 20 GB.
+  fresh
+  avail=$((29 * kb))
+  in_tree clean CUBA_GATE_MIN_FREE_GB=20 -- --prepare-scratch 1
+  avail=$((500 * kb))
+  if (( rc != 1 )) || ! run_said '20.0 GB reserve'; then
+    self_fail "Q5: CUBA_GATE_MIN_FREE_GB=20 did not become the reserve (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+
+  # A4: a cargo target inside rust/ other than target/ is copied whole by
+  # cargo-mutants (it excludes only its own target). On 2026-10-13 four of them
+  # made 25.8 GB of every copy. Instant to see, since cargo writes a
+  # CACHEDIR.TAG in each; du would take minutes on them.
+  mk_tree tainted
+  mkdir -p "$tmp/tainted/rust/target-x"
+  : > "$tmp/tainted/rust/target-x/CACHEDIR.TAG"
+  fresh
+  in_tree tainted -- --prepare-scratch 2
+  if (( rc != 2 )) || grep -q '^jobs=' "$tmp/run.out"; then
+    self_fail "A4: a rust/target-x holding CACHEDIR.TAG did not stop the step with exit 2 and no jobs= (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  for want in 'target-x' 'cargo-mutants copies' '25.8 GB' 'CARGO_TARGET_DIR'; do
+    run_said "$want" || self_fail "A4: the refusal did not say '$want': $(cat "$tmp/run.err")"
+  done
+  # The step itself stops before cargo mutants, not only the mode.
+  fresh
+  in_tree tainted MUTANTS_JOBS=2 --
+  if (( rc == 0 )) || ran_mutants || ! run_said 'target-x'; then
+    self_fail "A4: a tree with a target inside rust/ still reached cargo mutants, or the step did not name it (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  # The presence anchor: rust/target is cargo-mutants' own to exclude, and a
+  # directory named like a target but without the tag is not one.
+  mk_tree plain
+  mkdir -p "$tmp/plain/rust/target" "$tmp/plain/rust/src" "$tmp/plain/rust/target-notes"
+  : > "$tmp/plain/rust/target/CACHEDIR.TAG"
+  fresh
+  in_tree plain -- --prepare-scratch 2
+  if (( rc != 0 )) || ! grep -qx 'jobs=2' "$tmp/run.out"; then
+    self_fail "A4: rust/target holding its own CACHEDIR.TAG, and a target-notes without one, were taken for a target to refuse (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+
+  # M1/M2: the step itself. Out of disk, cargo mutants is never run.
+  fresh
+  avail=$((12 * kb))
+  in_tree clean MUTANTS_JOBS=2 --
+  avail=$((500 * kb))
+  if (( rc == 0 )) || ran_mutants || ! run_said '12.0 GB'; then
+    self_fail "M1: with 12 GB free the step ran cargo mutants, or did not name the 12.0 GB it had (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err" "$tmp/cargo.calls" 2>&1)"
+  fi
+  # With room, an explicit MUTANTS_JOBS goes through, and cargo mutants gets the
+  # judge's scratch as its temp dir in the three spellings (TMP and TEMP are what
+  # Windows reads, TMPDIR what Unix does) and debug info off (D4: 7.6 of the
+  # 14.1 GB of a copy's target were .pdb, and with it off the copy was 37 % smaller).
+  fresh
+  in_tree clean MUTANTS_JOBS=9 --
+  ran_mutants || self_fail "M2: with 500 GB free the step did not run cargo mutants: $(cat "$tmp/run.out" "$tmp/run.err")"
+  # The fields are tab-separated and some may be empty, which `read` would collapse.
+  call_field() { grep -m1 '^mutants --file' "$tmp/cargo.calls" | awk -F'\t' -v n="$1" '{print $n}'; }
+  argv="$(call_field 1)" t_tmp="$(call_field 2)" t_temp="$(call_field 3)" t_tmpdir="$(call_field 4)" t_debug="$(call_field 5)"
+  [[ "$argv" == *' --jobs 9 '* ]] || self_fail "M2: MUTANTS_JOBS=9 did not reach cargo mutants as --jobs 9 ($argv)"
+  if [[ "$(norm "$t_tmp")" != "$(norm "$t_tmpdir")" || "$(norm "$t_temp")" != "$(norm "$t_tmpdir")" || "$t_tmpdir" != *memory-industry-mutants ]]; then
+    self_fail "M2: cargo mutants did not get TMP, TEMP and TMPDIR on the judge's scratch (TMP=$t_tmp TEMP=$t_temp TMPDIR=$t_tmpdir)"
+  fi
+  # On Linux gate_linux_env may move TMPDIR off a RAM-backed /tmp first, so the
+  # exact place is only held where nothing moves it.
+  if [[ "$(uname -s)" != Linux && "$(norm "$t_tmpdir")" != "$(norm "$scr")" ]]; then
+    self_fail "M2: the scratch cargo mutants got was $t_tmpdir, not $scr"
+  fi
+  [[ "$t_debug" == 0 ]] || self_fail "M2: cargo mutants did not get CARGO_PROFILE_DEV_DEBUG=0 (got '$t_debug')"
+
+  # D9: an out-of-disk build is the machine, not a mutant that fails to compile.
+  # `error: could not write output to ...: (os error 112)` starts like a rustc
+  # diagnostic, and used to be taken for one.
+  fixture nospace112 1 '{"Failure":101}:nospace112'
+  judge nospace112
+  (( rc != 0 )) || self_fail "N1: a build that died of os error 112 was accepted as an unviable mutant"
+  for want in 'stopped 1 of 1 unviable' 'os error 112' 'disk'; do
+    grep -qF -- "$want" "$tmp/err" || self_fail "N1: the refusal did not say '$want': $(cat "$tmp/err")"
+  done
+  fixture nospace28 1 '{"Failure":101}:nospace28'
+  judge nospace28
+  (( rc != 0 )) || self_fail "N2: a build that died of os error 28 was accepted as an unviable mutant"
+  grep -qE 'os error (28|112/28)' "$tmp/err" || self_fail "N2: the refusal did not name os error 28: $(cat "$tmp/err")"
+  grep -qF 'ran out of disk' "$tmp/err" || self_fail "N2: the refusal did not say the build ran out of disk: $(cat "$tmp/err")"
+  # Only the out-of-disk build is the machine's: the genuine one beside it is not counted.
+  fixture nospace_mixed 2 '{"Failure":101}:e0308' '{"Failure":101}:nospace112'
+  judge nospace_mixed
+  if (( rc == 0 )) || ! grep -qF 'stopped 1 of 2 unviable' "$tmp/err" || ! grep -qF '1 of them ran out of disk' "$tmp/err"; then
+    self_fail "N4: one out-of-disk build beside one compile error was not '1 of 2' and '1 of them ran out of disk' (exit $rc): $(cat "$tmp/err")"
+  fi
+
   echo "OK  self-test: a build rustc refused with a diagnostic stays unviable; an NTSTATUS,"
-  echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log"
-  echo "    and a file whose total disagrees with its records are refused; a caught mutant"
-  echo "    counts only when its test run exited 1..255, or overflowed its stack"
+  echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log,"
+  echo "    a build out of disk and a file whose total disagrees with its records are refused; a caught mutant"
+  echo "    counts only when its test run exited 1..255, or overflowed its stack; the mutation step"
+  echo "    plans its jobs from the free disk before copying, refuses when not even one fits, reads"
+  echo "    an unreadable free space as an error, sweeps only what is the judge's and old, leaves a"
+  echo "    running gate's copies alone, refuses a cargo target inside rust/, and gives cargo mutants"
+  echo "    its own scratch directory"
   exit 0
 }
 
