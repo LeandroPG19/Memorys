@@ -383,10 +383,15 @@ async fn the_dead_database_hangs_up_at_once_instead_of_timing_out() {
     let took = started.elapsed();
 
     assert!(
-        matches!(refused, sqlx::Error::Io(_)),
-        "the dead database must fail with an I/O error from a peer that hung up, and got \
-         {refused:?} after {took:?}. sqlx 0.8 retries a refused connection until the pool's \
-         acquire_timeout (5 s, db.rs) and then returns PoolTimedOut, so a port with no \
+        matches!(&refused, sqlx::Error::Io(_))
+            || matches!(&refused, sqlx::Error::Protocol(text) if text.contains("SSLRequest")),
+        "the dead database must fail because the peer hung up, and got {refused:?} after \
+         {took:?}. The hang-up has two shapes by system, both immediate and neither retried by \
+         sqlx: on Windows the close arrives as a RST and the error is Io (os error 10054); on \
+         Linux it arrives as an EOF while reading the answer to the SSLRequest and the error is \
+         Protocol(\"unexpected response from SSLRequest: 0x00\") (measured 2026-10-13, 659 \
+         us). What this must reject is PoolTimedOut: sqlx 0.8 retries a refused connection \
+         until the pool's acquire_timeout (5 s, db.rs) and then returns it, so a port with no \
          listener, or a listener that never answers, is slow and ends in that error. A URL \
          that does not parse is no better: create_lazy_pool falls back to localhost:5432 and \
          the PG* variables, which could reach a real server"

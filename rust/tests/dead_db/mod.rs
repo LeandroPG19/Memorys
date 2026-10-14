@@ -9,7 +9,9 @@
 // `acquire_timeout` (5 s, `db.rs`), then returns `PoolTimedOut`. That is sqlx, not Windows, so it
 // costs the same on Linux. Measured with `memory-industry serve` against three dead databases:
 //   127.0.0.1:1, nobody listening        7.04 s  PoolTimedOut (2 s host identity + 5 s pool)
-//   listener that accepts and closes     0.02 s  Error::Io, sqlx does not retry it
+//   listener that accepts and closes     0.02 s  Error::Io on Windows (RST, os error 10054),
+//                                                Error::Protocol on Linux (EOF reading the answer
+//                                                to the SSLRequest, 659 us); sqlx retries neither
 //   listener that accepts and stays mute 7.03 s  PoolTimedOut
 // Accepting and closing is the only one that fails at once and still fails for the right reason
 // (`v042::the_dead_database_hangs_up_at_once_instead_of_timing_out` pins both).
