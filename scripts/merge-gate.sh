@@ -1215,7 +1215,11 @@ echo "=== cargo clippy/test --features docs ==="
 (cd "$ROOT/rust" && cargo clippy --all-targets --features docs -- -D warnings)
 (cd "$ROOT/rust" && cargo test --features docs)
 
-echo "=== npm wrapper smoke ==="
+# The line where the timed steps end: test-times.sh sums the `finished in` of the
+# test calls above it (run-all-tests.sh and --features docs) and nothing after.
+# One source for the step that prints it and for the judge that stops at it.
+TIMED_STEPS_END='=== npm wrapper smoke ==='
+echo "$TIMED_STEPS_END"
 node npm/install.test.js
 
 echo "=== codigo-muerto ==="
@@ -1226,6 +1230,19 @@ echo "=== crap-gate (coverage floor) ==="
 
 echo "=== mutants-gate ==="
 "$ROOT/scripts/mutants-gate.sh"
+
+echo "=== test times (scripts/test-time-ceilings.txt) ==="
+# Last, so a time red (drift, not broken behaviour) still leaves the verdicts of
+# codigo-muerto, crap-gate and mutants-gate in the same run. The log it reads is
+# this gate's own, written through tee: wait (30 s at most) for the boundary line
+# to reach the file, or a fast run reads it cut and the judge refuses it with 2.
+# grep -c reads to the end: with grep -q the early exit hands tr a SIGPIPE, and
+# under pipefail a log of a few MB would read as "not there yet" for the 30 s.
+for _ in $(seq 300); do
+  (( $(tr -d '\r' <"$GATE_LOG" 2>/dev/null | grep -cxF "$TIMED_STEPS_END") )) && break
+  sleep 0.1
+done
+"$ROOT/scripts/test-times.sh" --judge "$GATE_LOG" --until "$TIMED_STEPS_END"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"

@@ -1,0 +1,50 @@
+# Time ceiling per test binary, per judge host. scripts/test-times.sh reads it
+# as the last step of merge-gate.sh, over the gate's own log up to the line
+# `=== npm wrapper smoke ===`: every `finished in` printed by the cargo test calls
+# of run-all-tests.sh and of the --features docs step, summed per binary.
+#
+# A line: <os> <binary> <floor_s> <ceiling_s> <owner> <expires> <reason>
+#   os         windows (Git Bash) or linux. A host is judged by its own lines only.
+#   binary     <name> for rust/tests/<name>.rs (which has to exist), lib:<crate>
+#              and bin:<crate> for unittests, doc:<crate> for doc-tests.
+#   floor_s    whole seconds, at least 1. A run under it is red: the line no
+#              longer describes the binary, lower it.
+#   ceiling_s  whole seconds, above the default of 10. A run over it is red.
+#   owner      one word.   expires  YYYY-MM-DD; the day after it, red.
+#   reason     the rest of the line, never empty.
+# A binary with no line has a ceiling of 10 s and no floor. A line whose binary
+# this host's run did not run is red.
+#
+# How a line is set, from complete gate runs on that host, run alone:
+#   ceiling = ceil(k x the slowest run), k = 1.3 with three runs or more, 1.5 with fewer
+#   floor   = floor(0.5 x the fastest run)
+#   a binary gets a line when k x its slowest run is above 10 s.
+# Measured on 2026-10-14 from the 0.30 judge logs: windows, five runs from 111719e
+# to b110ac2; linux, b110ac2 whole and fcebc6c up to the --features docs step.
+# A run on a machine loaded by another heavy job is not a measure: db28cd0-r2 on
+# linux ran every binary ~2x slower. Run the gate alone (pesado) before moving a line.
+
+windows v029_bridge_against_the_real_daemon 52 399 orquestador-0.31 2026-11-30 a real daemon and the bridge against it, run by the plain cargo test and again by --features docs; 105.9-306.2 s in five runs, the widest spread of the judge and not explained yet
+windows local_gate_contract 58 217 orquestador-0.31 2026-11-30 every gate script's --self-test, each a throwaway gate tree of stand-ins, run twice; Git Bash forks slowly (16 s on linux); 116.5-166.5 s
+windows lib:memory_industry 23 68 orquestador-0.31 2026-11-30 the unit tests, run plain, --ignored, gpu:: in release and --features docs; 47.1-52.0 s
+windows v029_doctor_reads_only_its_world 2 59 orquestador-0.31 2026-10-31 4.6-6.6 s in four runs and 45.0 s in one (111719e, the same binary hash); the outlier is not explained: explain it, or bring the ceiling down
+windows v017_relation_scan 4 36 orquestador-0.31 2026-11-30 asks the generative LLM over the network; 8.7-27.4 s, the provider's time and not the code's
+windows v029_accounts_over_real_http 9 27 orquestador-0.31 2026-11-30 real HTTP daemons over scratch databases migrated one at a time (fcebc6c); 19.5-20.5 s, 1180 s before 0.30: this line keeps it from coming back
+windows v016_extract_without_sampling 4 18 orquestador-0.31 2026-11-30 asks the generative LLM over the network; 9.3-13.2 s
+windows v029_auto_host_over_real_http 6 17 orquestador-0.31 2026-11-30 12.2-12.3 s here and 3.1 s on linux; the windows difference is not explained yet
+windows v025_a_stuck_sync_fails_instead_of_hanging 5 14 orquestador-0.31 2026-11-30 waits for a stuck sync to give up, which is what it proves; 10.2-10.5 s on both hosts
+windows v045_a_merge_reaches_the_database 2 11 orquestador-0.31 2026-11-30 5.9-8.2 s, too close to the default to live under it
+windows v017_rerank_gpu 2 11 orquestador-0.31 2026-11-30 the real reranker on the GPU in release; 5.8-8.2 s (213 s on the CPU of the linux judge)
+windows v029_accounts_redeem 2 11 orquestador-0.31 2026-11-30 5.6-8.0 s, too close to the default to live under it
+
+linux v029_bridge_against_the_real_daemon 95 387 orquestador-0.31 2026-11-30 a real daemon and the bridge against it, twice per run; 191.0-257.8 s in two runs
+linux v017_rerank_gpu 106 327 orquestador-0.31 2026-11-30 the reranker on the CPU: the ONNX runtime in WSL is the CPU one (doctor, 2026-10-14); 212.9-217.4 s. The GPU runtime in WSL brings it down, and this line with it
+linux lib:memory_industry 23 71 orquestador-0.31 2026-11-30 the unit tests, run plain, --ignored, gpu:: in release and --features docs; 46.6-47.2 s
+linux v029_accounts_over_real_http 16 59 orquestador-0.31 2026-11-30 real HTTP daemons over scratch databases migrated one at a time (fcebc6c); 33.5-39.3 s, 635-847 s before 0.30: this line keeps it from coming back
+linux v017_relation_scan 9 33 orquestador-0.31 2026-11-30 asks the generative LLM over the network; 19.2-21.7 s
+linux v016_extract_without_sampling 5 26 orquestador-0.31 2026-11-30 asks the generative LLM over the network; 11.6-16.8 s
+linux local_gate_contract 8 25 orquestador-0.31 2026-11-30 every gate script's --self-test, each a throwaway gate tree of stand-ins, run twice; 16.2 s
+linux v025_a_stuck_sync_fails_instead_of_hanging 5 16 orquestador-0.31 2026-11-30 waits for a stuck sync to give up, which is what it proves; 10.2 s
+linux v029_doctor_reads_only_its_world 3 13 orquestador-0.31 2026-11-30 7.9-8.4 s, too close to the default to live under it
+linux v029_accounts_redeem 3 11 orquestador-0.31 2026-11-30 6.9-7.3 s, too close to the default to live under it
+linux v045_a_merge_reaches_the_database 1 11 orquestador-0.31 2026-11-30 2.4-6.8 s, too close to the default to live under it

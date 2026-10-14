@@ -20,6 +20,7 @@ Second judge, chained, not a substitute: `./scripts/quality-gate.sh` (lizard + `
 | `codigo-muerto` | dead code / unused deps |
 | `scripts/crap-gate.sh` | coverage floor (`CRAP_MIN_LINE_COV`, default 15%) |
 | `scripts/mutants-gate.sh` | kill-rate floor on `src/search/{mmr,rrf,cache}.rs`; fails first if any unviable mutant was not refused by the compiler: its build must exit 1..255 and its log must show a rustc diagnostic in the build phase, not only cargo's `could not compile` or a linker failure. Unviable mutants leave the kill rate's denominator, so a machine out of memory would otherwise score high. A caught mutant counts only when its test run exited 1..255, or died of `0xC00000FD STATUS_STACK_OVERFLOW` (a mutant that recurses without end, accepted by name): a `cargo test` that never started is not a catch (`--self-test` runs the fixtures) |
+| `scripts/test-times.sh` | Last step. The time of every test binary, summed over the gate's own log up to the npm step, against `scripts/test-time-ceilings.txt`: over its ceiling (or over the default 10 s with no line) is red, and so is under its floor, a line whose binary did not run, whose `rust/tests/<name>.rs` is gone, that expired or that is malformed. Prints the 10 slowest every run. A log it cannot read is exit 2 |
 | `scripts/quality-gate.sh` | **not** in the SIL — second judge: lizard + mutants of the `rust/src` diff. `--update-lizard-baseline` keeps every comment of `scripts/lizard-baseline.txt` over the key it explains, and names the ones that leave with their key |
 
 `cargo audit` and `cargo deny` go before the tests because they cost seconds against ~20 minutes: a judge idle for days used to find a new advisory half an hour in. Measured, `cargo audit` takes 2.4 s with the database current, 11.6 s from a cold clone and 20.2 s to give up on a server that does not answer, so 120 s is a ceiling for a stalled transfer. It is never run with `--no-fetch` or `--stale`. Exit 124, or `couldn't fetch advisory database`, is exit 2 with a `FAIL:` that names `https://github.com/RustSec/advisory-db`; any other failure is exit 1, with cargo audit's own lines above it.
@@ -151,6 +152,25 @@ TMP="$(cygpath -w "$SCR")" TEMP="$(cygpath -w "$SCR")" TMPDIR="$SCR" CARGO_PROFI
     --jobs 2 --timeout 90 --leak-dirs --output "$(cygpath -m "$OUT")" -- --lib
 du -sk "$SCR"/cargo-mutants-rust-*.tmp      # KB per copy; GB x 1.25, rounded up, is the default
 rm -rf "$SCR"
+```
+
+## Time per test binary
+
+0.30 took `v029_accounts_over_real_http` from 553 s to 10.9 s and `v042_health_says_what_degraded` from 31 s to 1.5 s by hand, and nothing stopped them from drifting back. `scripts/test-times.sh` is the last step of `merge-gate.sh` and pins every binary's time, in both directions.
+
+- **What is measured.** The gate's own log (`~/.cache/cuba-gate/merge-gate.log`), from its start to the line `=== npm wrapper smoke ===`: every `cargo test` of `run-all-tests.sh` and the `--features docs` step. Each binary is a `Running …` (or `Doc-tests …`) header and the first `test result: … finished in X.XXs` after it; its time is the sum over every call that ran it. `tests/<name>.rs` is `<name>`; unittests are `lib:<crate>` and `bin:<crate>` (the library and the binary of this crate share the stem `memory_industry`); doc-tests are `doc:<crate>`. Windows (`tests\x.rs`, `.exe`, CRLF) and Linux give the same keys. The instrumented run of `crap-gate.sh` and the mutation step are not timed.
+- **Why text.** `cargo test` on stable has no machine-readable timing: libtest's `--format json` needs `-Z unstable-options`, and `nextest` cannot be the verdict here (it splits a binary into processes, and this crate keeps global state behind a `Mutex`). The summary line of libtest is the one stable source, and the reader refuses anything it cannot pair: a header without a result before the next header or the boundary, a log without the boundary or without a single timed binary, are exit 2.
+- **The ceilings.** `scripts/test-time-ceilings.txt`, one line per binary and host: `<os> <binary> <floor_s> <ceiling_s> <owner> <expires> <reason>`. A host (`windows` under Git Bash, `linux`) is judged by its own lines: the CPU-only Linux judge runs the reranker in 213 s and Windows on its GPU in 6 s, so one number for both would let a 30x regression on Windows through. A binary with no line has a ceiling of **10 s** and no floor: every regression 0.30 fixed measured more than 10 s on both hosts, and the slowest binary with no line measures under 7.
+- **Two ways.** Over the ceiling is red. Under the floor is red too: the line no longer describes the binary, and has to come down with it. The floor is half the fastest run and the ceiling 1.3 x the slowest (1.5 with fewer than three complete runs on that host), because the noise is per binary: 1.05x for `v029_accounts_over_real_http`, 2.9x for `v029_bridge_against_the_real_daemon`, 3.2x for a test that waits on a generative LLM over the network. One factor wide enough for the noisy ones would leave the steady ones loose.
+- **Dead and expired.** A line whose binary this host's run did not run, or whose `rust/tests/<name>.rs` no longer exists, is red; so is one past its date, one that is malformed, one whose ceiling is not above 10 s and one repeated. Every red of a run is printed together, after the table of the 10 slowest, which is printed green or red.
+- **Before moving a line**, compare with the previous run of the same host and look at the machine's load: a run that shared the machine with another heavy job is not a measure (on 2026-10-13 a ceiling of 60 s in Mapupita-Rust read 73 s under load and 41 s alone). Then set the line by the rule above, with the run's numbers in its reason.
+- **Order.** It runs last, after `mutants-gate.sh`: a time red is drift, not broken behaviour, so the same run still reports codigo-muerto, crap-gate and mutation instead of stopping twenty minutes earlier. It waits (at most 30 s) for the boundary line to reach the log through `tee` before reading it.
+
+Replay any log without cargo:
+
+```bash
+./scripts/test-times.sh --judge <log> --until '=== npm wrapper smoke ===' [--os windows|linux] [--today YYYY-MM-DD]
+./scripts/test-times.sh --self-test
 ```
 
 ## Isolation extras (0.26)

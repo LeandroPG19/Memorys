@@ -307,4 +307,238 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit 0
 fi
 
+# --- the judge -------------------------------------------------------------------
+# Why it exists: 0.30 took v029_accounts_over_real_http from 553 s to 10.9 s by
+# hand, and nothing stopped it from drifting back. This pins the time of every
+# test binary, in both directions, over the log merge-gate.sh already writes.
+#
+# Why it reads text: stable cargo test has no machine-readable timing (libtest's
+# --format json needs -Z unstable-options, and nextest cannot be the verdict: it
+# splits a binary into processes and this crate keeps global state behind a
+# Mutex). The `finished in` of the summary line is the one stable source. That
+# bends the ci.md rule that no deciding number comes from text for humans; the
+# repo's AGENTS.md wins, and the parser is strict to pay for it: what it cannot
+# pair is exit 2, never green. Revert when libtest stabilises --format json.
+#
+# What it does not time: the instrumented run of crap-gate.sh and the mutation
+# step (coverage and mutants, not tests), which sit after the boundary.
+#
+#   test-times.sh --judge LOG --until LINE [--os windows|linux] [--today YYYY-MM-DD]
+#                 [--ceilings FILE] [--tests-dir DIR]
+#   exit 0 green, 1 a time or a ceilings line is red, 2 it could not judge.
+
+# 10 s: every regression 0.30 fixed measured more than that on both hosts (the
+# smallest, 10.13 s), and the slowest binary with no line measures 6.7 s on
+# Windows and 6.8 s on Linux.
+DEFAULT_CEILING_S=10
+SLOWEST_N=10
+
+die2() { echo "FAIL: $*" >&2; exit 2; }
+
+# fmt_cs CENTISECONDS: 5250 -> 52.50. Times are summed as whole centiseconds so a
+# ceiling is compared exactly, with no float on the edge of a line.
+fmt_cs() { printf '%d.%02d' $(($1 / 100)) $(($1 % 100)); }
+
+# parse_log LOG UNTIL: one record per line, tab separated.
+#   H key cs      a binary and its summed time, in order of first appearance
+#   F 0|1         whether the boundary line was found
+#   U line key    the first header with no `test result` before the next header
+#                 or the boundary
+# A `test result` with no pending header (a test that prints one with
+# --nocapture) is ignored.
+parse_log() {
+  UNTIL="$2" awk '
+    BEGIN { until = ENVIRON["UNTIL"]; OFS = "\t" }
+    {
+      sub(/\r$/, "")
+      if ($0 == until) { found = 1; exit }
+    }
+    /^ +Running (unittests )?[^ ]+ \(.+\)$/ {
+      line = $0
+      sub(/^ +Running /, "", line)
+      unit = 0
+      if (line ~ /^unittests /) { unit = 1; sub(/^unittests /, "", line) }
+      src = line;  sub(/ \(.*$/, "", src);  gsub(/\\/, "/", src)
+      path = line; sub(/^[^ ]+ \(/, "", path); sub(/\)$/, "", path); gsub(/\\/, "/", path)
+      n = split(path, parts, "/")
+      key = parts[n]
+      sub(/\.exe$/, "", key)
+      sub(/-[0-9a-f]+$/, "", key)
+      if (unit) key = ((src ~ /(^|\/)lib\.rs$/) ? "lib:" : "bin:") key
+      if (pending != "" && !unpaired) { unpaired = 1; ulineno = pline; ukey = pending }
+      pending = key; pline = NR
+      next
+    }
+    /^ +Doc-tests [A-Za-z0-9_]+$/ {
+      key = $0
+      sub(/^ +Doc-tests /, "", key)
+      if (pending != "" && !unpaired) { unpaired = 1; ulineno = pline; ukey = pending }
+      pending = "doc:" key; pline = NR
+      next
+    }
+    /^test result: (ok|FAILED)\. .*finished in [0-9]+(\.[0-9]+)?s$/ {
+      if (pending == "") next
+      t = $0
+      sub(/^.*finished in /, "", t); sub(/s$/, "", t)
+      cs = int(t * 100 + 0.5)
+      if (!(pending in sum)) { order[++count] = pending; sum[pending] = 0 }
+      sum[pending] += cs
+      pending = ""
+    }
+    END {
+      if (pending != "" && !unpaired) { unpaired = 1; ulineno = pline; ukey = pending }
+      for (i = 1; i <= count; i++) print "H", order[i], sum[order[i]]
+      print "F", found + 0
+      if (unpaired) print "U", ulineno, ukey
+    }
+  ' "$1"
+}
+
+if [[ "${1:-}" == "--judge" ]]; then
+  shift
+  LOG="${1:-}"; [[ $# -gt 0 ]] && shift
+  UNTIL=""
+  OS=""
+  TODAY=""
+  CEILINGS="$ROOT/scripts/test-time-ceilings.txt"
+  TESTS_DIR="$ROOT/rust/tests"
+  have_until=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --until|--os|--today|--ceilings|--tests-dir)
+        [[ $# -ge 2 ]] || die2 "$1 needs a value"
+        case "$1" in
+          --until) UNTIL="$2"; have_until=1 ;;
+          --os) OS="$2" ;;
+          --today) TODAY="$2" ;;
+          --ceilings) CEILINGS="$2" ;;
+          --tests-dir) TESTS_DIR="$2" ;;
+        esac
+        shift 2 ;;
+      *) die2 "unknown argument '$1'" ;;
+    esac
+  done
+
+  (( have_until )) || die2 "--judge needs --until <the line that ends the timed steps>"
+  if [[ -z "$OS" ]]; then
+    case "$(uname -s)" in
+      MINGW*|MSYS*|CYGWIN*) OS=windows ;;
+      Linux) OS=linux ;;
+      *) OS="$(uname -s)" ;;
+    esac
+  fi
+  [[ "$OS" == windows || "$OS" == linux ]] || die2 "test times are judged on windows and linux, and this is '$OS'"
+  [[ -n "$TODAY" ]] || TODAY="$(date +%F)"
+  [[ -f "$LOG" ]] || die2 "no log at $LOG"
+  [[ -f "$CEILINGS" ]] || die2 "no ceilings file at $CEILINGS"
+
+  parsed="$(parse_log "$LOG" "$UNTIL")"
+  declare -A MEAS=()
+  KEYS=()
+  found=0
+  unpaired=""
+  while IFS=$'\t' read -r kind a b; do
+    case "$kind" in
+      H) KEYS+=("$a"); MEAS["$a"]="$b" ;;
+      F) found="$a" ;;
+      U) unpaired="$a $b" ;;
+    esac
+  done <<<"$parsed"
+  (( found )) || die2 "$LOG has no line '$UNTIL', so it was cut or not yet written; no time is judged"
+  if [[ -n "$unpaired" ]]; then
+    die2 "$LOG:${unpaired%% *}: ${unpaired#* } has no 'test result' line before the next binary or the boundary; the log is cut or interleaved, and the judge will not guess"
+  fi
+  (( ${#KEYS[@]} > 0 )) || die2 "no test binary was timed in $LOG before '$UNTIL': nothing timed is not a pass"
+
+  # Slowest first, ties by name: what the table shows and the order of the reds.
+  total=0
+  sorted=()
+  while IFS=$'\t' read -r cs key; do
+    sorted+=("$key")
+    total=$((total + cs))
+  done < <(for k in "${KEYS[@]}"; do printf '%s\t%s\n' "${MEAS[$k]}" "$k"; done | LC_ALL=C sort -t$'\t' -k1,1nr -k2,2)
+
+  # The ceilings file: lint every line, whatever its host, and keep the good ones.
+  declare -A LINE_FLOOR=() LINE_CEIL=() LINE_AT=()
+  reds=()
+  red() { reds+=("$1"); }
+  n=0
+  host_lines=0
+  blank_or_comment='^[[:space:]]*(#|$)'
+  shape='<os> <binary> <floor_s> <ceiling_s> <owner> <expires YYYY-MM-DD> <reason>'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    [[ "$line" =~ $blank_or_comment ]] && continue
+    read -r l_os l_bin l_floor l_ceil l_owner l_exp l_reason <<<"$line"
+    if [[ ! "$l_os" =~ ^(windows|linux)$ || ! "$l_bin" =~ ^(lib:|bin:|doc:)?[A-Za-z0-9_-]+$ \
+      || ! "$l_floor" =~ ^[0-9]+$ || ! "$l_ceil" =~ ^[0-9]+$ || -z "$l_owner" \
+      || ! "$l_exp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ || -z "$l_reason" ]]; then
+      red "$CEILINGS:$n: not '$shape': $line"
+      continue
+    fi
+    f=$((10#$l_floor)); c=$((10#$l_ceil))
+    if (( f < 1 || f >= c )); then
+      red "$CEILINGS:$n: $l_bin on $l_os: the floor ($f s) has to be at least 1 and under the ceiling ($c s)"
+      continue
+    fi
+    if (( c <= DEFAULT_CEILING_S )); then
+      red "$CEILINGS:$n: $l_bin on $l_os: a ceiling of $c s is not above the default $DEFAULT_CEILING_S s, so the line changes nothing. Remove it."
+      continue
+    fi
+    if [[ -n "${LINE_AT[$l_os $l_bin]:-}" ]]; then
+      red "$CEILINGS:$n: $l_bin on $l_os already has a line at ${LINE_AT[$l_os $l_bin]}"
+      continue
+    fi
+    LINE_AT["$l_os $l_bin"]="$n"; LINE_FLOOR["$l_os $l_bin"]="$f"; LINE_CEIL["$l_os $l_bin"]="$c"
+    [[ "$l_os" == "$OS" ]] && host_lines=$((host_lines + 1))
+    if [[ "$l_exp" < "$TODAY" ]]; then
+      red "$CEILINGS:$n: the line of $l_bin on $l_os expired on $l_exp. Renew it with a reason that is still true, or remove it."
+    fi
+    if [[ "$l_bin" != *:* && ! -f "$TESTS_DIR/$l_bin.rs" ]]; then
+      red "$CEILINGS:$n: $l_bin names $TESTS_DIR/$l_bin.rs, which does not exist. Remove the line."
+    fi
+    if [[ "$l_os" == "$OS" && -z "${MEAS[$l_bin]:-}" ]]; then
+      red "$CEILINGS:$n: $l_bin has a line for $OS and this run did not run it. Remove the line."
+    fi
+  done <"$CEILINGS"
+
+  shown=$SLOWEST_N
+  (( ${#sorted[@]} < shown )) && shown=${#sorted[@]}
+  echo "test times on $OS: ${#KEYS[@]} binaries, $(fmt_cs "$total") s in all; the $shown slowest:"
+  rank=0
+  for key in "${sorted[@]}"; do
+    rank=$((rank + 1))
+    (( rank > SLOWEST_N )) && break
+    at="${LINE_AT[$OS $key]:-}"
+    if [[ -n "$at" ]]; then note="ceiling ${LINE_CEIL[$OS $key]} s, floor ${LINE_FLOOR[$OS $key]} s"
+    else note="default ceiling $DEFAULT_CEILING_S s"; fi
+    printf '  %9s s  %-52s %s\n' "$(fmt_cs "${MEAS[$key]}")" "$key" "$note"
+  done
+
+  # The judgement of the run: every binary measured, not only the ten shown.
+  for key in "${sorted[@]}"; do
+    cs="${MEAS[$key]}"
+    at="${LINE_AT[$OS $key]:-}"
+    if [[ -n "$at" ]]; then
+      ceil_s="${LINE_CEIL[$OS $key]}"; floor_s="${LINE_FLOOR[$OS $key]}"
+      if (( cs > ceil_s * 100 )); then
+        red "$key took $(fmt_cs "$cs") s on $OS, over its ceiling of $ceil_s s ($CEILINGS:$at). Bring it back under, or raise the line with the run that measured it; first check that this run was alone on the machine."
+      elif (( cs < floor_s * 100 )); then
+        red "$key took $(fmt_cs "$cs") s on $OS, under the floor of $floor_s s of its line ($CEILINGS:$at): the ceiling of $ceil_s s no longer describes it. Lower the line (floor = half the fastest run, ceiling = 1.3 x the slowest), or remove it if the binary is under $DEFAULT_CEILING_S s now."
+      fi
+    elif (( cs > DEFAULT_CEILING_S * 100 )); then
+      red "$key took $(fmt_cs "$cs") s on $OS, over the default ceiling of $DEFAULT_CEILING_S s, and has no line in $CEILINGS. Bring it back under, or add a line: $OS $key <floor> <ceiling> <owner> <expires> <reason>."
+    fi
+  done
+
+  if (( ${#reds[@]} > 0 )); then
+    for r in "${reds[@]}"; do echo "FAIL: $r" >&2; done
+    echo "FAIL: test times: ${#reds[@]} problem(s) on $OS; $CEILINGS says how a line is set" >&2
+    exit 1
+  fi
+  echo "OK  test times on $OS: ${#KEYS[@]} binaries within their ceilings ($host_lines lines for $OS, default $DEFAULT_CEILING_S s)"
+  exit 0
+fi
+
 echo "FAIL: unknown argument '${1:-}'" >&2; exit 2
