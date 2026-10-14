@@ -5,7 +5,27 @@ All notable changes to MemoryIndustry (formerly cuba-memorys) are documented her
 [SemVer](https://semver.org/) for the Rust crate (`Cargo.toml`). PyPI
 versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI 1.28.0).
 
-## [0.30.0] — unreleased (Cargo `0.30.0` · npm `0.30.0` · PyPI `1.32.0`)
+## [0.31.0] — unreleased (Cargo `0.31.0` · npm `0.31.0` · PyPI `1.33.0`)
+
+The real machine and a judge that does not lose the hour. 0.30.0 was proved and deployed on the user's PC on
+2026-10-14; what it left, plus what its own proving cost, is closed here.
+
+### Fixed
+
+- **`rustls` 0.23.45 → 0.23.46, which closes RUSTSEC-2026-0346 to 0349.** Published the day 0.30.0 was: the `Debug` impls of client session values expose TLS secrets (medium), buffered data goes to the outer server after an ECH rejection, brotli certificate decompression can allocate up to 1 GiB before authentication, and an unauthenticated ServerHello can downgrade later connections to classical key exchange (low ×3). `rustls` is the TLS of the HTTP clients (`reqwest`: model downloads, hosted LLMs) and of `sqlx`'s link to Postgres; the local server binds loopback. Only that package moves in `Cargo.lock`. `cargo audit` goes from 4 vulnerabilities to 0; `osv` lists only what the project already accepts (`rsa` without a fix, `paste` and `number_prefix` unmaintained).
+- **`/health` never reads an NLI `loaded` for a cell that looked once and found no model.** With no NLI model at start the cell resolves to `Unavailable`; `nli_state_from` re-read `available()` (does the file exist) on every poll, so a model installed afterwards read `loaded` with `device: null` while nothing was loaded and `enabled()` stayed false for the life of the process. It now reads `absent`, with the reason «restart it to load the one installed since». A failed open stays a failure. (K4)
+- **A commit that fails after the GPU provider refused says both causes.** The refusal lived only in a `tracing::error!`, so `/health` and `doctor` showed «load model: …» and the cause of the refusal appeared one restart later, when the commit had been fixed. `gpu::open` now hands a failed commit the sentence «the GPU provider did not start: <cause>; then the session did not open on the CPU either: <commit error>» (the registry is still written only after a good commit), and `/health` redacts each half by its own variable: the provider's DLL by `ORT_DYLIB_PATH`, the model's path by its own, instead of calling the DLL «the reranker directory (see `CUBA_RERANKER_PATH`)». (K5)
+- **No test binds a port it wrote down.** `v042`, `v045`, `v025`, `v026`, `v027`, `v029_accounts`, `v029_bridge` and `v029_two_agents` (113 lines) took ports 18797–18891 by number; on 2026-10-14 the Windows judge left `18853` in `TIME_WAIT` and the Linux judge, on the same port table (WSL mirrored networking), failed on «address already in use» until it cleared ~70 s later. They ask the OS (`tests/ephemeral::port()`) on the line before the daemon spawns, inside the section that already serialises daemon starts; with eight of the old ports held by another process the four binaries that run without a second database pass. A structural guard fails if a fixed port comes back. (T3)
+
+### Gate
+
+- **The judge ends by judging the time of every test binary.** `scripts/test-times.sh --judge` reads the log `merge-gate.sh` already writes, sums `finished in` per binary and fails over its ceiling, under its floor, or on a dead, malformed or expired line; exit 2 when it cannot measure. Ceilings are per OS (the reranker is 6 s on the Windows GPU and 213 s on the Linux CPU), default 10 s, each line with reason, owner and expiry; the ten slowest print on every run. Over the real 0.30 logs the Windows runs and the Linux `b110ac2` are green and the pre-0.30 logs are red on exactly what 0.30 fixed (`v029_accounts` 1180 s). Declared deviation from `ci.md`: stable `libtest` has no JSON, so the number comes from text. (G7)
+
+### Decided
+
+- **The one search that opens the reranker still judges «rerank by default» before it has a registry, and that is left as it is.** It cannot happen in a default `serve` (the warm-up is opt-out and `gpu::open` records the placement before the warm-up batch); it needs `CUBA_WARM_RERANKER=0` or a stdio search inside the load window. It costs at most one search per process, ~20 s, with the same results in the same order, flagged `reranker_degraded`. The right fix (judge again after opening) cannot be observed by any build of the gate, the same equivalent mutant that `quality-gate.sh` already excludes for `rerank_gpu_active -> false`. (K5)
+
+## [0.30.0] — 2026-10-14 (Cargo `0.30.0` · npm `0.30.0` · PyPI `1.32.0`)
 
 What 0.29.0 shipped knowing about and judged not blocking, closed: everything here is a defect found by the 0.29
 reviews or by the first Windows and Linux runs, none needs a real host.
