@@ -1872,7 +1872,9 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #
           # Owner: endurecedor 0.29. Expires: 2027-03-22.
           #
-          # Needs a database and a running daemon. Judged by rust/tests/v029_accounts_over_real_http.rs,
+          # Needs a database and a running daemon. Judged by rust/tests/v029_accounts_over_real_http.rs
+          # (g4) and rust/tests/v029_doctor_reads_only_its_world.rs (g16, a binary of its own so the
+          # world it builds for doctor does not change the environment under the daemon tests),
           # plain DATABASE_URL run, no #[ignore]. --lib cannot start the real daemon on its loopback ports.
           #
           #   accounts_db.rs record_pair_redeemed with Ok(())
@@ -1952,10 +1954,10 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #                     wants the first of the 50 codes issued on an empty table. With `<`
           #                     the first one is refused as too many active codes.
           #   accounts_db.rs account_facts with Ok(Default::default())
-          #                     v029_accounts_over_real_http::g16_account_facts_count_what_the_database_holds_and_doctor_prints_them
+          #                     v029_doctor_reads_only_its_world::g16_account_facts_count_what_the_database_holds_and_doctor_prints_them
           #                     wants tables_present true and the counts of a migrated database.
           #   accounts_db.rs account_facts, `<` with `==`
-          #                     v029_accounts_over_real_http::g16_a_database_without_the_account_tables_is_a_doctor_failure_not_a_crash
+          #                     v029_doctor_reads_only_its_world::g16_a_database_without_the_account_tables_is_a_doctor_failure_not_a_crash
           #                     wants account_facts to answer on a database without the tables. With
           #                     `==` it queries the missing tables and fails instead. The migrated
           #                     database of g16_account_facts_count_... also answers the default.
