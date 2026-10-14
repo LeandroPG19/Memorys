@@ -183,6 +183,7 @@ on_exit() {
 # lock that failed to refuse would stop at "psql is not on PATH" instead of
 # building anything.
 #   ./scripts/run-all-tests.sh --self-test
+# --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
   tmp="$(mktemp -d)"
   sleep 300 &
@@ -480,6 +481,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "    binary keeps them, whatever XDG_CACHE_HOME says"
   exit 0
 fi
+# --- self-test end ---
 
 inherit_gate_lock "$GATE_LOCK" || acquire_gate_lock "$GATE_LOCK" || exit 1
 [[ -z "$GATE_LOCK_HELD" ]] || exit_file_running

@@ -296,6 +296,7 @@ judge_file() {
   return 0
 }
 
+# --- self-test begin ---
 # ---------------------------------------------------------------- the self-test
 
 must_fail() {
@@ -413,9 +414,12 @@ self_test() {
   echo "    break it, and every honest machine passed"
   return 0
 }
+# --- self-test end ---
 
 case "${1:-}" in
+# --- self-test begin ---
   --self-test) self_test ;;
+# --- self-test end ---
   -h|--help) usage ;;
   "") usage >&2; exit 1 ;;
   *) judge_file "$1" ;;

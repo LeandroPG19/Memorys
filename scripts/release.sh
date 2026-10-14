@@ -206,6 +206,7 @@ verify_receipt() {
   echo "OK  $tag is annotated and carries the local gate's receipt for $sha"
 }
 
+# --- self-test begin ---
 # --- self-test: each guard gets the fixture that has to stop it ---------------
 # A throwaway origin (bare) and clone in a temp dir, with this script and a
 # stand-in merge-gate.sh committed into it. The stand-in never builds anything:
@@ -469,9 +470,12 @@ self_test() {
   echo "    gate and its lines reach the tag; one for another commit, one naming another"
   echo "    commit inside, and --rerun-gate all run the gate"
 }
+# --- self-test end ---
 
 case "${1:-}" in
+# --- self-test begin ---
   --self-test) self_test ;;
+# --- self-test end ---
   --verify-receipt)
     [[ $# -eq 3 ]] || usage
     verify_receipt "$2" "$3"

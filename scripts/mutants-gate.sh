@@ -445,6 +445,7 @@ mutants_prepare_scratch() {
   MUTANTS_SCRATCH="$scr"
 }
 
+# --- self-test begin ---
 # --- self-test: the build judge gets the fixtures that have to stop it --------
 # Each fixture is an outcomes.json in the shape cargo-mutants 27.1.0 writes, cut
 # down to what the judge reads, with a log per unviable mutant cut from real
@@ -1006,9 +1007,12 @@ self_test() {
   echo "    swept only when it carries the marker, and refused if it holds the repo or HOME"
   exit 0
 }
+# --- self-test end ---
 
 case "${1:-}" in
+# --- self-test begin ---
   "--self-test") self_test ;;
+# --- self-test end ---
   "--check-builds")
     [[ -n "${2:-}" && -f "$2" ]] || { echo "FAIL: --check-builds needs an outcomes.json (got '${2:-}')" >&2; exit 1; }
     check_builds "$2"

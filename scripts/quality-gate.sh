@@ -470,6 +470,7 @@ mutate_and_judge() {
 # that is NOT about complexity must come out of `lizard_warnings` as nothing at
 # all, and one that IS must still come out with its number.
 #   ./scripts/quality-gate.sh --self-test
+# --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
   if ! command -v lizard >/dev/null; then
     echo "FALTA lizard: el self-test del filtro CRAP no puede correr." >&2
@@ -1131,6 +1132,7 @@ PY
   echo "    inside rust/"
   exit 0
 fi
+# --- self-test end ---
 
 # TMPDIR off tmpfs and the target outside the tree, before cargo mutants copies
 # anything: gate-lock.sh says why. After the self-test, which needs neither.

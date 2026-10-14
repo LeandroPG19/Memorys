@@ -1443,6 +1443,144 @@ fn the_two_pass_guard_can_actually_fail() {
     );
 }
 
+const SELF_TEST_BEGIN: &str = "# --- self-test begin ---";
+const SELF_TEST_END: &str = "# --- self-test end ---";
+
+/// Every script of `scripts/` that has a `--self-test` mode, in the order
+/// `read_dir` + sort gives. Two-way on purpose: a script that gains a mode, or
+/// loses its own, is red until this list says so.
+const SCRIPTS_WITH_SELF_TEST: [&str; 10] = [
+    "advisory-exceptions.sh",
+    "codigo-muerto.sh",
+    "gpu-placement-check.sh",
+    "merge-gate.sh",
+    "mutants-gate.sh",
+    "quality-gate.sh",
+    "release.sh",
+    "run-all-tests.sh",
+    "test-times.sh",
+    "validar-handoff.sh",
+];
+
+/// The line that hands control to the self-test: the `if` of a script whose test
+/// is a block, or the arm of the `case` of one whose test is a function.
+fn dispatches_self_test(line: &str) -> bool {
+    let arm = line.trim_start();
+    line.contains("== \"--self-test\"")
+        || arm.starts_with("--self-test)")
+        || arm.starts_with("\"--self-test\")")
+}
+
+/// What is wrong with the markers of `body`, as `<name>:<line>: <what to do>`,
+/// and whether it has a dispatch line at all. `body` already has LF endings.
+fn self_test_marks(name: &str, body: &str) -> (Vec<String>, bool) {
+    let mut problems = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut dispatches = false;
+    for (index, line) in body.lines().enumerate() {
+        let n = index + 1;
+        if line == SELF_TEST_BEGIN {
+            match open {
+                Some(first) => problems.push(format!(
+                    "{name}:{n}: `{SELF_TEST_BEGIN}` opens inside the region of line {first}; \
+                     regions do not nest, remove it"
+                )),
+                None => open = Some(n),
+            }
+        } else if line == SELF_TEST_END {
+            if open.take().is_none() {
+                problems.push(format!(
+                    "{name}:{n}: `{SELF_TEST_END}` closes nothing; pair it with a begin or remove it"
+                ));
+            }
+        } else if dispatches_self_test(line) {
+            dispatches = true;
+            if open.is_none() {
+                problems.push(format!(
+                    "{name}:{n}: dispatches --self-test outside every marked region, so \
+                     validar-handoff.sh cannot see its tests; wrap the block or the function, \
+                     its helpers and the `case` arm between the two markers, at column 0"
+                ));
+            }
+        }
+    }
+    if let Some(first) = open {
+        problems.push(format!(
+            "{name}:{first}: `{SELF_TEST_BEGIN}` has no `{SELF_TEST_END}`; add the end"
+        ));
+    }
+    (problems, dispatches)
+}
+
+/// The self-tests of the gate scripts are frozen between the red pass and the
+/// green one, and in 0.30 that was done by hand with `sed` and `cmp` on every
+/// slice. `validar-handoff.sh` compares the lines between the two markers, but it
+/// only sees what a handoff touches. This sees the whole tree on every run: each
+/// dispatch of `--self-test` sits inside a pair, no pair is open, nested or
+/// orphaned, and the scripts that have the mode are exactly the written list.
+#[test]
+fn every_gate_script_with_a_self_test_marks_the_whole_of_it() {
+    // The scan has to be able to fail before a clean answer from it means anything.
+    let honest = format!(
+        "{SELF_TEST_BEGIN}\nif [[ \"${{1:-}}\" == \"--self-test\" ]]; then\n  exit 0\nfi\n{SELF_TEST_END}\n"
+    );
+    let (clean, saw) = self_test_marks("honest.sh", &honest);
+    assert!(
+        clean.is_empty() && saw,
+        "the scan refused a block that is marked and dispatched: {clean:?}"
+    );
+    let arm_outside = format!(
+        "{SELF_TEST_BEGIN}\nself_test() {{ :; }}\n{SELF_TEST_END}\ncase \"$1\" in\n  --self-test) self_test ;;\nesac\n"
+    );
+    let defects = [
+        ("dispatch outside", arm_outside),
+        ("begin without end", format!("{SELF_TEST_BEGIN}\ntrue\n")),
+        ("end without begin", format!("true\n{SELF_TEST_END}\n")),
+        (
+            "nested begin",
+            format!("{SELF_TEST_BEGIN}\n{SELF_TEST_BEGIN}\n{SELF_TEST_END}\n"),
+        ),
+    ];
+    for (what, body) in &defects {
+        let (found, _) = self_test_marks("defect.sh", body);
+        assert!(
+            !found.is_empty(),
+            "the scan let `{what}` through: a check that cannot fail is a paragraph"
+        );
+    }
+
+    let mut names: Vec<String> = std::fs::read_dir(repo_root().join("scripts"))
+        .expect("scripts/ is readable")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".sh"))
+        .collect();
+    names.sort();
+
+    let mut problems = Vec::new();
+    let mut with_self_test = Vec::new();
+    for name in &names {
+        let body = read(&format!("scripts/{name}")).replace("\r\n", "\n");
+        let (found, dispatches) = self_test_marks(name, &body);
+        problems.extend(found);
+        if dispatches {
+            with_self_test.push(name.clone());
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "the self-test of these gate scripts is not marked as a whole, so a handoff \
+         that edits it would read as frozen or as written without anyone having compared \
+         it: {problems:#?}"
+    );
+    assert_eq!(
+        with_self_test, SCRIPTS_WITH_SELF_TEST,
+        "the scripts with a `--self-test` dispatch are not the written list. A new one has to \
+         mark its self-test and go on SCRIPTS_WITH_SELF_TEST; one that lost its mode has to \
+         come off it. If the patterns stopped matching, this is the anchor that says so"
+    );
+}
+
 /// The file a dead session reads its answer from has to be the whole gate's
 /// verdict, and has to say "running" for as long as there is none.
 ///

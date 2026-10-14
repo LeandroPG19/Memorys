@@ -274,6 +274,7 @@ juzgar() { # <fichero.yml>
   return 0
 }
 
+# --- self-test begin ---
 # --------------------------------------------------------------- el self-test
 
 # Un guardia que no se ve fallar es un parrafo, que es literalmente lo que este
@@ -282,6 +283,21 @@ juzgar() { # <fichero.yml>
 
 st_tmp=""
 st_limpiar() { [[ -n "$st_tmp" && -d "$st_tmp" ]] && rm -rf "$st_tmp"; return 0; }
+
+# Los marcadores de los scripts de fixture se generan, no se escriben: una linea
+# de este fichero que fuera literalmente un marcador cortaria SU PROPIA region, y
+# el contrato de local_gate_contract.rs lo pondria rojo. Estas asignaciones no
+# son marcadores, y @@INI@@ / @@FIN@@ de los heredocs se sustituyen con sed.
+st_ini='# --- self-test begin ---'
+st_fin='# --- self-test end ---'
+
+# Vuelve el repo `sh` a su base sin tocar git: las tres filas que editan un
+# script se encadenan sobre la misma copia, y cada una arranca limpia.
+st_restaurar() { # <dir>
+  cp "$st_tmp/pristino/"*.sh "$1/scripts/"
+  cp "$st_tmp/pristino/contrato.rs" "$1/rust/tests/contrato.rs"
+  rm -f "$1/scripts/nuevo.sh"
+}
 
 # El guardia resuelve ROOT desde su propia ubicacion, asi que para juzgarlo
 # contra un repo desechable hay que copiarlo DENTRO de el.
@@ -322,20 +338,67 @@ fn el_contrato_se_sostiene() {
 }
 RS
 
+  # Un script del juez en cada forma que hay en scripts/: el bloque `if`
+  # (juez.sh), la funcion con su ayudante FUERA de self_test() y el brazo del
+  # `case` que la despacha, cada cosa con su par de marcadores (juez-fn.sh), y
+  # uno sin modo --self-test (plano.sh), que no necesita marcadores.
+  cat > "$d/scripts/juez.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+@@INI@@
+if [[ "${1:-}" == "--self-test" ]]; then
+  [[ "$(bash "$0" doble 2)" == "4" ]] || { echo "FAIL self-test: doble" >&2; exit 1; }
+  echo "OK  self-test: doble"
+  exit 0
+fi
+@@FIN@@
+case "${1:-}" in
+  doble) echo $(( $2 * 2 )) ;;
+esac
+SH
+
+  cat > "$d/scripts/juez-fn.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+triple() { echo $(( $1 * 3 )); }
+@@INI@@
+must_be() { [[ "$1" == "$2" ]] || { echo "FAIL self-test: $1 != $2" >&2; exit 1; }; }
+self_test() {
+  must_be "$(triple 2)" 6
+  echo "OK  self-test: triple"
+}
+@@FIN@@
+case "${1:-}" in
+@@INI@@
+  --self-test) self_test ;;
+@@FIN@@
+  triple) triple "$2" ;;
+esac
+SH
+
+  printf '%s\n' '#!/usr/bin/env bash' 'echo plano' > "$d/scripts/plano.sh"
+  sed -i -e "s/^@@INI@@\$/$st_ini/" -e "s/^@@FIN@@\$/$st_fin/" \
+    "$d/scripts/juez.sh" "$d/scripts/juez-fn.sh"
+
   # Rutas explicitas: `git add -A` arrastra CRLF fantasma y ficheros ajenos, y
   # en este repo lo bloquea la guardia de comandos.
-  git -C "$d" add rust/src/cosa.rs rust/tests/contrato.rs scripts/validar-handoff.sh >/dev/null 2>&1
+  git -C "$d" add rust/src/cosa.rs rust/tests/contrato.rs scripts/validar-handoff.sh \
+    scripts/juez.sh scripts/juez-fn.sh scripts/plano.sh >/dev/null 2>&1
   git -C "$d" commit -q -m "base" >/dev/null 2>&1
 
   # El arbol se convierte a CRLF DESPUES del commit, que es como pasa de verdad:
   # se escribe CRLF, git lo normaliza al commitear y el arbol de trabajo queda
   # inconsistente con el blob. El commit se queda en LF y el arbol en CRLF.
   if [[ "$crlf" == "true" ]]; then
-    sed -i 's/$/\r/' "$d/rust/src/cosa.rs" "$d/rust/tests/contrato.rs"
-    grep -qU "$(printf '\r')" "$d/rust/tests/contrato.rs" || {
-      echo "FAIL self-test: el fixture CRLF no tiene CRLF, asi que no prueba nada." >&2
-      return 1
-    }
+    sed -i 's/$/\r/' "$d/rust/src/cosa.rs" "$d/rust/tests/contrato.rs" \
+      "$d/scripts/juez.sh" "$d/scripts/juez-fn.sh" "$d/scripts/plano.sh"
+    local f
+    for f in rust/tests/contrato.rs scripts/juez.sh; do
+      grep -qU "$(printf '\r')" "$d/$f" || {
+        echo "FAIL self-test: el fixture CRLF no tiene CRLF en $f, asi que no prueba nada." >&2
+        return 1
+      }
+    done
   fi
 
   git -C "$d" rev-parse HEAD
@@ -377,6 +440,26 @@ must_pass() { # <que> <dir> <yml>
     return 1
   fi
   echo "  verde, como debe: $que"
+  return 0
+}
+
+# Un rojo mudo no le dice a nadie que arreglar (la leccion de `val()`): ademas
+# del exit distinto de 0, la salida tiene que nombrar la causa.
+must_fail_saying() { # <que> <aguja> <dir> <yml>
+  local que="$1" aguja="$2" dir="$3" yml="$4" out rc=0
+  out="$(bash "$dir/scripts/validar-handoff.sh" "$yml" 2>&1)" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL self-test: $que — el guardia lo acepto." >&2
+    printf '%s\n' "$out" | sed 's/^/      /' >&2
+    return 1
+  fi
+  if [[ "$out" != *"$aguja"* ]]; then
+    echo "FAIL self-test: $que — rechazo sin decir '$aguja':" >&2
+    printf '%s\n' "$out" | sed 's/^/      /' >&2
+    return 1
+  fi
+  echo "  rojo, como debe: $que"
+  printf '%s\n' "$out" | sed 's/^/      /'
   return 0
 }
 
@@ -498,6 +581,102 @@ self_test() {
     echo "  rojo, como debe: un campo que falta se nombra en la salida"
   fi
 
+  # -- el self-test de un script del juez es una region de test (G8) -----------
+  # Hasta G8 un .sh en `paths` se aceptaba y se ignoraba: frozen daba OK sobre un
+  # --self-test escrito de cero y written daba rojo sobre la pasada roja honesta.
+  # Un repo solo para toda la seccion; antes de cada grupo se restaura desde una
+  # copia, porque un repo por fila cuesta ~5 s en Windows y esto tiene 15.
+  d="$st_tmp/sh"; base="$(mk_repo "$d" false)"
+  mkdir -p "$st_tmp/pristino"
+  cp "$d"/scripts/juez.sh "$d"/scripts/juez-fn.sh "$d"/scripts/plano.sh \
+    "$d/rust/tests/contrato.rs" "$st_tmp/pristino/"
+
+  # V1-V4: una linea del bloque de juez.sh cambia.
+  sed -i 's/== "4"/== "5"/' "$d/scripts/juez.sh"
+  yml="$(mk_handoff "$d" v1 "$base" frozen)"
+  printf '%s\n' 'paths:' '  - scripts/juez.sh' >> "$yml"
+  must_fail "V1: el self-test de un .sh editado, declarado frozen" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" v2 "$base" written)"
+  printf '%s\n' 'paths:' '  - scripts/juez.sh' >> "$yml"
+  must_pass "V2: ese mismo arbol declarado written: la pasada roja de un .sh" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" v3 "$base" frozen)"
+  must_fail "V3: frozen sin paths, el arbol entero incluye los .sh" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" v4 "$base" frozen)"
+  printf '%s\n' 'paths:' '  - scripts/juez-fn.sh' >> "$yml"
+  must_pass "V4: frozen con paths a otro script, que no responde del editado" "$d" "$yml" || bad=1
+
+  # V5-V6: solo produccion, fuera de toda region.
+  st_restaurar "$d"
+  sed -i 's/\* 2 ))/* 20 ))/' "$d/scripts/juez.sh"
+  sed -i 's/\* 3 ))/* 30 ))/' "$d/scripts/juez-fn.sh"
+  echo 'echo mas' >> "$d/scripts/plano.sh"
+  yml="$(mk_handoff "$d" v5 "$base" frozen)"
+  printf '%s\n' 'paths:' '  - scripts' >> "$yml"
+  must_pass "V5: produccion de tres scripts tocada fuera de las regiones, frozen" "$d" "$yml" || bad=1
+  yml="$(mk_handoff "$d" v6 "$base" written)"
+  printf '%s\n' 'paths:' '  - scripts' >> "$yml"
+  must_fail "V6: ese mismo arbol declarado written, sin haber escrito un test" "$d" "$yml" || bad=1
+
+  # V7-V8: el ayudante y el despacho son parte del test, aunque no esten
+  # dentro de self_test().
+  st_restaurar "$d"
+  sed -i 's/^must_be() {.*$/must_be() { return 0; }/' "$d/scripts/juez-fn.sh"
+  yml="$(mk_handoff "$d" v7 "$base" frozen)"
+  printf '%s\n' 'paths:' '  - scripts/juez-fn.sh' >> "$yml"
+  must_fail "V7: el ayudante de la funcion pasa a return 0, declarado frozen" "$d" "$yml" || bad=1
+  st_restaurar "$d"
+  sed -i 's/^  --self-test) self_test ;;$/  --self-test) echo "OK  self-test: triple" ;;/' "$d/scripts/juez-fn.sh"
+  yml="$(mk_handoff "$d" v8 "$base" frozen)"
+  printf '%s\n' 'paths:' '  - scripts/juez-fn.sh' >> "$yml"
+  must_fail "V8: el brazo del case imprime el OK sin correr nada, declarado frozen" "$d" "$yml" || bad=1
+
+  # V9-V10: un script nuevo, sin versionar. El sin marcar es rojo AUNQUE otro
+  # test se movio, y tiene que decir por que.
+  st_restaurar "$d"
+  grep -vxF -e "$st_ini" -e "$st_fin" "$d/scripts/juez.sh" > "$d/scripts/nuevo.sh"
+  sed -i 's/assert!(true)/assert!(false)/' "$d/rust/tests/contrato.rs"
+  yml="$(mk_handoff "$d" v9 "$base" written)"
+  printf '%s\n' 'paths:' '  - scripts/nuevo.sh' '  - rust/tests/contrato.rs' >> "$yml"
+  must_fail_saying "V9: un script nuevo con --self-test sin marcar, aunque un test se movio" \
+    "fuera de toda region marcada" "$d" "$yml" || bad=1
+  st_restaurar "$d"
+  cp "$d/scripts/juez.sh" "$d/scripts/nuevo.sh"
+  yml="$(mk_handoff "$d" v10 "$base" written)"
+  printf '%s\n' 'paths:' '  - scripts/nuevo.sh' >> "$yml"
+  must_pass "V10: un script nuevo con su self-test marcado, declarado written" "$d" "$yml" || bad=1
+
+  # V11-V14: marcadores mal puestos, con un test movido a proposito: sin la
+  # regla, written se cumpliria y la fila fallaria por casualidad.
+  st_restaurar "$d"
+  sed -i 's/assert!(true)/assert!(false)/' "$d/rust/tests/contrato.rs"
+  sed -i "/^$st_fin\$/d" "$d/scripts/juez.sh"
+  yml="$(mk_handoff "$d" v11 "$base" written)"
+  printf '%s\n' 'paths:' '  - scripts/juez.sh' '  - rust/tests/contrato.rs' >> "$yml"
+  must_fail "V11: un begin sin su end, aunque un test se movio" "$d" "$yml" || bad=1
+  st_restaurar "$d"
+  sed -i 's/assert!(true)/assert!(false)/' "$d/rust/tests/contrato.rs"
+  sed -i -e "s/^$st_ini\$/@@T@@/" -e "s/^$st_fin\$/$st_ini/" -e "s/^@@T@@\$/$st_fin/" "$d/scripts/juez.sh"
+  must_fail "V12: el end va antes que el begin, aunque un test se movio" "$d" "$yml" || bad=1
+  st_restaurar "$d"
+  sed -i 's/assert!(true)/assert!(false)/' "$d/rust/tests/contrato.rs"
+  sed -i "/^$st_ini\$/a $st_ini" "$d/scripts/juez.sh"
+  must_fail "V13: un segundo begin dentro de la region, aunque un test se movio" "$d" "$yml" || bad=1
+  st_restaurar "$d"
+  sed -i 's/assert!(true)/assert!(false)/' "$d/rust/tests/contrato.rs"
+  sed -i "/^case /,\$ { /^$st_ini\$/d; /^$st_fin\$/d; }" "$d/scripts/juez-fn.sh"
+  yml="$(mk_handoff "$d" v14 "$base" written)"
+  printf '%s\n' 'paths:' '  - scripts/juez-fn.sh' '  - rust/tests/contrato.rs' >> "$yml"
+  must_fail "V14: el brazo del case fuera de toda region, aunque un test se movio" "$d" "$yml" || bad=1
+
+  # V15: el mismo V1 en el arbol CRLF. Va aqui y no junto a frozen-crlf-ok para
+  # que la primera fila roja de un guardia viejo sea V1; el repo crlf sigue ahi,
+  # y su frozen-crlf-ok ya paso antes.
+  d="$st_tmp/crlf"
+  sed -i 's/== "4"/== "5"/' "$d/scripts/juez.sh"
+  yml="$(mk_handoff "$d" v15 "$(git -C "$d" rev-parse HEAD)" frozen)"
+  printf '%s\n' 'paths:' '  - scripts/juez.sh' >> "$yml"
+  must_fail "V15: el self-test de un .sh editado en un arbol CRLF, declarado frozen" "$d" "$yml" || bad=1
+
   if [[ "$bad" -ne 0 ]]; then
     echo "FAIL self-test: al menos un guardia ya no decide nada." >&2
     return 1
@@ -509,9 +688,12 @@ self_test() {
   echo "    para romperla, y cada handoff honesto paso"
   return 0
 }
+# --- self-test end ---
 
 case "${1:-}" in
+# --- self-test begin ---
   --self-test) self_test ;;
+# --- self-test end ---
   -h | --help) usage ;;
   "") usage >&2; exit 1 ;;
   *) juzgar "$1" ;;

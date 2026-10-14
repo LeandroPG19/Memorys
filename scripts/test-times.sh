@@ -11,6 +11,7 @@ SELF="$ROOT/scripts/test-times.sh"
 # the row. Every row passes --os, --today, --ceilings and --tests-dir, so no row
 # depends on uname, on the date, on the real ceilings file or on rust/tests.
 #   ./scripts/test-times.sh --self-test
+# --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
@@ -306,6 +307,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "OK  self-test: test-times sums each binary's finished-in over both cargo shapes up to the boundary, prints the 10 slowest, and is red for a ceiling passed, the default passed, a floor undercut, a dead or expired line and a malformed one, all in one run; a log it cannot read is exit 2"
   exit 0
 fi
+# --- self-test end ---
 
 # --- the judge -------------------------------------------------------------------
 # Why it exists: 0.30 took v029_accounts_over_real_http from 553 s to 10.9 s by

@@ -13,6 +13,7 @@ SELF="$ROOT/scripts/advisory-exceptions.sh"
 # its green twin (the same files with the one change undone) beside it: a red
 # that a green twin does not show is a judge that refuses everything.
 #   ./scripts/advisory-exceptions.sh --self-test
+# --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
@@ -372,6 +373,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "OK  self-test: advisory exceptions are green for three owned, dated ones that match the report, with a CR in the list too, and red for an expiry past, an expiry beyond 180 days, a line malformed or repeated, one that matches no advisory of the report, and an ID that one of the two mirrors has and the list has not, or the other way round, all in one run; a report that is not cargo audit's, one made with ignores, a file that is missing or not TOML and a Python without tomllib are exit 2"
   exit 0
 fi
+# --- self-test end ---
 
 # Same rule as mutants-gate.sh and test-times.sh: PYTHON_BIN, else the first python
 # that is not the Microsoft Store stub, which exits 49 and prints nothing useful.

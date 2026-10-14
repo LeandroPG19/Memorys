@@ -132,6 +132,7 @@ count_ignores_without_reason() {
 # --- self-test: every guard above gets a fixture that puts it in the red -----
 # Without this the guards are unfalsifiable again the moment somebody edits
 # them, which is exactly how the original one died.
+# --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
@@ -185,6 +186,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "OK  self-test: every guard in this script failed against a fixture built to break it"
   exit 0
 fi
+# --- self-test end ---
 
 echo "=== codigo-muerto: tests must not be hidden from the local gate ==="
 for f in "$GATE" "$CI"; do

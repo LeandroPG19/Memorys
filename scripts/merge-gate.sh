@@ -29,6 +29,7 @@ source "$ROOT/scripts/gate-lock.sh"
 # gate would have left it, which is exactly what a gate must not leave behind
 # unless it is its own verdict.
 #   ./scripts/merge-gate.sh --self-test
+# --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
   tmp="$(mktemp -d)"
   sleep 300 &
@@ -1028,6 +1029,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "    advisory exceptions are judged right after cargo audit, from a report made without ignores, and their red stops the gate before cargo deny;"
   exit 0
 fi
+# --- self-test end ---
 
 # The receipt scripts/release.sh publishes from instead of running this gate a
 # second time (gate-lock.sh says why). It names one commit, so it is written
