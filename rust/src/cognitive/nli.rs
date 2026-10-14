@@ -130,8 +130,11 @@ pub fn resolved_without_a_model() -> bool {
     NLI_STATUS.get().is_some_and(found_no_model)
 }
 
-fn found_no_model(_status: &NliStatus) -> bool {
-    false
+/// Only `Unavailable` is «looked and found none»: a failed open is a failure,
+/// not an absence (see `reason_of`). The cell looks once per process, so this
+/// is the half of `resolved_without_a_model` that decides, and it is pure.
+fn found_no_model(status: &NliStatus) -> bool {
+    matches!(status, NliStatus::Unavailable)
 }
 
 /// Why NLI is not loaded, when something already tried to load it.

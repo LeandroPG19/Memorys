@@ -2903,10 +2903,15 @@ fn trailing_blanks(path: &[char]) -> &[char] {
 /// for two releases it was also the reason this block could say nothing but
 /// `configured` about a model that had already failed to open.
 ///
-/// All four facts are read before the decision instead of on the way through
+/// All the facts are read before the decision instead of on the way through
 /// it, for the reason written out over `reranker_state`: the first branch of a
 /// short-circuited version turns on a process-wide `OnceLock` that another
 /// test in this binary resolves.
+///
+/// `resolved_without_a_model` is read after `read_cell_first`, never before:
+/// read first, a poll that crosses the resolution could see «not resolved», then
+/// `status_resolved` true, and say `loaded` with no device for a model nothing
+/// loaded. Read after, the cell's own answer decides and the row stays coherent.
 fn nli_state() -> ModelState {
     let (resolved, failure, placement) = read_cell_first(
         crate::cognitive::nli::status_resolved,
@@ -2919,24 +2924,28 @@ fn nli_state() -> ModelState {
         crate::cognitive::nli::deferred_by_resource_plan(),
         crate::cognitive::nli::available(),
         resolved,
-        false,
+        crate::cognitive::nli::resolved_without_a_model(),
     )
 }
 
-/// The NLI model's state, from the four facts that decide it and nothing else.
+/// The NLI model's state, from the six facts that decide it and nothing else.
 ///
 /// `deferred` is the resource plan switching the model off by pointing the
 /// path at a sentinel it never creates; `available` is a model file in the
-/// cache; and `status_resolved` is whether something already tried to open a
+/// cache; `status_resolved` is whether something already tried to open a
 /// session — which is what tells `loaded` from `configured` without opening
-/// one here.
+/// one here; and `resolved_without_a_model` is whether that attempt looked and
+/// found no model. The cell looks only once per process, so a model installed
+/// since then is not loaded: that case answers `absent` with a restart reason,
+/// and it wins over a placement the registry still holds from an earlier write,
+/// because a cell that found no model never names a device.
 fn nli_state_from(
     failure: Option<String>,
     placement: Option<&crate::gpu::Placement>,
     deferred: bool,
     available: bool,
     status_resolved: bool,
-    _resolved_without_a_model: bool,
+    resolved_without_a_model: bool,
 ) -> ModelState {
     if let Some(reason) = failure {
         return ModelState {
@@ -2964,6 +2973,17 @@ fn nli_state_from(
             state: STATE_ABSENT,
             device: None,
             reason: Some("no NLI model where this daemon looks".to_string()),
+        };
+    }
+    if resolved_without_a_model {
+        return ModelState {
+            state: STATE_ABSENT,
+            device: None,
+            reason: Some(
+                "no NLI model was there when this daemon looked, and it looks only once: restart \
+                 it to load the one installed since"
+                    .to_string(),
+            ),
         };
     }
     if status_resolved {
