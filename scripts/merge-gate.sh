@@ -23,7 +23,7 @@ source "$ROOT/scripts/gate-lock.sh"
 # halfway (SIGKILL under memory pressure, twice on 2026-09-23) runs no trap, so
 # the file kept whatever an earlier run had left in it. Each fixture runs a
 # COPY of this script in a throwaway tree whose every step is a stand-in
-# (pg_isready, cargo, node, run-all-tests.sh and the three gate scripts after
+# (pg_isready, cargo, node, run-all-tests.sh and the gate scripts after
 # it), with HOME inside the tree: nothing here touches the cluster, the real
 # lock or cargo. The exit file of every tree starts at 0, as an earlier green
 # gate would have left it, which is exactly what a gate must not leave behind
@@ -43,11 +43,21 @@ if [[ "${1:-}" == "--self-test" ]]; then
     cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" "$t/scripts/"
     printf '#!/bin/sh\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
     for s in codigo-muerto crap-gate; do
-      printf '#!/bin/sh\nexit 0\n' >"$t/scripts/$s.sh"
+      printf '#!/bin/sh\necho %s >>"$HOME/steps"\nexit 0\n' "$s" >"$t/scripts/$s.sh"
     done
+    # The gate asks mutants-gate.sh --refuse-targets before any step, so that
+    # call is not the mutation step and does not go in the order.
     printf '%s\n' '#!/bin/sh' \
+      '[ "${1:-}" = --refuse-targets ] || echo mutants-gate >>"$HOME/steps"' \
       'echo "mutants caught=9 missed=1 timeout=0 unviable=0 kill_rate=0.900 min=0.800"' \
       >"$t/scripts/mutants-gate.sh"
+    # test-times.sh: what it was called with goes in the order, the log it was
+    # told to judge is copied as the gate had written it by then, and
+    # FAKE_TIMES_EXIT is its verdict.
+    printf '%s\n' '#!/bin/sh' \
+      'echo "test-times $*" >>"$HOME/steps"' \
+      'prev=""; for a in "$@"; do [ "$prev" = --judge ] && cp "$a" "$HOME/times.seen"; prev="$a"; done' \
+      'exit "${FAKE_TIMES_EXIT:-0}"' >"$t/scripts/test-times.sh"
     # pg_isready: the row picks what it answers on stdout, the line it writes on
     # stderr and its exit code (FAKE_PG_ANSWER, FAKE_PG_EXIT, FAKE_PG_STDERR),
     # and each call leaves its arguments, one per line, in $HOME/pg_isready.args.
@@ -438,6 +448,59 @@ if [[ "${1:-}" == "--self-test" ]]; then
   adv_stopped after_tests 1
   grep -q 'run.exit reads: running pid=[0-9]' "$tmp/after_tests.out" \
     || self_fail "after_tests: while the tests ran, the exit file did not say so: $(grep 'run.exit reads' "$tmp/after_tests.out")"
+
+  # The time of every test binary is judged last, after mutants-gate.sh, over the
+  # gate's own log up to the npm step (G7): a time red is drift and not broken
+  # behaviour, so the same run still gives the verdicts of codigo-muerto,
+  # crap-gate and the mutation. What it says is the gate's verdict: a 1 or a 2
+  # from it is the exit of the gate, in the exit file, with no receipt.
+  fake_tree times_last "$tests_step"
+  run_copy times_last
+  (( rc == 0 )) || self_fail "times_last: a gate whose every step passed exited $rc: $(cat "$tmp/times_last.out")"
+  [[ "$(exit_file times_last)" == 0 ]] || self_fail "times_last: the exit file says '$(exit_file times_last)', not 0"
+  docs_at="$(step_at times_last '^cargo test --features docs$')"
+  muerto_at="$(step_at times_last '^codigo-muerto$')"
+  crap_at="$(step_at times_last '^crap-gate$')"
+  mutants_at="$(step_at times_last '^mutants-gate$')"
+  times_at="$(step_at times_last '^test-times ')"
+  [[ -n "$docs_at" && -n "$muerto_at" && -n "$crap_at" && -n "$mutants_at" && -n "$times_at" ]] \
+    || self_fail "times_last: a step is missing from the order (docs '$docs_at', codigo-muerto '$muerto_at', crap-gate '$crap_at', mutants-gate '$mutants_at', test-times '$times_at'): $(steps_of times_last)"
+  (( docs_at < muerto_at && muerto_at < crap_at && crap_at < mutants_at && mutants_at < times_at )) \
+    || self_fail "times_last: test-times is not the last step, after cargo test --features docs, codigo-muerto, crap-gate and mutants-gate: $(steps_of times_last)"
+  grep -qxF "test-times --judge $tmp/times_last/home/.cache/cuba-gate/merge-gate.log --until === npm wrapper smoke ===" "$tmp/times_last/home/steps" \
+    || self_fail "times_last: test-times was not called as --judge <the gate's own log> --until '=== npm wrapper smoke ===': $(steps_of times_last)"
+  for line in '=== cargo clippy/test --features docs ===' '=== npm wrapper smoke ==='; do
+    tr -d '\r' <"$tmp/times_last/home/times.seen" 2>/dev/null | grep -qxF "$line" \
+      || self_fail "times_last: the log test-times was handed did not hold '$line' yet, so it judged a log cut before the boundary: $(cat "$tmp/times_last/home/times.seen" 2>/dev/null || true)"
+  done
+  mutants_out="$(grep -nm1 -F '=== mutants-gate ===' "$tmp/times_last.out" || true)"
+  times_out="$(grep -nm1 -F '=== test times (scripts/test-time-ceilings.txt) ===' "$tmp/times_last.out" || true)"
+  passed_out="$(grep -nm1 -F 'MERGE GATE PASSED' "$tmp/times_last.out" || true)"
+  [[ -n "$mutants_out" && -n "$times_out" && -n "$passed_out" ]] \
+    || self_fail "times_last: the output lacks the mutants-gate step, the test times step or the verdict: $(cat "$tmp/times_last.out")"
+  (( ${mutants_out%%:*} < ${times_out%%:*} && ${times_out%%:*} < ${passed_out%%:*} )) \
+    || self_fail "times_last: the test times step is not between mutants-gate and the verdict in what the gate printed: $(cat "$tmp/times_last.out")"
+
+  # A time that is red is red for the gate, and every other verdict was already given.
+  git_tree times_red "$tests_step"
+  run_copy times_red "" FAKE_TIMES_EXIT=1
+  adv_stopped times_red 1
+  if grep -q 'MERGE GATE PASSED' "$tmp/times_red.out"; then
+    self_fail "times_red: a gate whose test times were red passed: $(cat "$tmp/times_red.out")"
+  fi
+  [[ -z "$(receipts_of times_red)" ]] || self_fail "times_red: a red gate left a receipt: $(receipts_of times_red)"
+  mutants_at="$(step_at times_red '^mutants-gate$')"
+  times_at="$(step_at times_red '^test-times ')"
+  [[ -n "$mutants_at" && -n "$times_at" ]] && (( mutants_at < times_at )) \
+    || self_fail "times_red: the test times did not come after mutants-gate, so a red time hid the verdicts after it (mutants-gate '$mutants_at', test-times '$times_at'): $(steps_of times_red)"
+
+  # A log it cannot read (exit 2 from it) stops the gate with 2, not with a pass.
+  fake_tree times_cannot "$tests_step"
+  run_copy times_cannot "" FAKE_TIMES_EXIT=2
+  adv_stopped times_cannot 2
+  if grep -q 'MERGE GATE PASSED' "$tmp/times_cannot.out"; then
+    self_fail "times_cannot: a gate whose test times could not be judged passed: $(cat "$tmp/times_cannot.out")"
+  fi
 
   # The readiness check: libpq reads DATABASE_URL, and the gate says which port
   # it answered on. With WSL2 in mirrored mode the localhost:5488 of Windows is
@@ -876,6 +939,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "    cargo audit runs first, before cargo deny and before the tests, under timeout 120;"
   echo "    a database it cannot refresh is exit 2, never a skip; without pg_isready the"
   echo "    readiness check asks the container that publishes the port of DATABASE_URL, never one by name."
+  echo "    the test times are judged last, over the gate's own log up to the npm step, and their red is the gate's"
   exit 0
 fi
 

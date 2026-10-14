@@ -39,6 +39,9 @@ fn merge_gate_is_the_local_judge_and_stays_strict() {
         "codigo-muerto.sh",
         "crap-gate.sh",
         "mutants-gate.sh",
+        // With its call and flag, not the bare name: the stand-in the gate's own
+        // --self-test writes is called test-times.sh too.
+        "test-times.sh\" --judge",
         "WHAT THIS GATE DOES NOT CHECK",
         "never SKIPPED",
         "generative LLM",
@@ -363,6 +366,37 @@ stderr: {stderr}"
     assert!(
         stdout.contains("self-test:"),
         "the self-test exited 0 without saying it ran. An exit code alone is what let the          original guard pass while doing nothing. stdout: {stdout}"
+    );
+}
+
+/// A ceiling the judge cannot break is a paragraph.
+///
+/// `test-times.sh` reads the gate's own log and says the time of every test
+/// binary is within its ceiling. A judge whose ceiling never trips, whose floor
+/// never trips, or that reads a log it cannot pair and says OK, prints the same
+/// line over every run. Its `--self-test` builds the log in both shapes cargo
+/// prints (Windows and Linux) and runs the script through its CLI over each
+/// guard, and the script reports whether they broke.
+#[test]
+fn test_times_can_actually_fail() {
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/test-times.sh", "--self-test"])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "test-times.sh --self-test did not pass, so at least one of its guards no longer \
+         fails when it should. stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Anchored on the mode's label, not on its sentence, like the other self-tests.
+    assert!(
+        stdout.contains("self-test:"),
+        "the self-test exited 0 without saying it ran. An exit code alone is what let \
+         codigo-muerto.sh pass for months while doing nothing. stdout: {stdout}"
     );
 }
 
@@ -1442,6 +1476,13 @@ fn the_exit_file_holds_the_whole_gates_verdict_and_says_running_until_then() {
         "the self-test passed without its rows for the readiness fallback, so nothing shows \
          that, without pg_isready, the gate asks the container that publishes the port of \
          DATABASE_URL and not one picked by its name. stdout: {stdout}"
+    );
+    // The sentence of the rows for the order of the time judge, in the same way.
+    assert!(
+        stdout.contains("the test times are judged last"),
+        "the self-test passed without its rows for the test times, so nothing shows that the \
+         gate judges the time of every test binary last, over its own log, and that a red or \
+         an unreadable verdict from it is the gate's. stdout: {stdout}"
     );
 }
 
