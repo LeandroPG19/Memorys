@@ -2919,6 +2919,7 @@ fn nli_state() -> ModelState {
         crate::cognitive::nli::deferred_by_resource_plan(),
         crate::cognitive::nli::available(),
         resolved,
+        false,
     )
 }
 
@@ -2935,6 +2936,7 @@ fn nli_state_from(
     deferred: bool,
     available: bool,
     status_resolved: bool,
+    _resolved_without_a_model: bool,
 ) -> ModelState {
     if let Some(reason) = failure {
         return ModelState {
@@ -4828,6 +4830,7 @@ mod health_report_tests {
                 deferred,
                 available,
                 status_resolved,
+                false,
             );
             assert_eq!(
                 state.state, expected,
@@ -4846,6 +4849,7 @@ mod health_report_tests {
                 deferred,
                 available,
                 status_resolved,
+                false,
             );
             assert_eq!(
                 measured.device,
@@ -4859,7 +4863,7 @@ mod health_report_tests {
         }
 
         assert_eq!(
-            nli_state_from(None, None, false, true, true).reason,
+            nli_state_from(None, None, false, true, true, false).reason,
             None,
             "an NLI model that already loaded says nothing more. «loads on its first use» on a \
              model that has loaded leaves someone waiting for a load that has happened"
@@ -4965,7 +4969,7 @@ mod health_report_tests {
         }
 
         let mut runtime = report(true, false, ["failed", "loaded", "failed"]);
-        runtime.nli = nli_state_from(Some(nli_failure), None, false, true, true);
+        runtime.nli = nli_state_from(Some(nli_failure), None, false, true, true, false);
         runtime.embedder = embedder_state_from(Some(embedder_failure), None, true, false);
 
         assert_eq!(
@@ -5084,11 +5088,15 @@ mod health_report_tests {
                 reranker_state_from(None, placement, true, true, false)
             }
             (Which::Reranker, "loaded") => reranker_state_from(None, placement, true, true, true),
-            (Which::Nli, "failed") => nli_state_from(failure(), placement, false, true, false),
-            (Which::Nli, "off") => nli_state_from(None, placement, true, true, false),
-            (Which::Nli, "absent") => nli_state_from(None, placement, false, false, false),
-            (Which::Nli, "configured") => nli_state_from(None, placement, false, true, false),
-            (Which::Nli, "loaded") => nli_state_from(None, placement, false, true, true),
+            (Which::Nli, "failed") => {
+                nli_state_from(failure(), placement, false, true, false, false)
+            }
+            (Which::Nli, "off") => nli_state_from(None, placement, true, true, false, false),
+            (Which::Nli, "absent") => nli_state_from(None, placement, false, false, false, false),
+            (Which::Nli, "configured") => {
+                nli_state_from(None, placement, false, true, false, false)
+            }
+            (Which::Nli, "loaded") => nli_state_from(None, placement, false, true, true, false),
             _ => panic!("the fixture is broken: {which:?} has no row that lands on {state:?}"),
         }
     }
@@ -5239,7 +5247,7 @@ mod health_report_tests {
             ),
             (
                 "nli",
-                nli_state_from(None, Some(&refused), false, true, true),
+                nli_state_from(None, Some(&refused), false, true, true, false),
             ),
         ];
 
@@ -5339,7 +5347,7 @@ mod health_report_tests {
         let mut runtime = report(true, false, ["loaded", "loaded", "configured"]);
         runtime.reranker = reranker_state_from(None, Some(&refused), true, true, true);
         runtime.embedder = embedder_state_from(None, Some(&crate::gpu::Placement::Cpu), true, true);
-        runtime.nli = nli_state_from(None, None, false, true, false);
+        runtime.nli = nli_state_from(None, None, false, true, false, false);
         let json = runtime_json(&runtime);
 
         assert_eq!(json["reranker"]["state"], "loaded");
@@ -5748,7 +5756,7 @@ OUT: no hay model.onnx ni model_quantized.onnx en <R>
         match which {
             Which::Embedder => embedder_state_from(failure, placement, true, true),
             Which::Reranker => reranker_state_from(failure, placement, true, true, true),
-            Which::Nli => nli_state_from(failure, placement, false, true, true),
+            Which::Nli => nli_state_from(failure, placement, false, true, true, false),
         }
     }
 
@@ -5913,7 +5921,7 @@ OUT: no hay model.onnx ni model_quantized.onnx en <R>
             ),
             (
                 "nli",
-                nli_state_from(failure, placement.as_ref(), false, true, resolved),
+                nli_state_from(failure, placement.as_ref(), false, true, resolved, false),
             ),
         ]
     }
@@ -6000,6 +6008,187 @@ OUT: no hay model.onnx ni model_quantized.onnx en <R>
                  the order they are read in is decided here again, by hand"
             );
         }
+    }
+
+    /// K4. The NLI cell looks for a model once per process. A cell that looked,
+    /// found none and resolved to `Unavailable` never opens a session, so a model
+    /// installed afterwards is on disk but not loaded, and `/health` may not say
+    /// otherwise. The cell decides, not the disk and not the placement registry.
+    #[test]
+    fn an_nli_cell_that_found_no_model_is_absent_whatever_the_disk_says_now() {
+        let gpu = crate::gpu::Placement::Gpu;
+        for placement in [None, Some(&gpu)] {
+            let row = nli_state_from(None, placement, false, true, true, true);
+            assert_eq!(
+                row.state, "absent",
+                "a cell that looked and found no model, with a model on disk now and \
+                 placement={placement:?}: an NLI that no session opened was read as `{}`",
+                row.state
+            );
+            assert_eq!(
+                row.device, None,
+                "no session was opened, so the row may not name a device (placement={placement:?})"
+            );
+            let reason = row.reason.unwrap_or_default();
+            assert!(
+                reason.contains("restart"),
+                "the operator's next step is restarting the daemon, because the cell does not \
+                 look again: placement={placement:?} reason={reason:?}"
+            );
+            assert!(
+                !reason.contains("loads on its first use"),
+                "it does not load on first use: the cell already decided it will not, and that \
+                 sentence sends the operator to wait for a load that never comes: \
+                 placement={placement:?} reason={reason:?}"
+            );
+        }
+
+        let without_disk = nli_state_from(None, None, false, false, true, true);
+        assert_eq!(
+            without_disk.state, "absent",
+            "no model on disk and a cell that found none is `absent`"
+        );
+        assert_eq!(
+            without_disk.reason.as_deref(),
+            Some("no NLI model where this daemon looks"),
+            "with no model on disk the reason stays the one `/health` already says: telling the \
+             operator to restart a daemon that has nothing to load is noise"
+        );
+
+        let deferred = nli_state_from(None, None, true, true, true, true);
+        assert_eq!(
+            deferred.state, "off",
+            "a plan that defers the load also leaves the cell in `Unavailable`, and there the \
+             answer is `off`, not `absent`: the resource plan did it"
+        );
+    }
+
+    /// K4. The same poll as K3's, with the third fact the NLI row now reads
+    /// after the cell. `flip` is the read at which the world becomes resolved.
+    #[test]
+    fn a_poll_that_crosses_an_nli_resolution_never_reads_loaded_for_what_did_not_load() {
+        // (name, failure, placement, found no model, state, device)
+        type Outcome = (
+            &'static str,
+            Option<String>,
+            Option<crate::gpu::Placement>,
+            bool,
+            &'static str,
+            Option<&'static str>,
+        );
+        let outcomes: [Outcome; 3] = [
+            ("Unavailable", None, None, true, "absent", None),
+            (
+                "Loaded on the CPU",
+                None,
+                Some(crate::gpu::Placement::Cpu),
+                false,
+                "loaded",
+                Some("cpu"),
+            ),
+            (
+                "Failed",
+                Some("load model: k4".to_string()),
+                None,
+                false,
+                "failed",
+                None,
+            ),
+        ];
+
+        for (name, failure, placement, found_no_model, state, device) in &outcomes {
+            for flip in 0..=4usize {
+                let world = FlippingWorld {
+                    reads: std::cell::Cell::new(0),
+                    flip,
+                };
+                let (resolved, seen_failure, seen_placement) = read_cell_first(
+                    || world.resolved(),
+                    || world.seen(failure),
+                    || world.seen(placement),
+                );
+                let found_none_now = world.resolved() && *found_no_model;
+                assert_eq!(
+                    world.reads.get(),
+                    4,
+                    "{name}, flip={flip}: three reads for the cell and one for whether it found \
+                     no model, after them"
+                );
+                let row = nli_state_from(
+                    seen_failure,
+                    seen_placement.as_ref(),
+                    false,
+                    true,
+                    resolved,
+                    found_none_now,
+                );
+                let at = format!("{name}, flip={flip}: {row:?}");
+                if row.state == "loaded" {
+                    assert!(
+                        row.device.is_some() && *state == "loaded",
+                        "an NLI that no session opened, or that opened without a device, was \
+                         read as loaded: {at}"
+                    );
+                }
+                assert!(
+                    row.state == "configured" || row.state == *state,
+                    "the row is neither the one before the load nor the one the load produced: \
+                     {at}"
+                );
+                if flip == 0 {
+                    assert_eq!(
+                        (row.state, row.device),
+                        (*state, *device),
+                        "a poll that starts after the cell resolved has to say exactly what the \
+                         cell decided: {at}"
+                    );
+                }
+                if *name == "Unavailable" {
+                    let expected = if flip <= 3 { "absent" } else { "configured" };
+                    assert_eq!(
+                        row.state, expected,
+                        "a cell that found no model is `absent` as soon as the poll sees it \
+                         resolved, and `configured` only when the poll ends before it: {at}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// K4. If the NLI row asks whether its cell found no model before it reads
+    /// the cell, a poll that crosses the resolution reads `found no model =
+    /// false`, then `resolved = true`, and says `loaded` with no device: the
+    /// defect again, with every row of the pure table green.
+    #[test]
+    fn the_nli_row_asks_whether_its_cell_found_no_model_after_reading_the_cell() {
+        let source = include_str!("http.rs");
+        let body = source
+            .split_once("fn nli_state()")
+            .expect("fn nli_state() is in this file")
+            .1
+            .split_once("\n}")
+            .expect("fn nli_state() ends")
+            .0;
+        let code = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let asks = code
+            .find("crate::cognitive::nli::resolved_without_a_model()")
+            .expect(
+                "nli_state has to pass crate::cognitive::nli::resolved_without_a_model(): with a \
+                 literal, a cell that found no model is read as `loaded` once a model is installed",
+            );
+        let reads = code
+            .find("read_cell_first(")
+            .expect("nli_state reads its cell through read_cell_first");
+        assert!(
+            asks > reads,
+            "nli_state asks whether the cell found no model before it reads the cell: a poll that \
+             crosses the resolution gets `false` then `resolved = true` and reads `loaded` with \
+             `device: null`"
+        );
     }
 }
 

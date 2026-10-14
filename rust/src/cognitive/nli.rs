@@ -121,6 +121,19 @@ pub fn status_resolved() -> bool {
     NLI_STATUS.get().is_some()
 }
 
+/// Whether the cell already looked for a model and found none.
+///
+/// Reads the cell without forcing it, like `status_resolved`: the cell looks
+/// once per process, so `/health` has to tell «looked and found none» from
+/// «has not looked» to avoid reading a model installed since as loaded.
+pub fn resolved_without_a_model() -> bool {
+    NLI_STATUS.get().is_some_and(found_no_model)
+}
+
+fn found_no_model(_status: &NliStatus) -> bool {
+    false
+}
+
 /// Why NLI is not loaded, when something already tried to load it.
 ///
 /// `None` means it loaded, or nobody has asked yet.
@@ -438,6 +451,43 @@ mod tests {
             Some(String::new()),
             "an empty reason is worse than none: the reader gets a failure with nothing after \
              the colon"
+        );
+    }
+
+    #[test]
+    fn only_a_cell_that_looked_and_found_no_model_says_so() {
+        assert!(
+            found_no_model(&NliStatus::Unavailable),
+            "a cell resolved in `Unavailable` looked, found no model and will not look again: if \
+             this says false, `/health` reads a model installed afterwards as `loaded` for an \
+             NLI that no session ever opened"
+        );
+        assert!(
+            !found_no_model(&NliStatus::Loaded),
+            "a loaded cell did find a model: saying otherwise would put `absent` in `/health` \
+             over an NLI that is working"
+        );
+        assert!(
+            !found_no_model(&NliStatus::Failed("x".into())),
+            "a model that was there and did not open is a failure with its own reason: calling \
+             it `found no model` would hide that reason behind «restart»"
+        );
+    }
+
+    #[test]
+    fn asking_whether_the_cell_found_no_model_does_not_resolve_it() {
+        // Twin of `nothing_that_reads_the_status_can_load_the_model`: this is
+        // also an accessor `/health` calls on every poll, and the cell is
+        // still unresolved here because nothing in this binary calls
+        // `enabled()`.
+        let resolved_before = status_resolved();
+        let _ = resolved_without_a_model();
+        assert_eq!(
+            status_resolved(),
+            resolved_before,
+            "asking whether the cell found no model resolved the cell that loads it. A \
+             `get_or_init` here is a gigabyte read inside a monitor's poll, which is the defect \
+             this whole state exists to remove"
         );
     }
 
