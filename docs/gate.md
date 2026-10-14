@@ -11,7 +11,8 @@ Second judge, chained, not a substitute: `./scripts/quality-gate.sh` (lizard + `
 | Step | What it proves |
 |---|---|
 | Postgres at `DATABASE_URL` (default `:5488`) | The cluster that URL names is up before anything mutates, and the gate prints the port that answered. Without `pg_isready` on `PATH`, the container that publishes the port of `DATABASE_URL` is asked, not one picked by name |
-| `cargo audit` | Known Rust advisories, judged first: it refreshes the RustSec database itself (at most 120 s, under `timeout 120`); a database it cannot refresh is exit 2, never a skip |
+| `cargo audit` | Known Rust advisories, judged first: it refreshes the RustSec database itself (at most 120 s, under `timeout 120`); a database it cannot refresh is exit 2, never a skip; then the advisory exceptions (below) are judged against a report of the same database made without ignores |
+| `scripts/advisory-exceptions.sh` | Every advisory the project ignores is in `scripts/advisory-exceptions.txt` with an owner, an expiry at most 180 days ahead and a reason, still matches an advisory of `rust/Cargo.lock`, and is ignored by `rust/.cargo/audit.toml` and `rust/deny.toml`, no more and no less. Red is exit 1, every problem at once; a report it cannot read is exit 2 |
 | `cargo deny` | licenses, bans, sources; advisories are judged by `cargo audit` alone |
 | Optional backup | Live corpus is snapshotted unless `SKIP_BACKUP=1` |
 | `scripts/run-all-tests.sh` | fmt, clippy `-D warnings`, unit + ignored integration on throwaway `brain_gate` / peer, e2e MCP + live (no soft-skip), GPU placement vs `doctor --json`, eval smoke |
@@ -23,7 +24,7 @@ Second judge, chained, not a substitute: `./scripts/quality-gate.sh` (lizard + `
 | `scripts/test-times.sh` | Last step. The time of every test binary, summed over the gate's own log up to the npm step, against `scripts/test-time-ceilings.txt`: over its ceiling (or over the default 10 s with no line) is red, and so is under its floor, a line whose binary did not run, whose `rust/tests/<name>.rs` is gone, that expired or that is malformed. Prints the 10 slowest every run. A log it cannot read is exit 2 |
 | `scripts/quality-gate.sh` | **not** in the SIL — second judge: lizard + mutants of the `rust/src` diff. `--update-lizard-baseline` keeps every comment of `scripts/lizard-baseline.txt` over the key it explains, and names the ones that leave with their key |
 
-`cargo audit` and `cargo deny` go before the tests because they cost seconds against ~20 minutes: a judge idle for days used to find a new advisory half an hour in. Measured, `cargo audit` takes 2.4 s with the database current, 11.6 s from a cold clone and 20.2 s to give up on a server that does not answer, so 120 s is a ceiling for a stalled transfer. It is never run with `--no-fetch` or `--stale`. Exit 124, or `couldn't fetch advisory database`, is exit 2 with a `FAIL:` that names `https://github.com/RustSec/advisory-db`; any other failure is exit 1, with cargo audit's own lines above it.
+`cargo audit` and `cargo deny` go before the tests because they cost seconds against ~20 minutes: a judge idle for days used to find a new advisory half an hour in. Measured, `cargo audit` takes 2.4 s with the database current, 11.6 s from a cold clone and 20.2 s to give up on a server that does not answer, so 120 s is a ceiling for a stalled transfer. The judging run is never made with `--no-fetch` or `--stale`. The second call, for the exceptions, is: it reads the database the first one refreshed seconds earlier in the same run, and a second fetch would add a network failure and no information. Exit 124, or `couldn't fetch advisory database`, is exit 2 with a `FAIL:` that names `https://github.com/RustSec/advisory-db`; any other failure is exit 1, with cargo audit's own lines above it.
 
 Oracles and fixtures decide green — not an AI opinion.
 
@@ -172,6 +173,20 @@ Replay any log without cargo:
 ./scripts/test-times.sh --judge <log> --until '=== npm wrapper smoke ===' [--os windows|linux] [--today YYYY-MM-DD]
 ./scripts/test-times.sh --self-test
 ```
+
+## Advisory exceptions
+
+Until 0.31 the project ignored advisories in two lists that did not agree: `rust/.cargo/audit.toml` held four, `rust/deny.toml` one, none had an owner or a date, and one of them (`RUSTSEC-2026-0002`, lru) had matched nothing since lru 0.18.5. Now there is one list, `scripts/advisory-exceptions.txt`, one line per advisory: `<advisory> <owner> <expires> <reason>`.
+
+- **Why a text file, not a TOML.** cargo-audit 0.22 takes only bare IDs in `ignore` and rejects any other key (`unknown field 'owner'`); cargo-deny 0.20 takes only `id` and `reason` (`unexpected-keys`). The owner and the date fit in neither, so the two TOML lists are mirrors of the IDs, and the reason is written once, in the text file.
+- **When it is judged.** Right after `cargo audit`, before `cargo deny`: `cargo audit --json --no-fetch -f rust/Cargo.lock` again, from a temporary directory so that no `audit.toml` applies, gives every advisory the lockfile carries, ignored ones included (0.42 s measured). `scripts/advisory-exceptions.sh --judge <report>` reads it. The exit of that call does not count: without ignores it finds the excepted advisories and exits 1, which is the point. A report that was made with ignores anyway (a `~/.cargo/audit.toml`) is exit 2: every excepted advisory would look unused.
+- **Red, exit 1, all at once:** a line that is malformed or repeated; an expiry in the past (the day of `expires` is still green) or more than 180 days ahead; an advisory the report does not carry, in `vulnerabilities` or in `warnings` (an unmaintained crate counts); an ID that one mirror ignores and the list does not, or the other way round, a crate spec in `deny.toml` included.
+- **Exit 2:** no report, one that is not `cargo audit --json`, a list or a TOML that is missing or does not parse, a Python without `tomllib` (3.11+).
+- **`cargo deny check advisories` by hand** says `advisory-not-detected` for the three current exceptions. cargo-deny resolves features (`sqlx-mysql` is never built) and, with `unmaintained = "workspace"`, does not report unmaintained crates deep in the tree. cargo-audit reads the lockfile and sees them, and it is the judge.
+- **To add one:** the line in the text file with your name, a date and why it does not reach the binary and what ends it; the ID in both TOML files. To renew one, a new date and a reason that says what changed. To drop one, remove it from the three places.
+
+    ./scripts/advisory-exceptions.sh --judge <report.json> [--today YYYY-MM-DD]
+    ./scripts/advisory-exceptions.sh --self-test
 
 ## Isolation extras (0.26)
 

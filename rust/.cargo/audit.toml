@@ -1,23 +1,9 @@
 [advisories]
-# RUSTSEC-2023-0071: rsa Marvin Attack (via sqlx-mysql)
-# sqlx-mysql appears in Cargo.lock but is NOT compiled — we have no "mysql" feature.
-# Confirmed via `cargo tree -i sqlx-mysql` → "nothing to print".
-# Solution: No fixed version available upstream. False positive for this binary.
-#
-# RUSTSEC-2026-0002: lru 0.12.5 unsound IterMut
-# We only call .iter()/.get()/.put()/.pop()/.clear() in cache.rs — never IterMut.
-# No patched 0.12.x available. Track for upgrade to 0.13+ when released.
-#
-# RUSTSEC-2025-0119: number_prefix unmaintained (via indicatif → tokenizers)
-# Transitive dep of huggingface/tokenizers. No security impact — display-only crate.
-# Cannot be updated without a tokenizers release dropping indicatif.
-#
-# RUSTSEC-2024-0436: paste unmaintained (via tokenizers)
-# Transitive dep of huggingface/tokenizers. Macro crate, no runtime security impact.
-# Cannot be updated without a tokenizers release.
+# A mirror. The list, with each advisory's owner, expiry and reason, is
+# scripts/advisory-exceptions.txt; merge-gate.sh is red when this ignore list
+# differs from it by one ID either way. cargo-audit takes only bare IDs here.
 ignore = [
     "RUSTSEC-2023-0071",
-    "RUSTSEC-2026-0002",
     "RUSTSEC-2025-0119",
     "RUSTSEC-2024-0436",
 ]

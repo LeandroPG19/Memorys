@@ -1283,6 +1283,27 @@ elif (( audit_rc != 0 )); then
   exit 1
 fi
 
+# The ignored advisories are judged next, while the database the call above
+# refreshed is still current. cargo audit only says what is NOT ignored, so the
+# judge needs a second report made without ignores, from a directory of its own
+# so that rust/.cargo/audit.toml does not apply: every excepted advisory is in it.
+# That call takes 0.42 s measured and reads the lockfile alone, so --no-fetch is
+# right here and nowhere else: a second fetch would add a network failure and no
+# information. Its exit does not count (without ignores it exits 1 exactly when the
+# exceptions are real); the judge's does, and what the call wrote on stderr is
+# printed when the judge cannot read the report.
+echo "=== advisory exceptions (scripts/advisory-exceptions.txt) ==="
+adv_dir="$(mktemp -d)"
+adv_lock="$(cygpath -m "$ROOT/rust/Cargo.lock" 2>/dev/null || printf '%s' "$ROOT/rust/Cargo.lock")"
+(cd "$adv_dir" && timeout 120 cargo audit --json --no-fetch -f "$adv_lock" >audit.json 2>audit.err) || true
+adv_rc=0
+"$ROOT/scripts/advisory-exceptions.sh" --judge "$adv_dir/audit.json" || adv_rc=$?
+if (( adv_rc == 2 )); then
+  cat "$adv_dir/audit.err" >&2
+fi
+rm -rf "$adv_dir"
+(( adv_rc == 0 )) || exit "$adv_rc"
+
 echo "=== cargo deny ==="
 if ! command -v cargo-deny >/dev/null 2>&1 && ! (cd "$ROOT/rust" && cargo deny --version >/dev/null 2>&1); then
   echo "FAIL: cargo-deny is not installed. Install it (cargo install cargo-deny) — the gate does not skip license policy." >&2

@@ -2,7 +2,7 @@
 # AI-3: Automated GPL/AGPL/SSPL rejection + advisory checking
 #
 # Usage: cargo install cargo-deny && cargo deny check
-# CI: cargo deny check licenses advisories
+# The gate and CI: cargo deny check licenses bans sources. Advisories are judged by cargo audit alone.
 
 [licenses]
 # Dependencies stay permissive on purpose. cuba-memorys is Apache-2.0, and a copyleft
@@ -44,13 +44,16 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 unmaintained = "workspace"
 # Treat yanked versions as deny
 yanked = "deny"
-# Ignore specific advisories if needed (add IDs here)
+# A mirror of scripts/advisory-exceptions.txt, which holds each advisory's owner,
+# expiry and reason; merge-gate.sh is red when this list differs from it by one ID
+# either way. cargo deny by hand says advisory-not-detected for some of them: it
+# resolves features (sqlx-mysql is never built) and, with unmaintained = "workspace",
+# does not report unmaintained crates deep in the tree. cargo audit reads Cargo.lock
+# and does see them, and cargo audit is the judge.
 ignore = [
-    # RUSTSEC-2023-0071: rsa Marvin Attack via sqlx-mysql.
-    # sqlx-mysql is in Cargo.lock but NOT compiled (no mysql feature).
-    # Confirmed via `cargo tree -i sqlx-mysql` → "nothing to print".
-    # No fix available upstream (sqlx side). False positive for our binary.
-    { id = "RUSTSEC-2023-0071", reason = "sqlx-mysql not compiled — no mysql feature enabled, confirmed via cargo tree" },
+    { id = "RUSTSEC-2023-0071", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
+    { id = "RUSTSEC-2025-0119", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
+    { id = "RUSTSEC-2024-0436", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
 ]
 
 [bans]

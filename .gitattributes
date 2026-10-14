@@ -12,6 +12,8 @@ docs/gate.md text eol=lf
 scripts/lizard-baseline.txt text eol=lf
 # test-times.sh reads it with awk; the parser drops a CR, but a fresh clone should hold what was reviewed.
 scripts/test-time-ceilings.txt text eol=lf
+# advisory-exceptions.sh reads it line by line; a fresh clone should hold what was reviewed.
+scripts/advisory-exceptions.txt text eol=lf
 
 # Everything below is read back from disk by the crate or by its contracts and
 # compared by content. Git for Windows sets core.autocrlf=true system-wide, so

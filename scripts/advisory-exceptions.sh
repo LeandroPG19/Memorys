@@ -373,5 +373,299 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit 0
 fi
 
+# Same rule as mutants-gate.sh and test-times.sh: PYTHON_BIN, else the first python
+# that is not the Microsoft Store stub, which exits 49 and prints nothing useful.
+resolve_python() {
+  if [[ -n "${PYTHON_BIN:-}" && ( -x "$PYTHON_BIN" || -f "$PYTHON_BIN" ) ]]; then
+    printf '%s\n' "$PYTHON_BIN"
+    return
+  fi
+  local c p
+  for c in python3 python; do
+    p="$(command -v "$c" 2>/dev/null || true)"
+    [[ -n "$p" ]] || continue
+    case "$p" in
+      */WindowsApps/*) continue ;;
+    esac
+    printf '%s\n' "$p"
+    return
+  done
+  printf '%s\n' "python3"
+}
+
+# --- --judge: pure. It reads the four files it is given and calls nothing ---
+# The report is `cargo audit --json -f rust/Cargo.lock` made from a directory with
+# no audit.toml (merge-gate.sh does it), so every advisory the lockfile carries is
+# in it, the excepted ones included. Exit 1 is a verdict, with every problem at
+# once; exit 2 is "cannot judge", and says what is missing.
+#   ./scripts/advisory-exceptions.sh --judge REPORT [--today YYYY-MM-DD]
+#       [--exceptions F] [--audit-toml F] [--deny-toml F]
+if [[ "${1:-}" == "--judge" ]]; then
+  shift
+  report="${1:-}"
+  if [[ -z "$report" ]]; then
+    echo "FAIL: --judge needs the path of a cargo audit --json report" >&2
+    exit 2
+  fi
+  shift
+  today=""
+  exceptions="$ROOT/scripts/advisory-exceptions.txt"
+  audit_toml="$ROOT/rust/.cargo/audit.toml"
+  deny_toml="$ROOT/rust/deny.toml"
+  while (( $# > 0 )); do
+    case "$1" in
+      --today | --exceptions | --audit-toml | --deny-toml)
+        if (( $# < 2 )); then
+          echo "FAIL: $1 needs a value" >&2
+          exit 2
+        fi
+        case "$1" in
+          --today) today="$2" ;;
+          --exceptions) exceptions="$2" ;;
+          --audit-toml) audit_toml="$2" ;;
+          --deny-toml) deny_toml="$2" ;;
+        esac
+        shift 2
+        ;;
+      *)
+        echo "FAIL: unknown argument '$1'" >&2
+        exit 2
+        ;;
+    esac
+  done
+  [[ -n "$today" ]] || today="$(date +%F)"
+
+  PY="$(resolve_python)"
+  export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+  # The mirrors are TOML: no Python before 3.11 reads them, and a hand-made
+  # reader of them would be one more thing that can disagree with cargo.
+  if ! "$PY" -c 'import tomllib' >/dev/null 2>&1; then
+    echo "FAIL: advisory-exceptions.sh needs Python 3.11+ (tomllib); $PY has none" >&2
+    exit 2
+  fi
+
+  # An exception of the interpreter is exit 2, never the 1 of an uncaught
+  # traceback, which would read as a verdict.
+  rc=0
+  "$PY" -I - "$report" "$today" "$exceptions" "$audit_toml" "$deny_toml" <<'PYEOF' || rc=$?
+import datetime
+import json
+import re
+import sys
+import tomllib
+
+
+class Refused(Exception):
+    pass
+
+
+ID_RE = re.compile(r"RUSTSEC-[0-9]{4}-[0-9]{4}")
+OWNER_RE = re.compile(r"[A-Za-z0-9._-]+")
+DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+MAX_DAYS = 180
+SHAPE = "<advisory> <owner> <expires> <reason>"
+
+
+def parse_date(text):
+    if not DATE_RE.fullmatch(text):
+        return None
+    try:
+        return datetime.date(int(text[:4]), int(text[5:7]), int(text[8:10]))
+    except ValueError:
+        return None
+
+
+def read_text(path):
+    try:
+        with open(path, "rb") as handle:
+            return handle.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as err:
+        raise Refused(f"cannot read {path}: {err}")
+
+
+def not_a_report(path, why):
+    return Refused(f"{path} is not a cargo audit --json report ({why})")
+
+
+def load_report(path):
+    try:
+        with open(path, "rb") as handle:
+            data = json.loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError) as err:
+        raise not_a_report(path, f"cannot read it as JSON: {err}")
+    if not isinstance(data, dict):
+        raise not_a_report(path, "its top level is not an object")
+    settings = data.get("settings")
+    if not isinstance(settings, dict) or not isinstance(settings.get("ignore"), list):
+        raise not_a_report(path, "no settings.ignore list")
+    vulns = data.get("vulnerabilities")
+    if not isinstance(vulns, dict) or not isinstance(vulns.get("list"), list):
+        raise not_a_report(path, "no vulnerabilities.list")
+    warnings = data.get("warnings")
+    if not isinstance(warnings, dict) or not all(isinstance(v, list) for v in warnings.values()):
+        raise not_a_report(path, "no warnings object of lists")
+    if settings["ignore"]:
+        ids = ", ".join(str(i) for i in settings["ignore"])
+        raise Refused(
+            f"{path} was made with ignores ({ids}), so an ignored exception would look unused; "
+            "make it from a directory with no .cargo/audit.toml and no ~/.cargo/audit.toml"
+        )
+    entries = [("vulnerability", e) for e in vulns["list"]]
+    for kind, items in warnings.items():
+        entries += [(kind, e) for e in items]
+    used = {}
+    for kind, entry in entries:
+        if not isinstance(entry, dict):
+            raise not_a_report(path, f"a {kind} entry is not an object")
+        advisory = entry.get("advisory")
+        if advisory is None:
+            continue
+        if not isinstance(advisory, dict):
+            raise not_a_report(path, f"the advisory of a {kind} entry is not an object")
+        package = entry.get("package")
+        package = package if isinstance(package, dict) else {}
+        found = (kind, str(package.get("name", "?")), str(package.get("version", "?")))
+        hits = used.setdefault(advisory.get("id"), [])
+        if found not in hits:
+            hits.append(found)
+    return used
+
+
+def load_toml(path):
+    try:
+        return tomllib.loads(read_text(path))
+    except tomllib.TOMLDecodeError as err:
+        raise Refused(f"cannot read {path}: {err}")
+
+
+def table(data, key, path):
+    value = data.get(key, {})
+    if not isinstance(value, dict):
+        raise Refused(f"cannot read {path}: [{key}] is not a table")
+    return value
+
+
+def ignore_list(path):
+    value = table(load_toml(path), "advisories", path).get("ignore", [])
+    if not isinstance(value, list):
+        raise Refused(f"cannot read {path}: advisories.ignore is not a list")
+    return value
+
+
+def audit_ids(path):
+    ids = []
+    for item in ignore_list(path):
+        if not isinstance(item, str):
+            raise Refused(f"cannot read {path}: cargo-audit takes only bare advisory IDs in ignore, not {item!r}")
+        ids.append(item)
+    return ids
+
+
+def deny_ids(path):
+    ids = []
+    for item in ignore_list(path):
+        if isinstance(item, str):
+            ids.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("id"), str):
+            ids.append(item["id"])
+        elif isinstance(item, dict) and isinstance(item.get("crate"), str):
+            ids.append(item["crate"])
+        else:
+            raise Refused(f"cannot read {path}: an ignore entry is neither an ID nor a table with id or crate: {item!r}")
+    return ids
+
+
+def parse_list(path):
+    lines = []
+    for number, raw in enumerate(read_text(path).split("\n"), 1):
+        line = raw.rstrip("\r")
+        if line.strip() and not line.lstrip().startswith("#"):
+            lines.append((number, line))
+    return lines
+
+
+def judge(report_path, today_text, ex_path, audit_path, deny_path):
+    today = parse_date(today_text)
+    if today is None:
+        raise Refused(f"--today wants YYYY-MM-DD, not '{today_text}'")
+    used = load_report(report_path)
+    lines = parse_list(ex_path)
+    audit = audit_ids(audit_path)
+    deny = deny_ids(deny_path)
+
+    problems = []
+    entries = []
+    first_at = {}
+    for number, line in lines:
+        fields = line.split(None, 3)
+        expires = parse_date(fields[2]) if len(fields) == 4 else None
+        if not (len(fields) == 4 and ID_RE.fullmatch(fields[0])
+                and OWNER_RE.fullmatch(fields[1]) and expires is not None):
+            problems.append(f"{ex_path}:{number}: malformed line, want '{SHAPE}': {line}")
+            continue
+        advisory, owner, expires_text, _ = fields
+        if advisory in first_at:
+            problems.append(f"{ex_path}:{number}: {advisory} is listed twice (first at line {first_at[advisory]})")
+            continue
+        first_at[advisory] = number
+        entries.append((number, advisory, owner, expires_text))
+        if today > expires:
+            problems.append(
+                f"{ex_path}:{number}: {advisory} expired on {expires_text} (owner {owner}): "
+                "renew it with a new reason and date, or move past the advisory"
+            )
+        elif (expires - today).days > MAX_DAYS:
+            problems.append(
+                f"{ex_path}:{number}: {advisory} expires on {expires_text}, "
+                f"more than {MAX_DAYS} days after {today_text}"
+            )
+        if advisory not in used:
+            problems.append(
+                f"{ex_path}:{number}: {advisory} matches no advisory cargo audit reports for "
+                "rust/Cargo.lock: remove it here, from rust/.cargo/audit.toml and from rust/deny.toml"
+            )
+
+    for path, ids in ((audit_path, audit), (deny_path, deny)):
+        for advisory in first_at:
+            if advisory not in ids:
+                problems.append(f"{path}: does not ignore {advisory}, which {ex_path} lists")
+        for ignored in dict.fromkeys(ids):
+            if ignored not in first_at:
+                problems.append(
+                    f"{path}: ignores {ignored}, which {ex_path} does not list, "
+                    "so it has no owner and no expiry"
+                )
+
+    if problems:
+        return 1, [], problems + [f"{len(problems)} problem(s) with the advisory exceptions in {ex_path}"]
+    ok = []
+    for _, advisory, owner, expires_text in entries:
+        hits = ", ".join(" ".join(hit) for hit in used[advisory])
+        ok.append(f"ok  {advisory} {owner} until {expires_text}: {hits}")
+    ok.append(
+        f"OK  advisory exceptions: {len(entries)}, each owned, in date and matching an advisory of "
+        "rust/Cargo.lock; rust/.cargo/audit.toml and rust/deny.toml ignore exactly these"
+    )
+    return 0, ok, []
+
+
+def emit(stream, lines, prefix):
+    stream.buffer.write("".join(f"{prefix}{line}\n" for line in lines).encode("utf-8"))
+    stream.flush()
+
+
+try:
+    code, out_lines, fail_lines = judge(*sys.argv[1:6])
+except Refused as err:
+    code, out_lines, fail_lines = 2, [], [str(err)]
+except Exception as err:
+    code, out_lines, fail_lines = 2, [], [f"advisory-exceptions.sh could not judge: {type(err).__name__}: {err}"]
+emit(sys.stdout, out_lines, "")
+emit(sys.stderr, fail_lines, "FAIL: ")
+sys.exit(code)
+PYEOF
+  exit "$rc"
+fi
+
 echo "FAIL: unknown argument '${1:-}'" >&2
 exit 2

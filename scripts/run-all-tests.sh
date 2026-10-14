@@ -313,6 +313,24 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # The child is only merge-gate.sh's first half, so it neither clears the
   # file nor writes its own code into it: merge-gate.sh says "running" when
   # it starts and writes the whole gate's verdict when it ends.
+  #
+  # The rows that launch merge-gate.sh to reach this script's own steps run a
+  # copy of the gate in a tree of their own, with advisory-exceptions.sh swapped
+  # for a stand-in that passes: since G6 the real one judges the report of a
+  # real cargo audit and refuses (exit 2) the empty one the stand-in cargo
+  # leaves, so the gate would stop before reaching this script, which is what
+  # these rows are about. The judge of the advisories has its own self-test.
+  gate_tree() {
+    local t="$tmp/$1"
+    mkdir -p "$t/scripts" "$t/rust"
+    cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" \
+       "$ROOT/scripts/run-all-tests.sh" "$ROOT/scripts/mutants-gate.sh" "$t/scripts/"
+    cp "$ROOT/package.json" "$t/"
+    printf '#!/bin/sh\nexit 0\n' >"$t/scripts/advisory-exceptions.sh"
+    chmod +x "$t/scripts/advisory-exceptions.sh"
+  }
+  gate_tree tree2
+  gate_tree tree4
   mkdir -p "$tmp/home2/.cache/cuba-gate" "$tmp/bin"
   printf '0\n' >"$tmp/home2/.cache/cuba-gate/run.exit"
   # merge-gate.sh reads the answer of pg_isready for the port it prints, so the
@@ -335,7 +353,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/home2" \
       PATH="$tmp/bin:/usr/bin:/bin" SKIP_BACKUP=1 \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
-      "$BASH" "$ROOT/scripts/merge-gate.sh" >"$tmp/merge-held.out" 2>&1 || held_exit=$?
+      "$BASH" "$tmp/tree2/scripts/merge-gate.sh" >"$tmp/merge-held.out" 2>&1 || held_exit=$?
   if grep -q "another gate is running" "$tmp/merge-held.out"; then
     self_fail "run-all-tests.sh refused the merge-gate that launched it: $(cat "$tmp/merge-held.out")"
   fi
@@ -386,7 +404,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/home4" \
       PATH="$tmp/bin4:/usr/bin:/bin" SKIP_BACKUP=1 \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
-      "$BASH" "$ROOT/scripts/merge-gate.sh" >"$tmp/merge-killed.out" 2>&1 || true; } 2>/dev/null
+      "$BASH" "$tmp/tree4/scripts/merge-gate.sh" >"$tmp/merge-killed.out" 2>&1 || true; } 2>/dev/null
   child="$(cat "$tmp/home4/child.pid" 2>/dev/null || true)"
   [[ -n "$child" ]] || self_fail "the stand-in cargo never ran under the killed gate: $(cat "$tmp/merge-killed.out")"
   for _ in $(seq 100); do [[ -e "/proc/$child" ]] || break; sleep 0.1; done
