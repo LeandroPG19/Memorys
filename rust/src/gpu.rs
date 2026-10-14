@@ -144,8 +144,16 @@ where
     C: FnOnce(SessionBuilder) -> Result<T>,
 {
     let (builder, placement) = configure(make_builder, workload)?;
+    let refusal = placement.clone();
     record_if_built(workload, placement, commit(builder))
+        .map_err(|error| after_the_refusal(&refusal, error))
 }
+
+/// Between the provider's refusal and the commit's error in the one sentence
+/// `/health` cuts on to name each half's paths by its own variable. It is ours
+/// and not the `": "` that `anyhow` puts between the links of a chain, so the
+/// cut does not depend on how a chain is joined.
+pub(crate) const AND_THEN_ON_THE_CPU: &str = "; then the session did not open on the CPU either: ";
 
 /// Takes a factory rather than a builder: when the GPU provider refuses to
 /// start we need a second, clean builder for the CPU path, and a
@@ -246,6 +254,16 @@ fn fall_back_to_cpu(
 /// stays as it was.
 fn record_if_built<T>(workload: Workload, placement: Placement, built: Result<T>) -> Result<T> {
     built.inspect(|_| record(workload, placement))
+}
+
+/// The placement is the only place the provider's refusal lives, and a failed
+/// commit throws it away with the rest of the placement: `/health` and
+/// `doctor` would show the commit's error alone and the refusal would surface a
+/// restart later. It goes in the error, flattened, and not in the registry,
+/// which says where a session opened and this one did not.
+fn after_the_refusal(placement: &Placement, error: anyhow::Error) -> anyhow::Error {
+    let _ = (placement, AND_THEN_ON_THE_CPU);
+    error
 }
 
 fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {
@@ -1715,6 +1733,71 @@ mod placement_tests {
         );
     }
 
+    /// The provider refused and the CPU session did not open either: both
+    /// causes have to reach whoever reads the error, in the order they
+    /// happened, joined by the sentence `/health` cuts on. Pure on purpose: it
+    /// never touches the registry, which a failed commit leaves as it was.
+    #[test]
+    fn a_commit_that_fails_after_the_provider_refused_carries_both_causes() {
+        let refusal = "refusal k5-4731: \"cublasLt64_12.dll\" which is missing";
+        let refused = Placement::CpuAfterProviderFailed(refusal.to_string());
+
+        let both = after_the_refusal(
+            &refused,
+            anyhow::anyhow!("load model: commit refused k5-4732"),
+        );
+        let served = format!("{both:#}");
+        assert_eq!(
+            served,
+            format!(
+                "the GPU provider did not start: {refusal}{AND_THEN_ON_THE_CPU}load model: \
+                 commit refused k5-4732"
+            ),
+            "the provider's refusal is lost when the commit fails: the operator fixes the commit, \
+             restarts, and only then finds out the provider never started"
+        );
+        assert_eq!(
+            served.matches(AND_THEN_ON_THE_CPU).count(),
+            1,
+            "`/health` cuts on this sentence: twice, it cuts the commit's cause in the wrong \
+             place: {served}"
+        );
+
+        let chained = after_the_refusal(
+            &refused,
+            anyhow::anyhow!("inner k5-4734").context("load model: k5-4735"),
+        );
+        let served = format!("{chained:#}");
+        let (_, tail) = served
+            .split_once(AND_THEN_ON_THE_CPU)
+            .expect("the separator is in the error: without it `/health` cannot tell the halves");
+        assert_eq!(
+            tail, "load model: k5-4735: inner k5-4734",
+            "the commit's chain has to arrive whole and not only its outer line"
+        );
+    }
+
+    /// Green on the unmodified tree: the guard against writing the refusal
+    /// when there was none. A GPU placement that opened and a CPU one nobody
+    /// asked to leave the card have nothing to say about a provider.
+    #[test]
+    fn a_commit_that_fails_without_a_refusal_is_the_commit_error_as_it_came() {
+        for placement in [Placement::Gpu, Placement::Cpu] {
+            let served = format!(
+                "{:#}",
+                after_the_refusal(&placement, anyhow::anyhow!("load model: k5-4736"))
+            );
+            assert_eq!(
+                served, "load model: k5-4736",
+                "{placement:?}: no provider refused, so the error is the commit's and nothing else"
+            );
+            assert!(
+                !served.contains(AND_THEN_ON_THE_CPU),
+                "{placement:?}: the separator is only for the double failure: {served}"
+            );
+        }
+    }
+
     /// Production source of this file with the comment lines dropped, so a
     /// sentence that names a call cannot satisfy or break a structural check.
     fn production_without_comments() -> String {
@@ -1817,6 +1900,26 @@ mod placement_tests {
                  the registry before the commit"
             );
         }
+    }
+
+    /// Structural: `after_the_refusal` is worth nothing if nobody calls it, and
+    /// `open` is the only function that still holds the placement when the
+    /// commit fails. The runtime half needs ONNX Runtime and a provider that
+    /// refuses, which no build the gate compiles has.
+    #[test]
+    fn open_hands_a_failed_commit_to_after_the_refusal() {
+        let production = production_without_comments();
+        let open = span_of(
+            &production,
+            "pub fn open<",
+            "`gpu::open` is the one door a session opens through and it is not in this file",
+        );
+        assert!(
+            production[open].contains("after_the_refusal("),
+            "`open` does not call `after_the_refusal`: it is the only place that still has the \
+             placement when the commit fails, and without the call the provider's refusal lives \
+             only in the log again"
+        );
     }
 
     /// Structural, and in every build: `directml_provider` only compiles with

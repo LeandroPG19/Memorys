@@ -2552,7 +2552,7 @@ fn embedder_state_from(
         return ModelState {
             state: STATE_FAILED,
             device: None,
-            reason: Some(reason_without_a_model_path(
+            reason: Some(failure_without_paths(
                 &reason,
                 EMBEDDER_DIR_INSTEAD_OF_A_PATH,
             )),
@@ -2655,7 +2655,7 @@ fn reranker_state_from(
         return ModelState {
             state: STATE_FAILED,
             device: None,
-            reason: Some(reason_without_a_model_path(
+            reason: Some(failure_without_paths(
                 &reason,
                 RERANKER_DIR_INSTEAD_OF_A_PATH,
             )),
@@ -2784,6 +2784,12 @@ fn reason_without_a_model_path(reason: &str, instead: &'static str) -> String {
         at = redact_at(&chars, at, instead, &mut redacted);
     }
     redact_words(&redacted, instead)
+}
+
+/// The `reason` of a `failed` row, with each model's path named by its own
+/// variable.
+fn failure_without_paths(reason: &str, model: &'static str) -> String {
+    reason_without_a_model_path(reason, model)
 }
 
 /// Layers 1 and 2 at one position: writes what stands there into `out` and
@@ -2951,10 +2957,7 @@ fn nli_state_from(
         return ModelState {
             state: STATE_FAILED,
             device: None,
-            reason: Some(reason_without_a_model_path(
-                &reason,
-                NLI_DIR_INSTEAD_OF_A_PATH,
-            )),
+            reason: Some(failure_without_paths(&reason, NLI_DIR_INSTEAD_OF_A_PATH)),
         };
     }
     if deferred {
@@ -5081,6 +5084,97 @@ mod health_report_tests {
         format!(
             r#"E:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1962 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "C:\Users\{user}\.cache\cuba-memorys\onnxruntime\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "No se puede encontrar el módulo especificado.")"#
         )
+    }
+
+    /// The provider refused and the CPU session did not open either: the row
+    /// is `failed` and its sentence carries both halves. Each half names its
+    /// paths by its own variable, because the DLL of the provider is the
+    /// runtime's, and calling it "the reranker directory" sends the operator to
+    /// change the wrong one (see `RERANKER_DIR_INSTEAD_OF_A_PATH`).
+    #[test]
+    fn a_refusal_before_a_failed_commit_names_the_runtime_and_the_model_each_by_its_own_variable() {
+        let user = "Zk5user";
+        let reason = format!(
+            "the GPU provider did not start: {}{}load model: Load model from \
+             C:\\Users\\{user}\\.cache\\memory-industry\\models\\model.onnx failed",
+            provider_refusal(user),
+            crate::gpu::AND_THEN_ON_THE_CPU
+        );
+        let rows = [
+            (
+                Which::Embedder,
+                embedder_state_from(Some(reason.clone()), None, true, false),
+                EMBEDDER_DIR_INSTEAD_OF_A_PATH,
+            ),
+            (
+                Which::Reranker,
+                reranker_state_from(Some(reason.clone()), None, true, true, true),
+                RERANKER_DIR_INSTEAD_OF_A_PATH,
+            ),
+            (
+                Which::Nli,
+                nli_state_from(Some(reason.clone()), None, false, true, true, false),
+                NLI_DIR_INSTEAD_OF_A_PATH,
+            ),
+        ];
+        for (which, row, label) in rows {
+            let served = row.reason.clone().unwrap_or_default();
+            assert_eq!(
+                row.state, "failed",
+                "{which:?}: a session that did not open is `failed`: {served}"
+            );
+            assert!(
+                !served.contains(user),
+                "{which:?}: the operator's user name went out in the runtime block: {served}"
+            );
+            let (head, tail) = served
+                .split_once(crate::gpu::AND_THEN_ON_THE_CPU)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{which:?}: the sentence lost the separator between the halves: {served}"
+                    )
+                });
+            assert!(
+                head.contains(RUNTIME_DIR_INSTEAD_OF_A_PATH) && !head.contains(label),
+                "{which:?}: the provider's DLL has to be named by ORT_DYLIB_PATH, not by the \
+                 model's variable: that sends the operator to change the wrong one: {served}"
+            );
+            assert!(
+                tail.contains(label) && !tail.contains(RUNTIME_DIR_INSTEAD_OF_A_PATH),
+                "{which:?}: the commit's paths belong to the model, not to the runtime: {served}"
+            );
+            assert!(
+                head.contains("cublasLt64_12.dll"),
+                "{which:?}: the name of the DLL that is missing is the actionable half and has \
+                 to stay in view: {served}"
+            );
+        }
+    }
+
+    /// Green on the unmodified tree: without the separator the sentence is
+    /// redacted whole, with the model's variable, exactly as before the cut.
+    #[test]
+    fn a_failure_with_no_refusal_is_redacted_exactly_as_before() {
+        let inputs = [
+            provider_refusal("Zk5b"),
+            "load model: Load model from C:\\Users\\Zk5b\\x\\model.onnx failed".to_string(),
+            "tokenizer.json missing at \"/home/zk5b/.cache/memory-industry/reranker/tokenizer.json\""
+                .to_string(),
+        ];
+        for input in &inputs {
+            for label in [
+                EMBEDDER_DIR_INSTEAD_OF_A_PATH,
+                RERANKER_DIR_INSTEAD_OF_A_PATH,
+                NLI_DIR_INSTEAD_OF_A_PATH,
+            ] {
+                assert_eq!(
+                    failure_without_paths(input, label),
+                    reason_without_a_model_path(input, label),
+                    "a failure with no refusal in it changed: only the double failure is cut. \
+                     Input: {input}"
+                );
+            }
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
