@@ -1,7 +1,7 @@
 // needs-a-server: creates and drops its own database where DATABASE_URL points
-mod common;
+mod empty_db;
 
-use common::in_a_scratch_database;
+use empty_db::in_an_empty_database;
 use sqlx::{Executor, PgPool};
 
 #[tokio::test]
@@ -16,7 +16,7 @@ async fn the_daemon_refuses_a_vector_column_of_another_width_and_names_both() {
     let runtime = memory_industry::embeddings::onnx::embedding_dim();
     let other = runtime * 2;
 
-    in_a_scratch_database("brain_dimguard", move |url| async move {
+    in_an_empty_database("brain_dimguard", move |url| async move {
         let pool = PgPool::connect(&url)
             .await
             .expect("connecting to the scratch database");

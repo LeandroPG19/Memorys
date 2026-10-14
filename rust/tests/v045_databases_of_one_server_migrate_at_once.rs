@@ -23,11 +23,11 @@
 //! check that the whole of it holds against a real server.
 //!
 //! Needs a server: `DATABASE_URL` names it, and every database written here is
-//! one this file creates and drops (`common::in_a_scratch_database`).
+//! one this file creates and drops (`empty_db::in_an_empty_database`).
 
-mod common;
+mod empty_db;
 
-use common::in_a_scratch_database;
+use empty_db::in_an_empty_database;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Barrier;
 
@@ -43,7 +43,7 @@ async fn six_databases_of_one_server_migrated_at_once_all_come_up() {
     let each = (0..DATABASES).map(|_| {
         let start = Arc::clone(&start);
         let failures = Arc::clone(&failures);
-        in_a_scratch_database("brain_at_once", move |url| async move {
+        in_an_empty_database("brain_at_once", move |url| async move {
             start.wait().await;
             match memory_industry::db::create_pool(&url).await {
                 Ok(pool) => pool.close().await,

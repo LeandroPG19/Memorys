@@ -379,14 +379,16 @@ fn tests_that_need_a_second_node_get_one_from_the_workflow() {
 /// there and failed.
 const NEEDS_A_SERVER: &str = "// needs-a-server:";
 
-/// What makes a plain test need a server today: the shared helper in
-/// tests/common that creates and drops a scratch database on the server
-/// `DATABASE_URL` names, and `.expect()`s the variable. The files that read
-/// `DATABASE_URL` or `CUBA_PEER_DATABASE_URL` only from ignored tests do not
-/// count: the check job never runs those, and the e2e job gives them both
-/// servers. A plain test that reads the variable itself, without the helper, is
-/// the one shape this does not see.
-const USES_A_SERVER: &str = "in_a_scratch_database(";
+/// What makes a plain test need a server today: one of the two shared helpers
+/// that create and drop a scratch database on the server `DATABASE_URL` names,
+/// and `.expect()` the variable: `in_a_scratch_database` in tests/common (a
+/// clone of the migrated template) and `in_an_empty_database` in tests/empty_db
+/// (for the files that observe the migration from scratch or build their own
+/// schema). The files that read `DATABASE_URL` or `CUBA_PEER_DATABASE_URL` only
+/// from ignored tests do not count: the check job never runs those, and the e2e
+/// job gives them both servers. A plain test that reads the variable itself,
+/// without a helper, is the one shape this does not see.
+const USES_A_SERVER: [&str; 2] = ["in_a_scratch_database(", "in_an_empty_database("];
 
 /// The files whose first line and whose body disagree, each with what is
 /// wrong: a server used without the marker, which the check job would run and
@@ -398,10 +400,11 @@ fn server_marker_problems(files: &[(String, String)]) -> Vec<String> {
         .filter_map(|(name, body)| {
             let first = body.lines().next().unwrap_or("").trim_end();
             let reason = first.strip_prefix(NEEDS_A_SERVER).map(str::trim);
-            match (reason, body.contains(USES_A_SERVER)) {
+            let uses_a_server = USES_A_SERVER.iter().any(|needle| body.contains(needle));
+            match (reason, uses_a_server) {
                 (None, true) => Some(format!(
-                    "{name}: calls {USES_A_SERVER}…) and does not open with \
-                     `{NEEDS_A_SERVER} <why>`"
+                    "{name}: calls {}…) and does not open with `{NEEDS_A_SERVER} <why>`",
+                    USES_A_SERVER.join("…) or ")
                 )),
                 (Some(_), false) => Some(format!(
                     "{name}: opens with {NEEDS_A_SERVER} and uses no server, so the check job \
@@ -420,12 +423,20 @@ fn server_marker_problems(files: &[(String, String)]) -> Vec<String> {
 fn the_server_marker_check_fails_on_each_way_a_file_can_disagree() {
     let server = "mod common;\n\n#[tokio::test]\nasync fn t() {\n    \
                   common::in_a_scratch_database(\"x\", |url| async move { drop(url) }).await;\n}\n";
-    let rows: [(&str, String, bool); 7] = [
+    let empty = "mod empty_db;\n\n#[tokio::test]\nasync fn t() {\n    \
+                 empty_db::in_an_empty_database(\"x\", |url| async move { drop(url) }).await;\n}\n";
+    let rows: [(&str, String, bool); 9] = [
         (
             "marked_and_using",
             format!("{NEEDS_A_SERVER} creates its own database\n{server}"),
             false,
         ),
+        (
+            "marked_and_using_the_empty_helper",
+            format!("{NEEDS_A_SERVER} creates its own empty database\n{empty}"),
+            false,
+        ),
+        ("using_the_empty_helper_unmarked", empty.to_string(), true),
         (
             "marked_with_crlf",
             format!("{NEEDS_A_SERVER} creates its own database\r\n{server}"),
@@ -476,9 +487,12 @@ fn a_test_file_that_needs_a_server_says_so_where_ci_reads_it() {
         .collect();
 
     assert!(
-        files.iter().any(|(_, body)| body.contains(USES_A_SERVER)),
-        "no test file calls {USES_A_SERVER}…), and five do. A check that found nothing to check \
-         would pass for any tree"
+        files
+            .iter()
+            .any(|(_, body)| USES_A_SERVER.iter().any(|needle| body.contains(needle))),
+        "no test file calls {}…), and many do. A check that found nothing to check would pass \
+         for any tree",
+        USES_A_SERVER.join("…) or ")
     );
     let problems = server_marker_problems(&files);
     assert!(

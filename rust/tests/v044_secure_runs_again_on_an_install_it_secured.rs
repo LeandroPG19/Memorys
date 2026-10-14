@@ -19,11 +19,11 @@
 // HOME is inherited on purpose: a scratch HOME would hand `secure` a fresh
 // pgpass_app, and it would move the live role to a password no daemon has.
 
-mod common;
+mod empty_db;
 
 use std::process::{Command, Output};
 
-use common::in_a_scratch_database;
+use empty_db::in_an_empty_database;
 use sqlx::{Connection, PgConnection};
 
 /// `memory-industry secure` against `database_url`, with the step down to the
@@ -50,7 +50,7 @@ fn printed_runtime_url(stdout: &str) -> Option<&str> {
 
 #[tokio::test]
 async fn secure_runs_again_on_an_install_it_already_secured() {
-    in_a_scratch_database("brain_secure_twice", |url| async move {
+    in_an_empty_database("brain_secure_twice", |url| async move {
         let mut admin = PgConnection::connect(&url)
             .await
             .expect("connecting to the scratch database as the DATABASE_URL role");

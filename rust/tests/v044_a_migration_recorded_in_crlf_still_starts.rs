@@ -14,9 +14,9 @@
 // database, and two databases of one server migrating at once can collide on
 // the server-wide role that migration 0041 touches.
 
-mod common;
+mod empty_db;
 
-use common::in_a_scratch_database;
+use empty_db::in_an_empty_database;
 use sha2::{Digest, Sha384};
 use sqlx::PgPool;
 
@@ -71,7 +71,7 @@ async fn record_checksum(admin: &PgPool, version: i64, checksum: &[u8]) {
 
 #[tokio::test]
 async fn a_record_in_the_other_line_endings_is_realigned_and_no_other_is() {
-    in_a_scratch_database("brain_crlf", |url| async move {
+    in_an_empty_database("brain_crlf", |url| async move {
         memory_industry::db::create_pool(&url)
             .await
             .unwrap_or_else(|e| panic!("migrating the empty scratch database: {e:#}"))

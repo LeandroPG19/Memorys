@@ -16,11 +16,11 @@
 // They also never call `db::create_pool`: after migrating it runs
 // `provision_app_role`, which rewrites the password of the real `cuba_app`.
 
-mod common;
+mod empty_db;
 
 use std::future::Future;
 
-use common::in_a_scratch_database;
+use empty_db::in_an_empty_database;
 use memory_industry::secure_cli::{AppRole, ensure_app_role};
 use sqlx::{Connection, Executor, PgConnection, PgPool, Row};
 
@@ -73,7 +73,7 @@ where
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
     let for_body = role.clone();
-    let outcome = tokio::spawn(in_a_scratch_database("brain_app_role", move |url| {
+    let outcome = tokio::spawn(in_an_empty_database("brain_app_role", move |url| {
         body(url, for_body)
     }))
     .await;
