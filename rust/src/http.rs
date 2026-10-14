@@ -2787,9 +2787,19 @@ fn reason_without_a_model_path(reason: &str, instead: &'static str) -> String {
 }
 
 /// The `reason` of a `failed` row, with each model's path named by its own
-/// variable.
+/// variable. A refusal and the commit error after it share one sentence, and
+/// the paths in the refusal are the runtime's: the provider DLL is named by
+/// `ORT_DYLIB_PATH`, so it cannot be redacted as the model's directory.
 fn failure_without_paths(reason: &str, model: &'static str) -> String {
-    reason_without_a_model_path(reason, model)
+    match reason.split_once(crate::gpu::AND_THEN_ON_THE_CPU) {
+        Some((refusal, commit)) => format!(
+            "{}{}{}",
+            reason_without_a_model_path(refusal, RUNTIME_DIR_INSTEAD_OF_A_PATH),
+            crate::gpu::AND_THEN_ON_THE_CPU,
+            reason_without_a_model_path(commit, model),
+        ),
+        None => reason_without_a_model_path(reason, model),
+    }
 }
 
 /// Layers 1 and 2 at one position: writes what stands there into `out` and

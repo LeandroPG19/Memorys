@@ -262,8 +262,12 @@ fn record_if_built<T>(workload: Workload, placement: Placement, built: Result<T>
 /// restart later. It goes in the error, flattened, and not in the registry,
 /// which says where a session opened and this one did not.
 fn after_the_refusal(placement: &Placement, error: anyhow::Error) -> anyhow::Error {
-    let _ = (placement, AND_THEN_ON_THE_CPU);
-    error
+    match placement {
+        Placement::CpuAfterProviderFailed(cause) => {
+            anyhow::anyhow!("the GPU provider did not start: {cause}{AND_THEN_ON_THE_CPU}{error:#}")
+        }
+        Placement::Gpu | Placement::Cpu => error,
+    }
 }
 
 fn configure_cpu(builder: SessionBuilder, workload: Workload) -> Result<SessionBuilder> {
