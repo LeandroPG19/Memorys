@@ -206,7 +206,16 @@ async fn start(port: u16, pool: &PgPool) {
     serve(port, pool.clone(), &[]).await;
 }
 
+// Migration 0041 runs `ALTER ROLE cuba_app`, a `pg_authid` row, global to the server. The product
+// already retries that race between servers (`retry_on_catalog_race`, 5 attempts), but with the
+// daemons started without models (553 s -> 10.9 s) this binary's ~20 tests migrate their scratch
+// databases at the same instant and some exhaust the retries: `while executing migration 41: error
+// returned from database: tuple concurrently updated` (g1, g7). Here the binary itself causes the
+// race, so it migrates one database at a time.
+static MIGRATE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn migrated(url: &str) -> PgPool {
+    let _one_at_a_time = MIGRATE_GUARD.lock().await;
     memory_industry::db::create_pool(url)
         .await
         .expect("migrating the scratch database")
