@@ -27,6 +27,25 @@
 # y 6 sobre un item suelto de apoyo), y cero ficheros tests.rs hermanos. «No
 # tocaste los tests» no se puede contestar con nombres de fichero, que es
 # exactamente por lo que este guardia no existia. Hay que extraer las regiones.
+#
+# Y un .sh tambien tiene region de test: la que cae entre las dos lineas
+# marcador `# --- self-test begin ---` y `# --- self-test end ---`, en columna 0.
+# Hasta 0.31 un .sh en `paths:` se aceptaba y se ignoraba: repetido sobre el
+# historial de G7, un `--self-test` nuevo de 295 lineas declarado `frozen` daba
+# OK, y la pasada roja honesta declarada `written` daba rojo. Cuatro razones
+# medidas para marcar en vez de detectar por patron:
+#   - en validar-handoff.sh y gpu-placement-check.sh los ayudantes del test
+#     (must_fail, must_pass) viven FUERA de self_test(): con la funcion como
+#     region, volver un ayudante `return 0` pasaria `frozen`;
+#   - el despacho (`--self-test) self_test ;;`) esta en el `case` de produccion:
+#     reescribirlo para que imprima el OK sin correr nada dejaba verde la fila
+#     que solo ancla en la etiqueta;
+#   - un `fi` o un `}` en columna 0 dentro de un heredoc corta una region
+#     detectada por patron EN SILENCIO (mk_repo ya tiene dos `}` asi); con
+#     marcadores el corte deja un fichero desparejado, y eso es rojo;
+#   - son dos patrones que crecen con cada forma nueva, frente a una regla.
+# Un marcador mal puesto es rojo sea cual sea `tests` (marcas_sh), porque una
+# region adivinada no vale para decidir written ni frozen.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,6 +62,9 @@ uso:
 Campos: from, to, type, task, commit, evidence, y `tests` cuando commit != none.
 Opcional con commit != none: `paths`, la lista de rutas de la tajada; `tests`
 se juzga entonces solo sobre los ficheros bajo ellas.
+Region de test: un `#[cfg(test)]` de un .rs, un .rs entero bajo tests/, o en un
+.sh lo que hay entre las lineas `# --- self-test begin ---` y
+`# --- self-test end ---` (columna 0).
 TXT
 }
 
@@ -60,12 +82,27 @@ regiones_cfg_test() {
   '
 }
 
+marca_ini='# --- self-test begin ---'
+marca_fin='# --- self-test end ---'
+
+# Las lineas de cada par, marcadores incluidos, en orden. Sin anidamiento: un
+# begin dentro de una region no abre otra (marcas_sh lo pone en rojo antes de
+# que esto cuente).
+regiones_self_test() {
+  awk -v ini="$marca_ini" -v fin="$marca_fin" '
+    $0 == ini { dentro = 1 }
+    dentro { print }
+    $0 == fin { dentro = 0 }
+  '
+}
+
 filtrar_region() { # <ruta-relativa>, contenido ya normalizado por stdin
   case "$1" in
     # Un .rs bajo tests/ es test de arriba abajo. El crate tiene 81 y solo 3
     # llevan #[cfg(test)]: extraer por atributo dejaria 78 ficheros de test
     # invisibles para `frozen`, que es el agujero mas grande que cabria aqui.
     */tests/*.rs | tests/*.rs) cat ;;
+    *.sh) regiones_self_test ;;
     *) regiones_cfg_test ;;
   esac
 }
@@ -110,20 +147,58 @@ en_la_tajada() { # <fichero> [ruta...] -> 0 si el fichero cae dentro de alguna r
   return 1
 }
 
-tests_tocados() { # <commit> [ruta...] -> imprime los ficheros cuya region cambio
-  local commit="$1" f a b ficheros
+# Una sola lista para las dos pasadas (la comparacion de regiones y el juicio de
+# marcadores): si salieran de dos sitios, podrian dejar de mirar los mismos
+# ficheros sin que nada lo notara.
+ficheros_candidatos() { # <commit> [ruta...] -> .rs y .sh cambiados o sin versionar, dentro de la tajada
+  local commit="$1" f
   shift
   # `git diff` no ve lo que no esta trackeado, y la pasada roja estrena ficheros
   # de test a menudo. Sin ls-files --others, `written` diria que no se escribio
   # ningun test justo el dia que se escribio uno nuevo.
-  ficheros="$( {
-    git -C "$ROOT" diff --name-only "$commit" -- '*.rs' 2>/dev/null
-    git -C "$ROOT" ls-files --others --exclude-standard -- '*.rs' 2>/dev/null
-  } | sort -u )"
+  {
+    git -C "$ROOT" diff --name-only "$commit" -- '*.rs' '*.sh' 2>/dev/null
+    git -C "$ROOT" ls-files --others --exclude-standard -- '*.rs' '*.sh' 2>/dev/null
+  } | sort -u | while IFS= read -r f; do
+    # `if`, no `&&`: con pipefail un ultimo fichero fuera de la tajada dejaria el
+    # bucle en 1 y mataria al llamante dentro de su sustitucion, sin decir nada.
+    if [[ -n "$f" ]] && en_la_tajada "$f" "$@"; then
+      printf '%s\n' "$f"
+    fi
+  done
+}
+
+# Imprime, con ruta:linea, cada marcador mal puesto de un .sh del ARBOL y cada
+# despacho de --self-test que cae fuera de toda region. Devuelve 1 si imprimio.
+marcas_sh() { # <ruta-relativa>
+  local salida
+  salida="$(sed 's/\r$//' < "$ROOT/$1" | awk -v ini="$marca_ini" -v fin="$marca_fin" -v ruta="$1" '
+    function dice(n, txt) { print ruta ":" n ": " txt }
+    $0 == ini {
+      if (dentro) dice(NR, "\047" ini "\047 abre una region dentro de la que abrio la linea " abierta "; las regiones no se anidan")
+      else { dentro = 1; abierta = NR }
+      next
+    }
+    $0 == fin {
+      if (dentro) dentro = 0
+      else dice(NR, "\047" fin "\047 no cierra ninguna region")
+      next
+    }
+    !dentro && (index($0, "== \"--self-test\"") || $0 ~ /^[ \t]*"?--self-test"?\)/) {
+      dice(NR, "despacha --self-test fuera de toda region marcada, asi que sus tests son invisibles para written y frozen. Envuelve el self-test entero (el bloque o la funcion, sus ayudantes y el brazo del case que lo despacha) entre \047" ini "\047 y \047" fin "\047, en columna 0.")
+    }
+    END { if (dentro) dice(abierta, "\047" ini "\047 no tiene su \047" fin "\047") }
+  ')" || true
+  [[ -z "$salida" ]] && return 0
+  printf '%s\n' "$salida"
+  return 1
+}
+
+tests_tocados() { # <commit> <ficheros candidatos, uno por linea> -> imprime los que cambiaron de region
+  local commit="$1" ficheros="$2" f a b
   [[ -n "$ficheros" ]] || return 0
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
-    en_la_tajada "$f" "$@" || continue
     a="$(region_en_commit "$commit" "$f")"
     b="$(region_en_arbol "$f")"
     [[ "$a" == "$b" ]] || printf '%s\n' "$f"
@@ -238,8 +313,22 @@ juzgar() { # <fichero.yml>
         }
       done
     fi
+    # Antes del case y fuera de la sustitucion de `cambiados`: con set -e un
+    # fallo dentro de ella mataria el script sin decir nada (la leccion de
+    # val()). Se juzga el .sh del ARBOL; el de `commit` es historia, y si no tenia
+    # marcadores su region sale vacia y la comparacion lo cuenta como movido.
+    local sh_f marcas mal=0 candidatos
+    candidatos="$(ficheros_candidatos "$commit" "${paths[@]}")"
+    while IFS= read -r sh_f; do
+      [[ "$sh_f" == *.sh && -f "$ROOT/$sh_f" ]] || continue
+      marcas="$(marcas_sh "$sh_f")" || { printf '%s\n' "$marcas"; mal=1; }
+    done <<< "$candidatos"
+    (( mal == 0 )) || {
+      echo "regiones de self-test mal marcadas: no se juzga written ni frozen sobre una region adivinada."
+      return 1
+    }
     local cambiados
-    cambiados="$(tests_tocados "$commit" "${paths[@]}")"
+    cambiados="$(tests_tocados "$commit" "$candidatos")"
     case "$tests" in
       written)
         [[ -n "$cambiados" ]] || {

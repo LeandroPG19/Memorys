@@ -21,6 +21,11 @@ evidence: none
 #                    incorrecto se para y se devuelve un `type: note`; no se
 #                    edita, ni se salta, ni se debilita.
 #
+# Regiones de test: #[cfg(test)] en un .rs, el .rs entero bajo tests/, y en
+# un .sh lo que hay entre `# --- self-test begin ---` y `# --- self-test end ---`
+# (columna 0). Un script del juez marca su --self-test entero: el bloque o la
+# funcion, sus ayudantes y el brazo del case que lo despacha.
+#
 # Obligatorio cuando commit != none y prohibido cuando commit == none (un
 # handoff de especificador no entrega código y declararía sobre la nada).
 # Omitir el campo NO es una salida: esa era justo la fuga que 0.28 cerró.
@@ -44,4 +49,5 @@ evidence: none
 #   paths:
 #     - rust/src/search/rrf.rs
 #     - rust/tests/local_gate_contract.rs
+#     - scripts/merge-gate.sh
 #   evidence: "qué tiene que correr el orquestador, y qué se pone rojo sin esto"

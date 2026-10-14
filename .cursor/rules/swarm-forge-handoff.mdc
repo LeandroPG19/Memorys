@@ -16,8 +16,12 @@ Cada entrega entre roles es un fichero `.cursor/handoffs/*.yml` con exactamente:
 
 ## El campo `tests`
 
-Declara qué hizo esta pasada con los tests, y el guardia lo comprueba comparando las regiones
-`#[cfg(test)]` de `rust/src` —y los ficheros de `rust/tests/` enteros— contra ese commit:
+Declara qué hizo esta pasada con los tests, y el guardia lo comprueba comparando las regiones de test
+contra ese commit: las `#[cfg(test)]` de `rust/src`, los ficheros de `rust/tests/` enteros y, en un
+script `.sh`, lo que hay entre `# --- self-test begin ---` y `# --- self-test end ---` (en columna 0).
+Un script con modo `--self-test` envuelve entero su test (el bloque o la función, sus ayudantes y el
+brazo del `case`), y si lo despacha fuera de una región o deja un marcador desparejado, el handoff se
+rechaza:
 
 - `written`: esta pasada **escribió** tests. Falla si ninguna región cambió, porque una pasada roja
   que no movió un test no escribió nada que pueda ponerse rojo.
