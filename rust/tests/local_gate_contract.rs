@@ -42,6 +42,8 @@ fn merge_gate_is_the_local_judge_and_stays_strict() {
         // With its call and flag, not the bare name: the stand-in the gate's own
         // --self-test writes is called test-times.sh too.
         "test-times.sh\" --judge",
+        // The same for the judge of the ignored advisories (G6).
+        "advisory-exceptions.sh\" --judge",
         "WHAT THIS GATE DOES NOT CHECK",
         "never SKIPPED",
         "generative LLM",
@@ -391,6 +393,40 @@ fn test_times_can_actually_fail() {
         out.status.success(),
         "test-times.sh --self-test did not pass, so at least one of its guards no longer \
          fails when it should. stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Anchored on the mode's label, not on its sentence, like the other self-tests.
+    assert!(
+        stdout.contains("self-test:"),
+        "the self-test exited 0 without saying it ran. An exit code alone is what let \
+         codigo-muerto.sh pass for months while doing nothing. stdout: {stdout}"
+    );
+}
+
+/// A list of exceptions the judge cannot break is a paragraph.
+///
+/// `advisory-exceptions.sh` reads the one list of ignored advisories, the two
+/// TOML mirrors of its IDs and a `cargo audit --json` report made without
+/// ignores, and says each exception has an owner, a date and an advisory of
+/// `Cargo.lock` behind it. A judge that does not refuse an expired line, one that
+/// matches nothing, or a mirror that drifted prints the same `OK` over every run.
+/// Its `--self-test` runs the script through its CLI over a file built to break
+/// each guard, and the script reports whether they broke. The calendar is not
+/// read here: the real list expires, and a `cargo test` that judged it would go
+/// red by date; the gate judges it.
+#[test]
+fn advisory_exceptions_can_actually_fail() {
+    let out = std::process::Command::new(git_bash())
+        .args(["scripts/advisory-exceptions.sh", "--self-test"])
+        .current_dir(repo_root())
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "advisory-exceptions.sh --self-test did not pass, so at least one of its guards no \
+         longer fails when it should. stdout: {stdout}\nstderr: {stderr}"
     );
     // Anchored on the mode's label, not on its sentence, like the other self-tests.
     assert!(

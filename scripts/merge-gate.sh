@@ -58,6 +58,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'echo "test-times $*" >>"$HOME/steps"' \
       'prev=""; for a in "$@"; do [ "$prev" = --judge ] && cp "$a" "$HOME/times.seen"; prev="$a"; done' \
       'exit "${FAKE_TIMES_EXIT:-0}"' >"$t/scripts/test-times.sh"
+    # advisory-exceptions.sh (G6): what it was called with goes in the order, the
+    # report it was told to judge is copied as the gate had made it, and
+    # FAKE_ADVEX_EXIT is its verdict.
+    printf '%s\n' '#!/bin/sh' \
+      'echo "advisory-exceptions $*" >>"$HOME/steps"' \
+      'prev=""; for a in "$@"; do [ "$prev" = --judge ] && cp "$a" "$HOME/advex.seen"; prev="$a"; done' \
+      'exit "${FAKE_ADVEX_EXIT:-0}"' >"$t/scripts/advisory-exceptions.sh"
     # pg_isready: the row picks what it answers on stdout, the line it writes on
     # stderr and its exit code (FAKE_PG_ANSWER, FAKE_PG_EXIT, FAKE_PG_STDERR),
     # and each call leaves its arguments, one per line, in $HOME/pg_isready.args.
@@ -81,9 +88,20 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # order of the steps. cargo audit has two ways to fail that the gate has to
     # tell apart: a database it could not fetch (FAKE_AUDIT_NOFETCH=1, the three
     # lines cargo-audit 0.22.2 printed with no route to github.com) and an
-    # advisory it found (FAIL_AT=audit).
+    # advisory it found (FAIL_AT=audit). The report of the exceptions step is a third
+    # audit call, `audit --json`: it leaves the directory it ran in (and whether an
+    # audit.toml was there to be read from it) in $HOME, prints a marker the
+    # stand-in judge copies, and exits FAKE_AUDIT_JSON_EXIT, 1 unless the row says
+    # otherwise, which is what the real one does when it finds the excepted advisories.
     printf '%s\n' '#!/bin/sh' \
       'echo "cargo $*" >>"$HOME/steps"' \
+      'if [ "$1" = audit ] && [ "${2:-}" = --json ]; then' \
+      '  echo "$PWD" >"$HOME/audit_json.cwd"' \
+      '  if [ -e .cargo/audit.toml ]; then echo present >"$HOME/audit_json.audit_toml"; fi' \
+      '  echo '"'"'{"marker":"g6-fake-report"}'"'" \
+      '  [ -z "${FAKE_AUDIT_JSON_STDERR:-}" ] || echo "$FAKE_AUDIT_JSON_STDERR" >&2' \
+      '  exit "${FAKE_AUDIT_JSON_EXIT:-1}"' \
+      'fi' \
       'if [ "$1" = audit ] && [ "${FAKE_AUDIT_NOFETCH:-}" = 1 ]; then' \
       '  echo "error: couldn'"'"'t fetch advisory database: git operation failed: An IO error occurred when talking to the server" >&2' \
       '  echo "Caused by:" >&2' \
@@ -382,6 +400,73 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ -n "$audit_at" && -n "$deny_at" ]] && (( audit_at < deny_at )) \
     || self_fail "deny_before_tests: cargo deny did not come after cargo audit: $(steps_of deny_before_tests)"
   adv_never deny_before_tests 'run-all-tests'
+
+  # G6: the exceptions of cargo audit are judged right after it and before cargo deny,
+  # from a report that second call makes without ignores. It has to run from a directory
+  # of its own: rust/.cargo/audit.toml would ignore the very advisories the judge looks
+  # for, and every exception would look unused. Its exit does not count (1 is what it
+  # does when the exceptions are real), the judge's does, and a refused judge (2) is
+  # explained by what the call wrote on stderr.
+  fake_tree adv_exc_order "$tests_step"
+  mkdir -p "$tmp/adv_exc_order/rust/.cargo" "$tmp/adv_exc_order/.cargo"
+  : >"$tmp/adv_exc_order/rust/.cargo/audit.toml"
+  : >"$tmp/adv_exc_order/.cargo/audit.toml"
+  run_copy adv_exc_order
+  (( rc == 0 )) || self_fail "adv_exc_order: a gate whose every step passed exited $rc: $(cat "$tmp/adv_exc_order.out")"
+  audit_at="$(step_at adv_exc_order '^cargo audit$')"
+  json_at="$(step_at adv_exc_order '^cargo audit --json --no-fetch -f .*rust/Cargo\.lock$')"
+  exc_at="$(step_at adv_exc_order '^advisory-exceptions --judge ')"
+  deny_at="$(step_at adv_exc_order '^cargo deny check')"
+  tests_at="$(step_at adv_exc_order '^run-all-tests$')"
+  [[ -n "$audit_at" && -n "$json_at" && -n "$exc_at" && -n "$deny_at" && -n "$tests_at" ]] \
+    || self_fail "adv_exc_order: a step is missing (cargo audit '$audit_at', cargo audit --json --no-fetch -f <rust/Cargo.lock> '$json_at', advisory-exceptions --judge '$exc_at', cargo deny '$deny_at', tests '$tests_at'): $(steps_of adv_exc_order)"
+  (( audit_at < json_at && json_at < exc_at && exc_at < deny_at && deny_at < tests_at )) \
+    || self_fail "adv_exc_order: the order is not cargo audit, cargo audit --json, the exceptions, cargo deny, the tests: $(steps_of adv_exc_order)"
+  json_cwd="$(cat "$tmp/adv_exc_order/home/audit_json.cwd" 2>/dev/null || true)"
+  [[ -n "$json_cwd" ]] || self_fail "adv_exc_order: cargo audit --json left no directory: $(steps_of adv_exc_order)"
+  case "$json_cwd" in
+    "$tmp/adv_exc_order" | "$tmp/adv_exc_order/rust" | "$tmp/adv_exc_order/rust/"* | */rust)
+      self_fail "adv_exc_order: cargo audit --json ran in '$json_cwd', not in a directory of its own" ;;
+  esac
+  [[ ! -e "$tmp/adv_exc_order/home/audit_json.audit_toml" ]] \
+    || self_fail "adv_exc_order: cargo audit --json ran where an audit.toml was there to ignore advisories ('$json_cwd')"
+  grep -q 'g6-fake-report' "$tmp/adv_exc_order/home/advex.seen" 2>/dev/null \
+    || self_fail "adv_exc_order: the judge was not handed the report that cargo audit --json made: $(cat "$tmp/adv_exc_order/home/advex.seen" 2>/dev/null || true)"
+
+  # The judge's 1 is the gate's, and the tests never start.
+  fake_tree adv_exc_red "$tests_step"
+  run_copy adv_exc_red "" FAKE_ADVEX_EXIT=1
+  adv_stopped adv_exc_red 1
+  [[ -n "$(step_at adv_exc_red '^advisory-exceptions --judge ')" ]] \
+    || self_fail "adv_exc_red: the exceptions were not judged: $(steps_of adv_exc_red)"
+  adv_never adv_exc_red 'cargo deny check' 'run-all-tests'
+  if grep -q 'MERGE GATE PASSED' "$tmp/adv_exc_red.out"; then
+    self_fail "adv_exc_red: a gate whose exceptions were red passed: $(cat "$tmp/adv_exc_red.out")"
+  fi
+
+  # Its 2 is the gate's too, and says why: what the call that made the report wrote on stderr.
+  fake_tree adv_exc_refused "$tests_step"
+  run_copy adv_exc_refused "" FAKE_ADVEX_EXIT=2 'FAKE_AUDIT_JSON_STDERR=stand-in audit json: S7derr'
+  adv_stopped adv_exc_refused 2
+  adv_never adv_exc_refused 'cargo deny check' 'run-all-tests'
+  grep -q 'S7derr' "$tmp/adv_exc_refused.out" \
+    || self_fail "adv_exc_refused: the gate did not print what cargo audit --json wrote on stderr: $(cat "$tmp/adv_exc_refused.out")"
+
+  # An advisory cargo audit itself found is the verdict, and the exceptions are not judged.
+  fake_tree adv_exc_after_audit "$tests_step"
+  run_copy adv_exc_after_audit audit
+  adv_stopped adv_exc_after_audit 1
+  adv_never adv_exc_after_audit 'cargo audit --json' 'advisory-exceptions'
+
+  # cargo audit --json exits 1 when it finds the excepted advisories, and 0 when it finds
+  # none: neither is the verdict, so the exceptions are judged either way.
+  for json_exit in 0 1; do
+    fake_tree "adv_exc_json_exit$json_exit" "$tests_step"
+    run_copy "adv_exc_json_exit$json_exit" "" FAKE_AUDIT_JSON_EXIT="$json_exit"
+    (( rc == 0 )) || self_fail "adv_exc_json_exit$json_exit: cargo audit --json exited $json_exit and the gate $rc: $(cat "$tmp/adv_exc_json_exit$json_exit.out")"
+    [[ -n "$(step_at "adv_exc_json_exit$json_exit" '^advisory-exceptions --judge ')" ]] \
+      || self_fail "adv_exc_json_exit$json_exit: the exceptions were not judged: $(steps_of "adv_exc_json_exit$json_exit")"
+  done
 
   # G4/A1: a cargo target inside rust/ is copied whole into every job of the mutation
   # step, the last one of this gate, and it used to be refused only there: ~20 min of
@@ -940,6 +1025,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "    a database it cannot refresh is exit 2, never a skip; without pg_isready the"
   echo "    readiness check asks the container that publishes the port of DATABASE_URL, never one by name."
   echo "    the test times are judged last, over the gate's own log up to the npm step, and their red is the gate's"
+  echo "    advisory exceptions are judged right after cargo audit, from a report made without ignores, and their red stops the gate before cargo deny;"
   exit 0
 fi
 
