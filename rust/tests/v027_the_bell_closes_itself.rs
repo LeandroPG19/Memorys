@@ -3,11 +3,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-const SYNC_DIR_LOCK: i64 = 0x0CBA_A0D1_7106_0027;
+// The port of the peer daemon, asked of the OS.
+mod ephemeral;
 
-/// One place owns the port, so the daemon, the readiness probe and the URL the
-/// sync call is pointed at cannot drift apart.
-const PEER_ADDR: &str = "127.0.0.1:18821";
+const SYNC_DIR_LOCK: i64 = 0x0CBA_A0D1_7106_0027;
 
 /// The peer's own ceiling on loading models before it opens for business.
 ///
@@ -114,8 +113,11 @@ async fn probe(client: &reqwest::Client, url: &str) -> Result<String, String> {
 /// waiting on it would fail a peer that was working. `ready` is still worth
 /// carrying into the failure message of whatever fails next, which is why this
 /// returns it instead of dropping it.
-async fn wait_until_the_peer_serves(daemon: &tokio::task::JoinHandle<()>) -> String {
-    let url = format!("http://{PEER_ADDR}/health");
+async fn wait_until_the_peer_serves(
+    daemon: &tokio::task::JoinHandle<()>,
+    peer_addr: &str,
+) -> String {
+    let url = format!("http://{peer_addr}/health");
     let client = reqwest::Client::builder()
         .timeout(PROBE_BUDGET)
         .build()
@@ -130,9 +132,10 @@ async fn wait_until_the_peer_serves(daemon: &tokio::task::JoinHandle<()>) -> Str
     while Instant::now() < deadline {
         assert!(
             !daemon.is_finished(),
-            "the peer daemon on {PEER_ADDR} ended before it served anything, so nothing below \
+            "the peer daemon on {peer_addr} ended before it served anything, so nothing below \
              can run. serve_pool printed why it stopped — with --nocapture that line is just \
-             above this one; the port still held by an earlier run is the usual reason"
+             above this one; `already in use` there means the OS gave this port to another \
+             socket between `ephemeral::port()` and the bind, see tests/ephemeral/mod.rs"
         );
 
         probes += 1;
@@ -241,15 +244,17 @@ async fn taking_what_the_peer_offered_silences_its_bell() {
     .expect("the peer rings the bell");
 
     let served = remote.clone();
+    let peer_addr = format!("127.0.0.1:{}", ephemeral::port());
+    let addr = peer_addr.clone();
     let daemon = tokio::spawn(async move {
         // Printed rather than dropped: when it is the bind that failed, the
         // readiness probe below only ever sees a refused connection, and the
         // sentence naming the cause lives in this Err and nowhere else.
-        if let Err(why) = memory_industry::http::serve_pool(PEER_ADDR, served, true).await {
-            eprintln!("the peer daemon on {PEER_ADDR} stopped: {why:#}");
+        if let Err(why) = memory_industry::http::serve_pool(&addr, served, true).await {
+            eprintln!("the peer daemon on {addr} stopped: {why:#}");
         }
     });
-    let peer = wait_until_the_peer_serves(&daemon).await;
+    let peer = wait_until_the_peer_serves(&daemon, &peer_addr).await;
 
     let open_before: i64 =
         sqlx::query_scalar("SELECT count(*) FROM brain_peer_notices WHERE resolved_at IS NULL")
@@ -267,7 +272,7 @@ async fn taking_what_the_peer_offered_silences_its_bell() {
         json!({
             "action": "fetch",
             "peer": "la-otra",
-            "url": format!("http://{PEER_ADDR}"),
+            "url": format!("http://{peer_addr}"),
             "conflict": "skip"
         }),
     )

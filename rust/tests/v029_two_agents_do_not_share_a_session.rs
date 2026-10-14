@@ -3,6 +3,9 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use uuid::Uuid;
 
+// The port of the daemon, asked of the OS.
+mod ephemeral;
+
 static ENV_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const ADMIN: &str = "identity-admin-token";
@@ -95,7 +98,8 @@ async fn wait_until_it_serves(port: u16, daemon: &tokio::task::JoinHandle<()>) {
             !daemon.is_finished(),
             "the daemon on 127.0.0.1:{port} ended before it served anything, so nothing below \
              can run. serve_pool printed why it stopped — with --nocapture that line is just \
-             above this one; the port still held by an earlier run is the usual reason"
+             above this one; `already in use` there means the OS gave this port to another \
+             socket between `ephemeral::port()` and the bind, see tests/ephemeral/mod.rs"
         );
 
         probes += 1;
@@ -117,7 +121,9 @@ async fn wait_until_it_serves(port: u16, daemon: &tokio::task::JoinHandle<()>) {
     );
 }
 
-async fn daemon(port: u16) -> sqlx::PgPool {
+/// Returns the pool and the port the daemon was given. This binary has a single
+/// test, so no other daemon can be handed the same port between asking and binding.
+async fn daemon() -> (sqlx::PgPool, u16) {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let pool = memory_industry::db::create_pool(&url)
@@ -144,8 +150,9 @@ async fn daemon(port: u16) -> sqlx::PgPool {
         std::env::set_var("CUBA_WARM_RERANKER", "0");
     }
     let served = pool.clone();
-    let addr = format!("127.0.0.1:{port}");
+    let port = ephemeral::port();
     let serve_task = tokio::spawn(async move {
+        let addr = format!("127.0.0.1:{port}");
         // Printed rather than dropped: when it is the bind that failed, the
         // wait below only ever sees a connection nobody answers, and the
         // sentence naming the cause lives in this Err and nowhere else.
@@ -154,7 +161,7 @@ async fn daemon(port: u16) -> sqlx::PgPool {
         }
     });
     wait_until_it_serves(port, &serve_task).await;
-    pool
+    (pool, port)
 }
 
 async fn open_a_session(port: u16, header: Option<&str>, name: &str) -> serde_json::Value {
@@ -221,15 +228,15 @@ async fn whose_session(port: u16, header: Option<&str>) -> Option<String> {
 #[ignore]
 async fn a_client_that_only_says_claude_code_does_not_inherit_another_agents_session() {
     let _env = ENV_GUARD.lock().await;
-    let pool = daemon(18841).await;
+    let (pool, port) = daemon().await;
 
-    let started = open_a_session(18841, None, "el trabajo de la primera IA").await;
+    let started = open_a_session(port, None, "el trabajo de la primera IA").await;
     let owned = started["session"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("jornada start returns the session: {started}"))
         .to_string();
 
-    let inherited = whose_session(18841, None).await;
+    let inherited = whose_session(port, None).await;
     assert_ne!(
         inherited.as_deref(),
         Some(owned.as_str()),
@@ -242,13 +249,13 @@ async fn a_client_that_only_says_claude_code_does_not_inherit_another_agents_ses
     );
 
     let declared = format!("agent-a-{}", &Uuid::new_v4().to_string()[..8]);
-    let mine = open_a_session(18841, Some(&declared), "la que sí se identifica").await;
+    let mine = open_a_session(port, Some(&declared), "la que sí se identifica").await;
     let mine_id = mine["session"]["id"]
         .as_str()
         .expect("session id")
         .to_string();
     assert_eq!(
-        whose_session(18841, Some(&declared)).await.as_deref(),
+        whose_session(port, Some(&declared)).await.as_deref(),
         Some(mine_id.as_str()),
         "and an agent that DOES declare an id has to keep its session across calls, or the fix \
          works by breaking sessions for everybody, which is the same loss with better manners"

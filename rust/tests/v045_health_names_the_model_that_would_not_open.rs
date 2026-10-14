@@ -37,12 +37,12 @@ use serde_json::Value;
 // A database that is certainly not there. Nothing asserted here is about the
 // database; `/health` just has to be able to ask one.
 mod dead_db;
+// The port of the daemon, asked of the OS.
+mod ephemeral;
 
 /// Long enough to be a real bearer token, so nothing in the bind guard has an
 /// opinion about it.
 const TOKEN: &str = "canary-token-7d2e90c4a1b35f68e0c9d4b7";
-
-const PORT: u16 = 18854;
 
 /// The daemon's own ceiling on loading models before it opens for business.
 /// Past it `serve_pool` serves with `ready:false`, and a failure still wins
@@ -179,10 +179,14 @@ fn broken_machine(install: &BrokenInstall) -> Vec<Env> {
 }
 
 /// Start a daemon and wait until it answers, or fail saying it never did.
-async fn daemon(port: u16) {
+///
+/// Returns the port the daemon was given. This binary has a single test, so no
+/// other daemon can be handed the same port between asking and binding.
+async fn daemon() -> u16 {
     let pool = memory_industry::db::create_lazy_pool(&dead_db::url());
-    let addr = format!("127.0.0.1:{port}");
+    let port = ephemeral::port();
     let serve_task = tokio::spawn(async move {
+        let addr = format!("127.0.0.1:{port}");
         if let Err(why) = memory_industry::http::serve_pool(&addr, pool, false).await {
             eprintln!("the daemon on 127.0.0.1:{port} stopped: {why:#}");
         }
@@ -200,11 +204,12 @@ async fn daemon(port: u16) {
         assert!(
             !serve_task.is_finished(),
             "the daemon on 127.0.0.1:{port} ended before it served anything; serve_pool printed \
-             why just above (with --nocapture). The port still held by an earlier run is the \
-             usual reason"
+             why just above (with --nocapture); `already in use` there means the OS gave this \
+             port to another socket between `ephemeral::port()` and the bind, see \
+             tests/ephemeral/mod.rs"
         );
         match client.get(&url).send().await {
-            Ok(_) => return,
+            Ok(_) => return port,
             Err(e) => last = format!("no answer at all: {e}"),
         }
         tokio::time::sleep(PROBE_EVERY).await;
@@ -234,7 +239,7 @@ async fn health(port: u16, token: Option<&str>) -> Value {
 async fn a_model_that_would_not_open_is_failed_in_health_and_its_path_stays_home() {
     let install = BrokenInstall::new();
     let _env = broken_machine(&install);
-    daemon(PORT).await;
+    let port = daemon().await;
 
     // The daemon warms the embedder and, told to, the reranker. Nothing warms
     // NLI: its first use does, and a verify or a contradiction check calls
@@ -249,7 +254,7 @@ async fn a_model_that_would_not_open_is_failed_in_health_and_its_path_stays_home
          failed model"
     );
 
-    let body = health(PORT, Some(TOKEN)).await;
+    let body = health(port, Some(TOKEN)).await;
     let runtime = body
         .get("runtime")
         .unwrap_or_else(|| panic!("a caller with the admin token gets the runtime block: {body}"));
@@ -300,7 +305,7 @@ async fn a_model_that_would_not_open_is_failed_in_health_and_its_path_stays_home
         }
     }
 
-    let anonymous = health(PORT, None).await;
+    let anonymous = health(port, None).await;
     assert!(
         anonymous.get("runtime").is_none(),
         "a caller without the token gets the verdict and nothing of the inventory: {anonymous}"

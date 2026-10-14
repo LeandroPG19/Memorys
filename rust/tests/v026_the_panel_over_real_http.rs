@@ -2,6 +2,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+// The port of each daemon, asked of the OS.
+mod ephemeral;
+
 const ADMIN: &str = "panel-admin-token";
 const PEER: &str = "panel-peer-token";
 
@@ -95,7 +98,8 @@ async fn wait_until_it_serves(port: u16, daemon: &tokio::task::JoinHandle<()>) {
             !daemon.is_finished(),
             "the daemon on 127.0.0.1:{port} ended before it served anything, so nothing below \
              can run. serve_pool printed why it stopped — with --nocapture that line is just \
-             above this one; the port still held by an earlier run is the usual reason"
+             above this one; `already in use` there means the OS gave this port to another \
+             socket between `ephemeral::port()` and the bind, see tests/ephemeral/mod.rs"
         );
 
         probes += 1;
@@ -117,7 +121,10 @@ async fn wait_until_it_serves(port: u16, daemon: &tokio::task::JoinHandle<()>) {
     );
 }
 
-async fn daemon(port: u16, panel: bool, public: bool) -> sqlx::PgPool {
+/// Returns the pool and the port the daemon was given. The port is asked of the OS
+/// on the line before the spawn, and every test holds `ENV_GUARD` around this, so
+/// no other daemon of this binary can be handed the same one in between.
+async fn daemon(panel: bool, public: bool) -> (sqlx::PgPool, u16) {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
     let pool = memory_industry::db::create_pool(&url)
@@ -155,8 +162,9 @@ async fn daemon(port: u16, panel: bool, public: bool) -> sqlx::PgPool {
     }
 
     let served = pool.clone();
-    let addr = format!("127.0.0.1:{port}");
+    let port = ephemeral::port();
     let serve_task = tokio::spawn(async move {
+        let addr = format!("127.0.0.1:{port}");
         // Printed rather than dropped: when it is the bind that failed, the
         // wait below only ever sees a connection nobody answers, and the
         // sentence naming the cause lives in this Err and nowhere else.
@@ -165,7 +173,7 @@ async fn daemon(port: u16, panel: bool, public: bool) -> sqlx::PgPool {
         }
     });
     wait_until_it_serves(port, &serve_task).await;
-    pool
+    (pool, port)
 }
 
 async fn rpc(port: u16, token: &str, method: &str) -> (u16, serde_json::Value) {
@@ -185,10 +193,10 @@ async fn rpc(port: u16, token: &str, method: &str) -> (u16, serde_json::Value) {
 #[ignore]
 async fn a_peer_token_cannot_open_the_admin_surface() {
     let _env = ENV_GUARD.lock().await;
-    let _pool = daemon(18811, true, false).await;
+    let (_pool, port) = daemon(true, false).await;
 
     for method in memory_industry::admin::METHODS {
-        let (status, body) = rpc(18811, ADMIN, method).await;
+        let (status, body) = rpc(port, ADMIN, method).await;
         assert_eq!(status, 200, "{method} refused the admin token: {body}");
         assert!(
             body["result"].is_object(),
@@ -196,7 +204,7 @@ async fn a_peer_token_cannot_open_the_admin_surface() {
              nothing about the refusal half: {body}"
         );
 
-        let (_, refused) = rpc(18811, PEER, method).await;
+        let (_, refused) = rpc(port, PEER, method).await;
         assert!(
             refused["error"]["message"]
                 .as_str()
@@ -209,7 +217,7 @@ async fn a_peer_token_cannot_open_the_admin_surface() {
         );
     }
 
-    let (_, unknown) = rpc(18811, ADMIN, "admin/whatever").await;
+    let (_, unknown) = rpc(port, ADMIN, "admin/whatever").await;
     assert!(
         unknown["error"].is_object(),
         "an unlisted admin method must not be served: {unknown}"
@@ -220,11 +228,11 @@ async fn a_peer_token_cannot_open_the_admin_surface() {
 #[ignore]
 async fn the_panel_route_stays_shut_unless_it_is_switched_on() {
     let _env = ENV_GUARD.lock().await;
-    let _pool = daemon(18812, false, false).await;
+    let (_pool, port) = daemon(false, false).await;
     let client = reqwest::Client::new();
 
     let off = client
-        .get("http://127.0.0.1:18812/panel")
+        .get(format!("http://127.0.0.1:{port}/panel"))
         .send()
         .await
         .expect("the daemon answers");
@@ -236,7 +244,7 @@ async fn the_panel_route_stays_shut_unless_it_is_switched_on() {
     );
 
     let health = client
-        .get("http://127.0.0.1:18812/health")
+        .get(format!("http://127.0.0.1:{port}/health"))
         .send()
         .await
         .expect("health answers");
@@ -252,11 +260,11 @@ async fn the_panel_route_stays_shut_unless_it_is_switched_on() {
 #[ignore]
 async fn the_panel_refuses_a_request_that_arrived_through_a_tunnel() {
     let _env = ENV_GUARD.lock().await;
-    let _pool = daemon(18813, true, false).await;
+    let (_pool, port) = daemon(true, false).await;
     let client = reqwest::Client::new();
 
     let direct = client
-        .get("http://127.0.0.1:18813/panel")
+        .get(format!("http://127.0.0.1:{port}/panel"))
         .send()
         .await
         .expect("the daemon answers");
@@ -281,7 +289,7 @@ async fn the_panel_refuses_a_request_that_arrived_through_a_tunnel() {
 
     for header in memory_industry::http::FORWARDING_HEADERS {
         let forwarded = client
-            .get("http://127.0.0.1:18813/panel")
+            .get(format!("http://127.0.0.1:{port}/panel"))
             .header(header, "203.0.113.7")
             .send()
             .await

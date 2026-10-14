@@ -17,6 +17,7 @@
 //! so, and the manual check on the host covers the real bind.
 
 mod common;
+mod ephemeral;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -136,8 +137,9 @@ async fn wait_until_it_serves(port: u16, daemon: &tokio::task::JoinHandle<()>) {
         assert!(
             !daemon.is_finished(),
             "the daemon on 127.0.0.1:{port} ended before it served anything, so nothing below \
-             can run. serve_pool printed why it stopped; a port still held by an earlier run is \
-             the usual reason"
+             can run. serve_pool printed why it stopped; `already in use` there means the OS \
+             gave this port to another socket between `ephemeral::port()` and the bind, see \
+             tests/ephemeral/mod.rs"
         );
         match probe(&client, &url).await {
             Ok(()) => return,
@@ -153,9 +155,11 @@ async fn wait_until_it_serves(port: u16, daemon: &tokio::task::JoinHandle<()>) {
     );
 }
 
-/// Starts a daemon on `port` over `pool`. The caller holds `ENV_GUARD`: the daemon reads its
-/// environment once, at boot, and the environment is the process's, shared by every test here.
-async fn serve(port: u16, pool: PgPool, env: &[(&str, Option<&str>)]) {
+/// Starts a daemon over `pool` and returns the port it was given. The caller holds `ENV_GUARD`:
+/// the daemon reads its environment once, at boot, and the environment is the process's, shared
+/// by every test here. The same lock is what keeps two daemons of this binary from being handed
+/// one port between asking the OS and binding it.
+async fn serve(pool: PgPool, env: &[(&str, Option<&str>)]) -> u16 {
     captured_log();
     unsafe {
         std::env::set_var("CUBA_HTTP_TOKEN", SHARED);
@@ -192,18 +196,20 @@ async fn serve(port: u16, pool: PgPool, env: &[(&str, Option<&str>)]) {
             }
         }
     }
-    let addr = format!("127.0.0.1:{port}");
+    let port = ephemeral::port();
     let task = tokio::spawn(async move {
+        let addr = format!("127.0.0.1:{port}");
         if let Err(why) = memory_industry::http::serve_pool(&addr, pool, false).await {
             eprintln!("the daemon on 127.0.0.1:{port} stopped: {why:#}");
         }
     });
     wait_until_it_serves(port, &task).await;
+    port
 }
 
-async fn start(port: u16, pool: &PgPool) {
+async fn start(pool: &PgPool) -> u16 {
     let _env = ENV_GUARD.lock().await;
-    serve(port, pool.clone(), &[]).await;
+    serve(pool.clone(), &[]).await
 }
 
 // Migration 0041 runs `ALTER ROLE cuba_app`, a `pg_authid` row, global to the server. The product
@@ -476,14 +482,9 @@ async fn g1_identity_names_the_service_the_installation_and_a_label_and_nothing_
             .host_id;
 
         let _env = ENV_GUARD.lock().await;
-        serve(
-            18861,
-            pool.clone(),
-            &[("CUBA_NODE_NAME", Some("planta-madre"))],
-        )
-        .await;
+        let port = serve(pool.clone(), &[("CUBA_NODE_NAME", Some("planta-madre"))]).await;
 
-        let anonymous = identity(18861, "").await;
+        let anonymous = identity(port, "").await;
         assert_eq!(
             anonymous.status, 200,
             "a client that has never been paired asks who answers, so there is no credential to \
@@ -532,37 +533,30 @@ async fn g1_the_label_falls_back_to_the_machine_name_and_then_to_nothing() {
         let pool = migrated(&url_).await;
 
         let _env = ENV_GUARD.lock().await;
-        serve(
-            18862,
+        let first = serve(
             pool.clone(),
             &[("HOSTNAME", Some("hostname-g1")), ("COMPUTERNAME", None)],
         )
         .await;
         assert_eq!(
-            identity(18862, "").await.json()["name"],
+            identity(first, "").await.json()["name"],
             json!("hostname-g1"),
             "without CUBA_NODE_NAME the daemon says the name of the machine it runs on"
         );
 
-        serve(
-            18863,
+        let second = serve(
             pool.clone(),
             &[("HOSTNAME", None), ("COMPUTERNAME", Some("PC-LAB-G1"))],
         )
         .await;
         assert_eq!(
-            identity(18863, "").await.json()["name"],
+            identity(second, "").await.json()["name"],
             json!("PC-LAB-G1"),
             "and on Windows, where there is no HOSTNAME, COMPUTERNAME"
         );
 
-        serve(
-            18864,
-            pool.clone(),
-            &[("HOSTNAME", None), ("COMPUTERNAME", None)],
-        )
-        .await;
-        let nameless = identity(18864, "").await;
+        let third = serve(pool.clone(), &[("HOSTNAME", None), ("COMPUTERNAME", None)]).await;
+        let nameless = identity(third, "").await;
         assert_eq!(nameless.status, 200, "{}", nameless.body);
         assert_eq!(
             nameless.json()["name"],
@@ -592,11 +586,11 @@ async fn g2_g3_identity_proves_knowledge_of_an_active_credential_and_only_that()
         let (active, secret) = paired(&pool, "ana", None, "pc-1").await;
         let (to_revoke, _) = paired(&pool, "ana", None, "pc-2").await;
         let (of_bob, _) = paired(&pool, "bob", None, "pc-3").await;
-        start(18865, &pool).await;
+        let port = start(&pool).await;
 
         let nonce = random_bytes::<16>();
         let reply = identity(
-            18865,
+            port,
             &format!("?cred={}&nonce={}", active.simple(), hex::encode(nonce)),
         )
         .await;
@@ -621,7 +615,7 @@ async fn g2_g3_identity_proves_knowledge_of_an_active_credential_and_only_that()
 
         let other_nonce = random_bytes::<16>();
         let again = identity(
-            18865,
+            port,
             &format!(
                 "?cred={}&nonce={}",
                 active.simple(),
@@ -655,7 +649,7 @@ async fn g2_g3_identity_proves_knowledge_of_an_active_credential_and_only_that()
             ("a credential nobody ever issued", Uuid::new_v4(), "unknown"),
         ] {
             let reply = identity(
-                18865,
+                port,
                 &format!("?cred={}&nonce={}", id.simple(), hex::encode(nonce)),
             )
             .await;
@@ -688,7 +682,7 @@ async fn g2_g3_identity_proves_knowledge_of_an_active_credential_and_only_that()
                 format!("?cred={}&nonce={}", active.simple(), "z".repeat(32)),
             ),
         ] {
-            let reply = identity(18865, &query).await;
+            let reply = identity(port, &query).await;
             assert_eq!(reply.status, 400, "{why}: {}", reply.body);
             assert_eq!(
                 reply.json(),
@@ -712,11 +706,11 @@ async fn g4_pairing_creates_the_credential_and_the_host_proves_it_knew_the_code(
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
         let host_id = db::host_identity(&pool).await.expect("host identity").host_id;
-        start(18866, &pool).await;
+        let port = start(&pool).await;
 
         let code = issue(&pool, "ana", Some("pc-lab-1"), Utc::now()).await;
         let asked = ask(&code, "mi-pc");
-        let reply = pair(18866, &asked.request).await;
+        let reply = pair(port, &asked.request).await;
 
         assert_eq!(reply.status, 200, "a valid code must pair: {}", reply.body);
         let response: PairResponse = serde_json::from_str(&reply.body).expect("a PairResponse");
@@ -783,7 +777,7 @@ async fn g4_pairing_creates_the_credential_and_the_host_proves_it_knew_the_code(
         }
 
         let free_code = issue(&pool, "ana", None, Utc::now()).await;
-        let free = pair(18866, &ask(&free_code, "mi-pc").request).await;
+        let free = pair(port, &ask(&free_code, "mi-pc").request).await;
         assert_eq!(free.status, 200, "{}", free.body);
         assert_eq!(
             serde_json::from_str::<PairResponse>(&free.body)
@@ -864,7 +858,7 @@ async fn g5_every_pairing_failure_looks_the_same_from_outside_and_differs_inside
     in_a_scratch_database("brain_g_oracle", |url_| async move {
         let pool = migrated(&url_).await;
         let failures = five_ways_to_fail(&pool).await;
-        start(18867, &pool).await;
+        let port = start(&pool).await;
         let log_before = log_text().len();
 
         let sent = [
@@ -885,7 +879,7 @@ async fn g5_every_pairing_failure_looks_the_same_from_outside_and_differs_inside
         ];
         let mut replies = Vec::new();
         for (why, request) in &sent {
-            let reply = pair(18867, request).await;
+            let reply = pair(port, request).await;
             assert_eq!(reply.status, 401, "{why}: {}", reply.body);
             replies.push((*why, reply));
         }
@@ -980,7 +974,7 @@ async fn g5_malformed_requests_are_a_400_that_is_not_a_pairing_failure() {
     in_a_scratch_database("brain_g_malformed", |url_| async move {
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
-        start(18868, &pool).await;
+        let port = start(&pool).await;
         let code = issue(&pool, "ana", None, Utc::now()).await;
         let good = ask(&code, "pc").request;
 
@@ -997,7 +991,7 @@ async fn g5_malformed_requests_are_a_400_that_is_not_a_pairing_failure() {
         let mut cases: Vec<(&str, reqwest::RequestBuilder)> = vec![(
             "a body that is not JSON",
             client
-                .post(url(18868, "/pair"))
+                .post(url(port, "/pair"))
                 .header("content-type", "application/json")
                 .body("this is not json"),
         )];
@@ -1007,7 +1001,7 @@ async fn g5_malformed_requests_are_a_400_that_is_not_a_pairing_failure() {
             ("a MAC of 62 hex digits", &short_mac),
             ("a MAC in upper case", &upper_mac),
         ] {
-            cases.push((why, client.post(url(18868, "/pair")).json(request)));
+            cases.push((why, client.post(url(port, "/pair")).json(request)));
         }
         for (why, request) in cases {
             let reply = send(request).await;
@@ -1208,7 +1202,7 @@ async fn g6_failures_of_pair_and_of_mcp_add_up_in_one_counter_and_identity_adds_
     in_a_scratch_database("brain_g_shared_brake", |url_| async move {
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
-        start(18869, &pool).await;
+        let port = start(&pool).await;
         let code = issue(&pool, "ana", None, Utc::now()).await;
         let asked = ask(&code, "pc");
 
@@ -1218,10 +1212,10 @@ async fn g6_failures_of_pair_and_of_mcp_add_up_in_one_counter_and_identity_adds_
             hex::encode([0u8; 16])
         );
         for _ in 0..15 {
-            let reply = identity(18869, &nobody).await;
+            let reply = identity(port, &nobody).await;
             assert_eq!(reply.status, 200, "{}", reply.body);
         }
-        let clears = mcp(18869, Some(SHARED), ping()).await;
+        let clears = mcp(port, Some(SHARED), ping()).await;
         assert_eq!(
             clears.status, 200,
             "fifteen questions to /identity about credentials nobody has are not failures: \
@@ -1231,13 +1225,13 @@ async fn g6_failures_of_pair_and_of_mcp_add_up_in_one_counter_and_identity_adds_
         );
 
         for _ in 0..5 {
-            assert_eq!(pair(18869, &asked.with_a_bad_mac()).await.status, 401);
+            assert_eq!(pair(port, &asked.with_a_bad_mac()).await.status, 401);
         }
         for _ in 0..5 {
-            assert_eq!(mcp(18869, Some("not-the-token"), ping()).await.status, 401);
+            assert_eq!(mcp(port, Some("not-the-token"), ping()).await.status, 401);
         }
 
-        let braked_mcp = mcp(18869, Some(SHARED), ping()).await;
+        let braked_mcp = mcp(port, Some(SHARED), ping()).await;
         assert_eq!(
             braked_mcp.status, 429,
             "five bad pairing requests and five bad tokens are ten failures from one address, \
@@ -1252,7 +1246,7 @@ async fn g6_failures_of_pair_and_of_mcp_add_up_in_one_counter_and_identity_adds_
             .expect("a 429 says how long to wait");
         assert!((1..=60).contains(&wait), "Retry-After: {wait}");
 
-        let braked_pair = pair(18869, &asked.request).await;
+        let braked_pair = pair(port, &asked.request).await;
         assert_eq!(
             braked_pair.status, 429,
             "and the same counter brakes /pair, even with the right code: {}",
@@ -1278,12 +1272,12 @@ async fn g7_the_same_pairing_request_twice_gives_the_same_credential_once() {
     in_a_scratch_database("brain_g_replay", |url_| async move {
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
-        start(18870, &pool).await;
+        let port = start(&pool).await;
         let code = issue(&pool, "ana", None, Utc::now()).await;
         let asked = ask(&code, "pc");
 
-        let first = pair(18870, &asked.request).await;
-        let second = pair(18870, &asked.request).await;
+        let first = pair(port, &asked.request).await;
+        let second = pair(port, &asked.request).await;
 
         assert_eq!(first.status, 200, "{}", first.body);
         assert_eq!(
@@ -1309,7 +1303,7 @@ async fn g7_the_same_pairing_request_twice_gives_the_same_credential_once() {
             "asking twice must not mint two credentials from one code"
         );
 
-        let someone_else = pair(18870, &ask_with(&code, "pc", Secret::generate()).request).await;
+        let someone_else = pair(port, &ask_with(&code, "pc", Secret::generate()).request).await;
         assert_eq!(
             someone_else.status, 401,
             "but a different device presenting the same code, with a different secret, is a \
@@ -1330,7 +1324,7 @@ async fn g8_identity_and_pair_refuse_proxies_foreign_pages_and_big_bodies() {
     in_a_scratch_database("brain_g_doors", |url_| async move {
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
-        start(18871, &pool).await;
+        let port = start(&pool).await;
         let code = issue(&pool, "ana", None, Utc::now()).await;
         let asked = ask(&code, "pc");
         let client = reqwest::Client::new();
@@ -1338,7 +1332,7 @@ async fn g8_identity_and_pair_refuse_proxies_foreign_pages_and_big_bodies() {
         for header in memory_industry::http::FORWARDING_HEADERS {
             let identity_through = send(
                 client
-                    .get(url(18871, "/identity"))
+                    .get(url(port, "/identity"))
                     .header(header, "203.0.113.7"),
             )
             .await;
@@ -1350,7 +1344,7 @@ async fn g8_identity_and_pair_refuse_proxies_foreign_pages_and_big_bodies() {
             );
             let pair_through = send(
                 client
-                    .post(url(18871, "/pair"))
+                    .post(url(port, "/pair"))
                     .header(header, "203.0.113.7")
                     .json(&asked.request),
             )
@@ -1366,13 +1360,13 @@ async fn g8_identity_and_pair_refuse_proxies_foreign_pages_and_big_bodies() {
             (
                 "/identity",
                 client
-                    .get(url(18871, "/identity"))
+                    .get(url(port, "/identity"))
                     .header("origin", "https://malo.example"),
             ),
             (
                 "/pair",
                 client
-                    .post(url(18871, "/pair"))
+                    .post(url(port, "/pair"))
                     .header("origin", "https://malo.example")
                     .json(&asked.request),
             ),
@@ -1388,8 +1382,8 @@ async fn g8_identity_and_pair_refuse_proxies_foreign_pages_and_big_bodies() {
         assert_eq!(
             send(
                 client
-                    .get(url(18871, "/identity"))
-                    .header("origin", "http://127.0.0.1:18871")
+                    .get(url(port, "/identity"))
+                    .header("origin", format!("http://127.0.0.1:{port}"))
             )
             .await
             .status,
@@ -1399,7 +1393,7 @@ async fn g8_identity_and_pair_refuse_proxies_foreign_pages_and_big_bodies() {
 
         let at_the_limit = send(
             client
-                .post(url(18871, "/pair"))
+                .post(url(port, "/pair"))
                 .header("content-type", "application/json")
                 .body(vec![b' '; 4096]),
         )
@@ -1412,7 +1406,7 @@ async fn g8_identity_and_pair_refuse_proxies_foreign_pages_and_big_bodies() {
         );
         let over_the_limit = send(
             client
-                .post(url(18871, "/pair"))
+                .post(url(port, "/pair"))
                 .header("content-type", "application/json")
                 .body(vec![b' '; 4097]),
         )
@@ -1424,7 +1418,7 @@ async fn g8_identity_and_pair_refuse_proxies_foreign_pages_and_big_bodies() {
              anyone on the LAN"
         );
 
-        let control = pair(18871, &asked.request).await;
+        let control = pair(port, &asked.request).await;
         assert_eq!(
             control.status, 200,
             "control: every refusal above happened before the code was looked at, so the same \
@@ -1447,9 +1441,9 @@ async fn g9_an_account_credential_is_a_full_scope_caller_who_is_named_in_whoami(
         account(&pool, "ana").await;
         let (id, secret) = paired(&pool, "ana", None, "pc-lab-1").await;
         let bearer = bearer_of(id, &secret);
-        start(18872, &pool).await;
+        let port = start(&pool).await;
 
-        let named = whoami(18872, &bearer).await;
+        let named = whoami(port, &bearer).await;
         assert_eq!(
             named["scope"],
             json!("full"),
@@ -1459,7 +1453,7 @@ async fn g9_an_account_credential_is_a_full_scope_caller_who_is_named_in_whoami(
         assert_eq!(named["account"], json!("ana"), "{named}");
         assert_eq!(named["device"], json!("pc-lab-1"), "{named}");
 
-        let legacy = whoami(18872, SHARED).await;
+        let legacy = whoami(port, SHARED).await;
         assert_eq!(legacy["scope"], json!("full"));
         assert_eq!(legacy["server"], json!("MemoryIndustry"));
         assert!(
@@ -1472,7 +1466,7 @@ async fn g9_an_account_credential_is_a_full_scope_caller_who_is_named_in_whoami(
         let client = reqwest::Client::new();
         let ticket = send(
             client
-                .post(url(18872, "/events/ticket"))
+                .post(url(port, "/events/ticket"))
                 .bearer_auth(&bearer),
         )
         .await;
@@ -1484,7 +1478,7 @@ async fn g9_an_account_credential_is_a_full_scope_caller_who_is_named_in_whoami(
         );
 
         let stream = client
-            .get(url(18872, "/events"))
+            .get(url(port, "/events"))
             .bearer_auth(&bearer)
             .send()
             .await
@@ -1500,7 +1494,7 @@ async fn g9_an_account_credential_is_a_full_scope_caller_who_is_named_in_whoami(
         );
         drop(stream);
         let refused = client
-            .get(url(18872, "/events"))
+            .get(url(port, "/events"))
             .bearer_auth(bearer_of(id, &Secret::generate()))
             .send()
             .await
@@ -1511,7 +1505,7 @@ async fn g9_an_account_credential_is_a_full_scope_caller_who_is_named_in_whoami(
             "control: the right id with the wrong secret does not open /events"
         );
 
-        let full = send(client.get(url(18872, "/health")).bearer_auth(&bearer))
+        let full = send(client.get(url(port, "/health")).bearer_auth(&bearer))
             .await
             .json();
         assert!(
@@ -1519,7 +1513,7 @@ async fn g9_an_account_credential_is_a_full_scope_caller_who_is_named_in_whoami(
             "/health gives a paired device the full view, as it gives it to the shared token: \
              {full}"
         );
-        let anonymous = send(client.get(url(18872, "/health"))).await.json();
+        let anonymous = send(client.get(url(port, "/health"))).await.json();
         assert!(
             anonymous.get("runtime").is_none() && anonymous.get("clients_count").is_some(),
             "control: with no credential the view is the limited one: {anonymous}"
@@ -1547,11 +1541,11 @@ async fn g10_a_revoked_device_or_account_stops_on_the_very_next_request() {
             bearer_of(second, &second_secret),
             bearer_of(third, &third_secret),
         );
-        start(18873, &pool).await;
+        let port = start(&pool).await;
 
         for (who, bearer) in [("pc-1", &first), ("pc-2", &second), ("pc-3", &third)] {
             assert_eq!(
-                mcp(18873, Some(bearer), ping()).await.status,
+                mcp(port, Some(bearer), ping()).await.status,
                 200,
                 "{who} is admitted before anything is revoked"
             );
@@ -1560,7 +1554,7 @@ async fn g10_a_revoked_device_or_account_stops_on_the_very_next_request() {
         db::revoke_device(&pool, "ana", "PC-1", Utc::now())
             .await
             .expect("revoking a device");
-        let stopped = mcp(18873, Some(&first), ping()).await;
+        let stopped = mcp(port, Some(&first), ping()).await;
         assert_eq!(
             stopped.status, 401,
             "no pause, no restart: the request after the revocation is the one that finds out. \
@@ -1573,17 +1567,17 @@ async fn g10_a_revoked_device_or_account_stops_on_the_very_next_request() {
             "and it reads like any wrong token, so a revoked device learns nothing about why"
         );
         assert_eq!(
-            mcp(18873, Some(&second), ping()).await.status,
+            mcp(port, Some(&second), ping()).await.status,
             200,
             "revoking one device leaves the account's other device alone"
         );
-        assert_eq!(mcp(18873, Some(&third), ping()).await.status, 200);
+        assert_eq!(mcp(port, Some(&third), ping()).await.status, 200);
 
         db::revoke_account(&pool, "bob", Utc::now())
             .await
             .expect("revoking an account");
         assert_eq!(
-            mcp(18873, Some(&third), ping()).await.status,
+            mcp(port, Some(&third), ping()).await.status,
             401,
             "revoking an account stops its devices on the next request too"
         );
@@ -1591,7 +1585,7 @@ async fn g10_a_revoked_device_or_account_stops_on_the_very_next_request() {
             .await
             .expect("revoking an account");
         assert_eq!(
-            mcp(18873, Some(&second), ping()).await.status,
+            mcp(port, Some(&second), ping()).await.status,
             401,
             "and the device that survived the first revocation falls with its account"
         );
@@ -1611,10 +1605,10 @@ async fn g11_every_kind_of_bad_credential_is_a_401_that_counts_toward_the_brake(
         account(&pool, "ana").await;
         let (id, secret) = paired(&pool, "ana", None, "pc-1").await;
         let good = bearer_of(id, &secret);
-        start(18874, &pool).await;
+        let port = start(&pool).await;
 
         assert_eq!(
-            mcp(18874, Some(&good), ping()).await.status,
+            mcp(port, Some(&good), ping()).await.status,
             200,
             "control: the credential is good before anyone tampers with it, so the refusals \
              below are about the tampering and not about a credential that never worked"
@@ -1633,7 +1627,7 @@ async fn g11_every_kind_of_bad_credential_is_a_401_that_counts_toward_the_brake(
             ),
         ] {
             for _ in 0..times {
-                let reply = mcp(18874, Some(bearer), ping()).await;
+                let reply = mcp(port, Some(bearer), ping()).await;
                 assert_eq!(reply.status, 401, "{why}: {}", reply.body);
                 assert_eq!(reply.error_message(), "invalid bearer token", "{why}");
                 sent += 1;
@@ -1641,7 +1635,7 @@ async fn g11_every_kind_of_bad_credential_is_a_401_that_counts_toward_the_brake(
         }
         assert_eq!(sent, 10, "the three kinds add up to the limit");
 
-        let braked = mcp(18874, Some(&good), ping()).await;
+        let braked = mcp(port, Some(&good), ping()).await;
         assert_eq!(
             braked.status, 429,
             "ten failures of the three kinds from one address brake the eleventh request even \
@@ -1662,14 +1656,13 @@ async fn g12_a_loopback_daemon_ignores_the_knob_and_says_so() {
     in_a_scratch_database("brain_g_loopback_knob", |url_| async move {
         let pool = migrated(&url_).await;
         let _env = ENV_GUARD.lock().await;
-        serve(
-            18875,
+        let port = serve(
             pool.clone(),
             &[("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS", Some("1"))],
         )
         .await;
 
-        let reply = mcp(18875, Some(SHARED), ping()).await;
+        let reply = mcp(port, Some(SHARED), ping()).await;
         assert_eq!(
             reply.status, 200,
             "on a loopback bind the shared token is the only way in, so a knob that closed it \
@@ -1717,14 +1710,14 @@ async fn g13_a_credential_cannot_be_checked_without_the_database_and_that_is_a_5
             "postgres://nobody:nothing@127.0.0.1:{silent_port}/none"
         ))
         .expect("a lazy pool never connects, so building one cannot fail");
-    {
+    let port = {
         let _env = ENV_GUARD.lock().await;
-        serve(18876, pool, &[]).await;
-    }
+        serve(pool, &[]).await
+    };
 
     let credential = bearer_of(Uuid::new_v4(), &Secret::generate());
     let started = Instant::now();
-    let reply = mcp(18876, Some(&credential), ping()).await;
+    let reply = mcp(port, Some(&credential), ping()).await;
     assert_eq!(
         reply.status, 503,
         "a credential that cannot be checked is not a wrong credential: answering 401 would \
@@ -1745,20 +1738,20 @@ async fn g13_a_credential_cannot_be_checked_without_the_database_and_that_is_a_5
     );
 
     let burst: Vec<Reply> =
-        futures::future::join_all((0..11).map(|_| mcp(18876, Some(&credential), ping()))).await;
+        futures::future::join_all((0..11).map(|_| mcp(port, Some(&credential), ping()))).await;
     assert!(
         burst.iter().all(|r| r.status == 503),
         "eleven more, at once, all 503: {:?}",
         burst.iter().map(|r| r.status).collect::<Vec<_>>()
     );
-    let after = mcp(18876, Some(&credential), ping()).await;
+    let after = mcp(port, Some(&credential), ping()).await;
     assert_eq!(
         after.status, 503,
         "twelve unverifiable requests did not turn into a 429: the daemon's own outage is not \
          the client's failure and must not lock it out when the database comes back"
     );
 
-    let shared = mcp(18876, Some(SHARED), ping()).await;
+    let shared = mcp(port, Some(SHARED), ping()).await;
     assert_eq!(
         shared.status, 200,
         "the shared token never touches the database to be admitted, so a database outage does \
@@ -1778,14 +1771,14 @@ async fn g14_the_failure_log_and_the_log_lines_name_the_account_and_never_the_cr
         account(&pool, "ina-g14").await;
         let (id, secret) = paired(&pool, "ina-g14", None, "pc-lab-1").await;
         let bearer = bearer_of(id, &secret);
-        start(18877, &pool).await;
+        let port = start(&pool).await;
 
         let failing = tool_call("cuba_archivo", json!({"action": "nope"}));
-        let legacy_failure = mcp(18877, Some(SHARED), failing.clone()).await;
+        let legacy_failure = mcp(port, Some(SHARED), failing.clone()).await;
         assert_eq!(legacy_failure.status, 200, "{}", legacy_failure.body);
-        let failure = mcp(18877, Some(&bearer), failing).await;
+        let failure = mcp(port, Some(&bearer), failing).await;
         assert_eq!(failure.status, 200, "{}", failure.body);
-        whoami(18877, &bearer).await;
+        whoami(port, &bearer).await;
 
         let accounts: Vec<Option<String>> = sqlx::query_scalar(
             "SELECT account FROM brain_handler_failures WHERE tool = 'cuba_archivo' \
@@ -1852,14 +1845,14 @@ async fn g15_last_seen_is_written_by_the_first_request_and_not_by_every_one() {
         account(&pool, "ana").await;
         let (id, secret) = paired(&pool, "ana", None, "pc-1").await;
         let bearer = bearer_of(id, &secret);
-        start(18878, &pool).await;
+        let port = start(&pool).await;
         assert_eq!(
             last_seen(&pool, id).await,
             None,
             "control: a device that never connected has never been seen"
         );
 
-        assert_eq!(mcp(18878, Some(&bearer), ping()).await.status, 200);
+        assert_eq!(mcp(port, Some(&bearer), ping()).await.status, 200);
         let deadline = Instant::now() + Duration::from_secs(5);
         let first = loop {
             if let Some(seen) = last_seen(&pool, id).await {
@@ -1874,7 +1867,7 @@ async fn g15_last_seen_is_written_by_the_first_request_and_not_by_every_one() {
         };
 
         for _ in 0..5 {
-            assert_eq!(mcp(18878, Some(&bearer), ping()).await.status, 200);
+            assert_eq!(mcp(port, Some(&bearer), ping()).await.status, 200);
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(

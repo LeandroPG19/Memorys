@@ -3,11 +3,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-const SYNC_DIR_LOCK: i64 = 0x0CBA_A0D1_7106_0027;
+// The port of the peer daemon, asked of the OS.
+mod ephemeral;
 
-/// One place owns the port, so the daemon, the address it is announced at and
-/// the URL the fetch is pointed at cannot drift apart.
-const PEER_ADDR: &str = "127.0.0.1:18797";
+const SYNC_DIR_LOCK: i64 = 0x0CBA_A0D1_7106_0027;
 
 /// The peer's own ceiling on loading models before it opens for business.
 ///
@@ -112,8 +111,11 @@ async fn probe(client: &reqwest::Client, url: &str) -> Result<String, String> {
 /// waiting on it would fail a peer that was working. `ready` is still worth
 /// carrying into the failure message of whatever fails next, which is why this
 /// returns it instead of dropping it.
-async fn wait_until_the_peer_serves(daemon: &tokio::task::JoinHandle<()>) -> String {
-    let url = format!("http://{PEER_ADDR}/health");
+async fn wait_until_the_peer_serves(
+    daemon: &tokio::task::JoinHandle<()>,
+    peer_addr: &str,
+) -> String {
+    let url = format!("http://{peer_addr}/health");
     let client = reqwest::Client::builder()
         .timeout(PROBE_BUDGET)
         .build()
@@ -128,9 +130,10 @@ async fn wait_until_the_peer_serves(daemon: &tokio::task::JoinHandle<()>) -> Str
     while Instant::now() < deadline {
         assert!(
             !daemon.is_finished(),
-            "the peer daemon on {PEER_ADDR} ended before it served anything, so nothing below \
+            "the peer daemon on {peer_addr} ended before it served anything, so nothing below \
              can run. serve_pool printed why it stopped — with --nocapture that line is just \
-             above this one; the port still held by an earlier run is the usual reason"
+             above this one; `already in use` there means the OS gave this port to another \
+             socket between `ephemeral::port()` and the bind, see tests/ephemeral/mod.rs"
         );
 
         probes += 1;
@@ -187,7 +190,6 @@ async fn what_one_machine_learns_offline_reaches_the_other_when_the_link_comes_b
         std::env::set_var("CUBA_SYNC_DIR", &bundle);
         std::env::set_var("CUBA_PEER_TOKEN", "two-node-secret");
         std::env::set_var("CUBA_HTTP_TOKEN", "admin-secret-that-differs");
-        std::env::set_var("CUBA_HTTP_ADDR", PEER_ADDR);
         std::env::set_var(
             "MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS",
             PEER_WARM_CEILING.as_secs().to_string(),
@@ -223,15 +225,20 @@ async fn what_one_machine_learns_offline_reaches_the_other_when_the_link_comes_b
         .expect("seed the observation");
 
     let served = remote.clone();
+    let peer_addr = format!("127.0.0.1:{}", ephemeral::port());
+    unsafe {
+        std::env::set_var("CUBA_HTTP_ADDR", &peer_addr);
+    }
+    let addr = peer_addr.clone();
     let daemon = tokio::spawn(async move {
         // Printed rather than dropped: when it is the bind that failed, the
         // readiness probe below only ever sees a refused connection, and the
         // sentence naming the cause lives in this Err and nowhere else.
-        if let Err(why) = memory_industry::http::serve_pool(PEER_ADDR, served, true).await {
-            eprintln!("the peer daemon on {PEER_ADDR} stopped: {why:#}");
+        if let Err(why) = memory_industry::http::serve_pool(&addr, served, true).await {
+            eprintln!("the peer daemon on {addr} stopped: {why:#}");
         }
     });
-    let peer = wait_until_the_peer_serves(&daemon).await;
+    let peer = wait_until_the_peer_serves(&daemon, &peer_addr).await;
 
     let before: i64 =
         sqlx::query_scalar("SELECT count(*) FROM brain_observations WHERE content LIKE $1")
@@ -252,7 +259,7 @@ async fn what_one_machine_learns_offline_reaches_the_other_when_the_link_comes_b
         json!({
             "action": "fetch",
             "peer": "the-other-one",
-            "url": format!("http://{PEER_ADDR}"),
+            "url": format!("http://{peer_addr}"),
             "conflict": "skip"
         }),
     )
@@ -291,7 +298,9 @@ async fn what_one_machine_learns_offline_reaches_the_other_when_the_link_comes_b
          Got: {again}"
     );
     assert!(
-        again["url"].as_str().is_some_and(|u| u.contains("18797")),
+        again["url"]
+            .as_str()
+            .is_some_and(|u| u.contains(&peer_addr)),
         "and the address has to be remembered, or every fetch needs it spelled out again: \
          {again}"
     );

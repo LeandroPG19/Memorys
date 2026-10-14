@@ -6,8 +6,8 @@
 //!
 //! `DATABASE_URL` names the server. Every database written here is one this file creates and
 //! drops (`common::in_a_scratch_database`); the database the URL itself points at is never
-//! touched. One daemon per test (two where the scenario needs two), each on its own port in
-//! 18880..=18891, each over its own scratch database, so the per-address brake of one test is
+//! touched. One daemon per test (two where the scenario needs two), each on a port the OS
+//! picks, each over its own scratch database, so the per-address brake of one test is
 //! never the brake of another.
 //!
 //! What stands in for the outside world, and why:
@@ -23,6 +23,7 @@
 //! behind the shared token and over an empty scratch database, and stops it at the end.
 
 mod common;
+mod ephemeral;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -54,19 +55,6 @@ use uuid::Uuid;
 
 const SHARED: &str = "j-shared-token-for-the-lan-0123456789ab";
 const PEER: &str = "j-peer-token-for-the-other-machine-0123";
-
-const J1_PORT: u16 = 18880;
-const J2_PORT: u16 = 18881;
-const J3_PORT: u16 = 18882;
-const J4_MOVED_FIRST: u16 = 18883;
-const J4_MOVED_SECOND: u16 = 18884;
-const J4_PINNED_HOST: u16 = 18885;
-const J4_OTHER_HOST: u16 = 18886;
-const J5_KNOB_ON: u16 = 18887;
-const J5_KNOB_OFF: u16 = 18888;
-const J6_PORT: u16 = 18889;
-const J7_PORT: u16 = 18890;
-const J2B_PORT: u16 = 18891;
 
 const LOOPBACK: &str = "127.0.0.1";
 const EVERY_INTERFACE: &str = "0.0.0.0";
@@ -106,6 +94,7 @@ static ENV_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// be released.
 struct Daemon {
     task: JoinHandle<()>,
+    port: u16,
 }
 
 impl Daemon {
@@ -137,8 +126,9 @@ async fn wait_until_it_serves(port: u16, daemon: &JoinHandle<()>) {
         assert!(
             !daemon.is_finished(),
             "the daemon on port {port} ended before it served anything, so nothing below can \
-             run. serve_pool printed why it stopped; a port still held by an earlier run is the \
-             usual reason"
+             run. serve_pool printed why it stopped; `already in use` there means the OS gave \
+             this port to another socket between `ephemeral::port()` and the bind, see \
+             tests/ephemeral/mod.rs"
         );
         match client.get(&url).send().await {
             Ok(_) => return,
@@ -154,14 +144,11 @@ async fn wait_until_it_serves(port: u16, daemon: &JoinHandle<()>) {
     );
 }
 
-/// Starts a daemon bound to `bind:port` over `pool`. The environment is the process's and the
-/// daemon reads it once, at boot, so the guard is held until the port answers.
-async fn start_daemon(
-    bind: &str,
-    port: u16,
-    pool: &PgPool,
-    env: &[(&str, Option<&str>)],
-) -> Daemon {
+/// Starts a daemon bound to `bind` on a port the OS picks, over `pool`. The environment is the
+/// process's and the daemon reads it once, at boot, so the guard is held until the port answers;
+/// the same guard keeps two daemons of this binary from being handed one port between asking the
+/// OS and binding it.
+async fn start_daemon(bind: &str, pool: &PgPool, env: &[(&str, Option<&str>)]) -> Daemon {
     let _env = ENV_GUARD.lock().await;
     unsafe {
         std::env::set_var("CUBA_HTTP_TOKEN", SHARED);
@@ -185,15 +172,16 @@ async fn start_daemon(
             }
         }
     }
-    let addr = format!("{bind}:{port}");
     let pool = pool.clone();
+    let port = ephemeral::port();
+    let addr = format!("{bind}:{port}");
     let task = tokio::spawn(async move {
         if let Err(why) = memory_industry::http::serve_pool(&addr, pool, false).await {
             eprintln!("the daemon on {addr} stopped: {why:#}");
         }
     });
     wait_until_it_serves(port, &task).await;
-    Daemon { task }
+    Daemon { task, port }
 }
 
 async fn migrated(url: &str) -> PgPool {
@@ -574,10 +562,10 @@ async fn j1_a_client_with_no_credential_is_named_by_the_daemon_through_the_bridg
     in_a_scratch_database("brain_j_whole", |url_| async move {
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
-        let daemon = start_daemon(LOOPBACK, J1_PORT, &pool, &[]).await;
+        let daemon = start_daemon(LOOPBACK, &pool, &[]).await;
         let scratch = Scratch::new();
 
-        let state = paired_state(&pool, J1_PORT, "ana", "pc-lab-1").await;
+        let state = paired_state(&pool, daemon.port, "ana", "pc-lab-1").await;
         let secret = state.secret.to_hex();
         let credential = state.credential_id.simple().to_string();
         save(&scratch.state_path(), &state);
@@ -608,7 +596,7 @@ async fn j1_a_client_with_no_credential_is_named_by_the_daemon_through_the_bridg
             )),
             "anchor: the client config points at the bridge's port: {written}"
         );
-        let daemon_port = J1_PORT.to_string();
+        let daemon_port = daemon.port.to_string();
         for hidden in [
             secret.as_str(),
             credential.as_str(),
@@ -640,11 +628,11 @@ async fn j2_a_revoked_device_is_told_to_pair_again_and_the_bridge_stops_asking()
     in_a_scratch_database("brain_j_revoke", |url_| async move {
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
-        let daemon = start_daemon(LOOPBACK, J2_PORT, &pool, &[]).await;
+        let daemon = start_daemon(LOOPBACK, &pool, &[]).await;
         let scratch = Scratch::new();
         let clock = JumpClock::new();
 
-        let state = paired_state(&pool, J2_PORT, "ana", "pc-lab-1").await;
+        let state = paired_state(&pool, daemon.port, "ana", "pc-lab-1").await;
         save(&scratch.state_path(), &state);
         let bridge = open_bridge(&scratch.state_path(), &clock, Some(0)).await;
         assert_named(
@@ -675,7 +663,7 @@ async fn j2_a_revoked_device_is_told_to_pair_again_and_the_bridge_stops_asking()
             );
         }
 
-        let recorded = failures_the_daemon_recorded(J2_PORT).await;
+        let recorded = failures_the_daemon_recorded(daemon.port).await;
         assert!(
             recorded <= 1,
             "five calls from a revoked device left {recorded} refused credentials on the \
@@ -699,11 +687,11 @@ async fn j2b_a_revoked_device_is_cut_at_its_next_call_without_waiting_for_the_wi
     in_a_scratch_database("brain_j_revoke_now", |url_| async move {
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
-        let daemon = start_daemon(LOOPBACK, J2B_PORT, &pool, &[]).await;
+        let daemon = start_daemon(LOOPBACK, &pool, &[]).await;
         let scratch = Scratch::new();
         let clock = JumpClock::new();
 
-        let state = paired_state(&pool, J2B_PORT, "ana", "pc-lab-1").await;
+        let state = paired_state(&pool, daemon.port, "ana", "pc-lab-1").await;
         save(&scratch.state_path(), &state);
         let bridge = open_bridge(&scratch.state_path(), &clock, Some(0)).await;
         assert_named(
@@ -740,7 +728,7 @@ async fn j2b_a_revoked_device_is_cut_at_its_next_call_without_waiting_for_the_wi
             );
         }
 
-        let recorded = failures_the_daemon_recorded(J2B_PORT).await;
+        let recorded = failures_the_daemon_recorded(daemon.port).await;
         assert!(
             recorded <= 1,
             "five calls from a revoked device left {recorded} refused credentials on the \
@@ -762,7 +750,8 @@ async fn j2b_a_revoked_device_is_cut_at_its_next_call_without_waiting_for_the_wi
 async fn j3_two_bridges_racing_for_one_code_leave_exactly_one_credential() {
     in_a_scratch_database("brain_j_race", |url_| async move {
         let pool = migrated(&url_).await;
-        let daemon = start_daemon(LOOPBACK, J3_PORT, &pool, &[]).await;
+        let daemon = start_daemon(LOOPBACK, &pool, &[]).await;
+        let port = daemon.port;
 
         for round in 0..ROUNDS_OF_THE_RACE {
             let name = format!("ana-{round}");
@@ -775,7 +764,7 @@ async fn j3_two_bridges_racing_for_one_code_leave_exactly_one_credential() {
                     let (start_line, code) = (start_line.clone(), code.clone());
                     tokio::spawn(async move {
                         start_line.wait().await;
-                        pair_against(J3_PORT, &code, label).await
+                        pair_against(port, &code, label).await
                     })
                 })
                 .collect();
@@ -828,13 +817,14 @@ async fn j4_when_the_first_daemon_goes_away_the_bridge_finds_the_second_and_reme
     in_a_scratch_database("brain_j_moved", |url_| async move {
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
-        let first = start_daemon(LOOPBACK, J4_MOVED_FIRST, &pool, &[]).await;
-        let second = start_daemon(LOOPBACK, J4_MOVED_SECOND, &pool, &[]).await;
+        let first = start_daemon(LOOPBACK, &pool, &[]).await;
+        let second = start_daemon(LOOPBACK, &pool, &[]).await;
+        let (first_port, second_port) = (first.port, second.port);
         let scratch = Scratch::new();
 
-        let mut state = paired_state(&pool, J4_MOVED_FIRST, "ana", "pc-lab-1").await;
-        state.addresses = vec![addr_of(J4_MOVED_FIRST), addr_of(J4_MOVED_SECOND)];
-        state.last_good = Some(addr_of(J4_MOVED_FIRST));
+        let mut state = paired_state(&pool, first_port, "ana", "pc-lab-1").await;
+        state.addresses = vec![addr_of(first_port), addr_of(second_port)];
+        state.last_good = Some(addr_of(first_port));
         save(&scratch.state_path(), &state);
         let bridge = open_bridge(&scratch.state_path(), &JumpClock::new(), Some(0)).await;
         assert_named(
@@ -845,7 +835,7 @@ async fn j4_when_the_first_daemon_goes_away_the_bridge_finds_the_second_and_reme
 
         first.stop().await;
         assert!(
-            refuses_connections(addr_of(J4_MOVED_FIRST)).await,
+            refuses_connections(addr_of(first_port)).await,
             "anchor: the first daemon must really be gone, or the call below proves nothing"
         );
 
@@ -861,7 +851,7 @@ async fn j4_when_the_first_daemon_goes_away_the_bridge_finds_the_second_and_reme
             .expect("bridge.json exists");
         assert_eq!(
             healed.last_good,
-            Some(addr_of(J4_MOVED_SECOND)),
+            Some(addr_of(second_port)),
             "the address that answered is written down, so the next start does not begin by \
              asking a dead one"
         );
@@ -888,12 +878,12 @@ async fn j4_a_daemon_with_another_database_is_refused_with_both_fingerprints_and
                 "anchor: two databases are two installations, each with its own host id"
             );
             account(&pinned_pool, "ana").await;
-            let pinned_host = start_daemon(LOOPBACK, J4_PINNED_HOST, &pinned_pool, &[]).await;
-            let other_host = start_daemon(LOOPBACK, J4_OTHER_HOST, &other_pool, &[]).await;
+            let pinned_host = start_daemon(LOOPBACK, &pinned_pool, &[]).await;
+            let other_host = start_daemon(LOOPBACK, &other_pool, &[]).await;
             let scratch = Scratch::new();
 
-            let mut state = paired_state(&pinned_pool, J4_PINNED_HOST, "ana", "pc-lab-1").await;
-            let relay = Relay::in_front_of(addr_of(J4_OTHER_HOST)).await;
+            let mut state = paired_state(&pinned_pool, pinned_host.port, "ana", "pc-lab-1").await;
+            let relay = Relay::in_front_of(addr_of(other_host.port)).await;
             state.addresses = vec![relay.addr];
             state.last_good = Some(relay.addr);
             save(&scratch.state_path(), &state);
@@ -968,25 +958,24 @@ async fn j5_the_knob_closes_the_shared_token_and_leaves_the_bridge_in() {
         account(&pool, "ana").await;
         let closed = start_daemon(
             EVERY_INTERFACE,
-            J5_KNOB_ON,
             &pool,
             &[("MEMORY_INDUSTRY_REQUIRE_ACCOUNTS", Some("1"))],
         )
         .await;
-        let open = start_daemon(EVERY_INTERFACE, J5_KNOB_OFF, &pool, &[]).await;
+        let open = start_daemon(EVERY_INTERFACE, &pool, &[]).await;
         let scratch = Scratch::new();
         let (closed_path, open_path) = (scratch.0.join("on.json"), scratch.0.join("off.json"));
         save(
             &closed_path,
-            &paired_state(&pool, J5_KNOB_ON, "ana", "pc-on").await,
+            &paired_state(&pool, closed.port, "ana", "pc-on").await,
         );
         save(
             &open_path,
-            &paired_state(&pool, J5_KNOB_OFF, "ana", "pc-off").await,
+            &paired_state(&pool, open.port, "ana", "pc-off").await,
         );
         let clock = JumpClock::new();
 
-        let shared = to_the_daemon(J5_KNOB_ON, Some(SHARED), ping()).await;
+        let shared = to_the_daemon(closed.port, Some(SHARED), ping()).await;
         assert_eq!(
             shared.status, 401,
             "with the knob on, a bind that others can reach does not take the shared token: {}",
@@ -1005,7 +994,7 @@ async fn j5_the_knob_closes_the_shared_token_and_leaves_the_bridge_in() {
             "the bridge carries an account credential, which the closed daemon admits",
         );
 
-        let shared = to_the_daemon(J5_KNOB_OFF, Some(SHARED), ping()).await;
+        let shared = to_the_daemon(open.port, Some(SHARED), ping()).await;
         assert_eq!(
             shared.status, 200,
             "control: the same daemon with the knob off still takes the shared token: {}",
@@ -1034,13 +1023,13 @@ async fn j6_a_restarted_bridge_serves_the_same_call_from_its_file_on_the_same_po
     in_a_scratch_database("brain_j_restart", |url_| async move {
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
-        let daemon = start_daemon(LOOPBACK, J6_PORT, &pool, &[]).await;
+        let daemon = start_daemon(LOOPBACK, &pool, &[]).await;
         let scratch = Scratch::new();
 
         let free = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a free port");
         let port = free.local_addr().expect("its address").port();
         drop(free);
-        let mut state = paired_state(&pool, J6_PORT, "ana", "pc-lab-1").await;
+        let mut state = paired_state(&pool, daemon.port, "ana", "pc-lab-1").await;
         state.port = port;
         save(&scratch.state_path(), &state);
         let file = std::fs::read(scratch.state_path()).expect("bridge.json");
@@ -1123,15 +1112,8 @@ async fn identity_of(port: u16, query: &str) -> Value {
     reply.json()
 }
 
-async fn verdict_on(state: &BridgeState, nonce: [u8; 16]) -> Verdict {
-    check_identity(
-        &bridge_client(),
-        addr_of(J7_PORT),
-        state,
-        nonce,
-        CALL_BUDGET,
-    )
-    .await
+async fn verdict_on(port: u16, state: &BridgeState, nonce: [u8; 16]) -> Verdict {
+    check_identity(&bridge_client(), addr_of(port), state, nonce, CALL_BUDGET).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1140,12 +1122,12 @@ async fn j7_what_the_daemon_writes_is_what_the_bridge_reads_field_by_field() {
         let pool = migrated(&url_).await;
         account(&pool, "ana").await;
         let host_id = db::host_identity(&pool).await.expect("host").host_id;
-        let daemon = start_daemon(LOOPBACK, J7_PORT, &pool, &[]).await;
+        let daemon = start_daemon(LOOPBACK, &pool, &[]).await;
 
         let raw = raw_pair_request(&code_for(&pool, "ana").await, "pc-raw");
         let reply = send(
             http()
-                .post(format!("http://127.0.0.1:{J7_PORT}/pair"))
+                .post(format!("http://127.0.0.1:{}/pair", daemon.port))
                 .json(&raw.request),
         )
         .await;
@@ -1181,14 +1163,14 @@ async fn j7_what_the_daemon_writes_is_what_the_bridge_reads_field_by_field() {
             "the daemon's MAC and the bridge's check are the same function of the same fields"
         );
 
-        let state = paired_state(&pool, J7_PORT, "ana", "pc-lab-1").await;
+        let state = paired_state(&pool, daemon.port, "ana", "pc-lab-1").await;
         assert_eq!(
             (state.host_id, state.host_name.as_str()),
             (host_id, response.host_name.as_str()),
             "pairing through the bridge's own code pins the host id and name the daemon wrote"
         );
 
-        let anonymous = identity_of(J7_PORT, "").await;
+        let anonymous = identity_of(daemon.port, "").await;
         assert_eq!(sorted_keys(&anonymous), ["host_id", "name", "service"]);
         assert_eq!(
             anonymous["name"],
@@ -1202,7 +1184,7 @@ async fn j7_what_the_daemon_writes_is_what_the_bridge_reads_field_by_field() {
             state.credential_id.simple(),
             hex::encode(nonce)
         );
-        let active = identity_of(J7_PORT, &query).await;
+        let active = identity_of(daemon.port, &query).await;
         assert_eq!(
             sorted_keys(&active),
             ["credential", "host_id", "name", "proof", "service"],
@@ -1219,7 +1201,7 @@ async fn j7_what_the_daemon_writes_is_what_the_bridge_reads_field_by_field() {
             "the proof is the one the bridge computes from its own secret"
         );
         assert_eq!(
-            verdict_on(&state, nonce).await,
+            verdict_on(daemon.port, &state, nonce).await,
             Verdict::Verified {
                 fingerprint: fingerprint(&host_id)
             },
@@ -1234,7 +1216,7 @@ async fn j7_what_the_daemon_writes_is_what_the_bridge_reads_field_by_field() {
             ..state
         };
         let revoked = identity_of(
-            J7_PORT,
+            daemon.port,
             &format!(
                 "?cred={}&nonce={}",
                 state.credential_id.simple(),
@@ -1248,7 +1230,7 @@ async fn j7_what_the_daemon_writes_is_what_the_bridge_reads_field_by_field() {
             "a revoked credential gets no proof: its absence is how the bridge knows to stop"
         );
         assert_eq!(
-            verdict_on(&state, nonce).await,
+            verdict_on(daemon.port, &state, nonce).await,
             Verdict::Revoked,
             "and the bridge reads that as revoked"
         );

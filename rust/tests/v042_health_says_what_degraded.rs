@@ -24,6 +24,8 @@ use serde_json::Value;
 
 // A database that is certainly not there, and whose password is a canary.
 mod dead_db;
+// The port of each daemon, asked of the OS.
+mod ephemeral;
 
 /// Under HOST_IDENTITY_BUDGET (2 s), the shortest budget a dead database used to eat.
 const DEAD_DB_CEILING: Duration = Duration::from_secs(1);
@@ -171,10 +173,15 @@ async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
 /// `WARM_CEILING` it serves with `ready:false` for as long as the models take,
 /// so a wait on that flag could outlive a daemon that was working — and two of
 /// the tests below are written against exactly that daemon.
-async fn daemon(port: u16) {
+///
+/// Returns the port the daemon was given. It is asked of the OS on the line
+/// before the spawn, and callers hold `ENV_GUARD`, so no other daemon of this
+/// binary can be handed the same one in between.
+async fn daemon() -> u16 {
     let pool = memory_industry::db::create_lazy_pool(&dead_db::url());
-    let addr = format!("127.0.0.1:{port}");
+    let port = ephemeral::port();
     let serve_task = tokio::spawn(async move {
+        let addr = format!("127.0.0.1:{port}");
         // Printed rather than dropped: when it is the bind that failed, the
         // wait below only ever sees a connection nobody answers, and the
         // sentence naming the cause lives in this Err and nowhere else.
@@ -200,12 +207,13 @@ async fn daemon(port: u16) {
             !serve_task.is_finished(),
             "the daemon on 127.0.0.1:{port} ended before it served anything, so nothing below \
              can run. serve_pool printed why it stopped — with --nocapture that line is just \
-             above this one; the port still held by an earlier run is the usual reason"
+             above this one; `already in use` there means the OS gave this port to another \
+             socket between `ephemeral::port()` and the bind, see tests/ephemeral/mod.rs"
         );
 
         probes += 1;
         match probe(&client, &url).await {
-            Ok(()) => return,
+            Ok(()) => return port,
             Err(why) => last = why,
         }
         tokio::time::sleep(PROBE_EVERY).await;
@@ -236,13 +244,13 @@ async fn health(port: u16, token: Option<&str>) -> (u16, Value) {
 async fn health_without_a_token_does_not_inventory_the_machine() {
     let _one_at_a_time = ENV_GUARD.lock().await;
     let _env = quiet_machine();
-    daemon(18851).await;
+    let port = daemon().await;
 
     // The control comes first and is not optional. Asserting that an
     // anonymous caller does not get these keys proves nothing at all against a
     // daemon that never emits them, which is exactly what this daemon was
     // doing before the block existed.
-    let (_, authorized) = health(18851, Some(TOKEN)).await;
+    let (_, authorized) = health(port, Some(TOKEN)).await;
     let runtime = authorized
         .get("runtime")
         .unwrap_or_else(|| panic!("a caller with the admin token gets the block: {authorized}"));
@@ -297,7 +305,7 @@ async fn health_without_a_token_does_not_inventory_the_machine() {
         );
     }
 
-    let (_, anonymous) = health(18851, None).await;
+    let (_, anonymous) = health(port, None).await;
     assert!(
         anonymous.get("runtime").is_none(),
         "`/health` answers anyone who can route a packet to the port. The runtime block is an \
@@ -337,10 +345,10 @@ async fn health_never_prints_a_secret() {
     ));
     env.push(Env::set("MEMORY_INDUSTRY_LLM_API_KEY", "sk-canary-apikey"));
     env.push(Env::set("MEMORY_INDUSTRY_LLM_MODEL", "qwen2.5-canary"));
-    daemon(18852).await;
+    let port = daemon().await;
 
-    let (_, authorized) = health(18852, Some(TOKEN)).await;
-    let (_, anonymous) = health(18852, None).await;
+    let (_, authorized) = health(port, Some(TOKEN)).await;
+    let (_, anonymous) = health(port, None).await;
 
     // Positive control. Without it an empty `llm` block would pass every
     // assertion below while telling the operator nothing.
@@ -409,9 +417,9 @@ async fn the_dead_database_hangs_up_at_once_instead_of_timing_out() {
 async fn a_daemon_whose_database_is_down_still_answers_200() {
     let _one_at_a_time = ENV_GUARD.lock().await;
     let _env = quiet_machine();
-    daemon(18853).await;
+    let port = daemon().await;
 
-    let (code, body) = health(18853, Some(TOKEN)).await;
+    let (code, body) = health(port, Some(TOKEN)).await;
 
     assert_eq!(
         body["database"], "unreachable",
