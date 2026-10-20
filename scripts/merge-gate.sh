@@ -229,26 +229,26 @@ if [[ "${1:-}" == "--self-test" ]]; then
     || self_fail "a gate killed in the middle left '$(exit_file killed)' in its exit file, not 'running pid=...'"
 
   # G9: stopped in the middle by a signal that CAN be caught (a timeout, a service
-  # manager, a closed terminal). Bash runs the EXIT trap for it with the status of the
-  # last command, and between two steps that is a 0: found on 2026-10-20 by stopping a
-  # gate during cargo test, run.exit read 0 over a run that had finished nothing. The
-  # file is what gets read when the session that launched the gate is gone, so a stopped
-  # gate has to say it has no verdict: 2, the status this judge keeps for «could not
-  # judge», in the file, and no receipt, whatever the tree is.
-  for sig in TERM HUP; do
-    git_tree "stopped_$sig" "kill -$sig \"\$PPID\"; exit 0"
-    run_copy "stopped_$sig"
-    # Not asserted to be 2: after its EXIT trap bash raises the signal again, so the
-    # status of the process is the signal's (143, 129) whatever the trap exits with.
-    # The verdict is the file, and the process must simply not have passed.
-    (( rc != 0 )) || self_fail "G9: a gate stopped by SIG$sig exited 0: $(cat "$tmp/stopped_$sig.out")"
-    [[ "$(exit_file "stopped_$sig")" == 2 ]] \
-      || self_fail "G9: a gate stopped by SIG$sig left '$(exit_file "stopped_$sig")' in its exit file, not 2: an unfinished run read as a verdict"
-    grep -q 'stopped before its last step' "$tmp/stopped_$sig.out" \
-      || self_fail "G9: a gate stopped by SIG$sig did not say so: $(cat "$tmp/stopped_$sig.out")"
-    [[ -z "$(receipts_of "stopped_$sig")" ]] \
-      || self_fail "G9: a gate stopped by SIG$sig over a clean tree left a receipt: $(receipts_of "stopped_$sig")"
-  done
+  # manager). Bash runs the EXIT trap for it with the status of the last command, and
+  # between two steps that is a 0: found on 2026-10-20 by stopping a gate during cargo
+  # test, run.exit read 0 over a run that had finished nothing. The file is what gets read
+  # when the session that launched the gate is gone, so a stopped gate has to say it has no
+  # verdict: 2, the status this judge keeps for «could not judge», in the file, and no
+  # receipt, whatever the tree is. The process itself ends with the signal's status
+  # (bash raises it again after the trap), so it is only required not to have passed.
+  # Only SIGTERM is held here. SIGHUP takes the same trap, but a lineage started with
+  # nohup (the gate itself, the way a long run is launched) has it ignored on entry, bash
+  # cannot reset a signal ignored on entry, and a row that passes or fails by how its
+  # runner was started is not a row: the first version of this one failed the real gate.
+  git_tree stopped_term 'kill -TERM "$PPID"; exit 0'
+  run_copy stopped_term
+  (( rc != 0 )) || self_fail "G9: a gate stopped by SIGTERM exited 0: $(cat "$tmp/stopped_term.out")"
+  [[ "$(exit_file stopped_term)" == 2 ]] \
+    || self_fail "G9: a gate stopped by SIGTERM left '$(exit_file stopped_term)' in its exit file, not 2: an unfinished run read as a verdict"
+  grep -q 'stopped before its last step' "$tmp/stopped_term.out" \
+    || self_fail "G9: a gate stopped by SIGTERM did not say so: $(cat "$tmp/stopped_term.out")"
+  [[ -z "$(receipts_of stopped_term)" ]] \
+    || self_fail "G9: a gate stopped by SIGTERM over a clean tree left a receipt: $(receipts_of stopped_term)"
 
   # A second gate, refused by a live one's lock: the file belongs to that one.
   fake_tree refused 'exit 0'
@@ -1049,7 +1049,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "    readiness check asks the container that publishes the port of DATABASE_URL, never one by name."
   echo "    the test times are judged last, over the gate's own log up to the npm step, and their red is the gate's"
   echo "    advisory exceptions are judged right after cargo audit, from a report made without ignores, and their red stops the gate before cargo deny;"
-  echo "    a gate stopped by a signal it can catch (TERM, HUP) leaves 2 in the exit file, says so and leaves no receipt, never the 0 of its last command"
+  echo "    a gate stopped by a signal it can catch (TERM) leaves 2 in the exit file, says so and leaves no receipt, never the 0 of its last command"
   exit 0
 fi
 # --- self-test end ---
