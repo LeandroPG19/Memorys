@@ -234,11 +234,14 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # gate during cargo test, run.exit read 0 over a run that had finished nothing. The
   # file is what gets read when the session that launched the gate is gone, so a stopped
   # gate has to say it has no verdict: 2, the status this judge keeps for «could not
-  # judge», in the file and as the exit, and no receipt, whatever the tree is.
+  # judge», in the file, and no receipt, whatever the tree is.
   for sig in TERM HUP; do
     git_tree "stopped_$sig" "kill -$sig \"\$PPID\"; exit 0"
     run_copy "stopped_$sig"
-    (( rc == 2 )) || self_fail "G9: a gate stopped by SIG$sig exited $rc, not 2 (it has no verdict): $(cat "$tmp/stopped_$sig.out")"
+    # Not asserted to be 2: after its EXIT trap bash raises the signal again, so the
+    # status of the process is the signal's (143, 129) whatever the trap exits with.
+    # The verdict is the file, and the process must simply not have passed.
+    (( rc != 0 )) || self_fail "G9: a gate stopped by SIG$sig exited 0: $(cat "$tmp/stopped_$sig.out")"
     [[ "$(exit_file "stopped_$sig")" == 2 ]] \
       || self_fail "G9: a gate stopped by SIG$sig left '$(exit_file "stopped_$sig")' in its exit file, not 2: an unfinished run read as a verdict"
     grep -q 'stopped before its last step' "$tmp/stopped_$sig.out" \
