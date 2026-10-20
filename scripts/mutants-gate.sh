@@ -12,6 +12,14 @@
 #   ./scripts/mutants-gate.sh --refuse-targets      exit 2 if a cargo target is inside
 #                                                   rust/ or CARGO_TARGET_DIR points
 #                                                   there (merge-gate.sh, at the start)
+#   ./scripts/mutants-gate.sh --available-kb [MEMINFO]
+#                                                   the KB the machine can still give
+#   ./scripts/mutants-gate.sh --jobs-plan CORES AVAILABLE_KB
+#                                                   how many jobs the cores and the
+#                                                   available memory hold
+#   ./scripts/mutants-gate.sh --default-jobs [CORES MEMINFO]
+#                                                   both, read from this machine
+#                                                   (quality-gate.sh asks this)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -238,6 +246,13 @@ PY
 MUTANTS_SCRATCH_GB_PER_COPY_MEASURED=12
 MUTANTS_SWEEP_MINUTES=360
 MUTANTS_KB_PER_GB=1048576
+# One mutant is a debug --lib build plus its tests, far lighter than a release link,
+# so the jobs lean on cores; 4 GB each is the calibration the formula started from
+# (a 14.9 GB laptop ran 3). The ceiling is 6 because each run carries a 90 s test
+# timeout, and a saturated machine turns a caught mutant into a reported TIMEOUT,
+# which is a worse answer than a slower one.
+MUTANTS_GB_PER_JOB=4
+MUTANTS_JOBS_CEILING=6
 
 mutants_gb() { awk -v kb="$1" -v per="$MUTANTS_KB_PER_GB" 'BEGIN { printf "%.1f", kb / per }'; }
 
@@ -300,6 +315,65 @@ mutants_disk_plan() {
   printf 'jobs=%s\n' "$jobs"
   echo "disk: $root $(mutants_gb "$free") GB free, $(mutants_gb "$per") GB per copy, $(mutants_gb "$reserve") GB reserve -> $jobs job(s)" >&2
   (( jobs == want )) || echo "capped by disk: $want wanted, $jobs fit" >&2
+}
+
+# The KB the machine can still give, read from a meminfo-format file (/proc/meminfo
+# when none is named). MemAvailable is the kernel's own answer to how much a new
+# process could get without swapping; Git Bash's /proc/meminfo has MemFree and no
+# MemAvailable, and MemFree undercounts what is cached and never overcounts it.
+# The total is not read at all: on 2026-10-14 it sized 6 jobs on a VM with 63 GB in
+# total and ~10 GB free, two builds died in rustc's handle_alloc_error and the judge,
+# rightly, refused: 48 minutes. With no /proc/meminfo (a Windows shell without it) the
+# OS is asked. Not knowing is exit 2, as for the disk, and MUTANTS_JOBS=<n> is the
+# way out: a named number never reads the memory.
+mutants_available_kb() {
+  local file="${1:-/proc/meminfo}" kb=""
+  if [[ -r "$file" ]]; then
+    kb="$(awk '$1 == "MemAvailable:" { print $2; found = 1; exit } $1 == "MemFree:" { free = $2 } END { if (!found && free != "") print free }' "$file" | tr -d '\r')" || kb=""
+  elif [[ -z "${1:-}" ]]; then
+    kb="$(powershell.exe -NoProfile -Command '(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory' 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+$' || true)"
+  fi
+  if ! [[ "$kb" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: could not read the memory this machine has available from $file (no MemAvailable or MemFree), so nobody can say how many mutation jobs fit." >&2
+    echo "      Name the jobs yourself and the memory is not read: MUTANTS_JOBS=<n>." >&2
+    return 2
+  fi
+  printf '%s\n' "$kb"
+}
+
+# jobs= on stdout, the human lines on stderr. min(cores/2, GB available/4, ceiling),
+# never below 1: a build the machine kills for want of memory is judged by
+# --check-builds, which says so out loud, and not here. 2: a value that is not a whole
+# number, or no cores.
+mutants_jobs_plan() {
+  local cores="$1" avail="$2" value half cap jobs wanted
+  for value in "$cores" "$avail"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || { echo "FAIL: --jobs-plan wants the cores and the available KB as whole numbers (got '$value')." >&2; return 2; }
+  done
+  cores=$((10#$cores)) avail=$((10#$avail))
+  (( cores > 0 )) || { echo "FAIL: --jobs-plan wants at least one core." >&2; return 2; }
+  half=$(( cores / 2 ))
+  (( half >= 1 )) || half=1
+  cap=$(( avail / MUTANTS_KB_PER_GB / MUTANTS_GB_PER_JOB ))
+  wanted=$half
+  (( wanted <= MUTANTS_JOBS_CEILING )) || wanted=$MUTANTS_JOBS_CEILING
+  jobs=$wanted
+  (( cap >= jobs )) || jobs=$cap
+  (( jobs >= 1 )) || jobs=1
+  printf 'jobs=%s\n' "$jobs"
+  echo "memory: $(mutants_gb "$avail") GB available, $MUTANTS_GB_PER_JOB GB per job -> $cap job(s) by memory; cores/2 = $half, ceiling $MUTANTS_JOBS_CEILING -> $jobs job(s)" >&2
+  (( cap >= 1 )) || echo "memory: $(mutants_gb "$avail") GB is below the $MUTANTS_GB_PER_JOB GB one job is measured to need: running 1 job anyway, and --check-builds says so if the machine kills a build" >&2
+  (( jobs == wanted )) || echo "capped by memory: $half wanted by cores, $jobs fit" >&2
+}
+
+# The plan for this machine: the cores and the available memory, both read. Given
+# CORES and a MEMINFO file it is the same rule over those, which is how --self-test
+# holds it; quality-gate.sh asks this and keeps no formula of its own.
+mutants_default_jobs() {
+  local cores="${1:-}" avail
+  [[ -n "$cores" ]] || cores="$(nproc 2>/dev/null || echo 4)"
+  avail="$(mutants_available_kb "${2:-}")" || return $?
+  mutants_jobs_plan "$cores" "$avail"
 }
 
 # A cargo target inside rust/ is copied whole into every job: cargo-mutants leaves
@@ -1119,6 +1193,18 @@ case "${1:-}" in
     printf 'jobs=%s\nscratch=%s\n' "$MUTANTS_PLANNED_JOBS" "$MUTANTS_SCRATCH"
     exit 0
     ;;
+  "--available-kb")
+    mutants_available_kb "${2:-}" || exit $?
+    exit 0
+    ;;
+  "--jobs-plan")
+    mutants_jobs_plan "${2:-}" "${3:-}" || exit $?
+    exit 0
+    ;;
+  "--default-jobs")
+    mutants_default_jobs "${2:-}" "${3:-}" || exit $?
+    exit 0
+    ;;
   "") ;;
   *) echo "FAIL: unknown argument '$1'" >&2; exit 2 ;;
 esac
@@ -1143,40 +1229,17 @@ rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
 
-# Parallelism derived from the machine, not pinned to a number.
-#
-# The values these replace were measured on a 14.9 GB laptop, and a constant
-# calibrated on one machine and then applied to every other one is exactly the
-# defect this release spent its time removing from the GPU path. The formula
-# below reproduces the old hand-tuned figure on the machine it was tuned for
-# (14.9 GB / 4 = 3) and scales from there.
-machine_cores() { nproc 2>/dev/null || echo 4; }
-
-machine_ram_gb() {
-  if [[ -r /proc/meminfo ]]; then
-    awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo
-    return
-  fi
-  powershell.exe -NoProfile -Command \
-    '[int]((Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize/1MB)' 2>/dev/null |
-    tr -d '\r' | grep -E '^[0-9]+$' || echo 8
-}
-# One mutant is a debug --lib build plus its tests: far lighter than a release
-# link, so this leans on cores. Capped at 6 because each run carries a 90 s
-# test timeout, and a saturated machine turns a caught mutant into a reported
-# TIMEOUT, which is a worse answer than a slower one.
-default_mutants_jobs() {
-  local half cap
-  half=$(( $(machine_cores) / 2 ))
-  cap=$(( $(machine_ram_gb) / 4 ))
-  (( half < 1 )) && half=1
-  (( cap < half )) && half=$cap
-  (( half > 6 )) && half=6
-  (( half < 1 )) && half=1
-  echo "$half"
-}
-MUTANTS_JOBS="${MUTANTS_JOBS:-$(default_mutants_jobs)}"
-echo "mutants jobs=$MUTANTS_JOBS (cores=$(machine_cores) ram=$(machine_ram_gb)GB)"
+# Parallelism derived from the machine, not pinned to a number, and from the memory
+# it has available and not the memory it has (mutants_default_jobs: the rule, and why).
+# A MUTANTS_JOBS named by the operator is kept as named and the memory is not read,
+# which is also the way out on a machine whose memory cannot be read (exit 2).
+if [[ -n "${MUTANTS_JOBS:-}" ]]; then
+  echo "mutants jobs=$MUTANTS_JOBS (named by MUTANTS_JOBS; the memory is not read)"
+else
+  default_plan="$(mutants_default_jobs)" || exit $?
+  MUTANTS_JOBS="${default_plan#jobs=}"
+  echo "mutants jobs=$MUTANTS_JOBS (from the cores and the memory that is available)"
+fi
 
 # The disk has the last word on the jobs, an explicit MUTANTS_JOBS included, and
 # decides before anything is copied.

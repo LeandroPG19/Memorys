@@ -133,7 +133,7 @@ jobs x GB per copy + reserve <= free GB on the scratch's volume
 | `MUTANTS_SCRATCH_DIR` | the system temp | The directory in which `memory-industry-mutants` is made, the way out when `C:` is full and another volume has room. Only that subdirectory is swept, and only with its marker; the scratch is refused if it is the system temp, `$HOME` or `/`, or if it holds the repo or `$HOME`. |
 | `MUTANTS_SCRATCH_GB_PER_COPY` | 12 | Whole GB per copy. 12 is ceil(8.94 x 1.25), measured on Windows with debug info off. |
 | `CUBA_GATE_MIN_FREE_GB` | 8 | The reserve that stays free; the same variable and value `run-all-tests.sh` uses. |
-| `MUTANTS_JOBS` | from cores and RAM | Jobs wanted. The disk can lower it, never raise it. |
+| `MUTANTS_JOBS` | from the cores and the memory that is available ([below](#memory-for-the-mutation-step)) | Jobs wanted. A number named here is kept as named and the memory is not read. The disk can lower it, never raise it. |
 
 **What is swept**, before the disk is measured, so that what it frees counts:
 
@@ -153,6 +153,25 @@ TMP="$(cygpath -w "$SCR")" TEMP="$(cygpath -w "$SCR")" TMPDIR="$SCR" CARGO_PROFI
     --jobs 2 --timeout 90 --leak-dirs --output "$(cygpath -m "$OUT")" -- --lib
 du -sk "$SCR"/cargo-mutants-rust-*.tmp      # KB per copy; GB x 1.25, rounded up, is the default
 rm -rf "$SCR"
+```
+
+## Memory for the mutation step
+
+On 2026-10-14 the WSL VM had 63 GB in total and about 10 GB free. The jobs came out of the total (`min(cores/2, total GB/4, 6)` = 6), two builds died in rustc's `handle_alloc_error`, and the judge, rightly, refused them (`check_builds`): 48 minutes for a choice of jobs that was wrong, not a mutant that was. The rule now reads the memory that is **available**, and it lives once.
+
+```text
+jobs = min(cores / 2, GB available / 4, 6), never below 1
+```
+
+- `mutants-gate.sh --available-kb [MEMINFO]` prints the KB the machine can still give: `MemAvailable` of `/proc/meminfo`, else `MemFree` (Git Bash's `/proc/meminfo` has no `MemAvailable`; `MemFree` undercounts what is cached and never overcounts it), else the OS is asked (`FreePhysicalMemory`, for a Windows shell with no `/proc`). **The total is not read.** Not knowing is **exit 2**, with the way out in the message: `MUTANTS_JOBS=<n>`.
+- `--jobs-plan CORES AVAILABLE_KB` is the pure rule. It prints `jobs=<n>` and a `memory:` line, adds `capped by memory: 12 wanted by cores, 2 fit` when the memory lowered the number, and says `below the 4 GB one job is measured to need` when there is less than one job's worth (it still runs 1: a build the machine kills for want of memory is `--check-builds`' to say, out loud, and not this rule's to refuse). A value that is not a whole number, or 0 cores, is exit 2.
+- `--default-jobs [CORES MEMINFO]` is both, read from this machine when given nothing. `quality-gate.sh` asks it; it keeps no formula of its own (the comment over the old copy said «same derivation as mutants-gate.sh», and that is the line that drifted). `local_gate_contract.rs` fails if either script reads `MemTotal` outside its `--self-test`, or if `quality-gate.sh` stops asking.
+- 4 GB per job is the calibration the formula started from (a 14.9 GB laptop ran 3); 6 is the ceiling because each run carries a 90 s test timeout and a saturated machine turns a caught mutant into a reported TIMEOUT.
+- **A named `MUTANTS_JOBS` is not cut by the memory** (the disk does cut it): the operator who writes the number answers for it, and a build the machine then kills is still refused by `--check-builds` with the cause. `build-gpu.sh` still sizes its release build from `MemTotal`; it is not this rule.
+
+```bash
+./scripts/mutants-gate.sh --jobs-plan 24 10485760     # the incident: jobs=2
+./scripts/mutants-gate.sh --default-jobs              # this machine
 ```
 
 ## Time per test binary

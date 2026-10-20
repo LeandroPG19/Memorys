@@ -6,22 +6,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 BASELINE="$ROOT/scripts/lizard-baseline.txt"
 
-# Same derivation as mutants-gate.sh: a number tuned on one machine and used
-# on every other one is the defect this release removed from the GPU path.
+# The jobs are mutants-gate.sh's rule, asked and not copied: the formula that lived
+# here said «same derivation» and read the machine's TOTAL memory, and on 2026-10-14
+# a VM with 63 GB and ~10 GB free got 6 jobs, two builds died in rustc's
+# handle_alloc_error and the judge lost 48 minutes (G5). The rule's own `memory:` line
+# goes to this step's stderr; a machine whose memory cannot be read is its exit 2.
 qg_mutants_jobs() {
-  local cores ram half
-  cores=$(nproc 2>/dev/null || echo 4)
-  if [[ -r /proc/meminfo ]]; then
-    ram=$(awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo)
-  else
-    ram=8
-  fi
-  half=$(( cores / 2 ))
-  (( half < 1 )) && half=1
-  (( ram / 4 < half )) && half=$(( ram / 4 ))
-  (( half > 6 )) && half=6
-  (( half < 1 )) && half=1
-  echo "$half"
+  local plan
+  plan="$("$ROOT/scripts/mutants-gate.sh" --default-jobs)" || return $?
+  printf '%s\n' "${plan#jobs=}"
 }
 
 # Every --exclude-re entry of the mutation step, in one place so that the
@@ -440,8 +433,9 @@ unused_exclusions() {
 # what it reads on Unix. CARGO_PROFILE_DEV_DEBUG=0 is for that one command and
 # takes a copy's target from 14.1 to 8.94 GB (the .pdb files were 54 %).
 mutate_and_judge() {
-  local out native rc=0 plan jobs scratch scratch_native
-  plan="$("$ROOT/scripts/mutants-gate.sh" --prepare-scratch "${MUTANTS_JOBS:-$(qg_mutants_jobs)}")" || return $?
+  local out native rc=0 plan jobs scratch scratch_native want="${MUTANTS_JOBS:-}"
+  [[ -n "$want" ]] || want="$(qg_mutants_jobs)" || return $?
+  plan="$("$ROOT/scripts/mutants-gate.sh" --prepare-scratch "$want")" || return $?
   jobs="$(sed -n 's/^jobs=//p' <<<"$plan")"
   scratch="$(sed -n 's/^scratch=//p' <<<"$plan")"
   if [[ -z "$jobs" || -z "$scratch" ]]; then
