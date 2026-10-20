@@ -228,6 +228,25 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$(exit_file killed)" == "running pid="* ]] \
     || self_fail "a gate killed in the middle left '$(exit_file killed)' in its exit file, not 'running pid=...'"
 
+  # G9: stopped in the middle by a signal that CAN be caught (a timeout, a service
+  # manager, a closed terminal). Bash runs the EXIT trap for it with the status of the
+  # last command, and between two steps that is a 0: found on 2026-10-20 by stopping a
+  # gate during cargo test, run.exit read 0 over a run that had finished nothing. The
+  # file is what gets read when the session that launched the gate is gone, so a stopped
+  # gate has to say it has no verdict: 2, the status this judge keeps for «could not
+  # judge», in the file and as the exit, and no receipt, whatever the tree is.
+  for sig in TERM HUP; do
+    git_tree "stopped_$sig" "kill -$sig \"\$PPID\"; exit 0"
+    run_copy "stopped_$sig"
+    (( rc == 2 )) || self_fail "G9: a gate stopped by SIG$sig exited $rc, not 2 (it has no verdict): $(cat "$tmp/stopped_$sig.out")"
+    [[ "$(exit_file "stopped_$sig")" == 2 ]] \
+      || self_fail "G9: a gate stopped by SIG$sig left '$(exit_file "stopped_$sig")' in its exit file, not 2: an unfinished run read as a verdict"
+    grep -q 'stopped before its last step' "$tmp/stopped_$sig.out" \
+      || self_fail "G9: a gate stopped by SIG$sig did not say so: $(cat "$tmp/stopped_$sig.out")"
+    [[ -z "$(receipts_of "stopped_$sig")" ]] \
+      || self_fail "G9: a gate stopped by SIG$sig over a clean tree left a receipt: $(receipts_of "stopped_$sig")"
+  done
+
   # A second gate, refused by a live one's lock: the file belongs to that one.
   fake_tree refused 'exit 0'
   mkdir -p "$tmp/refused/home/.cache/cuba-gate/lock"
@@ -1027,6 +1046,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   echo "    readiness check asks the container that publishes the port of DATABASE_URL, never one by name."
   echo "    the test times are judged last, over the gate's own log up to the npm step, and their red is the gate's"
   echo "    advisory exceptions are judged right after cargo audit, from a report made without ignores, and their red stops the gate before cargo deny;"
+  echo "    a gate stopped by a signal it can catch (TERM, HUP) leaves 2 in the exit file, says so and leaves no receipt, never the 0 of its last command"
   exit 0
 fi
 # --- self-test end ---
