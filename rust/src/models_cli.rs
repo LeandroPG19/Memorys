@@ -2130,4 +2130,79 @@ mod tests {
              in the directory must not answer for it: {gpu:?}"
         );
     }
+
+    /// The Windows runtime ships as a zip, and `extract_runtime` reads it with
+    /// `by_index` + `enclosed_name`, never with `ZipArchive::extract`, which is
+    /// the call RUSTSEC-2026-0367, -0368 and -0369 are about. No test opened a
+    /// zip before `zip` moved from 2 to 9 (a new deflate backend, among other
+    /// things), so this pins what the branch does with one: it keeps the library
+    /// `lib_name` names wherever it sits in the archive, leaves the rest on the
+    /// floor, and writes nothing for an entry whose name climbs out of the
+    /// directory. That entry comes last and says something else, so if its name
+    /// were ever trusted it would overwrite the library and the bytes would show it.
+    #[test]
+    fn the_zip_runtime_keeps_its_library_and_nothing_that_climbs_out_of_the_directory() {
+        use std::io::Write;
+
+        let root = scratch_root("zip-runtime");
+        let dir = root.join("onnxruntime");
+        std::fs::create_dir_all(&dir).expect("the test owns this directory");
+        let archive = root.join("onnxruntime.zip");
+
+        let library: &[u8] = b"the library the daemon loads, long enough to be the largest";
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let mut writer =
+            zip::ZipWriter::new(std::fs::File::create(&archive).expect("the test owns this file"));
+        for (name, bytes) in [
+            ("onnxruntime-win-x64-1.2.3/lib/onnxruntime.dll", library),
+            ("onnxruntime-win-x64-1.2.3/lib/onnxruntime.lib", b"import"),
+            ("onnxruntime-win-x64-1.2.3/README.md", b"readme"),
+            (
+                "onnxruntime-win-x64-1.2.3/lib/onnxruntime_providers_cuda.dll",
+                b"cuda",
+            ),
+            ("../escaped/onnxruntime.dll", b"climbing"),
+        ] {
+            writer
+                .start_file(name, options)
+                .expect("a name the writer takes");
+            writer.write_all(bytes).expect("the test owns this file");
+        }
+        writer.finish().expect("the archive is closed");
+
+        let extracted = extract_runtime(&archive, "zip", "onnxruntime.dll", &dir, false)
+            .expect("a zip with the library in it extracts");
+
+        assert_eq!(
+            extracted,
+            vec!["onnxruntime.dll".to_string()],
+            "only the library named by lib_name is wanted on a CPU install"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("onnxruntime.dll")).expect("the library was written"),
+            library,
+            "the library is the entry inside the runtime, not the one that climbed out"
+        );
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the directory exists")
+            .map(|e| {
+                e.expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["onnxruntime.dll"],
+            "nothing else is left in the directory"
+        );
+        assert!(
+            !root.join("escaped").exists(),
+            "an entry that climbs out of the directory writes nothing outside it"
+        );
+        std::fs::remove_dir_all(&root).expect("the test owns this directory");
+    }
 }
