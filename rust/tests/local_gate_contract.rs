@@ -951,6 +951,80 @@ fn the_second_judge_hands_its_mutation_outcomes_to_the_same_build_check() {
     );
 }
 
+/// The lines of `body` that are not between the self-test markers, as
+/// `(line number, line)`. The fixtures of a self-test are meminfo files, and a
+/// meminfo has a `MemTotal:` line; only the code that runs is the guard's business.
+fn outside_self_test(body: &str) -> Vec<(usize, &str)> {
+    let mut inside = false;
+    let mut out = Vec::new();
+    for (index, line) in body.lines().enumerate() {
+        if line == SELF_TEST_BEGIN {
+            inside = true;
+        } else if line == SELF_TEST_END {
+            inside = false;
+        } else if !inside {
+            out.push((index + 1, line));
+        }
+    }
+    out
+}
+
+/// The lines, outside the self-test, that read the machine's TOTAL memory. Comments
+/// may name it (the reason this exists is written in one); a line of code may not.
+fn reads_total_memory(body: &str) -> Vec<usize> {
+    outside_self_test(body)
+        .into_iter()
+        .filter(|(_, line)| !line.trim_start().starts_with('#') && line.contains("MemTotal"))
+        .map(|(n, _)| n)
+        .collect()
+}
+
+/// 2026-10-14: the jobs of the mutation step came out of the machine's TOTAL memory
+/// (63 GB, 6 jobs) on a VM with about 10 GB free, two builds died in rustc's
+/// handle_alloc_error and the judge, rightly, refused: 48 minutes. The rule reads the
+/// memory that is available and lives once, in mutants-gate.sh; the second judge asks
+/// it. A `MemTotal` in the code of either script is the incident again, and a formula
+/// in quality-gate.sh is the drift quality-gate.ps1 was.
+#[test]
+fn the_mutation_jobs_come_from_the_memory_that_is_available_and_one_script_holds_the_rule() {
+    // The scan has to be able to fail before a clean answer from it means anything.
+    let code = "x=$(awk '/MemTotal/ {print $2}' /proc/meminfo)\n# MemTotal in a comment\n";
+    let fixture = format!("{code}{SELF_TEST_BEGIN}\nprintf 'MemTotal: 1 kB'\n{SELF_TEST_END}\n");
+    assert_eq!(
+        reads_total_memory(&fixture),
+        vec![1],
+        "the scan must flag the code line, and only it: not the comment, not the fixture \
+         between the markers"
+    );
+
+    for script in ["scripts/mutants-gate.sh", "scripts/quality-gate.sh"] {
+        let body = read(script).replace("\r\n", "\n");
+        assert!(
+            reads_total_memory(&body).is_empty(),
+            "{script} reads MemTotal outside its self-test (line {:?}). The jobs of the \
+             mutation step are sized from the memory that is available: on 2026-10-14 a VM \
+             with 63 GB in total and ~10 GB free got 6 jobs and two builds died",
+            reads_total_memory(&body)
+        );
+    }
+
+    let sil = read("scripts/mutants-gate.sh");
+    for mode in ["--available-kb", "--jobs-plan", "--default-jobs"] {
+        assert!(
+            sil.contains(&format!("\"{mode}\")")),
+            "mutants-gate.sh has no `{mode}` mode: the rule that sizes the jobs is called \
+             through the CLI by the second judge and by its own --self-test"
+        );
+    }
+    let q = read("scripts/quality-gate.sh");
+    assert!(
+        q.contains("scripts/mutants-gate.sh\" --default-jobs"),
+        "quality-gate.sh does not ask mutants-gate.sh for its default jobs, so it keeps a \
+         formula of its own: the comment over qg_mutants_jobs said 'same derivation' and \
+         that is what drifted"
+    );
+}
+
 fn looks_absolute(path: &str) -> bool {
     if path.starts_with('/') {
         return true;

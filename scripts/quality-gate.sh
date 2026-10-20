@@ -1049,6 +1049,19 @@ PY
     echo "FAIL self-test: QG2: MUTANTS_JOBS=3 over disk for 2 did not reach cargo mutants as --jobs 2 with 'capped by disk: 3 wanted, 2 fit' (exit $mut_rc, argv: $(mj_field 1)): $(cat "$tmp/mut.out")" >&2
     exit 1
   fi
+  # QG8 (G5): with no MUTANTS_JOBS the step does not size the jobs itself, it asks the
+  # one rule, mutants-gate.sh --default-jobs, which reads the memory that is available
+  # (the copy of the formula that used to live here read the total, and on 2026-10-14
+  # a VM with 63 GB and ~10 GB free got 6 jobs and two builds died). Its `memory:` line
+  # reaches this step's output, and cargo mutants gets a number between 1 and the ceiling.
+  q_fresh
+  q_avail=$((500 * kb))
+  mj FAKE_OUTCOME=genuine -- --file src/a.rs
+  if (( mut_rc != 0 )) || ! mj_invoked || ! mj_said 'memory:' \
+    || ! [[ "$(mj_field 1)" =~ --jobs\ [1-6]\  ]]; then
+    echo "FAIL self-test: QG8: with no MUTANTS_JOBS the step did not take its jobs from mutants-gate.sh --default-jobs: no 'memory:' line, or cargo mutants got no --jobs between 1 and 6 (exit $mut_rc, argv: $(mj_field 1)): $(cat "$tmp/mut.out")" >&2
+    exit 1
+  fi
   # QG3 and QG7: cargo mutants gets the judge's scratch as its temp dir, in the
   # three spellings (TMP and TEMP are what Windows reads, TMPDIR what Unix does),
   # and debug info off (7.6 of the 14.1 GB of a copy's target were .pdb). That
@@ -1129,7 +1142,8 @@ PY
   echo "    step hands cargo-mutants an output path it can see, and judges what it wrote; it asks"
   echo "    for the jobs the disk holds before cargo mutants, an explicit MUTANTS_JOBS included,"
   echo "    runs it in the judge's own scratch with debug info off, and stops at a cargo target"
-  echo "    inside rust/"
+  echo "    inside rust/; with no MUTANTS_JOBS its jobs come from mutants-gate.sh --default-jobs,"
+  echo "    which sizes them from the memory that is available"
   exit 0
 fi
 # --- self-test end ---

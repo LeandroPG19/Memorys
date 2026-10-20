@@ -996,6 +996,91 @@ self_test() {
     self_fail "N4: one out-of-disk build beside one compile error was not '1 of 2' and '1 of them ran out of disk' (exit $rc): $(cat "$tmp/err")"
   fi
 
+  # --- G5: the default jobs come from the memory that is available ------------------
+  # On 2026-10-14 the WSL VM had 63 GB in total and ~10 GB free, the jobs came out of
+  # the total (6), two builds died in rustc's handle_alloc_error and the judge, rightly,
+  # refused: 48 minutes. Three modes carry the rule, as --disk-plan does for the disk,
+  # and quality-gate.sh asks the third instead of keeping its own copy of the formula:
+  #   --available-kb [MEMINFO]          the KB the machine can still give
+  #   --jobs-plan CORES AVAILABLE_KB    pure: min(cores/2, GB available/4, 6), floor 1
+  #   --default-jobs [CORES MEMINFO]    both; with no arguments it reads this machine
+  # Called through the CLI, so that before they exist the failure is `unknown argument`
+  # and not `command not found`. The meminfo files are made by hand: the rule reads a
+  # file, and no variable of the code under test is invented to point it elsewhere.
+  g5_meminfo() { local f="$tmp/meminfo.$1"; shift; printf '%s\n' "$@" > "$f"; }
+  g5_meminfo incident 'MemTotal:       66060288 kB' 'MemFree:         3145728 kB' \
+    'MemAvailable:   10485760 kB' 'Cached:          9000000 kB'
+  g5_meminfo plenty 'MemTotal:       66060288 kB' 'MemFree:        50331648 kB' 'MemAvailable:   62914560 kB'
+  # Git Bash: MemFree and no MemAvailable.
+  g5_meminfo msys 'MemTotal:       16653852 kB' 'MemFree:          8388608 kB' 'SwapTotal:       4000000 kB'
+  g5_meminfo none 'MemTotal:       16653852 kB' 'SwapTotal:       4000000 kB'
+  g5_run() { rc=0; bash "$ROOT/scripts/mutants-gate.sh" "$@" >"$tmp/g5.out" 2>"$tmp/g5.err" || rc=$?; }
+  g5_said() { grep -qF -- "$1" "$tmp/g5.out" "$tmp/g5.err"; }
+  g5_jobs() { grep -qx "jobs=$1" "$tmp/g5.out"; }
+  g5_silent() { [[ ! -s "$tmp/g5.out" ]]; }
+
+  g5_run --available-kb "$tmp/meminfo.incident"
+  if (( rc != 0 )) || [[ "$(cat "$tmp/g5.out")" != 10485760 ]]; then
+    self_fail "J1: a meminfo with 63 GB in total and MemAvailable 10 GB did not print 10485760, the available one (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_run --available-kb "$tmp/meminfo.msys"
+  if (( rc != 0 )) || [[ "$(cat "$tmp/g5.out")" != 8388608 ]]; then
+    self_fail "J2: a meminfo with MemFree and no MemAvailable (Git Bash) did not print MemFree, 8388608 (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_run --available-kb "$tmp/meminfo.none"
+  if (( rc != 2 )) || ! g5_silent || ! g5_said MemAvailable || ! g5_said 'MUTANTS_JOBS='; then
+    self_fail "J3: a meminfo with neither MemAvailable nor MemFree was not exit 2 with nothing on stdout, naming MemAvailable and the way out MUTANTS_JOBS= (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_run --available-kb "$tmp/no-such-meminfo"
+  if (( rc != 2 )) || ! g5_silent; then
+    self_fail "J4: a meminfo that cannot be read was not exit 2 with nothing on stdout (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+
+  # The pure rule. 10 GB / 4 = 2 against cores/2 = 12 and the ceiling 6: the incident.
+  g5_run --jobs-plan 24 $((10 * kb))
+  if (( rc != 0 )) || ! g5_jobs 2 || ! g5_said 'capped by memory: 12 wanted by cores, 2 fit'; then
+    self_fail "J5: 24 cores and 10 GB available were not jobs=2, said out loud as 'capped by memory: 12 wanted by cores, 2 fit' (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_run --jobs-plan 24 $((60 * kb))
+  if (( rc != 0 )) || ! g5_jobs 6 || g5_said 'capped by memory'; then
+    self_fail "J6: 24 cores and 60 GB available were not jobs=6, the ceiling, with nothing capped by memory (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_run --jobs-plan 4 $((15 * kb))
+  if (( rc != 0 )) || ! g5_jobs 2 || g5_said 'capped by memory'; then
+    self_fail "J7: 4 cores and 15 GB available were not jobs=2, which the cores decide (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_run --jobs-plan 24 $((3 * kb))
+  if (( rc != 0 )) || ! g5_jobs 1 || ! g5_said 'below the 4 GB'; then
+    self_fail "J8: 3 GB available was not jobs=1 with a line saying it is below the 4 GB a job is measured to need (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  for bad in "0 $((10 * kb))" "4 lots" "four $((10 * kb))" "4" ""; do
+    # shellcheck disable=SC2086  # the words are the arguments
+    g5_run --jobs-plan $bad
+    if (( rc != 2 )) || g5_jobs '[0-9]*'; then
+      self_fail "J9: --jobs-plan '$bad' was not exit 2 with no jobs= line (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+    fi
+  done
+
+  # The default plan is the file and the rule together: the same incident, and the
+  # same answer on 60 GB, so a MemTotal read would be 6 in the first.
+  g5_run --default-jobs 24 "$tmp/meminfo.incident"
+  if (( rc != 0 )) || ! g5_jobs 2 || ! g5_said 'capped by memory'; then
+    self_fail "J10: --default-jobs over the incident's meminfo (63 GB total, 10 GB available) and 24 cores was not jobs=2 (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_run --default-jobs 24 "$tmp/meminfo.plenty"
+  if (( rc != 0 )) || ! g5_jobs 6; then
+    self_fail "J11: --default-jobs over 60 GB available and 24 cores was not jobs=6 (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_run --default-jobs 24 "$tmp/meminfo.none"
+  if (( rc != 2 )) || g5_jobs '[0-9]*'; then
+    self_fail "J12: --default-jobs over a meminfo it cannot read was not exit 2 with no jobs= line (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  # With no arguments it reads this machine: a number between 1 and the ceiling.
+  g5_run --default-jobs
+  if (( rc != 0 )) || ! grep -qxE 'jobs=[1-6]' "$tmp/g5.out" || ! g5_said 'memory:'; then
+    self_fail "J13: --default-jobs on this machine was not jobs=1..6 with a memory: line (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+
   echo "OK  self-test: a build rustc refused with a diagnostic stays unviable; an NTSTATUS,"
   echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log,"
   echo "    a build out of disk and a file whose total disagrees with its records are refused; a caught mutant"
@@ -1004,7 +1089,9 @@ self_test() {
   echo "    an unreadable free space as an error, sweeps only what is the judge's and old, leaves a"
   echo "    running gate's copies alone, refuses a cargo target inside rust/, and gives cargo mutants"
   echo "    its own scratch directory: always MUTANTS_SCRATCH_DIR's subdirectory memory-industry-mutants,"
-  echo "    swept only when it carries the marker, and refused if it holds the repo or HOME"
+  echo "    swept only when it carries the marker, and refused if it holds the repo or HOME;"
+  echo "    the default jobs come from the memory that is available (MemAvailable, else MemFree,"
+  echo "    else exit 2), not from the total, and are said out loud when the memory capped them"
   exit 0
 }
 # --- self-test end ---
