@@ -67,7 +67,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 
 flate2 = "1"
 tar = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 url = { version = "2", optional = true }
 html2text = { version = "0.12", optional = true }
