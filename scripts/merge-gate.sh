@@ -1100,8 +1100,23 @@ write_receipt() {
 # wait is bounded: a process the gate started and left behind (a server the
 # E2E launched) keeps the pipe open and tee would never see its end, and an
 # unbounded wait would hang the exit of a gate that has already finished.
+#
+# A signal bash can catch (TERM from a timeout or a service manager, HUP from a closed
+# terminal) runs this trap with the status of the last command, and a gate stopped
+# between two steps has a 0 there: the exit file would read as a pass over a run that
+# finished nothing (found on 2026-10-20, stopping a gate during cargo test). Only the
+# last line of the script sets GATE_REACHED_END, so an exit of 0 without it is not a
+# verdict, and 2 is what this judge says when it could not judge. SIGKILL runs no trap
+# at all and leaves `running`, which is why the file starts there. The status of the
+# process itself is the signal's (143, 129): bash raises it again after this trap, so
+# the verdict is the file, and the process just has not passed.
+GATE_REACHED_END=""
 on_exit() {
-  local code=$? tenths=0
+  local code=$? tenths=0 stopped=0
+  if (( code == 0 )) && [[ -z "$GATE_REACHED_END" ]]; then
+    code=2
+    stopped=1
+  fi
   if [[ -n "$GATE_TEE" ]]; then
     exec 1>&3 2>&4 3>&- 4>&-
     while kill -0 "$GATE_TEE" 2>/dev/null && (( tenths < 300 )); do
@@ -1112,6 +1127,7 @@ on_exit() {
       echo "note: something this gate started still holds its output open; $GATE_LOG was judged as it stood after 30 s"
     fi
   fi
+  (( stopped == 0 )) || echo "FAIL: the gate was stopped before its last step (a signal), so it has no verdict: exit 2, no receipt."
   (( code != 0 )) || write_receipt || echo "no receipt: writing it failed"
   exit_file_verdict "$code"
   release_gate_lock
@@ -1376,6 +1392,7 @@ for _ in $(seq 300); do
 done
 "$ROOT/scripts/test-times.sh" --judge "$GATE_LOG" --until "$TIMED_STEPS_END"
 
+GATE_REACHED_END=1
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  MERGE GATE PASSED — safe to merge (local CI 100%)       ║"
