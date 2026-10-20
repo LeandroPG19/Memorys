@@ -54,6 +54,7 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
     { id = "RUSTSEC-2025-0119", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
     { id = "RUSTSEC-2024-0436", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
+    { id = "RUSTSEC-2026-0381", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
 ]
 
 [bans]
