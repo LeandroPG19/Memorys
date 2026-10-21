@@ -1297,6 +1297,135 @@ fn a_release_cargo_call_in_the_gate_carries_the_features_the_release_build_used(
     }
 }
 
+/// A stand-in on the `PATH` of `run_build_gpu`: written executable, because bash
+/// looks a command up by its mode on Linux (Git Bash reads the shebang instead).
+fn write_stand_in(dir: &Path, name: &str, body: &str) {
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+    }
+}
+
+/// Runs a copy of `scripts/build-gpu.sh` in a throwaway tree, with `cargo` and
+/// `systemd-run` replaced by the stand-ins given. Returns whether it exited 0,
+/// its output, and the lines the stand-in cargo logged (its arguments and
+/// whether it ran inside the stand-in scope).
+fn run_build_gpu(systemd_run: &str) -> (bool, String, Vec<String>) {
+    let dir = std::env::temp_dir().join(format!("mi-build-gpu-{}", uuid::Uuid::new_v4()));
+    let bin = dir.join("bin");
+    for sub in [&bin, &dir.join("scripts"), &dir.join("rust")] {
+        std::fs::create_dir_all(sub).expect("create the throwaway tree");
+    }
+    std::fs::write(
+        dir.join("scripts/build-gpu.sh"),
+        read("scripts/build-gpu.sh"),
+    )
+    .expect("copy build-gpu.sh");
+    write_stand_in(&bin, "systemd-run", systemd_run);
+    write_stand_in(
+        &bin,
+        "cargo",
+        "#!/usr/bin/env bash\n\
+         printf '%s scope=%s\\n' \"$*\" \"${STANDIN_UNDER_SCOPE:-0}\" >> \"$STANDIN_LOG\"\n\
+         mkdir -p \"$CARGO_TARGET_DIR/release\"\n\
+         printf '#!/usr/bin/env bash\\necho memory-industry stand-in\\n' \
+           > \"$CARGO_TARGET_DIR/release/memory-industry\"\n\
+         chmod +x \"$CARGO_TARGET_DIR/release/memory-industry\"\n",
+    );
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&path)))
+            .expect("join PATH");
+    let log = dir.join("cargo.calls");
+    let out = std::process::Command::new(git_bash())
+        .arg(dir.join("scripts/build-gpu.sh"))
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", dir.join("target"))
+        .env("CUBA_BUILD_JOBS", "1")
+        .env("STANDIN_LOG", &log)
+        .env_remove("CUBA_BUILD_MEM_MAX")
+        .env_remove("STANDIN_UNDER_SCOPE")
+        .output()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let calls = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    let text = format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text, calls)
+}
+
+/// The memory cap is the one thing `systemd-run` was there for, so a machine
+/// that cannot give it builds without it, as the script already says it will.
+///
+/// On 2026-10-21 the first gate in a cloud container (Ubuntu 24.04, no systemd
+/// as PID 1) stopped at the release build on `Failed to connect to bus: No
+/// medium found`: `systemd-run` is installed there, so `command -v` found it,
+/// but there is no user session for `--user --scope` to talk to, and `set -e`
+/// ended the gate on the wrapper, before cargo had run at all. WSL2 without
+/// `systemd=true` in `wsl.conf` is the same machine. The second row keeps the
+/// other half: where a scope can be had, the build still runs inside it, so a
+/// script that stopped asking for the cap would be red too.
+#[test]
+fn a_systemd_run_with_no_session_to_talk_to_builds_without_the_cap_and_one_with_a_session_caps() {
+    let no_bus = "#!/usr/bin/env bash\n\
+                  echo 'Failed to connect to bus: No medium found' >&2\n\
+                  exit 1\n";
+    let (ok, text, calls) = run_build_gpu(no_bus);
+    assert!(
+        ok,
+        "build-gpu.sh failed where systemd-run is installed but has no user session to \
+         start a scope in, the cloud container of 2026-10-21. It has a branch that builds \
+         without the memory cap for a machine without systemd-run; this one is that machine \
+         too. {text}"
+    );
+    assert_eq!(
+        calls.len(),
+        1,
+        "the release build has to run exactly once, outside any scope: {calls:?}\n{text}"
+    );
+    assert!(
+        calls[0].contains("build --release --features cuda") && calls[0].ends_with("scope=0"),
+        "the one cargo call was not the uncapped release build: {calls:?}\n{text}"
+    );
+    assert!(
+        text.contains("without a memory cap"),
+        "the build ran without its cap and the log does not say so. {text}"
+    );
+
+    let scope = "#!/usr/bin/env bash\n\
+                 while [[ $# -gt 0 && \"$1\" == -* ]]; do\n\
+                 case \"$1\" in -p) shift 2 ;; *) shift ;; esac\n\
+                 done\n\
+                 STANDIN_UNDER_SCOPE=1 exec \"$@\"\n";
+    let (ok, text, calls) = run_build_gpu(scope);
+    assert!(
+        ok,
+        "build-gpu.sh failed with a systemd-run that works. {text}"
+    );
+    let builds: Vec<&String> = calls.iter().filter(|c| c.starts_with("build ")).collect();
+    assert_eq!(
+        builds.len(),
+        1,
+        "the release build has to run exactly once: {calls:?}\n{text}"
+    );
+    assert!(
+        builds[0].ends_with("scope=1"),
+        "systemd-run could start a scope and the release build ran outside it, without the \
+         memory cap that keeps a fat-LTO link from taking the machine down: {calls:?}\n{text}"
+    );
+}
+
 /// The half of the second judge that has to be able to fail.
 ///
 /// The CRAP half decides by absence: on a diff that made nothing worse it
