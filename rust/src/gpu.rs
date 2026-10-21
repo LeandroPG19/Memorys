@@ -553,10 +553,6 @@ pub fn status() -> GpuStatus {
     )
 }
 
-pub fn active_provider() -> String {
-    status().detail
-}
-
 /// The directory the provider libraries are looked for in: beside the runtime
 /// `configure` loads, which is whatever `locate_onnxruntime` finds.
 ///

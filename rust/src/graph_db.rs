@@ -452,10 +452,6 @@ async fn project_entity_full(
     .await
 }
 
-pub async fn project_relation(from: &str, to: &str, rel_type: &str) -> anyhow::Result<()> {
-    project_relation_full(from, to, rel_type, 1.0).await
-}
-
 pub async fn project_relation_full(
     from: &str,
     to: &str,
@@ -529,15 +525,6 @@ fn falkor_neighbors(start: &str, incoming: bool) -> Result<Vec<(String, String, 
         out.push((name, kind, strength));
     }
     Ok(out)
-}
-
-/// k-hop BFS on Falkor. Empty or error → caller falls back to Postgres.
-pub fn traverse_falkor(start: &str, max_depth: i32) -> Result<Vec<GraphHop>, String> {
-    Ok(walk_falkor(start, max_depth)?.0)
-}
-
-pub fn traverse_paths_falkor(start: &str, max_depth: i32) -> Result<Vec<RelPath>, String> {
-    Ok(walk_falkor(start, max_depth)?.1)
 }
 
 pub fn traverse_falkor_with_paths(
@@ -918,10 +905,6 @@ pub async fn reconcile(pool: &sqlx::PgPool) -> Value {
         "postgres_artifacts": postgres_artifacts,
         "paged": true,
     })
-}
-
-pub async fn reconcile_stub(pool: &sqlx::PgPool) -> Value {
-    reconcile(pool).await
 }
 
 #[cfg(test)]

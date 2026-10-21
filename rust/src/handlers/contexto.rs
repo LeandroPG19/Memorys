@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -163,21 +163,6 @@ pub fn transparency_block(saved_summary_chars: usize, discarded_hint: &str) -> V
         "discarded": discarded_hint,
         "note": "pre_compact persists a recoverable snapshot; this block is the receipt"
     })
-}
-
-#[allow(dead_code)]
-pub async fn ensure_table_exists(pool: &PgPool) -> Result<()> {
-    let n: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM information_schema.tables
-         WHERE table_name = 'brain_artifacts'",
-    )
-    .fetch_one(pool)
-    .await
-    .context("probe artifacts table")?;
-    if n == 0 {
-        anyhow::bail!("brain_artifacts missing — run migrations");
-    }
-    Ok(())
 }
 
 pub fn merge_recall(

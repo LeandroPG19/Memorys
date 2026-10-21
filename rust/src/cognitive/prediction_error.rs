@@ -69,17 +69,6 @@ pub fn adaptive_thresholds_zscore(recent_similarities: &[f64]) -> (f64, f64) {
     (reinforce, update)
 }
 
-pub fn assess_novelty_adaptive(
-    similarity_scores: &[f64],
-    recent_similarities: &[f64],
-) -> (bool, f64, GatingAction) {
-    let max_sim = similarity_scores.iter().cloned().fold(0.0f64, f64::max);
-    let action = adaptive_gate(max_sim, recent_similarities);
-
-    let should_store = !matches!(action, GatingAction::Reinforce);
-    (should_store, max_sim, action)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

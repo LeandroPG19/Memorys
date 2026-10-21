@@ -37,6 +37,16 @@ async fn write(pool: &PgPool, args: &Value) -> Result<Value> {
     let project_id = crate::project::current_project_id(pool).await?;
     let session_id = crate::session::session_id();
 
+    // `read` only hides what expired; this is the one place it leaves the table. It runs in the
+    // caller's scope, so under row-level security it removes what that caller may see, and it
+    // sits after the checks above so a refused write deletes nothing. A purge that fails must
+    // not cost the note being written.
+    match purge_expired(pool).await {
+        Ok(0) => {}
+        Ok(purged) => tracing::debug!(purged, "expired working-memory notes removed"),
+        Err(why) => tracing::warn!(error = %why, "could not purge expired working-memory notes"),
+    }
+
     let row: (Uuid,) = sqlx::query_as(
         "INSERT INTO brain_wm (session_id, project_id, content, tag, ttl_seconds, expires_at)
          VALUES ($1, $2, $3, $4, $5, NOW() + make_interval(secs => $5::float8))

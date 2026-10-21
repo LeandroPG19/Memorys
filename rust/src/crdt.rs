@@ -8,23 +8,6 @@ pub struct Clock {
     pub counter: i64,
 }
 
-impl Clock {
-    pub fn dominates(&self, other: &Clock) -> bool {
-        self.actor == other.actor && self.counter >= other.counter
-            || self.counter > other.counter
-                && (self.actor != other.actor || self.counter > other.counter)
-    }
-
-    /// Total order for LWW: higher counter wins; tie → lexicographic actor.
-    pub fn happens_before_or_eq(&self, other: &Clock) -> bool {
-        match self.counter.cmp(&other.counter) {
-            std::cmp::Ordering::Less => true,
-            std::cmp::Ordering::Greater => false,
-            std::cmp::Ordering::Equal => self.actor <= other.actor,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergePick {
     KeepLocal,

@@ -22,11 +22,6 @@ impl ActivationPropagation {
         Self::default()
     }
 
-    pub fn with_decay(mut self, decay: f32) -> Self {
-        self.decay = decay.clamp(0.1, 0.99);
-        self
-    }
-
     pub fn with_max_hops(mut self, hops: usize) -> Self {
         self.max_hops = hops.clamp(1, 8);
         self

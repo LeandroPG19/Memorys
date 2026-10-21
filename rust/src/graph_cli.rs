@@ -19,7 +19,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         "reconcile" => {
             let url = crate::setup::resolve_database_url().await;
             let pool = crate::db::create_pool(&url).await?;
-            let report = crate::graph_db::reconcile_stub(&pool).await;
+            let report = crate::graph_db::reconcile(&pool).await;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }

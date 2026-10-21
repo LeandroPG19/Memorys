@@ -108,30 +108,6 @@ pub struct AbilityScore {
     pub recall_at_k: f64,
 }
 
-pub struct BenchmarkHarness {
-    dataset: Vec<EvaluationSample>,
-    k: usize,
-}
-
-impl BenchmarkHarness {
-    pub fn new(dataset: Vec<EvaluationSample>) -> Self {
-        Self { dataset, k: 10 }
-    }
-
-    pub fn with_k(mut self, k: usize) -> Self {
-        self.k = k.clamp(1, 50);
-        self
-    }
-
-    pub async fn run(&self, pool: &PgPool) -> Result<EvalReport> {
-        let cfg = EvalConfig {
-            k: self.k,
-            ..EvalConfig::default()
-        };
-        run_faro_eval(pool, &self.dataset, &cfg).await
-    }
-}
-
 pub async fn run_faro_eval(
     pool: &PgPool,
     samples: &[EvaluationSample],

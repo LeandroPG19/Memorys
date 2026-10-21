@@ -152,13 +152,6 @@ pub fn load_jsonl_dataset(path: &str) -> Result<Vec<EvaluationSample>, io::Error
     Ok(out)
 }
 
-pub fn load_locomo_dataset(path: &str) -> Result<Vec<EvaluationSample>, io::Error> {
-    if path.is_empty() {
-        return Ok(builtin_retrieval_set());
-    }
-    load_jsonl_dataset(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

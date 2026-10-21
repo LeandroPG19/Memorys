@@ -65,20 +65,6 @@ pub async fn store_chunks(
     Ok(stored)
 }
 
-pub async fn count_unchunked(pool: &PgPool) -> Result<i64> {
-    let threshold = crate::embeddings::chunk::threshold_chars() as i32;
-    let (n,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM brain_observations o
-         WHERE o.observation_type != 'superseded'
-           AND char_length(o.content) > $1
-           AND NOT EXISTS (SELECT 1 FROM brain_observation_chunks c WHERE c.observation_id = o.id)",
-    )
-    .bind(threshold)
-    .fetch_one(pool)
-    .await?;
-    Ok(n)
-}
-
 pub async fn backfill_chunks(pool: &PgPool, limit: i64) -> Result<usize> {
     if limit == 0 {
         return Ok(0);

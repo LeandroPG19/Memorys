@@ -144,30 +144,6 @@ pub async fn append_fact(pool: &PgPool, fact: &Fact) -> Result<(), sqlx::Error> 
     Ok(())
 }
 
-pub async fn supersede_fact(
-    pool: &PgPool,
-    old_id: Uuid,
-    new_id: Uuid,
-    reason: &str,
-) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE brain_facts SET is_current = FALSE, valid_to = $2 WHERE fact_id = $1")
-        .bind(old_id)
-        .bind(Utc::now())
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "INSERT INTO brain_fact_supersedes (old_fact_id, new_fact_id, reason) VALUES ($1, $2, $3)",
-    )
-    .bind(old_id)
-    .bind(new_id)
-    .bind(reason)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
