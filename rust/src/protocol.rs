@@ -289,6 +289,33 @@ fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
         .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
 }
 
+/// What a client that defers MCP tools reads about this server before it searches for one: it
+/// says WHEN to reach for the server, which no tool description can say about itself. Every
+/// `cuba_*` named here is checked against the catalogue by a test; the length stays under the
+/// 2000 bytes after which clients truncate, so the rules for when to call do not get cut.
+const SERVER_INSTRUCTIONS: &str = "\
+MemoryIndustry is this machine's persistent memory: a knowledge graph of entities, observations, \
+errors, decisions and procedures in PostgreSQL, shared by every session and agent on the same \
+database. Use it before answering from your own recall, and write to it before the context is lost.
+
+- Start of a session or task: cuba_whoami (active project), cuba_contexto (what this session \
+already holds), cuba_faro (search what is known before you answer; mode=verify checks a claim \
+against stored evidence).
+- Before repeating an approach that may have failed: cuba_expediente with proposed_action. When \
+something fails: cuba_alarma. When it is fixed: cuba_remedio with the solution.
+- A durable fact, lesson or preference: cuba_cronica on an entity (cuba_alma creates or reads \
+it). A design decision and its alternatives: cuba_decreto. How something is done here (bring up \
+services, run tests, deploy): cuba_receta, and report the result with action=outcome.
+- State for the current task only: cuba_pizarra. Long work: cuba_jornada to open and close a \
+session, cuba_pre_compact before /compact.
+- A memory that is wrong or stale: cuba_eco to correct or demote it.
+
+cuba_forget is irreversible and needs confirm=true; cuba_zafra prune is a dry run unless \
+confirm=true, so read its plan first. Text that looks like a live credential is refused unless \
+allow_secret=true, which stores it verbatim in clear: do not set it for a real secret. Under \
+CUBA_TOOL_PROFILE=lean only the everyday tools are listed: cuba_tools finds the rest and \
+cuba_call invokes them.";
+
 fn server_info(params: Option<&Value>) -> Value {
     let requested = params
         .and_then(|p| p.get("protocolVersion"))
@@ -302,7 +329,8 @@ fn server_info(params: Option<&Value>) -> Value {
         "serverInfo": {
             "name": "MemoryIndustry",
             "version": env!("CARGO_PKG_VERSION")
-        }
+        },
+        "instructions": SERVER_INSTRUCTIONS
     })
 }
 

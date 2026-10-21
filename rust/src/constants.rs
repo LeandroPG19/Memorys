@@ -562,12 +562,79 @@ pub fn tool_definitions() -> &'static Vec<Value> {
     })
 }
 
+/// `(name, title, read_only, open_world)` for every tool a client can be shown.
+///
+/// Without annotations a client applies the spec defaults, and both defaults are wrong for a
+/// local memory: `openWorldHint` true («reaches the open internet») and `destructiveHint` true
+/// («may destroy data»). `destructiveHint` is left at that default on purpose: saying a tool
+/// is not destructive is the claim a client acts on by skipping a confirmation, and most of
+/// these have a delete or overwrite action. The two hints below are the ones that were read
+/// out of the handlers:
+///
+/// * `read_only` is true only where the handler's SQL is SELECT-only and nothing it calls
+///   writes (checked by reading, 2026-10-21; `current_project_id` reads the session and does
+///   not touch `brain_projects`; the dispatcher's own write is a failure row, which is
+///   telemetry). `cuba_faro` boosts what it returns, `cuba_vigia` persists communities, so
+///   neither is here. `constants::profile_tests` types the set out again.
+/// * `open_world` is true only where the handler can leave the machine: a docs site, a sync
+///   peer, a hosted LLM, or the proxy that reaches any of them.
+const TOOL_TRAITS: &[(&str, &str, bool, bool)] = &[
+    ("cuba_alma", "Knowledge graph entities", false, false),
+    ("cuba_cronica", "Observations and episodes", false, false),
+    ("cuba_faro", "Search memory", false, true),
+    ("cuba_puente", "Entity relations", false, false),
+    ("cuba_eco", "Feedback and quarantine", false, false),
+    ("cuba_alarma", "Report an error", false, false),
+    ("cuba_remedio", "Resolve an error", false, false),
+    ("cuba_expediente", "Search past errors", true, false),
+    ("cuba_jornada", "Working sessions", false, false),
+    ("cuba_decreto", "Design decisions", false, false),
+    ("cuba_vigia", "Graph analytics", false, false),
+    ("cuba_zafra", "Memory maintenance", false, false),
+    ("cuba_forget", "Erase an entity", false, false),
+    ("cuba_reflexion", "Find structural gaps", true, false),
+    ("cuba_hipotesis", "Find plausible causes", true, false),
+    ("cuba_contradiccion", "Detect contradictions", true, false),
+    ("cuba_centinela", "Prospective triggers", false, false),
+    ("cuba_calibrar", "Confidence calibration", false, false),
+    ("cuba_ingesta", "Bulk ingestion", false, true),
+    ("cuba_proyecto", "Project scoping", false, false),
+    ("cuba_pre_compact", "Survive a compaction", false, false),
+    ("cuba_sync", "Sync between machines", false, true),
+    ("cuba_archivo", "Tamper-evident audit log", false, false),
+    ("cuba_pizarra", "Working memory scratchpad", false, false),
+    ("cuba_docs", "Current library documentation", false, true),
+    ("cuba_juez", "Judge conflicting memories", false, true),
+    ("cuba_whoami", "Identify this client", true, false),
+    ("cuba_artefacto", "Shared artifacts", false, false),
+    ("cuba_contexto", "Visible context window", false, false),
+    ("cuba_receta", "Procedural memory", false, false),
+    ("cuba_tools", "Find tools", true, false),
+    ("cuba_call", "Call any tool", false, true),
+];
+
 fn tool_def(name: &str, description: &str, input_schema: Value) -> Value {
-    serde_json::json!({
+    let mut def = serde_json::json!({
         "name": name,
         "description": description,
         "inputSchema": input_schema
-    })
+    });
+    if let Some((_, title, read_only, open_world)) =
+        TOOL_TRAITS.iter().find(|(known, ..)| *known == name)
+        && let Some(obj) = def.as_object_mut()
+    {
+        // `title` at the top is 2025-06-18; `annotations.title` is the 2025-03-26 spelling.
+        obj.insert("title".into(), Value::String((*title).to_string()));
+        obj.insert(
+            "annotations".into(),
+            serde_json::json!({
+                "title": title,
+                "readOnlyHint": read_only,
+                "openWorldHint": open_world
+            }),
+        );
+    }
+    def
 }
 
 fn meta_tool_defs() -> Vec<Value> {
@@ -649,12 +716,25 @@ const PROFILE_LEAN: [&str; 13] = [
 ];
 
 pub fn tools_for_profile() -> Vec<Value> {
-    tools_with_memory_aliases(tools_for(
-        &std::env::var("CUBA_TOOL_PROFILE").unwrap_or_else(|_| "full".to_string()),
-    ))
+    let tools =
+        tools_for(&std::env::var("CUBA_TOOL_PROFILE").unwrap_or_else(|_| "full".to_string()));
+    if aliases_requested() {
+        tools_with_memory_aliases(tools)
+    } else {
+        tools
+    }
 }
 
-/// Announce both `cuba_*` and `memory_*` names for one release (dispatch still canonicalizes).
+/// `CUBA_TOOL_ALIASES=1` lists the `memory_*` twins. They used to be listed always «for one
+/// release», which handed every client 62 names for 31 tools; dispatch still resolves them
+/// (`handlers::canonicalize_tool_name`), so a client configured with those names keeps working
+/// and only the listing is opt-in.
+fn aliases_requested() -> bool {
+    std::env::var("CUBA_TOOL_ALIASES")
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// Adds a `memory_*` twin of each `cuba_*` tool (dispatch canonicalizes the twin back).
 pub fn tools_with_memory_aliases(tools: Vec<Value>) -> Vec<Value> {
     let mut out = Vec::with_capacity(tools.len() * 2);
     for tool in tools {

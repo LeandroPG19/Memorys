@@ -5,6 +5,24 @@ All notable changes to MemoryIndustry (formerly cuba-memorys) are documented her
 [SemVer](https://semver.org/) for the Rust crate (`Cargo.toml`). PyPI
 versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI 1.28.0).
 
+## [0.32.0] — unreleased (not versioned yet: `Cargo.toml` still says 0.31.0)
+
+What the 2026-10-21 audit of the 0.31 branch found and could close without the user's machine; the plan, with its
+measurements and the state of the art it was weighed against, is `backlog/0.32-analisis-y-sota.md`.
+
+### Behaviour changes — read before deploying
+
+- **`tools/list` shows each tool once.** The `memory_*` twins were announced «for one release» next to every `cuba_*` tool and stayed: a client was handed 62 names for 31 tools (the twins carry the whole schema again), 30 under `CUBA_TOOL_PROFILE=lean` where this README says 15, and a client that defers MCP tools pays for every name it is shown. The twins still dispatch (`memory_whoami`, `memory_artifact`, … resolve through `handlers::canonicalize_tool_name`), so a client configured with those names keeps working; only the listing is opt-in, `CUBA_TOOL_ALIASES=1` (also `true` / `yes`). `/admin` reports the number of tools listed, so it halves with it. `tests/mcp_catalogue.rs` starts the binary and counts what a client receives.
+
+### Fixed
+
+- **`initialize` stops answering a client from the future with a revision we do not speak.** `SUPPORTED_PROTOCOL_VERSIONS` started with `2026-07-28` and an unknown version was answered with index 0, so a client asking for anything newer was told «2026-07-28» by a server that sends none of that revision's mandatory fields (`resultType`, `ttlMs`/`cacheScope` on `*/list`, `server/discover`; 0 occurrences in `src/` and `tests/`). Claude Code 2.1.302 carries a workaround for exactly that. The list now holds the four revisions the server implements and the newest is the answer; a test names `2026-07-28` as «not implemented» and is deleted in the change that implements it. (0.32 A3)
+- **The saved `llm set` / `graph` configuration is loaded before the tokio runtime exists.** `llm_cli::load_saved_config_into_env` and `graph_db::load_saved_config_into_env` call `std::env::set_var`, which Rust 2024 makes `unsafe` because it races with any thread that reads the environment; their `SAFETY` comment said «single-threaded startup before tokio workers spawn», and they were called at the top of `async_main`, inside `block_on`, after `Builder::new_multi_thread().build()` had created the workers. They now run in `main()`, after `resources::apply` (the other writer, already there) and before the runtime, in the same order as before. The workers were parked, so nothing was ever seen to go wrong; the contract was broken all the same. (0.32 A4)
+
+### Added
+
+- **Every tool has a `title` and `annotations`, and `initialize` carries `instructions`.** Without annotations a client applies the spec defaults, `openWorldHint: true` and `destructiveHint: true`, to a memory that never leaves the machine (except in six tools, which now say so: `cuba_docs`, `cuba_sync`, `cuba_ingesta`, `cuba_juez`, `cuba_faro` mode=verify and the `cuba_call` proxy). `readOnlyHint: true` is claimed for six tools only (`cuba_tools`, `cuba_whoami`, `cuba_expediente`, `cuba_reflexion`, `cuba_hipotesis`, `cuba_contradiccion`), each read in its handler for SELECT-only SQL and no writer on its path; `cuba_faro` boosts what it returns and `cuba_vigia` persists communities, so they are not there. `destructiveHint` stays at the spec default on purpose: saying «not destructive» is the claim a client acts on by skipping a confirmation, and most tools have a delete or overwrite action. The `instructions` (1,552 bytes, under the 2,000 after which clients truncate) say when to reach for the server — search before answering, report errors, record decisions — and every `cuba_*` they name is checked against the catalogue by a test. (0.32 A2)
+
 ## [0.31.0] — unreleased (Cargo `0.31.0` · npm `0.31.0` · PyPI `1.33.0`)
 
 The real machine and a judge that does not lose the hour. 0.30.0 was proved and deployed on the user's PC on
