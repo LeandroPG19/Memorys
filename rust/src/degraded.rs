@@ -85,4 +85,45 @@ mod tests {
              for a program to match and a repeat would only be noise"
         );
     }
+
+    fn costs(signal: &str) -> &'static str {
+        match signal {
+            "working_memory" => "cuesta la memoria de trabajo",
+            _ => "cuesta otra cosa",
+        }
+    }
+
+    #[test]
+    fn a_response_with_nothing_lost_is_left_exactly_as_it_was() {
+        let mut response = serde_json::json!({"results": [1]});
+        LostSignals::default().annotate(&mut response, costs);
+        assert_eq!(
+            response,
+            serde_json::json!({"results": [1]}),
+            "a healthy call carries no degradation keys: these handlers run every turn"
+        );
+    }
+
+    #[test]
+    fn a_response_with_something_lost_names_it_flags_it_and_says_what_it_costs() {
+        let mut lost = LostSignals::default();
+        let _: Vec<u8> = lost.note("working_memory", Err::<Vec<u8>, _>("gone"));
+        let _: Vec<u8> = lost.note("artifacts", Err::<Vec<u8>, _>("gone"));
+        let mut response = serde_json::json!({"results": [1]});
+        lost.annotate(&mut response, costs);
+
+        assert_eq!(response["results"], serde_json::json!([1]));
+        assert_eq!(response["signals_degraded"], serde_json::json!(true));
+        assert_eq!(
+            response["signals_lost"],
+            serde_json::json!(["working_memory", "artifacts"])
+        );
+        let reason = response["signals_degraded_reason"]
+            .as_str()
+            .expect("a reason in words");
+        assert!(
+            reason.contains("cuesta la memoria de trabajo; cuesta otra cosa"),
+            "the reason says what each lost signal costs the reader, in the order lost: {reason}"
+        );
+    }
 }
