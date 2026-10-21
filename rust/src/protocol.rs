@@ -1553,6 +1553,36 @@ mod tests {
         assert_eq!(unique.len(), SUPPORTED_PROTOCOL_VERSIONS.len());
     }
 
+    /// The `2026-07-28` revision removes `initialize` and sessions and makes three things
+    /// mandatory: `resultType` in every result, `ttlMs` and `cacheScope` in every `*/list`,
+    /// and `server/discover`. This server produces none of them, so naming that revision in
+    /// the handshake is a claim it cannot keep: a strict client trusts it, and Claude Code
+    /// 2.1.302 already carries a workaround for servers that make it («no tools»). Answering
+    /// with the newest revision we really speak keeps the claim true.
+    ///
+    /// The day the revision is implemented, this test is deleted in the same change.
+    #[test]
+    fn we_do_not_name_a_protocol_revision_whose_mandatory_fields_we_do_not_send() {
+        const NOT_IMPLEMENTED: [&str; 1] = ["2026-07-28"];
+        for revision in NOT_IMPLEMENTED {
+            assert!(
+                !SUPPORTED_PROTOCOL_VERSIONS.contains(&revision),
+                "{revision} is in SUPPORTED_PROTOCOL_VERSIONS, but nothing in this server sends \
+                 resultType, ttlMs, cacheScope or answers server/discover"
+            );
+            assert_ne!(
+                negotiate_protocol_version(Some(revision)),
+                revision,
+                "a client asking for {revision} was answered {revision}"
+            );
+        }
+        assert_eq!(
+            negotiate_protocol_version(Some("2099-01-01")),
+            "2025-11-25",
+            "a client from the future gets the newest revision we really implement"
+        );
+    }
+
     fn pool_that_never_connects() -> PgPool {
         sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(Duration::from_secs(5))
