@@ -1582,6 +1582,46 @@ mod tests {
         );
     }
 
+    /// The `instructions` field of `initialize` is the only text a client that defers MCP tools
+    /// reads about this server before it searches for one of them (Claude Code: names and
+    /// instructions at start, schemas on demand). It says WHEN to reach for the server, which no
+    /// tool description can say about itself. Every `cuba_*` it names must exist: the text is
+    /// written by hand and the catalogue changes, and a tool renamed under it would send every
+    /// session to a name that answers «unknown tool».
+    #[test]
+    fn the_handshake_carries_instructions_that_name_only_tools_that_exist() {
+        let info = server_info(None);
+        let text = info
+            .get("instructions")
+            .and_then(Value::as_str)
+            .expect("initialize has no `instructions`");
+        assert!(
+            (200..=2000).contains(&text.len()),
+            "instructions are {} bytes: under 200 says nothing, over 2000 gets truncated by \
+             clients, and the end is where the rules go",
+            text.len()
+        );
+
+        let catalogue: Vec<String> = crate::constants::tools_for("full")
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
+            .collect();
+        let named: Vec<&str> = text
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| word.starts_with("cuba_"))
+            .collect();
+        assert!(
+            named.contains(&"cuba_faro"),
+            "the search that grounds an answer is the first thing to call and must be named"
+        );
+        for name in named {
+            assert!(
+                catalogue.iter().any(|n| n == name),
+                "the instructions send the client to `{name}`, which is not in the catalogue"
+            );
+        }
+    }
+
     fn pool_that_never_connects() -> PgPool {
         sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(Duration::from_secs(5))

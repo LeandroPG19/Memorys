@@ -807,6 +807,85 @@ mod profile_tests {
         assert!(names.contains(&"memory_artifact"));
     }
 
+    fn named(tools: &[Value], hint: &str, value: bool) -> Vec<String> {
+        let mut out: Vec<String> = tools
+            .iter()
+            .filter(|t| t.pointer(&format!("/annotations/{hint}")) == Some(&Value::Bool(value)))
+            .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn every_tool_carries_a_title_and_says_what_it_does_to_the_world() {
+        for tool in tools_for("full") {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("?");
+            let title = tool
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(!title.trim().is_empty(), "{name} has no `title`");
+            assert_eq!(
+                tool.pointer("/annotations/title").and_then(Value::as_str),
+                Some(title),
+                "{name}: clients on 2025-03-26 read the title from annotations"
+            );
+            for hint in ["readOnlyHint", "openWorldHint"] {
+                assert!(
+                    tool.pointer(&format!("/annotations/{hint}"))
+                        .is_some_and(Value::is_boolean),
+                    "{name} leaves `{hint}` to the spec default, and the default of \
+                     openWorldHint is true: every local-memory call would be labelled as \
+                     reaching the open internet"
+                );
+            }
+        }
+    }
+
+    /// Checked by reading each handler on 2026-10-21, not inferred from its name: SELECT-only
+    /// SQL, no call into a module that writes (`current_project_id` reads the session, it does
+    /// not touch `brain_projects`), and the dispatcher writes only a failure row that is
+    /// telemetry. `cuba_faro` boosts what it returns, `cuba_vigia` persists communities and
+    /// `cuba_jornada`/`cuba_proyecto` change the session, so none of them is here. The list is
+    /// typed out in the test on purpose: widening what a tool claims takes a second edit, and
+    /// a client that auto-approves read-only tools is the one that pays for a wrong claim.
+    #[test]
+    fn only_tools_that_write_nothing_claim_to_be_read_only() {
+        assert_eq!(
+            named(&tools_for("full"), "readOnlyHint", true),
+            [
+                "cuba_contradiccion",
+                "cuba_expediente",
+                "cuba_hipotesis",
+                "cuba_reflexion",
+                "cuba_tools",
+                "cuba_whoami",
+            ]
+        );
+    }
+
+    /// The tools whose handler can leave the machine: a documentation site (`cuba_docs`), a sync
+    /// peer over HTTP (`cuba_sync`), an LLM that may be hosted (`cuba_ingesta` auto_extract,
+    /// `cuba_juez`, `cuba_faro` mode=verify) and the proxy that reaches any of them
+    /// (`cuba_call`). Everything else answers from the local database.
+    #[test]
+    fn only_tools_that_can_leave_the_machine_say_they_are_open_world() {
+        let mut expected = vec![
+            "cuba_call",
+            "cuba_faro",
+            "cuba_ingesta",
+            "cuba_juez",
+            "cuba_sync",
+        ];
+        #[cfg(feature = "docs")]
+        if crate::handlers::docs::enabled() {
+            expected.push("cuba_docs");
+            expected.sort();
+        }
+        assert_eq!(named(&tools_for("full"), "openWorldHint", true), expected);
+    }
+
     #[test]
     fn agent_profile_includes_coordination_tools() {
         let names: Vec<String> = tools_for("agent")
