@@ -726,9 +726,86 @@ struct GraphContext {
     hop_ball_tokens: usize,
 }
 
+/// Up to three observations of the nodes PageRank found that the results do not already carry,
+/// two per node at most.
+async fn observations_of_ranked_nodes(
+    pool: &PgPool,
+    ranked: &[crate::graph_db::PprNode],
+    results_json: &[Value],
+) -> Vec<Value> {
+    let mut existing: HashSet<String> = results_json
+        .iter()
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    let mut extras: Vec<Value> = Vec::new();
+    for node in ranked {
+        if extras.len() >= 3 {
+            break;
+        }
+        for obs in observations_for_entities(pool, std::slice::from_ref(&node.name), 2).await {
+            let Some(id) = obs.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !existing.insert(id.to_string()) {
+                continue;
+            }
+            extras.push(obs);
+            if extras.len() >= 3 {
+                break;
+            }
+        }
+    }
+    extras
+}
+
+/// The PageRank half of a multi-hop answer: the names, and the extra observations that take the
+/// place of the last results.
+async fn add_ppr_context(
+    pool: &PgPool,
+    opts: &SearchOpts<'_>,
+    ranked: &[crate::graph_db::PprNode],
+    results_json: &mut Vec<Value>,
+    graph: &mut GraphContext,
+) {
+    graph.backend = Some("falkor");
+    graph.ppr_names = ranked.iter().take(5).map(|n| n.name.clone()).collect();
+    let extras = observations_of_ranked_nodes(pool, ranked, results_json).await;
+    if !extras.is_empty() {
+        let keep = (opts.limit as usize).saturating_sub(extras.len());
+        results_json.truncate(keep);
+        results_json.extend(extras);
+    }
+}
+
+/// The traversal half: the paths and what the hop ball and the compact context cost in tokens.
+fn add_traversal_context(
+    graph: &mut GraphContext,
+    hops: &[crate::graph_db::GraphHop],
+    paths: &[crate::graph::paths::RelPath],
+) {
+    if !hops.is_empty() || !paths.is_empty() {
+        graph.backend = Some("falkor");
+    }
+    if !paths.is_empty() {
+        graph.paths = Some(serde_json::json!(
+            paths
+                .iter()
+                .map(crate::graph_db::compact_rel_path)
+                .collect::<Vec<_>>()
+        ));
+    }
+    graph.hop_ball_tokens =
+        crate::search::budget::count_tokens(&crate::graph_db::hop_ball_payload(hops).to_string());
+    let compact_ctx = serde_json::json!({
+        "paths": graph.paths.clone().unwrap_or(serde_json::json!([])),
+        "ppr": graph.ppr_names,
+    });
+    graph.context_tokens = crate::search::budget::count_tokens(&compact_ctx.to_string());
+}
+
 /// Multi-hop questions: personalised PageRank around the entities the query and the results
-/// mention, up to three extra observations of the nodes it finds, and the paths and hop ball
-/// with their token cost. Every step is optional: with no graph backend it adds nothing.
+/// mention, and the paths and hop ball of the first of them, each with its token cost. Every step
+/// is optional: with no graph backend it adds nothing.
 async fn multi_hop_context(
     pool: &PgPool,
     query: &str,
@@ -744,58 +821,12 @@ async fn multi_hop_context(
     if let Ok(ranked) = crate::graph_db::ppr_around_seeds(&seeds, 3, 15)
         && !ranked.is_empty()
     {
-        graph.backend = Some("falkor");
-        graph.ppr_names = ranked.iter().take(5).map(|n| n.name.clone()).collect();
-        let mut existing: HashSet<String> = results_json
-            .iter()
-            .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
-            .collect();
-        let mut extras: Vec<Value> = Vec::new();
-        for node in &ranked {
-            if extras.len() >= 3 {
-                break;
-            }
-            for obs in observations_for_entities(pool, std::slice::from_ref(&node.name), 2).await {
-                let Some(id) = obs.get("id").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if !existing.insert(id.to_string()) {
-                    continue;
-                }
-                extras.push(obs);
-                if extras.len() >= 3 {
-                    break;
-                }
-            }
-        }
-        if !extras.is_empty() {
-            let keep = (opts.limit as usize).saturating_sub(extras.len());
-            results_json.truncate(keep);
-            results_json.extend(extras);
-        }
+        add_ppr_context(pool, opts, &ranked, results_json, &mut graph).await;
     }
     if let Some(seed) = seeds.first()
         && let Ok((hops, paths)) = crate::graph_db::traverse_falkor_with_paths(seed, 3)
     {
-        if !hops.is_empty() || !paths.is_empty() {
-            graph.backend = Some("falkor");
-        }
-        if !paths.is_empty() {
-            graph.paths = Some(serde_json::json!(
-                paths
-                    .iter()
-                    .map(crate::graph_db::compact_rel_path)
-                    .collect::<Vec<_>>()
-            ));
-        }
-        graph.hop_ball_tokens = crate::search::budget::count_tokens(
-            &crate::graph_db::hop_ball_payload(&hops).to_string(),
-        );
-        let compact_ctx = serde_json::json!({
-            "paths": graph.paths.clone().unwrap_or(serde_json::json!([])),
-            "ppr": graph.ppr_names,
-        });
-        graph.context_tokens = crate::search::budget::count_tokens(&compact_ctx.to_string());
+        add_traversal_context(&mut graph, &hops, &paths);
     }
     graph
 }

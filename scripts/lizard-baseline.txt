@@ -90,7 +90,7 @@ src/handlers/expediente.rs::handle#1 9
 src/handlers/faro.rs::check_ood#1 14
 src/handlers/faro.rs::enrich_graphrag#1 9
 src/handlers/faro.rs::handle#1 12
-src/handlers/faro.rs::hybrid_search#1 80
+src/handlers/faro.rs::hybrid_search#1 24
 src/handlers/faro.rs::text_search#1 11
 src/handlers/faro.rs::verify_claim#1 12
 src/handlers/forget.rs::handle#1 9

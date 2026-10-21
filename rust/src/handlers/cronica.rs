@@ -278,12 +278,25 @@ async fn add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<Value> {
         "embedding": embedding,
         "write_to_searchable_ms": started.elapsed().as_millis() as u64
     });
-    if let Some(because) = quarantined_because {
+    note_quarantine(&mut response, &trust, quarantined_because);
+    Ok(response)
+}
+
+/// Says in the response that the write was held back, and why, when it was.
+fn note_quarantine(response: &mut Value, trust: &str, because: Option<&'static str>) {
+    if let Some(because) = because {
         response["trust"] = serde_json::json!(trust);
         response["quarantined_because"] = serde_json::json!(because);
         response["quarantined_note"] = serde_json::json!(QUARANTINED_NOTE);
     }
-    Ok(response)
+}
+
+/// The batch version: which entities had a row held back, and why.
+fn note_quarantined_rows(response: &mut Value, quarantined: Vec<Value>) {
+    if !quarantined.is_empty() {
+        response["quarantined"] = serde_json::json!(quarantined);
+        response["quarantined_note"] = serde_json::json!(QUARANTINED_NOTE);
+    }
 }
 
 const QUARANTINED_NOTE: &str = "the text has the shape of an attempt to override instructions, so \
@@ -538,12 +551,9 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
                     importance: pending.importance,
                 });
                 added += 1;
-                if let Some(because) = pending.quarantined_because {
-                    quarantined.push(serde_json::json!({
-                        "entity": pending.entity_name,
-                        "because": because
-                    }));
-                }
+                quarantined.extend(pending.quarantined_because.map(|because| {
+                    serde_json::json!({"entity": pending.entity_name, "because": because})
+                }));
             }
             BatchAction::Reinforce(obs_id) => {
                 sqlx::query(
@@ -601,10 +611,7 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
         "total_processed": added + deduplicated + reinforced,
         "chunks": chunks_written
     });
-    if !quarantined.is_empty() {
-        response["quarantined"] = serde_json::json!(quarantined);
-        response["quarantined_note"] = serde_json::json!(QUARANTINED_NOTE);
-    }
+    note_quarantined_rows(&mut response, quarantined);
     Ok(response)
 }
 
