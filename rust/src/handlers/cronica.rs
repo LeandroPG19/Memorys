@@ -161,7 +161,8 @@ async fn add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<Value> {
 
     let active_session_id: Option<uuid::Uuid> = crate::session::session_id();
 
-    let trust = crate::core::trust::for_source(source, args.get("trust").and_then(|v| v.as_str()));
+    let (trust, quarantined_because) =
+        crate::core::trust::for_write(source, args.get("trust").and_then(|v| v.as_str()), content);
 
     let row: (uuid::Uuid,) = sqlx::query_as(
         "INSERT INTO brain_observations (entity_id, content, observation_type, source, importance, session_id, tags, project_id, trust)
@@ -264,7 +265,7 @@ async fn add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<Value> {
         (None, 0)
     };
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "action": "add",
         "id": row.0.to_string(),
         "entity_name": entity_name,
@@ -276,8 +277,19 @@ async fn add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<Value> {
         "superseded": superseded,
         "embedding": embedding,
         "write_to_searchable_ms": started.elapsed().as_millis() as u64
-    }))
+    });
+    if let Some(because) = quarantined_because {
+        response["trust"] = serde_json::json!(trust);
+        response["quarantined_because"] = serde_json::json!(because);
+        response["quarantined_note"] = serde_json::json!(QUARANTINED_NOTE);
+    }
+    Ok(response)
 }
+
+const QUARANTINED_NOTE: &str = "the text has the shape of an attempt to override instructions, so \
+     it is stored but withheld from cuba_faro and the context until a person looks at it: \
+     cuba_eco action=pending lists it, action=promote clears it. Pass trust=trusted to store \
+     such a text on purpose.";
 
 const RETIRE_LOW_VALUE_SQL: &str = "UPDATE brain_observations SET observation_type = 'superseded'
      WHERE entity_id = $1 AND importance < 0.05
@@ -409,6 +421,7 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
         importance: f64,
         tags: Vec<String>,
         trust: String,
+        quarantined_because: Option<&'static str>,
     }
     struct InsertedObs {
         entity_id: uuid::Uuid,
@@ -418,7 +431,7 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
         importance: f64,
     }
     enum BatchAction {
-        Insert(PendingObs),
+        Insert(Box<PendingObs>),
         Reinforce(uuid::Uuid),
     }
 
@@ -461,7 +474,12 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
                 let density = information_density(content);
                 let importance = crate::constants::importance_prior(obs_type, density);
                 let tags = extract_tags(content);
-                actions.push(BatchAction::Insert(PendingObs {
+                let (trust, quarantined_because) = crate::core::trust::for_write(
+                    source,
+                    obs.get("trust").and_then(|v| v.as_str()),
+                    content,
+                );
+                actions.push(BatchAction::Insert(Box::new(PendingObs {
                     precomputed_embedding: precomputed,
                     entity_id,
                     entity_name: entity_name.to_string(),
@@ -471,11 +489,9 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
                     source: source.to_string(),
                     importance,
                     tags,
-                    trust: crate::core::trust::for_source(
-                        source,
-                        obs.get("trust").and_then(|v| v.as_str()),
-                    ),
-                }));
+                    trust,
+                    quarantined_because,
+                })));
             }
         }
     }
@@ -484,6 +500,7 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
 
     let mut tx = pool.begin().await.context("failed to begin transaction")?;
     let mut added = 0u32;
+    let mut quarantined: Vec<Value> = Vec::new();
     let mut reinforced = 0u32;
     let mut inserted_for_embed: Vec<PendingEmbed> = Vec::new();
     let mut inserted_for_facts: Vec<InsertedObs> = Vec::new();
@@ -521,6 +538,12 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
                     importance: pending.importance,
                 });
                 added += 1;
+                if let Some(because) = pending.quarantined_because {
+                    quarantined.push(serde_json::json!({
+                        "entity": pending.entity_name,
+                        "because": because
+                    }));
+                }
             }
             BatchAction::Reinforce(obs_id) => {
                 sqlx::query(
@@ -570,14 +593,19 @@ async fn batch_add(pool: &PgPool, args: &Value) -> Result<Value> {
         chunks_written += n;
     }
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "action": "batch_add",
         "added": added,
         "deduplicated": deduplicated,
         "reinforced": reinforced,
         "total_processed": added + deduplicated + reinforced,
         "chunks": chunks_written
-    }))
+    });
+    if !quarantined.is_empty() {
+        response["quarantined"] = serde_json::json!(quarantined);
+        response["quarantined_note"] = serde_json::json!(QUARANTINED_NOTE);
+    }
+    Ok(response)
 }
 
 async fn timeline(pool: &PgPool, entity_name: &str) -> Result<Value> {
