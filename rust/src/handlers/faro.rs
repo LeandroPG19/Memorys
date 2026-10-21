@@ -358,6 +358,510 @@ fn annotate_lost_signals(response: &mut Value, lost: &LostSignals) {
     ));
 }
 
+type Ranked = Vec<(String, FusedResult)>;
+
+/// Which ranked list a result came from, and so which score of `FusedResult` it fills.
+#[derive(Clone, Copy)]
+enum Channel {
+    Text,
+    Vector,
+    Bm25,
+    Entity,
+}
+
+fn set_channel_score(fr: &mut FusedResult, channel: Channel, score: f64) {
+    match channel {
+        Channel::Text => fr.text_score = score,
+        Channel::Vector => fr.vector_score = score,
+        Channel::Bm25 => fr.bm25_score = score,
+        Channel::Entity => {}
+    }
+}
+
+/// Folds one ranked list into the fusion with reciprocal rank: `weight / (k + rank + 1)`. The text
+/// list is the first and inserts (a repeated id keeps its later rank, as it always did); the others
+/// add to what is there. The entity leg has no score of its own and skips a row with no id.
+fn fold_ranked(
+    fused: &mut HashMap<String, FusedResult>,
+    ranked: &[Value],
+    weight: f64,
+    channel: Channel,
+) {
+    let rrf_k = crate::search::rrf::RRF_K;
+    for (rank, result) in ranked.iter().enumerate() {
+        let id = result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if matches!(channel, Channel::Entity) && id.is_empty() {
+            continue;
+        }
+        let rrf_score = weight / (rrf_k + rank as f64 + 1.0);
+        let fresh = || {
+            let mut fr = FusedResult {
+                text_score: 0.0,
+                vector_score: 0.0,
+                bm25_score: 0.0,
+                session_boosted: false,
+                total: rrf_score,
+                data: result.clone(),
+            };
+            set_channel_score(&mut fr, channel, rrf_score);
+            fr
+        };
+        if matches!(channel, Channel::Text) {
+            fused.insert(id, fresh());
+        } else {
+            fused
+                .entry(id)
+                .and_modify(|fr| {
+                    set_channel_score(fr, channel, rrf_score);
+                    fr.total += rrf_score;
+                })
+                .or_insert_with(fresh);
+        }
+    }
+}
+
+/// Observations carrying the requested tag join the text results. A tag is an observation filter:
+/// under scope=errors it used to dump observations into a result set that claimed to be errors.
+async fn add_tag_matches(
+    pool: &PgPool,
+    tag: &str,
+    scope: &str,
+    opts: &SearchOpts<'_>,
+    text_results: &mut Vec<Value>,
+) -> Result<()> {
+    if scope != "all" && scope != "observations" {
+        return Ok(());
+    }
+    let tagged_obs: Vec<(uuid::Uuid, String, String, String, f64, f64)> = sqlx::query_as(
+        "SELECT o.id, e.name, o.content, o.observation_type, o.importance::float8,
+                    (o.importance::float8 * 0.8 + 0.2)::float8 AS score
+             FROM brain_observations o
+             JOIN brain_entities e ON o.entity_id = e.id
+             WHERE $1 = ANY(o.tags)
+               AND o.observation_type != 'superseded'
+               AND o.trust = 'trusted'
+               AND ($3::uuid IS NULL OR o.project_id = $3 OR ($4::bool AND o.project_id IS NULL))
+             ORDER BY o.importance DESC
+             LIMIT $2",
+    )
+    .bind(tag)
+    .bind(opts.limit)
+    .bind(opts.project_id)
+    .bind(opts.include_unscoped)
+    .fetch_all(pool)
+    .await
+    .with_context(|| {
+        format!(
+            "looking up observations tagged {tag:?}. Failing loud instead of returning \
+                 the untagged ranking: those results would be presented as if the tag had \
+                 been applied and simply matched nothing."
+        )
+    })?;
+
+    for (id, entity_name, content, obs_type, importance, score) in tagged_obs {
+        let id_str = id.to_string();
+        if !text_results
+            .iter()
+            .any(|r| r.get("id").and_then(|v| v.as_str()) == Some(&id_str))
+        {
+            text_results.push(serde_json::json!({
+                "id": id_str,
+                "type": "observation",
+                "entity_name": entity_name,
+                "content": content,
+                "observation_type": obs_type,
+                "importance": importance,
+                "score": score,
+                "matched_tag": tag
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Highest fused score first; the id decides a tie so that the order does not depend on the
+/// iteration order of the map the results came out of.
+fn sort_ranked(results: &mut Ranked) {
+    results.sort_by(|a, b| {
+        b.1.total
+            .partial_cmp(&a.1.total)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
+/// Drops a result whose text overlaps more than `FUSION_DEDUP` with one that ranked above it.
+fn dedup_by_overlap(results: Ranked) -> Ranked {
+    const FUSION_DEDUP: f64 = 0.85;
+    let mut deduped: Ranked = Vec::with_capacity(results.len());
+    for (id, fr) in results {
+        let content = fr
+            .data
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let duplicate = deduped.iter().any(|(_, existing)| {
+            let other = existing
+                .data
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            crate::search::rrf::content_overlap(content, other) > FUSION_DEDUP
+        });
+        if !duplicate {
+            deduped.push((id, fr));
+        }
+    }
+    deduped
+}
+
+/// How many fused results go on to the later stages: the reranker takes fifty, the diversifier
+/// five times the limit, and otherwise the limit.
+fn pool_size(opts: &SearchOpts<'_>, available: usize) -> usize {
+    if opts.enable_rerank {
+        50.min(available)
+    } else if opts.diversify {
+        (opts.limit as usize * 5).min(available)
+    } else {
+        (opts.limit as usize).min(available)
+    }
+}
+
+/// Reorders `results` with the cross-encoder, within the budget, and says what happened. On a
+/// failure the ranking goes back as RRF left it.
+async fn rerank_stage(query: &str, mut results: Ranked) -> (Ranked, RerankOutcome) {
+    let contents: Vec<&str> = results
+        .iter()
+        .map(|(_, fr)| {
+            fr.data
+                .get("content")
+                .or_else(|| fr.data.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        })
+        .collect();
+    // The budget starts here, before the model is resolved. It used to
+    // start after: the first search on a cold daemon pays a 1.1 GB read,
+    // and measuring only the inference that followed made 20 s look
+    // generous while the caller waited minutes for a number that was never
+    // being timed.
+    let rerank_budget = crate::search::rerank::budget();
+    let mut timed_out = false;
+    let attempted = tokio::time::timeout(rerank_budget, async {
+        let have_model = tokio::task::spawn_blocking(crate::search::rerank::enabled)
+            .await
+            .context("reranker status task panicked")?;
+        anyhow::Ok((
+            have_model,
+            crate::search::rerank::rerank(query, &contents).await,
+        ))
+    })
+    .await;
+
+    let (have_model, rerank_result) = match attempted {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => (false, Err(e)),
+        Err(_) => {
+            tracing::warn!(
+                secs = rerank_budget.as_secs(),
+                "reranker excedió su presupuesto — se devuelve el ranking RRF"
+            );
+            timed_out = true;
+            (false, Err(anyhow::anyhow!("reranker timeout")))
+        }
+    };
+    let rerank_outcome = rerank_outcome_of(rerank_result.is_ok(), have_model, timed_out);
+    match rerank_result {
+        Ok(reranked) => {
+            let original = results.clone();
+            results = reranked
+                .into_iter()
+                .filter_map(|(idx, score)| {
+                    let mut entry = original.get(idx).cloned()?;
+                    if have_model {
+                        entry.1.total = score;
+                    } else {
+                        entry.1.total += score * 0.0001;
+                    }
+                    Some(entry)
+                })
+                .collect();
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %format!("{e:#}"),
+                "RERANK FAILED — el ranking se devuelve SIN reordenar. El modelo se \
+                     cargó y se gastó el tiempo de inferencia, pero sus scores se \
+                     descartaron: los resultados son los de RRF."
+            );
+        }
+    }
+    (results, rerank_outcome)
+}
+
+/// Boosts what the session's goals and working memory are about, and re-sorts.
+fn boost_by_session(results: &mut Ranked, session_boost: &[String]) {
+    for (_, fr) in results.iter_mut() {
+        let content = fr
+            .data
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let entity_name = fr
+            .data
+            .get("entity_name")
+            .or_else(|| fr.data.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let (boosted, flagged) = crate::search::entity_factoid::apply_session_entity_boost(
+            fr.total,
+            entity_name,
+            content,
+            session_boost,
+        );
+        if flagged {
+            fr.total = boosted;
+            fr.session_boosted = true;
+        }
+    }
+    sort_ranked(results);
+}
+
+fn content_tokens(data: &Value) -> HashSet<String> {
+    data.get("content")
+        .or_else(|| data.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            s.to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() > 2)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pairwise Jaccard similarity of the token sets, 1.0 on the diagonal.
+fn jaccard_matrix(token_sets: &[HashSet<String>]) -> Vec<Vec<f64>> {
+    let n = token_sets.len();
+    let mut pairwise = vec![vec![0.0_f64; n]; n];
+    for i in 0..n {
+        pairwise[i][i] = 1.0;
+        for j in (i + 1)..n {
+            let inter = token_sets[i].intersection(&token_sets[j]).count();
+            let union = token_sets[i].union(&token_sets[j]).count();
+            let jaccard = if union == 0 {
+                0.0
+            } else {
+                inter as f64 / union as f64
+            };
+            pairwise[i][j] = jaccard;
+            pairwise[j][i] = jaccard;
+        }
+    }
+    pairwise
+}
+
+/// The final cut: MMR when diversifying (picks the `limit` that balance relevance and novelty),
+/// otherwise the first `limit` by score.
+fn diversify_or_cut(mut results: Ranked, opts: &SearchOpts<'_>) -> Ranked {
+    if opts.diversify && results.len() > 1 {
+        let relevance: Vec<f64> = results.iter().map(|(_, fr)| fr.total).collect();
+        let token_sets: Vec<HashSet<String>> = results
+            .iter()
+            .map(|(_, fr)| content_tokens(&fr.data))
+            .collect();
+        let pairwise = jaccard_matrix(&token_sets);
+        let picks = crate::search::mmr::mmr_select(
+            &relevance,
+            &pairwise,
+            opts.mmr_lambda,
+            opts.limit as usize,
+        );
+        picks
+            .into_iter()
+            .filter_map(|i| results.get(i).cloned())
+            .collect()
+    } else {
+        results.truncate(opts.limit as usize);
+        results
+    }
+}
+
+/// The result rows as the response carries them: the data plus how each channel scored it.
+fn ranked_to_json(results: &Ranked) -> Vec<Value> {
+    results
+        .iter()
+        .map(|(_, fr)| {
+            let mut r = fr.data.clone();
+            if let Some(obj) = r.as_object_mut() {
+                obj.insert("fused_score".to_string(), serde_json::json!(fr.total));
+                obj.insert("text_score".to_string(), serde_json::json!(fr.text_score));
+                obj.insert(
+                    "vector_score".to_string(),
+                    serde_json::json!(fr.vector_score),
+                );
+                obj.insert("bm25_score".to_string(), serde_json::json!(fr.bm25_score));
+                obj.insert(
+                    "session_boosted".to_string(),
+                    serde_json::json!(fr.session_boosted),
+                );
+            }
+            r
+        })
+        .collect()
+}
+
+/// What the graph added to a multi-hop answer, for the response to report.
+#[derive(Default)]
+struct GraphContext {
+    backend: Option<&'static str>,
+    ppr_names: Vec<String>,
+    paths: Option<Value>,
+    context_tokens: usize,
+    hop_ball_tokens: usize,
+}
+
+/// Multi-hop questions: personalised PageRank around the entities the query and the results
+/// mention, up to three extra observations of the nodes it finds, and the paths and hop ball
+/// with their token cost. Every step is optional: with no graph backend it adds nothing.
+async fn multi_hop_context(
+    pool: &PgPool,
+    query: &str,
+    opts: &SearchOpts<'_>,
+    results_json: &mut Vec<Value>,
+) -> GraphContext {
+    let mut graph = GraphContext::default();
+    let mentioned = mentioned_entities(pool, query).await;
+    let seeds = merge_seed_names(mentioned, entity_names_from_list(results_json));
+    if seeds.is_empty() {
+        return graph;
+    }
+    if let Ok(ranked) = crate::graph_db::ppr_around_seeds(&seeds, 3, 15)
+        && !ranked.is_empty()
+    {
+        graph.backend = Some("falkor");
+        graph.ppr_names = ranked.iter().take(5).map(|n| n.name.clone()).collect();
+        let mut existing: HashSet<String> = results_json
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        let mut extras: Vec<Value> = Vec::new();
+        for node in &ranked {
+            if extras.len() >= 3 {
+                break;
+            }
+            for obs in observations_for_entities(pool, std::slice::from_ref(&node.name), 2).await {
+                let Some(id) = obs.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if !existing.insert(id.to_string()) {
+                    continue;
+                }
+                extras.push(obs);
+                if extras.len() >= 3 {
+                    break;
+                }
+            }
+        }
+        if !extras.is_empty() {
+            let keep = (opts.limit as usize).saturating_sub(extras.len());
+            results_json.truncate(keep);
+            results_json.extend(extras);
+        }
+    }
+    if let Some(seed) = seeds.first()
+        && let Ok((hops, paths)) = crate::graph_db::traverse_falkor_with_paths(seed, 3)
+    {
+        if !hops.is_empty() || !paths.is_empty() {
+            graph.backend = Some("falkor");
+        }
+        if !paths.is_empty() {
+            graph.paths = Some(serde_json::json!(
+                paths
+                    .iter()
+                    .map(crate::graph_db::compact_rel_path)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        graph.hop_ball_tokens = crate::search::budget::count_tokens(
+            &crate::graph_db::hop_ball_payload(&hops).to_string(),
+        );
+        let compact_ctx = serde_json::json!({
+            "paths": graph.paths.clone().unwrap_or(serde_json::json!([])),
+            "ppr": graph.ppr_names,
+        });
+        graph.context_tokens = crate::search::budget::count_tokens(&compact_ctx.to_string());
+    }
+    graph
+}
+
+/// Keeps rows while the token budget lasts; the row that crosses it is cut down to what is left
+/// and is the last.
+fn fit_to_budget(shaped: Vec<Value>, text_key: &str, max_tokens: i64) -> Vec<Value> {
+    use crate::search::budget::{count_tokens, truncate_to_budget};
+
+    let mut token_budget = max_tokens;
+    let mut final_results: Vec<Value> = Vec::with_capacity(shaped.len());
+    for mut r in shaped {
+        if token_budget <= 0 {
+            break;
+        }
+        let row_tokens = count_tokens(&r.to_string()) as i64;
+        if row_tokens > token_budget {
+            let truncated: Option<String> = r
+                .get(text_key)
+                .and_then(|v| v.as_str())
+                .map(|s| truncate_to_budget(s, token_budget.max(0) as usize));
+            if let (Some(obj), Some(t)) = (r.as_object_mut(), truncated) {
+                obj.insert(text_key.to_string(), serde_json::json!(t));
+            }
+            final_results.push(r);
+            break;
+        }
+        token_budget -= row_tokens;
+        final_results.push(r);
+    }
+    final_results
+}
+
+fn attach_graph_context(response: &mut Value, graph: GraphContext) {
+    if let Some(backend) = graph.backend {
+        response["graph_backend"] = serde_json::json!(backend);
+    }
+    if !graph.ppr_names.is_empty() {
+        response["ppr_entities"] = serde_json::json!(graph.ppr_names);
+    }
+    if let Some(paths) = graph.paths {
+        response["graph_paths"] = paths;
+    }
+    if graph.context_tokens > 0 || graph.hop_ball_tokens > 0 {
+        response["graph_context_tokens"] = serde_json::json!(graph.context_tokens);
+        response["graph_hop_ball_tokens"] = serde_json::json!(graph.hop_ball_tokens);
+        if graph.hop_ball_tokens > 0 {
+            response["graph_token_ratio"] =
+                serde_json::json!(graph.context_tokens as f64 / graph.hop_ball_tokens as f64);
+        }
+    }
+}
+
+fn attach_new_since_started(response: &mut Value, fresh: &[usize]) {
+    if fresh.is_empty() {
+        return;
+    }
+    response["new_since_you_started"] = serde_json::json!(fresh);
+    response["new_since_you_started_note"] = serde_json::json!(
+        "those positions in results were written after this session opened — by another \
+         agent working the same project, or by you. Indices and not ids on purpose: one \
+         uuid costs as many tokens as a whole timestamp, and this list rides on every \
+         search."
+    );
+}
+
 async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Result<Value> {
     let query_entropy = crate::search::rrf::query_entropy(query);
     let (text_weight, vector_weight) = entropy_weights(query_entropy);
@@ -380,57 +884,8 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
         opts.include_unscoped,
     )
     .await?;
-
     if let Some(tag) = opts.tag_filter {
-        if scope != "all" && scope != "observations" {
-            // A tag is an observation filter. Applying it under scope=errors
-            // used to dump observations into a result set that claimed to be errors.
-        } else {
-            let tagged_obs: Vec<(uuid::Uuid, String, String, String, f64, f64)> = sqlx::query_as(
-                "SELECT o.id, e.name, o.content, o.observation_type, o.importance::float8,
-                    (o.importance::float8 * 0.8 + 0.2)::float8 AS score
-             FROM brain_observations o
-             JOIN brain_entities e ON o.entity_id = e.id
-             WHERE $1 = ANY(o.tags)
-               AND o.observation_type != 'superseded'
-               AND o.trust = 'trusted'
-               AND ($3::uuid IS NULL OR o.project_id = $3 OR ($4::bool AND o.project_id IS NULL))
-             ORDER BY o.importance DESC
-             LIMIT $2",
-            )
-            .bind(tag)
-            .bind(opts.limit)
-            .bind(opts.project_id)
-            .bind(opts.include_unscoped)
-            .fetch_all(pool)
-            .await
-            .with_context(|| {
-                format!(
-                    "looking up observations tagged {tag:?}. Failing loud instead of returning \
-                 the untagged ranking: those results would be presented as if the tag had \
-                 been applied and simply matched nothing."
-                )
-            })?;
-
-            for (id, entity_name, content, obs_type, importance, score) in tagged_obs {
-                let id_str = id.to_string();
-                if !text_results
-                    .iter()
-                    .any(|r| r.get("id").and_then(|v| v.as_str()) == Some(&id_str))
-                {
-                    text_results.push(serde_json::json!({
-                        "id": id_str,
-                        "type": "observation",
-                        "entity_name": entity_name,
-                        "content": content,
-                        "observation_type": obs_type,
-                        "importance": importance,
-                        "score": score,
-                        "matched_tag": tag
-                    }));
-                }
-            }
-        }
+        add_tag_matches(pool, tag, scope, opts, &mut text_results).await?;
     }
 
     let vector_results = vector_search(
@@ -444,29 +899,8 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
     )
     .await;
 
-    let rrf_k = crate::search::rrf::RRF_K;
-
     let mut fused_scores: HashMap<String, FusedResult> = HashMap::new();
-
-    for (rank, result) in text_results.iter().enumerate() {
-        let id = result
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let rrf_score = text_weight / (rrf_k + rank as f64 + 1.0);
-        fused_scores.insert(
-            id,
-            FusedResult {
-                text_score: rrf_score,
-                vector_score: 0.0,
-                bm25_score: 0.0,
-                session_boosted: false,
-                total: rrf_score,
-                data: result.clone(),
-            },
-        );
-    }
+    fold_ranked(&mut fused_scores, &text_results, text_weight, Channel::Text);
 
     let vector_failure: Option<String> = match &vector_results {
         Ok(_) => None,
@@ -478,30 +912,13 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
             Some(e.to_string())
         }
     };
-
     if let Ok(vec_results) = vector_results {
-        for (rank, result) in vec_results.iter().enumerate() {
-            let id = result
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let rrf_score = vector_weight / (rrf_k + rank as f64 + 1.0);
-            fused_scores
-                .entry(id.clone())
-                .and_modify(|fr| {
-                    fr.vector_score = rrf_score;
-                    fr.total += rrf_score;
-                })
-                .or_insert(FusedResult {
-                    text_score: 0.0,
-                    vector_score: rrf_score,
-                    bm25_score: 0.0,
-                    session_boosted: false,
-                    total: rrf_score,
-                    data: result.clone(),
-                });
-        }
+        fold_ranked(
+            &mut fused_scores,
+            &vec_results,
+            vector_weight,
+            Channel::Vector,
+        );
     }
 
     let mut bm25_failed = false;
@@ -528,28 +945,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
                 Vec::new()
             }
         };
-        for (rank, result) in bm25_results.iter().enumerate() {
-            let id = result
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let rrf_score = bm25_weight / (rrf_k + rank as f64 + 1.0);
-            fused_scores
-                .entry(id.clone())
-                .and_modify(|fr| {
-                    fr.bm25_score = rrf_score;
-                    fr.total += rrf_score;
-                })
-                .or_insert(FusedResult {
-                    text_score: 0.0,
-                    vector_score: 0.0,
-                    bm25_score: rrf_score,
-                    session_boosted: false,
-                    total: rrf_score,
-                    data: result.clone(),
-                });
-        }
+        fold_ranked(&mut fused_scores, &bm25_results, bm25_weight, Channel::Bm25);
     }
 
     if crate::search::entity_factoid::entity_factoid_enabled()
@@ -559,143 +955,21 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
         let entity_leg =
             entity_factoid_observations(pool, query, &mentioned, opts.limit * 2, opts.project_id)
                 .await;
-        for (rank, result) in entity_leg.iter().enumerate() {
-            let id = result
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if id.is_empty() {
-                continue;
-            }
-            let rrf_score = 1.0 / (rrf_k + rank as f64 + 1.0);
-            fused_scores
-                .entry(id.clone())
-                .and_modify(|fr| {
-                    fr.total += rrf_score;
-                })
-                .or_insert(FusedResult {
-                    text_score: 0.0,
-                    vector_score: 0.0,
-                    bm25_score: 0.0,
-                    session_boosted: false,
-                    total: rrf_score,
-                    data: result.clone(),
-                });
-        }
+        fold_ranked(&mut fused_scores, &entity_leg, 1.0, Channel::Entity);
     }
 
     if opts.associative {
         associative_expand(pool, query, opts.project_id, &mut fused_scores).await;
     }
 
-    let mut results: Vec<(String, FusedResult)> = fused_scores.into_iter().collect();
-    results.sort_by(|a, b| {
-        b.1.total
-            .partial_cmp(&a.1.total)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    const FUSION_DEDUP: f64 = 0.85;
-    let mut deduped: Vec<(String, FusedResult)> = Vec::with_capacity(results.len());
-    for (id, fr) in results {
-        let content = fr
-            .data
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let duplicate = deduped.iter().any(|(_, existing)| {
-            let other = existing
-                .data
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            crate::search::rrf::content_overlap(content, other) > FUSION_DEDUP
-        });
-        if !duplicate {
-            deduped.push((id, fr));
-        }
-    }
-    results = deduped;
-
-    let pool_size = if opts.enable_rerank {
-        50.min(results.len())
-    } else if opts.diversify {
-        (opts.limit as usize * 5).min(results.len())
-    } else {
-        (opts.limit as usize).min(results.len())
-    };
-    results.truncate(pool_size);
+    let mut results: Ranked = fused_scores.into_iter().collect();
+    sort_ranked(&mut results);
+    let mut results = dedup_by_overlap(results);
+    results.truncate(pool_size(opts, results.len()));
 
     let mut rerank_outcome = RerankOutcome::NotRequested;
     if opts.enable_rerank && results.len() > 1 {
-        let contents: Vec<&str> = results
-            .iter()
-            .map(|(_, fr)| {
-                fr.data
-                    .get("content")
-                    .or_else(|| fr.data.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-            })
-            .collect();
-        // The budget starts here, before the model is resolved. It used to
-        // start after: the first search on a cold daemon pays a 1.1 GB read,
-        // and measuring only the inference that followed made 20 s look
-        // generous while the caller waited minutes for a number that was never
-        // being timed.
-        let rerank_budget = crate::search::rerank::budget();
-        let mut timed_out = false;
-        let attempted = tokio::time::timeout(rerank_budget, async {
-            let have_model = tokio::task::spawn_blocking(crate::search::rerank::enabled)
-                .await
-                .context("reranker status task panicked")?;
-            anyhow::Ok((
-                have_model,
-                crate::search::rerank::rerank(query, &contents).await,
-            ))
-        })
-        .await;
-
-        let (have_model, rerank_result) = match attempted {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => (false, Err(e)),
-            Err(_) => {
-                tracing::warn!(
-                    secs = rerank_budget.as_secs(),
-                    "reranker excedió su presupuesto — se devuelve el ranking RRF"
-                );
-                timed_out = true;
-                (false, Err(anyhow::anyhow!("reranker timeout")))
-            }
-        };
-        rerank_outcome = rerank_outcome_of(rerank_result.is_ok(), have_model, timed_out);
-        match rerank_result {
-            Ok(reranked) => {
-                let original = results.clone();
-                results = reranked
-                    .into_iter()
-                    .filter_map(|(idx, score)| {
-                        let mut entry = original.get(idx).cloned()?;
-                        if have_model {
-                            entry.1.total = score;
-                        } else {
-                            entry.1.total += score * 0.0001;
-                        }
-                        Some(entry)
-                    })
-                    .collect();
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %format!("{e:#}"),
-                    "RERANK FAILED — el ranking se devuelve SIN reordenar. El modelo se \
-                     cargó y se gastó el tiempo de inferencia, pero sus scores se \
-                     descartaron: los resultados son los de RRF."
-                );
-            }
-        }
+        (results, rerank_outcome) = rerank_stage(query, results).await;
     }
 
     let matched_obs_ids: Vec<uuid::Uuid> = results
@@ -707,7 +981,6 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
                 .and_then(|s| s.parse::<uuid::Uuid>().ok())
         })
         .collect();
-
     if opts.track_access
         && !matched_obs_ids.is_empty()
         && let Err(e) = dual_strength::on_search_match(pool, &matched_obs_ids).await
@@ -718,218 +991,29 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
     let mut lost = LostSignals::default();
     let (session_boost, session_started) = session_context(pool, &mut lost).await;
     if !session_boost.is_empty() {
-        for (_, fr) in &mut results {
-            let content = fr
-                .data
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let entity_name = fr
-                .data
-                .get("entity_name")
-                .or_else(|| fr.data.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let (boosted, flagged) = crate::search::entity_factoid::apply_session_entity_boost(
-                fr.total,
-                entity_name,
-                content,
-                &session_boost,
-            );
-            if flagged {
-                fr.total = boosted;
-                fr.session_boosted = true;
-            }
-        }
-        results.sort_by(|a, b| {
-            b.1.total
-                .partial_cmp(&a.1.total)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        boost_by_session(&mut results, &session_boost);
     }
 
-    if opts.diversify && results.len() > 1 {
-        let n = results.len();
-        let relevance: Vec<f64> = results.iter().map(|(_, fr)| fr.total).collect();
-        let token_sets: Vec<std::collections::HashSet<String>> = results
-            .iter()
-            .map(|(_, fr)| {
-                fr.data
-                    .get("content")
-                    .or_else(|| fr.data.get("name"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| {
-                        s.to_lowercase()
-                            .split(|c: char| !c.is_alphanumeric())
-                            .filter(|w| w.len() > 2)
-                            .map(String::from)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            })
-            .collect();
-        let mut pairwise = vec![vec![0.0_f64; n]; n];
-        for i in 0..n {
-            pairwise[i][i] = 1.0;
-            for j in (i + 1)..n {
-                let inter = token_sets[i].intersection(&token_sets[j]).count();
-                let union = token_sets[i].union(&token_sets[j]).count();
-                let jaccard = if union == 0 {
-                    0.0
-                } else {
-                    inter as f64 / union as f64
-                };
-                pairwise[i][j] = jaccard;
-                pairwise[j][i] = jaccard;
-            }
-        }
-        let picks = crate::search::mmr::mmr_select(
-            &relevance,
-            &pairwise,
-            opts.mmr_lambda,
-            opts.limit as usize,
-        );
-        let reordered: Vec<(String, FusedResult)> = picks
-            .into_iter()
-            .filter_map(|i| results.get(i).cloned())
-            .collect();
-        results = reordered;
-    } else {
-        results.truncate(opts.limit as usize);
-    }
-
+    let results = diversify_or_cut(results, opts);
     let graphrag_context = enrich_graphrag(pool, &results, GRAPHRAG_TOP_K).await;
+    let mut results_json = ranked_to_json(&results);
 
-    let mut results_json: Vec<Value> = results
-        .iter()
-        .map(|(_, fr)| {
-            let mut r = fr.data.clone();
-            if let Some(obj) = r.as_object_mut() {
-                obj.insert("fused_score".to_string(), serde_json::json!(fr.total));
-                obj.insert("text_score".to_string(), serde_json::json!(fr.text_score));
-                obj.insert(
-                    "vector_score".to_string(),
-                    serde_json::json!(fr.vector_score),
-                );
-                obj.insert("bm25_score".to_string(), serde_json::json!(fr.bm25_score));
-                obj.insert(
-                    "session_boosted".to_string(),
-                    serde_json::json!(fr.session_boosted),
-                );
-            }
-            r
-        })
-        .collect();
+    let graph = if query_class == crate::search::query_class::QueryClass::MultiHop {
+        multi_hop_context(pool, query, opts, &mut results_json).await
+    } else {
+        GraphContext::default()
+    };
 
-    let mut ppr_names: Vec<String> = Vec::new();
-    let mut graph_paths_json: Option<Value> = None;
-    let mut graph_backend: Option<&'static str> = None;
-    let mut graph_context_tokens = 0usize;
-    let mut graph_hop_ball_tokens = 0usize;
-    if query_class == crate::search::query_class::QueryClass::MultiHop {
-        let mentioned = mentioned_entities(pool, query).await;
-        let seeds = merge_seed_names(mentioned, entity_names_from_list(&results_json));
-        if !seeds.is_empty() {
-            if let Ok(ranked) = crate::graph_db::ppr_around_seeds(&seeds, 3, 15)
-                && !ranked.is_empty()
-            {
-                graph_backend = Some("falkor");
-                ppr_names = ranked.iter().take(5).map(|n| n.name.clone()).collect();
-                let mut existing: HashSet<String> = results_json
-                    .iter()
-                    .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
-                    .collect();
-                let mut extras: Vec<Value> = Vec::new();
-                for node in &ranked {
-                    if extras.len() >= 3 {
-                        break;
-                    }
-                    for obs in
-                        observations_for_entities(pool, std::slice::from_ref(&node.name), 2).await
-                    {
-                        let Some(id) = obs.get("id").and_then(|v| v.as_str()) else {
-                            continue;
-                        };
-                        if !existing.insert(id.to_string()) {
-                            continue;
-                        }
-                        extras.push(obs);
-                        if extras.len() >= 3 {
-                            break;
-                        }
-                    }
-                }
-                if !extras.is_empty() {
-                    let keep = (opts.limit as usize).saturating_sub(extras.len());
-                    results_json.truncate(keep);
-                    results_json.extend(extras);
-                }
-            }
-            if let Some(seed) = seeds.first()
-                && let Ok((hops, paths)) = crate::graph_db::traverse_falkor_with_paths(seed, 3)
-            {
-                if !hops.is_empty() || !paths.is_empty() {
-                    graph_backend = Some("falkor");
-                }
-                if !paths.is_empty() {
-                    graph_paths_json = Some(serde_json::json!(
-                        paths
-                            .iter()
-                            .map(crate::graph_db::compact_rel_path)
-                            .collect::<Vec<_>>()
-                    ));
-                }
-                graph_hop_ball_tokens = crate::search::budget::count_tokens(
-                    &crate::graph_db::hop_ball_payload(&hops).to_string(),
-                );
-                let compact_ctx = serde_json::json!({
-                    "paths": graph_paths_json.clone().unwrap_or(serde_json::json!([])),
-                    "ppr": ppr_names,
-                });
-                graph_context_tokens =
-                    crate::search::budget::count_tokens(&compact_ctx.to_string());
-            }
-        }
-    }
-
-    use crate::search::budget::{count_tokens, truncate_to_budget};
-
-    let shaped: Vec<Value> = if opts.format == "compact" {
+    let compact = opts.format == "compact";
+    let shaped: Vec<Value> = if compact {
         results_json.iter().map(compact_result).collect()
     } else {
         results_json
     };
-    let text_key = if opts.format == "compact" {
-        "c"
-    } else {
-        "content"
-    };
-
-    let mut token_budget = opts.max_tokens;
-    let mut final_results: Vec<Value> = Vec::with_capacity(shaped.len());
-    for mut r in shaped {
-        if token_budget <= 0 {
-            break;
-        }
-        let row_tokens = count_tokens(&r.to_string()) as i64;
-        if row_tokens > token_budget {
-            let truncated: Option<String> = r
-                .get(text_key)
-                .and_then(|v| v.as_str())
-                .map(|s| truncate_to_budget(s, token_budget.max(0) as usize));
-            if let (Some(obj), Some(t)) = (r.as_object_mut(), truncated) {
-                obj.insert(text_key.to_string(), serde_json::json!(t));
-            }
-            final_results.push(r);
-            break;
-        }
-        token_budget -= row_tokens;
-        final_results.push(r);
-    }
+    let text_key = if compact { "c" } else { "content" };
+    let mut final_results = fit_to_budget(shaped, text_key, opts.max_tokens);
 
     annotate_evidence(pool, &mut final_results, &mut lost).await;
-
     let fresh = match session_started {
         Some(since) => written_since(pool, &final_results, since, &mut lost).await,
         None => Vec::new(),
@@ -947,34 +1031,8 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
         "count": final_results.len(),
         "graphrag_context": graphrag_context
     });
-    if let Some(backend) = graph_backend {
-        response["graph_backend"] = serde_json::json!(backend);
-    }
-    if !ppr_names.is_empty() {
-        response["ppr_entities"] = serde_json::json!(ppr_names);
-    }
-    if let Some(paths) = graph_paths_json {
-        response["graph_paths"] = paths;
-    }
-    if graph_context_tokens > 0 || graph_hop_ball_tokens > 0 {
-        response["graph_context_tokens"] = serde_json::json!(graph_context_tokens);
-        response["graph_hop_ball_tokens"] = serde_json::json!(graph_hop_ball_tokens);
-        if graph_hop_ball_tokens > 0 {
-            response["graph_token_ratio"] =
-                serde_json::json!(graph_context_tokens as f64 / graph_hop_ball_tokens as f64);
-        }
-    }
-
-    if !fresh.is_empty() {
-        response["new_since_you_started"] = serde_json::json!(fresh);
-        response["new_since_you_started_note"] = serde_json::json!(
-            "those positions in results were written after this session opened — by another \
-             agent working the same project, or by you. Indices and not ids on purpose: one \
-             uuid costs as many tokens as a whole timestamp, and this list rides on every \
-             search."
-        );
-    }
-
+    attach_graph_context(&mut response, graph);
+    attach_new_since_started(&mut response, &fresh);
     annotate_degradation(
         &mut response,
         vector_failure.as_deref(),
