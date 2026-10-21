@@ -32,9 +32,12 @@ use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
-/// The session is process-wide (`session::set`), so two of these running side by side would
-/// open each other's sessions in the wrong database.
-static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The session is process-wide unless the call runs under a client identity, which keys it
+/// apart (`session::with_client`): every test here is its own client, so the four run side by
+/// side instead of one after the other.
+fn a_client() -> String {
+    format!("signals-test-{}", Uuid::new_v4())
+}
 
 async fn call(pool: &PgPool, tool: &str, args: Value) -> Value {
     let envelope = memory_industry::handlers::dispatch(pool, tool, args)
@@ -65,7 +68,6 @@ async fn a_corpus_and_an_open_session(pool: &PgPool) -> String {
     .await
     .expect("seed the observation");
 
-    memory_industry::session::clear();
     call(
         pool,
         "cuba_jornada",
@@ -128,94 +130,102 @@ fn must_say_it(response: &Value, lost: &str) {
 
 #[tokio::test]
 async fn a_search_that_could_not_read_the_working_memory_says_so() {
-    let _one = ONE_AT_A_TIME.lock().await;
     in_a_scratch_database("brain_sig_wm", |url| async move {
-        let pool = memory_industry::db::create_pool(&url)
-            .await
-            .expect("migrating the scratch database");
-        let marker = a_corpus_and_an_open_session(&pool).await;
+        memory_industry::session::with_client(a_client(), async {
+            let pool = memory_industry::db::create_pool(&url)
+                .await
+                .expect("migrating the scratch database");
+            let marker = a_corpus_and_an_open_session(&pool).await;
 
-        let healthy = search(&pool, &marker).await;
-        must_still_find(&marker, &healthy);
-        assert!(
-            healthy.get("signals_degraded").is_none()
-                && healthy.get("signals_lost").is_none()
-                && healthy.get("signals_degraded_reason").is_none(),
-            "a healthy search carries no degradation keys: the common case costs nothing. Got: \
+            let healthy = search(&pool, &marker).await;
+            must_still_find(&marker, &healthy);
+            assert!(
+                healthy.get("signals_degraded").is_none()
+                    && healthy.get("signals_lost").is_none()
+                    && healthy.get("signals_degraded_reason").is_none(),
+                "a healthy search carries no degradation keys: the common case costs nothing. Got: \
              {healthy}"
-        );
+            );
 
-        break_it(&url, "DROP TABLE brain_wm").await;
-        let broken = search(&pool, &marker).await;
-        must_still_find(&marker, &broken);
-        must_say_it(&broken, "working_memory");
-        pool.close().await;
+            break_it(&url, "DROP TABLE brain_wm").await;
+            let broken = search(&pool, &marker).await;
+            must_still_find(&marker, &broken);
+            must_say_it(&broken, "working_memory");
+            pool.close().await;
+        })
+        .await;
     })
     .await;
 }
 
 #[tokio::test]
 async fn a_search_that_could_not_read_the_session_says_so() {
-    let _one = ONE_AT_A_TIME.lock().await;
     in_a_scratch_database("brain_sig_session", |url| async move {
-        let pool = memory_industry::db::create_pool(&url)
-            .await
-            .expect("migrating the scratch database");
-        let marker = a_corpus_and_an_open_session(&pool).await;
+        memory_industry::session::with_client(a_client(), async {
+            let pool = memory_industry::db::create_pool(&url)
+                .await
+                .expect("migrating the scratch database");
+            let marker = a_corpus_and_an_open_session(&pool).await;
 
-        break_it(
-            &url,
-            "ALTER TABLE brain_sessions RENAME COLUMN goals TO goals_gone",
-        )
+            break_it(
+                &url,
+                "ALTER TABLE brain_sessions RENAME COLUMN goals TO goals_gone",
+            )
+            .await;
+            let broken = search(&pool, &marker).await;
+            must_still_find(&marker, &broken);
+            must_say_it(&broken, "session_goals");
+            pool.close().await;
+        })
         .await;
-        let broken = search(&pool, &marker).await;
-        must_still_find(&marker, &broken);
-        must_say_it(&broken, "session_goals");
-        pool.close().await;
     })
     .await;
 }
 
 #[tokio::test]
 async fn a_search_that_could_not_mark_the_evidence_says_so() {
-    let _one = ONE_AT_A_TIME.lock().await;
     in_a_scratch_database("brain_sig_evidence", |url| async move {
-        let pool = memory_industry::db::create_pool(&url)
-            .await
-            .expect("migrating the scratch database");
-        let marker = a_corpus_and_an_open_session(&pool).await;
+        memory_industry::session::with_client(a_client(), async {
+            let pool = memory_industry::db::create_pool(&url)
+                .await
+                .expect("migrating the scratch database");
+            let marker = a_corpus_and_an_open_session(&pool).await;
 
-        break_it(
-            &url,
-            "ALTER TABLE brain_observations RENAME COLUMN verified_at TO verified_at_gone",
-        )
+            break_it(
+                &url,
+                "ALTER TABLE brain_observations RENAME COLUMN verified_at TO verified_at_gone",
+            )
+            .await;
+            let broken = search(&pool, &marker).await;
+            must_still_find(&marker, &broken);
+            must_say_it(&broken, "evidence_marks");
+            pool.close().await;
+        })
         .await;
-        let broken = search(&pool, &marker).await;
-        must_still_find(&marker, &broken);
-        must_say_it(&broken, "evidence_marks");
-        pool.close().await;
     })
     .await;
 }
 
 #[tokio::test]
 async fn a_search_that_could_not_tell_what_is_new_says_so() {
-    let _one = ONE_AT_A_TIME.lock().await;
     in_a_scratch_database("brain_sig_new", |url| async move {
-        let pool = memory_industry::db::create_pool(&url)
-            .await
-            .expect("migrating the scratch database");
-        let marker = a_corpus_and_an_open_session(&pool).await;
+        memory_industry::session::with_client(a_client(), async {
+            let pool = memory_industry::db::create_pool(&url)
+                .await
+                .expect("migrating the scratch database");
+            let marker = a_corpus_and_an_open_session(&pool).await;
 
-        break_it(
-            &url,
-            "ALTER TABLE brain_episodes RENAME COLUMN started_at TO started_at_gone",
-        )
+            break_it(
+                &url,
+                "ALTER TABLE brain_episodes RENAME COLUMN started_at TO started_at_gone",
+            )
+            .await;
+            let broken = search(&pool, &marker).await;
+            must_still_find(&marker, &broken);
+            must_say_it(&broken, "new_since_session_start");
+            pool.close().await;
+        })
         .await;
-        let broken = search(&pool, &marker).await;
-        must_still_find(&marker, &broken);
-        must_say_it(&broken, "new_since_session_start");
-        pool.close().await;
     })
     .await;
 }

@@ -30,6 +30,18 @@ measurements and the state of the art it was weighed against, is `backlog/0.32-a
 
 - **13 `pub` items nobody called, and one alias.** Each checked with `grep -w` over `src/`, `tests/` and the docs: `cognitive::prediction_error::assess_novelty_adaptive`, `core::bitemporal::supersede_fact`, the whole `impl Clock` of `crdt` (`dominates`, `happens_before_or_eq`; the merge uses `pick_lww`), `embeddings::backfill::count_unchunked`, `eval::datasets::load_locomo_dataset`, `eval::harness::BenchmarkHarness` (the struct, `new`, `with_k` and `run`: `eval` calls `run_faro_eval`), `gpu::active_provider`, `graph::activation::ActivationPropagation::with_decay`, `graph_db::{project_relation, traverse_falkor, traverse_paths_falkor}` and `handlers::contexto::ensure_table_exists` (which carried `#[allow(dead_code)]`), plus `graph_db::reconcile_stub`, which only forwarded to `reconcile`. The compiler could not say any of this: they are `pub` in a library crate. Not touched on purpose: the tables `brain_fact_provenance` and `brain_embedding_stats` (unreferenced from Rust, but a `0066` that drops them has to recreate their DDL and the RLS 0055 gave one of them in its `down`, for no saving), and `brain_grants`, which is not dead — the SQL function `brain_principal_can()` of migration 0031 reads it. (0.32 B6)
 
+### Gate
+
+- **`graph_cli::run_cli` is in the documented group of CLI entry points that `cli_contract` judges.** The mutation step of `quality-gate.sh` runs `cargo mutants -- --lib`, which never builds `rust/tests/`; `graph --help` prints `usage: memory-industry graph …` from inside that body, so `run_cli -> Ok(())` is killed by `every_listed_command_is_actually_dispatched` in the plain `cargo test` of the SIL. Same owner and expiry as the group.
+- **`lizard` misparsed a test of this release, and the lesson is written down.** A char literal (`'_'`) inside a closure made `lizard` 1.24.1 read the instructions test as 455 lines and CC 11 and drop the tests after it from its report; `"_".contains(c)` measures as 31 lines and CC 3. Eleven other CRAP findings of `quality-gate.sh` over this release's diff are baseline drift (the same numbers come out at the commit before it), which is why regenerating `lizard-baseline.txt` with the owner's `lizard` stays an open decision.
+
+### Not verified
+
+- **No client but Claude Code 2.1.306 was tried.** It connects (`claude mcp list` → Connected) to the binary with `instructions`, `title` and `annotations`; Cursor, Gemini CLI and Codex were not available here, which is also why `2026-07-28` (C2) is still not implemented.
+- **Whether a Spanish lexical channel helps has no answer yet.** `scripts/lexical_ab.py` is the experiment, and it needs the live corpus.
+- **The reads of `jornada`, `calibrar`, `admin`, `pre_compact`, `protocol` and `graph_db` still swallow their failures.** `faro` and `contexto`, the two read paths an agent calls every turn, do not.
+- **`merge-gate.sh` was not run on the final commit in this container**: its hardware-bound `test times` step fails on this CPU-only VM by design, so «mergeable» stays the owner's to establish on the real machine.
+
 ## [0.31.0] — unreleased (Cargo `0.31.0` · npm `0.31.0` · PyPI `1.33.0`)
 
 The real machine and a judge that does not lose the hour. 0.30.0 was proved and deployed on the user's PC on

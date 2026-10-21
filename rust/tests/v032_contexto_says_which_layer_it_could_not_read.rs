@@ -24,15 +24,15 @@ use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
-/// The session and the client identity are process-wide, so two of these running side by side
-/// would read each other's.
-static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The session and the notes are keyed by client identity (`session::with_client`), so every test
+/// is its own client and the five run side by side instead of one after the other.
+fn a_client() -> String {
+    format!("contexto-test-{}", Uuid::new_v4())
+}
 
-const CLIENT: &str = "contexto-test-client";
-
-async fn context(pool: &PgPool) -> Value {
+async fn context(pool: &PgPool, client: &str) -> Value {
     let envelope = memory_industry::session::with_client(
-        CLIENT.to_string(),
+        client.to_string(),
         memory_industry::handlers::dispatch(pool, "cuba_contexto", json!({})),
     )
     .await
@@ -42,7 +42,7 @@ async fn context(pool: &PgPool) -> Value {
 }
 
 /// Something in every layer, so that a layer which comes back empty is one that was not read.
-async fn a_corpus_with_every_layer(pool: &PgPool) {
+async fn a_corpus_with_every_layer(pool: &PgPool, client: &str) {
     let entity = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO brain_entities (id, name, entity_type) VALUES ($1, 'capa_viva', 'concept')",
@@ -70,15 +70,17 @@ async fn a_corpus_with_every_layer(pool: &PgPool) {
         "INSERT INTO brain_triggers (condition_type, entity_pattern, message, active)
          VALUES ('on_session_start', $1, 'recordatorio para este cliente', TRUE)",
     )
-    .bind(CLIENT)
+    .bind(client)
     .execute(pool)
     .await
     .expect("seed the note for this client");
-    memory_industry::session::clear();
-    memory_industry::handlers::dispatch(
-        pool,
-        "cuba_pizarra",
-        json!({"action": "write", "content": "una nota de la pizarra", "ttl_seconds": 600}),
+    memory_industry::session::with_client(
+        client.to_string(),
+        memory_industry::handlers::dispatch(
+            pool,
+            "cuba_pizarra",
+            json!({"action": "write", "content": "una nota de la pizarra", "ttl_seconds": 600}),
+        ),
     )
     .await
     .expect("seed working memory");
@@ -133,14 +135,14 @@ fn must_still_answer(response: &Value, layer_that_works: &str) {
 
 #[tokio::test]
 async fn a_healthy_context_carries_every_layer_and_no_degradation_keys() {
-    let _one = ONE_AT_A_TIME.lock().await;
     in_a_scratch_database("brain_ctx_ok", |url| async move {
         let pool = memory_industry::db::create_pool(&url)
             .await
             .expect("migrating the scratch database");
-        a_corpus_with_every_layer(&pool).await;
+        let client = a_client();
+        a_corpus_with_every_layer(&pool, &client).await;
 
-        let healthy = context(&pool).await;
+        let healthy = context(&pool, &client).await;
         for layer in ["working_memory", "agent_notes", "artifacts", "top_recall"] {
             must_still_answer(&healthy, layer);
         }
@@ -158,15 +160,15 @@ async fn a_healthy_context_carries_every_layer_and_no_degradation_keys() {
 
 #[tokio::test]
 async fn a_context_that_could_not_read_the_working_memory_says_so() {
-    let _one = ONE_AT_A_TIME.lock().await;
     in_a_scratch_database("brain_ctx_wm", |url| async move {
         let pool = memory_industry::db::create_pool(&url)
             .await
             .expect("migrating the scratch database");
-        a_corpus_with_every_layer(&pool).await;
+        let client = a_client();
+        a_corpus_with_every_layer(&pool, &client).await;
         break_it(&url, "DROP TABLE brain_wm").await;
 
-        let broken = context(&pool).await;
+        let broken = context(&pool, &client).await;
         must_still_answer(&broken, "artifacts");
         must_say_it(&broken, "working_memory");
         pool.close().await;
@@ -176,15 +178,15 @@ async fn a_context_that_could_not_read_the_working_memory_says_so() {
 
 #[tokio::test]
 async fn a_context_that_could_not_read_the_notes_for_this_client_says_so() {
-    let _one = ONE_AT_A_TIME.lock().await;
     in_a_scratch_database("brain_ctx_notes", |url| async move {
         let pool = memory_industry::db::create_pool(&url)
             .await
             .expect("migrating the scratch database");
-        a_corpus_with_every_layer(&pool).await;
+        let client = a_client();
+        a_corpus_with_every_layer(&pool, &client).await;
         break_it(&url, "DROP TABLE brain_triggers").await;
 
-        let broken = context(&pool).await;
+        let broken = context(&pool, &client).await;
         must_still_answer(&broken, "artifacts");
         must_say_it(&broken, "agent_notes");
         pool.close().await;
@@ -194,15 +196,15 @@ async fn a_context_that_could_not_read_the_notes_for_this_client_says_so() {
 
 #[tokio::test]
 async fn a_context_that_could_not_read_the_artifact_index_says_so() {
-    let _one = ONE_AT_A_TIME.lock().await;
     in_a_scratch_database("brain_ctx_artifacts", |url| async move {
         let pool = memory_industry::db::create_pool(&url)
             .await
             .expect("migrating the scratch database");
-        a_corpus_with_every_layer(&pool).await;
+        let client = a_client();
+        a_corpus_with_every_layer(&pool, &client).await;
         break_it(&url, "DROP TABLE brain_artifacts").await;
 
-        let broken = context(&pool).await;
+        let broken = context(&pool, &client).await;
         must_still_answer(&broken, "working_memory");
         must_say_it(&broken, "artifacts");
         pool.close().await;
@@ -212,19 +214,19 @@ async fn a_context_that_could_not_read_the_artifact_index_says_so() {
 
 #[tokio::test]
 async fn a_context_that_could_not_read_the_recall_says_so() {
-    let _one = ONE_AT_A_TIME.lock().await;
     in_a_scratch_database("brain_ctx_recall", |url| async move {
         let pool = memory_industry::db::create_pool(&url)
             .await
             .expect("migrating the scratch database");
-        a_corpus_with_every_layer(&pool).await;
+        let client = a_client();
+        a_corpus_with_every_layer(&pool, &client).await;
         break_it(
             &url,
             "ALTER TABLE brain_observations RENAME COLUMN updated_at TO updated_at_gone",
         )
         .await;
 
-        let broken = context(&pool).await;
+        let broken = context(&pool, &client).await;
         must_still_answer(&broken, "artifacts");
         must_say_it(&broken, "top_recall");
         pool.close().await;
