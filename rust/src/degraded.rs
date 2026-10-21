@@ -7,6 +7,7 @@
 //! reads in `src/`. `LostSignals` is the one place that logs the failure with the name of what was
 //! lost and remembers it, so the handler can put that name in its response.
 
+use serde_json::Value;
 use std::fmt::Display;
 
 #[derive(Default)]
@@ -30,6 +31,23 @@ impl LostSignals {
 
     pub fn names(&self) -> &[&'static str] {
         &self.0
+    }
+
+    /// Puts `signals_degraded`, `signals_lost` (the names, for a program to match) and a reason in
+    /// the response when something was lost, and nothing at all when nothing was: these handlers
+    /// are called every turn. `costs` says, per signal, what its absence means to the reader.
+    pub fn annotate(&self, response: &mut Value, costs: fn(&str) -> &'static str) {
+        if self.0.is_empty() {
+            return;
+        }
+        let missing: Vec<&str> = self.0.iter().map(|signal| costs(signal)).collect();
+        response["signals_degraded"] = serde_json::json!(true);
+        response["signals_lost"] = serde_json::json!(self.0);
+        response["signals_degraded_reason"] = serde_json::json!(format!(
+            "Una lectura falló y la respuesta sigue sin ella: {}. Lo que falta aquí no significa \
+             que no exista. Diagnosticá con `memory-industry doctor`.",
+            missing.join("; ")
+        ));
     }
 }
 

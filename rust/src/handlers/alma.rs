@@ -1,5 +1,6 @@
 use crate::cognitive::{dual_strength, hebbian};
 use crate::constants::VALID_ENTITY_TYPES;
+use crate::degraded::LostSignals;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -223,14 +224,26 @@ async fn get(pool: &PgPool, name: &str) -> Result<Value> {
         "relations": rel_json
     });
 
-    let triggered = crate::handlers::centinela::check_triggers(pool, name, "on_access")
-        .await
-        .unwrap_or_default();
+    let mut lost = LostSignals::default();
+    let triggered = lost.note(
+        "triggered_reminders",
+        crate::handlers::centinela::check_triggers(pool, name, "on_access").await,
+    );
     if !triggered.is_empty() {
         response["triggered_reminders"] = serde_json::json!(triggered);
     }
+    lost.annotate(&mut response, what_a_lost_signal_costs);
 
     Ok(response)
+}
+
+fn what_a_lost_signal_costs(signal: &str) -> &'static str {
+    match signal {
+        "triggered_reminders" => {
+            "los recordatorios de cuba_centinela para esta entidad (si había uno, NO se disparó)"
+        }
+        _ => "una señal de la lectura",
+    }
 }
 
 async fn boost_entity_importance(pool: &PgPool, entity_id: uuid::Uuid) -> Result<()> {

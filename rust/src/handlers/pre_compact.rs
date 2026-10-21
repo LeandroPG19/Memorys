@@ -1,3 +1,4 @@
+use crate::degraded::LostSignals;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -32,19 +33,22 @@ async fn snapshot(pool: &PgPool) -> Result<Value> {
             .flatten();
 
     let summary_md = super::eco::reflect(pool, session_id).await?;
+    let mut lost = LostSignals::default();
 
-    let key_obs: Vec<(uuid::Uuid, String, String, String)> = sqlx::query_as(
-        "SELECT o.id, e.name, o.observation_type, o.content
-         FROM brain_observations o
-         JOIN brain_entities e ON o.entity_id = e.id
-         WHERE o.session_id = $1 AND o.observation_type != 'superseded'
-         ORDER BY o.created_at DESC
-         LIMIT 50",
-    )
-    .bind(session_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let key_obs: Vec<(uuid::Uuid, String, String, String)> = lost.note(
+        "key_observations",
+        sqlx::query_as(
+            "SELECT o.id, e.name, o.observation_type, o.content
+             FROM brain_observations o
+             JOIN brain_entities e ON o.entity_id = e.id
+             WHERE o.session_id = $1 AND o.observation_type != 'superseded'
+             ORDER BY o.created_at DESC
+             LIMIT 50",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await,
+    );
 
     let key_obs_json: Vec<Value> = key_obs
         .iter()
@@ -58,18 +62,20 @@ async fn snapshot(pool: &PgPool) -> Result<Value> {
         })
         .collect();
 
-    let decisions: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
-        "SELECT o.id, e.name, o.content
-         FROM brain_observations o
-         JOIN brain_entities e ON o.entity_id = e.id
-         WHERE o.session_id = $1 AND o.observation_type = 'decision'
-         ORDER BY o.created_at DESC
-         LIMIT 20",
-    )
-    .bind(session_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let decisions: Vec<(uuid::Uuid, String, String)> = lost.note(
+        "decisions",
+        sqlx::query_as(
+            "SELECT o.id, e.name, o.content
+             FROM brain_observations o
+             JOIN brain_entities e ON o.entity_id = e.id
+             WHERE o.session_id = $1 AND o.observation_type = 'decision'
+             ORDER BY o.created_at DESC
+             LIMIT 20",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await,
+    );
     let decisions_json: Vec<Value> = decisions
         .iter()
         .map(|(id, ent, content)| {
@@ -81,18 +87,20 @@ async fn snapshot(pool: &PgPool) -> Result<Value> {
         })
         .collect();
 
-    let unresolved: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, error_type, error_message
-         FROM brain_errors
-         WHERE resolved = FALSE
-           AND ($1::uuid IS NULL OR project_id = $1)
-         ORDER BY created_at DESC
-         LIMIT 20",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let unresolved: Vec<(uuid::Uuid, String, String)> = lost.note(
+        "unresolved_errors",
+        sqlx::query_as(
+            "SELECT id, error_type, error_message
+             FROM brain_errors
+             WHERE resolved = FALSE
+               AND ($1::uuid IS NULL OR project_id = $1)
+             ORDER BY created_at DESC
+             LIMIT 20",
+        )
+        .bind(project_id)
+        .fetch_all(pool)
+        .await,
+    );
     let unresolved_json: Vec<Value> = unresolved
         .iter()
         .map(|(id, ty, msg)| {
@@ -104,17 +112,19 @@ async fn snapshot(pool: &PgPool) -> Result<Value> {
         })
         .collect();
 
-    let pending: Vec<(uuid::Uuid, String)> = sqlx::query_as(
-        "SELECT id, content
-         FROM brain_observations
-         WHERE session_id = $1 AND embedding IS NULL
-         ORDER BY created_at DESC
-         LIMIT 20",
-    )
-    .bind(session_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let pending: Vec<(uuid::Uuid, String)> = lost.note(
+        "pending_embeddings",
+        sqlx::query_as(
+            "SELECT id, content
+             FROM brain_observations
+             WHERE session_id = $1 AND embedding IS NULL
+             ORDER BY created_at DESC
+             LIMIT 20",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await,
+    );
     let pending_json: Vec<Value> = pending
         .iter()
         .map(|(id, c)| {
@@ -133,6 +143,8 @@ async fn snapshot(pool: &PgPool) -> Result<Value> {
     let active_goals = goals_row
         .map(|(g,)| g)
         .unwrap_or_else(|| Value::Array(vec![]));
+
+    let summary_md = with_incomplete_banner(summary_md, &lost);
 
     let snap: (uuid::Uuid,) = sqlx::query_as(
         "INSERT INTO brain_compaction_snapshots
@@ -164,7 +176,7 @@ async fn snapshot(pool: &PgPool) -> Result<Value> {
         "compaction snapshot persisted"
     );
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "action": "snapshot",
         "snapshot_id": snap.0.to_string(),
         "session_id": session_id.to_string(),
@@ -192,7 +204,32 @@ async fn snapshot(pool: &PgPool) -> Result<Value> {
             "raw conversation turns outside this snapshot are not retained by pre_compact; \
              restore re-injects summary_md + structured lists only",
         ),
-    }))
+    });
+    lost.annotate(&mut response, what_a_lost_signal_costs);
+    Ok(response)
+}
+
+/// The warning in the response is gone after `/compact`; the stored snapshot has to carry its own,
+/// or `restore` hands back a snapshot that reads as complete.
+fn with_incomplete_banner(summary_md: String, lost: &LostSignals) -> String {
+    if lost.names().is_empty() {
+        return summary_md;
+    }
+    format!(
+        "> SNAPSHOT INCOMPLETO: no se pudo leer {}. Lo que falte de esas listas NO sobrevive al \
+         compact: no lo des por guardado.\n\n{summary_md}",
+        lost.names().join(", ")
+    )
+}
+
+fn what_a_lost_signal_costs(signal: &str) -> &'static str {
+    match signal {
+        "key_observations" => "las observaciones clave de la sesión (se guardaron vacías)",
+        "decisions" => "las decisiones de la sesión (se guardaron vacías)",
+        "unresolved_errors" => "los errores sin resolver (se guardaron vacíos)",
+        "pending_embeddings" => "las observaciones sin embedding (se guardaron vacías)",
+        _ => "una lista del snapshot",
+    }
 }
 
 async fn restore(pool: &PgPool) -> Result<Value> {

@@ -1,3 +1,4 @@
+use crate::degraded::LostSignals;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -23,7 +24,7 @@ async fn metrics(pool: &PgPool) -> Result<Value> {
     )
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    .context("reading the verify log for the calibration metrics")?;
 
     if rows.is_empty() {
         return Ok(serde_json::json!({
@@ -95,7 +96,7 @@ async fn trust_stats(pool: &PgPool) -> Result<Value> {
     )
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    .context("reading the source trust table")?;
 
     let trust: Vec<Value> = rows
         .iter()
@@ -137,7 +138,7 @@ async fn stats(pool: &PgPool) -> Result<Value> {
     )
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    .context("reading the verify log for the calibration stats")?;
 
     let levels: Vec<Value> = rows
         .iter()
@@ -160,8 +161,7 @@ async fn stats(pool: &PgPool) -> Result<Value> {
     )
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten();
+    .context("counting the verify log for the calibration stats")?;
 
     let (total_count, correct, incorrect) = total.unwrap_or((0, 0, 0));
 
@@ -257,16 +257,19 @@ async fn resolve(pool: &PgPool, args: &Value) -> Result<Value> {
     }
 
     let mut sources_updated = 0u32;
+    let mut lost = LostSignals::default();
     if let Some(ref ename) = entity_name {
-        let sources: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT o.source FROM brain_observations o
-             JOIN brain_entities e ON o.entity_id = e.id
-             WHERE e.name = $1 AND o.observation_type != 'superseded'",
-        )
-        .bind(ename)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+        let sources: Vec<(String,)> = lost.note(
+            "trust_sources",
+            sqlx::query_as(
+                "SELECT DISTINCT o.source FROM brain_observations o
+                 JOIN brain_entities e ON o.entity_id = e.id
+                 WHERE e.name = $1 AND o.observation_type != 'superseded'",
+            )
+            .bind(ename)
+            .fetch_all(pool)
+            .await,
+        );
 
         let column = if outcome == "correct" {
             "alpha"
@@ -288,11 +291,22 @@ async fn resolve(pool: &PgPool, args: &Value) -> Result<Value> {
         }
     }
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "action": "resolve",
         "verify_id": verify_id,
         "outcome": outcome,
         "entity_name": entity_name,
         "sources_credibility_updated": sources_updated
-    }))
+    });
+    lost.annotate(&mut response, what_a_lost_signal_costs);
+    Ok(response)
+}
+
+fn what_a_lost_signal_costs(signal: &str) -> &'static str {
+    match signal {
+        "trust_sources" => {
+            "las fuentes cuya credibilidad debía actualizarse (el resultado quedó registrado, la confianza de sus fuentes NO se actualizó)"
+        }
+        _ => "una señal de la calibración",
+    }
 }

@@ -1,3 +1,4 @@
+use crate::degraded::LostSignals;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -76,15 +77,16 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                 "replaced_previous": replaced > 0,
             });
 
-            let prev_session: Option<(Option<String>, Option<String>, Option<String>)> =
+            let mut lost = LostSignals::default();
+            let prev_session: Option<(Option<String>, Option<String>, Option<String>)> = lost.note(
+                "previous_session",
                 sqlx::query_as(
                     "SELECT session_name, summary, outcome FROM brain_sessions
-                     WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1",
+                         WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1",
                 )
                 .fetch_optional(pool)
-                .await
-                .ok()
-                .flatten();
+                .await,
+            );
 
             if let Some((prev_name, prev_summary, prev_outcome)) = prev_session {
                 response["previous_session"] = serde_json::json!({
@@ -94,17 +96,18 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                 });
             }
 
-            let triggered =
-                crate::handlers::centinela::check_triggers(pool, name, "on_session_start")
-                    .await
-                    .unwrap_or_default();
+            let triggered = lost.note(
+                "triggered_reminders",
+                crate::handlers::centinela::check_triggers(pool, name, "on_session_start").await,
+            );
             if !triggered.is_empty() {
                 response["triggered_reminders"] = serde_json::json!(triggered);
             }
 
-            let notices = crate::handlers::sync::pending_notices(pool)
-                .await
-                .unwrap_or_default();
+            let notices = lost.note(
+                "peer_notices",
+                crate::handlers::sync::pending_notices(pool).await,
+            );
             if !notices.is_empty() {
                 response["peer_notices"] = serde_json::json!(notices);
                 response["peer_notices_note"] = serde_json::json!(
@@ -115,15 +118,17 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                 );
             }
 
-            let pending_review: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM brain_observations
-                 WHERE trust = 'quarantined'
-                   AND ($1::uuid IS NULL OR project_id = $1)",
-            )
-            .bind(project_id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+            let pending_review: i64 = lost.note(
+                "observations_pending_review",
+                sqlx::query_scalar(
+                    "SELECT count(*) FROM brain_observations
+                     WHERE trust = 'quarantined'
+                       AND ($1::uuid IS NULL OR project_id = $1)",
+                )
+                .bind(project_id)
+                .fetch_one(pool)
+                .await,
+            );
             if pending_review > 0 {
                 response["observations_pending_review"] = serde_json::json!(pending_review);
                 response["observations_pending_review_note"] = serde_json::json!(
@@ -133,6 +138,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                 );
             }
 
+            lost.annotate(&mut response, what_a_lost_signal_costs);
             Ok(response)
         }
         "end" => {
@@ -173,21 +179,25 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             });
 
             if let Some((session_id,)) = active_session {
-                let session_diff: Vec<(String, i64)> = sqlx::query_as(
-                    "SELECT observation_type, COUNT(*) FROM brain_observations
-                     WHERE session_id = $1 GROUP BY observation_type",
-                )
-                .bind(session_id)
-                .fetch_all(pool)
-                .await
-                .unwrap_or_default();
+                let mut lost = LostSignals::default();
+                let session_diff: Vec<(String, i64)> = lost.note(
+                    "session_diff",
+                    sqlx::query_as(
+                        "SELECT observation_type, COUNT(*) FROM brain_observations
+                         WHERE session_id = $1 GROUP BY observation_type",
+                    )
+                    .bind(session_id)
+                    .fetch_all(pool)
+                    .await,
+                );
 
-                let episode_count: i64 =
+                let episode_count: i64 = lost.note(
+                    "session_diff",
                     sqlx::query_scalar("SELECT COUNT(*) FROM brain_episodes WHERE session_id = $1")
                         .bind(session_id)
                         .fetch_one(pool)
-                        .await
-                        .unwrap_or(0);
+                        .await,
+                );
 
                 let mut diff = serde_json::Map::new();
                 for (obs_type, count) in &session_diff {
@@ -196,6 +206,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                 diff.insert("episodes".to_string(), serde_json::json!(episode_count));
 
                 response["session_diff"] = Value::Object(diff);
+                lost.annotate(&mut response, what_a_lost_signal_costs);
             }
 
             Ok(response)
@@ -221,32 +232,36 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             };
             match session {
                 Some((id, name, goals, started_at)) => {
-                    let obs_count: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM brain_observations WHERE session_id = $1",
-                    )
-                    .bind(id)
-                    .fetch_one(pool)
-                    .await
-                    .unwrap_or(0);
+                    let mut lost = LostSignals::default();
+                    let obs_count: i64 = lost.note(
+                        "obs_count",
+                        sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM brain_observations WHERE session_id = $1",
+                        )
+                        .bind(id)
+                        .fetch_one(pool)
+                        .await,
+                    );
 
                     let elapsed = chrono::Utc::now() - started_at;
                     let compaction_hint = elapsed
                         > chrono::Duration::seconds(crate::constants::COMPACTION_HINT_HOURS * 3600)
                         || obs_count >= crate::constants::COMPACTION_HINT_OBS_COUNT;
 
-                    let last_snapshot: Option<(uuid::Uuid, chrono::DateTime<chrono::Utc>)> =
-                        sqlx::query_as(
-                            "SELECT id, created_at FROM brain_compaction_snapshots
-                             WHERE session_id = $1
-                             ORDER BY created_at DESC LIMIT 1",
-                        )
-                        .bind(id)
-                        .fetch_optional(pool)
-                        .await
-                        .ok()
-                        .flatten();
+                    let last_snapshot: Option<(uuid::Uuid, chrono::DateTime<chrono::Utc>)> = lost
+                        .note(
+                            "last_snapshot",
+                            sqlx::query_as(
+                                "SELECT id, created_at FROM brain_compaction_snapshots
+                                 WHERE session_id = $1
+                                 ORDER BY created_at DESC LIMIT 1",
+                            )
+                            .bind(id)
+                            .fetch_optional(pool)
+                            .await,
+                        );
 
-                    Ok(serde_json::json!({
+                    let mut response = serde_json::json!({
                         "action": "current",
                         "session": {
                             "id": id.to_string(),
@@ -262,7 +277,9 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                                 "created_at": ts.to_rfc3339(),
                             })
                         }),
-                    }))
+                    });
+                    lost.annotate(&mut response, what_a_lost_signal_costs);
+                    Ok(response)
                 }
                 None => Ok(serde_json::json!({
                     "action": "current",
@@ -283,6 +300,21 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             Ok(serde_json::json!({"action": "list", "sessions": list, "count": list.len()}))
         }
         _ => anyhow::bail!("Invalid action: {action}"),
+    }
+}
+
+fn what_a_lost_signal_costs(signal: &str) -> &'static str {
+    match signal {
+        "previous_session" => "la sesión anterior (su resumen y su resultado no aparecen)",
+        "triggered_reminders" => {
+            "los recordatorios de cuba_centinela (si había uno para este inicio, NO se disparó)"
+        }
+        "peer_notices" => "los avisos de otras máquinas",
+        "observations_pending_review" => "el conteo de observaciones en cuarentena",
+        "session_diff" => "el resumen de lo escrito en la sesión",
+        "obs_count" => "el conteo de observaciones (el aviso de compactación puede estar mal)",
+        "last_snapshot" => "el último snapshot de compactación",
+        _ => "una señal de la sesión",
     }
 }
 

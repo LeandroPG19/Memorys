@@ -203,7 +203,7 @@ pub async fn check_triggers(
         .bind(client.as_deref())
         .fetch_all(pool)
         .await
-        .unwrap_or_default()
+        .context("looking up the reminders that could fire")?
     } else {
         sqlx::query_as(
             "SELECT id, entity_pattern, message, fire_count, max_fires, from_agent
@@ -218,7 +218,7 @@ pub async fn check_triggers(
         .bind(entity_name)
         .fetch_all(pool)
         .await
-        .unwrap_or_default()
+        .context("looking up the reminders that could fire")?
     };
 
     let mut fired: Vec<Value> = Vec::new();
