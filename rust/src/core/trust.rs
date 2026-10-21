@@ -51,9 +51,13 @@ pub fn for_write(
 /// Not «imperative mood»: «always run the tests before committing» is the most useful memory
 /// there is, and a gate that withheld it would be switched off within a week. Each tell is a
 /// phrase or a verb-and-object pair that a rule, a decision or a lesson has no reason to contain,
-/// in English and Spanish (the corpus is both). A false positive costs one `cuba_eco promote`.
+/// in English and Spanish (the corpus is both), with «don't» read as «do not» so that a negation is
+/// a word of its own. A false positive costs one `cuba_eco promote`.
 pub fn injection_tell(content: &str) -> Option<&'static str> {
-    let lowered = content.to_lowercase();
+    let lowered = content
+        .to_lowercase()
+        .replace("n't", " not")
+        .replace("n\u{2019}t", " not");
     let words = words_of(&lowered);
     if disobeys_prior_instructions(&words) {
         return Some("disobey_prior_instructions");
@@ -156,7 +160,7 @@ const CREDENTIAL_WORDS: [&str; 14] = [
     "credenciales",
 ];
 
-/// Lowercase words, with «don't» read as «do not» so that a negation is a word of its own.
+/// The words of an already lowercased text.
 fn words_of(lowered: &str) -> Vec<&str> {
     lowered
         .split(|c: char| !c.is_alphanumeric())
