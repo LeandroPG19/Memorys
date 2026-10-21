@@ -388,7 +388,11 @@ async fn a_calibration_of_a_table_that_cannot_be_read_fails_instead_of_being_emp
                 );
             }
 
-            break_it(&url, "DROP TABLE brain_source_trust").await;
+            break_it(
+                &url,
+                "ALTER TABLE brain_source_trust RENAME COLUMN alpha TO alpha_gone",
+            )
+            .await;
             let trust = try_call(&pool, "cuba_calibrar", json!({"action": "trust"})).await;
             assert!(
                 trust.is_err(),
@@ -440,6 +444,59 @@ async fn a_resolve_that_could_not_find_the_sources_to_retrain_says_so() {
             .await;
             assert_eq!(resolved["sources_credibility_updated"], 0);
             must_say_it(&resolved, "trust_sources");
+            pool.close().await;
+        })
+        .await;
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------- the other readers of the reminders
+
+#[tokio::test]
+async fn an_error_report_that_could_not_look_up_the_reminders_says_so() {
+    in_a_scratch_database("brain_rest_alarma", |url| async move {
+        as_a_client(async {
+            let pool = migrated(&url).await;
+            break_it(&url, "DROP TABLE brain_triggers").await;
+
+            let reported = call(
+                &pool,
+                "cuba_alarma",
+                json!({"error_type": "TypeError", "error_message": "boom"}),
+            )
+            .await;
+            assert!(
+                reported["error_id"].is_string(),
+                "the report itself still lands: {reported}"
+            );
+            must_say_it(&reported, "triggered_reminders");
+            pool.close().await;
+        })
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_entity_read_that_could_not_look_up_the_reminders_says_so() {
+    in_a_scratch_database("brain_rest_alma", |url| async move {
+        as_a_client(async {
+            let pool = migrated(&url).await;
+            call(
+                &pool,
+                "cuba_alma",
+                json!({"action": "create", "name": "tema", "entity_type": "concept"}),
+            )
+            .await;
+            break_it(&url, "DROP TABLE brain_triggers").await;
+
+            let got = call(&pool, "cuba_alma", json!({"action": "get", "name": "tema"})).await;
+            assert_eq!(
+                got["entity"]["name"], "tema",
+                "the read itself still works: {got}"
+            );
+            must_say_it(&got, "triggered_reminders");
             pool.close().await;
         })
         .await;
