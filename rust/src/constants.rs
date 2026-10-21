@@ -969,6 +969,68 @@ mod profile_tests {
         assert_eq!(named(&tools_for("full"), "openWorldHint", true), expected);
     }
 
+    fn listed_with(aliases: Option<&str>, profile: Option<&str>) -> Vec<String> {
+        let _aliases = match aliases {
+            Some(v) => crate::envs::ScopedEnv::set("CUBA_TOOL_ALIASES", v),
+            None => crate::envs::ScopedEnv::cleared("CUBA_TOOL_ALIASES"),
+        };
+        let _profile = match profile {
+            Some(v) => crate::envs::ScopedEnv::set("CUBA_TOOL_PROFILE", v),
+            None => crate::envs::ScopedEnv::cleared("CUBA_TOOL_PROFILE"),
+        };
+        tools_for_profile()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
+            .collect()
+    }
+
+    /// `tools_for_profile` is what `tools/list` and `/admin` call; the binary-level test of it
+    /// lives in tests/mcp_catalogue.rs, which `cargo mutants -- --lib` never runs, so the same
+    /// questions are asked here through the environment the way the server reads it.
+    #[tokio::test]
+    async fn the_listing_has_each_tool_once_unless_the_aliases_are_asked_for() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let default = listed_with(None, None);
+        assert_eq!(default.len(), tool_definitions().len() + 2);
+        assert!(
+            default.iter().all(|n| !n.starts_with("memory_")),
+            "no twins unless asked: {default:?}"
+        );
+
+        for yes in ["1", "true", "TRUE", " yes "] {
+            let with = listed_with(Some(yes), None);
+            assert_eq!(
+                with.len(),
+                default.len() * 2,
+                "CUBA_TOOL_ALIASES={yes:?} lists a twin of every tool"
+            );
+            assert!(with.iter().any(|n| n == "memory_whoami"));
+        }
+        for no in ["0", "", "no", "false", "2", "banana"] {
+            assert_eq!(
+                listed_with(Some(no), None),
+                default,
+                "CUBA_TOOL_ALIASES={no:?} is not a yes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_listing_follows_the_profile_the_environment_names() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        assert_eq!(
+            listed_with(None, Some("lean")).len(),
+            PROFILE_LEAN.len() + 2,
+            "CUBA_TOOL_PROFILE=lean must reach the listing"
+        );
+        assert_eq!(
+            listed_with(Some("1"), Some("lean")).len(),
+            (PROFILE_LEAN.len() + 2) * 2,
+            "and the twins are of the tools the profile lists, not of all of them"
+        );
+    }
+
     #[test]
     fn agent_profile_includes_coordination_tools() {
         let names: Vec<String> = tools_for("agent")

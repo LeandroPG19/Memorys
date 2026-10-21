@@ -1635,7 +1635,7 @@ mod tests {
             .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
             .collect();
         let named: Vec<&str> = text
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .split(|c: char| !(c.is_ascii_alphanumeric() || "_".contains(c)))
             .filter(|word| word.starts_with("cuba_"))
             .collect();
         assert!(
