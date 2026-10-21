@@ -214,22 +214,38 @@ def self_test():
 # --- self-test end ---
 
 
-def main(argv):
+def parse(argv):
     parser = argparse.ArgumentParser(description="Lexical channel A/B: 'simple' vs Spanish, read-only.")
     default = Path(__file__).resolve().parent.parent / "rust" / "eval-datasets" / "phase2-id-scored.jsonl"
     parser.add_argument("--dataset", default=str(default))
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--self-test", action="store_true")
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
 
-    if args.self_test:
-        problems = self_test()
-        for p in problems:
-            print("FAIL:", p, file=sys.stderr)
-        print("lexical_ab self-test:", "FAILED" if problems else "OK")
-        return 1 if problems else 0
 
+def run_self_test():
+    problems = self_test()
+    for p in problems:
+        print("FAIL:", p, file=sys.stderr)
+    print("lexical_ab self-test:", "FAILED" if problems else "OK")
+    return 1 if problems else 0
+
+
+def report(args, rows, result):
+    gain, text = verdict(result)
+    if args.json:
+        print(json.dumps({"queries": len(rows), "k": args.k, "result": result, "gain_ndcg": gain, "verdict": text}))
+        return
+    print(f"{len(rows)} queries with relevant_ids, k={args.k}")
+    print(f"{'channel':<10}{'nDCG@' + str(args.k):>10}{'recall@' + str(args.k):>11}{'MRR':>8}")
+    for name in ("simple", "spanish", "fused"):
+        v = result[name]
+        print(f"{name:<10}{v['ndcg']:>10.3f}{v['recall']:>11.3f}{v['mrr']:>8.3f}")
+    print(text)
+
+
+def run(args):
     url = os.environ.get("DATABASE_URL")
     if not url:
         print("DATABASE_URL is required (read-only: only SELECTs are sent)", file=sys.stderr)
@@ -244,18 +260,13 @@ def main(argv):
     except (OSError, RuntimeError, ValueError) as why:
         print(f"cannot run: {why}", file=sys.stderr)
         return 2
-
-    gain, text = verdict(result)
-    if args.json:
-        print(json.dumps({"queries": len(rows), "k": args.k, "result": result, "gain_ndcg": gain, "verdict": text}))
-        return 0
-    print(f"{len(rows)} queries with relevant_ids, k={args.k}")
-    print(f"{'channel':<10}{'nDCG@' + str(args.k):>10}{'recall@' + str(args.k):>11}{'MRR':>8}")
-    for name in ("simple", "spanish", "fused"):
-        v = result[name]
-        print(f"{name:<10}{v['ndcg']:>10.3f}{v['recall']:>11.3f}{v['mrr']:>8.3f}")
-    print(text)
+    report(args, rows, result)
     return 0
+
+
+def main(argv):
+    args = parse(argv)
+    return run_self_test() if args.self_test else run(args)
 
 
 if __name__ == "__main__":

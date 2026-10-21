@@ -37,15 +37,9 @@ async fn write(pool: &PgPool, args: &Value) -> Result<Value> {
     let project_id = crate::project::current_project_id(pool).await?;
     let session_id = crate::session::session_id();
 
-    // `read` only hides what expired; this is the one place it leaves the table. It runs in the
-    // caller's scope, so under row-level security it removes what that caller may see, and it
-    // sits after the checks above so a refused write deletes nothing. A purge that fails must
-    // not cost the note being written.
-    match purge_expired(pool).await {
-        Ok(0) => {}
-        Ok(purged) => tracing::debug!(purged, "expired working-memory notes removed"),
-        Err(why) => tracing::warn!(error = %why, "could not purge expired working-memory notes"),
-    }
+    // `read` only hides what expired; this is the one place it leaves the table. It sits after the
+    // checks above so a refused write deletes nothing.
+    purge_expired_logged(pool).await;
 
     let row: (Uuid,) = sqlx::query_as(
         "INSERT INTO brain_wm (session_id, project_id, content, tag, ttl_seconds, expires_at)
@@ -138,6 +132,16 @@ async fn clear(pool: &PgPool, args: &Value) -> Result<Value> {
         "tag": tag,
         "session_id": session_id.map(|s| s.to_string()),
     }))
+}
+
+/// Runs in the caller's scope, so under row-level security it removes what that caller may see. A
+/// purge that fails is logged and must not cost the note being written.
+async fn purge_expired_logged(pool: &PgPool) {
+    match purge_expired(pool).await {
+        Ok(0) => {}
+        Ok(purged) => tracing::debug!(purged, "expired working-memory notes removed"),
+        Err(why) => tracing::warn!(error = %why, "could not purge expired working-memory notes"),
+    }
 }
 
 pub async fn purge_expired(pool: &PgPool) -> Result<u64> {
