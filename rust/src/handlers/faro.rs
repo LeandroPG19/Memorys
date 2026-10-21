@@ -321,6 +321,67 @@ fn annotate_degradation(
     }
 }
 
+/// The reads around the ranking that failed during one search. The ranking itself (text, vector,
+/// BM25) reports its failures through `annotate_degradation`; these four feed it or decorate its
+/// result, and each used to be `unwrap_or_default()`: the search went on and the response read as
+/// if the signal had been consulted and found empty — no boost, a verified fact shown as merely
+/// asserted, «nothing new» for a session that could not be asked. A failed read is logged with the
+/// signal it belonged to and recorded, and the response says which signal is missing.
+#[derive(Default)]
+struct LostSignals(Vec<&'static str>);
+
+impl LostSignals {
+    fn note<T: Default>(
+        &mut self,
+        signal: &'static str,
+        read: Result<T, impl std::fmt::Display>,
+    ) -> T {
+        match read {
+            Ok(value) => value,
+            Err(why) => {
+                tracing::warn!(signal, error = %why, "a read around the ranking failed; the search goes on without it");
+                if !self.0.contains(&signal) {
+                    self.0.push(signal);
+                }
+                T::default()
+            }
+        }
+    }
+}
+
+fn what_a_lost_signal_costs(signal: &str) -> &'static str {
+    match signal {
+        "working_memory" => "la memoria de trabajo de la sesión (no refuerza ningún resultado)",
+        "session_goals" => "las metas de la sesión (los resultados no se priorizan por ellas)",
+        "evidence_marks" => {
+            "las marcas de evidencia (un hecho verificado se ve como una simple afirmación)"
+        }
+        "new_since_session_start" => {
+            "qué se escribió desde que abriste la sesión (que no aparezca nada no significa que no haya nada nuevo)"
+        }
+        _ => "una señal de la búsqueda",
+    }
+}
+
+fn annotate_lost_signals(response: &mut Value, lost: &LostSignals) {
+    if lost.0.is_empty() {
+        return;
+    }
+    let costs: Vec<&str> = lost
+        .0
+        .iter()
+        .map(|signal| what_a_lost_signal_costs(signal))
+        .collect();
+    response["signals_degraded"] = serde_json::json!(true);
+    response["signals_lost"] = serde_json::json!(lost.0);
+    response["signals_degraded_reason"] = serde_json::json!(format!(
+        "Una lectura alrededor del ranking falló y la búsqueda siguió sin ella: {}. Los \
+         resultados son válidos pero no llevan esa señal; no la leas como «no hay». \
+         Diagnosticá con `memory-industry doctor`.",
+        costs.join("; ")
+    ));
+}
+
 async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Result<Value> {
     let query_entropy = crate::search::rrf::query_entropy(query);
     let (text_weight, vector_weight) = entropy_weights(query_entropy);
@@ -678,7 +739,8 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
         tracing::warn!(error = %e, "failed to apply Testing Effect boost");
     }
 
-    let (session_boost, session_started) = session_context(pool).await.unwrap_or_default();
+    let mut lost = LostSignals::default();
+    let (session_boost, session_started) = session_context(pool, &mut lost).await;
     if !session_boost.is_empty() {
         for (_, fr) in &mut results {
             let content = fr
@@ -890,10 +952,10 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
         final_results.push(r);
     }
 
-    annotate_evidence(pool, &mut final_results).await;
+    annotate_evidence(pool, &mut final_results, &mut lost).await;
 
     let fresh = match session_started {
-        Some(since) => written_since(pool, &final_results, since).await,
+        Some(since) => written_since(pool, &final_results, since, &mut lost).await,
         None => Vec::new(),
     };
 
@@ -943,6 +1005,7 @@ async fn hybrid_search(pool: &PgPool, query: &str, opts: &SearchOpts<'_>) -> Res
         bm25_failed,
         rerank_outcome,
     );
+    annotate_lost_signals(&mut response, &lost);
 
     Ok(response)
 }
@@ -1091,7 +1154,7 @@ fn compact_chars() -> usize {
         .unwrap_or(1200)
 }
 
-async fn annotate_evidence(pool: &PgPool, results: &mut [Value]) {
+async fn annotate_evidence(pool: &PgPool, results: &mut [Value], lost: &mut LostSignals) {
     let ids: Vec<uuid::Uuid> = results
         .iter()
         .filter_map(|r| r.get("id").or_else(|| r.get("i")))
@@ -1103,14 +1166,16 @@ async fn annotate_evidence(pool: &PgPool, results: &mut [Value]) {
     }
 
     type Row = (uuid::Uuid, String, Option<chrono::DateTime<chrono::Utc>>);
-    let stronger: Vec<Row> = sqlx::query_as(
-        "SELECT id, evidence, verified_at FROM brain_observations
-         WHERE id = ANY($1) AND evidence <> 'asserted'",
-    )
-    .bind(&ids)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let stronger: Vec<Row> = lost.note(
+        "evidence_marks",
+        sqlx::query_as(
+            "SELECT id, evidence, verified_at FROM brain_observations
+             WHERE id = ANY($1) AND evidence <> 'asserted'",
+        )
+        .bind(&ids)
+        .fetch_all(pool)
+        .await,
+    );
     if stronger.is_empty() {
         return;
     }
@@ -1792,16 +1857,19 @@ async fn associative_expand(
 
 type SessionContext = (Vec<String>, Option<DateTime<Utc>>);
 
-async fn session_context(pool: &PgPool) -> Result<SessionContext> {
+async fn session_context(pool: &PgPool, lost: &mut LostSignals) -> SessionContext {
     let Some(sid) = crate::session::session_id() else {
-        return Ok((Vec::new(), None));
+        return (Vec::new(), None);
     };
-    let row: Option<(serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT goals, started_at FROM brain_sessions WHERE id = $1 AND ended_at IS NULL",
-    )
-    .bind(sid)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(serde_json::Value, DateTime<Utc>)> = lost.note(
+        "session_goals",
+        sqlx::query_as(
+            "SELECT goals, started_at FROM brain_sessions WHERE id = $1 AND ended_at IS NULL",
+        )
+        .bind(sid)
+        .fetch_optional(pool)
+        .await,
+    );
 
     let (mut boosts, started) = match row {
         Some((goals, started_at)) => (
@@ -1810,26 +1878,33 @@ async fn session_context(pool: &PgPool) -> Result<SessionContext> {
         ),
         None => (Vec::new(), None),
     };
-    let wm: Vec<(String,)> = sqlx::query_as(
-        "SELECT content FROM brain_wm
-         WHERE expires_at > NOW()
-           AND session_id IS NOT DISTINCT FROM $1
-         ORDER BY created_at DESC
-         LIMIT 20",
-    )
-    .bind(sid)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let wm: Vec<(String,)> = lost.note(
+        "working_memory",
+        sqlx::query_as(
+            "SELECT content FROM brain_wm
+             WHERE expires_at > NOW()
+               AND session_id IS NOT DISTINCT FROM $1
+             ORDER BY created_at DESC
+             LIMIT 20",
+        )
+        .bind(sid)
+        .fetch_all(pool)
+        .await,
+    );
     for (content,) in wm {
         if !content.trim().is_empty() {
             boosts.push(content);
         }
     }
-    Ok((boosts, started))
+    (boosts, started)
 }
 
-async fn written_since(pool: &PgPool, results: &[Value], since: DateTime<Utc>) -> Vec<usize> {
+async fn written_since(
+    pool: &PgPool,
+    results: &[Value],
+    since: DateTime<Utc>,
+    lost: &mut LostSignals,
+) -> Vec<usize> {
     let ids: Vec<uuid::Uuid> = results
         .iter()
         .filter_map(|r| r.get("id").or_else(|| r.get("i")))
@@ -1840,18 +1915,20 @@ async fn written_since(pool: &PgPool, results: &[Value], since: DateTime<Utc>) -
         return Vec::new();
     }
 
-    let fresh: Vec<(uuid::Uuid,)> = sqlx::query_as(
-        "SELECT id FROM brain_observations WHERE id = ANY($1) AND created_at > $2
-         UNION ALL
-         SELECT id FROM brain_episodes WHERE id = ANY($1) AND started_at > $2
-         UNION ALL
-         SELECT id FROM brain_entities WHERE id = ANY($1) AND created_at > $2",
-    )
-    .bind(&ids)
-    .bind(since)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let fresh: Vec<(uuid::Uuid,)> = lost.note(
+        "new_since_session_start",
+        sqlx::query_as(
+            "SELECT id FROM brain_observations WHERE id = ANY($1) AND created_at > $2
+             UNION ALL
+             SELECT id FROM brain_episodes WHERE id = ANY($1) AND started_at > $2
+             UNION ALL
+             SELECT id FROM brain_entities WHERE id = ANY($1) AND created_at > $2",
+        )
+        .bind(&ids)
+        .bind(since)
+        .fetch_all(pool)
+        .await,
+    );
     if fresh.is_empty() {
         return Vec::new();
     }
