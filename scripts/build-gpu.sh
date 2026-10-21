@@ -75,12 +75,18 @@ fi
 
 echo "building release + cuda (MemoryMax=$MEM_MAX, jobs=$JOBS)"
 
-if command -v systemd-run >/dev/null 2>&1; then
+# `command -v` finds the binary, not a session to talk to. In a container
+# without systemd as PID 1, or a WSL2 without systemd=true, systemd-run is
+# installed and `--user --scope` answers «Failed to connect to bus», which under
+# set -e ended the gate before cargo had run (cloud container, 2026-10-21). A
+# scope that runs `true` asks the machine exactly what the build is about to.
+if command -v systemd-run >/dev/null 2>&1 \
+    && systemd-run --user --scope -q true >/dev/null 2>&1; then
     systemd-run --user --scope -q \
         -p MemoryMax="$MEM_MAX" -p CPUQuota="$CPU_QUOTA" \
         nice -n 15 cargo build --release --features cuda -j "$JOBS"
 else
-    echo "note: systemd-run unavailable, building without a memory cap"
+    echo "note: systemd-run cannot start a user scope here (not installed, or no user session), building without a memory cap"
     nice -n 15 cargo build --release --features cuda -j "$JOBS"
 fi
 
