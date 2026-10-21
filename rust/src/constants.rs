@@ -871,6 +871,10 @@ mod profile_tests {
     /// (`cuba_call`). Everything else answers from the local database.
     #[test]
     fn only_tools_that_can_leave_the_machine_say_they_are_open_world() {
+        #[cfg(feature = "docs")]
+        let with_docs = crate::handlers::docs::enabled();
+        #[cfg(not(feature = "docs"))]
+        let with_docs = false;
         let mut expected = vec![
             "cuba_call",
             "cuba_faro",
@@ -878,8 +882,7 @@ mod profile_tests {
             "cuba_juez",
             "cuba_sync",
         ];
-        #[cfg(feature = "docs")]
-        if crate::handlers::docs::enabled() {
+        if with_docs {
             expected.push("cuba_docs");
             expected.sort();
         }
