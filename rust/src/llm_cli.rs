@@ -52,7 +52,8 @@ pub fn load_saved_config_into_env() {
             continue;
         }
         if std::env::var_os(k).is_none() {
-            // SAFETY: single-threaded startup before tokio workers spawn MCP handlers.
+            // SAFETY: called from main() before the tokio runtime exists (see main.rs); the one-shot CLI
+            // paths that call it again find every key already set and write nothing.
             unsafe {
                 std::env::set_var(k, v);
             }

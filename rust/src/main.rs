@@ -116,6 +116,13 @@ fn main() {
     );
     memory_industry::resources::apply(&plan);
 
+    // Saved by `memory-industry llm set` / `graph` — easiest path for humans and agents.
+    // These call `std::env::set_var`, which is only sound while no other thread can read the
+    // environment: that is true here, before the runtime's workers exist, and it stopped
+    // being true when they were called from `async_main`, under `block_on`.
+    memory_industry::llm_cli::load_saved_config_into_env();
+    memory_industry::graph_db::load_saved_config_into_env();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(plan.worker_threads)
         .max_blocking_threads(plan.max_blocking_threads)
@@ -127,10 +134,6 @@ fn main() {
 }
 
 async fn async_main() {
-    // Saved by `memory-industry llm set` — easiest path for humans and agents.
-    memory_industry::llm_cli::load_saved_config_into_env();
-    memory_industry::graph_db::load_saved_config_into_env();
-
     let argv: Vec<String> = std::env::args().collect();
     match argv.get(1).map(String::as_str) {
         Some("eval") => {

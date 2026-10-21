@@ -269,13 +269,12 @@ pub fn register_cancel_token(request_id: &Value) -> CancelRegistration {
     CancelRegistration { key, token }
 }
 
-const SUPPORTED_PROTOCOL_VERSIONS: [&str; 5] = [
-    "2026-07-28",
-    "2025-11-25",
-    "2025-06-18",
-    "2025-03-26",
-    "2024-11-05",
-];
+// Only revisions this server really implements. 2026-07-28 is not one of them: it makes
+// `resultType` mandatory in every result, `ttlMs`/`cacheScope` in every `*/list`, and
+// removes `initialize` and sessions in favour of `server/discover` and a `_meta` on each
+// request. Naming it here made the handshake claim a shape the responses do not have.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] =
+    ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const FALLBACK_PROTOCOL_VERSION: &str = "2024-11-05";
 
