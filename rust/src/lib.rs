@@ -15,6 +15,7 @@ pub mod crdt;
 pub mod dashboard;
 pub mod db;
 pub mod dedupe_cli;
+pub mod degraded;
 pub mod doctor;
 pub mod embeddings;
 pub mod envs;

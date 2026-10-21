@@ -1,4 +1,5 @@
 use crate::cognitive::dual_strength;
+use crate::degraded::LostSignals;
 use crate::search::cache::TtlLruCache;
 use crate::search::confidence as grounding;
 use anyhow::{Context, Result};
@@ -321,34 +322,9 @@ fn annotate_degradation(
     }
 }
 
-/// The reads around the ranking that failed during one search. The ranking itself (text, vector,
-/// BM25) reports its failures through `annotate_degradation`; these four feed it or decorate its
-/// result, and each used to be `unwrap_or_default()`: the search went on and the response read as
-/// if the signal had been consulted and found empty — no boost, a verified fact shown as merely
-/// asserted, «nothing new» for a session that could not be asked. A failed read is logged with the
-/// signal it belonged to and recorded, and the response says which signal is missing.
-#[derive(Default)]
-struct LostSignals(Vec<&'static str>);
-
-impl LostSignals {
-    fn note<T: Default>(
-        &mut self,
-        signal: &'static str,
-        read: Result<T, impl std::fmt::Display>,
-    ) -> T {
-        match read {
-            Ok(value) => value,
-            Err(why) => {
-                tracing::warn!(signal, error = %why, "a read around the ranking failed; the search goes on without it");
-                if !self.0.contains(&signal) {
-                    self.0.push(signal);
-                }
-                T::default()
-            }
-        }
-    }
-}
-
+/// The reads around the ranking that failed during one search (see `crate::degraded`). The ranking
+/// itself (text, vector, BM25) reports its failures through `annotate_degradation`; these four feed
+/// it or decorate its result, and the response says which signal is missing.
 fn what_a_lost_signal_costs(signal: &str) -> &'static str {
     match signal {
         "working_memory" => "la memoria de trabajo de la sesión (no refuerza ningún resultado)",
@@ -364,16 +340,16 @@ fn what_a_lost_signal_costs(signal: &str) -> &'static str {
 }
 
 fn annotate_lost_signals(response: &mut Value, lost: &LostSignals) {
-    if lost.0.is_empty() {
+    if lost.names().is_empty() {
         return;
     }
     let costs: Vec<&str> = lost
-        .0
+        .names()
         .iter()
         .map(|signal| what_a_lost_signal_costs(signal))
         .collect();
     response["signals_degraded"] = serde_json::json!(true);
-    response["signals_lost"] = serde_json::json!(lost.0);
+    response["signals_lost"] = serde_json::json!(lost.names());
     response["signals_degraded_reason"] = serde_json::json!(format!(
         "Una lectura alrededor del ranking falló y la búsqueda siguió sin ella: {}. Los \
          resultados son válidos pero no llevan esa señal; no la leas como «no hay». \

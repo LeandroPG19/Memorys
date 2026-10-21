@@ -1,3 +1,4 @@
+use crate::degraded::LostSignals;
 use anyhow::Result;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -18,68 +19,78 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
     let session_id = crate::session::session_id();
     let client = crate::session::current_client();
 
-    let wm: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT content, tag FROM brain_wm
-         WHERE expires_at > NOW()
-           AND session_id IS NOT DISTINCT FROM $1
-           AND ($2::uuid IS NULL OR project_id = $2)
-         ORDER BY created_at DESC
-         LIMIT 20",
-    )
-    .bind(session_id)
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let mut lost = LostSignals::default();
+
+    let wm: Vec<(String, Option<String>)> = lost.note(
+        "working_memory",
+        sqlx::query_as(
+            "SELECT content, tag FROM brain_wm
+             WHERE expires_at > NOW()
+               AND session_id IS NOT DISTINCT FROM $1
+               AND ($2::uuid IS NULL OR project_id = $2)
+             ORDER BY created_at DESC
+             LIMIT 20",
+        )
+        .bind(session_id)
+        .bind(project_id)
+        .fetch_all(pool)
+        .await,
+    );
 
     let notes: Vec<(String, Option<String>)> = if let Some(ref cid) = client {
-        sqlx::query_as(
-            "SELECT message, from_agent FROM brain_triggers
-             WHERE active = TRUE
-               AND condition_type = 'on_session_start'
-               AND (expires_at IS NULL OR expires_at > NOW())
-               AND entity_pattern = $1
-             ORDER BY created_at DESC
-             LIMIT 10",
+        lost.note(
+            "agent_notes",
+            sqlx::query_as(
+                "SELECT message, from_agent FROM brain_triggers
+                 WHERE active = TRUE
+                   AND condition_type = 'on_session_start'
+                   AND (expires_at IS NULL OR expires_at > NOW())
+                   AND entity_pattern = $1
+                 ORDER BY created_at DESC
+                 LIMIT 10",
+            )
+            .bind(cid)
+            .fetch_all(pool)
+            .await,
         )
-        .bind(cid)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
     } else {
         Vec::new()
     };
 
-    let artifacts: Vec<(String, i64, String)> = sqlx::query_as(
-        "SELECT path, version, content_hash FROM brain_artifacts
-         WHERE (
-                ($1::uuid IS NULL AND project_id IS NULL)
-             OR ($1::uuid IS NOT NULL AND project_id IS NOT DISTINCT FROM $1)
-           )
-         ORDER BY updated_at DESC
-         LIMIT 30",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    let session_writes: Vec<(String, String, f64)> = if let Some(sid) = session_id {
+    let artifacts: Vec<(String, i64, String)> = lost.note(
+        "artifacts",
         sqlx::query_as(
-            "SELECT e.name, left(o.content, 240), o.importance::float8
-             FROM brain_observations o
-             JOIN brain_entities e ON e.id = o.entity_id
-             WHERE o.session_id = $1
-               AND o.observation_type != 'superseded'
-               AND ($2::uuid IS NULL OR o.project_id = $2)
-             ORDER BY o.created_at DESC
-             LIMIT 8",
+            "SELECT path, version, content_hash FROM brain_artifacts
+             WHERE (
+                    ($1::uuid IS NULL AND project_id IS NULL)
+                 OR ($1::uuid IS NOT NULL AND project_id IS NOT DISTINCT FROM $1)
+               )
+             ORDER BY updated_at DESC
+             LIMIT 30",
         )
-        .bind(sid)
         .bind(project_id)
         .fetch_all(pool)
-        .await
-        .unwrap_or_default()
+        .await,
+    );
+
+    let session_writes: Vec<(String, String, f64)> = if let Some(sid) = session_id {
+        lost.note(
+            "top_recall",
+            sqlx::query_as(
+                "SELECT e.name, left(o.content, 240), o.importance::float8
+                 FROM brain_observations o
+                 JOIN brain_entities e ON e.id = o.entity_id
+                 WHERE o.session_id = $1
+                   AND o.observation_type != 'superseded'
+                   AND ($2::uuid IS NULL OR o.project_id = $2)
+                 ORDER BY o.created_at DESC
+                 LIMIT 8",
+            )
+            .bind(sid)
+            .bind(project_id)
+            .fetch_all(pool)
+            .await,
+        )
     } else {
         Vec::new()
     };
@@ -90,49 +101,54 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         .collect::<Vec<_>>()
         .join(" ");
     let wm_mentions: Vec<(String, String, f64)> = if wm_blob.chars().count() >= 4 {
-        let names: Vec<(String,)> =
+        let names: Vec<(String,)> = lost.note(
+            "top_recall",
             sqlx::query_as("SELECT name FROM brain_entities WHERE char_length(name) >= 4")
                 .fetch_all(pool)
-                .await
-                .unwrap_or_default();
+                .await,
+        );
         let hits =
             crate::search::mentions::names_in_query(&wm_blob, names.iter().map(|(n,)| n.as_str()));
         if hits.is_empty() {
             Vec::new()
         } else {
-            sqlx::query_as(
-                "SELECT e.name, left(o.content, 240), o.importance::float8
-                 FROM brain_observations o
-                 JOIN brain_entities e ON e.id = o.entity_id
-                 WHERE e.name = ANY($1)
-                   AND o.observation_type != 'superseded'
-                   AND o.trust = 'trusted'
-                   AND ($2::uuid IS NULL OR o.project_id = $2)
-                 ORDER BY o.importance DESC NULLS LAST, o.created_at DESC
-                 LIMIT 8",
+            lost.note(
+                "top_recall",
+                sqlx::query_as(
+                    "SELECT e.name, left(o.content, 240), o.importance::float8
+                     FROM brain_observations o
+                     JOIN brain_entities e ON e.id = o.entity_id
+                     WHERE e.name = ANY($1)
+                       AND o.observation_type != 'superseded'
+                       AND o.trust = 'trusted'
+                       AND ($2::uuid IS NULL OR o.project_id = $2)
+                     ORDER BY o.importance DESC NULLS LAST, o.created_at DESC
+                     LIMIT 8",
+                )
+                .bind(&hits)
+                .bind(project_id)
+                .fetch_all(pool)
+                .await,
             )
-            .bind(&hits)
-            .bind(project_id)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default()
         }
     } else {
         Vec::new()
     };
 
-    let importance_fallback: Vec<(String, String, f64)> = sqlx::query_as(
-        "SELECT e.name, left(o.content, 240), o.importance::float8
-         FROM brain_observations o
-         JOIN brain_entities e ON e.id = o.entity_id
-         WHERE ($1::uuid IS NULL OR o.project_id = $1)
-         ORDER BY o.importance DESC NULLS LAST, o.updated_at DESC NULLS LAST
-         LIMIT 15",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let importance_fallback: Vec<(String, String, f64)> = lost.note(
+        "top_recall",
+        sqlx::query_as(
+            "SELECT e.name, left(o.content, 240), o.importance::float8
+             FROM brain_observations o
+             JOIN brain_entities e ON e.id = o.entity_id
+             WHERE ($1::uuid IS NULL OR o.project_id = $1)
+             ORDER BY o.importance DESC NULLS LAST, o.updated_at DESC NULLS LAST
+             LIMIT 15",
+        )
+        .bind(project_id)
+        .fetch_all(pool)
+        .await,
+    );
 
     let recall = merge_recall(session_writes, wm_mentions, importance_fallback, RECALL_CAP);
 
@@ -145,7 +161,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
 
     let (layers, truncated) = apply_char_budget(layers, budget);
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "action": "contexto",
         "client_id": client,
         "session_id": session_id.map(|s| s.to_string()),
@@ -153,7 +169,25 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         "budget_chars": budget,
         "truncated": truncated,
         "layers": layers,
-    }))
+    });
+    annotate_lost_layers(&mut response, &lost);
+    Ok(response)
+}
+
+/// A layer that could not be read comes back as `[]`, which is also what a layer with nothing in it
+/// looks like. Called at the start of every turn, so a healthy call must carry none of these keys.
+fn annotate_lost_layers(response: &mut Value, lost: &LostSignals) {
+    if lost.names().is_empty() {
+        return;
+    }
+    response["layers_degraded"] = serde_json::json!(true);
+    response["layers_lost"] = serde_json::json!(lost.names());
+    response["layers_degraded_reason"] = serde_json::json!(format!(
+        "No se pudo leer: {}. Esas capas vuelven vacías y vacía aquí no significa «no hay nada»: \
+         no replanees desde cero ni asumas que no existe un artefacto. Diagnosticá con \
+         `memory-industry doctor`.",
+        lost.names().join(", ")
+    ));
 }
 
 /// Compact transparency helper used by pre_compact after it runs.
