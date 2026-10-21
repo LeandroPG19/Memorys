@@ -182,7 +182,10 @@ fn has_any(words: &[&str], set: &[&str]) -> bool {
 fn disobeys_prior_instructions(words: &[&str]) -> bool {
     words.iter().enumerate().any(|(i, word)| {
         DISOBEY_VERBS.contains(word) && {
-            let window = &words[i + 1..(i + 6).min(words.len())];
+            // The verb and the five words after it. The verb is in the slice and is neither a
+            // qualifier nor a noun, so it changes nothing; starting at `i` leaves no `+ 1` for a
+            // mutant to turn into an equivalent `* 1`.
+            let window = &words[i..(i + 6).min(words.len())];
             has_any(window, &PRIOR_QUALIFIERS) && has_any(window, &INSTRUCTION_NOUNS)
         }
     })
