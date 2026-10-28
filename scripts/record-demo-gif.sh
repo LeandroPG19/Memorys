@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CAST="${ROOT}/assets/demo.cast"
 GIF="${ROOT}/assets/demo.gif"
-export CUBA_BINARY_PATH="${CUBA_BINARY_PATH:-$ROOT/rust/target/release/cuba-memorys}"
+export CUBA_BINARY_PATH="${CUBA_BINARY_PATH:-$ROOT/rust/target/release/memory-industry}"
 export RECORD_DEMO=1
 
 if [[ ! -x "$CUBA_BINARY_PATH" ]]; then
@@ -24,7 +24,7 @@ asciinema rec "$CAST" \
   --command "bash -lc 'export TERM=xterm-256color; export RECORD_DEMO=1; bash \"$ROOT/scripts/demo.sh\"'" \
   --idle-time-limit 1.2 \
   --overwrite \
-  --title "cuba-memorys demo"
+  --title "memory-industry demo"
 
 echo "Rendering GIF → $GIF"
 agg "$CAST" "$GIF" \
