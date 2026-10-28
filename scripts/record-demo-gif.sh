@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CAST="${ROOT}/assets/demo.cast"
-GIF="${ROOT}/assets/demo.gif"
+GIF="${ROOT}/assets/demo-v0.30.gif"
 export CUBA_BINARY_PATH="${CUBA_BINARY_PATH:-$ROOT/rust/target/release/memory-industry}"
 export RECORD_DEMO=1
 
@@ -39,4 +39,4 @@ agg "$CAST" "$GIF" \
 
 rm -f "$CAST"
 ls -lh "$GIF"
-echo "Done. Commit assets/demo.gif"
+echo "Done. Commit assets/demo-v0.30.gif"
