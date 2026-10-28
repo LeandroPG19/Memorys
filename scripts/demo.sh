@@ -125,7 +125,10 @@ call receta '{"action":"outcome","name":"publish a release","success":true}' \
 sleep 0.3
 
 echo -e "\n${BOLD}── And you can read it yourself ──${NC}"
-cli "search from the shell — no agent, no tokens" search "embedding model" --limit 2
+echo -e "\n${MAGENTA}\$ memory-industry search embedding model --limit 2${NC}"
+echo -e "${DIM}search from the shell — no agent, no tokens${NC}"
+timeout 60 "$BINARY" search "embedding model" --limit 2 2>/dev/null | tail -n +3 | head -12
+sleep "$PAUSE"
 sleep 0.3
 
 echo -e "\n${BOLD}── It tells you when something is wrong ──${NC}"
