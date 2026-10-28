@@ -23,14 +23,40 @@ Written in Rust. Backed by PostgreSQL + pgvector. **31 MCP tools** (32 with `CUB
 
 ## Install
 
-```bash
-pip install memory-industry        # or: npm install -g memory-industry
-claude mcp add memory-industry -- memory-industry
+Pick the package manager you already have. All of them give you the same `memory-industry` binary.
 
-# Previous names still install the same binary:
-#   pip install cuba-memorys
-#   npm install -g cuba-memorys
+| You use | Install | Or run without installing |
+|---|---|---|
+| **pip** | `pip install memory-industry` | |
+| **pipx** | `pipx install memory-industry` | |
+| **uv** | | `uvx memory-industry` |
+| **npm** | `npm install -g memory-industry` | `npx -y memory-industry` |
+| **pnpm** | `pnpm add -g memory-industry` | `pnpm dlx memory-industry` |
+| **Standalone binary** | download it from [GitHub Releases](https://github.com/LeandroPG19/Memorys/releases/latest) | |
+| **From source** | `cd rust && cargo build --release` | |
+
+Then register it with your client:
+
+```bash
+claude mcp add memory-industry -- memory-industry
+# or, with nothing installed:
+claude mcp add memory-industry -- npx -y memory-industry
 ```
+
+<details>
+<summary><b>pnpm, the standalone binary, the registry, and the old names</b></summary>
+
+- **pnpm blocks install scripts by default** (since v10), so `memory-industry`'s `postinstall` does not run and the binary is fetched from GitHub Releases the first time you launch it. `pnpm add -g` and `pnpm dlx` work as they are. Inside a project, run `pnpm approve-builds` if you want the download to happen at install time. Checked with pnpm 11.27.
+- **Standalone binary.** One file per platform: `memory-industry-linux-x64`, `-linux-arm64`, `-macos-x64`, `-macos-arm64` and `-windows-x64.exe`. For example:
+  ```bash
+  curl -L -o memory-industry https://github.com/LeandroPG19/Memorys/releases/latest/download/memory-industry-linux-x64
+  chmod +x memory-industry && ./memory-industry --version
+  ```
+- **MCP Registry.** Listed as `io.github.LeandroPG19/memory-industry` (npm and PyPI packages), for clients that install from the registry.
+- **Previous names** still install the same binary: `pip install cuba-memorys`, `npm install -g cuba-memorys`, and the `cuba-memorys` command.
+- **As a service.** `memory-industry setup service --apply` writes the systemd units on Linux, or the scheduled task on Windows (add `--register` from an elevated shell).
+
+</details>
 
 That is the whole setup. On first run it provisions a PostgreSQL 18 + pgvector container via Docker and initializes the schema. **[Docker](https://docs.docker.com/get-docker/) must be running.** The `cuba-memorys` command remains a binary alias.
 
