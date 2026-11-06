@@ -305,3 +305,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   real mutants-gate runs (seed built, then hit), each compared mutant by mutant with F0's outcomes.json.
   A suggestion of the F4 implementer kept for later: a versioned class table so --compare-classes does not depend
   on F0's cache.
+- 2026-11-06 20:40 · **F4 acceptance measurement (Measured, `54edcc8` + F4c, under pesado, nothing else of mine
+  running):** run 1 472.4 s (seed built in 70 s), run 2 279.2 s; both 54/54 classes identical one by one to F0's
+  outcomes.json (53 caught, 1 unviable, kill rate 1.000; OK tree, OK seed unchanged, OK mutant set 54). F0 took
+  1053 s for the same step: 3.8× faster on run 2, under the 500 s target, from F4a (lib test only) alone. The seed of
+  F4b did not hit on run 2 (`seed: miss (204 crates compiled in the baseline)`, 1.1 GB): suspected cargo-mutants'
+  own RUSTFLAGS (cap-lints) or an environment difference in the seed's fingerprint; diagnosis with the kept logs
+  handed to the F4 implementer. The miss line did what it was built for: it informed and decided nothing.
