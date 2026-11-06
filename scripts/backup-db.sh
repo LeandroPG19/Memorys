@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP_DIR="${BACKUP_DIR:-$ROOT/backups}"
 KEEP_COUNT="${KEEP_COUNT:-7}"
-DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
+: "${DATABASE_URL:?set DATABASE_URL to the database to back up (see docs/gate.md)}"
 
 COUNTED_TABLES=(brain_observations brain_entities brain_relations brain_episodes brain_audit_log)
 

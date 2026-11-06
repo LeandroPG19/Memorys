@@ -13,7 +13,8 @@
 #                                                   rust/ or CARGO_TARGET_DIR points
 #                                                   there (merge-gate.sh, at the start)
 #   ./scripts/mutants-gate.sh --available-kb [MEMINFO]
-#                                                   the KB the machine can still give
+#                                                   the KB the machine can still give,
+#                                                   under the margin of its cgroup
 #   ./scripts/mutants-gate.sh --jobs-plan CORES AVAILABLE_KB
 #                                                   how many jobs the cores and the
 #                                                   available memory hold
@@ -338,6 +339,17 @@ mutants_available_kb() {
     echo "      Name the jobs yourself and the memory is not read: MUTANTS_JOBS=<n>." >&2
     return 2
   fi
+  # The gate runs inside a cgroup (pesado's scope): its margin is what the jobs really
+  # have when it is tighter than the machine's (CI-J, D-J5b). Called directly, so a
+  # refused value exits this shell.
+  gate_cgroup_read
+  if [[ -n "$GATE_CG_NOTE" ]]; then
+    echo "note: $GATE_CG_NOTE; the memory is MemAvailable alone, as before" >&2
+  fi
+  if [[ -n "$GATE_CG_MEM_KB" ]] && (( 10#$GATE_CG_MEM_KB < 10#$kb )); then
+    echo "memory: the cgroup leaves $(mutants_gb "$GATE_CG_MEM_KB") GB of the $(mutants_gb "$kb") GB available, and it is the tighter one" >&2
+    kb="$GATE_CG_MEM_KB"
+  fi
   printf '%s\n' "$kb"
 }
 
@@ -370,8 +382,14 @@ mutants_jobs_plan() {
 # CORES and a MEMINFO file it is the same rule over those, which is how --self-test
 # holds it; quality-gate.sh asks this and keeps no formula of its own.
 mutants_default_jobs() {
-  local cores="${1:-}" avail
+  local cores="${1:-}" avail named_cores
   [[ -n "$cores" ]] || cores="$(nproc 2>/dev/null || echo 4)"
+  named_cores="$cores"
+  gate_cgroup_read
+  if [[ -n "$GATE_CG_CPUS" && "$cores" =~ ^[0-9]+$ ]] && (( 10#$cores > GATE_CG_CPUS )); then
+    cores="$GATE_CG_CPUS"
+    echo "cpu: the cgroup allows $GATE_CG_CPUS CPUs of the $named_cores the cores would give, and it is the tighter one" >&2
+  fi
   avail="$(mutants_available_kb "${2:-}")" || return $?
   mutants_jobs_plan "$cores" "$avail"
 }
@@ -1323,6 +1341,13 @@ self_test() {
 }
 # --- self-test end ---
 
+# The modes below size the jobs through gate-lock.sh's cgroup reader (D-J5b), so the
+# library is sourced before any of them. Sourcing defines functions and variables only:
+# gate_linux_env, which sets up the Linux environment of a gate run, stays on the path
+# below, after the modes.
+# shellcheck source=scripts/gate-lock.sh
+source "$ROOT/scripts/gate-lock.sh"
+
 case "${1:-}" in
 # --- self-test begin ---
   "--self-test") self_test ;;
@@ -1365,9 +1390,13 @@ esac
 # Where each mutant's scratch copy lands is TMPDIR, so it has to be a disk and not
 # tmpfs (RAM here) before the output directory below is named: gate-lock.sh says
 # why. The modes above judge a file and need neither.
-# shellcheck source=scripts/gate-lock.sh
-source "$ROOT/scripts/gate-lock.sh"
 gate_linux_env
+
+# The judge's server, when DATABASE_URL names one (D-J1d): asked before cargo, and a
+# server with no judge marker is exit 2. With no DATABASE_URL the step runs as it did.
+if [[ -n "${DATABASE_URL:-}" ]]; then
+  gate_require_judge_server "$DATABASE_URL"
+fi
 
 cd "$ROOT/rust"
 
@@ -1377,9 +1406,24 @@ if ! command -v cargo-mutants >/dev/null 2>&1 && ! cargo mutants --version >/dev
 fi
 
 MUTANTS_MIN_KILL="${MUTANTS_MIN_KILL:-0.7}"
-OUT_DIR="${TMPDIR:-/tmp}/memory-industry-mutants-out"
-rm -rf "$OUT_DIR"
-mkdir -p "$OUT_DIR"
+# D-J7a: a directory of this run, made now under the judge's scratch. A fixed name would be
+# removed by the run that comes after, or by a self-test, while this one still reads it.
+OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/memory-industry-mutants-out.XXXXXX")"
+# A green run takes its own directory away; a red one keeps it, and says where, for the diagnosis.
+mutants_keep_out() {
+  local code=$?
+  case "${OUT_DIR:-}" in
+    "${TMPDIR:-/tmp}"/memory-industry-mutants-out.*) ;;
+    *) return "$code" ;;
+  esac
+  if (( code == 0 )); then
+    rm -rf "$OUT_DIR"
+  else
+    echo "note: the mutation run failed; its output stays in $OUT_DIR for the diagnosis" >&2
+  fi
+  return "$code"
+}
+trap mutants_keep_out EXIT
 
 
 # Parallelism derived from the machine, not pinned to a number, and from the memory

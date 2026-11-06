@@ -9,7 +9,7 @@ fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DUMP="$1"
-DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
+: "${DATABASE_URL:?set DATABASE_URL to the database to restore into (see docs/gate.md)}"
 
 if [[ ! -f "$DUMP" ]]; then
   echo "error: dump file not found: $DUMP" >&2
@@ -53,7 +53,7 @@ BACKUP_DIR="$ROOT/backups/pre-restore" "$ROOT/scripts/backup-db.sh" || {
 }
 
 echo
-echo "About to replace the contents of $DATABASE_URL with $DUMP."
+echo "About to replace the contents of ${DATABASE_URL#*@} with $DUMP."
 echo "The restore runs in a single transaction: if it fails, nothing changes."
 read -r -p "Continue? [y/N] " ans
 if [[ "${ans,,}" != "y" ]]; then

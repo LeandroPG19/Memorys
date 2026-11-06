@@ -17,9 +17,10 @@ BINARY_PATH = os.environ.get(
     "CUBA_BINARY_PATH",
     str(Path(__file__).resolve().parent.parent / "target" / "release" / "cuba-memorys"),
 )
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://cuba:memorys2026@127.0.0.1:5488/brain"
-)
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    print("FAIL: DATABASE_URL is not set. This suite has no default server: point it at the judge's, as docs/gate.md says.", file=sys.stderr)
+    sys.exit(2)
 ENV = {
     "DATABASE_URL": DATABASE_URL,
     "PATH": "/usr/bin:/bin",

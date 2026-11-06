@@ -407,3 +407,124 @@ gate_linux_env() {
   gate_tmpdir_on_disk
   gate_require_node
 }
+
+# --- the judge's server (CI-J, D-J1a) ----------------------------------------
+# The judge runs only against a Postgres that says it is the judge's: one started
+# with -c cluster_name=memory-industry-gate (or memory-industry-gate-<lane>). The
+# mark decides, not the port and not the container's name: the live corpus has no
+# mark, so any server without one is refused whatever it is called. The identity
+# is read read-only from the postgres database of that same server, so the answer
+# is about the server DATABASE_URL names and about nothing else. Sets
+# GATE_JUDGE_SYSID to the system_identifier it read.
+GATE_JUDGE_SYSID=""
+
+gate_url_port() {
+  local rest="${1#*://}" authority hostport
+  authority="${rest%%/*}"
+  hostport="${authority##*@}"
+  if [[ "$hostport" == \[*\] || "$hostport" != *:* ]]; then
+    printf '%s' "${PGPORT:-5432}"
+  else
+    printf '%s' "${hostport##*:}"
+  fi
+}
+
+gate_require_judge_server() {
+  local url="${1:-}" port identity cn sysid
+  local identity_re='^[^|]*[|][0-9]+$' mark_re='^memory-industry-gate(-[A-Za-z0-9]+)?$'
+  if [[ -z "$url" ]]; then
+    gate_refuse "DATABASE_URL is not set, or is empty. The judge has no default server: it runs only against its own Postgres, started with -c cluster_name=memory-industry-gate, as docs/gate.md says. Export DATABASE_URL with that server."
+  fi
+  gate_require_database_url "$url"
+  command -v psql >/dev/null 2>&1 \
+    || gate_refuse "psql is not on PATH, so the judge cannot read which server DATABASE_URL names (cluster_name and system_identifier). Install the PostgreSQL client tools."
+  port="$(gate_url_port "$url")"
+  identity="$(PGOPTIONS='-c default_transaction_read_only=on' psql -X -At -F '|' -d "${url%/*}/postgres" \
+    -c "select current_setting('cluster_name'), system_identifier from pg_control_system()" 2>/dev/null)" || identity=""
+  identity="${identity%$'\r'}"
+  [[ "$identity" =~ $identity_re ]] \
+    || gate_refuse "could not read the identity of the server on :$port (cluster_name and system_identifier from pg_control_system(), read-only, through its postgres database). Nothing is judged; check that the server answers and that its role can read the identity."
+  cn="${identity%%|*}"
+  sysid="${identity##*|}"
+  [[ "$cn" =~ $mark_re ]] \
+    || gate_refuse "the server on :$port is not the judge's: its cluster_name is '$cn' (system_identifier $sysid), and the judge runs only against a server marked cluster_name=memory-industry-gate. Never the live corpus. docs/gate.md says how to start the judge's server."
+  GATE_JUDGE_SYSID="$sysid"
+  echo "OK  judge server :$port (cluster_name=$cn, system_identifier=$sysid)"
+}
+
+# --- the cgroup the gate runs in (CI-J, D-J5a) -------------------------------
+# pesado runs the gate in a scope inside a slice, and the limit that holds is the
+# tightest of the chain: the scope's, each ancestor's up to the root's. Walks
+# <root>/<path> and its ancestors, from /proc/self/cgroup's `0::` line. Sets
+# GATE_CG_MEM_KB (the smallest memory.max - memory.current, in KB; empty when no
+# file in the chain says a number), GATE_CG_CPUS (the smallest ceil(quota/period)
+# of cpu.max, in cores; empty when none) and GATE_CG_NOTE (set when there is no
+# cgroup v2 line: a cgroup v1 shell, Git Bash). A value that is neither a number
+# nor `max` is the refusal, not a limit that goes unread. Must be called directly,
+# not in a subshell: the refusal is an exit of this shell.
+gate_cgroup_limit() {
+  local dir="$1" v cur q p inactive key val
+  if [[ -r "$dir/memory.max" ]]; then
+    v="$(<"$dir/memory.max")"
+    if [[ "$v" != max ]]; then
+      [[ "$v" =~ ^[0-9]+$ ]] \
+        || gate_refuse "$dir/memory.max holds '$v', which is neither a number of bytes nor max, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+      [[ -r "$dir/memory.current" ]] \
+        || gate_refuse "$dir/memory.max is a limit and $dir/memory.current is not readable, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+      cur="$(<"$dir/memory.current")"
+      [[ "$cur" =~ ^[0-9]+$ ]] \
+        || gate_refuse "$dir/memory.current holds '$cur', which is not a number of bytes, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+      # D-J5c: the page cache a cgroup holds is memory it gives back under pressure, so its
+      # inactive part is not in use (memory.stat's inactive_file; 0 when the file is absent).
+      inactive=0
+      if [[ -r "$dir/memory.stat" ]]; then
+        while read -r key val; do
+          if [[ "$key" == inactive_file ]]; then inactive="$val"; fi
+        done <"$dir/memory.stat"
+      fi
+      [[ "$inactive" =~ ^[0-9]+$ ]] \
+        || gate_refuse "$dir/memory.stat holds '$inactive' as inactive_file, which is not a number of bytes. Set MUTANTS_JOBS=<n> by hand."
+      cur=$(( cur - inactive ))
+      (( cur >= 0 )) || cur=0
+      v=$(( (v - cur) / 1024 ))
+      (( v >= 0 )) || v=0
+      if [[ -z "$GATE_CG_MEM_KB" ]] || (( v < GATE_CG_MEM_KB )); then GATE_CG_MEM_KB="$v"; fi
+    fi
+  fi
+  if [[ -r "$dir/cpu.max" ]]; then
+    read -r q p <"$dir/cpu.max" || true
+    if [[ "$q" != max ]]; then
+      [[ "$q" =~ ^[0-9]+$ && "$p" =~ ^[0-9]+$ ]] && (( p > 0 )) \
+        || gate_refuse "$dir/cpu.max holds '$q ${p:-}', which is not '<quota> <period>' in numbers, so the CPUs the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+      v=$(( (q + p - 1) / p ))
+      if [[ -z "$GATE_CG_CPUS" ]] || (( v < GATE_CG_CPUS )); then GATE_CG_CPUS="$v"; fi
+    fi
+  fi
+}
+
+gate_cgroup_read() {
+  local self="${GATE_PROC_SELF_CGROUP:-/proc/self/cgroup}" root="${GATE_CGROUP_ROOT:-/sys/fs/cgroup}"
+  local line rel="" found="" dir
+  GATE_CG_MEM_KB=""
+  GATE_CG_CPUS=""
+  GATE_CG_NOTE=""
+  if [[ -r "$self" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == 0::* ]]; then
+        rel="${line#0::}"
+        found=1
+      fi
+    done <"$self"
+  fi
+  if [[ -z "$found" ]]; then
+    GATE_CG_NOTE="no cgroup v2 line in $self, so no limit is read from a cgroup"
+    return 0
+  fi
+  rel="${rel%/}"
+  dir="$rel"
+  while :; do
+    gate_cgroup_limit "$root$dir"
+    [[ -n "$dir" ]] || break
+    if [[ "$dir" == */* ]]; then dir="${dir%/*}"; else dir=""; fi
+  done
+}

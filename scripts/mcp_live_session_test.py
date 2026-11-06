@@ -48,9 +48,12 @@ def _resolve_binary() -> Path:
 
 
 BINARY = _resolve_binary()
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://cuba:memorys2026@127.0.0.1:5488/brain"
-)
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+
+def _host_and_base(url: str) -> str:
+    # D-J1h: the password never reaches the log; host:port/base is what the operator needs.
+    return url.split("://", 1)[-1].rsplit("@", 1)[-1]
 
 TOOL_CALLS: List[Tuple[str, str, Dict[str, Any]]] = [
     ("cuba_jornada", "current", {"action": "current"}),
@@ -208,6 +211,13 @@ def parse_tool_result(response: Dict[str, Any]) -> Tuple[bool, str]:
     return True, "ok"
 
 def main() -> int:
+    if not DATABASE_URL:
+        print(
+            "FAIL: DATABASE_URL is not set; point it at the judge's throwaway server "
+            "(see docs/gate.md)",
+            file=sys.stderr,
+        )
+        return 2
     if not BINARY.is_file():
         print(f"error: binary not found: {BINARY}", file=sys.stderr)
         print("run: cd rust && cargo build --release", file=sys.stderr)
@@ -217,7 +227,7 @@ def main() -> int:
     print("MCP LIVE SESSION TEST (single process)")
     print("=" * 60)
     print(f"Binary: {BINARY}")
-    print(f"DB:     {DATABASE_URL}")
+    print(f"DB:     {_host_and_base(DATABASE_URL)}")
 
     session = McpSession()
     failed: List[str] = []

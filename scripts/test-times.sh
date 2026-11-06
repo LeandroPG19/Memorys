@@ -354,6 +354,7 @@ fi
 #   test-times.sh --judge LOG --until LINE [--os windows|linux] [--today YYYY-MM-DD]
 #                 [--ceilings FILE] [--tests-dir DIR]
 #   exit 0 green, 1 a time or a ceilings line is red, 2 it could not judge.
+#   test-times.sh --count LOG   the tests each binary ran (below, with its format)
 
 # 10 s: every regression 0.30 fixed measured more than that on both hosts (the
 # smallest, 10.13 s), and the slowest binary with no line measures 6.7 s on
@@ -367,19 +368,22 @@ die2() { echo "FAIL: $*" >&2; exit 2; }
 # ceiling is compared exactly, with no float on the edge of a line.
 fmt_cs() { printf '%d.%02d' $(($1 / 100)) $(($1 % 100)); }
 
-# parse_log LOG UNTIL: one record per line, tab separated.
+# parse_log LOG UNTIL [BOUNDED]: one record per line, tab separated. BOUNDED 0 reads
+# the whole log (--count: a section's log has no boundary line).
 #   H key cs      a binary and its summed time, in order of first appearance
-#   F 0|1         whether the boundary line was found
+#   C key n       the same binary's passed + failed of its `test result` line
+#   B key         a binary whose `test result` line has no passed/failed pair
+#   F 0|1         whether the boundary line was found (BOUNDED 1 only)
 #   U line key    the first header with no `test result` before the next header
-#                 or the boundary
+#                 or the boundary (or the end of the log)
 # A `test result` with no pending header (a test that prints one with
 # --nocapture) is ignored.
 parse_log() {
-  UNTIL="$2" awk '
-    BEGIN { until = ENVIRON["UNTIL"]; OFS = "\t" }
+  UNTIL="$2" BOUNDED="${3:-1}" awk '
+    BEGIN { until = ENVIRON["UNTIL"]; bounded = ENVIRON["BOUNDED"]; OFS = "\t" }
     {
       sub(/\r$/, "")
-      if ($0 == until) { found = 1; exit }
+      if (bounded == "1" && $0 == until) { found = 1; exit }
     }
     /^ +Running (unittests )?[^ ]+ \(.+\)$/ {
       line = $0
@@ -409,13 +413,24 @@ parse_log() {
       t = $0
       sub(/^.*finished in /, "", t); sub(/s$/, "", t)
       cs = int(t * 100 + 0.5)
-      if (!(pending in sum)) { order[++count] = pending; sum[pending] = 0 }
+      n = $0
+      if (n ~ /^test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; /) {
+        sub(/^test result: [^.]*\. /, "", n)
+        split(n, f, /[^0-9]+/)
+        n = f[1] + f[2]
+      } else {
+        n = -1
+      }
+      if (!(pending in sum)) { order[++count] = pending; sum[pending] = 0; cnt[pending] = 0 }
       sum[pending] += cs
+      if (n < 0) badcount = pending; else cnt[pending] += n
       pending = ""
     }
     END {
       if (pending != "" && !unpaired) { unpaired = 1; ulineno = pline; ukey = pending }
       for (i = 1; i <= count; i++) print "H", order[i], sum[order[i]]
+      for (i = 1; i <= count; i++) print "C", order[i], cnt[order[i]]
+      if (badcount != "") print "B", badcount
       print "F", found + 0
       if (unpaired) print "U", ulineno, ukey
     }
@@ -566,6 +581,38 @@ if [[ "${1:-}" == "--judge" ]]; then
     exit 1
   fi
   echo "OK  test times on $OS: ${#KEYS[@]} binaries within their ceilings ($host_lines lines for $OS, default $DEFAULT_CEILING_S s)"
+  exit 0
+fi
+
+# --count LOG (D-J4c): the tests each binary of one section's log ran, for
+# run-all-tests.sh to hold against scripts/test-section-counts.txt. The same parser as
+# --judge, with no boundary: the log is one section's.
+#   stdout: one line per test binary, in order of first appearance, `<key> <count>`.
+#           <key> is the judge's name (the file name for tests/<name>.rs, lib:<name>,
+#           bin:<name> or doc:<name> for the rest) and <count> is passed + failed of
+#           its `test result` line. A binary that ran nothing counts 0 and is listed.
+#   exit 0 counted; 2 the log cannot be read or paired (a binary with no `test result`
+#           line, a result with no passed/failed numbers) or it names no binary.
+if [[ "${1:-}" == "--count" ]]; then
+  shift
+  LOG="${1:-}"
+  [[ $# -eq 1 ]] || die2 "--count takes one log and nothing else: --count LOG"
+  [[ -f "$LOG" ]] || die2 "no log at $LOG"
+
+  parsed="$(parse_log "$LOG" "" 0)"
+  counted=""
+  nbin=0
+  problem=""
+  while IFS=$'\t' read -r kind a b; do
+    case "$kind" in
+      C) counted+="$a $b"$'\n'; nbin=$((nbin + 1)) ;;
+      B) problem="$LOG: $a has a 'test result' line with no passed and failed count" ;;
+      U) problem="$LOG:${a}: ${b} has no 'test result' line before the next binary or the end of the log; the log is cut or interleaved, and the count will not guess" ;;
+    esac
+  done <<<"$parsed"
+  [[ -z "$problem" ]] || die2 "$problem"
+  (( nbin > 0 )) || die2 "no test binary was run in $LOG: a section that ran nothing is not a pass"
+  printf '%s' "$counted"
   exit 0
 fi
 

@@ -1,0 +1,24 @@
+{"entity_name": "Laboratorio sintético A", "observation_type": "fact", "source": "agent", "content": "El servidor de prueba del laboratorio está escrito en Rust y responde por stdio."}
+{"entity_name": "Laboratorio sintético A", "observation_type": "context", "source": "agent", "content": "La interfaz de herramientas del laboratorio sigue el protocolo MCP en su versión de prueba."}
+{"entity_name": "Base sintética B", "observation_type": "fact", "source": "agent", "content": "La base de datos de ensayo funciona sobre PostgreSQL con datos inventados."}
+{"entity_name": "Base sintética B", "observation_type": "tool_usage", "source": "agent", "content": "Las migraciones de ensayo se aplican una vez por base desechable."}
+{"entity_name": "Búsqueda sintética C", "observation_type": "fact", "source": "agent", "content": "La búsqueda de ensayo fusiona las listas de resultados con RRF antes de ordenarlas."}
+{"entity_name": "Búsqueda sintética C", "observation_type": "fact", "source": "agent", "content": "Los embeddings de ensayo tienen una dimensión fija y ficticia para cada fragmento."}
+{"entity_name": "Agente sintético D", "observation_type": "context", "source": "agent", "content": "Un agente de ensayo guarda sus notas en una memoria de prueba de largo plazo."}
+{"entity_name": "Agente sintético D", "observation_type": "preference", "source": "agent", "content": "El agente de ensayo prefiere respuestas cortas y datos inventados."}
+{"entity_name": "Canal sintético E", "observation_type": "error", "source": "agent", "content": "Un error de ensayo apareció al abrir la conexión con el banco de pruebas."}
+{"entity_name": "Canal sintético E", "observation_type": "solution", "source": "agent", "content": "Para ese fallo de ensayo basta con reintentar la apertura del canal de pruebas."}
+{"entity_name": "Diseño sintético F", "observation_type": "decision", "source": "agent", "content": "La arquitectura de ensayo separa el protocolo de las consultas a la base de datos."}
+{"entity_name": "Diseño sintético F", "observation_type": "decision", "source": "agent", "content": "Se tomó una decisión ficticia de usar un proceso aislado por cada sesión de prueba."}
+{"entity_name": "Cocina sintética G", "observation_type": "fact", "source": "agent", "content": "La receta ficticia de la sopa lleva calabaza, cebolla y agua tibia."}
+{"entity_name": "Cocina sintética G", "observation_type": "fact", "source": "agent", "content": "El horno imaginario se calienta a ciento ochenta grados durante veinte minutos."}
+{"entity_name": "Jardín sintético H", "observation_type": "fact", "source": "agent", "content": "Las plantas ficticias del jardín necesitan riego cada tercer día."}
+{"entity_name": "Jardín sintético H", "observation_type": "context", "source": "agent", "content": "La regadera imaginaria tiene un depósito azul con capacidad de cinco litros."}
+{"entity_name": "Viaje sintético I", "observation_type": "fact", "source": "agent", "content": "El tren ficticio sale de la estación del lago a las siete de la mañana."}
+{"entity_name": "Viaje sintético I", "observation_type": "context", "source": "agent", "content": "El equipaje de prueba incluye una lámpara, mapas inventados y una brújula."}
+{"entity_name": "Música sintética J", "observation_type": "preference", "source": "agent", "content": "La lista ficticia de canciones incluye piezas para piano y violonchelo."}
+{"entity_name": "Música sintética J", "observation_type": "fact", "source": "agent", "content": "El concierto imaginario dura una hora y cuarto sin pausa."}
+{"entity_name": "Deporte sintético K", "observation_type": "fact", "source": "agent", "content": "El equipo ficticio entrena los martes en una cancha de césped artificial."}
+{"entity_name": "Deporte sintético K", "observation_type": "context", "source": "agent", "content": "Las camisetas imaginarias son verdes con franjas blancas en los costados."}
+{"entity_name": "Biblioteca sintética L", "observation_type": "fact", "source": "agent", "content": "El catálogo ficticio tiene tres mil libros ordenados por autor."}
+{"entity_name": "Biblioteca sintética L", "observation_type": "context", "source": "agent", "content": "El horario inventado abre de nueve a una y de tres a seis."}

@@ -1,0 +1,13 @@
+# Conteos de las secciones del juez que corren tests (CI-J, D-J4b). Formato: <sección> <tests> <motivo>.
+# <tests> = Σ(passed + failed) de las líneas `test result:` de la llamada cargo de esa sección.
+# Fuente: log de F0, corrida 2 (~/.cache/memory-industry-gate/f0/20261106-084921-c1/log-con-hora.txt),
+# contado con `scripts/test-times.sh --count` sobre el segmento de cada sección.
+discovered-ignored 106 cargo test --test <todos los tests/*.rs salvo RUN_ELSEWHERE> -- --ignored (F0 corrida 2)
+lib-ignored 18 cargo test --lib -- --ignored (F0 corrida 2)
+admin-role 3 v020_audit_update_applies + v020_role_separation con CUBA_APP_ROLE=0 (F0 corrida 2)
+embedding-model 2 v016_chunking (F0 corrida 2)
+nli 10 nli_entailment + nli_cost + nli_probe (F0 corrida 2)
+generative-llm 4 v016_extract_without_sampling + v017_relation_scan (F0 corrida 2)
+reranker-placement 4 v017_rerank_gpu sin --ignored, con cuda y release (F0 corrida 2)
+placement-table 23 cargo test --release --features cuda --lib gpu:: (F0 corrida 2: 23 passed en release/deps con cuda, log línea ~5479)
+reranker-model 2 v017_rerank_gpu --ignored, con cuda y release (F0 corrida 2: "running 2 tests" en la corrida release de v017_rerank_gpu, log línea ~8700)

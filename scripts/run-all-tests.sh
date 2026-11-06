@@ -4,7 +4,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUST_DIR="$ROOT/rust"
-LIVE_DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
 export CUBA_JUDGE="${CUBA_JUDGE:-heuristic}"
 
 # Every path this gate hands to another process is absolute, and the resolution
@@ -862,10 +861,14 @@ inherit_gate_lock "$GATE_LOCK" || acquire_gate_lock "$GATE_LOCK" || exit 1
 [[ -z "$GATE_LOCK_HELD" ]] || exit_file_running
 trap on_exit EXIT
 
-# The three database URLs below are the live one with its last segment replaced;
-# gate-lock.sh refuses a URL for which that is not the database name. Under
-# merge-gate.sh this repeats its check, which costs nothing.
-gate_require_database_url "$LIVE_DATABASE_URL"
+# The judge runs only against its own server (CI-J, D-J1a): a server that does not
+# carry the cluster_name mark is refused here, whatever its port. Under merge-gate.sh
+# this repeats the check, which costs nothing. The system_identifier merge-gate.sh
+# read must be the one this run reads (D-J1c).
+gate_require_judge_server "${DATABASE_URL:-}"
+if [[ -n "${GATE_SERVER_SYSTEM_ID:-}" && "$GATE_SERVER_SYSTEM_ID" != "$GATE_JUDGE_SYSID" ]]; then
+  gate_refuse "the server changed under this run: merge-gate.sh read system_identifier $GATE_SERVER_SYSTEM_ID and this run reads $GATE_JUDGE_SYSID on the same DATABASE_URL. Nothing is judged; find out what answers on that port."
+fi
 
 # Under HOME/.cache and nowhere else, because that is where the binary keeps
 # them: envs::home() joins `.cache` to HOME, and nothing in the crate reads
@@ -921,16 +924,27 @@ MIN_FREE_GB="${CUBA_GATE_MIN_FREE_GB:-8}"
 SWEEP_BELOW_GB="${CUBA_GATE_SWEEP_BELOW_GB:-20}"
 SWEEP_OLDER_THAN_DAYS="${CUBA_GATE_SWEEP_DAYS:-7}"
 
-free_gb() { df --output=avail -BG "$RUST_DIR" | tail -1 | tr -dc '0-9'; }
+# The filesystem the target directory lives on, measured where it exists yet: a
+# CARGO_TARGET_DIR that has not been created is measured by its nearest parent.
+gate_existing_target_dir() {
+  local d
+  d="$(gate_target_dir)"
+  while [[ ! -e "$d" && "$d" != / ]]; do d="$(dirname "$d")"; done
+  printf '%s\n' "$d"
+}
+
+free_gb() { df --output=avail -BG "$(gate_existing_target_dir)" | tail -1 | tr -dc '0-9'; }
 
 sweep_stale_artifacts() {
-  local before after
+  local before after td
+  td="$(gate_target_dir)"
   before="$(free_gb)"
-  echo "disk: ${before}G free — sweeping build artifacts older than ${SWEEP_OLDER_THAN_DAYS}d"
-  rm -rf "$RUST_DIR/target/debug/incremental" 2>/dev/null || true
-  find "$RUST_DIR/target/debug/deps" -maxdepth 1 -type f \
+  echo "disk: ${before}G free — sweeping build artifacts older than ${SWEEP_OLDER_THAN_DAYS}d under $td"
+  find "$td/debug/incremental" -mindepth 1 -maxdepth 1 \
+       -mtime "+$SWEEP_OLDER_THAN_DAYS" -exec rm -rf {} + 2>/dev/null || true
+  find "$td/debug/deps" -maxdepth 1 -type f \
        -mtime "+$SWEEP_OLDER_THAN_DAYS" -delete 2>/dev/null || true
-  find "$RUST_DIR/target/debug/.fingerprint" -maxdepth 1 -type d \
+  find "$td/debug/.fingerprint" -maxdepth 1 -type d \
        -mtime "+$SWEEP_OLDER_THAN_DAYS" -exec rm -rf {} + 2>/dev/null || true
   after="$(free_gb)"
   echo "disk: ${after}G free after the sweep (was ${before}G)"
@@ -941,14 +955,86 @@ if [[ "$(free_gb)" -lt "$SWEEP_BELOW_GB" ]]; then
 fi
 
 if [[ "$(free_gb)" -lt "$MIN_FREE_GB" ]]; then
-  echo "FAIL: only $(free_gb)G free on the filesystem holding $RUST_DIR, and this run needs more." >&2
+  echo "FAIL: only $(free_gb)G free on the filesystem holding $(gate_target_dir), and this run needs more." >&2
   echo '      Linking is what breaks first, and it breaks as SIGBUS inside ld with no' >&2
   echo "      mention of disk — that is an hour of looking for a bug that is not there." >&2
-  echo "      target/ currently holds: $(du -sh "$RUST_DIR/target" 2>/dev/null | cut -f1)" >&2
+  echo "      target directory currently holds: $(du -sh "$(gate_target_dir)" 2>/dev/null | cut -f1)" >&2
   echo "      Free it with: cargo clean --manifest-path $RUST_DIR/Cargo.toml" >&2
   echo "      (or raise the bar with CUBA_GATE_MIN_FREE_GB if you know what you are doing)" >&2
   exit 1
 fi
+
+# --- the test counts (CI-J, D-J4b) -------------------------------------------
+# A section that runs a different number of tests than its line in
+# scripts/test-section-counts.txt is red, in either direction: a test that stops
+# being run is the same silence as one that is skipped. The count is passed + failed
+# over the `test result:` lines of that section's cargo call. A named section (one
+# that names its --test binaries) must also run every binary at least one test.
+SECTION_COUNTS="$ROOT/scripts/test-section-counts.txt"
+SECTION_NAMES="discovered-ignored lib-ignored admin-role embedding-model nli generative-llm reranker-placement placement-table reranker-model"
+
+# run_counted SECTION NAMED <command>: runs the call with its output shown and kept,
+# judges the count, and exits with the call's own code when the call failed. The count
+# is test-times.sh --count's, the one parse of a cargo log the judge has (D-J4d).
+run_counted() {
+  local section="$1" named="$2" log counts rc=0 want=0 arg expected ran bins zero
+  shift 2
+  for arg in "$@"; do
+    [[ "$arg" == --test ]] && want=$((want + 1))
+  done
+  log="$(mktemp)"
+  "$@" 2>&1 | tee "$log" || rc=$?
+  if (( rc != 0 )); then
+    rm -f "$log"
+    exit "$rc"
+  fi
+  if ! counts="$("$ROOT/scripts/test-times.sh" --count "$log")"; then
+    echo "FAIL: section $section: test-times.sh --count could not read the cargo log (see above)." >&2
+    rm -f "$log"
+    exit 1
+  fi
+  rm -f "$log"
+  read -r ran bins zero <<<"$(awk '{ ran += $2; bins++; if ($2 == 0) zero++ }
+    END { printf "%d %d %d\n", ran + 0, bins + 0, zero + 0 }' <<<"$counts")"
+  expected="$(awk -v s="$section" '!/^[[:space:]]*#/ && NF >= 2 && $1 == s { print $2; exit }' "$SECTION_COUNTS" 2>/dev/null || true)"
+  if [[ -n "$expected" && ! "$expected" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: scripts/test-section-counts.txt says '$expected' for section $section, which is not a number." >&2
+    exit 1
+  fi
+  if [[ -n "$expected" && "$expected" != "$ran" ]]; then
+    echo "FAIL: section $section: expected $expected, ran $ran tests ($bins test binaries). scripts/test-section-counts.txt says $expected: change that line only with the log that proves the new number." >&2
+    exit 1
+  fi
+  if [[ "$named" == 1 ]] && { (( bins != want )) || (( zero > 0 )); }; then
+    echo "FAIL: section $section: $bins test binaries reported for $want named --test, $zero of them ran 0 tests. Each named binary has to run at least one test." >&2
+    exit 1
+  fi
+  echo "OK  section $section: $ran tests in $bins test binaries"
+}
+
+# Every section that runs tests has its line, and every line is a section that runs.
+check_section_lines() {
+  local listed name missing="" orphan=""
+  listed="$(awk '!/^[[:space:]]*#/ && NF >= 2 { print $1 }' "$SECTION_COUNTS" 2>/dev/null || true)"
+  for name in $SECTION_NAMES; do
+    grep -qxF "$name" <<<"$listed" || missing+=" $name"
+  done
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    case " $SECTION_NAMES " in
+      *" $name "*) ;;
+      *) orphan+=" $name" ;;
+    esac
+  done <<<"$listed"
+  if [[ -n "$missing" ]]; then
+    echo "FAIL: scripts/test-section-counts.txt has no line for the section(s):$missing. Every section that runs tests states its count there, with its reason." >&2
+    exit 1
+  fi
+  if [[ -n "$orphan" ]]; then
+    echo "FAIL: scripts/test-section-counts.txt has a line for no section of this script:$orphan." >&2
+    exit 1
+  fi
+}
 
 require_present() {
   local what="$1" probe="$2"
@@ -1021,10 +1107,10 @@ require_generative_llm() {
 }
 
 GATE_DB="${GATE_DB:-brain_gate}"
-GATE_DATABASE_URL="${LIVE_DATABASE_URL%/*}/$GATE_DB"
+GATE_DATABASE_URL="${DATABASE_URL%/*}/$GATE_DB"
 PEER_DB="${PEER_DB:-brain_gate_peer}"
-PEER_DATABASE_URL="${LIVE_DATABASE_URL%/*}/$PEER_DB"
-ADMIN_DATABASE_URL="${LIVE_DATABASE_URL%/*}/postgres"
+PEER_DATABASE_URL="${DATABASE_URL%/*}/$PEER_DB"
+ADMIN_DATABASE_URL="${DATABASE_URL%/*}/postgres"
 export CUBA_PEER_DATABASE_URL="$PEER_DATABASE_URL"
 
 # Windows PostgreSQL 16 client: `psql URI -c SQL` prints
@@ -1048,41 +1134,23 @@ fi
 
 cd "$RUST_DIR"
 
-# Prefer an already-built binary. `cargo run` under timeout used to spend the
-# whole budget recompiling and leave the throwaway DB with zero tables while
-# `|| true` hid the failure (exit 124).
-#
-# gate_target_dir is defined at the top of this file, with the rest of the path
-# resolution. On Windows the file is memory-industry.exe; `[[ -x
-# memory-industry ]]` is false in Git Bash.
+# The binary the judge runs is the one cargo reports for this tree, built now: never a
+# copy left under target/ by an earlier build, and never a name looked up under
+# release/ or cuba-memorys (CI-J, D-J2a). A build that fails prepares nothing (J2.2).
 gate_bin() {
-  local td cand
-  td="$(gate_target_dir)"
-  for cand in \
-    "$td/debug/memory-industry.exe" \
-    "$td/debug/memory-industry" \
-    "$td/release/memory-industry.exe" \
-    "$td/release/memory-industry" \
-    "$td/debug/cuba-memorys.exe" \
-    "$td/debug/cuba-memorys" \
-    "$td/release/cuba-memorys.exe" \
-    "$td/release/cuba-memorys"
-  do
-    if [[ -x "$cand" ]]; then
-      printf '%s\n' "$cand"
-      return 0
-    fi
-  done
-  cargo build --quiet --bin memory-industry >&2
-  td="$(gate_target_dir)"
-  for cand in "$td/debug/memory-industry.exe" "$td/debug/memory-industry"; do
-    if [[ -x "$cand" ]]; then
-      printf '%s\n' "$cand"
-      return 0
-    fi
-  done
-  echo "FAIL: cargo build --bin memory-industry produced no binary under $td/debug." >&2
-  exit 1
+  local out exe
+  out="$(cargo build --bin memory-industry --message-format=json-render-diagnostics)" \
+    || { echo "FAIL: cargo build --bin memory-industry failed: no database is prepared from a binary that did not build." >&2; exit 1; }
+  exe="$(printf '%s\n' "$out" \
+    | sed -n 's/.*"reason":"compiler-artifact".*"executable":"\([^"]*\)".*/\1/p' \
+    | grep -E '[/\\]memory-industry(\.exe)?$' | tail -n 1 || true)"
+  exe="${exe//\\\\/\\}"
+  if [[ -n "$exe" ]] && command -v cygpath >/dev/null 2>&1; then
+    exe="$(cygpath -u "$exe")"
+  fi
+  [[ -n "$exe" && -x "$exe" ]] \
+    || { echo "FAIL: cargo build --bin memory-industry reported no executable for memory-industry (it reported: ${exe:-nothing})." >&2; exit 1; }
+  printf '%s\n' "$exe"
 }
 
 provision_gate_db() {
@@ -1161,8 +1229,7 @@ export DATABASE_URL="$GATE_DATABASE_URL"
 # sync and panel work had never once run in the gate, while the gate reported
 # green over the very commits that added them. A gate whose coverage depends on
 # somebody remembering to edit it is a gate that quietly shrinks.
-RUN_ELSEWHERE=(v020_audit_update_applies v020_role_separation v020_audit_hmac
-               v020_embed_cache_key v016_chunking nli_entailment nli_cost nli_probe
+RUN_ELSEWHERE=(v020_audit_update_applies v020_role_separation v016_chunking nli_entailment nli_cost nli_probe
                v016_extract_without_sampling v017_relation_scan v017_rerank_gpu)
 DISCOVERED=()
 DEFERRED_SECTIONS=()
@@ -1176,25 +1243,22 @@ for file in tests/*.rs; do
 done
 echo "deferred ${#DEFERRED_SECTIONS[@]} file(s) to their own sections: ${DEFERRED_SECTIONS[*]}"
 echo "running $(( ${#DISCOVERED[@]} / 2 )) discovered test file(s)"
-cargo test "${DISCOVERED[@]}" -- --ignored --nocapture
+run_counted discovered-ignored 0 cargo test "${DISCOVERED[@]}" -- --ignored --nocapture
 
-cargo test --lib -- --ignored --nocapture
+run_counted lib-ignored 0 cargo test --lib -- --ignored --nocapture
 
 echo "=== admin-role tests (they rewrite roles and the audit log) ==="
-CUBA_APP_ROLE=0 cargo test --test v020_audit_update_applies --test v020_role_separation \
+CUBA_APP_ROLE=0 run_counted admin-role 1 cargo test --test v020_audit_update_applies --test v020_role_separation \
            -- --ignored --nocapture
 
-echo "=== audit HMAC + embed cache key ==="
-cargo test --test v020_audit_hmac --test v020_embed_cache_key -- --ignored --nocapture
-
 require_present "tests that need the embedding model" "$ONNX_MODEL_PATH/model_quantized.onnx" \
-  cargo test --test v016_chunking -- --ignored --nocapture
+  run_counted embedding-model 1 cargo test --test v016_chunking -- --ignored --nocapture
 
 require_present "tests that need the NLI model" "$CUBA_NLI_PATH" \
-  cargo test --test nli_entailment --test nli_cost --test nli_probe -- --ignored --nocapture
+  run_counted nli 1 cargo test --test nli_entailment --test nli_cost --test nli_probe -- --ignored --nocapture
 
 require_generative_llm "tests that need a generative LLM (extract / relation-scan)" \
-  cargo test --test v016_extract_without_sampling --test v017_relation_scan \
+  run_counted generative-llm 1 cargo test --test v016_extract_without_sampling --test v017_relation_scan \
              -- --ignored --nocapture
 
 # build-gpu.sh, not a bare `cargo build --release`. Without --features cuda,
@@ -1234,7 +1298,7 @@ echo "=== release build (same feature set production runs) ==="
 # contracts hold. The model-bound ones stay behind the guard, where a missing
 # model is a FAIL and never a skip.
 echo "=== reranker placement contracts (GPU feature live, no model needed) ==="
-cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
+run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
 
 # The library half of the same hole. The cfg! that actually decides placement is
 # in gpu::wants_gpu, which returns false before reading the device variable when
@@ -1248,11 +1312,13 @@ cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
 # unit itself. In debug it would be a third feature set (debug bare, release
 # cuda, debug cuda) and a full rebuild of everything under it.
 echo "=== placement table under the feature that changes it ==="
-cargo test --release --features cuda --lib gpu:: -- --nocapture
+run_counted placement-table 0 cargo test --release --features cuda --lib gpu:: -- --nocapture
 
 require_present "reranker tests (release: 387s in debug, seconds here)" \
   "$CUBA_RERANKER_PATH/model.onnx" \
-  cargo test --release --features cuda --test v017_rerank_gpu -- --ignored --nocapture
+  run_counted reranker-model 1 cargo test --release --features cuda --test v017_rerank_gpu -- --ignored --nocapture
+
+check_section_lines
 
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
 CUBA_BINARY_PATH="$(resolve_binary_path)"
@@ -1323,10 +1389,99 @@ rm -f "$doctor_json" "$doctor_err"
 echo "=== MCP live session (single process, initialize + tools/list + calls) ==="
 "$PY" "$ROOT/scripts/mcp_live_session_test.py"
 
-echo "=== eval harness smoke (read-only, so it runs against the real corpus) ==="
-DATABASE_URL="$LIVE_DATABASE_URL" \
-  "$CUBA_BINARY_PATH" eval \
-  --dataset "$RUST_DIR/eval-datasets/smoke.jsonl" --k 10
+echo "=== eval harness smoke (a scratch database seeded from smoke-corpus.jsonl) ==="
+EVAL_DB=brain_gate_eval
+EVAL_DATABASE_URL="${DATABASE_URL%/*}/brain_gate_eval"
+EVAL_FIXTURE="$RUST_DIR/eval-datasets/smoke-corpus.jsonl"
+EVAL_QUERIES="$RUST_DIR/eval-datasets/smoke.jsonl"
+EVAL_BIN="$(resolve_binary_path)"
+[[ -x "$EVAL_BIN" ]] \
+  || { echo "FAIL: no release binary at $EVAL_BIN for the eval; build-gpu.sh writes it." >&2; exit 1; }
+claim_database "$EVAL_DB" || exit 1
+DATABASE_URL="$EVAL_DATABASE_URL" CUBA_APP_ROLE=0 ONNX_MODEL_PATH="" \
+  "$EVAL_BIN" doctor >/dev/null 2>&1 || true
+if [[ "$CUBA_EMBEDDING_DIM" != "384" ]]; then
+  DATABASE_URL="$EVAL_DATABASE_URL" "$ROOT/scripts/migrate-embedding-dim.sh" \
+    "$CUBA_EMBEDDING_DIM" >/dev/null 2>&1 || {
+      echo "FAIL: could not retype the eval database to vector($CUBA_EMBEDDING_DIM)." >&2
+      exit 1
+    }
+fi
+eval_tables="$(psql_url "$EVAL_DATABASE_URL" -Atc \
+  "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")"
+if ! [[ "$eval_tables" =~ ^[0-9]+$ ]] || (( eval_tables < 20 )); then
+  echo "FAIL: could not migrate the eval database (only ${eval_tables:-no} tables)." >&2
+  exit 1
+fi
+
+seed_out="$(mktemp)"
+seed_exit=0
+DATABASE_URL="$EVAL_DATABASE_URL" "$PY" -I "$ROOT/scripts/eval_seed.py" --binary "$EVAL_BIN" \
+  --fixture "$EVAL_FIXTURE" >"$seed_out" 2>&1 || seed_exit=$?
+if (( seed_exit != 0 )); then
+  echo "FAIL: the eval seeding exited $seed_exit: $(cat "$seed_out")" >&2
+  rm -f "$seed_out"
+  exit 1
+fi
+seeded="$(sed -n 's/^seeded \([0-9][0-9]*\) observations$/\1/p' "$seed_out")"
+rm -f "$seed_out"
+fixture_lines="$(grep -c . "$EVAL_FIXTURE" || true)"
+observed="$(psql_url "$EVAL_DATABASE_URL" -Atc "SELECT count(*) FROM brain_observations")"
+if ! [[ "$observed" =~ ^[0-9]+$ ]]; then
+  echo "FAIL: could not count the observations of the eval database." >&2
+  exit 1
+fi
+if (( observed == 0 )); then
+  echo "FAIL: the eval database has 0 observations after seeding $EVAL_FIXTURE (the seeder said: ${seeded:-no count})." >&2
+  exit 1
+fi
+if [[ "$seeded" != "$fixture_lines" ]] || (( observed != fixture_lines )); then
+  echo "FAIL: the eval seeded ${seeded:-no count} observations and the database holds $observed; the fixture has $fixture_lines lines." >&2
+  exit 1
+fi
+echo "OK  eval database seeded: $observed observations, the fixture has $fixture_lines lines"
+
+eval_json="$(mktemp)"
+DATABASE_URL="$EVAL_DATABASE_URL" "$EVAL_BIN" eval \
+  --dataset "$RUST_DIR/eval-datasets/smoke.jsonl" --k 10 --json >"$eval_json" || {
+  eval_rc=$?
+  echo "FAIL: eval exited $eval_rc (its output is above)." >&2
+  rm -f "$eval_json"
+  exit 1
+}
+queries_lines="$(grep -c . "$EVAL_QUERIES" || true)"
+scored="$(grep -o '"sample_count": *[0-9]*' "$eval_json" | head -n 1 | grep -o '[0-9]*$' || true)"
+ndcg="$(grep -o '"ndcg_at_k": *[0-9.eE+-]*' "$eval_json" | head -n 1 | sed 's/.*: *//' || true)"
+per_query="$("$PY" -I -c 'import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8")).get("metrics", {})
+q = m.get("per_query_ndcg")
+print("missing" if q is None else len(q))' "$eval_json" 2>/dev/null || echo unreadable)"
+rm -f "$eval_json"
+if [[ "$per_query" == missing ]]; then
+  echo "FAIL: the eval --json has no per_query_ndcg, so its scored queries cannot be counted against smoke.jsonl ($queries_lines lines)." >&2
+  exit 1
+fi
+if ! [[ "$per_query" =~ ^[0-9]+$ ]]; then
+  echo "FAIL: the eval --json cannot be read as JSON, so its per_query_ndcg cannot be counted ($queries_lines lines in smoke.jsonl)." >&2
+  exit 1
+fi
+if (( per_query != queries_lines )); then
+  echo "FAIL: the eval scored $per_query queries (metrics.per_query_ndcg) and smoke.jsonl has $queries_lines lines." >&2
+  exit 1
+fi
+if ! [[ "$scored" =~ ^[0-9]+$ ]]; then
+  echo "FAIL: the eval --json has no sample_count, so its queries cannot be counted against smoke.jsonl ($queries_lines lines)." >&2
+  exit 1
+fi
+if (( scored != queries_lines )); then
+  echo "FAIL: the eval --json reports $scored queries and smoke.jsonl has $queries_lines lines." >&2
+  exit 1
+fi
+if [[ -z "$ndcg" ]] || ! awk -v x="$ndcg" 'BEGIN { exit !(x + 0 > 0) }'; then
+  echo "FAIL: the eval nDCG (ndcg_at_k) is ${ndcg:-missing} over $observed observations: nothing was retrieved for the queries it scored." >&2
+  exit 1
+fi
+echo "OK  eval smoke: nDCG@10=$ndcg over $queries_lines queries, $observed observations"
 
 echo ""
 echo "All tests passed."

@@ -1290,9 +1290,6 @@ echo "  · retrieval quality     the eval step is a smoke run. It proves the"
 echo "                          harness executes; it asserts no nDCG threshold."
 echo "  · other platforms       this judge runs on the merge machine (typically"
 echo "                          Linux x64). Cross-targets are not exercised here."
-echo "  · migrations on old DBs the throwaway database is created from scratch, so"
-echo "                          a migration that only works on an EXISTING schema"
-echo "                          is still not covered here."
 echo ""
 echo "WHAT IT REQUIRES (missing = FAIL, never SKIPPED):"
 echo "  · ONNX embed + ORT      ~/.cache/memory-industry/models + onnxruntime"
@@ -1310,8 +1307,9 @@ echo "WHERE IT WRITES:"
 echo "  · every mutating step  a throwaway database (GATE_DB, default brain_gate),"
 echo "                         created before and dropped after. Your real corpus"
 echo "                         is never a test fixture."
-echo "  · the eval step        reads the REAL database, because a smoke run against"
-echo "                         an empty corpus would prove nothing. Read-only."
+echo "  · the eval step        a throwaway database (brain_gate_eval), seeded from the"
+echo "                         synthetic fixture rust/eval-datasets/smoke-corpus.jsonl."
+echo "                         It never reads the real corpus."
 echo "  · its own verdict      ~/.cache/cuba-gate/merge-gate.log, and on a green"
 echo "                         run over a clean tree receipts/<sha> next to it,"
 echo "                         which scripts/release.sh tags from instead of"
@@ -1335,10 +1333,14 @@ if (( refuse_rc != 0 )); then
   exit "$refuse_rc"
 fi
 
-export DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
-# A shape run-all-tests.sh cannot derive brain_gate from is refused here, before
-# libpq is asked, for the same reason gate-lock.sh gives: it would judge one
-# server ready and create the throwaway databases on another.
+# No default server (D-J1e): the URL is the operator's. An empty one is refused
+# here, before anybody is asked, and a shape run-all-tests.sh cannot derive
+# brain_gate from is refused before libpq is asked, for the reason gate-lock.sh
+# gives: it would judge one server ready and create the throwaway databases on another.
+export DATABASE_URL="${DATABASE_URL:-}"
+if [[ -z "$DATABASE_URL" ]]; then
+  gate_refuse "DATABASE_URL is not set, or is empty. The judge has no default server: it runs only against its own Postgres, started with -c cluster_name=memory-industry-gate, as docs/gate.md says. Export DATABASE_URL with that server."
+fi
 gate_require_database_url "$DATABASE_URL"
 
 # Without pg_isready the server is asked through the container that publishes the
@@ -1408,11 +1410,24 @@ if command -v pg_isready >/dev/null 2>&1; then
   [[ "$pg_answer" == *" - "* && "$pg_port" =~ ^[0-9]+$ ]] \
     || gate_refuse "pg_isready answered '$pg_answer', which names no port, so this gate cannot say which server it asked. It will not guess one."
   (( pg_rc == 0 )) \
-    || { echo "FAIL: Postgres not ready on :$pg_port (pg_isready: $pg_answer)"; exit 1; }
+    || {
+      echo "FAIL: Postgres not ready on :$pg_port (pg_isready: $pg_answer)"
+      echo "     the judge's server is started as docs/gate.md says (cluster_name=memory-industry-gate); this gate does not try another one"
+      exit 1
+    }
   echo "OK  Postgres :$pg_port"
+  gate_require_judge_server "$DATABASE_URL"
 else
+  # Without pg_isready the judge is asked first: the container's own readiness line
+  # comes after its OK, so the line after "OK  Postgres" is the next step.
+  gate_require_judge_server "$DATABASE_URL"
   gate_container_ready "$DATABASE_URL"
 fi
+# The server DATABASE_URL names is the judge's only if it says so: cluster_name
+# marked by the judge's start command, read read-only from the same server (D-J1a).
+# Before cargo audit, the first step that uses the network. The system_identifier it
+# read goes to run-all-tests.sh, which reads it again and refuses a server that changed (D-J1c).
+export GATE_SERVER_SYSTEM_ID="$GATE_JUDGE_SYSID"
 
 # The advisories are judged before the 20-minute test run: a judge idle for days
 # found its new advisory half an hour in, when 3 s would have said it. cargo audit
@@ -1464,10 +1479,8 @@ if ! command -v cargo-deny >/dev/null 2>&1 && ! (cd "$ROOT/rust" && cargo deny -
 fi
 (cd "$ROOT/rust" && cargo deny check licenses bans sources)
 
-if [[ "${SKIP_BACKUP:-0}" != "1" ]]; then
-  "$ROOT/scripts/backup-db.sh"
-  echo "OK  Database backup"
-fi
+# The copy of the real corpus is not a judge step (P1 a): respaldo-memoria.timer,
+# outside this repo, makes it. The judge never touches the live server.
 
 "$ROOT/scripts/run-all-tests.sh"
 

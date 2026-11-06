@@ -74,6 +74,15 @@ STUB
 fi
 # --- self-test end ---
 
+# shellcheck source=scripts/gate-lock.sh
+source "$ROOT/scripts/gate-lock.sh"
+
+# The judge's server, when DATABASE_URL names one (D-J1d): asked before cargo, and a
+# server with no judge marker is exit 2. With no DATABASE_URL the floor runs as it did.
+if [[ -n "${DATABASE_URL:-}" ]]; then
+  gate_require_judge_server "$DATABASE_URL"
+fi
+
 cd "$ROOT/rust"
 
 MIN_COV="${CRAP_MIN_LINE_COV:-15}"
@@ -85,7 +94,7 @@ if ! command -v cargo-llvm-cov >/dev/null 2>&1 && ! cargo llvm-cov --version >/d
 fi
 
 echo "=== crap-gate: llvm-cov --lib (min line ${MIN_COV}%) ==="
-COV_JSON="${TMPDIR:-/tmp}/memory-industry-cov.json"
+COV_JSON="$(mktemp "${TMPDIR:-/tmp}/memory-industry-cov.XXXXXX")"
 cargo llvm-cov --lib --json --summary-only --output-path "$COV_JSON"
 
 resolve_python() {
