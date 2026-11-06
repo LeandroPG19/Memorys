@@ -312,3 +312,11 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   F4b did not hit on run 2 (`seed: miss (204 crates compiled in the baseline)`, 1.1 GB): suspected cargo-mutants'
   own RUSTFLAGS (cap-lints) or an environment difference in the seed's fingerprint; diagnosis with the kept logs
   handed to the F4 implementer. The miss line did what it was built for: it informed and decided nothing.
+- 2026-11-06 21:10 · F4 seed miss, diagnosis from the kept logs (F4 implementer): the seed does work for the mutants
+  — 52 of 54 compiled only memory-industry (Fresh ≈ 304–609) — and only the first build of each of cargo-mutants'
+  two labs recompiled 204 crates, a cascade from proc-macro2's build script; no profile, flag or env reason in the
+  203 `Dirty` lines, so not cap-lints. Suspected cause: cargo-mutants' copy into its labs. My cp -a/cp -r experiment
+  is **void**: run without the judge's profile variables (CARGO_PROFILE_DEV_DEBUG=0 …), both copies rebuilt all 305
+  crates for the profile, not the mtimes; no conclusion taken from it. Left as debt: the first build per lab (~55 s
+  on the critical path) and renaming the misleading `seed: miss` line (it counts the labs' first builds). F4 accepted
+  as measured: 279 s, 54/54 classes. F4 rebased onto 0349cb9; integrated verification queued.
