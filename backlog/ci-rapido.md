@@ -195,3 +195,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   C2: the fake cargo prints one `Running` header for several `--test`). Pass 1d fixes both. To end the ping-pong, a
   test pass is now proven in a scratch copy with the pass 2 patch applied (green) and in the clean tree (red)
   before its red commit. Pass 2 set aside as stash `0ac9458` and patch `pasada2c-wip.patch`.
+- 2026-11-06 11:15 · Claude session cut (the machine stayed up since 06:55). State checked before going on: tree at
+  `5a8c46e` with the half-done 1d edit (C1, C2) inside the region only; pass 2 in stash `0ac9458`; `Memorys-r031`
+  clean at `2d61589`; judge server up; pesado free. The open question of 1d (how the fake tree gets its section
+  counts) decided as D-J4e: pass 2 prints `OK  section <name>: <N> tests in <B> test binaries` per counted section
+  (the per-section line §5 step 7 asks for), and the fixture calibrates its counts file from those lines once.
