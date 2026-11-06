@@ -1250,7 +1250,35 @@ fn a_release_cargo_call_in_the_gate_carries_the_features_the_release_build_used(
          the release build moved elsewhere or this extraction stopped matching the script"
     );
 
-    let mut expected: Vec<String> = Vec::new();
+    // CI-F1 (D-F3c): the feature set is the one of the single `--no-run` release call the gate
+    // makes, not the one build-gpu.sh asks for. The gate no longer calls build-gpu.sh, and the
+    // compile that the E2E judges is that call, so its features are the ones to hold.
+    let suite = read("scripts/run-all-tests.sh");
+    let suite_code: String = outside_self_test(&suite)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let no_run: Vec<Vec<String>> = cargo_invocations(&suite_code)
+        .into_iter()
+        .filter(|args| args.iter().any(|arg| arg == "--release") && args.iter().any(|arg| arg == "--no-run"))
+        .collect();
+    assert_eq!(
+        no_run.len(),
+        1,
+        "scripts/run-all-tests.sh must make exactly one `--release --no-run` cargo call, outside \
+         its self-test, and it makes {}. That call is the one compile of the release binary, so \
+         the feature set every other release call and build-gpu.sh asks for is read from it",
+        no_run.len()
+    );
+    let expected: Vec<String> = features_asked_for(&no_run[0]);
+    assert!(
+        !expected.is_empty(),
+        "the `--release --no-run` call of scripts/run-all-tests.sh asks for no features: `cargo {}`. \
+         Without --features cuda gpu::wants_gpu() returns false unconditionally and the reranker \
+         runs on CPU at 58x the cost",
+        no_run[0].join(" ")
+    );
+
     for args in &built {
         let features = features_asked_for(args);
         assert!(
@@ -1261,19 +1289,15 @@ fn a_release_cargo_call_in_the_gate_carries_the_features_the_release_build_used(
              exists instead of a line in the README",
             args.join(" ")
         );
-        if expected.is_empty() {
-            expected = features;
-        } else {
-            assert_eq!(
-                expected, features,
-                "scripts/build-gpu.sh has one release branch under systemd-run and one \
-                 without, and they ask for different feature sets. Which binary the gate \
-                 gets would then depend on whether systemd is on the machine"
-            );
-        }
+        assert_eq!(
+            expected, features,
+            "`cargo {}` in scripts/build-gpu.sh asks for {features:?}, while the gate's release \
+             build asks for {expected:?}. A person who runs build-gpu.sh has to compile what the \
+             judge tested",
+            args.join(" ")
+        );
     }
 
-    let suite = read("scripts/run-all-tests.sh");
     let calls = cargo_invocations(&suite);
     let total = calls.len();
     let release: Vec<Vec<String>> = calls
@@ -1302,6 +1326,150 @@ fn a_release_cargo_call_in_the_gate_carries_the_features_the_release_build_used(
             args.join(" ")
         );
     }
+}
+
+/// Whether a line of a script calls cargo: a bare `cargo` word in a command, not an argument of
+/// echo, printf or a refusal, and not a comment.
+fn is_cargo_call_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    if matches!(
+        trimmed.split_whitespace().next(),
+        Some("echo" | "printf" | "gate_refuse")
+    ) {
+        return false;
+    }
+    trimmed.split_whitespace().any(|word| word == "cargo")
+}
+
+/// CI-F1 (F1.1, D-F1a): merge-gate counts its cores and exports CARGO_BUILD_JOBS before its first
+/// cargo call, outside every self-test. Without the export, every cargo call of the gate takes the
+/// jobs of the machine, and the cgroup pesado gives it is not what decides how many compile.
+#[test]
+fn the_gate_exports_cargo_build_jobs_before_its_first_cargo_call() {
+    let gate = read("scripts/merge-gate.sh");
+    let outside: Vec<&str> = outside_self_test(&gate)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect();
+    let export = outside
+        .iter()
+        .position(|line| line.trim_start().starts_with("export CARGO_BUILD_JOBS="))
+        .expect(
+            "scripts/merge-gate.sh never exports CARGO_BUILD_JOBS outside its self-test, so its \
+             cargo calls take the jobs of the machine and not the cores the cgroup leaves",
+        );
+    let first_call = outside
+        .iter()
+        .position(|line| is_cargo_call_line(line))
+        .expect("scripts/merge-gate.sh has no cargo call outside its self-test");
+    assert!(
+        export < first_call,
+        "scripts/merge-gate.sh exports CARGO_BUILD_JOBS on line {} and its first cargo call is on \
+         line {}: the export has to come first, or that call compiles with the wrong job count",
+        export + 1,
+        first_call + 1
+    );
+}
+
+/// CI-F1 (F1.3): the file a laptop reads by hand keeps its three jobs. The gate's export wins over
+/// it (cargo reads the environment before the file), and the file itself is not touched.
+#[test]
+fn the_laptop_keeps_its_three_jobs() {
+    let config = read("rust/.cargo/config.toml");
+    assert!(
+        config.lines().any(|line| line.trim() == "jobs = 3"),
+        "rust/.cargo/config.toml must keep `jobs = 3`: a build run by hand on the laptop reads it"
+    );
+}
+
+/// CI-F1 (F2.1, D-F2a): the steps that cost seconds run after cargo deny and before the first cargo
+/// call that compiles, so a red there arrives before the build and not after it.
+#[test]
+fn the_cheap_steps_come_before_the_first_build() {
+    let gate = read("scripts/merge-gate.sh");
+    let code: String = outside_self_test(&gate)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let deny = first_code_line(&code, "cargo deny check licenses bans sources")
+        .expect("scripts/merge-gate.sh has no cargo deny step outside its self-test");
+    let build = first_code_line(&code, "cargo clippy --all-targets")
+        .expect("scripts/merge-gate.sh has no clippy call outside its self-test");
+    for (step, needle) in [
+        ("cargo fmt --check", "cargo fmt --check"),
+        ("codigo-muerto.sh", "$ROOT/scripts/codigo-muerto.sh\""),
+        ("node npm/install.test.js", "node npm/install.test.js"),
+        ("run-all-tests.sh --check-models", "run-all-tests.sh\" --check-models"),
+    ] {
+        let at = first_code_line(&code, needle).unwrap_or_else(|| {
+            panic!("scripts/merge-gate.sh has no `{step}` step outside its self-test")
+        });
+        assert!(
+            deny < at && at < build,
+            "scripts/merge-gate.sh runs `{step}` on line {at}, which is not after cargo deny (line \
+             {deny}) and before the first compiling cargo call (line {build}): a red there would \
+             arrive after the build"
+        );
+    }
+}
+
+/// CI-F1 (F3.1, D-F3a): the judge builds release once, in one `--release --no-run` call with --lib
+/// and --test v017_rerank_gpu and no --bins. No step of run-all-tests.sh runs build-gpu.sh, or puts
+/// a systemd-run or a nice in front of cargo: the release compile runs inside the scope pesado gives.
+#[test]
+fn the_gate_does_not_build_through_build_gpu_or_a_nested_scope() {
+    let suite = read("scripts/run-all-tests.sh");
+    let code: String = outside_self_test(&suite)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    for (index, line) in code.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let first = trimmed.split_whitespace().next().unwrap_or("");
+        assert!(
+            !first.ends_with("build-gpu.sh") && first != "systemd-run" && first != "nice",
+            "scripts/run-all-tests.sh line {} runs `{trimmed}` itself: the judge's release build is \
+             the one `--no-run` call, and it runs inside the scope pesado gives, not a nested one",
+            index + 1
+        );
+    }
+    let no_run: Vec<Vec<String>> = cargo_invocations(&code)
+        .into_iter()
+        .filter(|args| {
+            args.iter().any(|arg| arg == "--release") && args.iter().any(|arg| arg == "--no-run")
+        })
+        .collect();
+    assert_eq!(
+        no_run.len(),
+        1,
+        "scripts/run-all-tests.sh must make exactly one `--release --no-run` cargo call outside its \
+         self-test, and it makes {}",
+        no_run.len()
+    );
+    let args = &no_run[0];
+    assert!(
+        args.iter().any(|arg| arg == "--lib"),
+        "`cargo {}` does not build the lib test unit, and the gpu:: table runs on what it leaves",
+        args.join(" ")
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--test" && pair[1] == "v017_rerank_gpu"),
+        "`cargo {}` does not build the v017_rerank_gpu test, and that suite runs on what it leaves",
+        args.join(" ")
+    );
+    assert!(
+        !args.iter().any(|arg| arg == "--bins"),
+        "`cargo {}` asks for --bins, which compiles the binary's own test harness with LTO on top \
+         of the bins the judge already has",
+        args.join(" ")
+    );
 }
 
 /// A stand-in on the `PATH` of `run_build_gpu`: written executable, because bash

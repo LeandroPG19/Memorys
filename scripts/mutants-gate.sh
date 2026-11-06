@@ -720,7 +720,7 @@ self_test() {
     "echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'" \
     'echo "fake 0 0 ${FAKE_DF_AVAIL_KB} 0% $last"' > "$tmp/bin/df"
   printf '%s\n' '#!/bin/sh' \
-    'printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$*" "${TMP:-}" "${TEMP:-}" "${TMPDIR:-}" "${CARGO_PROFILE_DEV_DEBUG:-}" "${CARGO_INCREMENTAL:-}" >> "$FAKE_CALLS"' \
+    'printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$*" "${TMP:-}" "${TEMP:-}" "${TMPDIR:-}" "${CARGO_PROFILE_DEV_DEBUG:-}" "${CARGO_INCREMENTAL:-}" "${CARGO_BUILD_JOBS:-unset}" >> "$FAKE_CALLS"' \
     'exit 0' > "$tmp/bin/cargo"
   # psql answers the identity question the judge asks of the server before anything
   # else (J1.9): FAKE_PSQL_CLUSTER_NAME and FAKE_PSQL_SYSID are what it names (the
@@ -821,7 +821,7 @@ self_test() {
     [[ -z "$per_copy" ]] || e+=(MUTANTS_SCRATCH_GB_PER_COPY="$per_copy")
     rc=0
     env -u MUTANTS_SCRATCH_GB_PER_COPY -u MUTANTS_SCRATCH_DIR -u CUBA_GATE_LOCK_OWNER \
-        -u CUBA_GATE_MIN_FREE_GB -u MUTANTS_JOBS -u FAKE_DF_FAIL \
+        -u CUBA_GATE_MIN_FREE_GB -u MUTANTS_JOBS -u FAKE_DF_FAIL -u CARGO_BUILD_JOBS \
         -u CARGO_PROFILE_DEV_DEBUG -u CARGO_INCREMENTAL -u DATABASE_URL \
         -u FAKE_PSQL_CLUSTER_NAME -u FAKE_PSQL_SYSID -u FAKE_PSQL_EXIT \
         "${e[@]}" ${extra[@]+"${extra[@]}"} \
@@ -1325,6 +1325,23 @@ self_test() {
     || self_fail "J7: two runs in a row wrote their mutants to the same output directory ('$first_out' and '$second_out'): a run removes what the other one is using"
   [[ -e "$home/.cache/memory-industry-gate/tmp/memory-industry-mutants-out/centinela" ]] \
     || self_fail "J7: a run removed the fixed output directory of an earlier run, sentinel and all"
+
+  # --- CI-F1 row (spec §4 F1.1, D-F1b): the mutation builds take their share of the cores the gate
+  # counted. The seventh field of the cargo stand-in is the CARGO_BUILD_JOBS the mutation step gave
+  # cargo mutants: max(1, floor(N / MUTANTS_JOBS)), with --jobs unchanged.
+  avail=$((500 * kb))
+  fresh
+  in_tree clean MUTANTS_JOBS=4 CARGO_BUILD_JOBS=8 --
+  ran_mutants || self_fail "F1.1 mutants: with 500 GB free the step did not run cargo mutants: $(cat "$tmp/run.out" "$tmp/run.err")"
+  got="$(grep -m1 '^mutants --file' "$tmp/cargo.calls" | awk -F'\t' '{print $7}')"
+  [[ "$got" == 2 ]] \
+    || self_fail "F1.1 mutants: with 8 cores and MUTANTS_JOBS=4 a mutant build got CARGO_BUILD_JOBS='$got', not 2"
+  fresh
+  in_tree clean MUTANTS_JOBS=9 CARGO_BUILD_JOBS=8 --
+  ran_mutants || self_fail "F1.1 mutants: with MUTANTS_JOBS=9 the step did not run cargo mutants: $(cat "$tmp/run.out" "$tmp/run.err")"
+  got="$(grep -m1 '^mutants --file' "$tmp/cargo.calls" | awk -F'\t' '{print $7}')"
+  [[ "$got" == 1 ]] \
+    || self_fail "F1.1 mutants: with 8 cores and MUTANTS_JOBS=9 a mutant build got CARGO_BUILD_JOBS='$got', not 1 (the floor is at least one)"
 
   echo "OK  self-test: a build rustc refused with a diagnostic stays unviable; an NTSTATUS,"
   echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log,"

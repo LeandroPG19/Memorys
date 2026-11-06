@@ -51,6 +51,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
     for s in codigo-muerto crap-gate; do
       printf '#!/bin/sh\necho %s >>"$HOME/steps"\necho "${DATABASE_URL-unset}" >>"$HOME/%s.urls"\nexit 0\n' "$s" "$s" >"$t/scripts/$s.sh"
     done
+    # CI-F1: codigo-muerto alone takes FAKE_CODIGO_MUERTO_EXIT as its verdict, so a row can
+    # make the cheap step red (D-F2a). The loop above keeps crap-gate as it was.
+    printf '%s\n' '#!/bin/sh' 'echo codigo-muerto >>"$HOME/steps"' \
+      'exit "${FAKE_CODIGO_MUERTO_EXIT:-0}"' >"$t/scripts/codigo-muerto.sh"
     # The gate asks mutants-gate.sh --refuse-targets before any step, so that
     # call is not the mutation step and does not go in the order.
     printf '%s\n' '#!/bin/sh' \
@@ -100,7 +104,14 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'exit 0' >"$t/bin/psql"
     # gate_linux_env reads the version of node, and package.json says which one
     # is the oldest the gate accepts.
-    printf '#!/bin/sh\necho v20.0.0\n' >"$t/bin/node"
+    # CI-F1: node answers its version to gate_require_node and records any other call in
+    # the order of the steps, exiting FAKE_NODE_EXIT (the row sets it to make npm red).
+    printf '%s\n' '#!/bin/sh' \
+      'case "${1:-}" in --version) echo v20.0.0 ;;' \
+      '  *) echo "node $*" >>"$HOME/steps"; exit "${FAKE_NODE_EXIT:-0}" ;; esac' >"$t/bin/node"
+    # CI-F1: nproc says how many cores the machine has. The gate takes the cgroup's CPUs
+    # under it (D-F1a), so a row that gives a cgroup of 8 under 24 cores expects 8.
+    printf '#!/bin/sh\necho "${FAKE_NPROC:-24}"\n' >"$t/bin/nproc"
     printf '{"engines":{"node":">=18"}}\n' >"$t/package.json"
     # cargo fails the one subcommand named in FAIL_AT, and not its --version
     # probe, so the gate gets past "is cargo-deny installed" to the check. Each
@@ -116,6 +127,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     printf '%s\n' '#!/bin/sh' \
       'echo "cargo $*" >>"$HOME/steps"' \
       'echo "${DATABASE_URL-unset}" >>"$HOME/cargo.urls"' \
+      'echo "${CARGO_BUILD_JOBS-unset} $*" >>"$HOME/cargo.jobs"' \
       'if [ "$1" = audit ] && [ "${2:-}" = --json ]; then' \
       '  echo "$PWD" >"$HOME/audit_json.cwd"' \
       '  if [ -e .cargo/audit.toml ]; then echo present >"$HOME/audit_json.audit_toml"; fi' \
@@ -203,7 +215,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     [[ "$base" != unset ]] || start=()
     shift $(( $# > 2 ? 3 : 2 ))
     rc=0
-    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT HOME="$tmp/$name/home" \
+    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS HOME="$tmp/$name/home" \
         PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" ${start[@]+"${start[@]}"} "$@" \
         "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 || rc=$?; } 2>/dev/null
   }
@@ -1137,6 +1149,103 @@ if [[ "${1:-}" == "--self-test" ]]; then
   (( rc == 0 )) || self_fail "gate_linux_env refused a machine that is not Linux (exit $rc): $(cat "$tmp/not_linux.out")"
   [[ "$(env_var not_linux CARGO_TARGET_DIR)" == unset && "$(env_var not_linux TMPDIR)" == unset ]] \
     || self_fail "gate_linux_env set variables on a machine that is not Linux: $(cat "$tmp/not_linux.out")"
+
+  # --- CI-F1 rows (spec §4, F1 and F2): the cores the gate counts, the order of the cheap
+  # steps, and the boundary test-times judges. cg_tree NAME CPU_MAX builds a cgroup v2 scope
+  # by hand: its cpu.max, and the `0::` line /proc/self/cgroup would give. The rows read it
+  # through GATE_CGROUP_ROOT and GATE_PROC_SELF_CGROUP (gate-lock.sh, D-J5a).
+  cg_tree() {
+    local d="$tmp/cg/$1"
+    mkdir -p "$d/root/app/pesado.scope"
+    printf '%s\n' "$2" >"$d/root/app/pesado.scope/cpu.max"
+    printf '0::/app/pesado.scope\n' >"$d/self"
+  }
+
+  # F1.1 (D-F1a): the gate counts its cores once, before its first cargo call: the cgroup's
+  # CPUs under nproc's (8 under 24 here), exports CARGO_BUILD_JOBS with them and says so.
+  cg_tree f1jobs "800000 100000"
+  fake_tree f1jobs "$reads_while_running"
+  run_copy f1jobs "" GATE_CGROUP_ROOT="$tmp/cg/f1jobs/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1jobs/self"
+  (( rc == 0 )) || self_fail "F1.1: a gate whose every step passed exited $rc: $(cat "$tmp/f1jobs.out")"
+  grep -qE '^cargo jobs=8 \(nproc=24, cgroup cpu=8' "$tmp/f1jobs.out" \
+    || self_fail "F1.1: the gate did not print 'cargo jobs=8 (nproc=24, cgroup cpu=8' for 24 cores under an 8-CPU cgroup: $(grep 'cargo jobs' "$tmp/f1jobs.out" || echo 'no such line')"
+  jobs_at="$(grep -n '^cargo jobs=' "$tmp/f1jobs.out" | head -1 | cut -d: -f1)"
+  audit_at="$(grep -nxF '=== cargo audit ===' "$tmp/f1jobs.out" | head -1 | cut -d: -f1)"
+  [[ -n "$jobs_at" && -n "$audit_at" ]] && (( jobs_at < audit_at )) \
+    || self_fail "F1.1: the line that names the jobs (line '${jobs_at:-none}') is not before the first cargo call (cargo audit, line '${audit_at:-none}')"
+  [[ -s "$tmp/f1jobs/home/cargo.jobs" ]] \
+    || self_fail "F1.1: no cargo call was recorded, so nothing shows the CARGO_BUILD_JOBS it saw"
+  if grep -qv '^8 ' "$tmp/f1jobs/home/cargo.jobs"; then
+    self_fail "F1.1: a cargo call did not see CARGO_BUILD_JOBS=8: $(cat "$tmp/f1jobs/home/cargo.jobs")"
+  fi
+
+  # F1.2 (D-F1a): a CARGO_BUILD_JOBS the operator set is kept, every cargo call sees it,
+  # and the line that prints it says the operator named it.
+  cg_tree f1operator "800000 100000"
+  fake_tree f1operator "$reads_while_running"
+  run_copy f1operator "" CARGO_BUILD_JOBS=5 GATE_CGROUP_ROOT="$tmp/cg/f1operator/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1operator/self"
+  (( rc == 0 )) || self_fail "F1.2: a gate with CARGO_BUILD_JOBS=5 whose every step passed exited $rc: $(cat "$tmp/f1operator.out")"
+  grep -qE '^cargo jobs=5 \(.*CARGO_BUILD_JOBS' "$tmp/f1operator.out" \
+    || self_fail "F1.2: no 'cargo jobs=5 (...CARGO_BUILD_JOBS...' line says the operator named the jobs: $(grep 'cargo jobs' "$tmp/f1operator.out" || echo 'no such line')"
+  [[ -s "$tmp/f1operator/home/cargo.jobs" ]] \
+    || self_fail "F1.2: no cargo call was recorded with CARGO_BUILD_JOBS=5"
+  if grep -qv '^5 ' "$tmp/f1operator/home/cargo.jobs"; then
+    self_fail "F1.2: a cargo call did not see the CARGO_BUILD_JOBS=5 the operator set: $(cat "$tmp/f1operator/home/cargo.jobs")"
+  fi
+
+  # F2: the run-all-tests stand-in of the rows below answers --check-models (its verdict is
+  # FAKE_CHECK_MODELS_EXIT) and records a full run as one step. Anything else is a full run.
+  run_all_steps='case "${1:-}" in --check-models) echo "run-all-tests --check-models" >>"$HOME/steps"; exit "${FAKE_CHECK_MODELS_EXIT:-0}" ;; esac
+echo run-all-tests >>"$HOME/steps"
+exit 0'
+
+  # F2.1 (D-F2a): fmt, codigo-muerto, npm and the models run after cargo deny and before the
+  # first cargo call that compiles.
+  fake_tree f2order "$run_all_steps"
+  run_copy f2order ""
+  (( rc == 0 )) || self_fail "F2.1: a gate whose every step passed exited $rc: $(cat "$tmp/f2order.out")"
+  steps="$tmp/f2order/home/steps"
+  deny_at="$(grep -nxF 'cargo deny check licenses bans sources' "$steps" | head -1 | cut -d: -f1)"
+  build_at="$(grep -nE '^cargo (clippy|build|test|llvm-cov|mutants)' "$steps" | head -1 | cut -d: -f1)"
+  for step in 'cargo fmt --check' 'codigo-muerto' 'node npm/install.test.js' 'run-all-tests --check-models'; do
+    at="$(grep -nxF "$step" "$steps" | head -1 | cut -d: -f1)"
+    [[ -n "$deny_at" && -n "$at" && -n "$build_at" ]] && (( at > deny_at && at < build_at )) \
+      || self_fail "F2.1: '$step' is not after cargo deny (line '${deny_at:-none}') and before the first cargo call that compiles (line '${build_at:-none}'): $(cat "$steps")"
+  done
+
+  # F2.2 (D-F2a): a cheap step that fails stops the gate with exit 1 before any cargo call
+  # that compiles, and before the full run of run-all-tests.
+  f2_cheap_red() {
+    local name="$1" fail_at="$2"
+    shift 2
+    fake_tree "$name" "$run_all_steps"
+    run_copy "$name" "$fail_at" "$@"
+    (( rc == 1 )) || self_fail "F2.2 $name: a gate whose cheap step failed exited $rc, not 1: $(cat "$tmp/$name.out")"
+    if grep -qE '^cargo (clippy|build|test|llvm-cov|mutants)' "$tmp/$name/home/steps" 2>/dev/null; then
+      self_fail "F2.2 $name: a cheap step failed and the gate compiled anyway: $(cat "$tmp/$name/home/steps")"
+    fi
+    if grep -qxF 'run-all-tests' "$tmp/$name/home/steps" 2>/dev/null; then
+      self_fail "F2.2 $name: the full run of run-all-tests started after a cheap step failed"
+    fi
+  }
+  f2_cheap_red f2fmt fmt
+  f2_cheap_red f2codigo "" FAKE_CODIGO_MUERTO_EXIT=1
+  f2_cheap_red f2node "" FAKE_NODE_EXIT=1
+  f2_cheap_red f2models "" FAKE_CHECK_MODELS_EXIT=1
+
+  # F2.3 (D-F2c): test-times stops at a line of its own, printed after the --features docs
+  # step, and not at the npm banner, which now runs before the first build.
+  fake_tree f2until "$run_all_steps"
+  run_copy f2until ""
+  (( rc == 0 )) || self_fail "F2.3: a gate whose every step passed exited $rc: $(cat "$tmp/f2until.out")"
+  until_arg="$(sed -n 's/^test-times .*--until //p' "$tmp/f2until/home/steps" | tail -1)"
+  [[ -n "$until_arg" && "$until_arg" != '=== npm wrapper smoke ===' ]] \
+    || self_fail "F2.3: test-times was told to stop at '$until_arg', which is not a boundary printed after the --features docs step"
+  seen="$tmp/f2until/home/times.seen"
+  docs_at="$(grep -nxF '=== cargo clippy/test --features docs ===' "$seen" | head -1 | cut -d: -f1)"
+  bound_at="$(grep -nxF -- "$until_arg" "$seen" | head -1 | cut -d: -f1)"
+  [[ -n "$docs_at" && -n "$bound_at" ]] && (( bound_at > docs_at )) \
+    || self_fail "F2.3: the boundary '$until_arg' is not a line of the log after the --features docs step (docs at '${docs_at:-none}', boundary at '${bound_at:-none}')"
 
   echo "OK  self-test: the exit file says running while a gate runs and holds the whole"
   echo "    gate's verdict at the end, a step after the tests included; a gate killed"

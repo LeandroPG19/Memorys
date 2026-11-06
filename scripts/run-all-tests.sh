@@ -564,7 +564,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
     : >"$t/nli-model"
     : >"$t/models/model_quantized.onnx"
     : >"$t/reranker/model.onnx"
-    printf '%s\n' '#!/bin/sh' 'exit 0' >"$t/scripts/build-gpu.sh"
+    # CI-F1: a call of build-gpu.sh leaves its mark, so a row can say the judge did not make it.
+    printf '%s\n' '#!/bin/sh' 'echo build-gpu >>"$HOME/gpu.calls"' 'exit 0' >"$t/scripts/build-gpu.sh"
     printf '%s\n' '#!/bin/sh' 'exit 0' >"$t/scripts/gpu-placement-check.sh"
     printf '%s\n' 'raise SystemExit(0)' >"$t/scripts/mcp_live_session_test.py"
     printf '%s\n' 'raise SystemExit(0)' >"$t/rust/tests/e2e_all_tools.py"
@@ -584,12 +585,14 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'exit 0' >"$t/standin/memory-industry"
     printf '%s\n' '#!/bin/sh' \
       'echo "$*" >>"$HOME/cargo.calls"' \
+      'echo "${CARGO_BUILD_JOBS-unset} $*" >>"$HOME/cargo.jobs"' \
       'if [ "$1" = "${FAKE_CARGO_FAIL:-none}" ]; then exit "${FAKE_CARGO_FAIL_EXIT:-1}"; fi' \
       'mkdir -p "$CARGO_TARGET_DIR/debug" "$CARGO_TARGET_DIR/release"' \
       'case "$*" in *--release*) [ -e "$CARGO_TARGET_DIR/release/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/release/memory-industry" ;; esac' \
+      '[ -z "${FAKE_CHANGE_RELEASE_ON:-}" ] || case "$*" in *"$FAKE_CHANGE_RELEASE_ON"*) echo changed >"$CARGO_TARGET_DIR/release/memory-industry" ;; esac' \
       'if [ "$1" = build ]; then' \
       '  [ -e "$CARGO_TARGET_DIR/debug/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/debug/memory-industry"' \
-      '  case "$*" in *--message-format=*) printf "%s\n" "{\"reason\":\"compiler-artifact\",\"executable\":\"${FAKE_CARGO_BUILD_EXE:-$CARGO_TARGET_DIR/debug/memory-industry}\"}" ;; esac' \
+      '  case "$*" in *--message-format=*) printf "%s\n" "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"memory-industry\"},\"fresh\":${FAKE_CARGO_FRESH:-true},\"executable\":\"${FAKE_CARGO_BUILD_EXE:-$CARGO_TARGET_DIR/debug/memory-industry}\"}" ;; esac' \
       'fi' \
       'if [ "$1" = test ]; then' \
       '  n="${FAKE_CARGO_TEST_COUNT:-3}"' \
@@ -843,6 +846,133 @@ if [[ "${1:-}" == "--self-test" ]]; then
     || self_fail "J6.1: incremental state 30 days old survived the sweep of debug/incremental: $(cat "$tmp/j61i.out")"
   [[ -e "$ct/debug/incremental/new-session/new-inc" ]] \
     || self_fail "J6.1: the sweep took the recent incremental state of debug/incremental"
+
+  # --- CI-F1 rows (spec §4, F1, F2, F3; D-F1b, D-F2b, D-F3a/b). run_args NAME ARG...: the
+  # script with ARG... in NAME's tree, under the environment full_run gives it; $rc and
+  # $tmp/NAME.out as full_run leaves them. cg_tree NAME CPU_MAX MEMORY_MAX MEMORY_CURRENT
+  # builds a cgroup v2 scope by hand, read through GATE_CGROUP_ROOT and GATE_PROC_SELF_CGROUP.
+  run_args() {
+    local name="$1" t="$tmp/$1"
+    shift
+    rc=0
+    env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT HOME="$t/home" \
+      PATH="$t/bin:/usr/bin:/bin" DATABASE_URL="$rat_url" CARGO_TARGET_DIR="$t/target" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      ONNX_MODEL_PATH="$t/models" CUBA_RERANKER_PATH="$t/reranker" CUBA_NLI_PATH="$t/nli-model" \
+      MEMORY_INDUSTRY_LLM_PROVIDER=ollama \
+      "$BASH" "$t/scripts/run-all-tests.sh" "$@" >"$tmp/$name.out" 2>&1 || rc=$?
+  }
+  cg_tree() {
+    local scope="$tmp/cg/$1/root/app/pesado.scope"
+    mkdir -p "$scope"
+    printf '%s\n' "$2" >"$scope/cpu.max"
+    printf '%s\n' "$3" >"$scope/memory.max"
+    printf '%s\n' "$4" >"$scope/memory.current"
+    printf '0::/app/pesado.scope\n' >"$tmp/cg/$1/self"
+  }
+
+  # F1.1 (D-F1b): N is the CARGO_BUILD_JOBS merge-gate counted, 8 here. The release calls take
+  # min(N, floor(memory margin in GB / 4)): the cgroup leaves 12 GiB, so 3. Every other call takes N.
+  cg_tree f1rel "800000 100000" 17179869184 4294967296
+  full_tree f1rel
+  full_run f1rel CARGO_BUILD_JOBS=8 GATE_CGROUP_ROOT="$tmp/cg/f1rel/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1rel/self"
+  (( rc == 0 )) || self_fail "F1.1 release: a full run whose every step passed exited $rc: $(cat "$tmp/f1rel.out")"
+  [[ -s "$tmp/f1rel/home/cargo.jobs" ]] || self_fail "F1.1 release: no cargo call was recorded"
+  grep -q -- ' --release' "$tmp/f1rel/home/cargo.jobs" || self_fail "F1.1 release: no release call was recorded"
+  if grep -- ' --release' "$tmp/f1rel/home/cargo.jobs" | grep -qv '^3 '; then
+    self_fail "F1.1 release: a release call did not take min(8, floor(12 GiB / 4)) = 3 jobs: $(grep -- ' --release' "$tmp/f1rel/home/cargo.jobs")"
+  fi
+  if grep -v -- ' --release' "$tmp/f1rel/home/cargo.jobs" | grep -qv '^8 '; then
+    self_fail "F1.1 release: a call that is not a release one did not take the 8 jobs: $(grep -v -- ' --release' "$tmp/f1rel/home/cargo.jobs")"
+  fi
+
+  # F1.2 (D-F1a, D-F1b): the jobs the operator named are kept on every call that is not a release
+  # one. The release calls still take min(N, floor(margin / 4)): a 16 GiB cap with 4 GiB in use
+  # leaves 12 GiB, so 3 of the 5 named.
+  cg_tree f1op "800000 100000" 17179869184 4294967296
+  full_tree f1op
+  full_run f1op CARGO_BUILD_JOBS=5 GATE_CGROUP_ROOT="$tmp/cg/f1op/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1op/self"
+  (( rc == 0 )) || self_fail "F1.2: a full run with CARGO_BUILD_JOBS=5 whose every step passed exited $rc: $(cat "$tmp/f1op.out")"
+  [[ -s "$tmp/f1op/home/cargo.jobs" ]] || self_fail "F1.2: no cargo call was recorded"
+  if grep -- ' --release' "$tmp/f1op/home/cargo.jobs" | grep -qv '^3 '; then
+    self_fail "F1.2: a release call did not take min(5, floor(12 GiB / 4)) = 3 jobs: $(grep -- ' --release' "$tmp/f1op/home/cargo.jobs")"
+  fi
+  if grep -v -- ' --release' "$tmp/f1op/home/cargo.jobs" | grep -qv '^5 '; then
+    self_fail "F1.2: a call that is not a release one did not keep the CARGO_BUILD_JOBS=5 the operator set: $(grep -v -- ' --release' "$tmp/f1op/home/cargo.jobs")"
+  fi
+
+  # F2.2 (D-F2b): --check-models asks the paths the tests ask, runs no cargo, and names what is missing
+  # with the text of require_present.
+  full_tree f2mok
+  run_args f2mok --check-models
+  (( rc == 0 )) || self_fail "F2.2: --check-models with every model on disk exited $rc: $(cat "$tmp/f2mok.out")"
+  [[ ! -e "$tmp/f2mok/home/cargo.calls" ]] || self_fail "F2.2: --check-models ran cargo: $(cat "$tmp/f2mok/home/cargo.calls")"
+  full_tree f2mgone
+  rm -f "$tmp/f2mgone/models/model_quantized.onnx"
+  run_args f2mgone --check-models
+  (( rc == 1 )) || self_fail "F2.2: --check-models with the embedding model missing exited $rc, not 1: $(cat "$tmp/f2mgone.out")"
+  grep -qF "nothing at $tmp/f2mgone/models/model_quantized.onnx" "$tmp/f2mgone.out" \
+    || self_fail "F2.2: --check-models did not say what is missing, with the text of require_present: $(cat "$tmp/f2mgone.out")"
+  [[ ! -e "$tmp/f2mgone/home/cargo.calls" ]] || self_fail "F2.2: --check-models ran cargo before it found the model missing"
+
+  # F3.1 (D-F3a): one release call compiles the bins and the arneses, with --no-run; no step runs
+  # build-gpu.sh.
+  full_tree f31
+  full_run f31
+  (( rc == 0 )) || self_fail "F3.1: a full run whose every step passed exited $rc: $(cat "$tmp/f31.out")"
+  [[ ! -e "$tmp/f31/home/gpu.calls" ]] || self_fail "F3.1: the gate ran build-gpu.sh: $(cat "$tmp/f31/home/gpu.calls")"
+  noRun="$(grep -- '--no-run' "$tmp/f31/home/cargo.calls" 2>/dev/null || true)"
+  [[ "$(grep -c -- '--no-run' "$tmp/f31/home/cargo.calls" 2>/dev/null || true)" == 1 ]] \
+    || self_fail "F3.1: expected exactly one --no-run release call, found: '$noRun'"
+  [[ "$noRun" == *' --release '* && "$noRun" == *' --lib '* && "$noRun" == *'--test v017_rerank_gpu'* && "$noRun" != *'--bins'* ]] \
+    || self_fail "F3.1: the --no-run call must be --release with --lib and --test v017_rerank_gpu and no --bins: $noRun"
+
+  # F3.2 (D-F3b): --check-fresh judges the JSON of the release build: every compiler-artifact fresh,
+  # or exit 1 naming the unit that was compiled again. It runs no cargo.
+  printf '%s\n' \
+    '{"reason":"build-script-executed","package_id":"memory-industry 0.31.0"}' \
+    '{"reason":"compiler-artifact","package_id":"memory-industry 0.31.0","target":{"name":"memory-industry","kind":["bin"]},"fresh":true,"filenames":[]}' \
+    '{"reason":"build-finished","success":true}' >"$tmp/fresh-ok.json"
+  printf '%s\n' \
+    '{"reason":"compiler-artifact","package_id":"memory-industry 0.31.0","target":{"name":"memory-industry","kind":["bin"]},"fresh":false,"filenames":[]}' \
+    '{"reason":"build-finished","success":true}' >"$tmp/fresh-bad.json"
+  full_tree fresh
+  run_args fresh --check-fresh "$tmp/fresh-ok.json"
+  (( rc == 0 )) || self_fail "F3.2: --check-fresh over a build in which every unit was fresh exited $rc: $(cat "$tmp/fresh.out")"
+  [[ ! -e "$tmp/fresh/home/cargo.calls" ]] || self_fail "F3.2: --check-fresh ran cargo, which only judges a file: $(cat "$tmp/fresh/home/cargo.calls")"
+  run_args fresh --check-fresh "$tmp/fresh-bad.json"
+  (( rc == 1 )) || self_fail "F3.2: --check-fresh over a unit compiled again exited $rc, not 1: $(cat "$tmp/fresh.out")"
+  grep -qF 'memory-industry' "$tmp/fresh.out" \
+    || self_fail "F3.2: --check-fresh did not name the unit it found compiled again: $(cat "$tmp/fresh.out")"
+
+  # F3.2 (B3g, D-F3b): a release build that compiled memory-industry again after the --no-run is
+  # refused with exit 1 by name, before the E2E.
+  full_tree f3b
+  full_run f3b FAKE_CARGO_FRESH=false
+  (( rc == 1 )) || self_fail "F3.2 B3g: a release build that compiled memory-industry again exited $rc, not 1: $(cat "$tmp/f3b.out")"
+  grep -qF 'memory-industry recompiled' "$tmp/f3b.out" \
+    || self_fail "F3.2 B3g: the gate did not say 'memory-industry recompiled': $(cat "$tmp/f3b.out")"
+  if grep -qF '=== E2E' "$tmp/f3b.out"; then
+    self_fail "F3.2 B3g: the E2E ran after the build was refused"
+  fi
+
+  # F3.3 (D-F3b): the binary the E2E judges is the one the --no-run built. A change to it, made by
+  # whichever step, is refused before the E2E with its sha256 named.
+  sha_row() {
+    full_tree "$1"
+    full_run "$1" FAKE_CHANGE_RELEASE_ON="$2"
+    (( rc == 1 )) || self_fail "F3.3 ($2): the release binary changed under the gate and the run exited $rc, not 1: $(cat "$tmp/$1.out")"
+    grep -qF 'sha256 changed' "$tmp/$1.out" \
+      || self_fail "F3.3 ($2): the change was not named by its sha256: $(cat "$tmp/$1.out")"
+    if grep -qF '=== E2E' "$tmp/$1.out"; then
+      self_fail "F3.3 ($2): the E2E ran on a binary that had changed"
+    fi
+  }
+  sha_row f33a --no-run
+  sha_row f33b --bins
+  sha_row f33c 'gpu::'
+  grep -qF 'sha256 changed before E2E' "$tmp/f33c.out" \
+    || self_fail "F3.3: a change after the gpu:: release call is not named 'sha256 changed before E2E': $(cat "$tmp/f33c.out")"
 
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
