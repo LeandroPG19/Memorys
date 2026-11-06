@@ -92,3 +92,12 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   the gate exited 0, not 2`; run-all-tests `j16_unset: … exited 1, not 2`; mutants-gate `J5.1: … did not print the
   12582912 KB of margin`; test-times `TT13.linux exited 2, not 0: unknown argument '--count'`; crap-gate `J1.9: … no judge
   marker exited 0, not 2`; codigo-muerto unchanged, green. The Rust contract and v046 queued under pesado.
+- 2026-11-06 06:56 · WSL restarted again; `/tmp` and the judge's server lost again (J6). Work files now live in
+  `~/.cache/memory-industry-gate/ci-rapido/` (ext4), research extracts included.
+- 2026-11-06 07:10 · I0 done. Notion: «🎓 Investigación de CI II (5-nov-2026): lo que faltaba» under the CI template
+  (Parts I–VII and the bibliography), «🛠️ Aplicación a MemoryIndustry» (108 techniques: 61 apply today, 56.5 %; 78 with
+  the ones that wait for history, 72.2 %; the 5-nov study alone, 64.0 % and 72.0 %), a Conocimiento row in this space
+  and in Mapupita Rust, and §14 of the template. New changes 11–18 (LLM replay on the Rust side, injected clock, ORT
+  threads per lane, per-binary launcher with resource groups, critical-path dispatch with CPU+RAM admission, T/LB gap,
+  Monte Carlo acceptance, HNSW notice). Three questions for the user: the ">20 %" rule, signing the `.exe`, npm trusted
+  publishing.
