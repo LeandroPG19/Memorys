@@ -1477,6 +1477,12 @@ set +e
 # tests red in rrf.rs and eval/datasets.rs, on sources nobody had touched.
 unset CARGO_TARGET_DIR
 
+# Each mutant build takes its share of the cores the gate counted (CI-F1, D-F1b):
+# max(1, floor(N / MUTANTS_JOBS)), N being the gate's CARGO_BUILD_JOBS. --jobs is unchanged.
+gate_cargo_jobs
+mutants_build_jobs=$(( GATE_CARGO_JOBS / MUTANTS_JOBS ))
+(( mutants_build_jobs >= 1 )) || mutants_build_jobs=1
+
 # --timeout is 180, not 90. That budget was set when this ran two at a time;
 # at six, a slow test reported TIMEOUT instead of the CAUGHT it actually was,
 # and a timeout counts against the kill rate as though the mutant had lived.
@@ -1493,6 +1499,7 @@ unset CARGO_TARGET_DIR
 # and with it off the copy was 8.94 GB, 37 % smaller. Prefix assignments, so
 # nothing else in the gate sees them.
 TMP="$SCRATCH_NATIVE" TEMP="$SCRATCH_NATIVE" TMPDIR="$MUTANTS_SCRATCH" CARGO_PROFILE_DEV_DEBUG=0 \
+CARGO_BUILD_JOBS="$mutants_build_jobs" \
 cargo mutants \
   --file 'src/search/mmr.rs' \
   --file 'src/search/rrf.rs' \

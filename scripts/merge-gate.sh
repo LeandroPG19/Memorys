@@ -1376,6 +1376,15 @@ exec > >(tee "$GATE_LOG") 2>&1
 GATE_TEE=$!
 [[ -z "$GATE_NO_RECEIPT" ]] || echo "note: this run will leave no receipt for scripts/release.sh: $GATE_NO_RECEIPT"
 
+# CARGO_BUILD_JOBS for every cargo call of this run, counted once (CI-F1, D-F1a): the CPUs
+# of the cgroup this gate runs in, under nproc's. Before the banner, because the banner
+# and the OK lines of the judge server are read as one block (the first cargo call is
+# still after all of them).
+gate_cargo_jobs
+# The value the function settled on, exported here as well: the gate's own export is the
+# judge's line for every cargo call of the run, so it reads here and not only in gate-lock.sh.
+export CARGO_BUILD_JOBS="$GATE_CARGO_JOBS"
+
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  CUBA-MEMORYS MERGE GATE (local CI — sole merge judge)   ║"
 echo "╚══════════════════════════════════════════════════════════╝"
@@ -1585,6 +1594,22 @@ if ! command -v cargo-deny >/dev/null 2>&1 && ! (cd "$ROOT/rust" && cargo deny -
 fi
 (cd "$ROOT/rust" && cargo deny check licenses bans sources)
 
+# The cheap steps before the first compile (CI-F1, D-F2a and D-F2b): a red here is seconds,
+# not the twenty minutes of run-all-tests.sh. fmt runs again in run-all-tests.sh, a second
+# look of one second that keeps that script whole when it runs alone. The models are asked
+# by run-all-tests.sh --check-models, with the paths its own run exports.
+echo "=== cargo fmt --check ==="
+(cd "$ROOT/rust" && cargo fmt --check)
+
+echo "=== codigo-muerto ==="
+"$ROOT/scripts/codigo-muerto.sh"
+
+echo "=== npm wrapper smoke ==="
+node npm/install.test.js
+
+echo "=== models (run-all-tests.sh --check-models) ==="
+"$ROOT/scripts/run-all-tests.sh" --check-models
+
 # The copy of the real corpus is not a judge step (P1 a): respaldo-memoria.timer,
 # outside this repo, makes it. The judge never touches the live server.
 
@@ -1594,15 +1619,12 @@ echo "=== cargo clippy/test --features docs ==="
 (cd "$ROOT/rust" && cargo clippy --all-targets --features docs -- -D warnings)
 (cd "$ROOT/rust" && cargo test --features docs)
 
-# The line where the timed steps end: test-times.sh sums the `finished in` of the
-# test calls above it (run-all-tests.sh and --features docs) and nothing after.
-# One source for the step that prints it and for the judge that stops at it.
-TIMED_STEPS_END='=== npm wrapper smoke ==='
+# The line where the timed steps end (D-F2c): test-times.sh sums the `finished in` of the
+# test calls above it (run-all-tests.sh and --features docs) and nothing after. It is printed
+# here, after the --features docs step, and not at the npm step, which runs before the first
+# compile now. One source for the step that prints it and for the judge that stops at it.
+TIMED_STEPS_END='=== end of timed steps ==='
 echo "$TIMED_STEPS_END"
-node npm/install.test.js
-
-echo "=== codigo-muerto ==="
-"$ROOT/scripts/codigo-muerto.sh"
 
 echo "=== crap-gate (coverage floor) ==="
 "$ROOT/scripts/crap-gate.sh"

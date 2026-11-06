@@ -1,6 +1,6 @@
 # Time ceiling per test binary, per judge host. scripts/test-times.sh reads it
 # as the last step of merge-gate.sh, over the gate's own log up to the line
-# `=== npm wrapper smoke ===`: every `finished in` printed by the cargo test calls
+# `=== end of timed steps ===`: every `finished in` printed by the cargo test calls
 # of run-all-tests.sh and of the --features docs step, summed per binary.
 #
 # A line: <os> <binary> <floor_s> <ceiling_s> <owner> <expires> <reason>

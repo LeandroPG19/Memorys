@@ -93,6 +93,31 @@ if [[ "${1:-}" == "--print-paths" ]]; then
   exit 0
 fi
 
+# B3g (CI-F1, D-F3b): judges the JSON of `cargo build --release --features cuda --bins
+# --message-format=json`. Every compiler-artifact has to say fresh: a unit that compiled
+# again is a binary the --no-run build did not leave. Only reads the file.
+check_fresh() {
+  local file="$1" line name units=0 stale=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == *'"reason":"compiler-artifact"'* ]] || continue
+    units=$((units + 1))
+    if [[ "$line" != *'"fresh":true'* ]]; then
+      stale=$((stale + 1))
+      name="$(printf '%s\n' "$line" | sed -n 's/.*"target":{"name":"\([^"]*\)".*/\1/p')"
+      echo "FAIL: B3g: ${name:-a unit} recompiled after the --no-run build (its compiler-artifact is not fresh), so the binary the E2E would judge is not the one the release build made." >&2
+    fi
+  done <"$file"
+  if (( units == 0 )); then
+    echo "FAIL: B3g: $file holds no compiler-artifact, so nothing says the bins are fresh." >&2
+    return 1
+  fi
+  (( stale == 0 ))
+}
+if [[ "${1:-}" == "--check-fresh" ]]; then
+  check_fresh "${2:?--check-fresh needs the JSON file}"
+  exit 0
+fi
+
 # One gate at a time: the lock, its owner record and the rules for a dead or
 # foreign holder are in gate-lock.sh, which merge-gate.sh sources too so that
 # it can hold the lock for its whole run. What stays here is the half that is
@@ -1054,6 +1079,27 @@ export CUBA_EMBEDDING_DIM="${CUBA_EMBEDDING_DIM:-384}"
 export CUBA_EMBED_MODEL="${CUBA_EMBED_MODEL:-e5-small}"
 export CUBA_POOLING="${CUBA_POOLING:-cls}"
 
+# D-F2b (CI-F1): merge-gate.sh asks for the models before its first compile, with the paths
+# exported above, so a missing model is seconds and not the first section. Nothing compiles.
+require_model() {
+  if [[ ! -e "$2" ]]; then
+    echo "FAIL: $1 - nothing at $2" >&2
+    return 1
+  fi
+}
+check_models() {
+  local rc=0
+  require_model "tests that need the embedding model" "$ONNX_MODEL_PATH/model_quantized.onnx" || rc=1
+  require_model "tests that need the NLI model" "$CUBA_NLI_PATH" || rc=1
+  require_model "the reranker tests" "$CUBA_RERANKER_PATH/model.onnx" || rc=1
+  return "$rc"
+}
+if [[ "${1:-}" == "--check-models" ]]; then
+  check_models
+  echo "OK  models on disk: embedding, NLI and reranker"
+  exit 0
+fi
+
 # Disk, before anything compiles. A gate run of this repo linked with `ld` dying on
 # SIGBUS and three test binaries reported as "could not compile" — the cause was a
 # partition at 98% with target/ alone holding 64 GB, and nothing in that output said
@@ -1353,6 +1399,8 @@ provision_gate_db() {
   echo "OK  second node database $PEER_DB ready ($peer_tables tables)"
 }
 
+gate_cargo_jobs
+
 echo "=== cargo fmt --check ==="
 cargo fmt --check
 
@@ -1404,14 +1452,44 @@ require_generative_llm "tests that need a generative LLM (extract / relation-sca
   run_counted generative-llm 1 cargo test --test v016_extract_without_sampling --test v017_relation_scan \
              -- --ignored --nocapture
 
-# build-gpu.sh, not a bare `cargo build --release`. Without --features cuda,
-# gpu::wants_gpu() returns false unconditionally, CUBA_RERANK_DEVICE=gpu goes
-# inert, and the reranker runs on CPU at 20.669s per query against 0.356s — 58x,
-# measured in d7922fa. The E2E allows 15s per call, so every one of its 40 calls
-# times out and the gate can never pass on a machine that has a GPU configured.
-# It also overwrote the developer's GPU binary at this exact path.
-echo "=== release build (same feature set production runs) ==="
-"$ROOT/scripts/build-gpu.sh"
+# The release build carries --features cuda. Without it, gpu::wants_gpu() returns false
+# unconditionally, CUBA_RERANK_DEVICE=gpu goes inert, and the reranker runs on CPU at
+# 20.669s per query against 0.356s — 58x, measured in d7922fa. The E2E allows 15s per call,
+# so every one of its 40 calls times out and the gate can never pass on a machine that has
+# a GPU configured.
+#
+# CI-F1 (D-F3a, D-F3b): one release compile for the whole judge, with --no-run, so it leaves
+# the binary the E2E judges and runs no test. build-gpu.sh is not called: it capped its own
+# memory and nested systemd-run and nice inside pesado's scope. --bins is not in this call
+# (it would compile main.rs's harness with LTO): B3g adds it and must find every unit fresh.
+# The sha256 of the binary is taken here and checked after B3g, before the E2E and before
+# the doctor, so no step between them can change the binary without the gate refusing it.
+release_sha() {
+  sha256sum "$1" | cut -d' ' -f1
+}
+sha_unchanged() {
+  local now
+  now="$(release_sha "$REL_BIN")"
+  if [[ "$now" != "$REL_SHA" ]]; then
+    echo "FAIL: sha256 changed $1: $REL_BIN was $REL_SHA after the --no-run build and is $now now. The E2E would judge a binary this gate did not build." >&2
+    exit 1
+  fi
+}
+
+echo "=== release build (one cargo call with --no-run, the feature set production runs) ==="
+export CARGO_BUILD_JOBS="$GATE_RELEASE_JOBS"
+cargo test --release --features cuda --no-run --lib --test v017_rerank_gpu
+REL_BIN="$(resolve_binary_path)"
+[[ -f "$REL_BIN" ]] || { echo "FAIL: the release build left no binary at $REL_BIN." >&2; exit 1; }
+REL_SHA="$(release_sha "$REL_BIN")"
+
+echo "=== B3g (every unit of the bins is fresh after the --no-run build) ==="
+b3g_json="$(mktemp)"
+cargo build --release --features cuda --bins --message-format=json >"$b3g_json" \
+  || { rm -f "$b3g_json"; echo "FAIL: the release build of the bins failed (B3g)." >&2; exit 1; }
+check_fresh "$b3g_json" || { rm -f "$b3g_json"; exit 1; }
+rm -f "$b3g_json"
+sha_unchanged "after B3g"
 
 # --features cuda here too. The feature set is part of what cargo fingerprints,
 # so a second release call asking for a different one rebuilds this same target
@@ -1429,7 +1507,7 @@ echo "=== release build (same feature set production runs) ==="
 # feature. There gpu::wants_gpu() returns false on the cfg! check before it ever
 # reads the device variable, so every assertion that names a device is true and
 # unable to fail. ba0bf97 made them COMPILE with cuda; this call is what makes
-# them run under it. Same feature set as build-gpu.sh, so nothing rebuilds.
+# them run under it. Same feature set as the release build above, so nothing rebuilds.
 #
 # Not `--include-ignored` on the call below, which would look cheaper: that puts
 # is_configured_reports_whether_a_model_is_on_disk_without_loading_it, which
@@ -1450,7 +1528,7 @@ run_counted reranker-placement 1 cargo test --release --features cuda --test v01
 # without the feature, so the device knob is inert there and half of that table
 # is false == false for the same reason v017_rerank_gpu was.
 #
-# Release and not debug, for cost: build-gpu.sh above already built this
+# Release and not debug, for cost: the release build above already built this
 # dependency graph with cuda, so the only thing compiled here is the lib test
 # unit itself. In debug it would be a third feature set (debug bare, release
 # cuda, debug cuda) and a full rebuild of everything under it.
@@ -1462,6 +1540,8 @@ require_present "reranker tests (release: 387s in debug, seconds here)" \
   run_counted reranker-model 1 cargo test --release --features cuda --test v017_rerank_gpu -- --ignored --nocapture
 
 check_section_lines
+
+sha_unchanged "before E2E"
 
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
 CUBA_BINARY_PATH="$(resolve_binary_path)"
@@ -1505,11 +1585,12 @@ export PYTHONIOENCODING=utf-8
 echo "=== GPU placement (doctor --json must agree with this machine) ==="
 if [[ ! -f "$CUBA_BINARY_PATH" ]]; then
   echo "FAIL: no binary at $CUBA_BINARY_PATH, so there is nothing to ask about placement." >&2
-  echo "      This step reads the release build scripts/build-gpu.sh just produced" >&2
+  echo "      This step reads the release build this run just made (--features cuda)" >&2
   echo "      (--features cuda). Judging any other binary would report on a build that" >&2
   echo "      never had GPU support compiled in and call the answer honest." >&2
   exit 1
 fi
+sha_unchanged "before the doctor"
 doctor_json="$(mktemp)"
 doctor_err="$(mktemp)"
 doctor_exit=0
@@ -1539,7 +1620,7 @@ EVAL_FIXTURE="$RUST_DIR/eval-datasets/smoke-corpus.jsonl"
 EVAL_QUERIES="$RUST_DIR/eval-datasets/smoke.jsonl"
 EVAL_BIN="$(resolve_binary_path)"
 [[ -x "$EVAL_BIN" ]] \
-  || { echo "FAIL: no release binary at $EVAL_BIN for the eval; build-gpu.sh writes it." >&2; exit 1; }
+  || { echo "FAIL: no release binary at $EVAL_BIN for the eval; the release build above writes it." >&2; exit 1; }
 claim_database "$EVAL_DB" || exit 1
 DATABASE_URL="$EVAL_DATABASE_URL" CUBA_APP_ROLE=0 ONNX_MODEL_PATH="" \
   "$EVAL_BIN" doctor >/dev/null 2>&1 || true

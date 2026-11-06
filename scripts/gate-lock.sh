@@ -556,3 +556,42 @@ gate_cgroup_read() {
     if [[ "$dir" == */* ]]; then dir="${dir%/*}"; else dir=""; fi
   done
 }
+
+# --- the cargo jobs of a gate run (CI-F1, D-F1a/b, F-c) ----------------------
+# N is the number of CPUs the gate may hand cargo: the cgroup's (gate_cgroup_read) under
+# nproc's, so a judge in a scope of 8 CPUs on a 24-core machine asks for 8 jobs, not 24.
+# The release build takes min(N, floor(margin GB / 4)), at least 1, with the margin the
+# cgroup leaves (MemAvailable where it sets no memory limit): the 4 GB per job build-gpu.sh
+# used to cap with. The release margin is the cgroup's and not MemAvailable's because
+# pesado's MemoryMax is what kills the build, and that is the limit that holds here.
+# A CARGO_BUILD_JOBS the operator set is kept and said; one this gate exported (the
+# GATE_CARGO_JOBS_FROM_GATE marker, which the children inherit) is not named as the operator's.
+# Sets GATE_CARGO_JOBS and GATE_RELEASE_JOBS. Must be called directly, not in a subshell:
+# the refusals are exits of this shell.
+gate_cargo_jobs() {
+  local cores cg margin_kb margin_gb
+  gate_cgroup_read
+  cores="$(nproc)"
+  [[ "$cores" =~ ^[0-9]+$ ]] \
+    || gate_refuse "nproc printed '$cores', which is not a number of CPUs, so the cargo jobs cannot be counted. Set CARGO_BUILD_JOBS=<n> by hand."
+  cg="$GATE_CG_CPUS"
+  GATE_CARGO_JOBS="$cores"
+  if [[ -n "$cg" ]] && (( cg < GATE_CARGO_JOBS )); then GATE_CARGO_JOBS="$cg"; fi
+  if [[ -n "${CARGO_BUILD_JOBS:-}" && "$CARGO_BUILD_JOBS" != "${GATE_CARGO_JOBS_FROM_GATE:-}" ]]; then
+    echo "cargo jobs=$CARGO_BUILD_JOBS (CARGO_BUILD_JOBS set by the operator; nproc=$cores, cgroup cpu=${cg:-none})"
+  elif [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
+    export CARGO_BUILD_JOBS="$GATE_CARGO_JOBS" GATE_CARGO_JOBS_FROM_GATE="$GATE_CARGO_JOBS"
+    echo "cargo jobs=$GATE_CARGO_JOBS (nproc=$cores, cgroup cpu=${cg:-none})"
+  fi
+  GATE_CARGO_JOBS="$CARGO_BUILD_JOBS"
+  margin_kb="${GATE_CG_MEM_KB:-}"
+  if [[ -z "$margin_kb" ]]; then
+    margin_kb="$(awk '$1 == "MemAvailable:" { print $2; exit }' /proc/meminfo 2>/dev/null || true)"
+  fi
+  GATE_RELEASE_JOBS="$GATE_CARGO_JOBS"
+  if [[ "$margin_kb" =~ ^[0-9]+$ ]]; then
+    margin_gb=$(( margin_kb / 1048576 ))
+    if (( margin_gb / 4 < GATE_RELEASE_JOBS )); then GATE_RELEASE_JOBS=$(( margin_gb / 4 )); fi
+  fi
+  (( GATE_RELEASE_JOBS >= 1 )) || GATE_RELEASE_JOBS=1
+}

@@ -14,10 +14,12 @@ Second judge, chained, not a substitute: `./scripts/quality-gate.sh` (lizard + `
 | `cargo audit` | Known Rust advisories, judged first: it refreshes the RustSec database itself (at most 120 s, under `timeout 120`); a database it cannot refresh is exit 2, never a skip; then the advisory exceptions (below) are judged against a report of the same database made without ignores |
 | `scripts/advisory-exceptions.sh` | Every advisory the project ignores is in `scripts/advisory-exceptions.txt` with an owner, an expiry at most 180 days ahead and a reason, still matches an advisory of `rust/Cargo.lock`, and is ignored by `rust/.cargo/audit.toml` and `rust/deny.toml`, no more and no less. Red is exit 1, every problem at once; a report it cannot read is exit 2 |
 | `cargo deny` | licenses, bans, sources; advisories are judged by `cargo audit` alone |
+| `cargo fmt --check` | formatting, after `cargo deny` and before the first compile: a red here is seconds, not twenty minutes (CI-F1) |
+| `codigo-muerto` | dead code / unused deps, before the first compile |
+| npm wrapper smoke | `npm/install.test.js`, before the first compile |
+| `run-all-tests.sh --check-models` | the embedding, NLI and reranker models are on disk under the paths the run exports, before the first compile |
 | `scripts/run-all-tests.sh` | fmt, clippy `-D warnings`, unit + ignored integration on throwaway `brain_gate` / peer, e2e MCP + live (no soft-skip), GPU placement vs `doctor --json`, eval smoke on a throwaway `brain_gate_eval` seeded from `rust/eval-datasets/smoke-corpus.jsonl` |
 | `--features docs` | clippy + tests of the docs feature |
-| npm wrapper smoke | `npm/install.test.js` |
-| `codigo-muerto` | dead code / unused deps |
 | `scripts/crap-gate.sh` | coverage floor (`CRAP_MIN_LINE_COV`, default 15%) |
 | `scripts/mutants-gate.sh` | kill-rate floor on `src/search/{mmr,rrf,cache}.rs`; fails first if any unviable mutant was not refused by the compiler: its build must exit 1..255 and its log must show a rustc diagnostic in the build phase, not only cargo's `could not compile` or a linker failure. Unviable mutants leave the kill rate's denominator, so a machine out of memory would otherwise score high. A caught mutant counts only when its test run exited 1..255, or died of `0xC00000FD STATUS_STACK_OVERFLOW` (a mutant that recurses without end, accepted by name): a `cargo test` that never started is not a catch (`--self-test` runs the fixtures) |
 | `scripts/test-times.sh` | Last step. The time of every test binary, summed over the gate's own log up to the npm step, against `scripts/test-time-ceilings.txt`: over its ceiling (or over the default 10 s with no line) is red, and so is under its floor, a line whose binary did not run, whose `rust/tests/<name>.rs` is gone, that expired or that is malformed. Prints the 10 slowest every run. A log it cannot read is exit 2 |
@@ -26,6 +28,13 @@ Second judge, chained, not a substitute: `./scripts/quality-gate.sh` (lizard + `
 `cargo audit` and `cargo deny` go before the tests because they cost seconds against ~20 minutes: a judge idle for days used to find a new advisory half an hour in. Measured, `cargo audit` takes 2.4 s with the database current, 11.6 s from a cold clone and 20.2 s to give up on a server that does not answer, so 120 s is a ceiling for a stalled transfer. The judging run is never made with `--no-fetch` or `--stale`. The second call, for the exceptions, is: it reads the database the first one refreshed seconds earlier in the same run, and a second fetch would add a network failure and no information. Exit 124, or `couldn't fetch advisory database`, is exit 2 with a `FAIL:` that names `https://github.com/RustSec/advisory-db`; any other failure is exit 1, with cargo audit's own lines above it.
 
 Oracles and fixtures decide green — not an AI opinion.
+
+## Cargo jobs and the release build
+
+- **Jobs.** `merge-gate.sh` counts the cores once, before its first cargo call: `N` is the CPUs the cgroup this gate runs in allows (`cpu.max` up the chain, read by `gate_cgroup_read`) under `nproc`, and it prints `cargo jobs=N (nproc=…, cgroup cpu=…)`. Every cargo call of the run takes `CARGO_BUILD_JOBS=N`. A `CARGO_BUILD_JOBS` the operator sets is kept, and the line says so. `rust/.cargo/config.toml` keeps `jobs = 3` for the laptop, which the environment overrides on the judge.
+- **Release.** One release compile, `cargo test --release --features cuda --no-run --lib --test v017_rerank_gpu`, takes `min(N, floor(margin GB / 4))` jobs (at least 1), with the margin the cgroup leaves. The gate does not call `scripts/build-gpu.sh`: that script caps its own memory and nests `systemd-run` and `nice` inside the scope that already limits the gate.
+- **B3g.** `cargo build --release --features cuda --bins --message-format=json` must report every unit `fresh`. A unit that compiled again means the binary the E2E would judge is not the one the `--no-run` built, and the gate stops by name.
+- **sha256.** The binary's sha256 is taken after the `--no-run` build and checked after B3g, before the E2E and before the doctor. A change between those steps stops the gate with `sha256 changed`.
 
 ## What it does **not** check
 
@@ -188,7 +197,7 @@ jobs = min(cores / 2, GB available / 4, 6), never below 1
 
 0.30 took `v029_accounts_over_real_http` from 553 s to 10.9 s and `v042_health_says_what_degraded` from 31 s to 1.5 s by hand, and nothing stopped them from drifting back. `scripts/test-times.sh` is the last step of `merge-gate.sh` and pins every binary's time, in both directions.
 
-- **What is measured.** The gate's own log (`~/.cache/cuba-gate/merge-gate.log`), from its start to the line `=== npm wrapper smoke ===`: every `cargo test` of `run-all-tests.sh` and the `--features docs` step. Each binary is a `Running …` (or `Doc-tests …`) header and the first `test result: … finished in X.XXs` after it; its time is the sum over every call that ran it. `tests/<name>.rs` is `<name>`; unittests are `lib:<crate>` and `bin:<crate>` (the library and the binary of this crate share the stem `memory_industry`); doc-tests are `doc:<crate>`. Windows (`tests\x.rs`, `.exe`, CRLF) and Linux give the same keys. The instrumented run of `crap-gate.sh` and the mutation step are not timed.
+- **What is measured.** The gate's own log (`~/.cache/cuba-gate/merge-gate.log`), from its start to the line `=== end of timed steps ===`, printed after the `--features docs` step: every `cargo test` of `run-all-tests.sh` and the `--features docs` step. Each binary is a `Running …` (or `Doc-tests …`) header and the first `test result: … finished in X.XXs` after it; its time is the sum over every call that ran it. `tests/<name>.rs` is `<name>`; unittests are `lib:<crate>` and `bin:<crate>` (the library and the binary of this crate share the stem `memory_industry`); doc-tests are `doc:<crate>`. Windows (`tests\x.rs`, `.exe`, CRLF) and Linux give the same keys. The instrumented run of `crap-gate.sh` and the mutation step are not timed.
 - **Why text.** `cargo test` on stable has no machine-readable timing: libtest's `--format json` needs `-Z unstable-options`, and `nextest` cannot be the verdict here (it splits a binary into processes, and this crate keeps global state behind a `Mutex`). The summary line of libtest is the one stable source, and the reader refuses anything it cannot pair: a header without a result before the next header or the boundary, a log without the boundary or without a single timed binary, are exit 2.
 - **The ceilings.** `scripts/test-time-ceilings.txt`, one line per binary and host: `<os> <binary> <floor_s> <ceiling_s> <owner> <expires> <reason>`. A host (`windows` under Git Bash, `linux`) is judged by its own lines: the CPU-only Linux judge runs the reranker in 213 s and Windows on its GPU in 6 s, so one number for both would let a 30x regression on Windows through. A binary with no line has a ceiling of **10 s** and no floor: every regression 0.30 fixed measured more than 10 s on both hosts, and the slowest binary with no line measures under 7.
 - **Two ways.** Over the ceiling is red. Under the floor is red too: the line no longer describes the binary, and has to come down with it. The floor is half the fastest run and the ceiling 1.3 x the slowest (1.5 with fewer than three complete runs on that host), because the noise is per binary: 1.05x for `v029_accounts_over_real_http`, 2.9x for `v029_bridge_against_the_real_daemon`, 3.2x for a test that waits on a generative LLM over the network. One factor wide enough for the noisy ones would leave the steady ones loose.
@@ -199,7 +208,7 @@ jobs = min(cores / 2, GB available / 4, 6), never below 1
 Replay any log without cargo:
 
 ```bash
-./scripts/test-times.sh --judge <log> --until '=== npm wrapper smoke ===' [--os windows|linux] [--today YYYY-MM-DD]
+./scripts/test-times.sh --judge <log> --until '=== end of timed steps ===' [--os windows|linux] [--today YYYY-MM-DD]
 ./scripts/test-times.sh --self-test
 ```
 
