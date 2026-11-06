@@ -1071,7 +1071,7 @@ FAKE
     rc=0
     env -u MUTANTS_SCRATCH_GB_PER_COPY -u MUTANTS_SCRATCH_DIR -u CUBA_GATE_LOCK_OWNER \
         -u CUBA_GATE_MIN_FREE_GB -u MUTANTS_JOBS -u FAKE_DF_FAIL -u CARGO_BUILD_JOBS \
-        -u CARGO_PROFILE_DEV_DEBUG -u CARGO_INCREMENTAL -u DATABASE_URL \
+        -u CARGO_PROFILE_DEV_DEBUG -u CARGO_INCREMENTAL -u DATABASE_URL -u MUTANTS_KEEP_OUT \
         -u FAKE_PSQL_CLUSTER_NAME -u FAKE_PSQL_SYSID -u FAKE_PSQL_EXIT \
         "${e[@]}" ${extra[@]+"${extra[@]}"} \
         bash "$tmp/$t/scripts/mutants-gate.sh" "$@" >"$tmp/run.out" 2>"$tmp/run.err" || rc=$?
@@ -2087,6 +2087,48 @@ PY
   if (( rc != 0 )) || ! any_said 'seed: miss (305 crates compiled in the baseline)'; then
     self_fail "F4b.8: 305 compiles in the baseline were not a 'seed: miss' line that passes (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
   fi
+
+  # --- F4c (the judge keeps the classes): MUTANTS_KEEP_OUT copies this run's mutants.out, green or
+  # red, into a directory that is new or empty. Without it nothing is kept, as before.
+  mkdir -p "$tmp/f4c"
+  mk_crate_tree seedtree
+  keep_green="$tmp/f4c/green"
+  rm -rf "$keep_green"
+  f4b_run seedtree MUTANTS_KEEP_OUT="$keep_green"
+  (( rc == 0 )) || self_fail "F4c.1: a green run with MUTANTS_KEEP_OUT did not pass (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ -f "$keep_green/outcomes.json" ]] \
+    || self_fail "F4c.1: a green run with MUTANTS_KEEP_OUT left no outcomes.json in $keep_green: $(ls -A "$keep_green" 2>&1)"
+  any_said "kept: $keep_green" || self_fail "F4c.1: the log does not say 'kept: $keep_green': $(cat "$tmp/run.out" "$tmp/run.err")"
+
+  rec_missed="$(rec CaughtMutant "${F4B_NAMES[0]}" "$F4B_T"; rec CaughtMutant "${F4B_NAMES[1]}" "$F4B_T"; rec MissedMutant "${F4B_NAMES[2]}" "$F4B_T"; rec MissedMutant "${F4B_NAMES[3]}" "$F4B_T")"
+  printf '%s\n' "$rec_missed" > "$tmp/f4c/missed.spec"
+  mkout "$tmp/f4c/missed.json" Success "$tmp/f4c/missed.spec"
+  keep_red="$tmp/f4c/red"
+  rm -rf "$keep_red"
+  f4b_run seedtree FAKE_OUTCOMES_JSON="$tmp/f4c/missed.json" MUTANTS_KEEP_OUT="$keep_red"
+  (( rc != 0 )) || self_fail "F4c.2: a red run (kill rate 0.5) with MUTANTS_KEEP_OUT still passed"
+  [[ -f "$keep_red/outcomes.json" ]] || self_fail "F4c.2: a red run left no outcomes.json in $keep_red: $(ls -A "$keep_red" 2>&1)"
+  any_said "kept: $keep_red" || self_fail "F4c.2: a red run does not say 'kept: $keep_red': $(cat "$tmp/run.out" "$tmp/run.err")"
+
+  keep_full="$tmp/f4c/full"
+  rm -rf "$keep_full"
+  mkdir -p "$keep_full"
+  : > "$keep_full/leftover"
+  rm -f "$tmp/cargo.calls"
+  f4b_run seedtree MUTANTS_KEEP_OUT="$keep_full"
+  (( rc == 2 )) || self_fail "F4c.3: a MUTANTS_KEEP_OUT that is not empty exited $rc, not 2: $(cat "$tmp/run.out" "$tmp/run.err")"
+  ! ran_mutants || self_fail "F4c.3: cargo mutants ran before the refusal of a MUTANTS_KEEP_OUT that is not empty"
+  any_said MUTANTS_KEEP_OUT || self_fail "F4c.3: the refusal does not name MUTANTS_KEEP_OUT: $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ -f "$keep_full/leftover" && ! -e "$keep_full/outcomes.json" ]] \
+    || self_fail "F4c.3: the directory that was not empty was written to: $(ls -A "$keep_full" 2>&1)"
+
+  fresh
+  mk_crate_tree seedtree
+  f4b_run seedtree
+  (( rc == 0 )) || self_fail "F4c.4: a run without MUTANTS_KEEP_OUT did not pass (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  ! any_said 'kept:' || self_fail "F4c.4: a run without MUTANTS_KEEP_OUT said 'kept:'"
+  [[ -z "$(find "$home/.cache/memory-industry-gate/tmp" -maxdepth 1 -name 'memory-industry-mutants-out.*' -print -quit 2>/dev/null)" ]] \
+    || self_fail "F4c.4: a run without MUTANTS_KEEP_OUT left a mutants-out directory behind"
 
   echo "OK  self-test: a build rustc refused with a diagnostic stays unviable; an NTSTATUS,"
   echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log,"
