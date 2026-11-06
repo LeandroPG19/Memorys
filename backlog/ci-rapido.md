@@ -134,3 +134,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   (27.7 min) to reach mutants-gate. Largest: `cargo test` (unit + smoke) 316 s; `--features docs` 306 s; reranker
   (release) 242 s; crap-gate llvm-cov 180 s; release build 170 s; placement table 154 s; E2E 109 s; `--ignored` 75 s;
   clippy 20 s (warm). Everything else under 25 s. F0 run 1 relaunched whole at 09:25.
+- 2026-11-06 09:45 · J7 cause confirmed: the environment inherits `XDG_CACHE_HOME=/home/Leandro/.cache`. A non-fatal
+  copy of mutants-gate's self-test (09:17:27) set `HOME` to a fixture, but `gate_linux_env` reads
+  `${XDG_CACHE_HOME:-$HOME/.cache}`, so its J1.9 rows used the real `OUT_DIR` and `rm -rf` it under the live F0 run
+  (log line: `--output /home/Leandro/.cache/memory-industry-gate/tmp/memory-industry-mutants-out`). Not the disk
+  pruner (it ran at 09:18:46, after the failure, and respects the lock). The hermetic-self-test contract now sets both
+  `HOME` and `XDG_CACHE_HOME` to empty temporaries and requires both empty afterwards.
