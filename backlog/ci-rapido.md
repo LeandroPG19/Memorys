@@ -206,3 +206,12 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   1053 s is the critical path by itself), a reviewer of the CI-J pass 2 code, and an implementer for the two 0.31
   test-time lines on `release/0.31.0`. A duplicate orchestrator session (the pre-cut process of this conversation)
   was found busy on the same tree; it stopped its implementer and stays idle, the batch continues here.
+- 2026-11-06 12:00 · 0.31: `6ab98f5` on `release/0.31.0` fixes the two test-time lines (linux v029_accounts 5..16 s
+  from the 10.41 s run, k = 1.5; the expired Windows v029_doctor line removed, as its own text asked). test-times over
+  the F0 log: 118 binaries within their ceilings, exit 0; --self-test OK; a raised floor turns it red.
+- 2026-11-06 12:00 · CI-J pass 1d red committed: `171cb2b`, proven first (clean tree: j16_unset red; scratch copy
+  with pass 2 and its two pending lines: run-all-tests --self-test OK; hermetic). Handoff `ci-rapido-J-pasada1d.yml`
+  validated. Pass 2 reapplied (stash `0ac9458`), regions intact; it adds the `OK  section` echo and the
+  `grep -c || true`. CI-F1 pass 1 started in its own worktree `Memorys-ci-f1` (branch `feat/ci-rapido-f1` from
+  `171cb2b`), written for the final CI-J state. Live agents: 7 (3 implementing: CI-J pass 2, CI-F1 pass 1, and the
+  ceilings slice just closed).
