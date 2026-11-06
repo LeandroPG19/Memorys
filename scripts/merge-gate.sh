@@ -1338,10 +1338,7 @@ fi
 # brain_gate from is refused before libpq is asked, for the reason gate-lock.sh
 # gives: it would judge one server ready and create the throwaway databases on another.
 export DATABASE_URL="${DATABASE_URL:-}"
-if [[ -z "$DATABASE_URL" ]]; then
-  gate_refuse "DATABASE_URL is not set, or is empty. The judge has no default server: it runs only against its own Postgres, started with -c cluster_name=memory-industry-gate, as docs/gate.md says. Export DATABASE_URL with that server."
-fi
-gate_require_database_url "$DATABASE_URL"
+gate_require_given_database_url "$DATABASE_URL"
 
 # Without pg_isready the server is asked through the container that publishes the
 # port DATABASE_URL names, not through one picked by name: the name says nothing

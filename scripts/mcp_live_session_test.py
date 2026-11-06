@@ -210,7 +210,9 @@ def parse_tool_result(response: Dict[str, Any]) -> Tuple[bool, str]:
         return False, f"tool body error: {body['error']}"
     return True, "ok"
 
-def main() -> int:
+# What stops the session before it starts, as main's exit code: no DATABASE_URL is 2
+# (a configuration the operator owes), no binary is 1. None when both are there.
+def _preflight_exit() -> Optional[int]:
     if not DATABASE_URL:
         print(
             "FAIL: DATABASE_URL is not set; point it at the judge's throwaway server "
@@ -222,6 +224,13 @@ def main() -> int:
         print(f"error: binary not found: {BINARY}", file=sys.stderr)
         print("run: cd rust && cargo build --release", file=sys.stderr)
         return 1
+    return None
+
+
+def main() -> int:
+    refused = _preflight_exit()
+    if refused is not None:
+        return refused
 
     print("=" * 60)
     print("MCP LIVE SESSION TEST (single process)")

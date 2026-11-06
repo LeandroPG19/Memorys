@@ -429,13 +429,20 @@ gate_url_port() {
   fi
 }
 
+# No default server (D-J1e): an empty URL is refused before anybody is asked, and then
+# its shape, as gate_require_database_url judges it. merge-gate.sh asks this before
+# pg_isready, and gate_require_judge_server asks it again: one refusal, one text.
+gate_require_given_database_url() {
+  local url="${1:-}"
+  [[ -n "$url" ]] \
+    || gate_refuse "DATABASE_URL is not set, or is empty. The judge has no default server: it runs only against its own Postgres, started with -c cluster_name=memory-industry-gate, as docs/gate.md says. Export DATABASE_URL with that server."
+  gate_require_database_url "$url"
+}
+
 gate_require_judge_server() {
   local url="${1:-}" port identity cn sysid
   local identity_re='^[^|]*[|][0-9]+$' mark_re='^memory-industry-gate(-[A-Za-z0-9]+)?$'
-  if [[ -z "$url" ]]; then
-    gate_refuse "DATABASE_URL is not set, or is empty. The judge has no default server: it runs only against its own Postgres, started with -c cluster_name=memory-industry-gate, as docs/gate.md says. Export DATABASE_URL with that server."
-  fi
-  gate_require_database_url "$url"
+  gate_require_given_database_url "$url"
   command -v psql >/dev/null 2>&1 \
     || gate_refuse "psql is not on PATH, so the judge cannot read which server DATABASE_URL names (cluster_name and system_identifier). Install the PostgreSQL client tools."
   port="$(gate_url_port "$url")"
@@ -453,6 +460,76 @@ gate_require_judge_server() {
 }
 
 # --- the cgroup the gate runs in (CI-J, D-J5a) -------------------------------
+# NAME VALUE: VALUE goes into the variable NAME when NAME is empty or holds more.
+gate_cg_keep_tighter() {
+  local name="$1" v="$2"
+  if [[ -z "${!name}" ]] || (( v < ${!name} )); then printf -v "$name" '%s' "$v"; fi
+}
+
+# D-J5c: the page cache a cgroup holds is memory it gives back under pressure, so its
+# inactive part is not in use. Prints memory.stat's inactive_file of DIR as written
+# (the last such line, unchecked), and 0 when the file is absent or has no such line.
+gate_cgroup_inactive_file() {
+  local dir="$1" inactive=0 key val
+  if [[ -r "$dir/memory.stat" ]]; then
+    while read -r key val; do
+      if [[ "$key" == inactive_file ]]; then inactive="$val"; fi
+    done <"$dir/memory.stat"
+  fi
+  printf '%s' "$inactive"
+}
+
+# The memory one cgroup DIR leaves: memory.max - (memory.current - inactive_file), in KB,
+# into GATE_CG_MEM_KB when it is the tightest yet. No memory.max, or `max`, is no limit.
+gate_cgroup_memory_limit() {
+  local dir="$1" v cur inactive
+  [[ -r "$dir/memory.max" ]] || return 0
+  v="$(<"$dir/memory.max")"
+  [[ "$v" != max ]] || return 0
+  [[ "$v" =~ ^[0-9]+$ ]] \
+    || gate_refuse "$dir/memory.max holds '$v', which is neither a number of bytes nor max, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+  [[ -r "$dir/memory.current" ]] \
+    || gate_refuse "$dir/memory.max is a limit and $dir/memory.current is not readable, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+  cur="$(<"$dir/memory.current")"
+  [[ "$cur" =~ ^[0-9]+$ ]] \
+    || gate_refuse "$dir/memory.current holds '$cur', which is not a number of bytes, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+  inactive="$(gate_cgroup_inactive_file "$dir")"
+  [[ "$inactive" =~ ^[0-9]+$ ]] \
+    || gate_refuse "$dir/memory.stat holds '$inactive' as inactive_file, which is not a number of bytes. Set MUTANTS_JOBS=<n> by hand."
+  cur=$(( cur - inactive ))
+  (( cur >= 0 )) || cur=0
+  v=$(( (v - cur) / 1024 ))
+  (( v >= 0 )) || v=0
+  gate_cg_keep_tighter GATE_CG_MEM_KB "$v"
+}
+
+# The CPUs one cgroup DIR leaves: ceil(quota/period) of cpu.max, into GATE_CG_CPUS when it
+# is the tightest yet. No cpu.max, or a quota of `max`, is no limit.
+gate_cgroup_cpu_limit() {
+  local dir="$1" q p
+  [[ -r "$dir/cpu.max" ]] || return 0
+  read -r q p <"$dir/cpu.max" || true
+  [[ "$q" != max ]] || return 0
+  [[ "$q" =~ ^[0-9]+$ && "$p" =~ ^[0-9]+$ ]] && (( p > 0 )) \
+    || gate_refuse "$dir/cpu.max holds '$q ${p:-}', which is not '<quota> <period>' in numbers, so the CPUs the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+  gate_cg_keep_tighter GATE_CG_CPUS "$(( (q + p - 1) / p ))"
+}
+
+# The path of the cgroup v2 line (`0::<path>`) of SELF, the last one if there are several,
+# with no trailing '/'. Status 1 when SELF cannot be read or has no such line.
+gate_cgroup_v2_path() {
+  local self="$1" line rel="" found=""
+  [[ -r "$self" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == 0::* ]]; then
+      rel="${line#0::}"
+      found=1
+    fi
+  done <"$self"
+  [[ -n "$found" ]] || return 1
+  printf '%s' "${rel%/}"
+}
+
 # pesado runs the gate in a scope inside a slice, and the limit that holds is the
 # tightest of the chain: the scope's, each ancestor's up to the root's. Walks
 # <root>/<path> and its ancestors, from /proc/self/cgroup's `0::` line. Sets
@@ -462,68 +539,19 @@ gate_require_judge_server() {
 # cgroup v2 line: a cgroup v1 shell, Git Bash). A value that is neither a number
 # nor `max` is the refusal, not a limit that goes unread. Must be called directly,
 # not in a subshell: the refusal is an exit of this shell.
-gate_cgroup_limit() {
-  local dir="$1" v cur q p inactive key val
-  if [[ -r "$dir/memory.max" ]]; then
-    v="$(<"$dir/memory.max")"
-    if [[ "$v" != max ]]; then
-      [[ "$v" =~ ^[0-9]+$ ]] \
-        || gate_refuse "$dir/memory.max holds '$v', which is neither a number of bytes nor max, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
-      [[ -r "$dir/memory.current" ]] \
-        || gate_refuse "$dir/memory.max is a limit and $dir/memory.current is not readable, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
-      cur="$(<"$dir/memory.current")"
-      [[ "$cur" =~ ^[0-9]+$ ]] \
-        || gate_refuse "$dir/memory.current holds '$cur', which is not a number of bytes, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
-      # D-J5c: the page cache a cgroup holds is memory it gives back under pressure, so its
-      # inactive part is not in use (memory.stat's inactive_file; 0 when the file is absent).
-      inactive=0
-      if [[ -r "$dir/memory.stat" ]]; then
-        while read -r key val; do
-          if [[ "$key" == inactive_file ]]; then inactive="$val"; fi
-        done <"$dir/memory.stat"
-      fi
-      [[ "$inactive" =~ ^[0-9]+$ ]] \
-        || gate_refuse "$dir/memory.stat holds '$inactive' as inactive_file, which is not a number of bytes. Set MUTANTS_JOBS=<n> by hand."
-      cur=$(( cur - inactive ))
-      (( cur >= 0 )) || cur=0
-      v=$(( (v - cur) / 1024 ))
-      (( v >= 0 )) || v=0
-      if [[ -z "$GATE_CG_MEM_KB" ]] || (( v < GATE_CG_MEM_KB )); then GATE_CG_MEM_KB="$v"; fi
-    fi
-  fi
-  if [[ -r "$dir/cpu.max" ]]; then
-    read -r q p <"$dir/cpu.max" || true
-    if [[ "$q" != max ]]; then
-      [[ "$q" =~ ^[0-9]+$ && "$p" =~ ^[0-9]+$ ]] && (( p > 0 )) \
-        || gate_refuse "$dir/cpu.max holds '$q ${p:-}', which is not '<quota> <period>' in numbers, so the CPUs the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
-      v=$(( (q + p - 1) / p ))
-      if [[ -z "$GATE_CG_CPUS" ]] || (( v < GATE_CG_CPUS )); then GATE_CG_CPUS="$v"; fi
-    fi
-  fi
-}
-
 gate_cgroup_read() {
   local self="${GATE_PROC_SELF_CGROUP:-/proc/self/cgroup}" root="${GATE_CGROUP_ROOT:-/sys/fs/cgroup}"
-  local line rel="" found="" dir
+  local dir
   GATE_CG_MEM_KB=""
   GATE_CG_CPUS=""
   GATE_CG_NOTE=""
-  if [[ -r "$self" ]]; then
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      if [[ "$line" == 0::* ]]; then
-        rel="${line#0::}"
-        found=1
-      fi
-    done <"$self"
-  fi
-  if [[ -z "$found" ]]; then
+  if ! dir="$(gate_cgroup_v2_path "$self")"; then
     GATE_CG_NOTE="no cgroup v2 line in $self, so no limit is read from a cgroup"
     return 0
   fi
-  rel="${rel%/}"
-  dir="$rel"
   while :; do
-    gate_cgroup_limit "$root$dir"
+    gate_cgroup_memory_limit "$root$dir"
+    gate_cgroup_cpu_limit "$root$dir"
     [[ -n "$dir" ]] || break
     if [[ "$dir" == */* ]]; then dir="${dir%/*}"; else dir=""; fi
   done
