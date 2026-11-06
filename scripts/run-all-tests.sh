@@ -538,6 +538,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
   (( rat_exit != 2 )) && ! grep -q 'the server changed' "$tmp/j15_same.out" \
     || self_fail "j15_same: the same system_identifier as the exported one was refused (exit $rat_exit): $(cat "$tmp/j15_same.out")"
 
+  # The calibrated counts file every tree copies once calibrate has set it (empty until then).
+  calib_file=""
   # J2, J3, J4, J6 (CI-J): full_tree copies this script into a tree of its own,
   # with stand-ins for everything it runs before the eval, so a row reads what the
   # real script hands to each one and the exit it reaches. cargo logs every call;
@@ -556,7 +558,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
     mkdir -p "$t/scripts" "$t/rust/tests" "$t/rust/eval-datasets" "$t/rust/target/debug/deps" \
       "$t/home/.cache/cuba-gate" "$t/bin" "$t/standin" "$t/target/debug" "$t/target/release" \
       "$t/models" "$t/reranker"
-    cp "$ROOT/scripts/run-all-tests.sh" "$ROOT/scripts/gate-lock.sh" "$t/scripts/"
+    cp "$ROOT/scripts/run-all-tests.sh" "$ROOT/scripts/gate-lock.sh" "$ROOT/scripts/test-times.sh" "$t/scripts/"
+    [[ -z "${calib_file:-}" ]] || cp "$calib_file" "$t/scripts/test-section-counts.txt"
     cp "$ROOT/rust/eval-datasets/smoke.jsonl" "$t/rust/eval-datasets/"
     : >"$t/rust/tests/t1.rs"
     : >"$t/nli-model"
@@ -586,9 +589,15 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'fi' \
       'if [ "$1" = test ]; then' \
       '  n="${FAKE_CARGO_TEST_COUNT:-3}"' \
-      '  echo "     Running tests/fixture.rs (target/debug/deps/fixture-0000)"' \
-      '  echo "running $n tests"' \
-      '  echo "test result: ok. $n passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"' \
+      '  names=""; prev=""' \
+      '  for a in "$@"; do [ "$prev" = --test ] && names="$names $a"; prev="$a"; done' \
+      '  [ -n "$names" ] || names=fixture' \
+      '  for t in $names; do' \
+      '    m="$n"; [ "$t" = "${FAKE_CARGO_ZERO_TEST-}" ] && m=0' \
+      '    echo "     Running tests/$t.rs (target/debug/deps/$t-0000)"' \
+      '    echo "running $m tests"' \
+      '    echo "test result: ok. $m passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"' \
+      '  done' \
       'fi' \
       'exit 0' >"$t/bin/cargo"
     printf '%s\n' '#!/bin/sh' \
@@ -606,10 +615,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'printf "Avail\n%sG\n" "${FAKE_DF_GB-100}"' >"$t/bin/df"
     printf '%s\n' '#!/bin/sh' 'echo "docker $*" >>"$HOME/docker.calls"' 'exit 1' >"$t/bin/docker"
     printf '%s' "$t/standin/memory-industry" >"$t/home/standin.path"
-    # The seeder of the eval (scripts/eval_seed.py, D-J3a). This one seeds nothing: it
-    # records its arguments, and the count psql answers is what FAKE_SEEDED says.
+    # The seeder of the eval (scripts/eval_seed.py, D-J3a). It seeds nothing: it records its
+    # arguments and prints the count it claims to have seeded, `seeded N observations`, which
+    # the judge checks against what psql counts in the database. Both are FAKE_SEEDED, by
+    # default FAKE_OBS, so the claim and the database agree unless a row makes them differ.
     printf '%s\n' 'import os, sys' \
       'open(os.environ["HOME"] + "/seed.calls", "a").write(" ".join(sys.argv[1:]) + "\n")' \
+      'print("seeded %s observations" % os.environ.get("FAKE_SEEDED", os.environ.get("FAKE_OBS", "5")))' \
       >"$t/scripts/eval_seed.py"
     chmod +x "$t"/scripts/*.sh "$t"/bin/* "$t"/standin/*
   }
@@ -634,6 +646,29 @@ if [[ "${1:-}" == "--self-test" ]]; then
       MEMORY_INDUSTRY_LLM_PROVIDER=ollama "$@" \
       "$BASH" "$t/scripts/run-all-tests.sh" >"$tmp/$name.out" 2>&1 || rc=$?
   }
+
+  # CALIBRATION (D-J4e, spec §10 C3). The rows that run the whole script (J2, J3, J6) run
+  # on a tree whose scripts/test-section-counts.txt is calibrated, not written by hand. The
+  # counts the fake cargo produces follow how each section calls cargo (one binary per
+  # --test, FAKE_CARGO_TEST_COUNT tests each), and a hand-written number would have to copy
+  # that structure. The calibration reads what the script's own counter says: the judge
+  # prints `OK  section <name>: <N> tests in …` once a section passes its count, so an empty
+  # file lets every section pass its check and state its number. The file is written from
+  # those lines. It isolates J2, J3 and J6 from the counts, which TT13 and the counts
+  # contract test; the J4 rows start from this file and perturb it. It runs once per
+  # self-test, not once per row.
+  calibrate() {
+    local counts="$tmp/calib/scripts/test-section-counts.txt" lines
+    full_tree calib
+    : >"$counts"
+    full_run calib
+    lines="$(sed -n 's/^OK  section \([^:]*\): \([0-9][0-9]*\) tests in .*$/\1 \2 calibrated/p' "$tmp/calib.out")"
+    [[ -n "$lines" ]] \
+      || self_fail "calibration found no OK  section lines: the judge prints one per section that passes its count (run_counted). $(cat "$tmp/calib.out")"
+    printf '%s\n' "$lines" >"$tmp/calibrated-counts.txt"
+    calib_file="$tmp/calibrated-counts.txt"
+  }
+  calibrate
 
   # J2.1: brain_gate is prepared with the binary cargo has just reported. A stale
   # binary planted where the old lookup looked is never run, and nothing is
@@ -686,8 +721,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
   full_run j32b FAKE_SCORED=3
   (( rc == 1 )) || self_fail "J3.2: an eval that scored 3 of the 5 smoke queries exited $rc, not 1: $(cat "$tmp/j32b.out")"
   grep -q '^FAIL: .*smoke.jsonl' "$tmp/j32b.out" || self_fail "J3.2: no FAIL line names the queries smoke.jsonl has: $(cat "$tmp/j32b.out")"
+  # An empty scratch database: the seeder claims 0 and psql counts 0 over a five-line fixture.
+  # A zero-line fixture is not used, because the judge's count of the fixture's lines
+  # (grep -c, under set -e) ends the script with no message on an empty file: a production
+  # defect of pass 2, reported to the coordinator, not hidden here.
   full_tree j32c
-  full_run j32c FAKE_OBS=0
+  full_run j32c FAKE_SEEDED=0
   (( rc == 1 )) || self_fail "J3.2: an empty scratch database exited $rc, not 1: $(cat "$tmp/j32c.out")"
   grep -q '^FAIL: .*0 observations' "$tmp/j32c.out" || self_fail "J3.2: no FAIL line says 0 observations: $(cat "$tmp/j32c.out")"
   # J3.2 (N4, D-J3c): the observations the judge counts in the scratch database are the
@@ -697,26 +736,49 @@ if [[ "${1:-}" == "--self-test" ]]; then
   (( rc == 1 )) || self_fail "J3.2: a scratch database with 2 observations for a 5-line fixture exited $rc, not 1: $(cat "$tmp/j32d.out")"
   grep -q '^FAIL: .*fixture' "$tmp/j32d.out" || self_fail "J3.2: no FAIL line names the mismatch with the fixture: $(cat "$tmp/j32d.out")"
 
-  # J4.1: a section that runs a different number of tests than its line in
-  # scripts/test-section-counts.txt is red, now, and names the section and both numbers.
+  # J4 (N5, D-J4b): the counts of each section against its line, both ways. The rows start
+  # from the calibrated file and move one line, or one binary, so the message names the
+  # section and the two numbers. admin-role is the section that names two --test binaries.
+  admin_ran="$(awk '$1 == "admin-role" { print $2 }' "$calib_file")"
+  [[ "$admin_ran" =~ ^[0-9]+$ ]] && (( admin_ran > 0 )) \
+    || self_fail "J4: the calibrated file says admin-role runs '$admin_ran' tests, so the rows have no number to move"
+  # J4.1: a line one more than the count is red, and the message names the section and both numbers.
   full_tree j41
-  printf '%s\n' 'admin-role 4 fixture' >"$tmp/j41/scripts/test-section-counts.txt"
+  awk -v n="$((admin_ran + 1))" '$1 == "admin-role" { $2 = n } { print }' "$calib_file" \
+    >"$tmp/j41/scripts/test-section-counts.txt"
   full_run j41
-  (( rc == 1 )) || self_fail "J4.1: admin-role ran 3 tests against a line of 4 and the script exited $rc, not 1: $(cat "$tmp/j41.out")"
-  grep -q 'admin-role.*expected 4, ran 3' "$tmp/j41.out" \
+  (( rc == 1 )) || self_fail "J4.1: admin-role ran $admin_ran tests against a line of $((admin_ran + 1)) and the script exited $rc, not 1: $(cat "$tmp/j41.out")"
+  grep -q "admin-role.*expected $((admin_ran + 1)), ran $admin_ran" "$tmp/j41.out" \
     || self_fail "J4.1: the mismatch is not named with its section and both numbers: $(cat "$tmp/j41.out")"
   # J4.2: the count is checked in both directions, and a section with no line is red.
   full_tree j42a
-  printf '%s\n' 'admin-role 2 fixture' >"$tmp/j42a/scripts/test-section-counts.txt"
+  awk -v n="$((admin_ran - 1))" '$1 == "admin-role" { $2 = n } { print }' "$calib_file" \
+    >"$tmp/j42a/scripts/test-section-counts.txt"
   full_run j42a
-  (( rc == 1 )) || self_fail "J4.2: a line of 2 against 3 run tests exited $rc, not 1: $(cat "$tmp/j42a.out")"
-  grep -q 'expected 2, ran 3' "$tmp/j42a.out" || self_fail "J4.2: a count too low is not named: $(cat "$tmp/j42a.out")"
+  (( rc == 1 )) || self_fail "J4.2: a line of $((admin_ran - 1)) against $admin_ran run tests exited $rc, not 1: $(cat "$tmp/j42a.out")"
+  grep -q "expected $((admin_ran - 1)), ran $admin_ran" "$tmp/j42a.out" \
+    || self_fail "J4.2: a count too low is not named: $(cat "$tmp/j42a.out")"
   full_tree j42b
-  printf '%s\n' 'lib-ignored 3 fixture' >"$tmp/j42b/scripts/test-section-counts.txt"
+  awk '$1 != "admin-role"' "$calib_file" >"$tmp/j42b/scripts/test-section-counts.txt"
   full_run j42b
   (( rc == 1 )) || self_fail "J4.2: a section that ran with no line in the file exited $rc, not 1: $(cat "$tmp/j42b.out")"
   grep -q '^FAIL: .*admin-role' "$tmp/j42b.out" \
     || self_fail "J4.2: no FAIL line names the section with no line: $(cat "$tmp/j42b.out")"
+  # J4.2 (orphan): a line for a section the script does not have is red, and it is named.
+  full_tree j42c
+  { cat "$calib_file"; printf '%s\n' 'ghost-section 1 a line for a section this script does not have'; } \
+    >"$tmp/j42c/scripts/test-section-counts.txt"
+  full_run j42c
+  (( rc == 1 )) || self_fail "J4.2: a line for no section of the script exited $rc, not 1: $(cat "$tmp/j42c.out")"
+  grep -q '^FAIL: .*ghost-section' "$tmp/j42c.out" \
+    || self_fail "J4.2: no FAIL line names the line for no section: $(cat "$tmp/j42c.out")"
+  # J4.3: a named --test binary that runs no test is the same silence. The fake cargo gives
+  # v020_role_separation zero tests, so admin-role runs one binary's worth fewer than its line.
+  full_tree j43
+  full_run j43 FAKE_CARGO_ZERO_TEST=v020_role_separation
+  (( rc == 1 )) || self_fail "J4.3: a named --test that ran 0 tests exited $rc, not 1: $(cat "$tmp/j43.out")"
+  grep -q "admin-role.*expected $admin_ran, ran $((admin_ran - 3))" "$tmp/j43.out" \
+    || self_fail "J4.3: the section that lost a binary is not named with its two counts: $(cat "$tmp/j43.out")"
 
   # J6.1: the sweep works on CARGO_TARGET_DIR, the target the build writes to, not on
   # rust/target. Old artifacts of CARGO_TARGET_DIR go, recent ones stay, and the
