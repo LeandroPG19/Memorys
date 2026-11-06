@@ -292,3 +292,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   local_gate_contract 58/58, gate_dag_contract 14/14, v046 green, nine hermetic self-tests OK. F3.0's reds: e584abc,
   51af2dd (fake strace, A0b, A7c), 1b02e33 (D-A11); code 8aa2648. F3.2's red bfe21d8 (rebased), code and improver on
   top. Still open in F3: F3.1 (history module), F3.3–F3.5 (wiring the DAG into merge-gate), after F2.
+- 2026-11-06 19:30 · CI-J2 red `4729a63` and code `905ea3f` (rebased onto ef84b2f cleanly): red 54/59 as expected,
+  green 59/59 with the eleven self-tests and v046; the sysid contract moved with A2 into the common guard; each
+  property red under its own sabotage; A4 red on its own row. F4 red `b279984` and code `a154f2d`: contract 60/60,
+  fifteen sabotages red in scratch; cargo mutants --list --json is a list of objects with `name` (27.1.0, checked).
+  The acceptance measurement needs the outcomes of a green run, which J7a removes: slice F4c
+  (`MUTANTS_KEEP_OUT=<dir>` keeps a copy on any exit, refuses a non-empty dir) before measuring. Integrated state with
+  CI-J2 on top being verified.
