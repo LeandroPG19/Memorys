@@ -178,3 +178,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   The red: two lines of `scripts/test-time-ceilings.txt` on `release/0.31.0` — the Windows line of
   `v029_doctor_reads_only_its_world` expired on 2026-10-31, and `v029_accounts_over_real_http` took 10.41 s, under
   its 16 s floor (the ratchet works both ways). Both block the 0.31 verdict as well; fixed in their own slice.
+- 2026-11-06 11:05 · Pass 1c bash self-tests (old code, hermetic HOME/XDG): the same first red rows as before, and
+  now every script leaves its HOME and XDG_CACHE_HOME empty (A=0 B=0 in all eight). The Rust contract of the same
+  run is void: it ran 44 tests, the count before CI-J, from `local_gate_contract-14d075c5dd8b8806`, the binary
+  F0 had just built from `Memorys-r031`; no `Compiling memory-industry` in the log. The two worktrees share
+  `CARGO_TARGET_DIR` and cargo took the other tree's binary as fresh: the 2026-10-09 contamination lesson again. Every
+  verification script now does `cargo clean -p memory-industry` first, like F0. For F3: a target directory per lane
+  is not enough; it has to be per tree as well, or cleaned per run.
