@@ -3737,3 +3737,64 @@ fn restore_names_the_database_after_the_last_at_and_changes_nothing() {
         "restore-db.sh printed part of the credentials of DATABASE_URL: {stdout}"
     );
 }
+
+/// CI-F4 (F4a): each mutant builds only the lib test it runs. The `--lib` that selects the
+/// test goes to the build through `--cargo-arg`, and the filter stays after the `--`. With
+/// `-- --lib search::` every one of the 54 mutants compiled the 116 integration binaries
+/// it never ran: 973 s of the 1053 s of the baseline, measured on 2026-11-06.
+#[test]
+fn each_mutant_builds_only_the_lib_test_it_runs() {
+    let script = read("scripts/mutants-gate.sh").replace("\r\n", "\n");
+    let body: String = outside_self_test(&script)
+        .into_iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    assert!(
+        !body.contains("-- --lib search::"),
+        "mutants-gate.sh still passes `-- --lib search::`: the --lib after the `--` reaches the \
+         test only, so every mutant's build compiles all the test binaries"
+    );
+    let start = body
+        .find("\ncargo mutants \\\n")
+        .expect("mutants-gate.sh has no `cargo mutants \\` invocation")
+        + 1;
+    let end = start
+        + body[start..]
+            .find("mutants_rc=$?")
+            .expect("the cargo mutants invocation has no `mutants_rc=$?` after it");
+    let call = &body[start..end];
+    let (build_side, test_side) = call
+        .split_once("\n  -- ")
+        .expect("the cargo mutants invocation has no `  -- ` line before its test arguments");
+    assert!(
+        build_side.contains("--cargo-arg=--lib"),
+        "the cargo mutants invocation must pass `--cargo-arg=--lib` before the `--`, so the \
+         build of each mutant is the lib test and not every test binary"
+    );
+    assert_eq!(
+        test_side.trim(),
+        "search::",
+        "after the `--` cargo mutants must receive exactly the test filter and nothing else"
+    );
+}
+
+/// CI-F4 (F4b): the mutation seed lives under the cache of the gate, not under the scratch
+/// that the judge sweeps every six hours, so that it survives between runs.
+#[test]
+fn the_mutation_seed_lives_outside_the_swept_scratch() {
+    let body = read("scripts/mutants-gate.sh").replace("\r\n", "\n");
+    let line = body
+        .lines()
+        .find(|l| l.trim_start().starts_with("SEED_ROOT="))
+        .expect(
+            "mutants-gate.sh has no SEED_ROOT= assignment: the mutation seed has a root of its own",
+        );
+    assert!(
+        line.contains("memory-industry-gate/mutants-seed"),
+        "the mutation seed root `{line}` is not under memory-industry-gate/mutants-seed"
+    );
+    assert!(
+        !line.contains("MUTANTS_SCRATCH") && !line.contains("memory-industry-mutants"),
+        "the mutation seed root `{line}` is under the scratch the judge sweeps: a seed there is swept away"
+    );
+}
