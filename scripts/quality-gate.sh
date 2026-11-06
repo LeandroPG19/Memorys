@@ -474,8 +474,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # read the environment: an exported LIZARD_CC_MAX would move the line the
   # fixtures were cut to and fail the self-test for the wrong reason.
   LIZARD_CC_MAX=8
+  # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
+  # removed on exit, so a row that does not give them one never reaches the real cache.
+  hermetic="$(mktemp -d)"
+  mkdir -p "$hermetic/home" "$hermetic/cache"
+  export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  trap 'rm -rf "$tmp" "$hermetic"' EXIT
   mkdir -p "$tmp/src"
 
   # 1014 lines, one statement each: lizard measures it at CCN 1 and warns all

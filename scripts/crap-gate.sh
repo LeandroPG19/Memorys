@@ -12,8 +12,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 #   ./scripts/crap-gate.sh --self-test
 # --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
+  # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
+  # removed on exit, so a row that does not give them one never reaches the real cache.
+  hermetic="$(mktemp -d)"
+  mkdir -p "$hermetic/home" "$hermetic/cache"
+  export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  trap 'rm -rf "$tmp" "$hermetic"' EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
   mkdir -p "$tmp/t/scripts" "$tmp/t/rust" "$tmp/bin"
   cp "$ROOT/scripts/crap-gate.sh" "$ROOT/scripts/gate-lock.sh" "$tmp/t/scripts/"

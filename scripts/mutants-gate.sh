@@ -527,9 +527,14 @@ mutants_prepare_scratch() {
 # every one of them 1.000, which is the point.
 self_test() {
   local rc
+  # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
+  # removed on exit, so a row that does not give them one never reaches the real cache.
   # Global, not local: the EXIT trap reads it after this function has exited.
+  hermetic="$(mktemp -d)"
+  mkdir -p "$hermetic/home" "$hermetic/cache"
+  export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  trap 'rm -rf "$tmp" "$hermetic"' EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
 
   # write_log FILE KIND: the build phase of a real log, ending one of seven ways.
@@ -929,7 +934,7 @@ self_test() {
   mk_entry "$scr/cargo-mutants-rust-old.tmp" '7 hours ago'
   mk_marker "$scr" '7 hours ago'
   sleeper=""
-  trap 'kill "$sleeper" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+  trap 'kill "$sleeper" 2>/dev/null || true; rm -rf "$tmp" "$hermetic"' EXIT
   sleep 300 &
   sleeper=$!
   mkdir -p "$home/.cache/cuba-gate/lock"
@@ -1267,15 +1272,16 @@ self_test() {
   # J7 (D-J7a): two runs in a row of the main path, with the cargo stand-in, write to two
   # output directories, and a run never removes a directory it did not make. A sentinel in
   # the fixed directory the old script removed first is still there after the second run.
-  # The run's TMPDIR is not $sys: gate_linux_env moves it to the cache of its HOME, so the
-  # fixed directory is the one under $home/.cache/memory-industry-gate/tmp.
+  # Both runs get XDG_CACHE_HOME=$home/.cache: gate_linux_env puts the run's temp under it,
+  # so the fixed directory is $home/.cache/memory-industry-gate/tmp/memory-industry-mutants-out,
+  # the one the old script removed first, whatever cache the region gave the rows.
   fresh
   mkdir -p "$home/.cache/memory-industry-gate/tmp/memory-industry-mutants-out"
   : >"$home/.cache/memory-industry-gate/tmp/memory-industry-mutants-out/centinela"
-  in_tree clean --
+  in_tree clean XDG_CACHE_HOME="$home/.cache" --
   ran_mutants || self_fail "J7: the first run did not reach cargo mutants (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
   first_out="$(sed -n 's/.*--output \([^ ]*\).*/\1/p' "$tmp/cargo.calls" | tail -1)"
-  in_tree clean --
+  in_tree clean XDG_CACHE_HOME="$home/.cache" --
   second_out="$(sed -n 's/.*--output \([^ ]*\).*/\1/p' "$tmp/cargo.calls" | tail -1)"
   [[ -n "$first_out" && -n "$second_out" && "$first_out" != "$second_out" ]] \
     || self_fail "J7: two runs in a row wrote their mutants to the same output directory ('$first_out' and '$second_out'): a run removes what the other one is using"

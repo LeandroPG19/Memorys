@@ -185,10 +185,15 @@ on_exit() {
 #   ./scripts/run-all-tests.sh --self-test
 # --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
+  # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
+  # removed on exit, so a row that does not give them one never reaches the real cache.
+  hermetic="$(mktemp -d)"
+  mkdir -p "$hermetic/home" "$hermetic/cache"
+  export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
   tmp="$(mktemp -d)"
   sleep 300 &
   live=$!
-  trap 'kill "$live" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+  trap 'kill "$live" 2>/dev/null || true; rm -rf "$tmp" "$hermetic"' EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
   # The judge's test URL: a string that only the psql stand-in reads. Its marker
   # and identity come from that stand-in, never from a server.

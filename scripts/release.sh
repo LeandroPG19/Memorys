@@ -216,9 +216,14 @@ verify_receipt() {
 # reach the fixture repos.
 self_test() {
   local tmp origin work other sha out
+  # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
+  # removed on exit, so a row that does not give them one never reaches the real cache.
+  hermetic="$(mktemp -d)"
+  mkdir -p "$hermetic/home" "$hermetic/cache"
+  export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
   tmp="$(mktemp -d)"
   # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" EXIT
+  trap "rm -rf '$tmp' '$hermetic'" EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
 
   export HOME="$tmp/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$tmp/gitconfig"
