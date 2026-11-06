@@ -117,3 +117,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   to HEAD (one header comment added above crap-gate's new region). Commit `045811d` test(rojo); handoff
   `ci-rapido-J-pasada1.yml` validated (`OK implementador->implementador`).
 - 2026-11-06 08:10 · CI-J pass 2 (code) handed to an implementer. F0 run 1 queued on `release/0.31.0` at `2d61589`.
+- 2026-11-06 08:50 · CI-J pass 2 stopped with a note instead of touching frozen rows: N1–N6, M1, X1–X4 (spec §10).
+  Decided by the orchestrator: a pass 1b of tests (identity in the fake psql, a fake fixture and seeder, the fresh binary
+  by default, the eval judged on `count(*)` + `sample_count` + `ndcg_at_k`, real cargo output in the fake cargo and one
+  counter, age rule for `debug/incremental`, J1.9 without "no FAIL", and a contract that no gate script prints a URL with
+  credentials — `mcp_live_session_test.py` did). Pass 2 work set aside as stash `977102b` (plus a patch and a tar in
+  `~/.cache/memory-industry-gate/ci-rapido/`); its self-test regions were byte-equal to HEAD.
