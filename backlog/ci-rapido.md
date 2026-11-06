@@ -226,3 +226,11 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   fixes, in series. F4 spec delivered: every mutant builds the 116 `tests/` binaries it never runs (70 % of the
   1053 s); building only the lib test and a content-keyed dependency seed estimate 195–275 s. The F0 run 1 mutants
   output is kept as the F4 class reference (`outcomes.json` sha256 6ade15a0…, 55 outcomes).
+- 2026-11-06 13:00 · Decisions of the user: PGDG pinned (done: PostgreSQL 18.6 from Ubuntu + pgvector 0.8.7 from
+  apt.postgresql.org at priority 100, key fingerprint checked, the three packages on hold, no main cluster, nothing
+  on 5432, en_US.UTF-8 generated; the PGDG server was not used because it would replace Ubuntu's
+  postgresql-client-18; recorded in memory with its rollback). The ">20 %" rule of ci-rapido.md moves to
+  change-point detection per step once F3 keeps history, 20 % as a secondary alarm (rule edited). The Windows
+  `.exe` stays unsigned. npm trusted publishing becomes a task of its own, outside this batch (pending: a backlog
+  task). F2 spec delivered (`ci-rapido-F2.spec.md`): socket-only clusters per lane in tmpfs, scram over the socket,
+  `wal_level` stays `replica` unless PG18 measures say otherwise.
