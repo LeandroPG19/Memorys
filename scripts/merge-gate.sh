@@ -1524,6 +1524,9 @@ gate_container_ready() {
   echo "OK  Postgres :$port (container $name)"
 }
 
+# A server identity from an earlier run must not satisfy the first guard: the one exported
+# below is the one this run reads (D-J1c).
+unset GATE_SERVER_SYSTEM_ID
 if command -v pg_isready >/dev/null 2>&1; then
   # libpq reads the URL, so host, port, socket, IPv6 and PGPORT mean here what
   # they mean to psql, pg_dump and sqlx, and the port printed is the one libpq
@@ -1630,6 +1633,9 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 
 "$ROOT/scripts/run-all-tests.sh"
 
+# The identity is asked again before the --features docs step, which reads the database
+# after run-all-tests.sh: a server that changed under the run is refused here (D-J1c, A2).
+gate_require_judge_server "$DATABASE_URL"
 echo "=== cargo clippy/test --features docs ==="
 (cd "$ROOT/rust" && cargo clippy --all-targets --features docs -- -D warnings)
 (cd "$ROOT/rust" && cargo test --features docs)

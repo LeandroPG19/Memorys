@@ -148,6 +148,7 @@ fi
 
 echo "=== crap-gate: llvm-cov --lib (min line ${MIN_COV}%) ==="
 COV_JSON="$(mktemp "${TMPDIR:-/tmp}/memory-industry-cov.XXXXXX")"
+trap 'rm -f "$COV_JSON"' EXIT
 cargo llvm-cov --lib --json --summary-only --output-path "$COV_JSON"
 
 resolve_python() {

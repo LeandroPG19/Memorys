@@ -53,7 +53,7 @@ BACKUP_DIR="$ROOT/backups/pre-restore" "$ROOT/scripts/backup-db.sh" || {
 }
 
 echo
-echo "About to replace the contents of ${DATABASE_URL#*@} with $DUMP."
+echo "About to replace the contents of ${DATABASE_URL##*@} with $DUMP."
 echo "The restore runs in a single transaction: if it fails, nothing changes."
 read -r -p "Continue? [y/N] " ans
 if [[ "${ans,,}" != "y" ]]; then

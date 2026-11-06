@@ -341,8 +341,10 @@ mutants_available_kb() {
   fi
   # The gate runs inside a cgroup (pesado's scope): its margin is what the jobs really
   # have when it is tighter than the machine's (CI-J, D-J5b). Called directly, so a
-  # refused value exits this shell.
-  gate_cgroup_read
+  # refused value exits this shell. mutants_default_jobs reads it first when it is asked for
+  # the plan (GATE_CG_READ), so the cgroup is read once per run (CI-J2, A10).
+  GATE_CG_HINT="Set MUTANTS_JOBS=<n> by hand."
+  [[ -n "${GATE_CG_READ:-}" ]] || gate_cgroup_read
   if [[ -n "$GATE_CG_NOTE" ]]; then
     echo "note: $GATE_CG_NOTE; the memory is MemAvailable alone, as before" >&2
   fi
@@ -385,7 +387,9 @@ mutants_default_jobs() {
   local cores="${1:-}" avail named_cores
   [[ -n "$cores" ]] || cores="$(nproc 2>/dev/null || echo 4)"
   named_cores="$cores"
+  GATE_CG_HINT="Set MUTANTS_JOBS=<n> by hand."
   gate_cgroup_read
+  GATE_CG_READ=1
   if [[ -n "$GATE_CG_CPUS" && "$cores" =~ ^[0-9]+$ ]] && (( 10#$cores > GATE_CG_CPUS )); then
     cores="$GATE_CG_CPUS"
     echo "cpu: the cgroup allows $GATE_CG_CPUS CPUs of the $named_cores the cores would give, and it is the tighter one" >&2
