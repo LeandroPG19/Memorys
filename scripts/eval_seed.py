@@ -37,7 +37,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -83,36 +83,51 @@ def validate_observation(row: Dict[str, Any], number: int) -> None:
         raise ValueError(f"fixture line {number}: source «{source}» no existe")
 
 
-def check_fixture(fixture: Path, queries_path: Path) -> int:
-    queries = load_jsonl(queries_path)
-    observations = load_jsonl(fixture)
+def fixture_line_failures(observations: List[Dict[str, Any]]) -> List[str]:
     failures: List[str] = []
-
     for number, row in enumerate(observations, start=1):
         try:
             validate_observation(row, number)
         except ValueError as exc:
             failures.append(str(exc))
         text = json.dumps(row, ensure_ascii=False)
-        for token in NEEDS_NO_REAL_DATA:
-            if token in text:
-                failures.append(f"fixture line {number}: contiene «{token}», que no va en un fixture sintético")
+        failures.extend(
+            f"fixture line {number}: contiene «{token}», que no va en un fixture sintético"
+            for token in NEEDS_NO_REAL_DATA
+            if token in text
+        )
+    return failures
+
+
+def relevant_positions(query: Dict[str, Any], lowered: List[str]) -> List[int]:
+    markers = [m.lower() for m in query.get("relevant_markers", []) if m]
+    return [pos for pos, content in enumerate(lowered) if any(marker in content for marker in markers)]
+
+
+# Prints one line per query, in order, and returns the failures together with the
+# positions of `lowered` that at least one query finds relevant.
+def query_failures(queries: List[Dict[str, Any]], lowered: List[str]) -> Tuple[List[str], Set[int]]:
+    failures: List[str] = []
+    satisfied: Set[int] = set()
+    for index, query in enumerate(queries, start=1):
+        positions = relevant_positions(query, lowered)
+        satisfied.update(positions)
+        print(f"consulta {index}: {len(positions)} observaciones relevantes  «{query.get('query', '')}»")
+        if not positions:
+            failures.append(f"consulta {index} no tiene ninguna observación relevante en el fixture")
+    return failures, satisfied
+
+
+def check_fixture(fixture: Path, queries_path: Path) -> int:
+    queries = load_jsonl(queries_path)
+    observations = load_jsonl(fixture)
+    failures = fixture_line_failures(observations)
 
     lowered = [row["content"].lower() for row in observations if isinstance(row.get("content"), str)]
-    satisfied = [False] * len(lowered)
+    found, satisfied = query_failures(queries, lowered)
+    failures.extend(found)
 
-    for index, query in enumerate(queries, start=1):
-        markers = [m.lower() for m in query.get("relevant_markers", []) if m]
-        hits = 0
-        for pos, content in enumerate(lowered):
-            if any(marker in content for marker in markers):
-                hits += 1
-                satisfied[pos] = True
-        print(f"consulta {index}: {hits} observaciones relevantes  «{query.get('query', '')}»")
-        if hits == 0:
-            failures.append(f"consulta {index} no tiene ninguna observación relevante en el fixture")
-
-    non_relevant = satisfied.count(False)
+    non_relevant = len(lowered) - len(satisfied)
     print(f"observaciones que no satisfacen ninguna consulta: {non_relevant} (mínimo {MIN_NON_RELEVANT})")
     if non_relevant < MIN_NON_RELEVANT:
         failures.append(
@@ -215,6 +230,11 @@ class McpStdio:
         text = content[0].get("text", "") if content else ""
         if result.get("isError"):
             raise SeedError(f"{name}: isError {_scrub(text[:200], self.database_url)}")
+        return self._tool_body(name, text)
+
+    # The tool's own answer, as JSON: a body that is not JSON, or one that carries an
+    # "error" while the call itself succeeded, is a failed call all the same.
+    def _tool_body(self, name: str, text: str) -> Dict[str, Any]:
         try:
             body = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -230,6 +250,23 @@ class McpStdio:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+
+
+def add_observation(session: McpStdio, number: int, row: Dict[str, Any]) -> None:
+    body = session.call_tool(
+        "cuba_cronica",
+        {
+            "action": "add",
+            "entity_name": row["entity_name"],
+            "content": row["content"],
+            "observation_type": row["observation_type"],
+            "source": row.get("source", "agent"),
+        },
+    )
+    # Dedup and reinforcement answer ok without inserting a row; counting
+    # them would let the eval read fewer observations than the fixture has.
+    if body.get("deduplicated") or "reinforced_id" in body:
+        raise SeedError(f"fixture line {number}: no se insertó (dedup o refuerzo de otra fila)")
 
 
 def seed(binary: Path, database_url: str, fixture: Path) -> int:
@@ -254,20 +291,7 @@ def seed(binary: Path, database_url: str, fixture: Path) -> int:
             {"action": "start", "name": "eval-smoke-seed", "project": EVAL_PROJECT},
         )
         for number, row in enumerate(rows, start=1):
-            body = session.call_tool(
-                "cuba_cronica",
-                {
-                    "action": "add",
-                    "entity_name": row["entity_name"],
-                    "content": row["content"],
-                    "observation_type": row["observation_type"],
-                    "source": row.get("source", "agent"),
-                },
-            )
-            # Dedup and reinforcement answer ok without inserting a row; counting
-            # them would let the eval read fewer observations than the fixture has.
-            if body.get("deduplicated") or "reinforced_id" in body:
-                raise SeedError(f"fixture line {number}: no se insertó (dedup o refuerzo de otra fila)")
+            add_observation(session, number, row)
             saved += 1
     finally:
         session.close()
@@ -279,6 +303,30 @@ def seed(binary: Path, database_url: str, fixture: Path) -> int:
     return 0
 
 
+def check_fixture_mode(fixture: Path, queries: Path) -> int:
+    for path in (fixture, queries):
+        if not path.is_file():
+            print(f"FAIL: falta {path}")
+            return 2
+    return check_fixture(fixture, queries)
+
+
+# Why the seeding must not start (exit 2), or None. The URL itself is never in the text.
+def seed_refusal(url: str, binary: Optional[Path], fixture: Path) -> Optional[str]:
+    if not url:
+        return "DATABASE_URL es obligatorio y no puede estar vacío (ver docs/gate.md)"
+    if not database_name(url).startswith(DB_PREFIX):
+        return (
+            f"la base de la siembra tiene que llamarse {DB_PREFIX}* (la desechable del juez); "
+            "el nombre dado no lo cumple"
+        )
+    if binary is None or not binary.is_file():
+        return f"falta el binario {binary}"
+    if not fixture.is_file():
+        return f"falta {fixture}"
+    return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Siembra la base de la eval smoke por MCP.")
     parser.add_argument("--binary", type=Path, help="binario de MemoryIndustry (cuba-memorys)")
@@ -288,31 +336,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.check_fixture:
-        if not args.fixture.is_file():
-            print(f"FAIL: falta {args.fixture}")
-            return 2
-        if not args.queries.is_file():
-            print(f"FAIL: falta {args.queries}")
-            return 2
-        return check_fixture(args.fixture, args.queries)
+        return check_fixture_mode(args.fixture, args.queries)
 
     url = os.environ.get("DATABASE_URL", "").strip()
-    if not url:
-        print("FAIL: DATABASE_URL es obligatorio y no puede estar vacío (ver docs/gate.md)", file=sys.stderr)
-        return 2
-    name = database_name(url)
-    if not name.startswith(DB_PREFIX):
-        print(
-            f"FAIL: la base de la siembra tiene que llamarse {DB_PREFIX}* (la desechable del juez); "
-            "el nombre dado no lo cumple",
-            file=sys.stderr,
-        )
-        return 2
-    if args.binary is None or not args.binary.is_file():
-        print(f"FAIL: falta el binario {args.binary}", file=sys.stderr)
-        return 2
-    if not args.fixture.is_file():
-        print(f"FAIL: falta {args.fixture}", file=sys.stderr)
+    refusal = seed_refusal(url, args.binary, args.fixture)
+    if refusal is not None:
+        print(f"FAIL: {refusal}", file=sys.stderr)
         return 2
 
     try:
