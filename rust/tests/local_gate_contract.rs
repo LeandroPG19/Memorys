@@ -3341,7 +3341,11 @@ fn every_gate_step_after_the_guard_gets_the_verified_url() {
          so run-all-tests.sh has nothing to compare against"
     );
 
-    for script in ["scripts/crap-gate.sh", "scripts/mutants-gate.sh"] {
+    for script in [
+        "scripts/crap-gate.sh",
+        "scripts/mutants-gate.sh",
+        "scripts/run-all-tests.sh",
+    ] {
         let body = read(script);
         let calls_guard = outside_self_test(&body)
             .iter()
@@ -3353,18 +3357,60 @@ fn every_gate_step_after_the_guard_gets_the_verified_url() {
         );
     }
 
-    let suite_body = read("scripts/run-all-tests.sh");
-    let suite_code: Vec<&str> = outside_self_test(&suite_body)
-        .into_iter()
-        .map(|(_, l)| l)
+    // A2 (CI-J2, D-J1c): the comparison with GATE_SERVER_SYSTEM_ID lives in
+    // gate_require_judge_server, the one place that reads the identity. Every step that calls the
+    // guard then judges the server merge-gate.sh read, and none keeps its own copy of the test.
+    let lock_lines: Vec<String> = read("scripts/gate-lock.sh")
+        .lines()
+        .map(str::to_string)
         .collect();
+    let start = lock_lines
+        .iter()
+        .position(|l| l.starts_with("gate_require_judge_server() {"))
+        .expect("scripts/gate-lock.sh has no gate_require_judge_server() function");
+    let end = start
+        + lock_lines[start..]
+            .iter()
+            .position(|l| l == "}")
+            .expect("gate_require_judge_server() in scripts/gate-lock.sh is not closed");
+    let guard_body = &lock_lines[start..=end];
     assert!(
-        suite_code.iter().any(|l| l.contains("GATE_SERVER_SYSTEM_ID")),
-        "run-all-tests.sh does not read GATE_SERVER_SYSTEM_ID: a server changed in the middle of the run would go unseen"
+        guard_body
+            .iter()
+            .any(|l| l.contains("GATE_SERVER_SYSTEM_ID")),
+        "gate_require_judge_server (scripts/gate-lock.sh) does not read GATE_SERVER_SYSTEM_ID: a \
+         server that changed under the run would go unseen by every step that calls the guard"
     );
     assert!(
-        suite_code.iter().any(|l| l.contains("the server changed")),
-        "run-all-tests.sh does not stop with `the server changed` when the system_identifier it reads differs from the one merge-gate exported"
+        guard_body
+            .iter()
+            .any(|l| l.contains("GATE_SERVER_SYSTEM_ID") && l.contains("!=")),
+        "gate_require_judge_server (scripts/gate-lock.sh) does not compare GATE_SERVER_SYSTEM_ID \
+         with the system_identifier it reads"
+    );
+    assert!(
+        guard_body.iter().any(|l| l.contains("the server changed")),
+        "gate_require_judge_server (scripts/gate-lock.sh) does not stop with `the server changed` \
+         when the system_identifier it reads differs from the one merge-gate.sh exported"
+    );
+
+    // merge-gate.sh asks again after run-all-tests.sh, before the --features docs step: the
+    // identity exported above has to be the one that answers at that point (D-J1c, A2).
+    let export_at = first_line_where(&gate, |l| l.starts_with("export GATE_SERVER_SYSTEM_ID="));
+    let docs_at = first_line_where(&gate, |l| l.contains("features docs ==="));
+    let (Some(export_at), Some(docs_at)) = (export_at, docs_at) else {
+        panic!(
+            "merge-gate.sh must export GATE_SERVER_SYSTEM_ID (found on {export_at:?}) and print the \
+             --features docs step (found on {docs_at:?}) outside its self-test"
+        );
+    };
+    assert!(
+        gate.iter().any(|(n, l)| {
+            l.contains("gate_require_judge_server") && *n > export_at && *n < docs_at
+        }),
+        "merge-gate.sh does not call gate_require_judge_server between the export of \
+         GATE_SERVER_SYSTEM_ID (line {export_at}) and the --features docs step (line {docs_at}): a \
+         server that changed under run-all-tests.sh would reach the docs step unseen"
     );
 }
 
@@ -3562,97 +3608,132 @@ fn the_banner_and_the_doc_stop_saying_old_database_migrations_are_not_covered() 
         "the test that covers migrations over an existing schema is missing"
     );
 }
-
-/// The lines of a JSON Lines file under the repo, each parsed. A file that is not there says so by
-/// name: the eval has nothing fixed to score without it.
-fn jsonl(rel: &str) -> Vec<serde_json::Value> {
-    let path = repo_root().join(rel);
-    assert!(
-        path.is_file(),
-        "falta {rel}: el corpus sintético de la eval smoke (CI-J, pasada 2). Sin él la eval no \
-         tiene un corpus fijo que puntuar"
-    );
-    let text = read(rel);
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-        .map(|(index, line)| {
-            serde_json::from_str(line)
-                .unwrap_or_else(|e| panic!("{rel} line {}: {e}", index + 1))
-        })
-        .collect()
-}
-
-/// Each smoke query has at least one fixture observation that holds one of its markers (the rule
-/// the harness applies: a case-insensitive substring), so no query scores 0 by construction; and at
-/// least ten observations satisfy no query, so the order of the results is what gets measured.
+/// J3.3 is judged in one place: `scripts/eval_seed.py --check-fixture` (CI-J2, A6). This contract
+/// runs it over the real fixture, which has to pass, and over a fixture of one observation that
+/// holds no marker of any query, which has to be refused with exit 1 and a FAIL line. The rule is
+/// not copied here: a copy in Rust would go on passing when the judge's mode drifted from it.
 #[test]
 fn every_smoke_query_has_a_relevant_observation_in_the_fixture() {
-    let queries = jsonl("rust/eval-datasets/smoke.jsonl");
-    let corpus = jsonl("rust/eval-datasets/smoke-corpus.jsonl");
-    let markers_of = |query: &serde_json::Value| -> Vec<String> {
-        query["relevant_markers"]
-            .as_array()
-            .map(|markers| {
-                markers
-                    .iter()
-                    .filter_map(|m| m.as_str())
-                    .filter(|m| !m.is_empty())
-                    .map(str::to_lowercase)
-                    .collect()
-            })
-            .unwrap_or_default()
+    let script = repo_root().join("scripts/eval_seed.py");
+    let queries = repo_root().join("rust/eval-datasets/smoke.jsonl");
+    let check = |fixture: &std::path::Path| {
+        std::process::Command::new("python3")
+            .arg("-I")
+            .arg(&script)
+            .arg("--check-fixture")
+            .arg("--fixture")
+            .arg(fixture)
+            .arg("--queries")
+            .arg(&queries)
+            .output()
+            .expect("python3 runs scripts/eval_seed.py --check-fixture")
     };
-    let contents: Vec<String> = corpus
-        .iter()
-        .enumerate()
-        .map(|(index, observation)| {
-            observation["content"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "rust/eval-datasets/smoke-corpus.jsonl line {}: no \"content\" string",
-                        index + 1
-                    )
-                })
-                .to_lowercase()
-        })
-        .collect();
-
-    assert!(
-        !queries.is_empty() && !contents.is_empty(),
-        "the eval smoke needs queries ({}) and fixture observations ({}) to score",
-        queries.len(),
-        contents.len()
+    let real = check(
+        repo_root()
+            .join("rust/eval-datasets/smoke-corpus.jsonl")
+            .as_path(),
     );
-    for (index, query) in queries.iter().enumerate() {
-        let markers = markers_of(query);
-        assert!(
-            !markers.is_empty(),
-            "smoke.jsonl query {} has no relevant_markers",
-            index + 1
-        );
-        assert!(
-            contents
-                .iter()
-                .any(|c| markers.iter().any(|m| c.contains(m.as_str()))),
-            "smoke.jsonl query {} ({}) has no fixture observation with any of its markers \
-             {markers:?}: the eval scores it 0 by construction",
-            index + 1,
-            query["query"]
-        );
-    }
-    let unmatched = contents
-        .iter()
-        .filter(|c| {
-            !queries
-                .iter()
-                .any(|q| markers_of(q).iter().any(|m| c.contains(m.as_str())))
-        })
-        .count();
     assert!(
-        unmatched >= 10,
-        "only {unmatched} fixture observations satisfy no query; at least 10 are needed, so that \
-         the order of the results is measured and not just the presence of the relevant ones"
+        real.status.success(),
+        "eval_seed.py --check-fixture refuses the real fixture: {}{}",
+        String::from_utf8_lossy(&real.stdout),
+        String::from_utf8_lossy(&real.stderr)
+    );
+
+    let bad =
+        std::env::temp_dir().join(format!("memory-industry-j3-3-{}.jsonl", std::process::id()));
+    std::fs::write(&bad, "{\"content\": \"nada que buscar\"}\n").expect("write the bad fixture");
+    let refused = check(bad.as_path());
+    let _ = std::fs::remove_file(&bad);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "eval_seed.py --check-fixture over a fixture with no marker of any query is not exit 1: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("FAIL:"),
+        "the refusal names no FAIL line: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+}
+
+/// restore-db.sh names the database it is about to replace without its credentials (CI-J2, A8,
+/// D-J1h): the authority is cut at the LAST '@', as mcp_live_session_test.py cuts it, so a password
+/// with an unencoded '@' never reaches the screen. The run goes as far as the prompt, with a
+/// `docker` that finds nothing, a stub `pg_restore` that lists one table, and a `backup-db.sh`
+/// that does nothing; it answers no, so nothing is restored.
+#[cfg(unix)]
+#[test]
+fn restore_names_the_database_after_the_last_at_and_changes_nothing() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    let dir = std::env::temp_dir().join(format!("memory-industry-a8-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let stubs = dir.join("bin");
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&stubs).expect("create the stub directory");
+    std::fs::create_dir_all(tree.join("scripts")).expect("create the tree");
+    let stub = |path: std::path::PathBuf, body: &str| {
+        std::fs::write(&path, body).expect("write a stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make a stub executable");
+    };
+    stub(stubs.join("docker"), "#!/bin/sh\nexit 1\n");
+    stub(
+        stubs.join("pg_restore"),
+        "#!/bin/sh\necho '; TABLE DATA public memory_entities'\n",
+    );
+    stub(tree.join("scripts/backup-db.sh"), "#!/bin/sh\nexit 0\n");
+    std::fs::copy(
+        repo_root().join("scripts/restore-db.sh"),
+        tree.join("scripts/restore-db.sh"),
+    )
+    .expect("copy restore-db.sh");
+    let dump = dir.join("brain.dump");
+    std::fs::write(&dump, "dump").expect("write the dump");
+
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new("bash")
+        .arg(tree.join("scripts/restore-db.sh"))
+        .arg(&dump)
+        .env(
+            "DATABASE_URL",
+            "postgresql://cuba:pa@ss@127.0.0.1:5489/brain",
+        )
+        .env("PATH", &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run restore-db.sh");
+    child
+        .stdin
+        .take()
+        .expect("restore-db.sh has a stdin")
+        .write_all(b"n\n")
+        .expect("answer the prompt");
+    let out = child.wait_with_output().expect("wait for restore-db.sh");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "restore-db.sh answered no and should exit 0: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("replace the contents of 127.0.0.1:5489/brain "),
+        "restore-db.sh does not name the database as host:port/base: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ss@") && !stdout.contains("pa@"),
+        "restore-db.sh printed part of the credentials of DATABASE_URL: {stdout}"
     );
 }

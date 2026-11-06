@@ -1061,6 +1061,21 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$(tail -n1 "$tmp/j15/home/rat.sysid" 2>/dev/null || true)" == 7701731310526959658 ]] \
     || self_fail "j15: run-all-tests did not get the system_identifier the guard read: '$(cat "$tmp/j15/home/rat.sysid" 2>/dev/null || true)'"
 
+  # J1.6 (A2, D-J1c): a server whose system_identifier changes under the run is refused before
+  # the --features docs step, which reads the database after run-all-tests.sh. The stand-in
+  # answers the identity the guard read until run-all-tests.sh has run, and then another one.
+  j2_url='postgresql://gate:pw0@127.0.0.1:5489/brain'
+  fake_tree j2doc 'echo run-all-tests >>"$HOME/steps"; touch "$HOME/sysid.flip"'
+  printf '%s\n' '#!/bin/sh' \
+    'if [ -f "$HOME/sysid.flip" ]; then echo "memory-industry-gate|999"; else echo "memory-industry-gate|7701731310526959658"; fi' > "$tmp/j2doc/bin/psql"
+  chmod +x "$tmp/j2doc/bin/psql"
+  run_copy_as "$j2_url" j2doc ""
+  (( rc == 2 )) || self_fail "J1.6: a gate whose server changed system_identifier under run-all-tests exited $rc, not 2: $(cat "$tmp/j2doc.out")"
+  grep -qF 'system_identifier' "$tmp/j2doc.out" || self_fail "J1.6: the refusal does not name system_identifier: $(cat "$tmp/j2doc.out")"
+  if grep -qF '=== cargo clippy/test --features docs ===' "$tmp/j2doc.out"; then
+    self_fail "J1.6: the --features docs step ran after the server changed: $(cat "$tmp/j2doc.out")"
+  fi
+
   # gate_linux_env (gate-lock.sh): what a gate run on Linux hands to cargo, to the
   # mutation tool and to node. Each row runs it in a fresh bash with an empty
   # environment but HOME and a PATH of stand-ins, so every answer comes from the
@@ -1509,6 +1524,9 @@ gate_container_ready() {
   echo "OK  Postgres :$port (container $name)"
 }
 
+# A server identity from an earlier run must not satisfy the first guard: the one exported
+# below is the one this run reads (D-J1c).
+unset GATE_SERVER_SYSTEM_ID
 if command -v pg_isready >/dev/null 2>&1; then
   # libpq reads the URL, so host, port, socket, IPv6 and PGPORT mean here what
   # they mean to psql, pg_dump and sqlx, and the port printed is the one libpq
@@ -1615,6 +1633,9 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 
 "$ROOT/scripts/run-all-tests.sh"
 
+# The identity is asked again before the --features docs step, which reads the database
+# after run-all-tests.sh: a server that changed under the run is refused here (D-J1c, A2).
+gate_require_judge_server "$DATABASE_URL"
 echo "=== cargo clippy/test --features docs ==="
 (cd "$ROOT/rust" && cargo clippy --all-targets --features docs -- -D warnings)
 (cd "$ROOT/rust" && cargo test --features docs)

@@ -330,6 +330,56 @@ if [[ "${1:-}" == "--self-test" ]]; then
       || self_fail "TT13.$os: --count did not print 'zero 0' and 'mixed 4' (0 passed and 5 filtered out counts 0; 3 passed and 1 failed counts 4): $(cat "$tmp/TT13.$os.out")"
   done
 
+  # P1 (CI-J2, D-J4c, seed 20261106, printed on a FAIL): --count of a generated log is, per
+  # binary key, the passed plus the failed the generator wrote, in order of first appearance.
+  # The logs mix both shapes (Linux and Windows headers), a repeated key, noise between a
+  # header and its result, and about 30 % of their lines end in CRLF. A log cut after a header
+  # (no result line) is exit 2. The generator writes its own expected sums: nothing is read back.
+  p1_seed=20261106
+  RANDOM=$p1_seed
+  p1_keys=(lib:memory_industry bin:memory_industry doc:memory_industry suite_a suite_b suite_c)
+  p1_line() {
+    if (( RANDOM % 10 < 3 )); then printf '%s\r\n' "$1"; else printf '%s\n' "$1"; fi
+  }
+  for ((p1_n = 0; p1_n < 300; p1_n++)); do
+    p1_sep='/'; p1_exe=''
+    if (( RANDOM % 2 )); then p1_sep='\'; p1_exe='.exe'; fi
+    p1_log="$tmp/p1.log"
+    : >"$p1_log"
+    unset p1_sum; declare -A p1_sum=()
+    p1_order=()
+    p1_blocks=$(( RANDOM % 6 + 1 ))
+    for ((p1_b = 0; p1_b < p1_blocks; p1_b++)); do
+      p1_key="${p1_keys[RANDOM % ${#p1_keys[@]}]}"
+      case "$p1_key" in
+        lib:*) p1_head="     Running unittests src${p1_sep}lib.rs (target${p1_sep}debug${p1_sep}deps${p1_sep}${p1_key#lib:}-0123456789abcdef${p1_exe})" ;;
+        bin:*) p1_head="     Running unittests src${p1_sep}main.rs (target${p1_sep}debug${p1_sep}deps${p1_sep}${p1_key#bin:}-fedcba9876543210${p1_exe})" ;;
+        doc:*) p1_head="   Doc-tests ${p1_key#doc:}" ;;
+        *)     p1_head="     Running tests${p1_sep}${p1_key}.rs (target${p1_sep}debug${p1_sep}deps${p1_sep}${p1_key}-0123456789abcdef${p1_exe})" ;;
+      esac
+      p1_line "$p1_head" >>"$p1_log"
+      p1_line "" >>"$p1_log"
+      for ((p1_x = RANDOM % 3; p1_x > 0; p1_x--)); do p1_line "running $p1_x tests" >>"$p1_log"; done
+      p1_pass=$(( RANDOM % 30 )); p1_fail=$(( RANDOM % 3 )); p1_result=ok
+      (( p1_fail == 0 )) || p1_result=FAILED
+      p1_line "test result: $p1_result. $p1_pass passed; $p1_fail failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.$(( RANDOM % 90 + 10 ))s" >>"$p1_log"
+      p1_line "" >>"$p1_log"
+      if [[ -z "${p1_sum[$p1_key]+x}" ]]; then p1_order+=("$p1_key"); p1_sum[$p1_key]=0; fi
+      p1_sum[$p1_key]=$(( p1_sum[$p1_key] + p1_pass + p1_fail ))
+    done
+    p1_want=""
+    for p1_k in "${p1_order[@]}"; do p1_want+="$p1_k ${p1_sum[$p1_k]}"$'\n'; done
+    p1_rc=0
+    bash "$SELF" --count "$p1_log" >"$tmp/p1.out" 2>&1 || p1_rc=$?
+    (( p1_rc == 0 )) && [[ "$(cat "$tmp/p1.out")" == "${p1_want%$'\n'}" ]] \
+      || self_fail "P1 seed $p1_seed, log $p1_n: --count exited $p1_rc and printed '$(cat "$tmp/p1.out")', not the sums the generator wrote ('${p1_want%$'\n'}'): $(cat "$p1_log")"
+  done
+  cp "$p1_log" "$tmp/p1.cut.log"
+  printf '     Running tests/cut.rs (target/debug/deps/cut-0123456789abcdef)\n' >>"$tmp/p1.cut.log"
+  p1_rc=0
+  bash "$SELF" --count "$tmp/p1.cut.log" >/dev/null 2>&1 || p1_rc=$?
+  (( p1_rc == 2 )) || self_fail "P1 seed $p1_seed: a log cut after a header with no result line exited $p1_rc, not 2"
+
   echo "OK  self-test: test-times sums each binary's finished-in over both cargo shapes up to the boundary, prints the 10 slowest, and is red for a ceiling passed, the default passed, a floor undercut, a dead or expired line and a malformed one, all in one run; a log it cannot read is exit 2"
   exit 0
 fi

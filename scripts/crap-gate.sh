@@ -69,6 +69,59 @@ STUB
   grep -q -- '--lib' "$tmp/none.calls" 2>/dev/null || self_fail "J1.9: crap-gate with no DATABASE_URL did not run cargo llvm-cov: $(cat "$tmp/none.out")"
   [[ ! -e "$tmp/none.psql" ]] || self_fail "J1.9: crap-gate with no DATABASE_URL asked a server: $(cat "$tmp/none.psql")"
 
+  # J1.10 (A2, D-J1c): the server this step judges is the one merge-gate.sh read. The identity
+  # merge-gate exported is 7701731310526959658; a server that now answers 999 is exit 2 before
+  # cargo, and the refusal names system_identifier.
+  run_crap sysid DATABASE_URL='postgresql://gate:pw0@127.0.0.1:5489/brain' FAKE_PSQL_CLUSTER_NAME=memory-industry-gate FAKE_PSQL_SYSID=999 GATE_SERVER_SYSTEM_ID=7701731310526959658
+  (( rc == 2 )) || self_fail "J1.10: crap-gate over a server whose system_identifier changed exited $rc, not 2: $(cat "$tmp/sysid.out")"
+  [[ ! -e "$tmp/sysid.calls" ]] || self_fail "J1.10: crap-gate called cargo after the server changed: $(cat "$tmp/sysid.calls")"
+  grep -q 'system_identifier' "$tmp/sysid.out" || self_fail "J1.10: the refusal does not name system_identifier: $(cat "$tmp/sysid.out")"
+
+  # P4 (D-J1a, D-J1e, seed 20261106, printed on a FAIL): gate_require_database_url over 400
+  # generated URLs, half from the shape of a URL and half from a random tail, all from the
+  # alphabet «ab:@/?%[]#9.». Every URL it accepts (exit 0, nothing printed) keeps what the gate
+  # derives brain_gate from: no '?', at most one '@' before the host, one non-empty database
+  # segment after the host, and the maintenance URL ${url%/*} on the same authority. The property
+  # is not vacuous: the 400 must include accepted and refused URLs.
+  p4_seed=20261106
+  RANDOM=$p4_seed
+  p4_alpha='ab:@/?%[]#9.'
+  # The chunk is set by name, not echoed: a $(...) would draw RANDOM in a subshell, and every
+  # chunk of one URL would be the same.
+  p4_chunk() {
+    local s="" i
+    for ((i = RANDOM % 5; i > 0; i--)); do s+="${p4_alpha:RANDOM % ${#p4_alpha}:1}"; done
+    printf -v "$1" '%s' "$s"
+  }
+  p4_accepted=0; p4_refused=0
+  for ((p4_n = 0; p4_n < 400; p4_n++)); do
+    p4_chunk p4_c1; p4_chunk p4_c2; p4_chunk p4_c3; p4_chunk p4_c4
+    if (( p4_n % 2 )); then
+      p4_url="postgresql://$p4_c1:$p4_c2@$p4_c3/$p4_c4"
+    else
+      p4_url="postgresql://$p4_c1$p4_c2$p4_c3"
+    fi
+    rc=0
+    ( source "$ROOT/scripts/gate-lock.sh"; gate_require_database_url "$p4_url" ) >"$tmp/p4.out" 2>&1 || rc=$?
+    if (( rc == 0 )) && [[ ! -s "$tmp/p4.out" ]]; then
+      p4_accepted=$(( p4_accepted + 1 ))
+      p4_rest="${p4_url#*://}"
+      p4_auth="${p4_rest%%/*}"
+      p4_db="${p4_rest#*/}"
+      p4_base="${p4_url%/*}"
+      if [[ "$p4_url" == *\?* || "${p4_auth//[^@]/}" == @@* || "$p4_rest" != */* \
+            || -z "$p4_db" || "$p4_db" == */* || "${p4_base#*://}" != "$p4_auth" ]]; then
+        self_fail "P4 seed $p4_seed, case $p4_n: the guard accepted a URL that breaks an invariant of the derived databases: '$p4_url'"
+      fi
+    elif (( rc == 2 )); then
+      p4_refused=$(( p4_refused + 1 ))
+    else
+      self_fail "P4 seed $p4_seed, case $p4_n: gate_require_database_url exited $rc, not 0 or 2, for a generated URL: $(cat "$tmp/p4.out")"
+    fi
+  done
+  (( p4_accepted > 0 && p4_refused > 0 )) \
+    || self_fail "P4 seed $p4_seed: of 400 URLs $p4_accepted were accepted and $p4_refused refused; the property needs both to say anything"
+
   echo "OK  self-test: crap-gate refuses a DATABASE_URL to a server with no judge marker before cargo, and judges the floor as before"
   exit 0
 fi
@@ -95,6 +148,7 @@ fi
 
 echo "=== crap-gate: llvm-cov --lib (min line ${MIN_COV}%) ==="
 COV_JSON="$(mktemp "${TMPDIR:-/tmp}/memory-industry-cov.XXXXXX")"
+trap 'rm -f "$COV_JSON"' EXIT
 cargo llvm-cov --lib --json --summary-only --output-path "$COV_JSON"
 
 resolve_python() {

@@ -118,6 +118,82 @@ if [[ "${1:-}" == "--check-fresh" ]]; then
   exit 0
 fi
 
+# The eval judgement runs on the interpreter the gate uses everywhere else: the Windows
+# WindowsApps stub is skipped. Resolved here, before the mode, so that --check-eval works on its own.
+resolve_python() {
+  if [[ -n "${PYTHON_BIN:-}" && ( -x "$PYTHON_BIN" || -f "$PYTHON_BIN" ) ]]; then
+    printf '%s\n' "$PYTHON_BIN"
+    return
+  fi
+  local c p
+  for c in python3 python; do
+    p="$(command -v "$c" 2>/dev/null || true)"
+    [[ -n "$p" ]] || continue
+    case "$p" in
+      */WindowsApps/*) continue ;;
+    esac
+    printf '%s\n' "$p"
+    return
+  done
+  printf '%s\n' "python3"
+}
+PY="$(resolve_python)"
+
+# The eval judgement (CI-J2, A4, A5, D-J3c, D-J3d): the JSON of `eval --json` against the lines
+# of smoke.jsonl. Each key is read by its path under metrics, so a per_ability block in front of
+# it (with its own ndcg_at_k) does not stand for the eval. Green: the scored queries
+# (metrics.per_query_ndcg) and the loaded ones (metrics.sample_count) are the query lines, and
+# metrics.ndcg_at_k is a JSON number above 0. Reads the file only, no database: 0 green, 1 red,
+# 2 arguments it cannot use. The interpreter is $PY, resolved above (the Windows judge too).
+check_eval() {
+  local json="$1" lines="$2" judged scored sample ndcg
+  [[ "$lines" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: --check-eval wants the lines of smoke.jsonl as a whole number above 0 (got '$lines')." >&2; return 2; }
+  judged="$("$PY" -I -c 'import json, sys
+try:
+    m = json.load(open(sys.argv[1], encoding="utf-8")).get("metrics", {})
+except (OSError, ValueError, AttributeError):
+    print("unreadable\tunreadable\tunreadable"); sys.exit(0)
+def show(key):
+    if key not in m:
+        return "missing"
+    v = m[key]
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return "bad"
+    return repr(v)
+q = m.get("per_query_ndcg")
+scored = "missing" if q is None else (str(len(q)) if isinstance(q, list) else "bad")
+print("\t".join([scored, show("sample_count"), show("ndcg_at_k")]))' "$json" 2>/dev/null)" \
+    || judged="unreadable	unreadable	unreadable"
+  IFS=$'\t' read -r scored sample ndcg <<<"$judged"
+  if [[ "$scored" == unreadable ]]; then
+    echo "FAIL: the eval --json cannot be read as JSON, so its metrics cannot be counted against smoke.jsonl ($lines lines)." >&2
+    return 1
+  fi
+  if ! [[ "$scored" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: the eval --json has no per_query_ndcg list, so its scored queries cannot be counted ($lines lines in smoke.jsonl)." >&2
+    return 1
+  fi
+  if (( scored != lines )); then
+    echo "FAIL: the eval scored $scored queries (metrics.per_query_ndcg) and smoke.jsonl has $lines lines." >&2
+    return 1
+  fi
+  if ! [[ "$sample" =~ ^[0-9]+$ ]] || (( sample != lines )); then
+    echo "FAIL: the eval --json reports ${sample} queries loaded (metrics.sample_count) and smoke.jsonl has $lines lines." >&2
+    return 1
+  fi
+  if ! [[ "$ndcg" =~ ^[0-9.eE+-]+$ ]] || ! awk -v x="$ndcg" 'BEGIN { exit !(x + 0 > 0) }'; then
+    echo "FAIL: the eval nDCG (metrics.ndcg_at_k) is ${ndcg} over $lines queries: nothing was retrieved for the queries it scored." >&2
+    return 1
+  fi
+  echo "OK  eval smoke: nDCG@10=$ndcg over $lines queries (metrics.per_query_ndcg, metrics.sample_count)"
+}
+if [[ "${1:-}" == "--check-eval" ]]; then
+  [[ $# -eq 3 ]] || { echo "FAIL: --check-eval takes the eval --json file and the lines of smoke.jsonl: --check-eval JSON QUERIES_LINES" >&2; exit 2; }
+  check_eval "$2" "$3"
+  exit $?
+fi
+
 # One gate at a time: the lock, its owner record and the rules for a dead or
 # foreign holder are in gate-lock.sh, which merge-gate.sh sources too so that
 # it can hold the lock for its whole run. What stays here is the half that is
@@ -882,6 +958,49 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ -e "$ct/debug/incremental/new-session/new-inc" ]] \
     || self_fail "J6.1: the sweep took the recent incremental state of debug/incremental"
 
+  # --- CI-J2 rows (spec §11, A4, A5, P5; D-J3c, D-J3d). `run-all-tests.sh --check-eval JSON
+  # QUERIES_LINES` judges the eval's --json the way the eval section does, with no database:
+  # the queries scored are metrics.per_query_ndcg, metrics.sample_count is the queries loaded,
+  # and metrics.ndcg_at_k is a number above 0. Each key is read by its path: a per_ability block
+  # in front of metrics (with its own ndcg_at_k) does not stand for the eval's.
+  ce() { rc=0; env -u DATABASE_URL bash "$ROOT/scripts/run-all-tests.sh" --check-eval "$1" "$2" >"$tmp/ce.out" 2>&1 || rc=$?; }
+  printf '%s\n' '{"per_ability":[{"ndcg_at_k":0.0}],"metrics":{"ndcg_at_k":0.7,"sample_count":5,"per_query_ndcg":[0.1,0.2,0.3,0.4,0.5]}}' >"$tmp/ce.a4ok.json"
+  ce "$tmp/ce.a4ok.json" 5
+  (( rc == 0 )) || self_fail "A4: an eval whose per_ability ndcg_at_k is 0.0 in front of metrics.ndcg_at_k 0.7, 5 loaded and 5 scored, was not judged green (exit $rc): $(cat "$tmp/ce.out")"
+  printf '%s\n' '{"per_ability":[{"ndcg_at_k":0.9}],"metrics":{"ndcg_at_k":0.0,"sample_count":5,"per_query_ndcg":[0.1,0.2,0.3,0.4,0.5]}}' >"$tmp/ce.a4red.json"
+  ce "$tmp/ce.a4red.json" 5
+  (( rc == 1 )) || self_fail "A4: an eval whose metrics.ndcg_at_k is 0.0, behind a per_ability ndcg_at_k of 0.9, was not red (exit $rc, want 1): $(cat "$tmp/ce.out")"
+  grep -q 'ndcg' "$tmp/ce.out" || self_fail "A4: the red nDCG names no ndcg: $(cat "$tmp/ce.out")"
+
+  # P5 (D-J3c, D-J3d, seed 20261106, printed on a FAIL): 200 generated evals over 1 to 6 query
+  # lines. Green exactly when sample_count and the length of per_query_ndcg are the query lines
+  # and ndcg_at_k is a JSON number above 0. A string, null or an absent ndcg_at_k is red, and a
+  # per_ability block (with a 0.0 of its own) always sits in front of metrics.
+  p5_seed=20261106
+  RANDOM=$p5_seed
+  p5_nds=(0.0 1e-9 0.3 null '"0.5"' absent)
+  p5_green=0
+  for ((p5_n = 0; p5_n < 200; p5_n++)); do
+    p5_lines=$(( RANDOM % 6 + 1 ))
+    p5_sample=$(( RANDOM % 7 ))
+    p5_scored=$(( RANDOM % 7 ))
+    p5_nd="${p5_nds[RANDOM % ${#p5_nds[@]}]}"
+    p5_q=""
+    for ((p5_i = 0; p5_i < p5_scored; p5_i++)); do p5_q+="${p5_q:+,}0.5"; done
+    p5_m="\"sample_count\":$p5_sample,\"per_query_ndcg\":[$p5_q]"
+    [[ "$p5_nd" == absent ]] || p5_m="\"ndcg_at_k\":$p5_nd,$p5_m"
+    printf '{"per_ability":[{"ndcg_at_k":0.0,"sample_count":9}],"metrics":{%s}}\n' "$p5_m" >"$tmp/ce.p5.json"
+    p5_want=1
+    if (( p5_sample == p5_lines && p5_scored == p5_lines )) && [[ "$p5_nd" == 1e-9 || "$p5_nd" == 0.3 ]]; then
+      p5_want=0
+      p5_green=$(( p5_green + 1 ))
+    fi
+    ce "$tmp/ce.p5.json" "$p5_lines"
+    (( rc == p5_want )) \
+      || self_fail "P5 seed $p5_seed, case $p5_n: ${p5_lines} query lines, sample_count $p5_sample, $p5_scored scored, ndcg_at_k $p5_nd: judged $rc, want $p5_want: $(cat "$tmp/ce.out") / $(cat "$tmp/ce.p5.json")"
+  done
+  (( p5_green > 0 )) || self_fail "P5 seed $p5_seed: none of the 200 generated evals was green, so the green half of the property is not tested"
+
   # --- CI-F1 rows (spec §4, F1, F2, F3; D-F1b, D-F2b, D-F3a/b). run_args NAME ARG...: the
   # script with ARG... in NAME's tree, under the environment full_run gives it; $rc and
   # $tmp/NAME.out as full_run leaves them. cg_tree NAME CPU_MAX MEMORY_MAX MEMORY_CURRENT
@@ -1034,9 +1153,6 @@ trap on_exit EXIT
 # this repeats the check, which costs nothing. The system_identifier merge-gate.sh
 # read must be the one this run reads (D-J1c).
 gate_require_judge_server "${DATABASE_URL:-}"
-if [[ -n "${GATE_SERVER_SYSTEM_ID:-}" && "$GATE_SERVER_SYSTEM_ID" != "$GATE_JUDGE_SYSID" ]]; then
-  gate_refuse "the server changed under this run: merge-gate.sh read system_identifier $GATE_SERVER_SYSTEM_ID and this run reads $GATE_JUDGE_SYSID on the same DATABASE_URL. Nothing is judged; find out what answers on that port."
-fi
 
 # Under HOME/.cache and nowhere else, because that is where the binary keeps
 # them: envs::home() joins `.cache` to HOME, and nothing in the crate reads
@@ -1160,7 +1276,9 @@ fi
 # over the `test result:` lines of that section's cargo call. A named section (one
 # that names its --test binaries) must also run every binary at least one test.
 SECTION_COUNTS="$ROOT/scripts/test-section-counts.txt"
-SECTION_NAMES="discovered-ignored lib-ignored admin-role embedding-model nli generative-llm reranker-placement placement-table reranker-model"
+# The sections this gate ran and judged, in order (CI-J2, A7): run_counted appends each one. It is
+# the only list of sections: check_section_lines compares the count file with it, both ways.
+RAN_SECTIONS=""
 
 # run_counted SECTION NAMED <command>: runs the call with its output shown and kept,
 # judges the count, and exits with the call's own code when the call failed. The count
@@ -1198,6 +1316,7 @@ run_counted() {
     echo "FAIL: section $section: $bins test binaries reported for $want named --test, $zero of them ran 0 tests. Each named binary has to run at least one test." >&2
     exit 1
   fi
+  RAN_SECTIONS+=" $section"
   echo "OK  section $section: $ran tests in $bins test binaries"
 }
 
@@ -1205,12 +1324,12 @@ run_counted() {
 check_section_lines() {
   local listed name missing="" orphan=""
   listed="$(awk '!/^[[:space:]]*#/ && NF >= 2 { print $1 }' "$SECTION_COUNTS" 2>/dev/null || true)"
-  for name in $SECTION_NAMES; do
+  for name in $RAN_SECTIONS; do
     grep -qxF "$name" <<<"$listed" || missing+=" $name"
   done
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    case " $SECTION_NAMES " in
+    case " $RAN_SECTIONS " in
       *" $name "*) ;;
       *) orphan+=" $name" ;;
     esac
@@ -1549,24 +1668,6 @@ export CUBA_BINARY_PATH
 echo "E2E binary: $CUBA_BINARY_PATH"
 # Prefer PYTHON_BIN (set by run-gate on Windows). Never use the Microsoft Store
 # python3.exe stub under WindowsApps — it prints install text and exits 49.
-resolve_python() {
-  if [[ -n "${PYTHON_BIN:-}" && ( -x "$PYTHON_BIN" || -f "$PYTHON_BIN" ) ]]; then
-    printf '%s\n' "$PYTHON_BIN"
-    return
-  fi
-  local c p
-  for c in python3 python; do
-    p="$(command -v "$c" 2>/dev/null || true)"
-    [[ -n "$p" ]] || continue
-    case "$p" in
-      */WindowsApps/*) continue ;;
-    esac
-    printf '%s\n' "$p"
-    return
-  done
-  printf '%s\n' "python3"
-}
-PY="$(resolve_python)"
 echo "python=$PY"
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
@@ -1621,6 +1722,10 @@ EVAL_QUERIES="$RUST_DIR/eval-datasets/smoke.jsonl"
 EVAL_BIN="$(resolve_binary_path)"
 [[ -x "$EVAL_BIN" ]] \
   || { echo "FAIL: no release binary at $EVAL_BIN for the eval; the release build above writes it." >&2; exit 1; }
+# resolve_binary_path also takes the release/cuba-memorys alias: the eval judges the bytes the
+# --no-run build left, whatever name they came under (CI-J2, D-F3b).
+[[ "$(release_sha "$EVAL_BIN")" == "$REL_SHA" ]] \
+  || { echo "FAIL: the eval binary $EVAL_BIN is not the one the release build left (its sha256 differs from $REL_BIN): nothing is judged." >&2; exit 1; }
 claim_database "$EVAL_DB" || exit 1
 DATABASE_URL="$EVAL_DATABASE_URL" CUBA_APP_ROLE=0 ONNX_MODEL_PATH="" \
   "$EVAL_BIN" doctor >/dev/null 2>&1 || true
@@ -1674,38 +1779,8 @@ DATABASE_URL="$EVAL_DATABASE_URL" "$EVAL_BIN" eval \
   exit 1
 }
 queries_lines="$(grep -c . "$EVAL_QUERIES" || true)"
-scored="$(grep -o '"sample_count": *[0-9]*' "$eval_json" | head -n 1 | grep -o '[0-9]*$' || true)"
-ndcg="$(grep -o '"ndcg_at_k": *[0-9.eE+-]*' "$eval_json" | head -n 1 | sed 's/.*: *//' || true)"
-per_query="$("$PY" -I -c 'import json, sys
-m = json.load(open(sys.argv[1], encoding="utf-8")).get("metrics", {})
-q = m.get("per_query_ndcg")
-print("missing" if q is None else len(q))' "$eval_json" 2>/dev/null || echo unreadable)"
+check_eval "$eval_json" "$queries_lines" || { rm -f "$eval_json"; exit 1; }
 rm -f "$eval_json"
-if [[ "$per_query" == missing ]]; then
-  echo "FAIL: the eval --json has no per_query_ndcg, so its scored queries cannot be counted against smoke.jsonl ($queries_lines lines)." >&2
-  exit 1
-fi
-if ! [[ "$per_query" =~ ^[0-9]+$ ]]; then
-  echo "FAIL: the eval --json cannot be read as JSON, so its per_query_ndcg cannot be counted ($queries_lines lines in smoke.jsonl)." >&2
-  exit 1
-fi
-if (( per_query != queries_lines )); then
-  echo "FAIL: the eval scored $per_query queries (metrics.per_query_ndcg) and smoke.jsonl has $queries_lines lines." >&2
-  exit 1
-fi
-if ! [[ "$scored" =~ ^[0-9]+$ ]]; then
-  echo "FAIL: the eval --json has no sample_count, so its queries cannot be counted against smoke.jsonl ($queries_lines lines)." >&2
-  exit 1
-fi
-if (( scored != queries_lines )); then
-  echo "FAIL: the eval --json reports $scored queries and smoke.jsonl has $queries_lines lines." >&2
-  exit 1
-fi
-if [[ -z "$ndcg" ]] || ! awk -v x="$ndcg" 'BEGIN { exit !(x + 0 > 0) }'; then
-  echo "FAIL: the eval nDCG (ndcg_at_k) is ${ndcg:-missing} over $observed observations: nothing was retrieved for the queries it scored." >&2
-  exit 1
-fi
-echo "OK  eval smoke: nDCG@10=$ndcg over $queries_lines queries, $observed observations"
 
 echo ""
 echo "All tests passed."

@@ -459,6 +459,11 @@ gate_require_judge_server() {
   sysid="${identity##*|}"
   [[ "$cn" =~ $mark_re ]] \
     || gate_refuse "the server on :$port is not the judge's: its cluster_name is '$cn' (system_identifier $sysid), and the judge runs only against a server marked cluster_name=memory-industry-gate. Never the live corpus. docs/gate.md says how to start the judge's server."
+  # merge-gate.sh exports the system_identifier it read (D-J1c): a server that changed under
+  # the run is refused here, at every step that asks, and not only in run-all-tests.sh.
+  if [[ -n "${GATE_SERVER_SYSTEM_ID:-}" && "$GATE_SERVER_SYSTEM_ID" != "$sysid" ]]; then
+    gate_refuse "the server changed under this run: merge-gate.sh read system_identifier $GATE_SERVER_SYSTEM_ID and this run reads $sysid on the same DATABASE_URL. Nothing is judged; find out what answers on that port."
+  fi
   GATE_JUDGE_SYSID="$sysid"
   echo "OK  judge server :$port (cluster_name=$cn, system_identifier=$sysid)"
 }
@@ -490,16 +495,16 @@ gate_cgroup_memory_limit() {
   [[ -r "$dir/memory.max" ]] || return 0
   v="$(<"$dir/memory.max")"
   [[ "$v" != max ]] || return 0
-  [[ "$v" =~ ^[0-9]+$ ]] \
-    || gate_refuse "$dir/memory.max holds '$v', which is neither a number of bytes nor max, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+  [[ "$v" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || gate_refuse "$dir/memory.max holds '$v', which is neither a number of bytes nor max, so the memory the cgroup leaves cannot be read.${GATE_CG_HINT:+ $GATE_CG_HINT}"
   [[ -r "$dir/memory.current" ]] \
-    || gate_refuse "$dir/memory.max is a limit and $dir/memory.current is not readable, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+    || gate_refuse "$dir/memory.max is a limit and $dir/memory.current is not readable, so the memory the cgroup leaves cannot be read.${GATE_CG_HINT:+ $GATE_CG_HINT}"
   cur="$(<"$dir/memory.current")"
-  [[ "$cur" =~ ^[0-9]+$ ]] \
-    || gate_refuse "$dir/memory.current holds '$cur', which is not a number of bytes, so the memory the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+  [[ "$cur" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || gate_refuse "$dir/memory.current holds '$cur', which is not a number of bytes, so the memory the cgroup leaves cannot be read.${GATE_CG_HINT:+ $GATE_CG_HINT}"
   inactive="$(gate_cgroup_inactive_file "$dir")"
-  [[ "$inactive" =~ ^[0-9]+$ ]] \
-    || gate_refuse "$dir/memory.stat holds '$inactive' as inactive_file, which is not a number of bytes. Set MUTANTS_JOBS=<n> by hand."
+  [[ "$inactive" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || gate_refuse "$dir/memory.stat holds '$inactive' as inactive_file, which is not a number of bytes.${GATE_CG_HINT:+ $GATE_CG_HINT}"
   cur=$(( cur - inactive ))
   (( cur >= 0 )) || cur=0
   v=$(( (v - cur) / 1024 ))
@@ -514,8 +519,8 @@ gate_cgroup_cpu_limit() {
   [[ -r "$dir/cpu.max" ]] || return 0
   read -r q p <"$dir/cpu.max" || true
   [[ "$q" != max ]] || return 0
-  [[ "$q" =~ ^[0-9]+$ && "$p" =~ ^[0-9]+$ ]] && (( p > 0 )) \
-    || gate_refuse "$dir/cpu.max holds '$q ${p:-}', which is not '<quota> <period>' in numbers, so the CPUs the cgroup leaves cannot be read. Set MUTANTS_JOBS=<n> by hand."
+  [[ "$q" =~ ^(0|[1-9][0-9]*)$ && "$p" =~ ^(0|[1-9][0-9]*)$ ]] && (( p > 0 )) \
+    || gate_refuse "$dir/cpu.max holds '$q ${p:-}', which is not '<quota> <period>' in numbers, so the CPUs the cgroup leaves cannot be read.${GATE_CG_HINT:+ $GATE_CG_HINT}"
   gate_cg_keep_tighter GATE_CG_CPUS "$(( (q + p - 1) / p ))"
 }
 
@@ -574,6 +579,7 @@ gate_cgroup_read() {
 # the refusals are exits of this shell.
 gate_cargo_jobs() {
   local cores cg margin_kb margin_gb
+  GATE_CG_HINT="Set CARGO_BUILD_JOBS=<n> by hand."
   gate_cgroup_read
   cores="$(nproc)"
   [[ "$cores" =~ ^[0-9]+$ ]] \
