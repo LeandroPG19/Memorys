@@ -274,3 +274,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   `--check-fixture` untestable/unused, A8 restore-db.sh cutting at the first `@`, and minor ones) and five properties
   (P1–P5) run in scratch with 0 differences. They become slice CI-J2 (spec §11), after CI-F1 is integrated; the
   hardener runs on the final state. CI-F1 pass 1b red committed: `fb32d24`; its pass 2 code being copied in.
+- 2026-11-06 17:10 · F3.2 improver committed: `da7c140` (no function above CC 6, typed; behaviour compared; contract
+  14/14). F3.0 red 1b `9100bc2` (fake strace fixed, rows A0b and A7c for the two sabotages no row caught), rebased
+  onto `e530dab` → `a557da5`; its code is OK on its 21+2 rows and 11 other self-tests, but two contract reds: the
+  100755 of eval_seed.py (solved by the rebase) and the live-port literal the auditor needs (D-A11: one source,
+  `GATE_LIVE_PORT` in gate-lock.sh, the contract allows exactly that definition). CI-F1 pass 2 with cargo: 56/58
+  (the same eval_seed bit; a contract that took a B3g error message for a cargo call: message reworded) and sabotage
+  S8 left its contract green (quotes around the first word): contract fix as pass 1c.
