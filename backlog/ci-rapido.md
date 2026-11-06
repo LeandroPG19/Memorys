@@ -123,3 +123,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   counter, age rule for `debug/incremental`, J1.9 without "no FAIL", and a contract that no gate script prints a URL with
   credentials — `mcp_live_session_test.py` did). Pass 2 work set aside as stash `977102b` (plus a patch and a tar in
   `~/.cache/memory-industry-gate/ci-rapido/`); its self-test regions were byte-equal to HEAD.
+- 2026-11-06 09:18 · F0 run 1 (`2d61589`) red at mutants-gate after 1738 s wall, 6284 s CPU, 15.5 GB peak: the
+  mutants output directory vanished 78 s into the baseline. Cause (J7, new): `mutants-gate.sh` uses one fixed
+  `$TMPDIR/memory-industry-mutants-out` and removes it first, and `gate_linux_env` points `TMPDIR` at the real
+  `~/.cache/memory-industry-gate/tmp`; the implementer running `mutants-gate.sh --self-test` at 09:18 removed the live
+  run's output. The run is void as a verdict (interrupted, repeated whole); its step times up to mutants are kept.
+  J7 goes into pass 1b (own output directory per run, hermetic self-tests). Until it is green, no self-test of
+  mutants-gate runs with the real HOME.
