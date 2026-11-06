@@ -130,3 +130,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   run's output. The run is void as a verdict (interrupted, repeated whole); its step times up to mutants are kept.
   J7 goes into pass 1b (own output directory per run, hermetic self-tests). Until it is green, no self-test of
   mutants-gate runs with the real HOME.
+- 2026-11-06 09:30 · F0 run 1, step times up to mutants (Measured, `2d61589`, under pesado, Mapupita idle): 1660 s
+  (27.7 min) to reach mutants-gate. Largest: `cargo test` (unit + smoke) 316 s; `--features docs` 306 s; reranker
+  (release) 242 s; crap-gate llvm-cov 180 s; release build 170 s; placement table 154 s; E2E 109 s; `--ignored` 75 s;
+  clippy 20 s (warm). Everything else under 25 s. F0 run 1 relaunched whole at 09:25.
