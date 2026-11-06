@@ -2887,6 +2887,11 @@ fn names_a_default_url(line: &str) -> bool {
     false
 }
 
+/// The one file and the one line where the live port is spelled as code (D-A11): the definition
+/// of `GATE_LIVE_PORT` in `gate-lock.sh`. Every other line that names the port is a defect.
+const LIVE_PORT_HOME: &str = "scripts/gate-lock.sh";
+const LIVE_PORT_DEFINITION: &str = "GATE_LIVE_PORT=5488";
+
 /// What in `body` (the file `name`) names the live port 5488 or gives DATABASE_URL a default,
 /// as `file:line: …`. Comments may name both, and so may the self-test regions of a shell script,
 /// whose fixtures carry URLs. Python has no regions, so all of it is code.
@@ -2900,7 +2905,9 @@ fn default_url_defects(name: &str, body: &str) -> Vec<String> {
         .into_iter()
         .filter(|(_, line)| !line.trim_start().starts_with('#'))
         .filter_map(|(n, line)| {
-            if line.contains("5488") {
+            if name == LIVE_PORT_HOME && line.trim() == LIVE_PORT_DEFINITION {
+                None
+            } else if line.contains("5488") {
                 Some(format!("{name}:{n}: names the live port 5488: {}", line.trim()))
             } else if names_a_default_url(line) {
                 Some(format!("{name}:{n}: gives DATABASE_URL a default: {}", line.trim()))
@@ -2983,6 +2990,23 @@ fn no_gate_script_defaults_database_url_and_none_names_the_live_port() {
         default_url_defects("required.sh", required).is_empty(),
         "`:?` requires the variable, it does not default it: {:?}",
         default_url_defects("required.sh", required)
+    );
+
+    let definition = format!("{LIVE_PORT_DEFINITION}\n");
+    assert!(
+        default_url_defects(LIVE_PORT_HOME, &definition).is_empty(),
+        "the definition of the live port is admitted as the one exact line of gate-lock.sh: {:?}",
+        default_url_defects(LIVE_PORT_HOME, &definition)
+    );
+    assert_eq!(
+        default_url_defects(LIVE_PORT_HOME, "PORT=5488\n").len(),
+        1,
+        "another line of gate-lock.sh that spells the live port is still a defect"
+    );
+    assert_eq!(
+        default_url_defects("scripts/other.sh", &definition).len(),
+        1,
+        "the same line in another file is still a defect: the exemption is one line of one file"
     );
 
     let mut defects = Vec::new();

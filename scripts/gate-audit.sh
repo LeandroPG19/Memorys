@@ -147,6 +147,7 @@ FAKE
     shift
     mkdir -p "$t/scripts"
     cp "$GA" "$t/scripts/gate-audit.sh"
+    cp "$(dirname "$GA")/gate-lock.sh" "$t/scripts/gate-lock.sh"
     au_fake_step "$t/scripts/fake-step.sh"
     printf 'SENTINEL\n' > "$t/scripts/gate-groups.txt"
     : > "$t/scripts/gate-dag.txt"
