@@ -62,7 +62,7 @@ Encode models (embed / NLI / reranker) stay ONNX via `memory-industry models all
 
 ## Immutable fixtures
 
-Mutating tests use throwaway DBs (`brain_gate` / peer). Eval smoke may read the live corpus read-only.
+Mutating tests use throwaway DBs (`brain_gate` / peer). No judge step reads or writes the live corpus (`:5488`), not even read-only: the eval smoke scores a fixed snapshot restored into the judge's own server. The nightly copy of the live corpus is `respaldo-memoria.timer` (systemd user unit, outside the repo), not a judge step.
 
 Published migrations through **0060** are frozen (SHA-384). Wrong shipped SQL gets a **new** migration.
 
