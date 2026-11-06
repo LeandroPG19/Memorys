@@ -4,6 +4,10 @@
 #   ./scripts/mutants-gate.sh --check-builds FILE   judge the unviable builds of an
 #                                                   outcomes.json (quality-gate.sh)
 #   ./scripts/mutants-gate.sh --self-test           that judge against its fixtures
+#   ./scripts/mutants-gate.sh --compare-classes REF NEW
+#                                                   two outcomes.json judge every mutant
+#                                                   the same way (CI-F4, the reference)
+#   ./scripts/mutants-gate.sh --tree-guard A B      the two rust/ trees hold the same files
 #   ./scripts/mutants-gate.sh --disk-plan ROOT FREE_KB PER_COPY_KB RESERVE_KB WANT
 #                                                   how many jobs the free disk holds
 #   ./scripts/mutants-gate.sh --prepare-scratch WANT
@@ -539,6 +543,182 @@ mutants_prepare_scratch() {
   (( rc == 0 )) || return "$rc"
   MUTANTS_PLANNED_JOBS="${plan#jobs=}"
   MUTANTS_SCRATCH="$scr"
+}
+
+# CI-F4 (F4a, D-F4b): the two runs judge every mutant the same way. The names agree in both
+# directions, each class is the same, the test each mutant ran is the same (the path of the
+# cargo binary in argv[0] aside), both baselines are Success, and the totals add up to the
+# records. Only then is the comparison a comparison.
+compare_classes() {
+  "$PY" - "$1" "$2" <<'PY'
+import sys, json
+ref_path, new_path = sys.argv[1], sys.argv[2]
+problems = []
+
+def load(path):
+    data = json.load(open(path, encoding="utf-8"))
+    outcomes = data.get("outcomes")
+    if not isinstance(outcomes, list):
+        problems.append(f"{path} carries no per-mutant outcomes, so its classes cannot be compared")
+        return None
+    mutants, baseline = {}, None
+    for o in outcomes:
+        scenario = o.get("scenario")
+        if scenario == "Baseline":
+            baseline = o.get("summary")
+            continue
+        name = scenario["Mutant"]["name"]
+        test = next((p.get("argv") for p in o.get("phase_results", []) if p.get("phase") == "Test"), None)
+        mutants[name] = (o.get("summary"), None if test is None else test[1:])
+    recount = {
+        "caught": sum(1 for s, _ in mutants.values() if s == "CaughtMutant"),
+        "missed": sum(1 for s, _ in mutants.values() if s == "MissedMutant"),
+        "timeout": sum(1 for s, _ in mutants.values() if s == "TimeoutMutant"),
+        "unviable": sum(1 for s, _ in mutants.values() if s == "Unviable"),
+    }
+    for field, count in recount.items():
+        if data.get(field) != count:
+            problems.append(f"{path} carries no per-mutant outcomes that add up to its totals: {field} is {data.get(field)} and its records hold {count}")
+    return mutants, baseline
+
+ref = load(ref_path)
+new = load(new_path)
+if ref and new:
+    ref_mutants, ref_baseline = ref
+    new_mutants, new_baseline = new
+    if ref_baseline != "Success":
+        problems.append(f"the reference baseline is {ref_baseline}, not Success")
+    if new_baseline != "Success":
+        problems.append(f"the baseline of the new run is {new_baseline}, not Success")
+    for name in sorted(set(ref_mutants) - set(new_mutants)):
+        problems.append(f"mutant {name} is missing from the new run")
+    for name in sorted(set(new_mutants) - set(ref_mutants)):
+        problems.append(f"mutant {name} is not in the reference")
+    for name in sorted(set(ref_mutants) & set(new_mutants)):
+        ref_class, ref_test = ref_mutants[name]
+        new_class, new_test = new_mutants[name]
+        if ref_class != new_class:
+            problems.append(f"class changed for {name}: {ref_class} -> {new_class}")
+        if ref_test != new_test:
+            problems.append(f"test command changed for {name}: {ref_test} -> {new_test}")
+    if not problems:
+        print(f"OK  classes: {len(ref_mutants)}/{len(ref_mutants)} identical to {ref_path}")
+for problem in problems:
+    print(f"FAIL: {problem}", file=sys.stderr)
+sys.exit(1 if problems else 0)
+PY
+}
+
+# CI-F4 (F4b, D-F4g): the copy that cargo-mutants mutates holds the files of rust/, byte for
+# byte. The top-level target and the VCS directories are not part of either, as in copy_tree.rs.
+mutants_copy_tree() {
+  mkdir -p "$2"
+  (cd "$1" && tar --exclude=./target --exclude=.git --exclude=.hg --exclude=.svn -cf - .) | (cd "$2" && tar -xf -)
+}
+mutants_manifest() {
+  (cd "$1" && find . \( -path ./target -o -name .git -o -name .hg -o -name .svn \) -prune -o -type f -print0 \
+    | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+}
+mutants_tree_guard() { # ROOT_A ROOT_B
+  local first
+  first="$(diff <(mutants_manifest "$1") <(mutants_manifest "$2") | sed -n 's/^[<>] [0-9a-f]\{64\}  \.\/\(.*\)$/\1/p' | head -n 1 || true)"
+  if [[ -n "$first" ]]; then
+    echo "FAIL: the tree that is mutated is not the one that is judged: $first differs between $1 and $2" >&2
+    return 1
+  fi
+  echo "OK  tree: the copy that cargo mutants mutates has the files of rust/"
+}
+
+# CI-F4 (D-F4h): the mutants measured are the ones --list names, in both directions.
+mutants_set_guard() { # OUTCOMES LIST
+  "$PY" - "$1" "$2" <<'PY'
+import json, sys
+outcomes = json.load(open(sys.argv[1], encoding="utf-8"))["outcomes"]
+listed = json.load(open(sys.argv[2], encoding="utf-8"))
+measured = {o["scenario"]["Mutant"]["name"] for o in outcomes if isinstance(o.get("scenario"), dict) and "Mutant" in o["scenario"]}
+names = {m["name"] for m in listed}
+only_outcomes = sorted(measured - names)
+only_list = sorted(names - measured)
+if only_outcomes or only_list:
+    print(f"FAIL: mutant set differs: only in outcomes.json {only_outcomes}; only in --list {only_list}", file=sys.stderr)
+    sys.exit(1)
+print(f"OK  mutant set: {len(measured)} mutants, the ones --list names")
+PY
+}
+
+# CI-F4 (F4b, D-F4c..j): the dependencies of the mutants are built once per content. The
+# seed lives under the gate's cache, outside the scratch that mutants_sweep clears, and two
+# keys are kept. Nothing writes into a seed during a run: each run mutates a stage with a
+# copy of it (cp -a, so no inode is shared), and the seed is compared before and after.
+MUTANTS_SEED_FORMAT=seed-v1
+mutants_seed_inputs() { # the inputs the key is the hash of (D-F4d)
+  local f v
+  printf 'format=%s\n' "$MUTANTS_SEED_FORMAT"
+  for f in "$ROOT/rust/Cargo.lock" "$ROOT/rust/Cargo.toml" "$ROOT/rust/.cargo/config.toml" \
+    "$ROOT/.cargo/config.toml" "${CARGO_HOME:-$HOME/.cargo}/config.toml" \
+    "$ROOT/rust/rust-toolchain.toml" "$ROOT/rust/rust-toolchain"; do
+    if [[ -f "$f" ]]; then
+      printf 'file %s %s\n' "${f#"$ROOT"/}" "$(sha256sum "$f" | cut -d' ' -f1)"
+    else
+      printf 'absent %s\n' "${f#"$ROOT"/}"
+    fi
+  done
+  printf 'rustc '
+  rustc -vV
+  printf 'cargo '
+  cargo -V
+  for v in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CXX CFLAGS CXXFLAGS; do
+    printf '%s=%s\n' "$v" "${!v-}"
+  done
+  env | sed -n 's/^\(CARGO_PROFILE_\(DEV\|TEST\)_.*\)$/\1/p' | LC_ALL=C sort
+  printf 'features=\n'
+}
+mutants_seed_prune() { # keeps the two newest keys under the seed root, and only those
+  find "$SEED_ROOT" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9a-f]{64}' -printf '%T@ %p\n' \
+    | LC_ALL=C sort -rn | tail -n +3 | cut -d' ' -f2- | while IFS= read -r d; do rm -rf -- "$d"; done
+}
+mutants_seed_ensure() {
+  local key tmpdir pkg start left
+  SEED_BUILT=0
+  mutants_seed_inputs > "$OUT_DIR/seed-key.txt"
+  key="$(sha256sum "$OUT_DIR/seed-key.txt" | cut -d' ' -f1)"
+  SEED_DIR="$SEED_ROOT/$key"
+  [[ ! -d "$SEED_DIR/target" ]] || return 0
+  mkdir -p "$SEED_ROOT"
+  tmpdir="$SEED_ROOT/$key.tmp-$$"
+  rm -rf "$tmpdir"
+  mkdir -p "$tmpdir"
+  cp "$OUT_DIR/seed-key.txt" "$tmpdir/key.txt"
+  mutants_copy_tree "$ROOT/rust" "$tmpdir/src"
+  pkg="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/rust/Cargo.toml" 2>/dev/null | head -n 1 || true)"
+  start=$SECONDS
+  if ! (cd "$tmpdir/src" && CARGO_TARGET_DIR="$tmpdir/target" CARGO_PROFILE_DEV_DEBUG=0 \
+      CARGO_BUILD_JOBS="$GATE_CARGO_JOBS" cargo test --no-run --lib --package="memory-industry@$pkg"); then
+    rm -rf "$tmpdir"
+    echo "FAIL: the mutation seed did not build; its dependencies are above" >&2
+    return 1
+  fi
+  find "$tmpdir/target" \( -name '*memory-industry*' -o -name '*memory_industry*' -o -name '*cuba-memorys*' -o -name '*cuba_memorys*' \) -print0 \
+    | xargs -0 -r rm -rf --
+  left="$(find "$tmpdir/target" \( -name '*memory-industry*' -o -name '*memory_industry*' -o -name '*cuba-memorys*' -o -name '*cuba_memorys*' \) -print -quit)"
+  if [[ -n "$left" ]]; then
+    rm -rf "$tmpdir"
+    echo "FAIL: crate artifact in the seed: $left; the seed holds dependencies only" >&2
+    return 1
+  fi
+  rm -rf "$tmpdir/src"
+  mv -T "$tmpdir" "$SEED_DIR" || { rm -rf "$tmpdir"; return 1; }
+  SEED_BUILT=1
+  echo "seed: built $key in $((SECONDS - start)) s"
+  mutants_seed_prune
+}
+mutants_stage_make() { # this run's stage: a copy of rust/ and of the seed's target
+  MUTANTS_STAGE="$(mktemp -d "$MUTANTS_SCRATCH/stage.XXXXXX")"
+  mutants_copy_tree "$ROOT/rust" "$MUTANTS_STAGE/rust"
+  cp -a "$SEED_DIR/target" "$MUTANTS_STAGE/rust/target"
+}
+mutants_seed_stamp() { # path, size and mtime of every file of the seed (D-F4i)
+  (cd "$1" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)
 }
 
 # --- self-test begin ---
@@ -1939,6 +2119,14 @@ case "${1:-}" in
     check_builds "$2"
     exit $?
     ;;
+  "--compare-classes")
+    compare_classes "${2:-}" "${3:-}" || exit $?
+    exit 0
+    ;;
+  "--tree-guard")
+    mutants_tree_guard "${2:-}" "${3:-}" || exit $?
+    exit 0
+    ;;
   "--disk-plan")
     mutants_disk_plan "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
     exit $?
@@ -1994,6 +2182,11 @@ OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/memory-industry-mutants-out.XXXXXX")"
 # A green run takes its own directory away; a red one keeps it, and says where, for the diagnosis.
 mutants_keep_out() {
   local code=$?
+  # The stage is this run's and goes whatever the outcome (D-F4f); the scratch it lives in
+  # is the judge's own, so only a stage.* directly under it is ever removed.
+  if [[ -n "${MUTANTS_STAGE:-}" && "$MUTANTS_STAGE" == "${MUTANTS_SCRATCH:-}"/stage.* ]]; then
+    rm -rf "$MUTANTS_STAGE"
+  fi
   case "${OUT_DIR:-}" in
     "${TMPDIR:-/tmp}"/memory-industry-mutants-out.*) ;;
     *) return "$code" ;;
@@ -2030,8 +2223,10 @@ echo "=== cargo mutants (search cores with dense unit tests) ==="
 # judge.rs / tools.rs / full search/* generate 655 mutants (~12h) and miss
 # almost every change in untested branches (LLM resolve, ONNX decode fallback).
 # The merge judge still requires a real kill-rate check. Scope = mmr/rrf/cache.
-# --lib search:: keeps the unmutated baseline off contract tests that need
-# files outside rust/, and keeps each mutant's cargo test under a second.
+# --cargo-arg=--lib (CI-F4, F4a) builds only the lib test each mutant runs, and `-- search::`
+# filters it: without it every mutant compiled the 116 integration binaries it never ran.
+# The filter keeps the unmutated baseline off contract tests that need files outside rust/.
+MUTANTS_FILES=(--file 'src/search/mmr.rs' --file 'src/search/rrf.rs' --file 'src/search/cache.rs')
 set +e
 # Each scratch copy must build into its own target/, so unset whatever points
 # at a shared one. quality-gate.sh has done this since it was written, and its
@@ -2047,6 +2242,15 @@ unset CARGO_TARGET_DIR
 gate_cargo_jobs
 mutants_build_jobs=$(( GATE_CARGO_JOBS / MUTANTS_JOBS ))
 (( mutants_build_jobs >= 1 )) || mutants_build_jobs=1
+
+# CI-F4 (F4b): the seed is built or found, and this run's stage is a copy of rust/ with a copy
+# of the seed's target. Both before cargo mutants, never alongside it. The tree that is
+# mutated is judged the tree that is judged, and the seed is measured before the mutants run.
+SEED_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/mutants-seed"
+mutants_seed_ensure || exit $?
+mutants_stage_make || exit $?
+mutants_tree_guard "$ROOT/rust" "$MUTANTS_STAGE/rust" || exit $?
+mutants_seed_stamp "$SEED_DIR/target" > "$OUT_DIR/seed.before" || exit $?
 
 # --timeout is 180, not 90. That budget was set when this ran two at a time;
 # at six, a slow test reported TIMEOUT instead of the CAUGHT it actually was,
@@ -2066,15 +2270,25 @@ mutants_build_jobs=$(( GATE_CARGO_JOBS / MUTANTS_JOBS ))
 TMP="$SCRATCH_NATIVE" TEMP="$SCRATCH_NATIVE" TMPDIR="$MUTANTS_SCRATCH" CARGO_PROFILE_DEV_DEBUG=0 \
 CARGO_BUILD_JOBS="$mutants_build_jobs" \
 cargo mutants \
-  --file 'src/search/mmr.rs' \
-  --file 'src/search/rrf.rs' \
-  --file 'src/search/cache.rs' \
+  "${MUTANTS_FILES[@]}" \
+  --dir "$MUTANTS_STAGE/rust" \
+  --copy-target=true \
   --timeout 180 \
   --jobs "$MUTANTS_JOBS" \
   --output "$OUT_DIR" \
-  -- --lib search::
+  --cargo-arg=--lib \
+  -- search::
 mutants_rc=$?
 set -e
+
+# CI-F4 (D-F4i): a run that changed the seed is refused, and the seed goes with it.
+mutants_seed_stamp "$SEED_DIR/target" > "$OUT_DIR/seed.after" || exit $?
+if ! cmp -s "$OUT_DIR/seed.before" "$OUT_DIR/seed.after"; then
+  rm -rf "$SEED_DIR"
+  echo "FAIL: the seed changed during the run ($SEED_DIR); it is removed and the next run builds it again" >&2
+  exit 1
+fi
+echo "OK  seed unchanged"
 
 MUTANTS_JSON="$OUT_DIR/mutants.out/outcomes.json"
 if [[ ! -f "$MUTANTS_JSON" ]]; then
@@ -2082,7 +2296,23 @@ if [[ ! -f "$MUTANTS_JSON" ]]; then
   exit 1
 fi
 
+# CI-F4 (D-F4j): the compiles of the baseline say whether the seed was hit. A miss is a line,
+# not a verdict: cargo rebuilds what is missing, and the time is what the step's ceiling watches.
+if (( SEED_BUILT == 0 )); then
+  compiled="$(grep -c '^ *Compiling ' "$OUT_DIR/mutants.out/log/baseline.log" 2>/dev/null || true)"
+  noun=crates
+  (( compiled == 1 )) && noun=crate
+  if (( compiled <= 1 )); then
+    echo "seed: hit ($compiled $noun compiled in the baseline)"
+  else
+    echo "seed: miss ($compiled $noun compiled in the baseline)"
+  fi
+fi
+
 check_builds "$MUTANTS_JSON"
+
+(cd "$ROOT/rust" && cargo mutants --list --json "${MUTANTS_FILES[@]}" > "$OUT_DIR/list.json")
+mutants_set_guard "$MUTANTS_JSON" "$OUT_DIR/list.json" || exit $?
 
 MUTANTS_MIN_KILL="$MUTANTS_MIN_KILL" "$PY" - "$MUTANTS_JSON" <<'PY'
 import json, os, sys
