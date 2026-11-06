@@ -200,3 +200,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   clean at `2d61589`; judge server up; pesado free. The open question of 1d (how the fake tree gets its section
   counts) decided as D-J4e: pass 2 prints `OK  section <name>: <N> tests in <B> test binaries` per counted section
   (the per-section line §5 step 7 asks for), and the fixture calibrates its counts file from those lines once.
+- 2026-11-06 11:35 · The user: more agents, a cap of 7, faster, implementing and reviewing as we go. Read as: up to
+  7 live agents, at most 3 implementing (Swarm Forge rule), what touches the same file in series, one heavy job at a
+  time (pesado). Launched now: specifiers for F2 (ephemeral Postgres per lane), F3 (DAG + history) and F4 (mutants:
+  1053 s is the critical path by itself), a reviewer of the CI-J pass 2 code, and an implementer for the two 0.31
+  test-time lines on `release/0.31.0`. A duplicate orchestrator session (the pre-cut process of this conversation)
+  was found busy on the same tree; it stopped its implementer and stays idle, the batch continues here.
