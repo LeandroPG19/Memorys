@@ -101,3 +101,13 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   threads per lane, per-binary launcher with resource groups, critical-path dispatch with CPU+RAM admission, T/LB gap,
   Monte Carlo acceptance, HNSW notice). Three questions for the user: the ">20 %" rule, signing the `.exe`, npm trusted
   publishing.
+- 2026-11-06 07:40 · CI-J pass 1, Rust side, run against the judge's :5489. First run: 13 contracts red, of which 2 were
+  defects of the pass itself (crap-gate.sh gained `--self-test` but not a place on `SCRIPTS_WITH_SELF_TEST`; a fixture
+  of the new self-test broke the order search of `the_gpu_hole_…`), and v046 red on its own premise: `sqlx::migrate!`
+  lists both halves of each up/down pair, 65 pairs = 130 entries. Fixed in test regions (plus one duplicate helper the
+  fix introduced, caught by rust-analyzer before the run). Second run: `local_gate_contract` 40 green, 11 red, exactly
+  the expected set (7 new contracts + 4 that run the red self-tests); v046 green (1 test, 9.15 s).
+- 2026-11-06 07:45 · J2.3 sabotage, first attempt: both steps red for the wrong reason. Touching the test file
+  rebuilt the test's `MIGRATOR` (66) but not the library's (`src/db.rs:9`, 65): without a `build.rs` watching
+  `migrations/`, cargo does not rebuild the crate that embeds them. This is the `rerun-if-changed=migrations` hole of
+  plan §1, seen in practice. The script now touches `src/db.rs` too.
