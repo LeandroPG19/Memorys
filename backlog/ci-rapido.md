@@ -83,3 +83,12 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   what 10 000 find; after a red, 5 reruns confirm 87.8 %; 70 of 98 "NOD" were order-dependent. Angles D (shared state
   across processes) and E (concurrent template clones, initdb in tmpfs) kept no claim: they are measured in F0. The
   synthesis of the six runs goes to Notion (Investigación de CI II + Aplicación a MemoryIndustry).
+- 2026-11-05 20:08 · WSL restarted by the user. Lost: `/tmp` (the six research extracts, recovered from the workflow
+  journals under `~/.claude/projects/…/subagents/workflows/`) and the d3 verification run (killed, exit 137). Kept: the d3
+  diff on `release/0.31.0` (sabotage seen red at 20:03: 2 of 4 d3 tests fail with `left: InUse right: NotAssigned`,
+  reverted) and CI-J pass 1 in this tree. The judge's server `memory-industry-gate-20261028` came back stopped (exit 255,
+  `restart=no`): J6 seen in practice. Started by hand; F2 replaces it.
+- 2026-11-05 20:05 · CI-J pass 1 (tests only) written. Bash self-tests red, first line of each: merge-gate `j11_unset:
+  the gate exited 0, not 2`; run-all-tests `j16_unset: … exited 1, not 2`; mutants-gate `J5.1: … did not print the
+  12582912 KB of margin`; test-times `TT13.linux exited 2, not 0: unknown argument '--count'`; crap-gate `J1.9: … no judge
+  marker exited 0, not 2`; codigo-muerto unchanged, green. The Rust contract and v046 queued under pesado.
