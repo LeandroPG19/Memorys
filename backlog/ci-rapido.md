@@ -299,3 +299,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   The acceptance measurement needs the outcomes of a green run, which J7a removes: slice F4c
   (`MUTANTS_KEEP_OUT=<dir>` keeps a copy on any exit, refuses a non-empty dir) before measuring. Integrated state with
   CI-J2 on top being verified.
+- 2026-11-06 20:10 · CI-J2 integrated: `a9b27a1` (merge; its branch head verified: twelve self-tests, contracts
+  59/59 and 14/14, v046). F4c red `54edcc8` (MUTANTS_KEEP_OUT keeps a run's mutants.out on any exit, refuses a
+  non-empty directory), code in the tree. F4 acceptance measurement started under pesado: the self-test, then two
+  real mutants-gate runs (seed built, then hit), each compared mutant by mutant with F0's outcomes.json.
+  A suggestion of the F4 implementer kept for later: a versioned class table so --compare-classes does not depend
+  on F0's cache.
