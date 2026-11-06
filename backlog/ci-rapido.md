@@ -147,3 +147,11 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   codigo-muerto green. Measured with the old code: the self-tests of mutants-gate, run-all-tests, merge-gate and
   release leave entries in the XDG_CACHE_HOME they are given (mutants-gate 5, the others 2: the `mkdir` of
   `gate_linux_env`). The Rust contract and v046 queued under pesado behind F0.
+- 2026-11-06 09:39 · F0 run 1 (second attempt, `2d61589`) red after 723 s wall, 3503 s CPU, 10.9 GB peak:
+  `nli_entailment::a_verdict_costs_milliseconds_not_seconds` measured 1.199 s per verdict (mean of 5 after a warm-up)
+  against its 500 ms floor; the 08:49 run measured 87.6 ms. CPU pressure over the whole run was similar (PSI cpu some
+  22 s of 723 s, 3 %; the earlier run 2.7 %). Suspect: the pass-1b implementer ran six gate self-tests (fatal and
+  non-fatal) outside pesado at that time, and ONNX Runtime's spinning intra-op threads collapse when cores are taken.
+  Diagnosis queued (the test alone, three times, quiet machine), never as a verdict. Consequence for F3 whatever the
+  cause: a wall-clock latency floor cannot share the machine with other lanes; it needs an exclusive slot or a
+  CPU-time measure. Until then, no agent runs anything during an F0 run.
