@@ -3,8 +3,8 @@
 #
 # Lee trazas de strace de los pasos de test y dice que pares de pasos que el DAG puede
 # solapar tocan lo mismo: rutas, puertos, clusteres de Postgres y la base viva.
-# Esqueleto de la pasada 1: solo el autotest. Los modos --analyze y --run llegan en la
-# pasada 2; hasta entonces todo lo que no sea --self-test sale 2.
+# Modos: --self-test (autotest hermetico), --analyze (solo lee trazas) y --run (lanza
+# los pasos de test bajo strace, en serie, y analiza lo que sale). Sin strace, --run sale 2.
 set -euo pipefail
 
 # --- self-test begin ---
@@ -548,5 +548,470 @@ FAKE
 fi
 # --- self-test end ---
 
-echo "gate-audit: el modo no esta implementado todavia (pasada 1: solo el autotest)" >&2
-exit 2
+# El puerto vivo sale de gate-lock.sh (D-A11). Va despues del despacho de --self-test: el autotest no lo necesita.
+source "$(dirname "$0")/gate-lock.sh"
+
+# --- analisis (D-A1 a D-A10): trazas de strace -> hallazgos -------------------
+# Lee trazas, nunca conecta a nada (D-A5). El analizador es gawk: el awk de esta
+# maquina y de Ubuntu con gawk instalado; mawk no tiene match() con captura.
+
+ga_fail() { echo "FAIL: audit: $*" >&2; exit 2; }
+ga_usage() {
+  echo "uso: gate-audit.sh --self-test" >&2
+  echo "     gate-audit.sh --analyze <trazas> --roots <f> --steps <f> [--overlap <f>] [--keys <f>] [--pg-tcp-allowed <puerto>]" >&2
+  echo "     gate-audit.sh --run [--step <id>[,<id>...]]" >&2
+  exit 2
+}
+ga_in() { local x; for x in "${@:2}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
+GA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+read -r -d '' GA_AWK <<'AWK' || true
+function basename(p,   n, a) { n = split(p, a, "/"); return a[n] }
+function under(path, pre) {
+  if (pre == "") return 0
+  if (path == pre || index(path, pre "/") == 1) return 1
+  return substr(pre, length(pre), 1) == "." && index(path, pre) == 1
+}
+function fatal(loc, msg) {
+  printf "FAIL: audit: %s: %s\n", loc, msg > "/dev/stderr"
+  bad = 1
+  exit 2
+}
+function unq(t) { return substr(t, 2, length(t) - 2) }
+function annot(tok) {
+  if (match(tok, /<[^>]*>/)) return substr(tok, RSTART + 1, RLENGTH - 2)
+  return ""
+}
+function isunit(bin,   nm) {
+  nm = basename(bin)
+  return (bin ~ /\/deps\/[^\/]+-[0-9a-f]{16}$/) || (nm in TOOLS)
+}
+function keyof(nm) { return (nm in keymap) ? keymap[nm] : nm }
+function step_for(argv,   k) {
+  for (k = 1; k <= nsteps; k++) if (argv ~ sere[k]) return sid[k]
+  return ""
+}
+function overlap(a, b) {
+  if (a == b) return 0
+  if (a == "?" || b == "?") return 1
+  if (ovall) return 1
+  return ((a, b) in ov)
+}
+function emit(cls, p, u, r, d,   line) {
+  line = cls "\t" p "\t" u "\t" r "\t" d
+  if (line in seen) return
+  seen[line] = 1
+  nout++
+  fout[nout] = line
+  if (cls in RED) nred++
+  else ninfo++
+}
+function addev(k, kind, a, b, c, d,   i) {
+  nev[k]++
+  i = nev[k]
+  ek[k, i] = kind; ea[k, i] = a; eb[k, i] = b; ec[k, i] = c; ed[k, i] = d
+  el[k, i] = FILENAME ":" FNR
+}
+function parse_line(line,   op, cl, name, args, res, toks, nt, i, t, flags, nps, pth, pdt, dtok, rw, isopen, fam, port, bin, argv, i1, i2, child, ok, m) {
+  op = index(line, "(")
+  if (op == 0) fatal(FILENAME ":" FNR, "not a syscall line: " line)
+  name = substr(line, 1, op - 1)
+  cl = index(line, ") = ")
+  if (cl == 0) fatal(FILENAME ":" FNR, "a line with no result (cut?): " line)
+  args = substr(line, op + 1, cl - op - 1)
+  res = substr(line, cl + 4)
+  if (name == "execve") {
+    if (res !~ /^0/) return
+    if (!match(args, /"[^"]*"/)) fatal(FILENAME ":" FNR, "execve with no path")
+    bin = substr(args, RSTART + 1, RLENGTH - 2)
+    i1 = index(args, "["); i2 = index(args, "]")
+    if (i1 == 0 || i2 <= i1) fatal(FILENAME ":" FNR, "execve with no argv")
+    argv = substr(args, i1 + 1, i2 - i1 - 1)
+    gsub(/", "/, " ", argv); gsub(/"/, "", argv)
+    addev(key, "X", bin, argv, "", "")
+  } else if (name == "clone" || name == "clone3" || name == "fork" || name == "vfork") {
+    if (res !~ /^[0-9]+/) return
+    match(res, /^[0-9]+/); child = substr(res, 1, RLENGTH)
+    addev(key, "F", dir "/t." child, "", "", "")
+  } else if (name == "chdir" || name == "fchdir") {
+    if (res !~ /^0/) return
+    if (name == "chdir") {
+      if (!match(args, /"[^"]*"/)) fatal(FILENAME ":" FNR, "chdir with no path")
+      addev(key, "D", substr(args, RSTART + 1, RLENGTH - 2), "", "", "")
+    } else {
+      if (annot(args) == "") fatal(FILENAME ":" FNR, "trace without -y: fchdir with no path")
+      addev(key, "D", annot(args), "", "", "")
+    }
+  } else if (name ~ /^(open|openat|creat|mkdir|mkdirat|unlink|unlinkat|rename|renameat|renameat2|link|linkat|symlink|symlinkat)$/) {
+    isopen = (name == "open" || name == "openat" || name == "creat")
+    if (isopen) { if (res !~ /^[0-9]/) return }
+    else if (res !~ /^0/) return
+    nt = split(args, toks, ", ")
+    dtok = "AT_FDCWD"; flags = ""; nps = 0
+    for (i = 1; i <= nt; i++) {
+      t = toks[i]
+      if (substr(t, 1, 1) == "\"") { nps++; pth[nps] = unq(t); pdt[nps] = dtok; dtok = "AT_FDCWD" }
+      else if (t ~ /^(AT_FDCWD|[0-9])/) dtok = t
+      else if (flags == "" && t ~ /O_/) flags = t
+    }
+    if (nps == 0) fatal(FILENAME ":" FNR, name " with no path")
+    rw = "W"
+    if (isopen && name != "creat" && flags !~ /O_(WRONLY|RDWR|CREAT|TRUNC|APPEND)/) rw = "R"
+    for (i = 1; i <= nps; i++) addev(key, "P", pth[i], pdt[i], annot(pdt[i]), rw)
+  } else if (name == "bind" || name == "connect") {
+    if (!match(args, /sa_family=[A-Z0-9_]+/)) fatal(FILENAME ":" FNR, name " with no family")
+    fam = substr(args, RSTART + 10, RLENGTH - 10)
+    ok = (res ~ /^0/ || res ~ /^-1 EINPROGRESS/) ? "1" : "0"
+    if (fam == "AF_UNIX") {
+      if (!match(args, /sun_path="[^"]*"/)) fatal(FILENAME ":" FNR, name " AF_UNIX with no path")
+      m = substr(args, RSTART + 10, RLENGTH - 11)
+      if (name == "bind") { if (res ~ /^0/) addev(key, "P", m, "AT_FDCWD", "", "W") }
+      else addev(key, "C", fam, m, ok, "")
+    } else {
+      if (!match(args, /htons\([0-9]+\)/)) fatal(FILENAME ":" FNR, name " " fam " with no port")
+      port = substr(args, RSTART + 6, RLENGTH - 7)
+      if (name == "bind") { if (res ~ /^0/) addev(key, "B", port, "", "", "") }
+      else addev(key, "C", fam, port, ok, "")
+    }
+  } else fatal(FILENAME ":" FNR, "syscall not understood: " name)
+}
+function connect_ev(u, s, fam, val, ok,   st, port, cn, r) {
+  st = (s == "" ? "?" : s)
+  if (fam == "AF_UNIX") {
+    if (ok != "1" || val !~ /\.s\.PGSQL\.[0-9]+$/) return
+    cn = ""
+    for (r = 1; r <= nroots; r++) if (rtype[r] == "cluster" && under(val, rpre[r])) { cn = rown[r]; break }
+    if (cn != "" && ((st, cn) in sdecl_c)) { pgconn++; emit("pg-connect", st, uname[u], val, "cluster " cn) }
+    else if (cn != "") emit("pg-socket-cross", st, uname[u], val, "cluster " cn " is not declared by " st)
+    else emit("pg-socket-outside", st, uname[u], val, "no cluster root covers it")
+    return
+  }
+  port = val + 0
+  if (port == live_port + 0) { emit("live-port", st, uname[u], "tcp:" live_port, "connects to the live corpus, any result"); return }
+  if (ok != "1" || port < 5400 || port > 5599) return
+  if (port == pgallowed + 0) { pgconn++; emit("pg-connect", st, uname[u], "tcp:" port, "allowed by --pg-tcp-allowed") }
+  else emit("pg-tcp", st, uname[u], "tcp:" port, "Postgres over TCP, not allowed")
+}
+function fixed(u, s, port,   st) {
+  st = (s == "" ? "?" : s)
+  emit("fixed-port", st, uname[u], "tcp:" port + 0, "bound by a test; informative")
+  nb++
+  bport[nb] = port + 0; bu[nb] = u; bs[nb] = st
+}
+function record(u, s, p, rw) {
+  opn++
+  opath[opn] = p; ou[opn] = u; os[opn] = (s == "" ? "?" : s); orw[opn] = rw
+}
+function walk(k, cwd, unit, step,   i, n, kind, p, base, abs, s2) {
+  n = nev[k]
+  for (i = 1; i <= n; i++) {
+    kind = ek[k, i]
+    if (kind == "X") {
+      s2 = step_for(eb[k, i]); if (s2 != "") step = s2
+      if (isunit(ea[k, i])) {
+        unit = k
+        if (!(k in uname)) { uname[k] = keyof(basename(ea[k, i])); ustep[k] = (step == "" ? "?" : step); nunits++ }
+      }
+    } else if (kind == "D") {
+      p = ea[k, i]
+      if (substr(p, 1, 1) == "/" || cwd == "") cwd = p
+      else cwd = cwd "/" p
+    } else if (kind == "F") {
+      walk(ea[k, i], cwd, unit, step)
+    } else if (kind == "P") {
+      p = ea[k, i]
+      if (substr(p, 1, 1) == "/") abs = p
+      else if (eb[k, i] ~ /^AT_FDCWD/) {
+        base = (cwd != "") ? cwd : ec[k, i]
+        if (base == "") fatal(el[k, i], "relative path with no working directory: " p)
+        abs = base "/" p
+      } else {
+        if (ec[k, i] == "") fatal(el[k, i], "trace without -y: a numeric dirfd with no path behind it (" p ")")
+        abs = ec[k, i] "/" p
+      }
+      if (unit != "") record(unit, step, abs, ed[k, i])
+    } else if (kind == "C") {
+      if (unit != "") connect_ev(unit, step, ea[k, i], eb[k, i], ec[k, i])
+    } else if (kind == "B") {
+      if (unit != "" && ea[k, i] + 0 != 0) fixed(unit, step, ea[k, i])
+    }
+  }
+  if (unit == "" && step == "") orphan++
+}
+BEGIN {
+  RED["live-port"] = 1; RED["pg-tcp"] = 1; RED["pg-socket-outside"] = 1; RED["pg-socket-cross"] = 1
+  RED["cluster-write"] = 1; RED["root-intrusion"] = 1; RED["path-conflict"] = 1; RED["port-conflict"] = 1
+  TOOLS["e2e_all_tools.py"] = 1; TOOLS["mcp_live_session_test.py"] = 1; TOOLS["eval_seed.py"] = 1
+  home = ENVIRON["HOME"]
+  ovall = (ovfile == "")
+  if (pgallowed == "") pgallowed = 0
+  if (rootsf != "") while ((getline ln < rootsf) > 0) {
+    if (split(ln, f, " ") < 3) continue
+    nroots++; rtype[nroots] = f[1]; rown[nroots] = f[2]; rpre[nroots] = f[3]
+    if (f[1] == "cluster") nrc++
+  }
+  if (stepsf != "") while ((getline ln < stepsf) > 0) {
+    p1 = index(ln, " "); if (p1 == 0) continue
+    id = substr(ln, 1, p1 - 1); rest = substr(ln, p1 + 1)
+    p2 = index(rest, " "); if (p2 == 0) continue
+    rec = substr(rest, 1, p2 - 1); ere = substr(rest, p2 + 1)
+    nsteps++; sid[nsteps] = id; sere[nsteps] = ere
+    np = split(rec, parts, ",")
+    for (q = 1; q <= np; q++) {
+      if (parts[q] ~ /^target:/) sdecl_t[id, substr(parts[q], 8)] = 1
+      else if (parts[q] ~ /^cluster:/) sdecl_c[id, substr(parts[q], 9)] = 1
+    }
+  }
+  if (ovfile != "") while ((getline ln < ovfile) > 0) {
+    if (split(ln, f, " ") == 2) { ov[f[1], f[2]] = 1; ov[f[2], f[1]] = 1 }
+  }
+  if (keysf != "") while ((getline ln < keysf) > 0) {
+    if (split(ln, f, " ") == 2) keymap[f[1]] = f[2]
+  }
+}
+{
+  key = FILENAME
+  dir = FILENAME; sub(/\/[^\/]*$/, "", dir)
+  line = $0
+  if (line == "" || line ~ /^\+\+\+ / || line ~ /^--- /) next
+  if (index(line, " <unfinished ...>") > 0) { pend[key] = substr(line, 1, index(line, " <unfinished ...>") - 1); next }
+  if (index(line, " resumed>") > 0) {
+    if (!(key in pend)) fatal(FILENAME ":" FNR, "<... resumed> with no <unfinished ...> before it")
+    p = pend[key]; delete pend[key]
+    line = p substr(line, index(line, "resumed>") + 8)
+  }
+  parse_line(line)
+}
+END {
+  if (bad) exit 2
+  for (k in pend) fatal(k, "<unfinished ...> with no <... resumed> after it")
+  for (k in nev) for (i = 1; i <= nev[k]; i++) if (ek[k, i] == "F") ischild[ea[k, i]] = 1
+  for (k in nev) if (!(k in ischild)) walk(k, "", "", "")
+  if (nunits == 0) {
+    printf "FAIL: audit: no unit: no trace execs a test binary (/deps/<name>-<16 hex>) or a named tool\n" > "/dev/stderr"
+    exit 2
+  }
+  if (nrc > 0 && pgconn == 0) {
+    printf "FAIL: audit: the audit saw no connection to any cluster of --roots: no trace reaches a Postgres socket or port\n" > "/dev/stderr"
+    exit 2
+  }
+  for (i = 1; i <= opn; i++) {
+    p = opath[i]; u = ou[i]; s = os[i]; rw = orw[i]; disp = uname[u]; h = "generic"
+    for (r = 1; r <= nroots; r++) {
+      if (rtype[r] == "run" && rw == "W" && under(p, rpre[r])) {
+        if (s == rown[r]) h = "private"
+        else { h = "intrusion"; emit("root-intrusion", s, disp, p, "writes in the run directory of " rown[r]) }
+        break
+      }
+    }
+    if (h == "generic") for (r = 1; r <= nroots; r++) {
+      if (rtype[r] == "cluster" && rw == "W" && under(p, rpre[r])) { h = "cluster"; emit("cluster-write", s, disp, p, "writes under cluster " rown[r]); break }
+    }
+    if (h == "generic") for (r = 1; r <= nroots; r++) {
+      if (rtype[r] == "target" && under(p, rpre[r])) {
+        if (rw == "W" && !((s, rown[r]) in sdecl_t)) { h = "intrusion"; emit("root-intrusion", s, disp, p, "writes in target " rown[r] " without declaring it") }
+        break
+      }
+    }
+    if (h == "generic" && rw == "W" && home != "" && index(p, home "/") == 1) emit("home-write", s, disp, p, "writes under HOME")
+    if (rw == "R" && p ~ /\.onnx$/) emit("model-read", s, disp, p, "reads a model")
+    oh[i] = h
+    gp[p] = (p in gp) ? gp[p] "," i : i
+  }
+  for (p in gp) {
+    n = split(gp[p], idx, ",")
+    for (a = 1; a <= n; a++) for (b = a + 1; b <= n; b++) {
+      x = idx[a]; y = idx[b]
+      if (oh[x] != "generic" || oh[y] != "generic") continue
+      if (ou[x] == ou[y] || (orw[x] == "R" && orw[y] == "R")) continue
+      if (!overlap(os[x], os[y])) continue
+      s1 = os[x]; s2 = os[y]; if (s2 < s1) { t = s1; s1 = s2; s2 = t }
+      u1 = uname[ou[x]]; u2 = uname[ou[y]]; if (u2 < u1) { t = u1; u1 = u2; u2 = t }
+      emit("path-conflict", s1 "," s2, u1 "," u2, p, "both touch it and one of them writes")
+    }
+  }
+  for (a = 1; a <= nb; a++) for (b = a + 1; b <= nb; b++) {
+    if (bport[a] != bport[b] || bu[a] == bu[b] || !overlap(bs[a], bs[b])) continue
+    s1 = bs[a]; s2 = bs[b]; if (s2 < s1) { t = s1; s1 = s2; s2 = t }
+    u1 = uname[bu[a]]; u2 = uname[bu[b]]; if (u2 < u1) { t = u1; u1 = u2; u2 = t }
+    emit("port-conflict", s1 "," s2, u1 "," u2, "tcp:" bport[a], "both bind the same port")
+  }
+  if (orphan > 0) emit("orphan-procs", "-", "-", "-", orphan " process(es) with no unit")
+  for (i = 1; i <= nout; i++) print fout[i]
+  for (k in uname) if (!(ustep[k] in sst)) { sst[ustep[k]] = 1; nst++ }
+  printf "@@counts %d %d %d %d\n", nunits, nst, nred, ninfo
+}
+AWK
+
+ga_depends() { # <a> <b>: a depende de b, directa o transitivamente (tabla de --run)
+  local d
+  for d in ${deps_of[$1]:-}; do
+    [[ "$d" == "$2" ]] && return 0
+    ga_depends "$d" "$2" && return 0
+  done
+  return 1
+}
+
+ga_analyze() { # <trazas> <roots> <steps> <overlap|""> <keys|""> <pg-tcp-allowed> <informe|"">
+  local trdir="$1" roots="$2" steps="$3" overlap="$4" keys="$5" allowed="$6" report="$7"
+  local -a files=()
+  local f raw findings counts summary rc=0 nu ns nr ni
+  [[ -d "$trdir" ]] || ga_fail "$trdir is not a directory of traces"
+  [[ -f "$roots" ]] || ga_fail "--roots: no such file $roots"
+  [[ -f "$steps" ]] || ga_fail "--steps: no such file $steps"
+  [[ -z "$overlap" || -f "$overlap" ]] || ga_fail "--overlap: no such file $overlap"
+  [[ -z "$keys" || -f "$keys" ]] || ga_fail "--keys: no such file $keys"
+  while IFS= read -r f; do files+=("$f"); done < <(find "$trdir" -name 't.*' -type f | LC_ALL=C sort)
+  (( ${#files[@]} > 0 )) || ga_fail "no trace files (t.<pid>) under $trdir"
+  raw="$(awk -v rootsf="$roots" -v stepsf="$steps" -v ovfile="$overlap" -v keysf="$keys" -v pgallowed="$allowed" -v live_port="$GATE_LIVE_PORT" "$GA_AWK" "${files[@]}")" || rc=$?
+  (( rc == 0 )) || exit "$rc"
+  counts="$(printf '%s\n' "$raw" | grep '^@@counts' || true)"
+  findings="$(printf '%s\n' "$raw" | grep -v -e '^@@counts' -e '^$' | LC_ALL=C sort || true)"
+  read -r _ nu ns nr ni <<< "$counts"
+  if (( nr == 0 )); then summary="OK  audit: $nu units in $ns steps; 0 red, $ni info"; rc=0
+  else summary="FAIL: audit: $nr red finding(s) (above); $nu units in $ns steps"; rc=1
+  fi
+  [[ -z "$findings" ]] || printf '%s\n' "$findings"
+  printf '%s\n' "$summary"
+  if [[ -n "$report" ]]; then
+    { [[ -z "$findings" ]] || printf '%s\n' "$findings"; printf '%s\n' "$summary"; } > "$report"
+  fi
+  return "$rc"
+}
+
+ga_analyze_cli() {
+  local trdir="${1:-}" roots="" steps="" overlap="" keys="" allowed=""
+  [[ -n "$trdir" ]] || ga_usage
+  shift
+  while (( $# )); do
+    case "$1" in
+      --roots) roots="${2:-}"; shift 2 ;;
+      --steps) steps="${2:-}"; shift 2 ;;
+      --overlap) overlap="${2:-}"; shift 2 ;;
+      --keys) keys="${2:-}"; shift 2 ;;
+      --pg-tcp-allowed) allowed="${2:-}"; shift 2 ;;
+      *) ga_usage ;;
+    esac
+  done
+  [[ -n "$roots" && -n "$steps" ]] || ga_usage
+  if [[ -n "$allowed" ]]; then
+    [[ "$allowed" =~ ^[0-9]+$ ]] || ga_fail "--pg-tcp-allowed wants a port number, got $allowed"
+    (( allowed != GATE_LIVE_PORT )) || ga_fail "--pg-tcp-allowed $GATE_LIVE_PORT: that is the live corpus and is never allowed"
+  fi
+  ga_analyze "$trdir" "$roots" "$steps" "$overlap" "$keys" "${allowed:-0}" ""
+}
+
+ga_propose() { # <informe> <salida>: propuesta de grupos, fuera del fichero versionado (D-A8)
+  local sha hoy
+  sha="$(git -C "$GA_ROOT" rev-parse --short HEAD 2>/dev/null || echo none)"
+  hoy="$(date +%F)"
+  awk -F'\t' -v sha="$sha" -v hoy="$hoy" '
+    function add(unit, g) {
+      if (index("," grp[unit] ",", "," g ",") == 0) grp[unit] = (grp[unit] == "" ? g : grp[unit] "," g)
+    }
+    NF == 5 {
+      cls = $1; u = $3; r = $4
+      if (cls == "path-conflict") {
+        if (!(r in pid)) { np++; pid[r] = "p" np; hdr[np] = "# path:" pid[r] " " r }
+        n = split(u, us, ",")
+        for (q = 1; q <= n; q++) add(us[q], "path:" pid[r])
+      } else if (cls == "fixed-port") { split(r, t, ":"); add(u, "port:" t[2]) }
+      else if (cls == "pg-connect") add(u, "db")
+      else if (cls == "model-read") add(u, "models")
+    }
+    END {
+      for (q = 1; q <= np; q++) print hdr[q]
+      for (u in grp) print u " " grp[u] " " sha " " hoy " audit"
+    }' "$1" | LC_ALL=C sort > "$2"
+}
+
+ga_run() { # --run: la auditoria de verdad, en serie y con la tabla de gate-dag.txt (D-A7, D-A8)
+  local only="" run="" max used tblines incomplete="" line idx id deps rec cls order ere
+  local tree_key t c arc=0 rc traced part gen
+  local -a ids=() parts=() only_ids=() words=() rows=()
+  local -A deps_of=() cls_of=()
+  local -A traced_id=([D1]=1 [D2]=1 [NLI]=1 [D3]=1 [R]=1 [E]=1 [DC]=1 [CV]=1 [M]=1)
+  while (( $# )); do
+    case "$1" in
+      --step) only="${2:-}"; shift 2 ;;
+      *) ga_usage ;;
+    esac
+  done
+  command -v strace >/dev/null 2>&1 || ga_fail "strace is not installed (command -v strace found nothing). The audit is never skipped: install it (sudo apt install strace) and run it again."
+  local sv
+  sv="$(strace -V 2>/dev/null | sed -n '1s/.*version \([0-9][0-9.]*\).*/\1/p')"
+  [[ -n "$sv" ]] || ga_fail "cannot read the strace version (strace -V)"
+  [[ "$(printf '%s\n' 5.3 "$sv" | LC_ALL=C sort -V | head -n1)" == 5.3 ]] || ga_fail "strace $sv is older than 5.3: --seccomp-bpf together with -y needs it"
+  local table="$GA_ROOT/scripts/gate-dag.txt"
+  [[ -f "$table" ]] || ga_fail "needs scripts/gate-dag.txt (F3.3)"
+  max="${GATE_AUDIT_MAX_GB:-20}"
+  [[ "$max" =~ ^[0-9]+$ ]] || ga_fail "GATE_AUDIT_MAX_GB must be a whole number of gigabytes, got $max"
+  run="${GATE_AUDIT_RUN:-}"
+  [[ -n "$run" ]] || run="$(mktemp -d "${TMPDIR:-/tmp}/memory-industry-audit.XXXXXX")"
+  gen="$run/audit/gen"
+  mkdir -p "$gen"
+  tree_key="$(basename "$GA_ROOT")-$(realpath "$GA_ROOT" | sha256sum | cut -c1-12)"
+  : > "$gen/steps"; : > "$gen/roots"; : > "$gen/overlap"
+  tblines="$(grep -v -e '^#' -e '^[[:space:]]*$' "$table" | LC_ALL=C sort -k1,1n || true)"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    rows+=("$line")
+    read -r idx id deps rec cls _ _ _ order <<< "$line"
+    ids+=("$id"); deps_of[$id]="$deps"; cls_of[$id]="$cls"
+    ere="$(printf '%s' "$order" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g')"
+    printf '%s %s %s\n' "$id" "$rec" "$ere" >> "$gen/steps"
+    printf 'run %s %s/tmp/%s\n' "$id" "$run" "$id" >> "$gen/roots"
+    IFS=',' read -r -a parts <<< "$rec"
+    for part in "${parts[@]}"; do
+      case "$part" in
+        target:*) t="${part#target:}"; [[ -z "${GATE_TARGET_ROOT:-}" ]] || printf 'target %s %s/%s/%s\n' "$t" "$GATE_TARGET_ROOT" "$tree_key" "$t" >> "$gen/roots" ;;
+        cluster:*) c="${part#cluster:}"; [[ -z "${GATE_CLUSTER_ROOT:-}" ]] || printf 'cluster %s %s/%s.\n' "$c" "$GATE_CLUSTER_ROOT" "$c" >> "$gen/roots" ;;
+      esac
+    done
+  done <<< "$tblines"
+  local i j a b
+  for ((i = 0; i < ${#ids[@]}; i++)); do
+    for ((j = i + 1; j < ${#ids[@]}; j++)); do
+      a="${ids[i]}"; b="${ids[j]}"
+      [[ "${cls_of[$a]}" == exclusive || "${cls_of[$b]}" == exclusive ]] && continue
+      ga_depends "$a" "$b" && continue
+      ga_depends "$b" "$a" && continue
+      printf '%s %s\n' "$a" "$b" >> "$gen/overlap"
+    done
+  done
+  if [[ -n "$only" ]]; then IFS=',' read -r -a only_ids <<< "$only"; fi
+  for line in "${rows[@]}"; do
+    read -r idx id deps rec cls _ _ _ order <<< "$line"
+    read -r -a words <<< "$order"
+    traced=0
+    if [[ -n "${traced_id[$id]:-}" ]]; then
+      if [[ -z "$only" ]] || ga_in "$id" "${only_ids[@]}"; then traced=1; fi
+    fi
+    mkdir -p "$run/audit/$idx-$id"
+    rc=0
+    if (( traced )); then
+      strace --seccomp-bpf -f -ff -y -qq -e signal=none \
+        -e trace=execve,clone,clone3,fork,vfork,chdir,fchdir,open,openat,creat,mkdir,mkdirat,rename,renameat,renameat2,unlink,unlinkat,link,symlink,bind,connect \
+        -o "$run/audit/$idx-$id/t" -- "${words[@]}" >"$run/audit/$idx-$id.log" 2>&1 || rc=$?
+    else
+      "${words[@]}" >"$run/audit/$idx-$id.log" 2>&1 || rc=$?
+    fi
+    used="$(du -sb "$run/audit" | cut -f1)"
+    (( used <= max * 1073741824 )) || ga_fail "the traces in $run/audit weigh $used bytes, over GATE_AUDIT_MAX_GB=$max; they are kept, not truncated"
+    (( rc == 0 )) || incomplete+="$id exited $rc; "
+  done
+  ga_analyze "$run/audit" "$gen/roots" "$gen/steps" "$gen/overlap" "" 0 "$run/audit/report.tsv" || arc=$?
+  (( arc != 2 )) || exit 2
+  ga_propose "$run/audit/report.tsv" "$run/audit/groups.proposed.txt"
+  if [[ -n "$incomplete" ]]; then
+    echo "FAIL: audit: incomplete: $incomplete the findings above are what the audit could see, not a verdict" >&2
+    exit 2
+  fi
+  exit "$arc"
+}
+
+case "${1:-}" in
+  --analyze) shift; ga_analyze_cli "$@" ;;
+  --run) shift; ga_run "$@" ;;
+  *) ga_usage ;;
+esac

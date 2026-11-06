@@ -53,6 +53,10 @@
 GATE_LOCK="$HOME/.cache/cuba-gate/lock"
 GATE_LOCK_HELD=""
 GATE_OWNER=""
+# The live corpus port (D-A11): the one place the port is spelled as code. The scripts
+# that must refuse it read this name, not the number.
+# shellcheck disable=SC2034 # read by the scripts that source this one
+GATE_LIVE_PORT=5488
 
 # Field 22 of /proc/<pid>/stat, read after the last ')' because field 2 is the
 # command name in parentheses and may hold spaces. Prints nothing for a pid that
