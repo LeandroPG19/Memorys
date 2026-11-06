@@ -261,3 +261,11 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   in one function; behaviour checked byte for byte; full battery running. Debt noted by the improver: JSON fields
   read with grep in the eval judgement, restore-db.sh cutting the URL at the first `@`, one unreachable branch in
   eval_seed.py.
+- 2026-11-06 16:00 · CI-J improver committed: `4995f64` (eval_seed.py to CC ≤ 6, and 100755: a latent abad416 defect
+  caught by every_gate_entry_point_is_executable_in_the_index once the file was tracked) and `0072de8` (cgroup reader
+  split, one empty-URL refusal); contract 54/54, the full battery green, sabotages red. CI-J architect reviewing.
+  **F3.2 green: `d060c25`** (gate-dag.py): contract 14/14, sabotages D1, D2, D3b, D4, D7, D10 (both guards), D11 red;
+  its improver started. F3.0 pass 2 written; one frozen row (A13) unreachable because the fake strace logged after
+  `shift` emptied its arguments: pass 1b keeps the content checks and fixes the fake. CI-F1: two more fixture
+  contradictions from old CI-J rows (j15 reads one line of sysid; the lock rows' fake tree lacked the cheap-step
+  tools) — pass 1b-bis approved, the code proven in scratch.
