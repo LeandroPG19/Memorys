@@ -1431,7 +1431,11 @@ fn the_gate_does_not_build_through_build_gpu_or_a_nested_scope() {
         if trimmed.starts_with('#') {
             continue;
         }
-        let first = trimmed.split_whitespace().next().unwrap_or("");
+        let first = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| c == '"' || c == '\'');
         assert!(
             !first.ends_with("build-gpu.sh") && first != "systemd-run" && first != "nice",
             "scripts/run-all-tests.sh line {} runs `{trimmed}` itself: the judge's release build is \
