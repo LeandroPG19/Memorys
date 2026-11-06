@@ -287,3 +287,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   0e6262c (1b), bf56106 (1c). F4 (faster mutants, the critical path) and CI-J2 (architect follow-ups) started in
   worktrees `Memorys-ci-f4` and `Memorys-ci-j2` from `d80095a`, each writing tests in the tree and code in scratch.
   F3.0 1c red `75a85d9` (D-A11), its code being verified; F3.2 green and improved on its branch (`da7c140`).
+- 2026-11-06 18:30 · **F3.0 and F3.2 green and integrated: feat/ci-rapido at `e0b6fb7`** (CI-J + CI-F1 + F3.0
+  gate-audit.sh + F3.2 gate-dag.py). The integrated state verified in one run (own target, crate cleaned):
+  local_gate_contract 58/58, gate_dag_contract 14/14, v046 green, nine hermetic self-tests OK. F3.0's reds: e584abc,
+  51af2dd (fake strace, A0b, A7c), 1b02e33 (D-A11); code 8aa2648. F3.2's red bfe21d8 (rebased), code and improver on
+  top. Still open in F3: F3.1 (history module), F3.3–F3.5 (wiring the DAG into merge-gate), after F2.
