@@ -168,3 +168,13 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   the frozen regions. The error started in spec §10, which assigned it to pass 2. Pass 1c (tests only): every
   self-test region that reaches `gate_linux_env` sets its own HOME and XDG_CACHE_HOME on entry, and the J7a row points
   XDG_CACHE_HOME at its fixture so its sentinel means something again (A1). Pass 2 set aside again as stash `6fbaf47`.
+- 2026-11-06 10:40 · **F0 run 1 complete** (`2d61589`, uncut, nothing else of mine running): exit 1 at the very end
+  (test-times), 2121 s wall (35.3 min), 23362 s CPU, memory peak 35.0 GiB (the cap was 36), PSI cpu some 751 s.
+  Mutants: 54 in 18 min, 53 caught, 1 unviable, kill rate 1.000. Steps: mutants 1053 s; `--features docs` 261 s;
+  `cargo test` 247 s; reranker 237 s; E2E 102 s; `--ignored` 79 s; crap 54 s; clippy 22 s; the rest under 22 s.
+  The release build and the placement table came out cached (they took 170 s and 154 s in the 08:49 run): the
+  starting state is not the same as a cold crate, so both F0 runs start from this one's state. Mutation is the
+  critical path by itself: 1053 s at J=6 against the 418 s the plan estimated at J=4 (Estimated → Measured).
+  The red: two lines of `scripts/test-time-ceilings.txt` on `release/0.31.0` — the Windows line of
+  `v029_doctor_reads_only_its_world` expired on 2026-10-31, and `v029_accounts_over_real_http` took 10.41 s, under
+  its 16 s floor (the ratchet works both ways). Both block the 0.31 verdict as well; fixed in their own slice.
