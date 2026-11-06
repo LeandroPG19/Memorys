@@ -596,8 +596,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
     || self_fail "after_tests: while the tests ran, the exit file did not say so: $(grep 'run.exit reads' "$tmp/after_tests.out")"
 
   # The time of every test binary is judged last, after mutants-gate.sh, over the
-  # gate's own log up to the npm step (G7): a time red is drift and not broken
-  # behaviour, so the same run still gives the verdicts of codigo-muerto,
+  # gate's own log up to the line printed after the --features docs step (G7, D-F2c):
+  # a time red is drift and not broken behaviour, so the same run still gives the verdicts of codigo-muerto,
   # crap-gate and the mutation. What it says is the gate's verdict: a 1 or a 2
   # from it is the exit of the gate, in the exit file, with no receipt.
   fake_tree times_last "$tests_step"
@@ -611,11 +611,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
   times_at="$(step_at times_last '^test-times ')"
   [[ -n "$docs_at" && -n "$muerto_at" && -n "$crap_at" && -n "$mutants_at" && -n "$times_at" ]] \
     || self_fail "times_last: a step is missing from the order (docs '$docs_at', codigo-muerto '$muerto_at', crap-gate '$crap_at', mutants-gate '$mutants_at', test-times '$times_at'): $(steps_of times_last)"
-  (( docs_at < muerto_at && muerto_at < crap_at && crap_at < mutants_at && mutants_at < times_at )) \
-    || self_fail "times_last: test-times is not the last step, after cargo test --features docs, codigo-muerto, crap-gate and mutants-gate: $(steps_of times_last)"
-  grep -qxF "test-times --judge $tmp/times_last/home/.cache/cuba-gate/merge-gate.log --until === npm wrapper smoke ===" "$tmp/times_last/home/steps" \
-    || self_fail "times_last: test-times was not called as --judge <the gate's own log> --until '=== npm wrapper smoke ===': $(steps_of times_last)"
-  for line in '=== cargo clippy/test --features docs ===' '=== npm wrapper smoke ==='; do
+  (( muerto_at < docs_at && docs_at < crap_at && crap_at < mutants_at && mutants_at < times_at )) \
+    || self_fail "times_last: the order is not codigo-muerto (before the first cargo call that compiles), cargo test --features docs, crap-gate, mutants-gate, test-times: $(steps_of times_last)"
+  grep -qxF "test-times --judge $tmp/times_last/home/.cache/cuba-gate/merge-gate.log --until === end of timed steps ===" "$tmp/times_last/home/steps" \
+    || self_fail "times_last: test-times was not called as --judge <the gate's own log> --until '=== end of timed steps ===': $(steps_of times_last)"
+  for line in '=== cargo clippy/test --features docs ===' '=== end of timed steps ==='; do
     tr -d '\r' <"$tmp/times_last/home/times.seen" 2>/dev/null | grep -qxF "$line" \
       || self_fail "times_last: the log test-times was handed did not hold '$line' yet, so it judged a log cut before the boundary: $(cat "$tmp/times_last/home/times.seen" 2>/dev/null || true)"
   done
@@ -1058,7 +1058,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     [[ -z "$(grep -vxF -- "$j15_url" "$tmp/j15/home/$f")" ]] \
       || self_fail "j15: $f holds a DATABASE_URL other than the verified one: $(cat "$tmp/j15/home/$f")"
   done
-  [[ "$(cat "$tmp/j15/home/rat.sysid" 2>/dev/null || true)" == 7701731310526959658 ]] \
+  [[ "$(tail -n1 "$tmp/j15/home/rat.sysid" 2>/dev/null || true)" == 7701731310526959658 ]] \
     || self_fail "j15: run-all-tests did not get the system_identifier the guard read: '$(cat "$tmp/j15/home/rat.sysid" 2>/dev/null || true)'"
 
   # gate_linux_env (gate-lock.sh): what a gate run on Linux hands to cargo, to the
@@ -1239,8 +1239,8 @@ exit 0'
   run_copy f2until ""
   (( rc == 0 )) || self_fail "F2.3: a gate whose every step passed exited $rc: $(cat "$tmp/f2until.out")"
   until_arg="$(sed -n 's/^test-times .*--until //p' "$tmp/f2until/home/steps" | tail -1)"
-  [[ -n "$until_arg" && "$until_arg" != '=== npm wrapper smoke ===' ]] \
-    || self_fail "F2.3: test-times was told to stop at '$until_arg', which is not a boundary printed after the --features docs step"
+  [[ "$until_arg" == '=== end of timed steps ===' ]] \
+    || self_fail "F2.3: test-times was told to stop at '$until_arg', not at the line the gate prints after the --features docs step ('=== end of timed steps ===')"
   seen="$tmp/f2until/home/times.seen"
   docs_at="$(grep -nxF '=== cargo clippy/test --features docs ===' "$seen" | head -1 | cut -d: -f1)"
   bound_at="$(grep -nxF -- "$until_arg" "$seen" | head -1 | cut -d: -f1)"

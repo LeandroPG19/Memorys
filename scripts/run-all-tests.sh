@@ -339,6 +339,15 @@ if [[ "${1:-}" == "--self-test" ]]; then
   }
   gate_tree tree2
   gate_tree tree4
+  # CI-F1 (1b-bis): merge-gate runs its cheap steps before run-all-tests, so this tree
+  # gives them what they need: a codigo-muerto that passes, and the three models on the
+  # HOME this run looks for them under, so run-all-tests --check-models passes too.
+  printf '#!/bin/sh\nexit 0\n' >"$tmp/tree2/scripts/codigo-muerto.sh"
+  chmod +x "$tmp/tree2/scripts/codigo-muerto.sh"
+  mkdir -p "$tmp/home2/.cache/memory-industry/models" "$tmp/home2/.cache/memory-industry/reranker"
+  : >"$tmp/home2/.cache/memory-industry/models/model_quantized.onnx"
+  : >"$tmp/home2/.cache/memory-industry/models-nli"
+  : >"$tmp/home2/.cache/memory-industry/reranker/model.onnx"
   mkdir -p "$tmp/home2/.cache/cuba-gate" "$tmp/bin"
   printf '0\n' >"$tmp/home2/.cache/cuba-gate/run.exit"
   # merge-gate.sh reads the answer of pg_isready for the port it prints, so the
@@ -351,6 +360,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # two pass here and the first cargo that fails is still this script's own.
   printf '%s\n' '#!/bin/sh' \
     'case "$1" in audit|deny) exit 0;; esac' \
+    'if [ "$1" = fmt ] && [ -n "$CUBA_GATE_LOCK_OWNER" ]; then n="$(cat "$HOME/fmt.calls" 2>/dev/null || echo 0)"; echo "$((n + 1))" >"$HOME/fmt.calls"; [ "$n" -eq 0 ] && exit 0; fi' \
     'if [ -n "$CUBA_GATE_LOCK_OWNER" ] && [ "$(cat "$HOME/.cache/cuba-gate/lock/owner" 2>/dev/null)" = "$CUBA_GATE_LOCK_OWNER" ]; then' \
     '  echo "stand-in cargo: the lock is still the one merge-gate took"' \
     'fi' \
@@ -968,7 +978,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
       self_fail "F3.3 ($2): the E2E ran on a binary that had changed"
     fi
   }
-  sha_row f33a --no-run
+  # F3.3 row for a change made inside the --no-run call is not in this file on purpose
+  # (F-b, 6-nov): that call is the one that creates the binary and D-F3b takes the sha256
+  # baseline after it, so a change made there is the baseline and cannot be seen as a change.
+  # --bins (inside B3g) and gpu:: (after the --no-run, before the E2E) cover the order.
   sha_row f33b --bins
   sha_row f33c 'gpu::'
   grep -qF 'sha256 changed before E2E' "$tmp/f33c.out" \
