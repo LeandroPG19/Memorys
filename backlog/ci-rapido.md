@@ -320,3 +320,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   crates for the profile, not the mtimes; no conclusion taken from it. Left as debt: the first build per lab (~55 s
   on the critical path) and renaming the misleading `seed: miss` line (it counts the labs' first builds). F4 accepted
   as measured: 279 s, 54/54 classes. F4 rebased onto 0349cb9; integrated verification queued.
+- 2026-11-06 21:40 · **F4 integrated: `eb91db1`** (merge; branch head verified integrated: twelve self-tests,
+  local_gate_contract 61/61, gate_dag_contract 14/14, v046). feat/ci-rapido now carries CI-J, CI-J2, CI-F1, F3.0,
+  F3.2 and F4. F2 started in worktree `Memorys-ci-f2` from `a9fd82c`. A new marked throwaway judge server for the
+  CI-J guard: container `memory-industry-gate-20261106` on 127.0.0.1:5490, pgvector:pg18,
+  cluster_name=memory-industry-gate, durability off, restart unless-stopped (the old :5489 one stays for the old
+  judge's F0 run 2). First full run of the new judge in series (F1+F4, before F2/F3 wiring) started under pesado,
+  measured like F0.
