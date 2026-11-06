@@ -111,3 +111,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   rebuilt the test's `MIGRATOR` (66) but not the library's (`src/db.rs:9`, 65): without a `build.rs` watching
   `migrations/`, cargo does not rebuild the crate that embeds them. This is the `rerun-if-changed=migrations` hole of
   plan §1, seen in practice. The script now touches `src/db.rs` too.
+- 2026-11-06 08:05 · J2.3 sabotage, second attempt (the script touches `src/db.rs` too): step 1 red with "contains null
+  values", step 2 red with "the schema differs" and probe_idx on cuts 17, 25, 33, 34, 35, 38; removed, green (6.52 s);
+  `git status` of `rust/migrations` and `rust/src` empty. Outside the self-test regions the gate scripts are byte-equal
+  to HEAD (one header comment added above crap-gate's new region). Commit `045811d` test(rojo); handoff
+  `ci-rapido-J-pasada1.yml` validated (`OK implementador->implementador`).
+- 2026-11-06 08:10 · CI-J pass 2 (code) handed to an implementer. F0 run 1 queued on `release/0.31.0` at `2d61589`.
