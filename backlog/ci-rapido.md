@@ -244,3 +244,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   2–4 h of the shared lock). F3.0 (`gate-audit.sh`) and F3.2 (`gate-dag.py` + `gate_dag_contract.rs`) are new files:
   their pass 1 started in worktrees `Memorys-ci-f3audit` and `Memorys-ci-f3dag`. CI-F1 pass 1 written in
   `Memorys-ci-f1`, being verified.
+- 2026-11-06 14:00 · **CI-J green: `abad416`** (feat(gate), J1–J7). Verified with the crate cleaned: local_gate_contract
+  54/54, v046 green, eight self-tests OK and hermetic, validar-handoff `tests: frozen` against `cb8b0b9`; sabotages
+  red: X1, X3, X3b, N5 (contracts) and P1-a, P1-b, P1-c (rows). Red commits of the slice: 045811d, a5429ff,
+  710943a, 171cb2b, cb8b0b9. The three pass 2 stashes stay (the command guard refuses dropping a stash; the code
+  is committed). Next for CI-J: improver → architect → hardener → qa. CI-F1 being rebased onto `abad416` (one
+  conflict in a self-test row, resolved by its implementer). F3.0 and F3.2 pass 1 written, their reds queued.
+  strace 6.19 installed (recorded with its rollback).
