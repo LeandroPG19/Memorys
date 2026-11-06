@@ -189,3 +189,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   through the region change; v046 green; eight self-tests hermetic). Handoff `ci-rapido-J-pasada1c.yml` validated.
   Pass 2 reapplied from stash `6fbaf47` without conflicts, 1c regions intact; the implementer removes the
   `gate-lock.sh` block (A2) and runs the hermetic bash self-tests to green.
+- 2026-11-06 11:50 · Pass 2 green in seven of eight self-tests (merge-gate, mutants-gate incl. J7 and the J7a sabotage
+  seen red in scratch, test-times, crap-gate, codigo-muerto, quality-gate, release); the `gate-lock.sh` block (A2) is
+  gone. run-all-tests stopped on two fixture defects of the frozen region (C1: the fake tree lacks `test-times.sh`;
+  C2: the fake cargo prints one `Running` header for several `--test`). Pass 1d fixes both. To end the ping-pong, a
+  test pass is now proven in a scratch copy with the pass 2 patch applied (green) and in the clean tree (red)
+  before its red commit. Pass 2 set aside as stash `0ac9458` and patch `pasada2c-wip.patch`.
