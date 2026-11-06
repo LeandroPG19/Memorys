@@ -1252,9 +1252,10 @@ self_test() {
 
   fresh
   in_tree clean DATABASE_URL='postgresql://gate:pw0@127.0.0.1:5489/brain' FAKE_PSQL_CLUSTER_NAME=memory-industry-gate --
-  if any_said 'FAIL' || ! ran_mutants; then
-    self_fail "J1.9: the judge's own marked server was refused, or cargo mutants did not run after it (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
-  fi
+  any_said 'OK  judge server' \
+    || self_fail "J1.9: the judge's own marked server did not pass the guard (no 'OK  judge server' line): $(cat "$tmp/run.out" "$tmp/run.err")"
+  ran_mutants \
+    || self_fail "J1.9: the marked server passed the guard, and cargo mutants was not called after it (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
   grep -q 'default_transaction_read_only=on' "$tmp/psql.calls" 2>/dev/null \
     || self_fail "J1.9: the marked server was not asked in read-only mode: $(cat "$tmp/psql.calls" 2>/dev/null || echo 'psql was not called')"
 
@@ -1262,6 +1263,24 @@ self_test() {
   in_tree clean --
   ran_mutants || self_fail "J1.9: with no DATABASE_URL the step did not run cargo mutants as it always did (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
   [[ ! -e "$tmp/psql.calls" ]] || self_fail "J1.9: with no DATABASE_URL the step asked a server: $(cat "$tmp/psql.calls")"
+
+  # J7 (D-J7a): two runs in a row of the main path, with the cargo stand-in, write to two
+  # output directories, and a run never removes a directory it did not make. A sentinel in
+  # the fixed directory the old script removed first is still there after the second run.
+  # The run's TMPDIR is not $sys: gate_linux_env moves it to the cache of its HOME, so the
+  # fixed directory is the one under $home/.cache/memory-industry-gate/tmp.
+  fresh
+  mkdir -p "$home/.cache/memory-industry-gate/tmp/memory-industry-mutants-out"
+  : >"$home/.cache/memory-industry-gate/tmp/memory-industry-mutants-out/centinela"
+  in_tree clean --
+  ran_mutants || self_fail "J7: the first run did not reach cargo mutants (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  first_out="$(sed -n 's/.*--output \([^ ]*\).*/\1/p' "$tmp/cargo.calls" | tail -1)"
+  in_tree clean --
+  second_out="$(sed -n 's/.*--output \([^ ]*\).*/\1/p' "$tmp/cargo.calls" | tail -1)"
+  [[ -n "$first_out" && -n "$second_out" && "$first_out" != "$second_out" ]] \
+    || self_fail "J7: two runs in a row wrote their mutants to the same output directory ('$first_out' and '$second_out'): a run removes what the other one is using"
+  [[ -e "$home/.cache/memory-industry-gate/tmp/memory-industry-mutants-out/centinela" ]] \
+    || self_fail "J7: a run removed the fixed output directory of an earlier run, sentinel and all"
 
   echo "OK  self-test: a build rustc refused with a diagnostic stays unviable; an NTSTATUS,"
   echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log,"

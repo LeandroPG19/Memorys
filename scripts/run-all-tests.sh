@@ -538,10 +538,14 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # real script hands to each one and the exit it reaches. cargo logs every call;
   # FAKE_CARGO_FAIL names the subcommand that fails (FAKE_CARGO_FAIL_EXIT is its
   # code), FAKE_CARGO_TEST_COUNT is what each test run reports, and
-  # FAKE_CARGO_BUILD_EXE is the executable a build reports with --message-format.
-  # psql answers the catalog queries and the count of brain_observations
-  # (FAKE_OBS). df reports FAKE_DF_GB. The binary logs its doctor and eval calls;
-  # eval reports FAKE_NDCG, FAKE_SCORED and FAKE_OBS. Nothing here reaches a server.
+  # FAKE_CARGO_BUILD_EXE is the executable a build reports with --message-format
+  # (by default the binary the build put under CARGO_TARGET_DIR). cargo test prints
+  # what cargo prints: a Running header and a test result line per binary.
+  # full_run writes FAKE_OBS lines as the fixture smoke-corpus.jsonl, and psql counts
+  # FAKE_SEEDED of them (by default the fixture's lines). FAKE_PSQL_* set the judge's
+  # identity, which psql answers for pg_control_system. df reports FAKE_DF_GB. The
+  # binary logs its doctor and eval calls; eval reports FAKE_NDCG and FAKE_SCORED.
+  # Nothing here reaches a server.
   full_tree() {
     local name="$1" t="$tmp/$1"
     mkdir -p "$t/scripts" "$t/rust/tests" "$t/rust/eval-datasets" "$t/rust/target/debug/deps" \
@@ -562,7 +566,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'case "$1" in' \
       '  eval)' \
       '    echo "DATABASE_URL=${DATABASE_URL-unset} $*" >>"$HOME/eval.calls"' \
-      '    printf "{\"ndcg_at_k\": %s, \"queries_scored\": %s, \"observations\": %s}\n" "${FAKE_NDCG-0.8}" "${FAKE_SCORED-5}" "${FAKE_OBS-5}" ;;' \
+      '    printf "{\"metrics\": {\"ndcg_at_k\": %s, \"sample_count\": %s}}\n" "${FAKE_NDCG-0.8}" "${FAKE_SCORED-5}" ;;' \
       '  doctor) [ "${2:-}" = --json ] && echo "{\"checks\":[]}" ;;' \
       'esac' \
       'exit 0' >"$t/standin/memory-industry"
@@ -573,17 +577,23 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'case "$*" in *--release*) [ -e "$CARGO_TARGET_DIR/release/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/release/memory-industry" ;; esac' \
       'if [ "$1" = build ]; then' \
       '  [ -e "$CARGO_TARGET_DIR/debug/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/debug/memory-industry"' \
-      '  case "$*" in *--message-format=*) [ -z "${FAKE_CARGO_BUILD_EXE:-}" ] || echo "{\"reason\":\"compiler-artifact\",\"executable\":\"$FAKE_CARGO_BUILD_EXE\"}" ;; esac' \
+      '  case "$*" in *--message-format=*) echo "{\"reason\":\"compiler-artifact\",\"executable\":\"${FAKE_CARGO_BUILD_EXE:-$CARGO_TARGET_DIR/debug/memory-industry}\"}" ;; esac' \
       'fi' \
-      'if [ "$1" = test ]; then echo "test result: ok. ${FAKE_CARGO_TEST_COUNT:-3} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"; fi' \
+      'if [ "$1" = test ]; then' \
+      '  n="${FAKE_CARGO_TEST_COUNT:-3}"' \
+      '  echo "     Running tests/fixture.rs (target/debug/deps/fixture-0000)"' \
+      '  echo "running $n tests"' \
+      '  echo "test result: ok. $n passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"' \
+      'fi' \
       'exit 0' >"$t/bin/cargo"
     printf '%s\n' '#!/bin/sh' \
       'echo "$*" >>"$HOME/psql.calls"' \
       'case "$*" in' \
+      '  *pg_control_system*) echo "${FAKE_PSQL_CLUSTER_NAME-memory-industry-gate}|${FAKE_PSQL_SYSID-7701731310526959658}" ;;' \
       '  *atttypmod*) echo 384 ;;' \
       '  *information_schema.tables*) echo 20 ;;' \
       '  *shobj_description*) echo "" ;;' \
-      '  *brain_observations*) echo "${FAKE_OBS-5}" ;;' \
+      '  *brain_observations*) echo "${FAKE_SEEDED-${FAKE_OBS-5}}" ;;' \
       'esac' \
       'exit 0' >"$t/bin/psql"
     printf '%s\n' '#!/bin/sh' \
@@ -591,14 +601,26 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'printf "Avail\n%sG\n" "${FAKE_DF_GB-100}"' >"$t/bin/df"
     printf '%s\n' '#!/bin/sh' 'echo "docker $*" >>"$HOME/docker.calls"' 'exit 1' >"$t/bin/docker"
     printf '%s' "$t/standin/memory-industry" >"$t/home/standin.path"
+    # The seeder of the eval (scripts/eval_seed.py, D-J3a). This one seeds nothing: it
+    # records its arguments, and the count psql answers is what FAKE_SEEDED says.
+    printf '%s\n' 'import os, sys' \
+      'open(os.environ["HOME"] + "/seed.calls", "a").write(" ".join(sys.argv[1:]) + "\n")' \
+      >"$t/scripts/eval_seed.py"
     chmod +x "$t"/scripts/*.sh "$t"/bin/* "$t"/standin/*
   }
   # full_run NAME [VAR=value ...]: the whole script in NAME's tree, against the judge's
   # test URL, with the sweep and the free-space floor off unless a row says otherwise.
   # Its exit lands in $rc and what it printed in $tmp/NAME.out.
   full_run() {
-    local name="$1" t="$tmp/$1"
+    local name="$1" t="$tmp/$1" obs=5 arg n
     shift
+    for arg in "$@"; do
+      case "$arg" in FAKE_OBS=*) obs="${arg#FAKE_OBS=}" ;; esac
+    done
+    : >"$t/rust/eval-datasets/smoke-corpus.jsonl"
+    for ((n = 1; n <= obs; n++)); do
+      printf '{"content":"fake observation %d"}\n' "$n" >>"$t/rust/eval-datasets/smoke-corpus.jsonl"
+    done
     rc=0
     env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT HOME="$t/home" \
       PATH="$t/bin:/usr/bin:/bin" DATABASE_URL="$rat_url" CARGO_TARGET_DIR="$t/target" \
@@ -663,6 +685,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
   full_run j32c FAKE_OBS=0
   (( rc == 1 )) || self_fail "J3.2: an empty scratch database exited $rc, not 1: $(cat "$tmp/j32c.out")"
   grep -q '^FAIL: .*0 observations' "$tmp/j32c.out" || self_fail "J3.2: no FAIL line says 0 observations: $(cat "$tmp/j32c.out")"
+  # J3.2 (N4, D-J3c): the observations the judge counts in the scratch database are the
+  # lines of the fixture. Two seeded for a five-line fixture is red.
+  full_tree j32d
+  full_run j32d FAKE_SEEDED=2
+  (( rc == 1 )) || self_fail "J3.2: a scratch database with 2 observations for a 5-line fixture exited $rc, not 1: $(cat "$tmp/j32d.out")"
+  grep -q '^FAIL: .*fixture' "$tmp/j32d.out" || self_fail "J3.2: no FAIL line names the mismatch with the fixture: $(cat "$tmp/j32d.out")"
 
   # J4.1: a section that runs a different number of tests than its line in
   # scripts/test-section-counts.txt is red, now, and names the section and both numbers.
@@ -705,6 +733,20 @@ if [[ "${1:-}" == "--self-test" ]]; then
     || self_fail "J6.1: the sweep went into rust/target and took the sentinel there"
   grep -qF "$ct" "$tmp/j61/home/df.calls" 2>/dev/null \
     || self_fail "J6.1: df was not asked about CARGO_TARGET_DIR: $(cat "$tmp/j61/home/df.calls" 2>/dev/null || echo 'df never ran')"
+
+  # J6.1 (N6, D-J6c): debug/incremental is swept by the same age rule as the rest of the
+  # target. Incremental state from 30 days ago goes; the recent one stays.
+  full_tree j61i
+  ct="$tmp/j61i/ctarget"
+  mkdir -p "$ct/debug/incremental/old-session" "$ct/debug/incremental/new-session"
+  printf x >"$ct/debug/incremental/old-session/old-inc"
+  printf x >"$ct/debug/incremental/new-session/new-inc"
+  touch -d '30 days ago' "$ct/debug/incremental/old-session/old-inc" "$ct/debug/incremental/old-session"
+  full_run j61i FAKE_CARGO_FAIL=fmt CARGO_TARGET_DIR="$ct" CUBA_GATE_SWEEP_BELOW_GB=50 FAKE_DF_GB=10
+  [[ ! -e "$ct/debug/incremental/old-session/old-inc" ]] \
+    || self_fail "J6.1: incremental state 30 days old survived the sweep of debug/incremental: $(cat "$tmp/j61i.out")"
+  [[ -e "$ct/debug/incremental/new-session/new-inc" ]] \
+    || self_fail "J6.1: the sweep took the recent incremental state of debug/incremental"
 
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"

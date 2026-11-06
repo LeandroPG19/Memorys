@@ -2824,6 +2824,213 @@ fn no_gate_script_defaults_database_url_and_none_names_the_live_port() {
     );
 }
 
+/// Whether `line` prints a `DATABASE_URL` with its credentials: `echo`, `printf` or `print(` of the
+/// variable itself (`$DATABASE_URL`, `${DATABASE_URL`, `{DATABASE_URL}`), or of a literal URL whose
+/// userinfo holds a `:` before its `@`. A parameter expansion that drops the userinfo
+/// (`${DATABASE_URL#*@}`, `${DATABASE_URL%%@*}`) is the masking the banner needs, not a hit.
+fn prints_a_database_url_with_credentials(line: &str) -> bool {
+    let prints = line.contains("echo ") || line.contains("printf ") || line.contains("print(");
+    if !prints {
+        return false;
+    }
+    let masked = ["#*@", "##*@", "%@*", "%%@*"].iter().any(|m| line.contains(*m));
+    let names_it = ["$DATABASE_URL", "${DATABASE_URL", "{DATABASE_URL}", "{DATABASE_URL:"]
+        .iter()
+        .any(|v| line.contains(*v));
+    if names_it && !masked {
+        return true;
+    }
+    if let Some(at) = line.find("://") {
+        let rest = &line[at + 3..];
+        if let Some(end) = rest.find('@') {
+            let userinfo = &rest[..end];
+            return userinfo.contains(':') && !userinfo.chars().any(char::is_whitespace);
+        }
+    }
+    false
+}
+
+/// No script of the judge prints a `DATABASE_URL` with its password. The banner of the MCP
+/// client did, and the password reached the logs of every run. A self-test's fixtures
+/// are not code, so the scan reads the code outside them; Python has no regions.
+#[test]
+fn no_judge_script_prints_a_database_url_with_its_credentials() {
+    for (what, line) in [
+        ("a shell echo of the variable", "echo \"DB: $DATABASE_URL\""),
+        ("a Python f-string of the variable", "print(f\"DB:     {DATABASE_URL}\")"),
+        ("a literal URL with a password", "echo \"postgresql://gate:pw0@127.0.0.1:5489/brain\""),
+    ] {
+        assert!(
+            prints_a_database_url_with_credentials(line),
+            "the scan let through {what}: `{line}`, which prints the password of DATABASE_URL"
+        );
+    }
+    for (what, line) in [
+        ("the host, port and database of the variable", "echo \"DB: ${DATABASE_URL#*@}\""),
+        ("a message that names the variable", "echo \"DATABASE_URL is not set\""),
+        ("a Python print with no URL", "print(\"DB: judge server\", port)"),
+        ("a read of the variable with no print", "DATABASE_URL = os.environ[\"DATABASE_URL\"]"),
+    ] {
+        assert!(
+            !prints_a_database_url_with_credentials(line),
+            "the scan flagged {what}, which prints no password: `{line}`"
+        );
+    }
+
+    let mut defects = Vec::new();
+    for name in judge_scripts() {
+        let body = read(&name);
+        let lines: Vec<(usize, &str)> = if name.ends_with(".py") {
+            body.lines().enumerate().map(|(i, line)| (i + 1, line)).collect()
+        } else {
+            outside_self_test(&body)
+        };
+        for (n, line) in lines {
+            if !line.trim_start().starts_with('#') && prints_a_database_url_with_credentials(line) {
+                defects.push(format!("{name}:{n}: {}", line.trim()));
+            }
+        }
+    }
+    assert!(
+        defects.is_empty(),
+        "these lines print a DATABASE_URL with its password, and the judge's logs keep what they \
+         print. Print host:port/base, which is what the operator needs: {defects:#?}"
+    );
+}
+
+/// Every file and directory under `dir`, relative to it, sorted.
+fn entries_under(dir: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            out.push(relative_to(root, &path));
+            if path.is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+fn relative_to(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// What `script --self-test` leaves in the two places a judge script writes to (D-J7b): HOME and
+/// XDG_CACHE_HOME, each a fresh, empty directory of the test's own. This environment inherits
+/// `XDG_CACHE_HOME` from the login, and `gate_linux_env` puts its temp under it, so an empty HOME
+/// alone proves nothing. TMPDIR is removed, as an unset TMPDIR is what the script gets here. The
+/// exit code is not read: what the run left is the answer.
+fn left_by_self_test(script: &Path, tag: &str) -> Vec<String> {
+    let base = std::env::temp_dir().join(format!("selftest-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let home = base.join("home");
+    let cache = base.join("xdg-cache");
+    std::fs::create_dir_all(&home).expect("creating the empty HOME of the self-test");
+    std::fs::create_dir_all(&cache).expect("creating the empty XDG_CACHE_HOME of the self-test");
+    let _ = std::process::Command::new("bash")
+        .arg(script)
+        .arg("--self-test")
+        .current_dir(repo_root())
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", &cache)
+        .env_remove("TMPDIR")
+        .output()
+        .expect("running the self-test of a judge script");
+    let mut left: Vec<String> = entries_under(&home)
+        .into_iter()
+        .map(|entry| format!("HOME/{entry}"))
+        .collect();
+    left.extend(
+        entries_under(&cache)
+            .into_iter()
+            .map(|entry| format!("XDG_CACHE_HOME/{entry}")),
+    );
+    let _ = std::fs::remove_dir_all(&base);
+    left
+}
+
+/// The self-tests of the judge's scripts are hermetic (D-J7b). Each script that sources
+/// `gate-lock.sh` runs its `--self-test` with an empty HOME and an empty XDG_CACHE_HOME of its
+/// own, and leaves both empty, whatever its exit code. The scripts are read from `SCRIPTS_WITH_SELF_TEST`, so a new one
+/// that sources the lock is checked without being listed here. The fixture first: a script that
+/// writes under HOME has to be caught, or the check is a paragraph.
+#[test]
+fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
+    let liar_dir = std::env::temp_dir().join(format!("selftest-liar-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&liar_dir);
+    std::fs::create_dir_all(&liar_dir).expect("creating the liar fixture");
+    let liar = liar_dir.join("liar.sh");
+    std::fs::write(&liar, "#!/usr/bin/env bash\nmkdir -p \"$HOME/.cache/x\"\nexit 0\n")
+        .expect("writing the liar fixture");
+    let caught = left_by_self_test(&liar, "liar");
+    let _ = std::fs::remove_dir_all(&liar_dir);
+    assert!(
+        !caught.is_empty(),
+        "the check let through a script that writes ~/.cache/x under HOME during its self-test, \
+         so it cannot tell a clean self-test from a dirty one"
+    );
+
+    let sourcing: Vec<&str> = SCRIPTS_WITH_SELF_TEST
+        .iter()
+        .copied()
+        .filter(|name| read(&format!("scripts/{name}")).contains("gate-lock.sh"))
+        .collect();
+    assert!(
+        !sourcing.is_empty(),
+        "no script of SCRIPTS_WITH_SELF_TEST sources gate-lock.sh: the check would prove nothing"
+    );
+    let mut leftovers = Vec::new();
+    for name in sourcing {
+        let left = left_by_self_test(&repo_root().join("scripts").join(name), name);
+        if !left.is_empty() {
+            leftovers.push(format!("scripts/{name} --self-test left behind: {left:?}"));
+        }
+    }
+    assert!(
+        leftovers.is_empty(),
+        "a self-test of the judge wrote into the HOME or the XDG_CACHE_HOME it was given. A \
+         self-test has to leave both as it found them (D-J7b), or a judge that runs next to it \
+         loses its output: {leftovers:#?}"
+    );
+}
+
+/// The section counts come from one counter, `test-times.sh --count` (D-J4c, D-J4d): the script
+/// reads no `test result:` line itself, so there is one parse of a cargo log, not two.
+#[test]
+fn the_section_counts_come_from_test_times_count_alone() {
+    let body = read("scripts/run-all-tests.sh");
+    let code: Vec<(usize, &str)> = outside_self_test(&body)
+        .into_iter()
+        .filter(|(_, line)| !line.trim_start().starts_with('#'))
+        .collect();
+    let own: Vec<String> = code
+        .iter()
+        .filter(|(_, line)| line.contains("test result"))
+        .map(|(n, line)| format!("{n}: {}", line.trim()))
+        .collect();
+    assert!(
+        own.is_empty(),
+        "run-all-tests.sh parses `test result:` lines by itself, a second parser of the cargo \
+         log next to test-times.sh: {own:#?}"
+    );
+    assert!(
+        code.iter()
+            .any(|(_, line)| line.contains("test-times.sh") && line.contains("--count")),
+        "run-all-tests.sh does not count its sections with `scripts/test-times.sh --count`, the one \
+         counter of the judge"
+    );
+}
+
 /// The Python clients refuse without `DATABASE_URL` before they launch the binary: with
 /// `CUBA_BINARY_PATH` pointing at a stand-in that leaves a mark, the mark must not appear, and
 /// they exit 2 naming `DATABASE_URL`. Unix only: the stand-in is a shell script.
