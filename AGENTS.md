@@ -73,3 +73,8 @@ Published migrations through **0060** are frozen (SHA-384). Wrong shipped SQL ge
 - Crate: `memory_industry`
 - Compat: `cuba-memorys` binary (Cargo `[[bin]]` + npm `bin` alias), the `cuba-memorys` package on npm and PyPI, legacy `CUBA_*` env and the `~/.cache/cuba-memorys/` read fallback, through 0.28.x. The systemd units `cuba-memorys.service/.socket` left `packaging/` in 0.28.0; `doctor` still recognises a running `cuba-memorys-daemon`, and nothing uninstalls the old units for the user
 - MCP tool names `cuba_*` unchanged this release
+
+## Tracking
+
+- Progress lives in `backlog/` (the source of truth for what is done); git is the source of truth for the code.
+- Notion is the management view: the MemoryIndustry space, https://app.notion.com/p/410c9ec4d5d2814ea7e2c981c25ae20b (Cortes, Tareas, Decisiones, Bugs y lecciones, Despliegues, Conocimiento). A task is not opened, moved or closed in one without the other.
