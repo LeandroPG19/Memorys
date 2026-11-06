@@ -2229,6 +2229,13 @@ mutants_keep_out() {
   if [[ -n "${MUTANTS_STAGE:-}" && "$MUTANTS_STAGE" == "${MUTANTS_SCRATCH:-}"/stage.* ]]; then
     rm -rf "$MUTANTS_STAGE"
   fi
+  # CI-F4c: the run's mutants.out is kept whatever the outcome, when MUTANTS_KEEP_OUT named a
+  # directory this run checked was new or empty (MUTANTS_KEEP_READY, set before cargo mutants).
+  if [[ "${MUTANTS_KEEP_READY:-0}" == 1 && -d "$OUT_DIR/mutants.out" ]]; then
+    if cp -a "$OUT_DIR/mutants.out/." "$MUTANTS_KEEP_OUT/"; then
+      echo "kept: $MUTANTS_KEEP_OUT"
+    fi
+  fi
   case "${OUT_DIR:-}" in
     "${TMPDIR:-/tmp}"/memory-industry-mutants-out.*) ;;
     *) return "$code" ;;
@@ -2284,6 +2291,17 @@ unset CARGO_TARGET_DIR
 gate_cargo_jobs
 mutants_build_jobs=$(( GATE_CARGO_JOBS / MUTANTS_JOBS ))
 (( mutants_build_jobs >= 1 )) || mutants_build_jobs=1
+
+# CI-F4c: MUTANTS_KEEP_OUT names the directory that keeps this run's mutants.out. It must be
+# new or empty, so that two runs never mix: otherwise the run stops here, before cargo mutants.
+if [[ -n "${MUTANTS_KEEP_OUT:-}" ]]; then
+  if [[ -n "$(ls -A "$MUTANTS_KEEP_OUT" 2>/dev/null || true)" ]]; then
+    echo "FAIL: MUTANTS_KEEP_OUT=$MUTANTS_KEEP_OUT is not empty; name a new directory so that runs do not mix" >&2
+    exit 2
+  fi
+  mkdir -p "$MUTANTS_KEEP_OUT" || exit $?
+  MUTANTS_KEEP_READY=1
+fi
 
 # CI-F4 (F4b): the seed is built or found, and this run's stage is a copy of rust/ with a copy
 # of the seed's target. Both before cargo mutants, never alongside it. The tree that is
