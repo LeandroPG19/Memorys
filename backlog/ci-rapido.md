@@ -185,3 +185,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   `CARGO_TARGET_DIR` and cargo took the other tree's binary as fresh: the 2026-10-09 contamination lesson again. Every
   verification script now does `cargo clean -p memory-industry` first, like F0. For F3: a target directory per lane
   is not enough; it has to be per tree as well, or cleaned per run.
+- 2026-11-06 11:20 · Pass 1c red committed: `710943a` (crate cleaned first: contract 41 green, 13 red; J7b' green
+  through the region change; v046 green; eight self-tests hermetic). Handoff `ci-rapido-J-pasada1c.yml` validated.
+  Pass 2 reapplied from stash `6fbaf47` without conflicts, 1c regions intact; the implementer removes the
+  `gate-lock.sh` block (A2) and runs the hermetic bash self-tests to green.
