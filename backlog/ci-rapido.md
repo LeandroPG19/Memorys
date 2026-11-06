@@ -76,3 +76,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   only a stable publisher identity carries reputation across versions. sccache caches nothing that links (test binaries,
   bins, proc-macros), so it does not touch the judge's bottleneck. Angle E (CI for coding agents) kept no verified claim.
   CI-J pass 1 (tests only) handed to an implementer.
+- 2026-11-05 20:00 · I0: R2b done, the last research run. Verified: VCR.py/pytest-recording patch only the pytest
+  process, so the Rust child's LLM traffic is neither recorded nor blocked (the replay has to live on the Rust side);
+  VCR's default matcher ignores the body (a changed prompt replays the old answer); a cassette never expires (provider
+  drift needs a contract test outside the judge). Flaky detection: from a green, 10/100/1000 reruns find ~26/45/67 % of
+  what 10 000 find; after a red, 5 reruns confirm 87.8 %; 70 of 98 "NOD" were order-dependent. Angles D (shared state
+  across processes) and E (concurrent template clones, initdb in tmpfs) kept no claim: they are measured in F0. The
+  synthesis of the six runs goes to Notion (Investigación de CI II + Aplicación a MemoryIndustry).
