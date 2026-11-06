@@ -1279,6 +1279,121 @@ self_test() {
   if (( rc != 0 )) || ! g5_jobs 6; then
     self_fail "J5.6: a 27 GiB margin did not give 6 jobs (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
   fi
+  # J5.7 (A1, D-J5a): a number with a leading zero is not read as octal. A memory.max of 089 is
+  # a value bash cannot compute ("value too great for base"), and 010 would be 8 bytes: both are
+  # the refusal, exit 2 with nothing on stdout and MUTANTS_JOBS= named, as J5.5 has it. A cpu.max
+  # of 0200000 is a quota of 65536, not 2 CPUs, so it is refused too.
+  cg_tree j57a "$self_scope"
+  cg_put "$scope" memory.max 089
+  cg_put "$scope" memory.current 1
+  g5_run --default-jobs 24 "$tmp/meminfo.plenty"
+  if (( rc != 2 )) || ! g5_silent || ! g5_said 'MUTANTS_JOBS='; then
+    self_fail "J5.7: a memory.max of '089' was not exit 2 with nothing on stdout and MUTANTS_JOBS= named (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  cg_tree j57b "$self_scope"
+  cg_put "$scope" memory.max 010
+  cg_put "$scope" memory.current 1
+  g5_run --default-jobs 24 "$tmp/meminfo.plenty"
+  if (( rc != 2 )) || ! g5_silent || ! g5_said 'MUTANTS_JOBS='; then
+    self_fail "J5.7: a memory.max of '010' was not exit 2 with nothing on stdout and MUTANTS_JOBS= named (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  cg_tree j57c "$self_scope"
+  cg_put "$scope" cpu.max '0200000 100000'
+  g5_run --default-jobs 24 "$tmp/meminfo.plenty"
+  if (( rc != 2 )) || ! g5_silent || ! g5_said 'MUTANTS_JOBS='; then
+    self_fail "J5.7: a cpu.max of '0200000 100000' was not exit 2 with nothing on stdout and MUTANTS_JOBS= named (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+
+  # --- P2 and P3 (CI-J2, seed 20261106, printed on a FAIL) -----------------------------
+  # P2 (D-J5b): --jobs-plan over 120 generated (cores, available KB) pairs, cores 1 to 64 and
+  # available 0 to 80e6 KB: 1 <= jobs <= 6, jobs <= cores/2 (floor 1), jobs <= the GB available
+  # over 4 (floor 1), and the jobs do not fall when the cores or the memory grow.
+  # P3 (D-J5a): the margin the cgroup reader leaves is the minimum over the levels of the path,
+  # so it does not change when the levels trade their limits, when a level with no limit is
+  # added under the scope, or when only the tightest level is in the tree. Three shapes of one
+  # tree, one KB each, and the one the generator computed.
+  p2_plan() { bash "$ROOT/scripts/mutants-gate.sh" --jobs-plan "$1" "$2" 2>/dev/null | sed -n 's/^jobs=//p' || true; }
+  RANDOM=20261106
+  for ((p2_n = 0; p2_n < 120; p2_n++)); do
+    p2_c=$(( RANDOM % 64 + 1 ))
+    p2_kb=$(( (RANDOM * 32768 + RANDOM) % 80000001 ))
+    p2_j="$(p2_plan "$p2_c" "$p2_kb")"
+    [[ "$p2_j" =~ ^[1-6]$ ]] || self_fail "P2 seed 20261106, case $p2_n: --jobs-plan $p2_c $p2_kb printed '$p2_j', not a number of jobs from 1 to 6"
+    p2_half=$(( p2_c / 2 )); (( p2_half >= 1 )) || p2_half=1
+    p2_mem=$(( p2_kb / 4194304 )); (( p2_mem >= 1 )) || p2_mem=1
+    (( p2_j <= p2_half )) || self_fail "P2 seed 20261106, case $p2_n: $p2_j jobs for $p2_c cores is more than cores/2 = $p2_half"
+    (( p2_j <= p2_mem )) || self_fail "P2 seed 20261106, case $p2_n: $p2_j jobs for $p2_kb KB is more than the GB available over 4 = $p2_mem"
+    p2_more="$(p2_plan $(( p2_c + 1 )) "$p2_kb")"
+    [[ "$p2_more" =~ ^[0-9]+$ ]] && (( p2_more >= p2_j )) || self_fail "P2 seed 20261106, case $p2_n: one more core gave '$p2_more' jobs, fewer than $p2_j"
+    p2_more="$(p2_plan "$p2_c" $(( p2_kb + 4194304 )))"
+    [[ "$p2_more" =~ ^[0-9]+$ ]] && (( p2_more >= p2_j )) || self_fail "P2 seed 20261106, case $p2_n: one GB more available gave '$p2_more' jobs, fewer than $p2_j"
+  done
+
+  g5_meminfo p3 'MemTotal:       2000000000 kB' 'MemAvailable:   2000000000 kB'
+  for ((p3_n = 0; p3_n < 60; p3_n++)); do
+    p3_levels=$(( RANDOM % 4 + 1 ))
+    p3_path=""; p3_lvl=(); p3_max=(); p3_cur=()
+    for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
+      p3_path="${p3_path:+$p3_path/}lv$p3_i"
+      p3_lvl[p3_i]="$p3_path"
+      if (( p3_i == 0 || RANDOM % 3 )); then
+        p3_max[p3_i]=$(( (RANDOM % 64 + 1) * 1073741824 + (RANDOM % 512) * 1048576 ))
+        p3_cur[p3_i]=$(( (RANDOM * 32768 + RANDOM) % p3_max[p3_i] ))
+      else
+        p3_max[p3_i]=max
+        p3_cur[p3_i]=$(( RANDOM * 1024 ))
+      fi
+    done
+    p3_want=""; p3_tight=0
+    for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
+      [[ "${p3_max[p3_i]}" == max ]] && continue
+      p3_v=$(( (p3_max[p3_i] - p3_cur[p3_i]) / 1024 ))
+      if [[ -z "$p3_want" ]] || (( p3_v < p3_want )); then p3_want=$p3_v; p3_tight=$p3_i; fi
+    done
+    p3_last=$(( p3_levels - 1 ))
+
+    cg_tree "p3a$p3_n" "0::/${p3_lvl[p3_last]}"
+    for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
+      cg_put "${p3_lvl[p3_i]}" memory.max "${p3_max[p3_i]}"
+      cg_put "${p3_lvl[p3_i]}" memory.current "${p3_cur[p3_i]}"
+    done
+    g5_run --available-kb "$tmp/meminfo.p3"
+    [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
+      || self_fail "P3 seed 20261106, case $p3_n: the margin of $p3_levels levels was '$(cat "$tmp/g5.out")' (exit $rc), not the minimum over them, $p3_want KB"
+
+    p3_perm=()
+    for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do p3_perm[p3_i]=$p3_i; done
+    for ((p3_i = p3_last; p3_i > 0; p3_i--)); do
+      p3_j=$(( RANDOM % (p3_i + 1) )); p3_t=${p3_perm[p3_i]}; p3_perm[p3_i]=${p3_perm[p3_j]}; p3_perm[p3_j]=$p3_t
+    done
+    cg_tree "p3b$p3_n" "0::/${p3_lvl[p3_last]}"
+    for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
+      p3_src=${p3_perm[p3_i]}
+      cg_put "${p3_lvl[p3_i]}" memory.max "${p3_max[p3_src]}"
+      cg_put "${p3_lvl[p3_i]}" memory.current "${p3_cur[p3_src]}"
+    done
+    g5_run --available-kb "$tmp/meminfo.p3"
+    [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
+      || self_fail "P3 seed 20261106, case $p3_n: the same limits on other levels gave '$(cat "$tmp/g5.out")' (exit $rc), not $p3_want KB"
+
+    cg_tree "p3c$p3_n" "0::/${p3_lvl[p3_tight]}"
+    cg_put "${p3_lvl[p3_tight]}" memory.max "${p3_max[p3_tight]}"
+    cg_put "${p3_lvl[p3_tight]}" memory.current "${p3_cur[p3_tight]}"
+    g5_run --available-kb "$tmp/meminfo.p3"
+    [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
+      || self_fail "P3 seed 20261106, case $p3_n: the tightest level alone gave '$(cat "$tmp/g5.out")' (exit $rc), not $p3_want KB"
+
+    cg_tree "p3d$p3_n" "0::/${p3_lvl[p3_last]}/extra"
+    for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
+      cg_put "${p3_lvl[p3_i]}" memory.max "${p3_max[p3_i]}"
+      cg_put "${p3_lvl[p3_i]}" memory.current "${p3_cur[p3_i]}"
+    done
+    cg_put "${p3_lvl[p3_last]}/extra" memory.max max
+    cg_put "${p3_lvl[p3_last]}/extra" memory.current 1
+    g5_run --available-kb "$tmp/meminfo.p3"
+    [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
+      || self_fail "P3 seed 20261106, case $p3_n: a level with max under the scope gave '$(cat "$tmp/g5.out")' (exit $rc), not $p3_want KB"
+  done
   unset g5_root g5_self
 
   # --- J1.9 (D-J1d): the mutation step, with a DATABASE_URL, asks that server who it is
@@ -1325,6 +1440,15 @@ self_test() {
     || self_fail "J7: two runs in a row wrote their mutants to the same output directory ('$first_out' and '$second_out'): a run removes what the other one is using"
   [[ -e "$home/.cache/memory-industry-gate/tmp/memory-industry-mutants-out/centinela" ]] \
     || self_fail "J7: a run removed the fixed output directory of an earlier run, sentinel and all"
+
+  # J1.10 (A2, D-J1c): the server the step judges is the one merge-gate.sh read. With
+  # GATE_SERVER_SYSTEM_ID exported as 7701731310526959658 and a server that now answers 999, the
+  # step is exit 2 before cargo and names system_identifier. Judged with no export it goes on.
+  fresh
+  in_tree clean DATABASE_URL='postgresql://gate:pw0@127.0.0.1:5489/brain' FAKE_PSQL_CLUSTER_NAME=memory-industry-gate FAKE_PSQL_SYSID=999 GATE_SERVER_SYSTEM_ID=7701731310526959658 --
+  (( rc == 2 )) || self_fail "J1.10: a step that reads system_identifier 999 under GATE_SERVER_SYSTEM_ID 7701731310526959658 exited $rc, not 2: $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ ! -e "$tmp/cargo.calls" ]] || self_fail "J1.10: cargo was called after the server changed: $(cat "$tmp/cargo.calls")"
+  any_said 'system_identifier' || self_fail "J1.10: the refusal does not name system_identifier: $(cat "$tmp/run.out" "$tmp/run.err")"
 
   # --- CI-F1 row (spec §4 F1.1, D-F1b): the mutation builds take their share of the cores the gate
   # counted. The seventh field of the cargo stand-in is the CARGO_BUILD_JOBS the mutation step gave

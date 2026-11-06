@@ -882,6 +882,49 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ -e "$ct/debug/incremental/new-session/new-inc" ]] \
     || self_fail "J6.1: the sweep took the recent incremental state of debug/incremental"
 
+  # --- CI-J2 rows (spec §11, A4, A5, P5; D-J3c, D-J3d). `run-all-tests.sh --check-eval JSON
+  # QUERIES_LINES` judges the eval's --json the way the eval section does, with no database:
+  # the queries scored are metrics.per_query_ndcg, metrics.sample_count is the queries loaded,
+  # and metrics.ndcg_at_k is a number above 0. Each key is read by its path: a per_ability block
+  # in front of metrics (with its own ndcg_at_k) does not stand for the eval's.
+  ce() { rc=0; env -u DATABASE_URL bash "$ROOT/scripts/run-all-tests.sh" --check-eval "$1" "$2" >"$tmp/ce.out" 2>&1 || rc=$?; }
+  printf '%s\n' '{"per_ability":[{"ndcg_at_k":0.0}],"metrics":{"ndcg_at_k":0.7,"sample_count":5,"per_query_ndcg":[0.1,0.2,0.3,0.4,0.5]}}' >"$tmp/ce.a4ok.json"
+  ce "$tmp/ce.a4ok.json" 5
+  (( rc == 0 )) || self_fail "A4: an eval whose per_ability ndcg_at_k is 0.0 in front of metrics.ndcg_at_k 0.7, 5 loaded and 5 scored, was not judged green (exit $rc): $(cat "$tmp/ce.out")"
+  printf '%s\n' '{"per_ability":[{"ndcg_at_k":0.9}],"metrics":{"ndcg_at_k":0.0,"sample_count":5,"per_query_ndcg":[0.1,0.2,0.3,0.4,0.5]}}' >"$tmp/ce.a4red.json"
+  ce "$tmp/ce.a4red.json" 5
+  (( rc == 1 )) || self_fail "A4: an eval whose metrics.ndcg_at_k is 0.0, behind a per_ability ndcg_at_k of 0.9, was not red (exit $rc, want 1): $(cat "$tmp/ce.out")"
+  grep -q 'ndcg' "$tmp/ce.out" || self_fail "A4: the red nDCG names no ndcg: $(cat "$tmp/ce.out")"
+
+  # P5 (D-J3c, D-J3d, seed 20261106, printed on a FAIL): 200 generated evals over 1 to 6 query
+  # lines. Green exactly when sample_count and the length of per_query_ndcg are the query lines
+  # and ndcg_at_k is a JSON number above 0. A string, null or an absent ndcg_at_k is red, and a
+  # per_ability block (with a 0.0 of its own) always sits in front of metrics.
+  p5_seed=20261106
+  RANDOM=$p5_seed
+  p5_nds=(0.0 1e-9 0.3 null '"0.5"' absent)
+  p5_green=0
+  for ((p5_n = 0; p5_n < 200; p5_n++)); do
+    p5_lines=$(( RANDOM % 6 + 1 ))
+    p5_sample=$(( RANDOM % 7 ))
+    p5_scored=$(( RANDOM % 7 ))
+    p5_nd="${p5_nds[RANDOM % ${#p5_nds[@]}]}"
+    p5_q=""
+    for ((p5_i = 0; p5_i < p5_scored; p5_i++)); do p5_q+="${p5_q:+,}0.5"; done
+    p5_m="\"sample_count\":$p5_sample,\"per_query_ndcg\":[$p5_q]"
+    [[ "$p5_nd" == absent ]] || p5_m="\"ndcg_at_k\":$p5_nd,$p5_m"
+    printf '{"per_ability":[{"ndcg_at_k":0.0,"sample_count":9}],"metrics":{%s}}\n' "$p5_m" >"$tmp/ce.p5.json"
+    p5_want=1
+    if (( p5_sample == p5_lines && p5_scored == p5_lines )) && [[ "$p5_nd" == 1e-9 || "$p5_nd" == 0.3 ]]; then
+      p5_want=0
+      p5_green=$(( p5_green + 1 ))
+    fi
+    ce "$tmp/ce.p5.json" "$p5_lines"
+    (( rc == p5_want )) \
+      || self_fail "P5 seed $p5_seed, case $p5_n: ${p5_lines} query lines, sample_count $p5_sample, $p5_scored scored, ndcg_at_k $p5_nd: judged $rc, want $p5_want: $(cat "$tmp/ce.out") / $(cat "$tmp/ce.p5.json")"
+  done
+  (( p5_green > 0 )) || self_fail "P5 seed $p5_seed: none of the 200 generated evals was green, so the green half of the property is not tested"
+
   # --- CI-F1 rows (spec §4, F1, F2, F3; D-F1b, D-F2b, D-F3a/b). run_args NAME ARG...: the
   # script with ARG... in NAME's tree, under the environment full_run gives it; $rc and
   # $tmp/NAME.out as full_run leaves them. cg_tree NAME CPU_MAX MEMORY_MAX MEMORY_CURRENT
