@@ -574,7 +574,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'case "$1" in' \
       '  eval)' \
       '    echo "DATABASE_URL=${DATABASE_URL-unset} $*" >>"$HOME/eval.calls"' \
-      '    printf "{\"metrics\": {\"ndcg_at_k\": %s, \"sample_count\": %s}}\n" "${FAKE_NDCG-0.8}" "${FAKE_SCORED-5}" ;;' \
+      '    list=""; i=0; while [ "$i" -lt "${FAKE_SCORED-5}" ]; do list="${list:+$list, }0.8"; i=$((i + 1)); done' \
+      '    if [ -n "${FAKE_NO_PER_QUERY-}" ]; then' \
+      '      printf "{\"metrics\": {\"ndcg_at_k\": %s, \"sample_count\": %s}}\n" "${FAKE_NDCG-0.8}" "${FAKE_LOADED-5}"' \
+      '    else' \
+      '      printf "{\"metrics\": {\"ndcg_at_k\": %s, \"sample_count\": %s, \"per_query_ndcg\": [%s]}}\n" "${FAKE_NDCG-0.8}" "${FAKE_LOADED-5}" "$list"' \
+      '    fi ;;' \
       '  doctor) [ "${2:-}" = --json ] && echo "{\"checks\":[]}" ;;' \
       'esac' \
       'exit 0' >"$t/standin/memory-industry"
@@ -585,7 +590,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
       'case "$*" in *--release*) [ -e "$CARGO_TARGET_DIR/release/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/release/memory-industry" ;; esac' \
       'if [ "$1" = build ]; then' \
       '  [ -e "$CARGO_TARGET_DIR/debug/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/debug/memory-industry"' \
-      '  case "$*" in *--message-format=*) echo "{\"reason\":\"compiler-artifact\",\"executable\":\"${FAKE_CARGO_BUILD_EXE:-$CARGO_TARGET_DIR/debug/memory-industry}\"}" ;; esac' \
+      '  case "$*" in *--message-format=*) printf "%s\n" "{\"reason\":\"compiler-artifact\",\"executable\":\"${FAKE_CARGO_BUILD_EXE:-$CARGO_TARGET_DIR/debug/memory-industry}\"}" ;; esac' \
       'fi' \
       'if [ "$1" = test ]; then' \
       '  n="${FAKE_CARGO_TEST_COUNT:-3}"' \
@@ -703,6 +708,20 @@ if [[ "${1:-}" == "--self-test" ]]; then
     self_fail "J2.2: a database was created after the build failed: $(cat "$tmp/j22/home/psql.calls")"
   fi
 
+  # J2.1 (P1-c, D-J2e): Git Bash reports the executable in Windows form, with the escapes
+  # cargo writes in JSON (C:\\Users\\x\\target\\debug\\memory-industry.exe). gate_bin takes it,
+  # maps it with cygpath -u (a stand-in here, which maps to this tree's binary) and runs doctor
+  # on the mapped path: it does not refuse with "reported no executable".
+  full_tree j21w
+  printf '#!/bin/sh\necho %s\n' "$tmp/j21w/standin/memory-industry" >"$tmp/j21w/bin/cygpath"
+  chmod +x "$tmp/j21w/bin/cygpath"
+  full_run j21w FAKE_CARGO_BUILD_EXE='C:\\Users\\x\\target\\debug\\memory-industry.exe'
+  if grep -q 'reported no executable' "$tmp/j21w.out"; then
+    self_fail "J2.1 (P1-c): a Windows-form executable that cargo reported was refused: $(cat "$tmp/j21w.out")"
+  fi
+  grep -qF "$tmp/j21w/standin/memory-industry doctor" "$tmp/j21w/home/bin.calls" 2>/dev/null \
+    || self_fail "J2.1 (P1-c): doctor did not run with the path cygpath -u maps the Windows one to: $(cat "$tmp/j21w/home/bin.calls" 2>/dev/null || echo 'no doctor call')"
+
   # J3.1: the eval reads the scratch database brain_gate_eval, and asks for --json.
   full_tree j31
   full_run j31
@@ -721,6 +740,17 @@ if [[ "${1:-}" == "--self-test" ]]; then
   full_run j32b FAKE_SCORED=3
   (( rc == 1 )) || self_fail "J3.2: an eval that scored 3 of the 5 smoke queries exited $rc, not 1: $(cat "$tmp/j32b.out")"
   grep -q '^FAIL: .*smoke.jsonl' "$tmp/j32b.out" || self_fail "J3.2: no FAIL line names the queries smoke.jsonl has: $(cat "$tmp/j32b.out")"
+  # J3.2 (P1-a, D-J3d): the scored queries are the entries of metrics.per_query_ndcg, not
+  # sample_count, which counts the queries loaded (harness.rs). Five loaded with one scored is red.
+  full_tree j32f
+  full_run j32f FAKE_SCORED=1
+  (( rc == 1 )) || self_fail "J3.2 (P1-a): an eval with sample_count 5 and one per-query score exited $rc, not 1: $(cat "$tmp/j32f.out")"
+  grep -q '^FAIL: .*smoke.jsonl' "$tmp/j32f.out" || self_fail "J3.2 (P1-a): no FAIL line names the queries smoke.jsonl has, for one scored entry: $(cat "$tmp/j32f.out")"
+  # J3.2 (P1-a): an eval --json without per_query_ndcg cannot say what it scored: red.
+  full_tree j32g
+  full_run j32g FAKE_NO_PER_QUERY=1
+  (( rc == 1 )) || self_fail "J3.2 (P1-a): an eval --json without per_query_ndcg exited $rc, not 1: $(cat "$tmp/j32g.out")"
+  grep -q '^FAIL: .*per_query_ndcg' "$tmp/j32g.out" || self_fail "J3.2 (P1-a): no FAIL line names the missing per_query_ndcg: $(cat "$tmp/j32g.out")"
   # An empty scratch database: the seeder claims 0 and psql counts 0 over a five-line fixture.
   # A zero-line fixture is not used, because the judge's count of the fixture's lines
   # (grep -c, under set -e) ends the script with no message on an empty file: a production

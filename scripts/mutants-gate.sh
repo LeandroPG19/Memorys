@@ -1241,6 +1241,26 @@ self_test() {
   if (( rc != 2 )) || ! g5_silent || ! g5_said 'MUTANTS_JOBS='; then
     self_fail "J5.5: a memory.max of 'abc' was not exit 2 with nothing on stdout and MUTANTS_JOBS= named (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
   fi
+
+  # J5.6 (P1-b, D-J5c): the page cache a cgroup holds is memory it gives back, so the margin is
+  # memory.max - (memory.current - inactive_file), with inactive_file from memory.stat.
+  # Count: 32 GiB cap (34359738368) with 30 GiB current (32212254720) of which 25 GiB is
+  # inactive_file (26843545600) leaves 32 - (30 - 25) = 27 GiB = 27 * 1048576 = 28311552 KB,
+  # and 27 / 4 = 6 jobs under the 6 ceiling. Without inactive_file the margin would be
+  # 32 - 30 = 2 GiB: 2097152 KB and one job. J5.1 to J5.5 have no memory.stat, which reads as 0,
+  # so their numbers do not move.
+  cg_tree j56 "$self_scope"
+  cg_put "$scope" memory.max 34359738368
+  cg_put "$scope" memory.current 32212254720
+  cg_put "$scope" memory.stat $'anon 1073741824\ninactive_file 26843545600'
+  g5_run --available-kb "$tmp/meminfo.g40"
+  if (( rc != 0 )) || [[ "$(cat "$tmp/g5.out")" != 28311552 ]]; then
+    self_fail "J5.6: 25 GiB of inactive page cache under 30 GiB in use left the cgroup its 27 GiB margin, not 28311552 KB (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_run --default-jobs 24 "$tmp/meminfo.g40"
+  if (( rc != 0 )) || ! g5_jobs 6; then
+    self_fail "J5.6: a 27 GiB margin did not give 6 jobs (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
   unset g5_root g5_self
 
   # --- J1.9 (D-J1d): the mutation step, with a DATABASE_URL, asks that server who it is

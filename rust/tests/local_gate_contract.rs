@@ -2519,7 +2519,7 @@ const GATE_ENTRY_POINTS: [(&str, &str); 4] = [
         "scripts/quality-gate.sh",
         r#"echo "=== exclusions of the mutation step"#,
     ),
-    ("scripts/mutants-gate.sh", r#"OUT_DIR="${TMPDIR"#),
+    ("scripts/mutants-gate.sh", r#"OUT_DIR="$(mktemp -d"#),
     ("scripts/release.sh", r#"check_the_tree "$tag""#),
 ];
 
@@ -3272,25 +3272,70 @@ fn every_section_with_a_count_runs_and_every_count_has_a_section() {
     }
 
     let suite_body = read("scripts/run-all-tests.sh");
-    let counted: Vec<&str> = outside_self_test(&suite_body)
-        .into_iter()
-        .map(|(_, l)| l)
-        .filter(|l| !l.trim_start().starts_with('#') && l.contains("--count"))
+    // The section named by each `run_counted <section> <named> <command>` call outside the
+    // self-test: the counter is one (D-J4d), so each counted section is one of these calls.
+    // A line that is a comment, or the definition `run_counted() {`, names no section.
+    let called_sections = |body: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        for (_, line) in outside_self_test(body) {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            for (at, token) in tokens.iter().enumerate() {
+                if *token != "run_counted" {
+                    continue;
+                }
+                if let Some(section) = tokens.get(at + 1) {
+                    let shaped = section.starts_with(|c: char| c.is_ascii_lowercase())
+                        && section.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+                    if shaped {
+                        out.push(section.to_string());
+                    }
+                }
+            }
+        }
+        out
+    };
+    // Each section is counted by one call: a second `run_counted` with the same name would
+    // count the section twice, and the set comparison below cannot see that.
+    let calls = called_sections(&suite_body);
+    let mut once = std::collections::BTreeMap::<String, usize>::new();
+    for section in &calls {
+        *once.entry(section.clone()).or_insert(0) += 1;
+    }
+    let twice: Vec<&String> = once
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(section, _)| section)
         .collect();
-    assert_eq!(
-        counted.len(),
-        ids.len(),
-        "{file} has {} sections and run-all-tests.sh has {} `--count` calls: each counted \
-         section needs its call and each call its line",
-        ids.len(),
-        counted.len()
+    assert!(
+        twice.is_empty(),
+        "run-all-tests.sh counts these sections with more than one run_counted call, so each is \
+         counted twice: {twice:?}"
     );
-    for id in &ids {
+    let mut called = calls;
+    called.sort();
+    called.dedup();
+    let mut named = ids.clone();
+    named.sort();
+    named.dedup();
+    assert!(
+        !called.is_empty(),
+        "run-all-tests.sh has no `run_counted` call outside its self-test, so no section is counted"
+    );
+    for id in &called {
         assert!(
-            counted.iter().any(|line| line
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-                .any(|token| token == id.as_str())),
-            "section `{id}` has a count in {file} and no `--count` call in run-all-tests.sh names it"
+            named.contains(id),
+            "run-all-tests.sh counts the section `{id}` with run_counted and {file} has no line for \
+             it: a count nobody states is a silence"
+        );
+    }
+    for id in &named {
+        assert!(
+            called.contains(id),
+            "{file} states a count for the section `{id}` and no run_counted call in \
+             run-all-tests.sh counts it: a line for a section that is not counted proves nothing"
         );
     }
 }
