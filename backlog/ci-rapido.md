@@ -155,3 +155,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   Diagnosis queued (the test alone, three times, quiet machine), never as a verdict. Consequence for F3 whatever the
   cause: a wall-clock latency floor cannot share the machine with other lanes; it needs an exclusive slot or a
   CPU-time measure. Until then, no agent runs anything during an F0 run.
+- 2026-11-06 10:25 · NLI diagnosis, quiet machine, the test alone three times: 37.7, 36.9 and 38.1 ms per verdict
+  (the floor is 500 ms). The 1.199 s of F0 run 1 was contention, 32× slower: not a regression. F3 has to give
+  wall-clock latency tests an exclusive slot.
+- 2026-11-06 10:30 · CI-J pass 1b red committed: `a5429ff` (contract 40 green, 14 red exactly as expected; v046
+  green; bash reds hermetic). Handoff `ci-rapido-J-pasada1b.yml` validated. Pass 2 code reapplied from stash
+  `977102b` without conflicts, 1b test regions intact. F0 run 1 relaunched with nothing else running; the pass 2
+  implementer writes code only (no self-tests) until F0 ends.
