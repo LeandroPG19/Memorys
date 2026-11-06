@@ -2565,7 +2565,12 @@ mod service_tests {
         // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): documentation space no machine
         // is assigned. Binding it opens no connection; the OS refuses at once,
         // unless the host sets ip_nonlocal_bind, which a dev box does not.
-        let nobody = http_port_check(Some("192.0.2.1:8787"));
+        // The port is 0, not a fixed one: Linux checks the port before the
+        // address, and under WSL2 networkingMode=mirrored a Windows program can
+        // hold 8787 without showing in `ss`, so a fixed port would fail with
+        // EADDRINUSE and this test would blame a listener. Port 0 has no port
+        // to conflict on, so the only refusal left is the address's.
+        let nobody = http_port_check(Some("192.0.2.1:0"));
         assert!(
             nobody.detail.contains("is not assigned to this machine"),
             "the OS refuses to bind an address that is not on any interface and doctor has to say that, not blame a listener: {}",
