@@ -251,3 +251,13 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   is committed). Next for CI-J: improver → architect → hardener → qa. CI-F1 being rebased onto `abad416` (one
   conflict in a self-test row, resolved by its implementer). F3.0 and F3.2 pass 1 written, their reds queued.
   strace 6.19 installed (recorded with its rollback).
+- 2026-11-06 15:00 · Reds committed in their worktrees: CI-F1 `474863a` (rebased onto abad416; 4 own contracts red,
+  F1.3 a no-regression anchor seen red when sabotaged), F3.2 `bfe21d8` (14/14 red on the skeleton), F3.0 `a65a8e0`
+  (21 rows, A0 first; one region line that named `$XDG_CACHE_HOME` as a path fixed before the commit). F3.2's
+  interface fixed in its spec (one cgroup reader in gate-lock.sh, admission per event). CI-F1 pass 2 stopped on two
+  frozen rows that contradict the design (times_last order against F2.1/F2.3; f33a undetectable by D-F3b): pass 1b
+  decided (spec), proven against its own code in scratch before the red. CI-J improver: eval_seed.py down to CC ≤ 6
+  (it would have failed quality-gate's lizard ceiling of 8), gate_cgroup_limit split, the duplicated empty-URL refusal
+  in one function; behaviour checked byte for byte; full battery running. Debt noted by the improver: JSON fields
+  read with grep in the eval judgement, restore-db.sh cutting the URL at the first `@`, one unreachable branch in
+  eval_seed.py.
