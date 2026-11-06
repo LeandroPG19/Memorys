@@ -269,3 +269,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   `shift` emptied its arguments: pass 1b keeps the content checks and fixes the fake. CI-F1: two more fixture
   contradictions from old CI-J rows (j15 reads one line of sysid; the lock rows' fake tree lacked the cheap-step
   tools) — pass 1b-bis approved, the code proven in scratch.
+- 2026-11-06 16:30 · CI-J architect: no cycles, no blocking finding; eleven findings (A1 octal arithmetic in the cgroup
+  reader, A2 the sysid comparison only in run-all-tests, A4 eval JSON read with grep, A5/A6 eval judgement and
+  `--check-fixture` untestable/unused, A8 restore-db.sh cutting at the first `@`, and minor ones) and five properties
+  (P1–P5) run in scratch with 0 differences. They become slice CI-J2 (spec §11), after CI-F1 is integrated; the
+  hardener runs on the final state. CI-F1 pass 1b red committed: `fb32d24`; its pass 2 code being copied in.
