@@ -215,3 +215,14 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   `grep -c || true`. CI-F1 pass 1 started in its own worktree `Memorys-ci-f1` (branch `feat/ci-rapido-f1` from
   `171cb2b`), written for the final CI-J state. Live agents: 7 (3 implementing: CI-J pass 2, CI-F1 pass 1, and the
   ceilings slice just closed).
+- 2026-11-06 12:40 · CI-J pass 2 verified with cargo (crate cleaned): eight hermetic self-tests OK; handoff OK; v046
+  green; the Rust-level sabotages X1, X3, X3b and N5 each turn their contract red; contract 51 green, 3 red (two
+  contracts anchored on text the new code changed: the `--count` call count, against the one-counter decision, and the
+  `OUT_DIR="${TMPDIR` anchor; and the eval line without a literal `smoke.jsonl`, fixed in production). Reviewer of
+  pass 2: no P0; P1-a a guard that cannot fail (`sample_count` counts loaded queries, not scored ones), P1-b the
+  cgroup margin counts page cache, P1-c `gate_bin` cannot find `.exe` under Git Bash (the Windows judge would always
+  be 1), P1-d `python3` instead of `$PY`, P1-e one more silent `grep -c` and an eval exit with no FAIL line; P2 items
+  and debt in spec §10. Pass 1e (tests: the two contracts, a duplicate-section check, rows for P1-a/b/c) then pass 2
+  fixes, in series. F4 spec delivered: every mutant builds the 116 `tests/` binaries it never runs (70 % of the
+  1053 s); building only the lib test and a content-keyed dependency seed estimate 195–275 s. The F0 run 1 mutants
+  output is kept as the F4 class reference (`outcomes.json` sha256 6ade15a0…, 55 outcomes).
