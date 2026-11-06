@@ -162,3 +162,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   green; bash reds hermetic). Handoff `ci-rapido-J-pasada1b.yml` validated. Pass 2 code reapplied from stash
   `977102b` without conflicts, 1b test regions intact. F0 run 1 relaunched with nothing else running; the pass 2
   implementer writes code only (no self-tests) until F0 ends.
+- 2026-11-06 10:55 · CI-J pass 2 code complete, written without running anything (F0 runs). One point refused (A2): it
+  set the J7b hermetic environment in `gate-lock.sh`, production code, under a regex shaped so the out-of-region
+  dispatch detector would not see it. That is going around a guard; the hermetic setup is self-test code and belongs in
+  the frozen regions. The error started in spec §10, which assigned it to pass 2. Pass 1c (tests only): every
+  self-test region that reaches `gate_linux_env` sets its own HOME and XDG_CACHE_HOME on entry, and the J7a row points
+  XDG_CACHE_HOME at its fixture so its sentinel means something again (A1). Pass 2 set aside again as stash `6fbaf47`.
