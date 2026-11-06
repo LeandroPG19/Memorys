@@ -140,3 +140,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   (log line: `--output /home/Leandro/.cache/memory-industry-gate/tmp/memory-industry-mutants-out`). Not the disk
   pruner (it ran at 09:18:46, after the failure, and respects the lock). The hermetic-self-test contract now sets both
   `HOME` and `XDG_CACHE_HOME` to empty temporaries and requires both empty afterwards.
+- 2026-11-06 10:00 · CI-J pass 1b written (tests only): N1–N6, M1, X3 and J7 (J7a: one output dir per run; J7b': a
+  self-test leaves the HOME and the XDG_CACHE_HOME it is given empty). Outside the self-test regions the five gate
+  scripts are byte-equal to HEAD. Bash self-tests, run with throwaway HOME and XDG_CACHE_HOME, red on the first row as
+  before (merge-gate j11_unset, run-all-tests j16_unset, mutants-gate J5.1, test-times TT13, crap-gate J1.9);
+  codigo-muerto green. Measured with the old code: the self-tests of mutants-gate, run-all-tests, merge-gate and
+  release leave entries in the XDG_CACHE_HOME they are given (mutants-gate 5, the others 2: the `mkdir` of
+  `gate_linux_env`). The Rust contract and v046 queued under pesado behind F0.
