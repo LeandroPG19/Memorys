@@ -32,6 +32,10 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, NoReturn
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
 
 GIB = 1 << 30
 REPO = "memory-industry"
@@ -63,19 +67,19 @@ class Refusal(Exception):
     """Exit 2: a table or environment problem, or a planner that cannot decide."""
 
 
-def die(message):
+def die(message: str) -> NoReturn:
     raise Refusal(message)
 
 
-def repo_root():
+def repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def rounded(value, digits=3):
+def rounded(value: float | None, digits: int = 3) -> float | None:
     return None if value is None else round(value, digits)
 
 
-def read_text(path):
+def read_text(path: str) -> str | None:
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             return fh.read()
@@ -83,11 +87,11 @@ def read_text(path):
         return None
 
 
-def read_kv(path):
+def read_kv(path: str) -> dict[str, int] | None:
     text = read_text(path)
     if text is None:
         return None
-    values = {}
+    values: dict[str, int] = {}
     for line in text.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[1].isdigit():
@@ -95,12 +99,12 @@ def read_kv(path):
     return values
 
 
-def read_int(path):
+def read_int(path: str) -> int | None:
     text = read_text(path)
     return int(text) if text is not None and text.strip().isdigit() else None
 
 
-def psi_some_avg10(path):
+def psi_some_avg10(path: str) -> float | None:
     text = read_text(path)
     for line in (text or "").splitlines():
         if line.startswith("some"):
@@ -110,12 +114,12 @@ def psi_some_avg10(path):
     return None
 
 
-def p95(values):
+def p95(values: Iterable[float]) -> float:
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)]
 
 
-def sha256_of(path):
+def sha256_of(path: str) -> str:
     with open(path, "rb") as fh:
         return hashlib.sha256(fh.read()).hexdigest()
 
@@ -124,7 +128,18 @@ def sha256_of(path):
 
 
 class Step:
-    def __init__(self, idx, step_id, deps, clase, cpu, ram_gb, dur, env, argv):
+    def __init__(
+        self,
+        idx: int,
+        step_id: str,
+        deps: list[str],
+        clase: str,
+        cpu: float,
+        ram_gb: float,
+        dur: float,
+        env: dict[str, str],
+        argv: list[str],
+    ) -> None:
         self.idx = idx
         self.id = step_id
         self.deps = deps
@@ -135,28 +150,28 @@ class Step:
         self.env = env
         self.argv = argv
         self.state = "pending"
-        self.proc = None
-        self.log = None
-        self.cg = None
-        self.rc = None
+        self.proc: subprocess.Popen[bytes] | None = None
+        self.log: str | None = None
+        self.cg: str | None = None
+        self.rc: int | None = None
         self.parado = False
-        self.motivo = None
-        self.t_ready = None
-        self.t_start = None
-        self.t_end = None
+        self.motivo: str | None = None
+        self.t_ready: float | None = None
+        self.t_start: float | None = None
+        self.t_end: float | None = None
         self.dur = dur
         self.c = cpu
         self.r = ram_gb * GIB
-        self.anon_now = None
-        self.anon_max = None
-        self.cpu_s = None
-        self.mem_peak = None
-        self.oom_kill = None
-        self.psi = None
+        self.anon_now: int | None = None
+        self.anon_max: int | None = None
+        self.cpu_s: float | None = None
+        self.mem_peak: int | None = None
+        self.oom_kill: int | None = None
+        self.psi: dict[str, float | None] | None = None
 
 
-def parse_env(rest, step_id):
-    env = {}
+def parse_env(rest: list[str], step_id: str) -> tuple[dict[str, str], list[str]]:
+    env: dict[str, str] = {}
     while rest:
         match = NAME_RE.match(rest[0])
         if not match:
@@ -171,7 +186,7 @@ def parse_env(rest, step_id):
     return env, rest
 
 
-def parse_row(line, number):
+def parse_row(line: str, number: int) -> Step:
     tok = line.split()
     if len(tok) < 9:
         die(f"table line {number}: needs idx id deps recursos clase cpu ram_gb dur_s and an order")
@@ -186,11 +201,10 @@ def parse_row(line, number):
     return Step(idx, tok[1], deps, tok[4], cpu, ram_gb, dur, env, argv)
 
 
-def validate_table(steps):
-    if not steps:
-        die("the table has no steps")
-    by_id = {}
-    idxs = set()
+def unique_steps(steps: list[Step]) -> dict[str, Step]:
+    """The steps by id, refusing a repeated id or idx in table order."""
+    by_id: dict[str, Step] = {}
+    idxs: set[int] = set()
     for step in steps:
         if step.id in by_id:
             die(f"step id {step.id} appears twice")
@@ -198,14 +212,21 @@ def validate_table(steps):
             die(f"idx {step.idx} appears twice")
         by_id[step.id] = step
         idxs.add(step.idx)
+    return by_id
+
+
+def validate_table(steps: list[Step]) -> None:
+    if not steps:
+        die("the table has no steps")
+    by_id = unique_steps(steps)
     for step in steps:
         for dep in step.deps:
             if dep not in by_id or by_id[dep].idx >= step.idx:
                 die(f"step {step.id} depends on {dep}, which is not a step with a lower idx")
 
 
-def parse_table(path):
-    steps = []
+def parse_table(path: str) -> list[Step]:
+    steps: list[Step] = []
     with open(path, encoding="utf-8") as fh:
         for number, line in enumerate(fh, 1):
             line = line.strip()
@@ -218,7 +239,7 @@ def parse_table(path):
 # --- cgroups and capacity -----------------------------------------------------
 
 
-def scope_dir():
+def scope_dir() -> str | None:
     root = os.environ.get("GATE_CGROUP_ROOT", "/sys/fs/cgroup")
     self_path = os.environ.get("GATE_PROC_SELF_CGROUP", "/proc/self/cgroup")
     text = read_text(self_path) or ""
@@ -228,12 +249,12 @@ def scope_dir():
     return None
 
 
-def read_pids(directory):
+def read_pids(directory: str) -> set[int]:
     text = read_text(os.path.join(directory, "cgroup.procs")) or ""
     return {int(p) for p in text.split() if p.isdigit()}
 
 
-def move_pid(destination, pid):
+def move_pid(destination: str, pid: int) -> None:
     try:
         with open(os.path.join(destination, "cgroup.procs"), "w", encoding="utf-8") as fh:
             fh.write(str(pid))
@@ -241,7 +262,7 @@ def move_pid(destination, pid):
         pass
 
 
-def delegate(scope):
+def delegate(scope: str | None) -> bool:
     """Moves the planner and its scope's processes to scope/juez, then enables controllers."""
     if scope is None or not os.access(os.path.join(scope, "cgroup.subtree_control"), os.W_OK):
         return False
@@ -257,7 +278,7 @@ def delegate(scope):
     return True
 
 
-def cgroup_limits():
+def cgroup_limits() -> tuple[str, str]:
     lock = os.path.join(repo_root(), "scripts", "gate-lock.sh")
     order = 'source "$1"; gate_cgroup_read; printf "%s|%s" "$GATE_CG_MEM_KB" "$GATE_CG_CPUS"'
     res = subprocess.run(
@@ -269,11 +290,11 @@ def cgroup_limits():
     return mem_kb.strip(), cpus.strip()
 
 
-def total_memory():
+def total_memory() -> int:
     return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
 
 
-def capacities():
+def capacities() -> tuple[int, int]:
     """Returns (C cores, R bytes): R is the scope's memory less max(4 GiB, 10 %)."""
     mem_kb, cpus = cgroup_limits()
     margin = int(mem_kb) * 1024 if mem_kb.isdigit() else total_memory()
@@ -285,12 +306,12 @@ def capacities():
 # --- history ------------------------------------------------------------------
 
 
-def history_root():
+def history_root() -> str:
     return os.environ.get("CI_TIEMPOS_DIR") or os.path.expanduser("~/.cache/ci-tiempos")
 
 
-def read_jsonl(path):
-    records = []
+def read_jsonl(path: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
@@ -305,22 +326,27 @@ def read_jsonl(path):
     return records
 
 
-def is_serial_run(record, tabla):
+def is_serial_run(record: dict[str, Any], tabla: str) -> bool:
     return record.get("modo") == "serie" and record.get("tabla") == tabla and record.get("rc") == 0
 
 
-def load_history(tabla):
-    steps_by_id = {}
-    runs = []
+def is_step_sample(record: dict[str, Any], tabla: str) -> bool:
+    """A step of a green serial run of this table, with a duration to learn from."""
+    return is_serial_run(record, tabla) and isinstance(record.get("seg"), (int, float))
+
+
+def load_history(tabla: str) -> tuple[dict[Any, list[dict[str, Any]]], list[dict[str, Any]]]:
+    steps_by_id: dict[Any, list[dict[str, Any]]] = {}
+    runs: list[dict[str, Any]] = []
     for day in sorted(glob.glob(os.path.join(history_root(), REPO, "*"))):
         for record in read_jsonl(os.path.join(day, "pasos.jsonl")):
-            if is_serial_run(record, tabla) and isinstance(record.get("seg"), (int, float)):
+            if is_step_sample(record, tabla):
                 steps_by_id.setdefault(record.get("id"), []).append(record)
         runs += [r for r in read_jsonl(os.path.join(day, "corridas.jsonl")) if is_serial_run(r, tabla)]
     return steps_by_id, runs
 
 
-def annotate(name, record):
+def annotate(name: str, record: dict[str, Any]) -> None:
     """Appends one record under flock. A failed write never changes the verdict."""
     global _warned
     day = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -340,13 +366,14 @@ def annotate(name, record):
 # --- critical path ------------------------------------------------------------
 
 
-def ranks(steps, dur):
+def ranks(steps: list[Step], dur: dict[str, float]) -> tuple[dict[str, float], dict[str, Step | None]]:
     """rank_u(j) = dur(j) + max rank_u(successor), and the successor that gives it."""
-    successors = {s.id: [] for s in steps}
+    successors: dict[str, list[Step]] = {s.id: [] for s in steps}
     for step in steps:
         for dep in step.deps:
             successors[dep].append(step)
-    rank, nxt = {}, {}
+    rank: dict[str, float] = {}
+    nxt: dict[str, Step | None] = {}
     for step in sorted(steps, key=lambda s: -s.idx):
         best = max(successors[step.id], key=lambda t: rank[t.id], default=None)
         nxt[step.id] = best
@@ -354,9 +381,12 @@ def ranks(steps, dur):
     return rank, nxt
 
 
-def critical_chain(steps, rank, nxt):
+def critical_chain(
+    steps: list[Step], rank: dict[str, float], nxt: dict[str, Step | None]
+) -> tuple[float, str]:
     top = max(steps, key=lambda s: rank[s.id])
-    chain, cur = [], top
+    chain: list[str] = []
+    cur: Step | None = top
     while cur is not None:
         chain.append(cur.id)
         cur = nxt[cur.id]
@@ -366,71 +396,99 @@ def critical_chain(steps, rank, nxt):
 # --- the planner --------------------------------------------------------------
 
 
+def make_run_dir() -> str:
+    """This run's scratch: a fresh directory with its pasos/ (the logs) and tmp/ (each TMPDIR)."""
+    run_dir = tempfile.mkdtemp(prefix="memory-industry-dag.")
+    for sub in ("pasos", "tmp"):
+        os.makedirs(os.path.join(run_dir, sub), exist_ok=True)
+    return run_dir
+
+
+# The cores and the anonymous memory each earlier run of a step used: the samples its
+# estimate is drawn from. A record without the number, or of a step that took no time, says nothing.
+def observed_cores(previous: list[dict[str, Any]]) -> list[float]:
+    return [r["cpu_s"] / r["seg"] for r in previous if r.get("cpu_s") is not None and r["seg"] > 0]
+
+
+def observed_anon(previous: list[dict[str, Any]]) -> list[int]:
+    return [r["anon_max"] for r in previous if r.get("anon_max") is not None]
+
+
+def known_values(done: list[Step], attr: str) -> dict[str, Any]:
+    return {s.id: getattr(s, attr) for s in done if getattr(s, attr) is not None}
+
+
 class Planner:
-    def __init__(self, steps, dag, tabla):
+    def __init__(self, steps: list[Step], dag: bool, tabla: str) -> None:
         self.steps = steps
         self.by_id = {s.id: s for s in steps}
         self.dag = dag
         self.tabla = tabla
         self.modo = "dag" if dag else "serie"
         self.t0 = time.monotonic()
-        self.run_dir = tempfile.mkdtemp(prefix="memory-industry-dag.")
+        self.run_dir = make_run_dir()
         self.run_id = os.path.basename(self.run_dir)
-        for sub in ("pasos", "tmp"):
-            os.makedirs(os.path.join(self.run_dir, sub), exist_ok=True)
         self.hist_steps, self.hist_runs = load_history(tabla)
         self.scope = scope_dir()
         self.delegado = delegate(self.scope)
         self.cpu, self.ram = capacities()
         self.cpu_cap = math.floor(SAFETY * self.cpu)
-        self.red = None
-        self.no_verdict = None
+        self.red: Step | None = None
+        self.no_verdict: str | None = None
         self.cursor = 0
         self.last_sample = 0.0
-        self.lb_ref = None
-        self.lb_run = None
-        self.wake_r = self.wake_w = None
-        for step in steps:
-            self.estimate(step)
-        self.rank, self.nxt = ranks(steps, {s.id: s.dur for s in steps})
+        self.lb_ref: float | None = None
+        self.lb_run: float | None = None
+        self.wake_r: int | None = None
+        self.wake_w: int | None = None
+        self.rank, self.nxt = self.estimated_ranks()
         self.solo = not (dag and self.delegado and self.hist_runs)
         self.notes()
 
-    def notes(self):
+    def estimated_ranks(self) -> tuple[dict[str, float], dict[str, Step | None]]:
+        """Each step's estimate from its history, then the critical-path ranks over those durations."""
+        for step in self.steps:
+            self.estimate(step)
+        return ranks(self.steps, {s.id: s.dur for s in self.steps})
+
+    def notes(self) -> None:
         if self.dag and not self.delegado:
             print("note: the scope is not delegated: nothing is measured or killed per step, so the planner runs in series")
         elif self.dag and not self.hist_runs:
             print(f"note: no serial history for this table ({self.tabla[:12]}): the planner runs in series")
 
-    def estimate(self, step):
+    def estimate(self, step: Step) -> None:
         previous = self.hist_steps.get(step.id, [])[-WINDOW:]
         if not previous:
             return
         step.dur = statistics.median(r["seg"] for r in previous)
-        cores = [r["cpu_s"] / r["seg"] for r in previous if r.get("cpu_s") is not None and r["seg"] > 0]
+        cores = observed_cores(previous)
         if cores:
             step.c = p95(cores)
-        rams = [r["anon_max"] for r in previous if r.get("anon_max") is not None]
+        rams = observed_anon(previous)
         if rams:
             step.r = p95(rams) * SAFETY
 
-    def now(self):
+    def now(self) -> float:
         return time.monotonic() - self.t0
 
-    def running(self):
+    def running(self) -> list[Step]:
         return [s for s in self.steps if s.state == "running"]
 
-    def unfinished(self):
+    def unfinished(self) -> bool:
         return any(s.state in ("pending", "running") for s in self.steps)
 
     # admission
 
-    def ready(self):
-        ready = []
+    def deps_green(self, step: Step) -> bool:
+        return all(self.by_id[d].state == "done" and self.by_id[d].rc == 0 for d in step.deps)
+
+    def ready(self) -> list[Step]:
+        ready: list[Step] = []
         for step in self.steps:
             if step.state != "pending":
                 continue
-            if all(self.by_id[d].state == "done" and self.by_id[d].rc == 0 for d in step.deps):
+            if self.deps_green(step):
                 if step.t_ready is None:
                     step.t_ready = self.now()
                 ready.append(step)
@@ -438,7 +496,7 @@ class Planner:
             return ready
         return sorted(ready, key=lambda s: (-self.rank[s.id], s.idx))
 
-    def admit(self):
+    def admit(self) -> None:
         for step in self.ready():
             reason = self.wait_reason(step)
             if reason is None:
@@ -446,7 +504,7 @@ class Planner:
             else:
                 step.motivo = reason
 
-    def wait_reason(self, step):
+    def wait_reason(self, step: Step) -> str | None:
         alive = self.running()
         if self.exclusive_wait(step, alive):
             return "exclusive"
@@ -456,12 +514,12 @@ class Planner:
             return "serie"
         return self.capacity_wait(step, alive)
 
-    def exclusive_wait(self, step, alive):
+    def exclusive_wait(self, step: Step, alive: list[Step]) -> bool:
         if step.clase in EXCLUSIVE:
             return bool(alive) or any(o.idx < step.idx and o.state == "pending" for o in self.steps)
         return any(o.clase in EXCLUSIVE for o in alive)
 
-    def capacity_wait(self, step, alive):
+    def capacity_wait(self, step: Step, alive: list[Step]) -> str | None:
         if sum(o.c for o in alive) + step.c > self.cpu_cap:
             return "cpu"
         if sum(max(o.anon_now or 0, o.r) for o in alive) + step.r > self.ram:
@@ -470,7 +528,7 @@ class Planner:
 
     # steps
 
-    def step_env(self, step):
+    def step_env(self, step: Step) -> dict[str, str]:
         tmp = os.path.join(self.run_dir, "tmp", step.id)
         os.makedirs(tmp, exist_ok=True)
         env = dict(os.environ)
@@ -483,14 +541,14 @@ class Planner:
         print(f"dag: {step.id} env: {' '.join(changed)}")
         return env
 
-    def cgroup_for(self, step):
+    def cgroup_for(self, step: Step) -> str | None:
         if not self.delegado:
             return None
         path = os.path.join(self.scope, f"paso-{step.idx}-{step.id}")
         os.makedirs(path, exist_ok=True)
         return path
 
-    def start(self, step):
+    def start(self, step: Step) -> None:
         env = self.step_env(step)
         step.cg = self.cgroup_for(step)
         step.log = os.path.join(self.run_dir, "pasos", f"{step.idx}-{step.id}.log")
@@ -508,19 +566,19 @@ class Planner:
         step.state = "running"
         self.sample_step(step)
 
-    def anon_of(self, step):
+    def anon_of(self, step: Step) -> int | None:
         if not step.cg:
             return None
         stat = read_kv(os.path.join(step.cg, "memory.stat"))
         return stat.get("anon") if stat else None
 
-    def sample_step(self, step):
+    def sample_step(self, step: Step) -> None:
         value = self.anon_of(step)
         if value is not None:
             step.anon_now = value
             step.anon_max = max(step.anon_max or 0, value)
 
-    def sample(self):
+    def sample(self) -> None:
         now = self.now()
         if now - self.last_sample < TICK_S:
             return
@@ -528,7 +586,7 @@ class Planner:
         for step in self.running():
             self.sample_step(step)
 
-    def wait_event(self):
+    def wait_event(self) -> None:
         select.select([self.wake_r], [], [], TICK_S)
         try:
             while os.read(self.wake_r, 512):
@@ -536,7 +594,7 @@ class Planner:
         except BlockingIOError:
             pass
 
-    def reap(self):
+    def reap(self) -> None:
         for step in self.running():
             rc = step.proc.poll()
             if rc is not None:
@@ -544,17 +602,13 @@ class Planner:
                 if self.no_verdict:
                     return
 
-    def finish(self, step, rc):
+    def finish(self, step: Step, rc: int) -> None:
         step.rc = rc
         step.t_end = self.now()
         step.state = "done"
         self.measure(step)
         self.record_step(step)
-        if step.cg:
-            try:
-                os.rmdir(step.cg)
-            except OSError:
-                pass
+        remove_cgroup(step.cg)
         if step.parado:
             return
         if rc < 0 or (step.oom_kill or 0) > 0:
@@ -563,12 +617,12 @@ class Planner:
         if rc != 0:
             self.mark_red(step)
 
-    def no_verdict_text(self, step, rc):
+    def no_verdict_text(self, step: Step, rc: int) -> str:
         if step.oom_kill:
             return f"no verdict: {step.id} was killed by the kernel (memory.events oom_kill {step.oom_kill}); the judge exits 2"
         return f"no verdict: {step.id} ended by signal {-rc} that the planner did not send; the judge exits 2"
 
-    def measure(self, step):
+    def measure(self, step: Step) -> None:
         if not step.cg:
             return
         cpu = read_kv(os.path.join(step.cg, "cpu.stat"))
@@ -582,7 +636,7 @@ class Planner:
             for name in ("cpu", "memory", "io")
         }
 
-    def record_step(self, step):
+    def record_step(self, step: Step) -> None:
         annotate(
             "pasos.jsonl",
             {
@@ -609,18 +663,22 @@ class Planner:
 
     # verdict
 
-    def mark_red(self, step):
+    def mark_red(self, step: Step) -> None:
         if self.red is not None and step.idx >= self.red.idx:
             return
         self.red = step
+        self.stop_after(step.idx)
+
+    def stop_after(self, idx: int) -> None:
+        """What comes after idx in the serial order: not started if pending, killed if running."""
         for other in self.steps:
-            if other.idx > step.idx and other.state == "pending":
+            if other.idx > idx and other.state == "pending":
                 other.state = "stopped"
         for other in self.running():
-            if other.idx > step.idx:
+            if other.idx > idx:
                 self.kill(other)
 
-    def kill(self, step):
+    def kill(self, step: Step) -> None:
         step.parado = True
         if step.cg and os.path.exists(os.path.join(step.cg, "cgroup.kill")):
             try:
@@ -633,7 +691,7 @@ class Planner:
         except ProcessLookupError:
             pass
 
-    def drain(self):
+    def drain(self) -> None:
         """Kills and reaps whatever is still running, however the loop ended."""
         alive = self.running()
         for step in alive:
@@ -641,7 +699,7 @@ class Planner:
         for step in alive:
             self.finish(step, step.proc.wait())
 
-    def flush(self):
+    def flush(self) -> None:
         """Prints each block in idx order, once every lower idx has finished."""
         while self.cursor < len(self.steps):
             step = self.steps[self.cursor]
@@ -653,7 +711,7 @@ class Planner:
                 return
             self.cursor += 1
 
-    def emit_block(self, step):
+    def emit_block(self, step: Step) -> None:
         text = read_text(step.log) or ""
         sys.stdout.write(text)
         if text and not text.endswith("\n"):
@@ -661,7 +719,7 @@ class Planner:
 
     # loop
 
-    def loop(self):
+    def loop(self) -> None:
         while self.unfinished():
             self.admit()
             if not self.running():
@@ -675,20 +733,20 @@ class Planner:
             self.sample()
             self.flush()
 
-    def setup_signal(self):
+    def setup_signal(self) -> None:
         self.wake_r, self.wake_w = os.pipe()
         os.set_blocking(self.wake_r, False)
         os.set_blocking(self.wake_w, False)
         signal.signal(signal.SIGCHLD, lambda _n, _f: None)
         signal.set_wakeup_fd(self.wake_w)
 
-    def teardown_signal(self):
+    def teardown_signal(self) -> None:
         signal.set_wakeup_fd(-1)
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         os.close(self.wake_r)
         os.close(self.wake_w)
 
-    def execute(self):
+    def execute(self) -> int:
         self.setup_signal()
         try:
             self.loop()
@@ -697,7 +755,7 @@ class Planner:
             self.teardown_signal()
         return self.close()
 
-    def close(self):
+    def close(self) -> int:
         if self.no_verdict:
             sys.stderr.write(self.no_verdict + "\n")
             self.annotate_run(2)
@@ -713,37 +771,46 @@ class Planner:
 
     # summary
 
-    def measured(self):
+    def measured(self) -> tuple[dict[str, float], dict[str, Any], dict[str, Any]]:
         done = [s for s in self.steps if s.state == "done"]
         return (
             {s.id: s.t_end - s.t_start for s in done},
-            {s.id: s.cpu_s for s in done if s.cpu_s is not None},
-            {s.id: s.anon_max for s in done if s.anon_max is not None},
+            known_values(done, "cpu_s"),
+            known_values(done, "anon_max"),
         )
 
-    def reference(self, key):
-        values = {}
+    def reference(self, key: str) -> dict[str, Any]:
+        values: dict[str, Any] = {}
         for step in self.steps:
             previous = [r[key] for r in self.hist_steps.get(step.id, [])[-WINDOW:] if r.get(key) is not None]
             if previous:
                 values[step.id] = statistics.median(previous)
         return values
 
-    def bound(self, dur, cpu, anon):
+    def all_measured(self, values: dict[str, Any]) -> bool:
+        return all(values.get(s.id) is not None for s in self.steps)
+
+    def resource_terms(self, dur: dict[str, float], cpu: dict[str, Any], anon: dict[str, Any]) -> dict[str, float]:
+        """The CPU and RAM terms of the bound, each only when every step has its number."""
+        terms: dict[str, float] = {}
+        if self.all_measured(cpu):
+            terms["CPU"] = sum(cpu[s.id] for s in self.steps) / self.cpu
+        if self.ram > 0 and self.all_measured(anon):
+            terms["RAM"] = sum(anon[s.id] * dur[s.id] for s in self.steps) / self.ram
+        return terms
+
+    def bound(self, dur: dict[str, Any], cpu: dict[str, Any], anon: dict[str, Any]) -> tuple[float | None, str]:
         """LB = max(critical path, sum(cpu_s)/C, sum(anon*seg)/R, longest step); None if unmeasured."""
-        if any(dur.get(s.id) is None for s in self.steps):
+        if not self.all_measured(dur):
             return None, ""
         rank, nxt = ranks(self.steps, dur)
         chain_len, chain = critical_chain(self.steps, rank, nxt)
         terms = {"critical path": chain_len, "longest step": max(dur.values())}
-        if all(cpu.get(s.id) is not None for s in self.steps):
-            terms["CPU"] = sum(cpu[s.id] for s in self.steps) / self.cpu
-        if self.ram > 0 and all(anon.get(s.id) is not None for s in self.steps):
-            terms["RAM"] = sum(anon[s.id] * dur[s.id] for s in self.steps) / self.ram
+        terms.update(self.resource_terms(dur, cpu, anon))
         which = max(terms, key=terms.get)
         return terms[which], (f"critical path: {chain}" if which == "critical path" else which)
 
-    def summary(self):
+    def summary(self) -> None:
         total = self.now()
         self.lb_ref, ref_text = self.bound(
             self.reference("seg"), self.reference("cpu_s"), self.reference("anon_max")
@@ -757,7 +824,7 @@ class Planner:
             f"R={self.ram / GIB:.2f} GiB; mode={self.modo}"
         )
 
-    def annotate_run(self, code):
+    def annotate_run(self, code: int) -> None:
         annotate(
             "corridas.jsonl",
             {
@@ -776,18 +843,27 @@ class Planner:
         )
 
 
-def fmt(value):
+def remove_cgroup(path: str | None) -> None:
+    """A finished step's own cgroup goes away; one that cannot be removed is left, unjudged."""
+    if path:
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+
+
+def fmt(value: float | None) -> str:
     return "n/a" if value is None or value <= 0 else f"{value:.2f}"
 
 
-def ratio(total, bound):
+def ratio(total: float, bound: float | None) -> str:
     return "n/a" if bound is None or bound <= 0 else f"{total / bound:.2f}"
 
 
-def cgroup_entry(path):
+def cgroup_entry(path: str) -> Callable[[], None]:
     """Runs in the child before exec: the step is in its own cgroup before any of its code runs."""
 
-    def enter():
+    def enter() -> None:
         try:
             with open(os.path.join(path, "cgroup.procs"), "w", encoding="utf-8") as fh:
                 fh.write(str(os.getpid()))
@@ -797,7 +873,7 @@ def cgroup_entry(path):
     return enter
 
 
-def run_table(path):
+def run_table(path: str) -> int:
     mode = os.environ.get("GATE_DAG", "0")
     if mode not in ("0", "1"):
         die(f"GATE_DAG is {mode!r}; it has to be 0 (series) or 1 (DAG)")
@@ -805,7 +881,7 @@ def run_table(path):
     return Planner(steps, mode == "1", sha256_of(path)).execute()
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Lane planner of the local judge (CI-F3, F3.2).")
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="run a step table: GATE_DAG=0 series, GATE_DAG=1 DAG")
