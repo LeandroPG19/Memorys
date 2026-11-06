@@ -234,3 +234,13 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   `.exe` stays unsigned. npm trusted publishing becomes a task of its own, outside this batch (pending: a backlog
   task). F2 spec delivered (`ci-rapido-F2.spec.md`): socket-only clusters per lane in tmpfs, scram over the socket,
   `wal_level` stays `replica` unless PG18 measures say otherwise.
+- 2026-11-06 13:20 · F3 spec delivered (`ci-rapido-F3.spec.md`). Measured floor: mutants alone are 1053 s and ~18.4
+  threads on average, so F3 alone gives ≈20–23 min (lower bound 17.6 min); F3 + F4 ≈10.7–13.2 min (E). F4 has to
+  bring the mutants lane to ≤ ~670 s wall and ≤ ~13 400 CPU·s. Key design points: one step table for serial and DAG
+  (`GATE_DAG` 0 by default, 1 in a one-line commit once precision is green), same red as serial, OOM/signal is
+  exit 2, a closed environment list, a cgroup per step (needs `Delegate=yes` in pesado), the NLI section last and
+  alone, a target per lane and per tree with a `.gate-tree` mark, the per-binary launcher only if it pays. Its
+  question P1 decided by the orchestrator as (a): two ABBA pairs in F3 and the full campaign once after F4 (saves
+  2–4 h of the shared lock). F3.0 (`gate-audit.sh`) and F3.2 (`gate-dag.py` + `gate_dag_contract.rs`) are new files:
+  their pass 1 started in worktrees `Memorys-ci-f3audit` and `Memorys-ci-f3dag`. CI-F1 pass 1 written in
+  `Memorys-ci-f1`, being verified.
