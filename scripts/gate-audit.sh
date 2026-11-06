@@ -124,6 +124,7 @@ STEP
     cat > "$1/strace" <<'FAKE'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "-V" ]]; then echo "strace -- version ${FAKE_STRACE_VERSION:-5.3}"; exit 0; fi
+args=("$@")
 out="" cmd=() after=0
 while (( $# )); do
   if (( after )); then cmd+=("$1")
@@ -132,7 +133,7 @@ while (( $# )); do
   fi
   shift
 done
-echo "$*" >> "$FAKE_STRACE_LOG"
+echo "${args[*]}" >> "$FAKE_STRACE_LOG"
 fx="$FAKE_STRACE_FX/$(basename "$(dirname "$out")")"
 if [[ -d "$fx" ]]; then
   for f in "$fx"/t.*; do [[ -e "$f" ]] && cp "$f" "$out.${f##*.}"; done
@@ -192,6 +193,19 @@ FAKE
     row_want A0 exit "$rc" 0 || return 1
     row_match A0 "ultima linea" "$(tail -n 1 <<<"$out")" "OK  self-test: gate-audit" || return 1
     row_want A0 "HOME y XDG_CACHE_HOME vacios" "$(find "$h" "$x" -mindepth 1 | wc -l | tr -d ' ')" 0 || return 1
+  }
+
+  row_a0b() { # --run sin GATE_AUDIT_RUN: el informe va bajo TMPDIR y HOME y XDG_CACHE_HOME quedan vacios
+    local d h x t
+    d="$(rd)"; h="$(mktemp -d)"; x="$(mktemp -d)"; t="$(mktemp -d)"
+    au_tree "$d" "40 D1 - target:T_dbg,cluster:C_dbg normal"
+    au_fake_strace "$d/bin"
+    au_fx13 "$d"
+    env -u GATE_AUDIT_RUN HOME="$h" XDG_CACHE_HOME="$x" TMPDIR="$t" PATH="$d/bin:$PATH" \
+      FAKE_STRACE_LOG="$d/strace.log" FAKE_STRACE_FX="$d/fx" FAKE_LLEGADA="$d/llegada.txt" \
+      GATE_CLUSTER_ROOT="$d/clusters" "$BASH" "$d/tree/scripts/gate-audit.sh" --run >"$d/out" 2>"$d/err" || true
+    row_want A0b "HOME y XDG_CACHE_HOME vacios tras --run" "$(find "$h" "$x" -mindepth 1 | wc -l | tr -d ' ')" 0 || return 1
+    row_atleast A0b "informe bajo TMPDIR" "$(find "$t" -path '*/memory-industry-audit.*/audit' -type d | wc -l | tr -d ' ')" 1 || return 1
   }
 
   row_a1() { # una unidad de D1 y otra de DC escriben la misma ruta: conflicto
@@ -337,6 +351,17 @@ FAKE
     au_run "$e"
     row_want A7 "dirfd sin -y" "$RC" 2 || return 1
     row_has A7 "trace without -y" "$(cat "$e/err")" "trace without -y" || return 1
+  }
+
+  row_a7c() { # el hijo hereda la cwd del clone: su openat relativo, sin anotacion de cwd, sale de ella
+    local d; d="$(rd)"; au_std "$d"
+    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_put "$d/tr" 101 "chdir(\"$HOME/repo/rust\") = 0"
+    tr_fork "$d/tr" 101 102
+    tr_put "$d/tr" 102 'openat(AT_FDCWD, "tests/fixtures/out.json", O_WRONLY|O_CREAT, 0644) = 5'
+    au_run "$d"
+    row_want A7c exit "$RC" 0 || return 1
+    row_atleast A7c "home-write del hijo en la cwd heredada" "$(au_count "$d/out" home-write "$HOME/repo/rust/tests/fixtures/out.json")" 1 || return 1
   }
 
   row_a8() { # de quien es cada escritura: la del daemon de un test es del test; la de rustc no tiene dueno
@@ -495,6 +520,7 @@ FAKE
   }
 
   row_a0 || exit 1
+  row_a0b || exit 1
   row_a1 || exit 1
   row_a1b || exit 1
   row_a1c || exit 1
@@ -505,6 +531,7 @@ FAKE
   row_a5b || exit 1
   row_a6 || exit 1
   row_a7 || exit 1
+  row_a7c || exit 1
   row_a8 || exit 1
   row_a8b || exit 1
   row_a9 || exit 1
