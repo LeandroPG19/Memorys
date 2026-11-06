@@ -70,3 +70,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   (`respaldo-memoria.timer`, 03:00, 7 copies in `~/respaldos-memoria`, created at 14:27 by another session; first dump
   24 MB, 43 tables); the specifier's check missed it because `systemctl --user` needs `XDG_RUNTIME_DIR`. So J1 is
   absolute and needs no exception. `AGENTS.md`: no judge step touches the live corpus, not even read-only.
+- 2026-11-05 19:55 · I0: R4b done (22 sources, 25 claims verified, 18 confirmed, 7 killed). Two findings that change
+  a plan assumption: Azure Artifact Signing issues Public Trust to individuals only in the US or Canada and to
+  organizations in 12 jurisdictions, Mexico not among them; and EV no longer skips SmartScreen (Microsoft, 2026-08-17),
+  only a stable publisher identity carries reputation across versions. sccache caches nothing that links (test binaries,
+  bins, proc-macros), so it does not touch the judge's bottleneck. Angle E (CI for coding agents) kept no verified claim.
+  CI-J pass 1 (tests only) handed to an implementer.
