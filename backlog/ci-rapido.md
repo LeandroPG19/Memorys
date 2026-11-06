@@ -281,3 +281,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   `GATE_LIVE_PORT` in gate-lock.sh, the contract allows exactly that definition). CI-F1 pass 2 with cargo: 56/58
   (the same eval_seed bit; a contract that took a B3g error message for a cargo call: message reworded) and sabotage
   S8 left its contract green (quotes around the first word): contract fix as pass 1c.
+- 2026-11-06 17:50 · **CI-F1 green and integrated: `d80095a`** (feat/ci-rapido fast-forwarded). Verified (own target,
+  crate cleaned): local_gate_contract 58/58, v046 green, eight self-tests OK and hermetic, validar-handoff frozen
+  against `bf56106`; sabotages red: F1.3, F3.4, S8 (contracts) and nine on rows. Reds of the slice: 9f5152b (pass 1),
+  0e6262c (1b), bf56106 (1c). F4 (faster mutants, the critical path) and CI-J2 (architect follow-ups) started in
+  worktrees `Memorys-ci-f4` and `Memorys-ci-j2` from `d80095a`, each writing tests in the tree and code in scratch.
+  F3.0 1c red `75a85d9` (D-A11), its code being verified; F3.2 green and improved on its branch (`da7c140`).
