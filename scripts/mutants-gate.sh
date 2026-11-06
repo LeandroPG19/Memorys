@@ -699,7 +699,16 @@ self_test() {
   printf '%s\n' '#!/bin/sh' \
     'printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$*" "${TMP:-}" "${TEMP:-}" "${TMPDIR:-}" "${CARGO_PROFILE_DEV_DEBUG:-}" "${CARGO_INCREMENTAL:-}" >> "$FAKE_CALLS"' \
     'exit 0' > "$tmp/bin/cargo"
-  chmod +x "$tmp/bin/df" "$tmp/bin/cargo"
+  # psql answers the identity question the judge asks of the server before anything
+  # else (J1.9): FAKE_PSQL_CLUSTER_NAME and FAKE_PSQL_SYSID are what it names (the
+  # default is the judge's own marked server, an empty name is a server nobody
+  # marked), FAKE_PSQL_EXIT is its exit. Each call leaves its arguments and PGOPTIONS
+  # in $FAKE_PSQL_CALLS, which is how a row reads that the question was read-only.
+  printf '%s\n' '#!/bin/sh' \
+    'printf "%s %s\n" "$*" "${PGOPTIONS:-}" >> "$FAKE_PSQL_CALLS"' \
+    '[ "${FAKE_PSQL_EXIT:-0}" = 0 ] || exit "$FAKE_PSQL_EXIT"' \
+    'printf "%s|%s\n" "${FAKE_PSQL_CLUSTER_NAME-memory-industry-gate}" "${FAKE_PSQL_SYSID-7701731310526959658}"' > "$tmp/bin/psql"
+  chmod +x "$tmp/bin/df" "$tmp/bin/cargo" "$tmp/bin/psql"
 
   # The pure rule.
   plan() {
@@ -774,7 +783,7 @@ self_test() {
   sys_native="$(cygpath -w "$sys" 2>/dev/null || printf '%s' "$sys")"
   avail=$((500 * kb))
   per_copy=10
-  fresh() { rm -rf "$sys" "$home" "$tmp/cargo.calls"; mkdir -p "$sys" "$home"; }
+  fresh() { rm -rf "$sys" "$home" "$tmp/cargo.calls" "$tmp/psql.calls"; mkdir -p "$sys" "$home"; }
   # in_tree TREE [VAR=value]... -- ARGS...: the script of that tree, in the
   # fixture's environment, its stdout and stderr in $tmp/run.out and run.err.
   in_tree() {
@@ -784,12 +793,14 @@ self_test() {
     while [[ "${1:-}" != -- ]]; do extra+=("$1"); shift; done
     shift
     local -a e=(HOME="$home" TMP="$sys_native" TEMP="$sys_native" TMPDIR="$sys"
-                PATH="$tmp/bin:$PATH" FAKE_DF_AVAIL_KB="$avail" FAKE_CALLS="$tmp/cargo.calls")
+                PATH="$tmp/bin:$PATH" FAKE_DF_AVAIL_KB="$avail" FAKE_CALLS="$tmp/cargo.calls"
+                FAKE_PSQL_CALLS="$tmp/psql.calls")
     [[ -z "$per_copy" ]] || e+=(MUTANTS_SCRATCH_GB_PER_COPY="$per_copy")
     rc=0
     env -u MUTANTS_SCRATCH_GB_PER_COPY -u MUTANTS_SCRATCH_DIR -u CUBA_GATE_LOCK_OWNER \
         -u CUBA_GATE_MIN_FREE_GB -u MUTANTS_JOBS -u FAKE_DF_FAIL \
-        -u CARGO_PROFILE_DEV_DEBUG -u CARGO_INCREMENTAL \
+        -u CARGO_PROFILE_DEV_DEBUG -u CARGO_INCREMENTAL -u DATABASE_URL \
+        -u FAKE_PSQL_CLUSTER_NAME -u FAKE_PSQL_SYSID -u FAKE_PSQL_EXIT \
         "${e[@]}" ${extra[@]+"${extra[@]}"} \
         bash "$tmp/$t/scripts/mutants-gate.sh" "$@" >"$tmp/run.out" 2>"$tmp/run.err" || rc=$?
   }
@@ -1085,10 +1096,14 @@ self_test() {
   g5_meminfo incident 'MemTotal:       66060288 kB' 'MemFree:         3145728 kB' \
     'MemAvailable:   10485760 kB' 'Cached:          9000000 kB'
   g5_meminfo plenty 'MemTotal:       66060288 kB' 'MemFree:        50331648 kB' 'MemAvailable:   62914560 kB'
+  g5_meminfo g40 'MemTotal:       66060288 kB' 'MemFree:         2097152 kB' 'MemAvailable:   41943040 kB'
   # Git Bash: MemFree and no MemAvailable.
   g5_meminfo msys 'MemTotal:       16653852 kB' 'MemFree:          8388608 kB' 'SwapTotal:       4000000 kB'
   g5_meminfo none 'MemTotal:       16653852 kB' 'SwapTotal:       4000000 kB'
-  g5_run() { rc=0; bash "$ROOT/scripts/mutants-gate.sh" "$@" >"$tmp/g5.out" 2>"$tmp/g5.err" || rc=$?; }
+  # The cgroup the reader sees is injected too (g5_root, g5_self, set by cg_tree below).
+  # Unset, it is a machine with no cgroup v2 file, so the rows above read MemAvailable
+  # and nproc alone, whatever cgroup this self-test runs in.
+  g5_run() { rc=0; env GATE_CGROUP_ROOT="${g5_root:-$tmp/no-cgroup/root}" GATE_PROC_SELF_CGROUP="${g5_self:-$tmp/no-cgroup/self}" bash "$ROOT/scripts/mutants-gate.sh" "$@" >"$tmp/g5.out" 2>"$tmp/g5.err" || rc=$?; }
   g5_said() { grep -qF -- "$1" "$tmp/g5.out" "$tmp/g5.err"; }
   g5_jobs() { grep -qx "jobs=$1" "$tmp/g5.out"; }
   g5_silent() { [[ ! -s "$tmp/g5.out" ]]; }
@@ -1154,6 +1169,99 @@ self_test() {
   if (( rc != 0 )) || ! grep -qxE 'jobs=[1-6]' "$tmp/g5.out" || ! g5_said 'memory:'; then
     self_fail "J13: --default-jobs on this machine was not jobs=1..6 with a memory: line (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
   fi
+
+  # --- J5: the memory and the cores are the cgroup's, read at every level up -------------
+  # A cgroup v2 tree is built by hand: cg_tree names the root and the line that
+  # /proc/self/cgroup would say, cg_put writes one file under the root. The scope is
+  # the one the judge runs in, its slice is the ancestor. memory.max and memory.current
+  # are bytes ("max" is no limit), cpu.max is "<quota> <period>" in microseconds.
+  scope=user.slice/user-1000.slice/session-1.scope
+  slice=user.slice/user-1000.slice
+  self_scope='0::/user.slice/user-1000.slice/session-1.scope'
+  cg_tree() { g5_root="$tmp/cg.$1/root"; g5_self="$tmp/cg.$1/self"; mkdir -p "$g5_root"; printf '%s\n' "$2" >"$g5_self"; }
+  cg_put() { mkdir -p "$g5_root/$1"; printf '%s\n' "$3" >"$g5_root/$1/$2"; }
+
+  # J5.1: 32 GB of cap with 20 GB in use leaves 12 GB under the cgroup, against the 40 GB
+  # that MemAvailable says: the margin is the smaller, 12 GB, and 12 GB is 3 jobs, not 6.
+  cg_tree j51 "$self_scope"
+  cg_put "$scope" memory.max 34359738368
+  cg_put "$scope" memory.current 21474836480
+  g5_run --available-kb "$tmp/meminfo.g40"
+  if (( rc != 0 )) || [[ "$(cat "$tmp/g5.out")" != 12582912 ]]; then
+    self_fail "J5.1: 40 GB available under a 32 GB cgroup with 20 GB in use did not print the 12582912 KB of margin (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_run --default-jobs 24 "$tmp/meminfo.g40"
+  if (( rc != 0 )) || ! g5_jobs 3 || ! g5_said 'capped by memory: 12 wanted by cores, 3 fit'; then
+    self_fail "J5.1: the margin of the cgroup was not what capped the jobs at 3, said out loud (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+
+  # J5.2: the scope says max and its slice says 16 GB with 10 GB in use: the ancestor
+  # decides, 6 GB, which is 1 job.
+  cg_tree j52 "$self_scope"
+  cg_put "$scope" memory.max max
+  cg_put "$scope" memory.current 1073741824
+  cg_put "$slice" memory.max 17179869184
+  cg_put "$slice" memory.current 10737418240
+  g5_run --default-jobs 24 "$tmp/meminfo.g40"
+  if (( rc != 0 )) || ! g5_jobs 1 || ! g5_said 'capped by memory'; then
+    self_fail "J5.2: a slice's 16 GB cap with 10 GB in use, above a scope that says max, was not 1 job (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+
+  # J5.3: cpu.max 800000/100000 is 8 cores, so the cores/2 is 4, not the 12 of 24 cores.
+  cg_tree j53 "$self_scope"
+  cg_put "$scope" cpu.max '800000 100000'
+  g5_run --default-jobs 24 "$tmp/meminfo.plenty"
+  if (( rc != 0 )) || ! g5_jobs 4 || ! g5_said 'cores/2 = 4,'; then
+    self_fail "J5.3: a cpu.max of 8 cores under 24 cores of nproc did not give cores/2 = 4 and jobs=4 (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+
+  # J5.4: no cgroup v2 line (a cgroup v1 shell, Git Bash) is no limit, said in a note:
+  # the file that is not there is the same answer.
+  cg_tree j54 '1:cpu:/user.slice'
+  g5_run --default-jobs 24 "$tmp/meminfo.plenty"
+  if (( rc != 0 )) || ! g5_jobs 6 || ! g5_said 'note:'; then
+    self_fail "J5.4: without a 0:: line the default was not jobs=6 with a note: line (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  g5_root="$tmp/cg.absent/root" g5_self="$tmp/cg.absent/self"
+  g5_run --default-jobs 24 "$tmp/meminfo.plenty"
+  if (( rc != 0 )) || ! g5_jobs 6 || ! g5_said 'note:'; then
+    self_fail "J5.4: a /proc/self/cgroup that is not there was not jobs=6 with a note: line (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+
+  # J5.5: a memory.max the reader cannot read is the refusal, not max.
+  cg_tree j55 "$self_scope"
+  cg_put "$scope" memory.max abc
+  cg_put "$scope" memory.current 1
+  g5_run --default-jobs 24 "$tmp/meminfo.plenty"
+  if (( rc != 2 )) || ! g5_silent || ! g5_said 'MUTANTS_JOBS='; then
+    self_fail "J5.5: a memory.max of 'abc' was not exit 2 with nothing on stdout and MUTANTS_JOBS= named (exit $rc): $(cat "$tmp/g5.out" "$tmp/g5.err")"
+  fi
+  unset g5_root g5_self
+
+  # --- J1.9 (D-J1d): the mutation step, with a DATABASE_URL, asks that server who it is
+  # before cargo. A server with no judge marker is exit 2 that names the marker it saw
+  # and not the password; the judge's own marked server goes on, asked read-only; with
+  # no DATABASE_URL the step runs as it always did and asks no server.
+  any_said() { grep -qF -- "$1" "$tmp/run.out" "$tmp/run.err"; }
+  fresh
+  in_tree clean DATABASE_URL='postgresql://cuba:S3cr3tW2@127.0.0.1:5488/brain' FAKE_PSQL_CLUSTER_NAME= --
+  (( rc == 2 )) || self_fail "J1.9: a DATABASE_URL to a server with no judge marker exited $rc, not 2: $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ ! -e "$tmp/cargo.calls" ]] || self_fail "J1.9: cargo was called before the server was judged: $(cat "$tmp/cargo.calls")"
+  any_said 'cluster_name' || self_fail "J1.9: the refusal does not name cluster_name: $(cat "$tmp/run.out" "$tmp/run.err")"
+  if any_said 'S3cr3tW2'; then self_fail "J1.9: the refusal carries the password of DATABASE_URL: $(cat "$tmp/run.out" "$tmp/run.err")"; fi
+
+  fresh
+  in_tree clean DATABASE_URL='postgresql://gate:pw0@127.0.0.1:5489/brain' FAKE_PSQL_CLUSTER_NAME=memory-industry-gate --
+  if any_said 'FAIL' || ! ran_mutants; then
+    self_fail "J1.9: the judge's own marked server was refused, or cargo mutants did not run after it (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  grep -q 'default_transaction_read_only=on' "$tmp/psql.calls" 2>/dev/null \
+    || self_fail "J1.9: the marked server was not asked in read-only mode: $(cat "$tmp/psql.calls" 2>/dev/null || echo 'psql was not called')"
+
+  fresh
+  in_tree clean --
+  ran_mutants || self_fail "J1.9: with no DATABASE_URL the step did not run cargo mutants as it always did (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ ! -e "$tmp/psql.calls" ]] || self_fail "J1.9: with no DATABASE_URL the step asked a server: $(cat "$tmp/psql.calls")"
 
   echo "OK  self-test: a build rustc refused with a diagnostic stays unviable; an NTSTATUS,"
   echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log,"

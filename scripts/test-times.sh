@@ -304,6 +304,32 @@ if [[ "${1:-}" == "--self-test" ]]; then
   fail_with TT12 slow 70.00
   fail_with TT12 fast default
 
+  # TT13 (D-J4c): --count LOG is the same parser counting instead of timing: the passed
+  # plus the failed of each binary's `test result` line, in both shapes of the log. A binary
+  # that ran nothing (0 passed; 0 failed; 5 filtered out) counts 0 and is still a binary
+  # the section ran; 3 passed and 1 failed count 4. One line per binary, `<binary> <count>`,
+  # in the order of the headers. No boundary: run-all-tests hands it the log of one section.
+  count_block() {
+    local os="$1" key="$2" passed="$3" failed="$4" filtered="$5" sep='/' exe='' result=ok
+    if [[ "$os" == windows ]]; then sep='\'; exe='.exe'; fi
+    (( failed == 0 )) || result=FAILED
+    emit "$os" "     Running tests${sep}${key}.rs (target${sep}debug${sep}deps${sep}${key}-0123456789abcdef${exe})"
+    emit "$os" ""
+    emit "$os" "test result: $result. $passed passed; $failed failed; 0 ignored; 0 measured; $filtered filtered out; finished in 0.00s"
+    emit "$os" ""
+  }
+  for os in linux windows; do
+    {
+      count_block "$os" zero 0 0 5
+      count_block "$os" mixed 3 1 2
+    } >"$tmp/TT13.$os.log"
+    rc=0
+    bash "$SELF" --count "$tmp/TT13.$os.log" >"$tmp/TT13.$os.out" 2>&1 || rc=$?
+    want_rc "TT13.$os" 0
+    grep -qxF 'zero 0' "$tmp/TT13.$os.out" && grep -qxF 'mixed 4' "$tmp/TT13.$os.out" \
+      || self_fail "TT13.$os: --count did not print 'zero 0' and 'mixed 4' (0 passed and 5 filtered out counts 0; 3 passed and 1 failed counts 4): $(cat "$tmp/TT13.$os.out")"
+  done
+
   echo "OK  self-test: test-times sums each binary's finished-in over both cargo shapes up to the boundary, prints the 10 slowest, and is red for a ceiling passed, the default passed, a floor undercut, a dead or expired line and a malformed one, all in one run; a log it cannot read is exit 2"
   exit 0
 fi

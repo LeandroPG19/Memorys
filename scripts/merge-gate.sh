@@ -44,12 +44,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
     cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" "$t/scripts/"
     printf '#!/bin/sh\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
     for s in codigo-muerto crap-gate; do
-      printf '#!/bin/sh\necho %s >>"$HOME/steps"\nexit 0\n' "$s" >"$t/scripts/$s.sh"
+      printf '#!/bin/sh\necho %s >>"$HOME/steps"\necho "${DATABASE_URL-unset}" >>"$HOME/%s.urls"\nexit 0\n' "$s" "$s" >"$t/scripts/$s.sh"
     done
     # The gate asks mutants-gate.sh --refuse-targets before any step, so that
     # call is not the mutation step and does not go in the order.
     printf '%s\n' '#!/bin/sh' \
       '[ "${1:-}" = --refuse-targets ] || echo mutants-gate >>"$HOME/steps"' \
+      '[ "${1:-}" = --refuse-targets ] || echo "${DATABASE_URL-unset}" >>"$HOME/mutants-gate.urls"' \
       'echo "mutants caught=9 missed=1 timeout=0 unviable=0 kill_rate=0.900 min=0.800"' \
       >"$t/scripts/mutants-gate.sh"
     # test-times.sh: what it was called with goes in the order, the log it was
@@ -76,9 +77,22 @@ if [[ "${1:-}" == "--self-test" ]]; then
     printf '%s\n' '#!/bin/sh' \
       'for a in "$@"; do printf "%s\n" "$a"; done >>"$HOME/pg_isready.args"' \
       'echo "${FAKE_PG_STDERR-pg_isready: stderr noise carrying S3cr3tW2}" >&2' \
-      'answer="${FAKE_PG_ANSWER-127.0.0.1:5488 - accepting connections}"' \
+      'answer="${FAKE_PG_ANSWER-127.0.0.1:5489 - accepting connections}"' \
       '[ -z "$answer" ] || echo "$answer"' \
       'exit "${FAKE_PG_EXIT:-0}"' >"$t/bin/pg_isready"
+    # psql: the identity query of the judge server (gate-lock.sh, D-J1a) reads
+    # cluster_name and system_identifier from the maintenance database of the
+    # URL. The stand-in answers "<cluster_name>|<system_identifier>" (the row
+    # picks them with FAKE_PSQL_CLUSTER_NAME, empty when it says so, and
+    # FAKE_PSQL_SYSID); FAKE_PSQL_EXIT and FAKE_PSQL_STDERR make it fail. Each
+    # call leaves its arguments in $HOME/psql.args and its PGOPTIONS in
+    # $HOME/psql.env. Unless the row says otherwise it answers as a judge server.
+    printf '%s\n' '#!/bin/sh' \
+      'for a in "$@"; do printf "%s\n" "$a"; done >>"$HOME/psql.args"' \
+      'printf "PGOPTIONS=%s\n" "${PGOPTIONS-}" >>"$HOME/psql.env"' \
+      'if [ -n "${FAKE_PSQL_EXIT:-}" ]; then echo "${FAKE_PSQL_STDERR:-psql: fake failure}" >&2; exit "$FAKE_PSQL_EXIT"; fi' \
+      'echo "${FAKE_PSQL_CLUSTER_NAME-memory-industry-gate}|${FAKE_PSQL_SYSID-7701731310526959658}"' \
+      'exit 0' >"$t/bin/psql"
     # gate_linux_env reads the version of node, and package.json says which one
     # is the oldest the gate accepts.
     printf '#!/bin/sh\necho v20.0.0\n' >"$t/bin/node"
@@ -96,6 +110,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # otherwise, which is what the real one does when it finds the excepted advisories.
     printf '%s\n' '#!/bin/sh' \
       'echo "cargo $*" >>"$HOME/steps"' \
+      'echo "${DATABASE_URL-unset}" >>"$HOME/cargo.urls"' \
       'if [ "$1" = audit ] && [ "${2:-}" = --json ]; then' \
       '  echo "$PWD" >"$HOME/audit_json.cwd"' \
       '  if [ -e .cargo/audit.toml ]; then echo present >"$HOME/audit_json.audit_toml"; fi' \
@@ -159,8 +174,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # the copy, off this script's stderr; everything the copy prints is in
   # NAME.out. The VAR=value pairs reach the copy as they are. DATABASE_URL is
   # never inherited from whoever runs this test, so that no row's verdict
-  # depends on the shell it was started from: a row that needs one names it,
-  # and VAR= defines it empty.
+  # depends on the shell it was started from: run_copy starts the copy with the
+  # judge's test URL (a string that only the stand-ins read), a VAR=value that
+  # names another one replaces it, VAR= defines it empty, and run_copy_as takes
+  # the start URL as its first argument, "unset" to leave it out.
   # git's own directory is on the copy's PATH: on Git Bash it is /mingw64/bin,
   # not /usr/bin. It runs with a scratch global config, so nobody's signing or
   # hooks settings reach the fixture repos. PGPORT is not inherited either: it
@@ -173,12 +190,16 @@ if [[ "${1:-}" == "--self-test" ]]; then
   git config --global user.email fixture@example.invalid
   git config --global init.defaultBranch main
   git config --global core.autocrlf false
-  run_copy() {
-    local name="$1" fail_at="${2:-}"
-    shift $(( $# > 1 ? 2 : 1 ))
+  judge_test_url='postgresql://gate:pw0@127.0.0.1:5489/brain'
+  run_copy() { run_copy_as "$judge_test_url" "$@"; }
+  run_copy_as() {
+    local base="$1" name="$2" fail_at="${3:-}"
+    local -a start=(DATABASE_URL="$base")
+    [[ "$base" != unset ]] || start=()
+    shift $(( $# > 2 ? 3 : 2 ))
     rc=0
     { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT HOME="$tmp/$name/home" \
-        PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" "$@" \
+        PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" ${start[@]+"${start[@]}"} "$@" \
         "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 || rc=$?; } 2>/dev/null
   }
   exit_file() { cat "$tmp/$1/home/.cache/cuba-gate/run.exit" 2>/dev/null || true; }
@@ -643,29 +664,20 @@ if [[ "${1:-}" == "--self-test" ]]; then
       self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
     fi
   }
-  # pg_green NAME URL ANSWER PORT PASSWORD: URL is what the row defines as
-  # DATABASE_URL, or `unset` and `empty` for the gate's own default. pg_isready
-  # gets exactly -d and that URL, and the line after the banner is the OK for
-  # PORT, the one pg_isready's ANSWER names, with nothing printed in between.
-  # The line after the OK is the banner of cargo audit, the first step that
-  # follows the readiness check.
+  # pg_green NAME URL ANSWER PORT PASSWORD: URL is the DATABASE_URL the row starts
+  # the gate with. pg_isready gets exactly -d and that URL, and the line after the
+  # banner is the OK for PORT, the one pg_isready's ANSWER names, with nothing
+  # printed in between. The OK of the judge server (its cluster_name read through
+  # the identity query) comes next, and the line after it is the banner of cargo
+  # audit, the first step that follows the readiness check and the judge.
   pg_green() {
     local name="$1" url="$2" answer="$3" port="$4" password="$5" i at=-1
-    local default_url='postgresql://cuba:memorys2026@127.0.0.1:5488/brain' want="$2"
-    local -a lines var=()
-    case "$url" in
-      unset) want="$default_url" ;;
-      empty)
-        want="$default_url"
-        var=(DATABASE_URL=)
-        ;;
-      *) var=(DATABASE_URL="$url") ;;
-    esac
+    local -a lines
     fake_tree "$name" "echo \"$ran_marker\""
-    run_copy "$name" "" FAKE_PG_ANSWER="$answer" ${var[@]+"${var[@]}"}
+    run_copy_as "$url" "$name" "" FAKE_PG_ANSWER="$answer"
     (( rc == 0 )) || self_fail "$name: a gate whose pg_isready answered '$answer' exited $rc: $(cat "$tmp/$name.out")"
-    [[ "$(pg_args "$name")" == $'-d\n'"$want" ]] \
-      || self_fail "$name: pg_isready was called with '$(pg_args "$name" | tr '\n' ' ')', not with exactly -d and DATABASE_URL as it is ('$want')"
+    [[ "$(pg_args "$name")" == $'-d\n'"$url" ]] \
+      || self_fail "$name: pg_isready was called with '$(pg_args "$name" | tr '\n' ' ')', not with exactly -d and DATABASE_URL as it is ('$url')"
     mapfile -t lines < <(tr -d '\r' <"$tmp/$name.out")
     for i in "${!lines[@]}"; do
       if [[ "${lines[i]}" == "OK  Postgres :"* ]]; then
@@ -678,8 +690,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
       || self_fail "$name: the line said '${lines[at]}', not the port pg_isready answered on ($port)"
     [[ -z "${lines[at-1]}" && "${lines[at-2]}" == *"a second time."* ]] \
       || self_fail "$name: something was printed between the banner and the OK line: '${lines[at-2]}' / '${lines[at-1]}'"
-    [[ "${lines[at+1]:-}" == "=== cargo audit ===" ]] \
-      || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the banner of cargo audit, the first step after the readiness check"
+    [[ "${lines[at+1]:-}" == "OK  judge server :$port (cluster_name=memory-industry-gate, system_identifier=7701731310526959658)" ]] \
+      || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the OK of the judge server on :$port"
+    [[ "${lines[at+2]:-}" == "=== cargo audit ===" ]] \
+      || self_fail "$name: the line after the judge's OK is '${lines[at+2]:-}', not the banner of cargo audit, the first step after the readiness check"
     if grep -qxF "$answer" "$tmp/$name.out"; then
       self_fail "$name: pg_isready's own answer is a line of the output: $(cat "$tmp/$name.out")"
     fi
@@ -693,8 +707,71 @@ if [[ "${1:-}" == "--self-test" ]]; then
       self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
     fi
   }
-  pg_green pg_default unset "127.0.0.1:5488 - accepting connections" 5488 memorys2026
-  pg_green pg_empty empty "127.0.0.1:5488 - accepting connections" 5488 memorys2026
+  # judge_refused NAME URL ANSWER PASSWORD [VAR=value ...]: the gate stops with 2
+  # before cargo audit, asks no step, and prints nothing that carries the password.
+  judge_refused() {
+    local name="$1" url="$2" answer="$3" password="$4"
+    shift 4
+    fake_tree "$name" "echo \"$ran_marker\""
+    run_copy_as "$url" "$name" "" FAKE_PG_ANSWER="$answer" "$@"
+    pg_stopped "$name" 2 "$password"
+    if grep -qxF '=== cargo audit ===' "$tmp/$name.out"; then
+      self_fail "$name: the banner of cargo audit was printed before the server was refused: $(cat "$tmp/$name.out")"
+    fi
+  }
+  # judge_green NAME URL CLUSTER PORT PASSWORD: the server is marked CLUSTER on PORT.
+  # The gate says so on the line after the OK of Postgres, asks the identity of the
+  # same server read-only, from its maintenance database, and goes on to cargo audit.
+  judge_green() {
+    local name="$1" url="$2" cluster="$3" port="$4" password="$5" want at
+    fake_tree "$name" "echo \"$ran_marker\""
+    run_copy_as "$url" "$name" "" FAKE_PG_ANSWER="127.0.0.1:$port - accepting connections" FAKE_PSQL_CLUSTER_NAME="$cluster"
+    (( rc == 0 )) || self_fail "$name: a server marked '$cluster' on :$port exited $rc: $(cat "$tmp/$name.out")"
+    want="OK  judge server :$port (cluster_name=$cluster, system_identifier=7701731310526959658)"
+    at="$(grep -nxF -- "$want" "$tmp/$name.out" | head -1 | cut -d: -f1)"
+    [[ -n "$at" ]] || self_fail "$name: no line '$want': $(cat "$tmp/$name.out")"
+    [[ "$(sed -n "$((at+1))p" "$tmp/$name.out")" == "=== cargo audit ===" ]] \
+      || self_fail "$name: the line after the judge's OK is not the banner of cargo audit: $(cat "$tmp/$name.out")"
+    grep -qxF 'PGOPTIONS=-c default_transaction_read_only=on' "$tmp/$name/home/psql.env" 2>/dev/null \
+      || self_fail "$name: the identity query did not run read-only: $(cat "$tmp/$name/home/psql.env" 2>/dev/null || true)"
+    grep -qxF "postgresql://gate:$password@127.0.0.1:$port/postgres" "$tmp/$name/home/psql.args" 2>/dev/null \
+      || self_fail "$name: the identity query was not asked of the maintenance database of the same server: $(cat "$tmp/$name/home/psql.args" 2>/dev/null || true)"
+    if grep -qF "$password" "$tmp/$name.out"; then
+      self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
+    fi
+  }
+  # J1.1: no DATABASE_URL, unset or empty, is refused before anybody is asked, and
+  # the refusal names it and says where the judge's server is set up.
+  for form in unset empty; do
+    fake_tree "j11_$form" "echo \"$ran_marker\""
+    if [[ "$form" == unset ]]; then run_copy_as unset "j11_$form" ""; else run_copy_as "" "j11_$form" ""; fi
+    pg_stopped "j11_$form" 2
+    [[ ! -e "$tmp/j11_$form/home/pg_isready.args" && ! -e "$tmp/j11_$form/home/psql.args" ]] \
+      || self_fail "j11_$form: a server was asked with no DATABASE_URL: $(pg_args "j11_$form") $(cat "$tmp/j11_$form/home/psql.args" 2>/dev/null || true)"
+    fail_line_with "j11_$form" DATABASE_URL 'docs/gate.md' \
+      || self_fail "j11_$form: no FAIL line names DATABASE_URL and docs/gate.md: $(cat "$tmp/j11_$form.out")"
+    if grep -q '5488' "$tmp/j11_$form.out"; then
+      self_fail "j11_$form: the refusal names :5488, the live corpus: $(cat "$tmp/j11_$form.out")"
+    fi
+  done
+  # J1.2: a server that answers but is not marked is refused whatever its port,
+  # and the refusal says the port, the cluster_name it read and the system_identifier.
+  judge_refused j12_empty 'postgresql://gate:pw0@127.0.0.1:5488/brain' '127.0.0.1:5488 - accepting connections' pw0 FAKE_PSQL_CLUSTER_NAME=
+  fail_line_with j12_empty ':5488' cluster_name 7701731310526959658 \
+    || self_fail "j12_empty: no FAIL line names :5488, the cluster_name it read and the system_identifier: $(cat "$tmp/j12_empty.out")"
+  judge_refused j12_other 'postgresql://gate:pw0@127.0.0.1:5489/brain' '127.0.0.1:5489 - accepting connections' pw0 FAKE_PSQL_CLUSTER_NAME=otro
+  fail_line_with j12_other ':5489' otro 7701731310526959658 \
+    || self_fail "j12_other: no FAIL line names :5489, 'otro' and the system_identifier: $(cat "$tmp/j12_other.out")"
+  judge_green j12_marked_5488 'postgresql://gate:pw0@127.0.0.1:5488/brain' memory-industry-gate 5488 pw0
+  # J1.3: a server marked memory-industry-gate, or one of its lanes, is accepted and named.
+  judge_green j13_gate 'postgresql://gate:pw0@127.0.0.1:5489/brain' memory-industry-gate 5489 pw0
+  judge_green j13_e2e 'postgresql://gate:pw0@127.0.0.1:5489/brain' memory-industry-gate-e2e 5489 pw0
+  # J1.4: an identity query that fails is exit 2, says what it could not read, and
+  # does not print the password.
+  judge_refused j14_query 'postgresql://gate:pw0@127.0.0.1:5489/brain' '127.0.0.1:5489 - accepting connections' pw0 \
+    FAKE_PSQL_EXIT=1 'FAKE_PSQL_STDERR=ERROR:  permission denied for function pg_control_system'
+  fail_line_with j14_query pg_control_system \
+    || self_fail "j14_query: no FAIL line names what could not be read (pg_control_system): $(cat "$tmp/j14_query.out")"
   pg_green pg_port 'postgresql://gate:pw0@127.0.0.1:5575/brain' \
     "127.0.0.1:5575 - accepting connections" 5575 pw0
   # No port in the URL: it is libpq that puts 5432 (or PGPORT), not the gate.
@@ -715,6 +792,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
   pg_stopped pg_down 1 pw0
   grep -qxF 'FAIL: Postgres not ready on :5575 (pg_isready: 127.0.0.1:5575 - no response)' "$tmp/pg_down.out" \
     || self_fail "a Postgres that did not answer was not named with the port of the URL and libpq's own answer: $(cat "$tmp/pg_down.out")"
+  # J6.2: one call to pg_isready, with the URL as it is, and a line that says how
+  # to start the judge's server.
+  grep -qF 'docs/gate.md' "$tmp/pg_down.out" \
+    || self_fail "a Postgres that did not answer did not say how to start the judge's server (docs/gate.md): $(cat "$tmp/pg_down.out")"
+  [[ "$(wc -l <"$tmp/pg_down/home/pg_isready.args")" -eq 2 ]] \
+    || self_fail "pg_down: pg_isready was asked more than once: $(pg_args pg_down | tr '\n' ' ')"
   if grep -q ':5488' "$tmp/pg_down.out"; then
     self_fail "the refusal for :5575 names :5488: $(cat "$tmp/pg_down.out")"
   fi
@@ -793,16 +876,17 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # name judged memory-industry-db, a server DATABASE_URL did not name. A host
   # that is not this machine, or a gate with no docker, cannot be judged this way
   # and is refused with 2. Each row runs with a PATH of the tree's stand-ins and
-  # of wrappers for every program the system has except pg_isready and docker:
-  # a pg_isready of the machine running this test would turn every row green
-  # (Debian puts one in /usr/bin).
+  # of wrappers for every program the system has except pg_isready, docker and
+  # psql: a pg_isready of the machine running this test would turn every row green
+  # (Debian puts one in /usr/bin), and a real psql would ask the identity of a
+  # server the row never named (the judge's guard, J1.4, is what must find none).
   mkdir -p "$tmp/sysbin"
   for d in "$gitdir" /usr/bin /bin; do
     for f in "$d"/*; do
       [[ -f "$f" && -x "$f" ]] || continue
       tool="${f##*/}"
       tool="${tool%.exe}"
-      case "$tool" in pg_isready* | docker*) continue ;; esac
+      case "$tool" in pg_isready* | docker* | psql*) continue ;; esac
       [[ -e "$tmp/sysbin/$tool" ]] && continue
       printf '#!/bin/sh\nexec "%s" "$@"\n' "$f" >"$tmp/sysbin/$tool"
     done
@@ -936,6 +1020,29 @@ if [[ "${1:-}" == "--self-test" ]]; then
   dk_go dk_daemon_down 'postgresql://gate:pw0@127.0.0.1:5489/brain' FAKE_DOCKER_PS_EXIT=1 \
     FAKE_DOCKER_PORT=5489 FAKE_DOCKER_NAMES=pgone FAKE_DOCKER_HEALTHY=pgone
   dk_refused dk_daemon_down 2 pw0 docker
+
+  # J1.4 without psql: the identity query has no program to run, so the gate
+  # refuses with 2 before cargo and names psql. The PATH of dk_go has none.
+  fake_tree j14_nopsql "echo \"$ran_marker\""
+  rm -f "$tmp/j14_nopsql/bin/psql"
+  dk_go j14_nopsql 'postgresql://gate:pw0@127.0.0.1:5489/brain'
+  pg_stopped j14_nopsql 2 pw0
+  fail_line_with j14_nopsql psql \
+    || self_fail "j14_nopsql: no FAIL line names psql: $(cat "$tmp/j14_nopsql.out")"
+
+  # J1.5: every step after the guard gets the verified URL, and the system_identifier
+  # the guard read is handed to run-all-tests.sh as GATE_SERVER_SYSTEM_ID.
+  j15_url='postgresql://gate:pw0@127.0.0.1:5489/brain'
+  fake_tree j15 'echo "${DATABASE_URL-unset}" >>"$HOME/rat.url"; echo "${GATE_SERVER_SYSTEM_ID-unset}" >>"$HOME/rat.sysid"; echo run-all-tests >>"$HOME/steps"'
+  run_copy_as "$j15_url" j15 ""
+  (( rc == 0 )) || self_fail "j15: a gate whose every step passed exited $rc: $(cat "$tmp/j15.out")"
+  for f in rat.url cargo.urls crap-gate.urls mutants-gate.urls; do
+    [[ -s "$tmp/j15/home/$f" ]] || self_fail "j15: $f has no line, so the step that writes it did not run"
+    [[ -z "$(grep -vxF -- "$j15_url" "$tmp/j15/home/$f")" ]] \
+      || self_fail "j15: $f holds a DATABASE_URL other than the verified one: $(cat "$tmp/j15/home/$f")"
+  done
+  [[ "$(cat "$tmp/j15/home/rat.sysid" 2>/dev/null || true)" == 7701731310526959658 ]] \
+    || self_fail "j15: run-all-tests did not get the system_identifier the guard read: '$(cat "$tmp/j15/home/rat.sysid" 2>/dev/null || true)'"
 
   # gate_linux_env (gate-lock.sh): what a gate run on Linux hands to cargo, to the
   # mutation tool and to node. Each row runs it in a fresh bash with an empty

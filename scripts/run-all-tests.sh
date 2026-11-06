@@ -190,6 +190,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
   live=$!
   trap 'kill "$live" 2>/dev/null || true; rm -rf "$tmp"' EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
+  # The judge's test URL: a string that only the psql stand-in reads. Its marker
+  # and identity come from that stand-in, never from a server.
+  rat_url='postgresql://gate:pw0@127.0.0.1:5489/brain'
   lock="$tmp/lock"
   live_record="$(owner_record "$live" fixture-live)"
   [[ -n "$(record_field start "$live_record")" ]] \
@@ -336,8 +339,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '0\n' >"$tmp/home2/.cache/cuba-gate/run.exit"
   # merge-gate.sh reads the answer of pg_isready for the port it prints, so the
   # stand-in answers the way a server on the default port does.
-  printf '#!/bin/sh\necho "127.0.0.1:5488 - accepting connections"\nexit 0\n' >"$tmp/bin/pg_isready"
-  printf '#!/bin/sh\nexit 1\n' >"$tmp/bin/psql"
+  printf '#!/bin/sh\necho "127.0.0.1:5489 - accepting connections"\nexit 0\n' >"$tmp/bin/pg_isready"
+  printf '#!/bin/sh\necho "memory-industry-gate|7701731310526959658"\nexit 0\n' >"$tmp/bin/psql"
   # merge-gate.sh asks for a node as new as package.json says before its first step.
   printf '#!/bin/sh\necho v20.0.0\n' >"$tmp/bin/node"
   # merge-gate.sh runs cargo audit and cargo deny before this script, so those
@@ -351,7 +354,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     'exit 1' >"$tmp/bin/cargo"
   chmod +x "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin/cargo" "$tmp/bin/node"
   held_exit=0
-  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/home2" \
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home2" DATABASE_URL="$rat_url" \
       PATH="$tmp/bin:/usr/bin:/bin" SKIP_BACKUP=1 \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$tmp/tree2/scripts/merge-gate.sh" >"$tmp/merge-held.out" 2>&1 || held_exit=$?
@@ -377,7 +380,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   mkdir -p "$tmp/home3/.cache/cuba-gate"
   printf '0\n' >"$tmp/home3/.cache/cuba-gate/run.exit"
   alone_exit=0
-  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/home3" \
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home3" DATABASE_URL="$rat_url" \
       PATH="$tmp/bin:/usr/bin:/bin" \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$ROOT/scripts/run-all-tests.sh" >"$tmp/alone.out" 2>&1 || alone_exit=$?
@@ -402,7 +405,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     'kill -9 "$(printf "%s\n" "$CUBA_GATE_LOCK_OWNER" | sed -n "s/^pid=\([0-9]*\) .*/\1/p")"' \
     'exit 1' >"$tmp/bin4/cargo"
   chmod +x "$tmp/bin4/cargo"
-  { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL HOME="$tmp/home4" \
+  { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home4" DATABASE_URL="$rat_url" \
       PATH="$tmp/bin4:/usr/bin:/bin" SKIP_BACKUP=1 \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$tmp/tree4/scripts/merge-gate.sh" >"$tmp/merge-killed.out" 2>&1 || true; } 2>/dev/null
@@ -429,8 +432,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
     'exit 1' >"$tmp/bin5/cargo"
   chmod +x "$tmp/bin5/cargo"
   cache_exit=0
-  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u ONNX_MODEL_PATH -u DATABASE_URL \
-      HOME="$tmp/home5" XDG_CACHE_HOME="$tmp/xdg5" \
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u ONNX_MODEL_PATH \
+      HOME="$tmp/home5" XDG_CACHE_HOME="$tmp/xdg5" DATABASE_URL="$rat_url" \
       PATH="$tmp/bin5:/usr/bin:/bin" \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$ROOT/scripts/run-all-tests.sh" >"$tmp/cache.out" 2>&1 || cache_exit=$?
@@ -469,6 +472,239 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$(cat "$tmp/home6/.cache/cuba-gate/run.exit" 2>/dev/null)" == 2 ]] \
     || self_fail "the refusal exited 2 and its exit file says '$(cat "$tmp/home6/.cache/cuba-gate/run.exit" 2>/dev/null)'"
   [[ ! -e "$tmp/home6/.cache/cuba-gate/lock" ]] || self_fail "the refusal left its lock behind"
+
+  # J1 (CI-J), run-all-tests.sh on its own: a DATABASE_URL that is unset, empty, or
+  # that names a server without the judge's marker stops the script with 2 before
+  # any section. Its cargo and psql stand-ins record every call; none may run after
+  # the refusal (the unmarked server is asked its identity, and that is all). A
+  # system_identifier other than the one merge-gate exported in GATE_SERVER_SYSTEM_ID
+  # is the server changed under the run, and is refused the same way.
+  rat_refused() {
+    local name="$1" url="$2" cluster="$3" exported="$4"
+    local -a start=(DATABASE_URL="$url") extra=()
+    [[ "$url" != unset ]] || start=()
+    [[ -z "$exported" ]] || extra=(GATE_SERVER_SYSTEM_ID="$exported")
+    mkdir -p "$tmp/$name/home/.cache/cuba-gate" "$tmp/$name/bin"
+    printf '0\n' >"$tmp/$name/home/.cache/cuba-gate/run.exit"
+    printf '%s\n' '#!/bin/sh' 'echo cargo >>"$HOME/tools.calls"' 'exit 1' >"$tmp/$name/bin/cargo"
+    printf '%s\n' '#!/bin/sh' 'echo psql >>"$HOME/tools.calls"' \
+      'echo "$FAKE_RAT_CLUSTER|7701731310526959658"' 'exit 0' >"$tmp/$name/bin/psql"
+    # pg_isready and docker are stand-ins too: a real one on /usr/bin could reach
+    # the live server. Each records its call.
+    printf '%s\n' '#!/bin/sh' 'echo pg_isready >>"$HOME/tools.calls"' \
+      'echo "127.0.0.1:5489 - accepting connections"' 'exit 0' >"$tmp/$name/bin/pg_isready"
+    printf '%s\n' '#!/bin/sh' 'echo docker >>"$HOME/tools.calls"' 'exit 1' >"$tmp/$name/bin/docker"
+    chmod +x "$tmp/$name/bin/cargo" "$tmp/$name/bin/psql" "$tmp/$name/bin/pg_isready" "$tmp/$name/bin/docker"
+    rat_exit=0
+    env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u GATE_SERVER_SYSTEM_ID \
+        HOME="$tmp/$name/home" PATH="$tmp/$name/bin:/usr/bin:/bin" \
+        ${start[@]+"${start[@]}"} ${extra[@]+"${extra[@]}"} FAKE_RAT_CLUSTER="$cluster" \
+        CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+        "$BASH" "$ROOT/scripts/run-all-tests.sh" >"$tmp/$name.out" 2>&1 || rat_exit=$?
+  }
+  rat_stopped() {
+    local name="$1" want="$2"
+    (( rat_exit == want )) || self_fail "$name: run-all-tests.sh exited $rat_exit, not $want: $(cat "$tmp/$name.out")"
+    if grep -qx cargo "$tmp/$name/home/tools.calls" 2>/dev/null; then
+      self_fail "$name: cargo ran after the refusal: $(cat "$tmp/$name.out")"
+    fi
+  }
+  for form in unset empty; do
+    url=''
+    [[ "$form" != unset ]] || url=unset
+    rat_refused "j16_$form" "$url" memory-industry-gate ''
+    rat_stopped "j16_$form" 2
+    [[ ! -e "$tmp/j16_$form/home/tools.calls" ]] \
+      || self_fail "j16_$form: a tool ran with no DATABASE_URL: $(cat "$tmp/j16_$form/home/tools.calls")"
+    grep -q '^FAIL: .*DATABASE_URL' "$tmp/j16_$form.out" \
+      || self_fail "j16_$form: no FAIL line names DATABASE_URL: $(cat "$tmp/j16_$form.out")"
+  done
+  rat_refused j16_unmarked "$rat_url" '' ''
+  rat_stopped j16_unmarked 2
+  grep -qx psql "$tmp/j16_unmarked/home/tools.calls" \
+    || self_fail "j16_unmarked: the server was not asked its identity before the refusal"
+  grep -q '^FAIL: .*cluster_name' "$tmp/j16_unmarked.out" \
+    || self_fail "j16_unmarked: no FAIL line names the cluster_name it read: $(cat "$tmp/j16_unmarked.out")"
+  rat_refused j15_changed "$rat_url" memory-industry-gate 1111
+  rat_stopped j15_changed 2
+  grep -q 'the server changed' "$tmp/j15_changed.out" \
+    || self_fail "j15_changed: a system_identifier other than the exported one was not refused as 'the server changed': $(cat "$tmp/j15_changed.out")"
+  rat_refused j15_same "$rat_url" memory-industry-gate 7701731310526959658
+  (( rat_exit != 2 )) && ! grep -q 'the server changed' "$tmp/j15_same.out" \
+    || self_fail "j15_same: the same system_identifier as the exported one was refused (exit $rat_exit): $(cat "$tmp/j15_same.out")"
+
+  # J2, J3, J4, J6 (CI-J): full_tree copies this script into a tree of its own,
+  # with stand-ins for everything it runs before the eval, so a row reads what the
+  # real script hands to each one and the exit it reaches. cargo logs every call;
+  # FAKE_CARGO_FAIL names the subcommand that fails (FAKE_CARGO_FAIL_EXIT is its
+  # code), FAKE_CARGO_TEST_COUNT is what each test run reports, and
+  # FAKE_CARGO_BUILD_EXE is the executable a build reports with --message-format.
+  # psql answers the catalog queries and the count of brain_observations
+  # (FAKE_OBS). df reports FAKE_DF_GB. The binary logs its doctor and eval calls;
+  # eval reports FAKE_NDCG, FAKE_SCORED and FAKE_OBS. Nothing here reaches a server.
+  full_tree() {
+    local name="$1" t="$tmp/$1"
+    mkdir -p "$t/scripts" "$t/rust/tests" "$t/rust/eval-datasets" "$t/rust/target/debug/deps" \
+      "$t/home/.cache/cuba-gate" "$t/bin" "$t/standin" "$t/target/debug" "$t/target/release" \
+      "$t/models" "$t/reranker"
+    cp "$ROOT/scripts/run-all-tests.sh" "$ROOT/scripts/gate-lock.sh" "$t/scripts/"
+    cp "$ROOT/rust/eval-datasets/smoke.jsonl" "$t/rust/eval-datasets/"
+    : >"$t/rust/tests/t1.rs"
+    : >"$t/nli-model"
+    : >"$t/models/model_quantized.onnx"
+    : >"$t/reranker/model.onnx"
+    printf '%s\n' '#!/bin/sh' 'exit 0' >"$t/scripts/build-gpu.sh"
+    printf '%s\n' '#!/bin/sh' 'exit 0' >"$t/scripts/gpu-placement-check.sh"
+    printf '%s\n' 'raise SystemExit(0)' >"$t/scripts/mcp_live_session_test.py"
+    printf '%s\n' 'raise SystemExit(0)' >"$t/rust/tests/e2e_all_tools.py"
+    printf '%s\n' '#!/bin/sh' \
+      'echo "$0 $*" >>"$HOME/bin.calls"' \
+      'case "$1" in' \
+      '  eval)' \
+      '    echo "DATABASE_URL=${DATABASE_URL-unset} $*" >>"$HOME/eval.calls"' \
+      '    printf "{\"ndcg_at_k\": %s, \"queries_scored\": %s, \"observations\": %s}\n" "${FAKE_NDCG-0.8}" "${FAKE_SCORED-5}" "${FAKE_OBS-5}" ;;' \
+      '  doctor) [ "${2:-}" = --json ] && echo "{\"checks\":[]}" ;;' \
+      'esac' \
+      'exit 0' >"$t/standin/memory-industry"
+    printf '%s\n' '#!/bin/sh' \
+      'echo "$*" >>"$HOME/cargo.calls"' \
+      'if [ "$1" = "${FAKE_CARGO_FAIL:-none}" ]; then exit "${FAKE_CARGO_FAIL_EXIT:-1}"; fi' \
+      'mkdir -p "$CARGO_TARGET_DIR/debug" "$CARGO_TARGET_DIR/release"' \
+      'case "$*" in *--release*) [ -e "$CARGO_TARGET_DIR/release/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/release/memory-industry" ;; esac' \
+      'if [ "$1" = build ]; then' \
+      '  [ -e "$CARGO_TARGET_DIR/debug/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/debug/memory-industry"' \
+      '  case "$*" in *--message-format=*) [ -z "${FAKE_CARGO_BUILD_EXE:-}" ] || echo "{\"reason\":\"compiler-artifact\",\"executable\":\"$FAKE_CARGO_BUILD_EXE\"}" ;; esac' \
+      'fi' \
+      'if [ "$1" = test ]; then echo "test result: ok. ${FAKE_CARGO_TEST_COUNT:-3} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"; fi' \
+      'exit 0' >"$t/bin/cargo"
+    printf '%s\n' '#!/bin/sh' \
+      'echo "$*" >>"$HOME/psql.calls"' \
+      'case "$*" in' \
+      '  *atttypmod*) echo 384 ;;' \
+      '  *information_schema.tables*) echo 20 ;;' \
+      '  *shobj_description*) echo "" ;;' \
+      '  *brain_observations*) echo "${FAKE_OBS-5}" ;;' \
+      'esac' \
+      'exit 0' >"$t/bin/psql"
+    printf '%s\n' '#!/bin/sh' \
+      'echo "$*" >>"$HOME/df.calls"' \
+      'printf "Avail\n%sG\n" "${FAKE_DF_GB-100}"' >"$t/bin/df"
+    printf '%s\n' '#!/bin/sh' 'echo "docker $*" >>"$HOME/docker.calls"' 'exit 1' >"$t/bin/docker"
+    printf '%s' "$t/standin/memory-industry" >"$t/home/standin.path"
+    chmod +x "$t"/scripts/*.sh "$t"/bin/* "$t"/standin/*
+  }
+  # full_run NAME [VAR=value ...]: the whole script in NAME's tree, against the judge's
+  # test URL, with the sweep and the free-space floor off unless a row says otherwise.
+  # Its exit lands in $rc and what it printed in $tmp/NAME.out.
+  full_run() {
+    local name="$1" t="$tmp/$1"
+    shift
+    rc=0
+    env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT HOME="$t/home" \
+      PATH="$t/bin:/usr/bin:/bin" DATABASE_URL="$rat_url" CARGO_TARGET_DIR="$t/target" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      ONNX_MODEL_PATH="$t/models" CUBA_RERANKER_PATH="$t/reranker" CUBA_NLI_PATH="$t/nli-model" \
+      MEMORY_INDUSTRY_LLM_PROVIDER=ollama "$@" \
+      "$BASH" "$t/scripts/run-all-tests.sh" >"$tmp/$name.out" 2>&1 || rc=$?
+  }
+
+  # J2.1: brain_gate is prepared with the binary cargo has just reported. A stale
+  # binary planted where the old lookup looked is never run, and nothing is
+  # looked for under release/ or under the cuba-memorys name.
+  full_tree j21
+  printf '%s\n' '#!/bin/sh' 'echo planted >>"$HOME/planted.ran"' 'exit 0' >"$tmp/j21/target/debug/memory-industry"
+  printf '%s\n' '#!/bin/sh' 'echo planted >>"$HOME/planted-cuba.ran"' 'exit 0' >"$tmp/j21/target/debug/cuba-memorys"
+  mkdir -p "$tmp/j21/fresh"
+  cp "$tmp/j21/standin/memory-industry" "$tmp/j21/fresh/memory-industry"
+  chmod +x "$tmp/j21/fresh/memory-industry" "$tmp/j21/target/debug/memory-industry" "$tmp/j21/target/debug/cuba-memorys"
+  full_run j21 FAKE_CARGO_BUILD_EXE="$tmp/j21/fresh/memory-industry"
+  grep -q '^build --bin memory-industry --message-format=' "$tmp/j21/home/cargo.calls" 2>/dev/null \
+    || self_fail "J2.1: cargo was not asked for 'build --bin memory-industry --message-format=...': $(cat "$tmp/j21/home/cargo.calls" 2>/dev/null || true)"
+  [[ ! -e "$tmp/j21/home/planted.ran" ]] \
+    || self_fail "J2.1: the stale binary planted under target/debug ran: $(cat "$tmp/j21.out")"
+  [[ ! -e "$tmp/j21/home/planted-cuba.ran" ]] \
+    || self_fail "J2.1: the cuba-memorys name under target/debug was looked for and ran"
+  grep -qxF "$tmp/j21/fresh/memory-industry doctor" "$tmp/j21/home/bin.calls" 2>/dev/null \
+    || self_fail "J2.1: doctor did not run with the executable cargo reported: $(cat "$tmp/j21/home/bin.calls" 2>/dev/null || true)"
+
+  # J2.2: a build that fails prepares nothing: exit 1 with a FAIL line, no database
+  # claimed, and the stale binary left under target/debug not run. The stale binary
+  # is what makes a build that fails silently (cargo ... || true) visible here.
+  full_tree j22
+  printf '%s\n' '#!/bin/sh' 'echo stale >>"$HOME/stale.ran"' 'exit 0' >"$tmp/j22/target/debug/memory-industry"
+  chmod +x "$tmp/j22/target/debug/memory-industry"
+  full_run j22 FAKE_CARGO_FAIL=build FAKE_CARGO_FAIL_EXIT=101
+  (( rc == 1 )) || self_fail "J2.2: a build that failed with 101 made run-all-tests exit $rc, not 1: $(cat "$tmp/j22.out")"
+  grep -q '^FAIL: ' "$tmp/j22.out" || self_fail "J2.2: the failed build did not print a FAIL line: $(cat "$tmp/j22.out")"
+  [[ ! -e "$tmp/j22/home/stale.ran" ]] || self_fail "J2.2: the stale binary under target/debug ran after its build failed"
+  if grep -q 'CREATE DATABASE' "$tmp/j22/home/psql.calls" 2>/dev/null; then
+    self_fail "J2.2: a database was created after the build failed: $(cat "$tmp/j22/home/psql.calls")"
+  fi
+
+  # J3.1: the eval reads the scratch database brain_gate_eval, and asks for --json.
+  full_tree j31
+  full_run j31
+  grep -q 'brain_gate_eval ' "$tmp/j31/home/eval.calls" 2>/dev/null \
+    || self_fail "J3.1: the eval was not pointed at brain_gate_eval: $(cat "$tmp/j31/home/eval.calls" 2>/dev/null || echo 'no eval call')"
+  grep -q -- ' --json' "$tmp/j31/home/eval.calls" 2>/dev/null \
+    || self_fail "J3.1: the eval was not asked for --json: $(cat "$tmp/j31/home/eval.calls" 2>/dev/null || echo 'no eval call')"
+
+  # J3.2: a number that measures nothing is red. nDCG 0; fewer scored queries than
+  # smoke.jsonl has lines; no observation seeded.
+  full_tree j32a
+  full_run j32a FAKE_NDCG=0.0
+  (( rc == 1 )) || self_fail "J3.2: an eval with ndcg_at_k 0.0 exited $rc, not 1: $(cat "$tmp/j32a.out")"
+  grep -qi '^FAIL: .*ndcg' "$tmp/j32a.out" || self_fail "J3.2: no FAIL line names the nDCG of 0: $(cat "$tmp/j32a.out")"
+  full_tree j32b
+  full_run j32b FAKE_SCORED=3
+  (( rc == 1 )) || self_fail "J3.2: an eval that scored 3 of the 5 smoke queries exited $rc, not 1: $(cat "$tmp/j32b.out")"
+  grep -q '^FAIL: .*smoke.jsonl' "$tmp/j32b.out" || self_fail "J3.2: no FAIL line names the queries smoke.jsonl has: $(cat "$tmp/j32b.out")"
+  full_tree j32c
+  full_run j32c FAKE_OBS=0
+  (( rc == 1 )) || self_fail "J3.2: an empty scratch database exited $rc, not 1: $(cat "$tmp/j32c.out")"
+  grep -q '^FAIL: .*0 observations' "$tmp/j32c.out" || self_fail "J3.2: no FAIL line says 0 observations: $(cat "$tmp/j32c.out")"
+
+  # J4.1: a section that runs a different number of tests than its line in
+  # scripts/test-section-counts.txt is red, now, and names the section and both numbers.
+  full_tree j41
+  printf '%s\n' 'admin-role 4 fixture' >"$tmp/j41/scripts/test-section-counts.txt"
+  full_run j41
+  (( rc == 1 )) || self_fail "J4.1: admin-role ran 3 tests against a line of 4 and the script exited $rc, not 1: $(cat "$tmp/j41.out")"
+  grep -q 'admin-role.*expected 4, ran 3' "$tmp/j41.out" \
+    || self_fail "J4.1: the mismatch is not named with its section and both numbers: $(cat "$tmp/j41.out")"
+  # J4.2: the count is checked in both directions, and a section with no line is red.
+  full_tree j42a
+  printf '%s\n' 'admin-role 2 fixture' >"$tmp/j42a/scripts/test-section-counts.txt"
+  full_run j42a
+  (( rc == 1 )) || self_fail "J4.2: a line of 2 against 3 run tests exited $rc, not 1: $(cat "$tmp/j42a.out")"
+  grep -q 'expected 2, ran 3' "$tmp/j42a.out" || self_fail "J4.2: a count too low is not named: $(cat "$tmp/j42a.out")"
+  full_tree j42b
+  printf '%s\n' 'lib-ignored 3 fixture' >"$tmp/j42b/scripts/test-section-counts.txt"
+  full_run j42b
+  (( rc == 1 )) || self_fail "J4.2: a section that ran with no line in the file exited $rc, not 1: $(cat "$tmp/j42b.out")"
+  grep -q '^FAIL: .*admin-role' "$tmp/j42b.out" \
+    || self_fail "J4.2: no FAIL line names the section with no line: $(cat "$tmp/j42b.out")"
+
+  # J6.1: the sweep works on CARGO_TARGET_DIR, the target the build writes to, not on
+  # rust/target. Old artifacts of CARGO_TARGET_DIR go, recent ones stay, and the
+  # sentinel under rust/target stays. df is asked about CARGO_TARGET_DIR.
+  full_tree j61
+  ct="$tmp/j61/ctarget"
+  mkdir -p "$ct/debug/deps" "$ct/debug/.fingerprint/old-fp" "$ct/debug/incremental"
+  printf x >"$ct/debug/deps/old-artifact"
+  printf x >"$ct/debug/deps/new-artifact"
+  printf x >"$ct/debug/incremental/old-inc"
+  printf x >"$tmp/j61/rust/target/debug/deps/centinel"
+  touch -d '30 days ago' "$ct/debug/deps/old-artifact" "$ct/debug/incremental/old-inc" \
+    "$ct/debug/.fingerprint/old-fp" "$tmp/j61/rust/target/debug/deps/centinel"
+  full_run j61 FAKE_CARGO_FAIL=fmt CARGO_TARGET_DIR="$ct" CUBA_GATE_SWEEP_BELOW_GB=50 FAKE_DF_GB=10
+  [[ ! -e "$ct/debug/deps/old-artifact" ]] \
+    || self_fail "J6.1: an artifact 30 days old in CARGO_TARGET_DIR survived the sweep: $(cat "$tmp/j61.out")"
+  [[ -e "$ct/debug/deps/new-artifact" ]] || self_fail "J6.1: the sweep took a recent artifact of CARGO_TARGET_DIR"
+  [[ -e "$tmp/j61/rust/target/debug/deps/centinel" ]] \
+    || self_fail "J6.1: the sweep went into rust/target and took the sentinel there"
+  grep -qF "$ct" "$tmp/j61/home/df.calls" 2>/dev/null \
+    || self_fail "J6.1: df was not asked about CARGO_TARGET_DIR: $(cat "$tmp/j61/home/df.calls" 2>/dev/null || echo 'df never ran')"
 
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"

@@ -759,7 +759,12 @@ fn the_gate_banner_and_the_gate_doc_do_not_disagree() {
 /// to say which half they cover, and the step has to exist.
 #[test]
 fn the_gpu_hole_is_declared_and_the_half_that_can_be_checked_is_checked() {
-    let suite = read("scripts/run-all-tests.sh");
+    let body = read("scripts/run-all-tests.sh").replace("\r\n", "\n");
+    let suite: String = outside_self_test(&body)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
     let e2e = suite
         .find("tests/e2e_all_tools.py")
         .expect("run-all-tests.sh runs the E2E suite");
@@ -952,8 +957,10 @@ fn the_second_judge_hands_its_mutation_outcomes_to_the_same_build_check() {
 }
 
 /// The lines of `body` that are not between the self-test markers, as
-/// `(line number, line)`. The fixtures of a self-test are meminfo files, and a
-/// meminfo has a `MemTotal:` line; only the code that runs is the guard's business.
+/// `(line number, line)`. A self-test's fixtures name the same files, calls and
+/// words as the code they test (a meminfo fixture has a `MemTotal:` line), so a
+/// contract that searches the whole script can find a fixture first. Only the code
+/// that runs is judged.
 fn outside_self_test(body: &str) -> Vec<(usize, &str)> {
     let mut inside = false;
     let mut out = Vec::new();
@@ -1652,9 +1659,10 @@ const SELF_TEST_END: &str = "# --- self-test end ---";
 /// Every script of `scripts/` that has a `--self-test` mode, in the order
 /// `read_dir` + sort gives. Two-way on purpose: a script that gains a mode, or
 /// loses its own, is red until this list says so.
-const SCRIPTS_WITH_SELF_TEST: [&str; 10] = [
+const SCRIPTS_WITH_SELF_TEST: [&str; 11] = [
     "advisory-exceptions.sh",
     "codigo-muerto.sh",
+    "crap-gate.sh",
     "gpu-placement-check.sh",
     "merge-gate.sh",
     "mutants-gate.sh",
@@ -2663,5 +2671,539 @@ fn the_e2e_entry_point_resolves_the_binary_under_cargo_target_dir() {
          not `{}`. The entry point fixes rust/target/release/memory-industry, a directory the \
          gate on this machine never builds into",
         binary.display()
+    );
+}
+
+// --- CI-J: no default URL, the judge's server, the eval's database, the counted sections, the banner ---
+
+/// Whether `line` gives `DATABASE_URL` (or `LIVE_DATABASE_URL`) a default for when it is not set:
+/// `${DATABASE_URL:-…}`, `${DATABASE_URL-…}`, `:=`, `=`, or a Python `"DATABASE_URL", <default>`
+/// argument whose default is neither `None` nor the empty string. `${DATABASE_URL:?…}` is a
+/// requirement, not a default, and so is `${DATABASE_URL}` with nothing after it.
+fn names_a_default_url(line: &str) -> bool {
+    for var in ["DATABASE_URL", "LIVE_DATABASE_URL"] {
+        let needle = format!("${{{var}");
+        let mut rest = line;
+        while let Some(at) = rest.find(&needle) {
+            let after = &rest[at + needle.len()..];
+            for op in [":-", ":=", "-", "="] {
+                if let Some(default) = after.strip_prefix(op) {
+                    if !default.split('}').next().unwrap_or("").is_empty() {
+                        return true;
+                    }
+                    break;
+                }
+            }
+            rest = after;
+        }
+    }
+    let key = "\"DATABASE_URL\",";
+    let mut rest = line;
+    while let Some(at) = rest.find(key) {
+        let arg = rest[at + key.len()..].trim_start();
+        let no_default = arg.is_empty()
+            || arg.starts_with(')')
+            || arg.starts_with("None")
+            || arg.starts_with("\"\"")
+            || arg.starts_with("''");
+        if !no_default {
+            return true;
+        }
+        rest = &rest[at + key.len()..];
+    }
+    false
+}
+
+/// What in `body` (the file `name`) names the live port 5488 or gives DATABASE_URL a default,
+/// as `file:line: …`. Comments may name both, and so may the self-test regions of a shell script,
+/// whose fixtures carry URLs. Python has no regions, so all of it is code.
+fn default_url_defects(name: &str, body: &str) -> Vec<String> {
+    let lines: Vec<(usize, &str)> = if name.ends_with(".py") {
+        body.lines().enumerate().map(|(i, line)| (i + 1, line)).collect()
+    } else {
+        outside_self_test(body)
+    };
+    lines
+        .into_iter()
+        .filter(|(_, line)| !line.trim_start().starts_with('#'))
+        .filter_map(|(n, line)| {
+            if line.contains("5488") {
+                Some(format!("{name}:{n}: names the live port 5488: {}", line.trim()))
+            } else if names_a_default_url(line) {
+                Some(format!("{name}:{n}: gives DATABASE_URL a default: {}", line.trim()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Every script under `scripts/` (`.sh` and `.py`) and every Python client of `rust/tests/`,
+/// relative to the repo root, sorted.
+fn judge_scripts() -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if matches!(path.extension().and_then(|e| e.to_str()), Some("sh" | "py")) {
+                out.push(relative_to_repo(&path));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&repo_root().join("scripts"), &mut out);
+    for entry in std::fs::read_dir(repo_root().join("rust/tests"))
+        .expect("rust/tests is readable")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("py") {
+            out.push(relative_to_repo(&path));
+        }
+    }
+    out.sort();
+    out
+}
+
+fn relative_to_repo(path: &Path) -> String {
+    path.strip_prefix(repo_root())
+        .expect("a file of the repo lies under the repo root")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// The judge's scripts and clients never name the live port nor default DATABASE_URL: without it
+/// they refuse with exit 2 and ask no server. `merge-gate.sh` and the rest of the judge keep
+/// their own URL in one place, the one the guard verified.
+#[test]
+fn no_gate_script_defaults_database_url_and_none_names_the_live_port() {
+    let shell = "#!/usr/bin/env bash\n\
+                 # a comment may name ${DATABASE_URL:-x} and 5488, it is not code\n\
+                 export DATABASE_URL=\"${DATABASE_URL:-postgresql://cuba:pw@127.0.0.1:5488/brain}\"\n";
+    assert_eq!(
+        default_url_defects("planted.sh", shell).len(),
+        1,
+        "the scan must flag the planted default and nothing else in its own fixture: {:?}",
+        default_url_defects("planted.sh", shell)
+    );
+    let python = "DATABASE_URL = os.environ.get(\n    \"DATABASE_URL\", \"postgresql://cuba:pw@127.0.0.1:5575/brain\"\n)\n";
+    assert_eq!(
+        default_url_defects("planted.py", python).len(),
+        1,
+        "the scan must flag a Python default that sits on the line after os.environ.get( : {:?}",
+        default_url_defects("planted.py", python)
+    );
+    let region = format!(
+        "{SELF_TEST_BEGIN}\nDATABASE_URL=\"${{DATABASE_URL:-postgresql://cuba:pw@127.0.0.1:5488/brain}}\"\n{SELF_TEST_END}\n"
+    );
+    assert!(
+        default_url_defects("region.sh", &region).is_empty(),
+        "a self-test region may carry a URL fixture; the scan reads it as code: {:?}",
+        default_url_defects("region.sh", &region)
+    );
+    let required = "DATABASE_URL=\"${DATABASE_URL:?set DATABASE_URL to the judge's server}\"\n";
+    assert!(
+        default_url_defects("required.sh", required).is_empty(),
+        "`:?` requires the variable, it does not default it: {:?}",
+        default_url_defects("required.sh", required)
+    );
+
+    let mut defects = Vec::new();
+    for name in judge_scripts() {
+        defects.extend(default_url_defects(&name, &read(&name)));
+    }
+    assert!(
+        defects.is_empty(),
+        "these lines of the judge's scripts and clients name the live port 5488 or default \
+         DATABASE_URL. Without DATABASE_URL they must refuse with exit 2 and ask no server: \
+         {defects:#?}"
+    );
+}
+
+/// The Python clients refuse without `DATABASE_URL` before they launch the binary: with
+/// `CUBA_BINARY_PATH` pointing at a stand-in that leaves a mark, the mark must not appear, and
+/// they exit 2 naming `DATABASE_URL`. Unix only: the stand-in is a shell script.
+#[cfg(unix)]
+#[test]
+fn the_python_clients_refuse_without_database_url() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let dir = std::env::temp_dir().join(format!("ci-j-j17-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch directory for the stand-in");
+    let binary = dir.join("stand-in-binary");
+    let mark = dir.join("ran");
+    std::fs::write(
+        &binary,
+        format!("#!/bin/sh\necho ran >\"{}\"\nexit 0\n", mark.display()),
+    )
+    .expect("writing the stand-in binary");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("making the stand-in executable");
+
+    for client in ["rust/tests/e2e_all_tools.py", "scripts/mcp_live_session_test.py"] {
+        let _ = std::fs::remove_file(&mark);
+        let out = Command::new("python3")
+            .arg(repo_root().join(client))
+            .env_remove("DATABASE_URL")
+            .env("CUBA_BINARY_PATH", &binary)
+            .current_dir(&dir)
+            .output()
+            .expect("python3 must be on PATH to run the clients' contract");
+        assert!(
+            !mark.exists(),
+            "{client} launched the binary with DATABASE_URL unset: it defaults the URL to the live port"
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{client} without DATABASE_URL must exit 2; stdout: {} stderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            said.contains("DATABASE_URL"),
+            "{client} refused without saying which variable is missing: {said}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The first line whose trimmed text satisfies `pred`, as its number in the file.
+fn first_line_where(lines: &[(usize, String)], pred: impl Fn(&str) -> bool) -> Option<usize> {
+    lines
+        .iter()
+        .find(|(_, line)| pred(line.as_str()))
+        .map(|(n, _)| *n)
+}
+
+/// `merge-gate.sh` judges the URL before the first step that uses it, assigns it once, and hands
+/// that one value to its children; the children that take the URL on their own call the same
+/// guard. The anchors are the step headers and calls that the gate prints and runs.
+#[test]
+fn every_gate_step_after_the_guard_gets_the_verified_url() {
+    let gate_body = read("scripts/merge-gate.sh");
+    let gate: Vec<(usize, String)> = outside_self_test(&gate_body)
+        .into_iter()
+        .map(|(n, line)| (n, line.trim().to_string()))
+        .filter(|(_, line)| !line.starts_with('#'))
+        .collect();
+
+    let guard = first_line_where(&gate, |l| l.contains("gate_require_judge_server"));
+    let audit = first_line_where(&gate, |l| l.contains("=== cargo audit ==="));
+    let suite = first_line_where(&gate, |l| l.starts_with("\"$ROOT/scripts/run-all-tests.sh\""));
+    let (Some(guard), Some(audit), Some(suite)) = (guard, audit, suite) else {
+        panic!(
+            "merge-gate.sh must call gate_require_judge_server (found on {guard:?}), print \
+             `=== cargo audit ===` ({audit:?}) and call run-all-tests.sh ({suite:?}) outside its \
+             self-test"
+        );
+    };
+    assert!(
+        guard < audit && guard < suite,
+        "merge-gate.sh judges the server at line {guard}, after cargo audit ({audit}) or \
+         run-all-tests.sh ({suite}): a step would have used a URL nobody verified"
+    );
+
+    let assignments: Vec<usize> = gate
+        .iter()
+        .filter(|(_, l)| l.starts_with("export DATABASE_URL=") || l.starts_with("DATABASE_URL="))
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        assignments.len(),
+        1,
+        "merge-gate.sh assigns DATABASE_URL on lines {assignments:?}. The verified URL must be the \
+         only value the parent hands on, so one assignment"
+    );
+    assert!(
+        assignments[0] < suite,
+        "the verified URL is exported at line {} and run-all-tests.sh is called at {suite}: the \
+         child would not inherit it",
+        assignments[0]
+    );
+    assert!(
+        gate.iter().any(|(_, l)| l.starts_with("export GATE_SERVER_SYSTEM_ID=")),
+        "merge-gate.sh does not export GATE_SERVER_SYSTEM_ID, the system_identifier it verified, \
+         so run-all-tests.sh has nothing to compare against"
+    );
+
+    for script in ["scripts/crap-gate.sh", "scripts/mutants-gate.sh"] {
+        let body = read(script);
+        let calls_guard = outside_self_test(&body)
+            .iter()
+            .any(|(_, l)| !l.trim_start().starts_with('#') && l.contains("gate_require_judge_server"));
+        assert!(
+            calls_guard,
+            "{script} runs cargo with whatever DATABASE_URL it inherits and does not call \
+             gate_require_judge_server; with DATABASE_URL set it must judge it as merge-gate does"
+        );
+    }
+
+    let suite_body = read("scripts/run-all-tests.sh");
+    let suite_code: Vec<&str> = outside_self_test(&suite_body)
+        .into_iter()
+        .map(|(_, l)| l)
+        .collect();
+    assert!(
+        suite_code.iter().any(|l| l.contains("GATE_SERVER_SYSTEM_ID")),
+        "run-all-tests.sh does not read GATE_SERVER_SYSTEM_ID: a server changed in the middle of the run would go unseen"
+    );
+    assert!(
+        suite_code.iter().any(|l| l.contains("the server changed")),
+        "run-all-tests.sh does not stop with `the server changed` when the system_identifier it reads differs from the one merge-gate exported"
+    );
+}
+
+/// The eval smoke scores a fixture that is versioned and seeded into a scratch database that
+/// the judge owns; the live corpus is never named.
+#[test]
+fn the_eval_reads_a_seeded_scratch_database_and_never_the_live_one() {
+    let suite_body = read("scripts/run-all-tests.sh");
+    let code: Vec<(usize, &str)> = outside_self_test(&suite_body)
+        .into_iter()
+        .filter(|(_, l)| !l.trim_start().starts_with('#'))
+        .collect();
+
+    let live: Vec<usize> = code
+        .iter()
+        .filter(|(_, l)| l.contains("LIVE_DATABASE_URL"))
+        .map(|(n, _)| *n)
+        .collect();
+    assert!(
+        live.is_empty(),
+        "run-all-tests.sh still names LIVE_DATABASE_URL on lines {live:?}. The eval reads the \
+         live corpus through it: the eval has to read the seeded fixture, in brain_gate_eval"
+    );
+
+    let call = code
+        .iter()
+        .position(|(_, l)| l.contains("--dataset") && l.contains("smoke.jsonl"))
+        .expect("run-all-tests.sh runs the eval on smoke.jsonl");
+    let window = &code[call.saturating_sub(3)..=call];
+    let env_line: &str = window
+        .iter()
+        .map(|(_, l)| *l)
+        .find(|l| l.trim_start().starts_with("DATABASE_URL=\"$"))
+        .expect("the eval call names no DATABASE_URL, so it would reach whatever the environment holds");
+    let var = env_line.trim_start()["DATABASE_URL=\"$".len()..]
+        .split('"')
+        .next()
+        .unwrap_or("");
+    let definition = code
+        .iter()
+        .find(|(_, l)| l.trim_start().starts_with(&format!("{var}=")));
+    let (n, def) = definition.expect("the variable the eval call uses is not defined");
+    assert!(
+        def.contains("brain_gate_eval"),
+        "run-all-tests.sh line {n} defines the eval's database as `{}`, not brain_gate_eval, the \
+         scratch database the judge seeds from the fixture",
+        def.trim()
+    );
+}
+
+/// The sections of the judge that run tests by name or with `--ignored` each have a count in
+/// `scripts/test-section-counts.txt`, written as `<section> <tests> <motive>`. Every such
+/// section is named by a `--count` call in run-all-tests.sh, and every call has its line here.
+const CI_J_COUNTED_SECTIONS: [&str; 9] = [
+    "discovered-ignored",
+    "lib-ignored",
+    "admin-role",
+    "embedding-model",
+    "nli",
+    "generative-llm",
+    "reranker-placement",
+    "placement-table",
+    "reranker-model",
+];
+
+#[test]
+fn every_section_with_a_count_runs_and_every_count_has_a_section() {
+    let file = "scripts/test-section-counts.txt";
+    assert!(
+        repo_root().join(file).is_file(),
+        "falta {file}: CI-J (pasada 2) lo escribe con las secciones que corren --ignored o van \
+         nombradas, con los números del log de F0 (ci-rapido-J-F1.spec.md, D-J4b)"
+    );
+    let text = read(file);
+    let mut ids: Vec<String> = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let id = fields.next().unwrap_or("");
+        let tests = fields.next().unwrap_or("");
+        let motive = fields.collect::<Vec<_>>().join(" ");
+        assert!(
+            tests.parse::<u64>().is_ok(),
+            "{file}:{}: `{line}` has no test count; the line is <section> <tests> <motive>",
+            index + 1
+        );
+        assert!(
+            !motive.is_empty(),
+            "{file}:{}: `{id}` has no motive; a count without one is a number nobody can judge",
+            index + 1
+        );
+        ids.push(id.to_string());
+    }
+    for id in CI_J_COUNTED_SECTIONS {
+        assert!(
+            ids.iter().any(|i| i.as_str() == id),
+            "{file} has no line for the section `{id}`"
+        );
+    }
+
+    let suite_body = read("scripts/run-all-tests.sh");
+    let counted: Vec<&str> = outside_self_test(&suite_body)
+        .into_iter()
+        .map(|(_, l)| l)
+        .filter(|l| !l.trim_start().starts_with('#') && l.contains("--count"))
+        .collect();
+    assert_eq!(
+        counted.len(),
+        ids.len(),
+        "{file} has {} sections and run-all-tests.sh has {} `--count` calls: each counted \
+         section needs its call and each call its line",
+        ids.len(),
+        counted.len()
+    );
+    for id in &ids {
+        assert!(
+            counted.iter().any(|line| line
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .any(|token| token == id.as_str())),
+            "section `{id}` has a count in {file} and no `--count` call in run-all-tests.sh names it"
+        );
+    }
+}
+
+/// The product test of migrations over an existing schema is in
+/// `rust/tests/v046_migrations_apply_over_an_existing_schema.rs`, so the banner and the doc stop
+/// saying that migrations on old databases are not covered: they are, and the two copies must
+/// move in the same edit.
+#[test]
+fn the_banner_and_the_doc_stop_saying_old_database_migrations_are_not_covered() {
+    let banner = banner_does_not_check_block().to_lowercase();
+    let doc = doc_does_not_check_section().to_lowercase();
+    assert!(
+        !banner.contains("migrations on old db"),
+        "the gate banner still says that migrations on old databases are not covered; the \
+         product test rust/tests/v046_migrations_apply_over_an_existing_schema.rs covers them"
+    );
+    assert!(
+        !doc.contains("migrations on old db"),
+        "docs/gate.md still says that migrations on old databases are not covered; the product \
+         test rust/tests/v046_migrations_apply_over_an_existing_schema.rs covers them"
+    );
+    assert!(
+        repo_root()
+            .join("rust/tests/v046_migrations_apply_over_an_existing_schema.rs")
+            .is_file(),
+        "the test that covers migrations over an existing schema is missing"
+    );
+}
+
+/// The lines of a JSON Lines file under the repo, each parsed. A file that is not there says so by
+/// name: the eval has nothing fixed to score without it.
+fn jsonl(rel: &str) -> Vec<serde_json::Value> {
+    let path = repo_root().join(rel);
+    assert!(
+        path.is_file(),
+        "falta {rel}: el corpus sintético de la eval smoke (CI-J, pasada 2). Sin él la eval no \
+         tiene un corpus fijo que puntuar"
+    );
+    let text = read(rel);
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("{rel} line {}: {e}", index + 1))
+        })
+        .collect()
+}
+
+/// Each smoke query has at least one fixture observation that holds one of its markers (the rule
+/// the harness applies: a case-insensitive substring), so no query scores 0 by construction; and at
+/// least ten observations satisfy no query, so the order of the results is what gets measured.
+#[test]
+fn every_smoke_query_has_a_relevant_observation_in_the_fixture() {
+    let queries = jsonl("rust/eval-datasets/smoke.jsonl");
+    let corpus = jsonl("rust/eval-datasets/smoke-corpus.jsonl");
+    let markers_of = |query: &serde_json::Value| -> Vec<String> {
+        query["relevant_markers"]
+            .as_array()
+            .map(|markers| {
+                markers
+                    .iter()
+                    .filter_map(|m| m.as_str())
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_lowercase)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let contents: Vec<String> = corpus
+        .iter()
+        .enumerate()
+        .map(|(index, observation)| {
+            observation["content"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "rust/eval-datasets/smoke-corpus.jsonl line {}: no \"content\" string",
+                        index + 1
+                    )
+                })
+                .to_lowercase()
+        })
+        .collect();
+
+    assert!(
+        !queries.is_empty() && !contents.is_empty(),
+        "the eval smoke needs queries ({}) and fixture observations ({}) to score",
+        queries.len(),
+        contents.len()
+    );
+    for (index, query) in queries.iter().enumerate() {
+        let markers = markers_of(query);
+        assert!(
+            !markers.is_empty(),
+            "smoke.jsonl query {} has no relevant_markers",
+            index + 1
+        );
+        assert!(
+            contents
+                .iter()
+                .any(|c| markers.iter().any(|m| c.contains(m.as_str()))),
+            "smoke.jsonl query {} ({}) has no fixture observation with any of its markers \
+             {markers:?}: the eval scores it 0 by construction",
+            index + 1,
+            query["query"]
+        );
+    }
+    let unmatched = contents
+        .iter()
+        .filter(|c| {
+            !queries
+                .iter()
+                .any(|q| markers_of(q).iter().any(|m| c.contains(m.as_str())))
+        })
+        .count();
+    assert!(
+        unmatched >= 10,
+        "only {unmatched} fixture observations satisfy no query; at least 10 are needed, so that \
+         the order of the results is measured and not just the presence of the relevant ones"
     );
 }
