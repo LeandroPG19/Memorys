@@ -637,3 +637,6 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   `75d863e` (gate_history 33/33, gate_dag 14/14, local_gate 70/70, 13 self-tests OK); merged `72917cb`. Open note: the
   `__pycache__` test is not red in pass 1 (the launcher is test code); its red was seen only in the implementer's harness.
   F3.3b-1 waits for F2b-fix (both touch merge-gate's run_in_lane).
+- 2026-11-07 07:38 · **F2b-fix committed and merged:** red `700a5c2` (merge-gate row «the step of lane cov did not see
+  GATE_CLUSTER_ROOT»; contract 68/70), fix `f6a7277` (contract 70/70, gate_dag 14/14, gate_history 23/23); merged `c8dcdba`.
+  Ninth full run (lanes) started on c8dcdba; F3.3b-1 started in worktree `Memorys-ci-f33b1` from c8dcdba.
