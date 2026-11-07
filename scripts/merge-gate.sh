@@ -76,7 +76,9 @@ gate_cluster_check() {
 }
 gate_cluster_sweep() { echo sweep >>"$HOME/steps"; }
 gate_cluster_up() {
+  [ -n "${GATE_OWNER:-}" ] || { echo "FAIL: GATE_OWNER is empty, so no lane can say whose it is. The gate's lock owner must be set before a lane is made." >&2; exit 2; }
   echo "up $1" >>"$HOME/steps"
+  echo "$1 $GATE_OWNER" >>"$HOME/lane.owners"
   touch "$HOME/lanes.open"
   GATE_CLUSTER_URL="postgresql://cuba:fakepw@${GATE_CLUSTER_ROOT//\//%2F}%2F$1.fk0000:5432/brain"
   echo "OK  cluster $1 up in 1 ms (stand-in)"
@@ -275,7 +277,9 @@ FAKE
     [[ "$base" != unset ]] || start=()
     shift $(( $# > 2 ? 3 : 2 ))
     rc=0
-    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS HOME="$tmp/$name/home" \
+    # CI-F3.3c (the judge's names): a row takes the target root of the gate from its own HOME, not from the judge's
+    # CARGO_TARGET_DIR, which is a foreign directory no user can make. A row that needs one passes it in "$@".
+    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS -u CARGO_TARGET_DIR HOME="$tmp/$name/home" \
         PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" ${start[@]+"${start[@]}"} "$@" \
         "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 || rc=$?; } 2>/dev/null
   }
@@ -1570,6 +1574,50 @@ exit 0'
     || self_fail "--step changed the owner record of the gate lock"
   [[ "$(exit_file step_ok)" == 0 ]] \
     || self_fail "--step wrote the exit file of the gate that owns the lock: '$(exit_file step_ok)'"
+  # CI-F3.3c (the 14th full run, 7-nov, red at 4.5 s): a step is a process of its own, and GATE_OWNER is a shell variable
+  # that only acquire_gate_lock sets, so a step starts with it empty. The lane it makes names the owner of the lock: the
+  # record the step checked its ticket against, CUBA_GATE_LOCK_OWNER. The stand-in refuses an empty owner as the real one does.
+  fake_tree step_owner "$step_run_all"
+  step_lock="$tmp/step_owner/home/.cache/cuba-gate/lock"
+  mkdir -p "$step_lock/lanes"
+  owner_record "$$" fixture-owner >"$step_lock/owner"
+  printf '%s' tok-owner >"$step_lock/lanes/20-DBG"
+  step_owner_record="$(cat "$step_lock/owner")"
+  step_rc=0
+  env -i PATH="$tmp/step_owner/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_owner/home" GATE_LOCK="$step_lock" \
+    CUBA_GATE_LOCK_OWNER="$step_owner_record" CUBA_GATE_LANE_TOKEN=tok-owner \
+    "$BASH" "$tmp/step_owner/scripts/merge-gate.sh" --step DBG >"$tmp/step_owner.out" 2>&1 || step_rc=$?
+  (( step_rc == 0 )) || self_fail "--step with its ticket and no GATE_OWNER exited $step_rc, not 0: $(cat "$tmp/step_owner.out")"
+  [[ "$(cat "$tmp/step_owner/home/lane.owners" 2>/dev/null)" == "dbg $step_owner_record" ]] \
+    || self_fail "--step made its lane under '$(cat "$tmp/step_owner/home/lane.owners" 2>/dev/null)', not under the owner of the lock ('dbg $step_owner_record'): $(cat "$tmp/step_owner.out")"
+  # A record of a gate that is not running is refused with 2 before any lane is made, and no step runs.
+  fake_tree step_dead "$step_run_all"
+  step_lock="$tmp/step_dead/home/.cache/cuba-gate/lock"
+  mkdir -p "$step_lock/lanes"
+  owner_record 2147483646 dead-owner >"$step_lock/owner"
+  printf '%s' tok-dead >"$step_lock/lanes/20-DBG"
+  step_rc=0
+  env -i PATH="$tmp/step_dead/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_dead/home" GATE_LOCK="$step_lock" \
+    CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-dead \
+    "$BASH" "$tmp/step_dead/scripts/merge-gate.sh" --step DBG >"$tmp/step_dead.out" 2>&1 || step_rc=$?
+  (( step_rc == 2 )) || self_fail "--step with the owner of a gate that is not running exited $step_rc, not 2: $(cat "$tmp/step_dead.out")"
+  [[ -z "$(steps_of step_dead)" && ! -e "$tmp/step_dead/home/lane.owners" ]] \
+    || self_fail "--step with the owner of a gate that is not running made a lane or ran a step: $(steps_of step_dead)"
+  # CI-F3.3c (the judge's names: CUBA_GATE_LOCK_OWNER=ajeno-0000 is not any lock's record): the owner a step is handed is
+  # crossed with the record the lock holds, so a foreign value is refused with 2 before any lane is made, and the ticket
+  # it holds is not spent.
+  fake_tree step_judge "$step_run_all"
+  step_lock="$tmp/step_judge/home/.cache/cuba-gate/lock"
+  mkdir -p "$step_lock/lanes"
+  owner_record "$$" fixture-owner >"$step_lock/owner"
+  printf '%s' tok-judge >"$step_lock/lanes/20-DBG"
+  step_rc=0
+  env -i PATH="$tmp/step_judge/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_judge/home" GATE_LOCK="$step_lock" \
+    CUBA_GATE_LOCK_OWNER=ajeno-0000 CUBA_GATE_LANE_TOKEN=tok-judge \
+    "$BASH" "$tmp/step_judge/scripts/merge-gate.sh" --step DBG >"$tmp/step_judge.out" 2>&1 || step_rc=$?
+  (( step_rc == 2 )) || self_fail "--step with the judge's owner exited $step_rc, not 2: $(cat "$tmp/step_judge.out")"
+  [[ -z "$(steps_of step_judge)" ]] || self_fail "--step with the judge's owner ran a step: $(steps_of step_judge)"
+  [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-judge ]] || self_fail "--step with the judge's owner spent the ticket"
   # A ticket that is not the planner's (here, another token) is refused by name, before any lane starts.
   fake_tree step_foreign "$step_run_all"
   step_lock="$tmp/step_foreign/home/.cache/cuba-gate/lock"
