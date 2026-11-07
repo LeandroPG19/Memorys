@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 fn repo_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -347,11 +349,7 @@ fn comments_stay_plant_rules_are_not_copied() {
 /// to break each of its guards, and the script reports whether they broke.
 #[test]
 fn codigo_muerto_can_actually_fail() {
-    let out = std::process::Command::new(git_bash())
-        .args(["scripts/codigo-muerto.sh", "--self-test"])
-        .current_dir(repo_root())
-        .output()
-        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let out = &judge_env_self_test("codigo-muerto.sh").output;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -381,11 +379,7 @@ stderr: {stderr}"
 /// guard, and the script reports whether they broke.
 #[test]
 fn test_times_can_actually_fail() {
-    let out = std::process::Command::new(git_bash())
-        .args(["scripts/test-times.sh", "--self-test"])
-        .current_dir(repo_root())
-        .output()
-        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let out = &judge_env_self_test("test-times.sh").output;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -415,11 +409,7 @@ fn test_times_can_actually_fail() {
 /// red by date; the gate judges it.
 #[test]
 fn advisory_exceptions_can_actually_fail() {
-    let out = std::process::Command::new(git_bash())
-        .args(["scripts/advisory-exceptions.sh", "--self-test"])
-        .current_dir(repo_root())
-        .output()
-        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let out = &judge_env_self_test("advisory-exceptions.sh").output;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -814,11 +804,7 @@ fn the_gpu_hole_is_declared_and_the_half_that_can_be_checked_is_checked() {
 /// per guard, and reports whether each one was refused.
 #[test]
 fn the_gpu_placement_check_can_actually_fail() {
-    let out = std::process::Command::new(git_bash())
-        .args(["scripts/gpu-placement-check.sh", "--self-test"])
-        .current_dir(repo_root())
-        .output()
-        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let out = &judge_env_self_test("gpu-placement-check.sh").output;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -852,11 +838,7 @@ fn the_gpu_placement_check_can_actually_fail() {
 /// that `brain_gate` cannot be derived from.
 #[test]
 fn a_second_gate_is_refused_and_an_exit_drops_only_its_own_databases() {
-    let out = std::process::Command::new(git_bash())
-        .args(["scripts/run-all-tests.sh", "--self-test"])
-        .current_dir(repo_root())
-        .output()
-        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let out = &judge_env_self_test("run-all-tests.sh").output;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -915,11 +897,7 @@ fn a_build_the_machine_killed_is_not_an_unviable_mutant() {
          check can go red"
     );
 
-    let out = std::process::Command::new(git_bash())
-        .args(["scripts/mutants-gate.sh", "--self-test"])
-        .current_dir(repo_root())
-        .output()
-        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let out = &judge_env_self_test("mutants-gate.sh").output;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1632,11 +1610,7 @@ fn a_systemd_run_with_no_session_to_talk_to_builds_without_the_cap_and_one_with_
 /// drift the assert below is anchored against.
 #[test]
 fn the_crap_half_of_the_second_judge_can_actually_fail() {
-    let out = std::process::Command::new(git_bash())
-        .args(["scripts/quality-gate.sh", "--self-test"])
-        .current_dir(repo_root())
-        .output()
-        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let out = &judge_env_self_test("quality-gate.sh").output;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1765,11 +1739,7 @@ fn publishing_is_gated_by_the_local_receipt_and_not_by_github_ci() {
 /// another commit and a hand-made annotated tag are refused.
 #[test]
 fn the_release_script_refuses_what_it_should_and_its_receipt_is_the_one_publish_reads() {
-    let out = std::process::Command::new(git_bash())
-        .args(["scripts/release.sh", "--self-test"])
-        .current_dir(repo_root())
-        .output()
-        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let out = &judge_env_self_test("release.sh").output;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1806,11 +1776,7 @@ fn the_release_script_refuses_what_it_should_and_its_receipt_is_the_one_publish_
 /// whose blobs are LF - and reports whether each was refused.
 #[test]
 fn the_two_pass_guard_can_actually_fail() {
-    let out = std::process::Command::new(git_bash())
-        .args(["scripts/validar-handoff.sh", "--self-test"])
-        .current_dir(repo_root())
-        .output()
-        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let out = &judge_env_self_test("validar-handoff.sh").output;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2000,11 +1966,7 @@ fn the_exit_file_holds_the_whole_gates_verdict_and_says_running_until_then() {
          behind is its own verdict rather than the one its first half wrote"
     );
 
-    let out = std::process::Command::new(git_bash())
-        .args(["scripts/merge-gate.sh", "--self-test"])
-        .current_dir(repo_root())
-        .output()
-        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    let out = &judge_env_self_test("merge-gate.sh").output;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -3166,25 +3128,69 @@ fn relative_to(root: &Path, path: &Path) -> String {
         .into_owned()
 }
 
+/// Launches of `run_self_test` in this process (CI-J7). With the pid it names each launch's base, so
+/// two launches at the same time never share a directory.
+static SELF_TEST_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+
+/// What gate-cluster.sh builds under the TMPDIR of a self-test, after the base (CI-J7): `/t` (the
+/// TMPDIR of the run), mktemp's `tmp.XXXXXXXXXX`, the root of the case `noowner` (the longest lib
+/// name that reaches gate_cluster_up), the lane `dbg.XXXXXX` and the socket file. 55 bytes.
+const SELF_TEST_SOCKET_SUFFIX: &str = "/t/tmp.XXXXXXXXXX/noowner/root/dbg.XXXXXX/.s.PGSQL.5432";
+
+/// A unix socket path holds 107 bytes at most (sun_path), and gate-cluster.sh:155 refuses past it.
+const SOCKET_PATH_MAX: usize = 107;
+
+/// Where the base of a launch goes (CI-J7): `/tmp` when it is a directory, because the TMPDIR the
+/// test process inherits is not guaranteed short, and `temp_dir()` only where `/tmp` is not one.
+fn self_test_parent() -> std::path::PathBuf {
+    let tmp = Path::new("/tmp");
+    if tmp.is_dir() {
+        tmp.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 /// Runs `script --self-test` with HOME and XDG_CACHE_HOME, each a fresh, empty directory of the
 /// run's own, and `env` set on top (CI-J3). The judge's names are removed from the inherited
 /// environment first, so a run gets exactly what `env` gives it for them. Returns the run and what
-/// it left in those two directories. This environment inherits `XDG_CACHE_HOME` from the login, and `gate_linux_env`
-/// puts its temp under it, so an empty HOME alone proves nothing. TMPDIR is removed, as an unset
-/// TMPDIR is what the script gets here. The exit code is not read by the leftovers: what the run
-/// left is the answer.
+/// it left in those two directories. This environment inherits `XDG_CACHE_HOME` from the login, and
+/// `gate_linux_env` puts its temp under it, so an empty HOME alone proves nothing. TMPDIR is
+/// removed, as an unset TMPDIR is what the script gets here, unless `own_tmpdir` gives the run an
+/// empty TMPDIR of its own, `base/t` (CI-J7). The exit code is not read by the leftovers: what the
+/// run left is the answer.
+///
+/// The base is `self_test_parent()/st-<pid>-<n>`, short on purpose (CI-J7). The socket of the
+/// longest case is that base plus `SELF_TEST_SOCKET_SUFFIX`, and the arithmetic is 107 − 70 = 37:
+/// with a 7-digit pid (pid_max 4194304 here) and a 3-digit counter, the path is the parent plus 70
+/// bytes, so the parent may be at most 37 bytes. `/tmp` is 4, a margin of 33 (the socket is 74).
+/// The assert below checks the real base before any launch, so a longer parent is a red of its own
+/// that says how many bytes to cut, and not the B5 lane refused by gate-cluster's guard.
 fn run_self_test(
     script: &Path,
-    tag: &str,
     env: &[(&str, &str)],
+    own_tmpdir: bool,
 ) -> (std::process::Output, Vec<String>) {
-    let base = std::env::temp_dir().join(format!("selftest-{}-{tag}", std::process::id()));
+    let launch = SELF_TEST_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+    let base = self_test_parent().join(format!("st-{}-{launch}", std::process::id()));
+    let longest = base.as_os_str().len() + SELF_TEST_SOCKET_SUFFIX.len();
+    assert!(
+        longest <= SOCKET_PATH_MAX,
+        "the base of this self-test is {} ({} bytes), so the longest socket gate-cluster.sh builds \
+         under it is {longest} bytes, over the {SOCKET_PATH_MAX} a unix socket path holds: the temp \
+         dir has to be {} bytes shorter, or the B5 lane is refused by its own guard",
+        base.display(),
+        base.as_os_str().len(),
+        longest - SOCKET_PATH_MAX
+    );
     let _ = std::fs::remove_dir_all(&base);
     let home = base.join("home");
     let cache = base.join("xdg-cache");
+    let tmp = base.join("t");
     std::fs::create_dir_all(&home).expect("creating the empty HOME of the self-test");
     std::fs::create_dir_all(&cache).expect("creating the empty XDG_CACHE_HOME of the self-test");
-    let mut command = std::process::Command::new("bash");
+    std::fs::create_dir_all(&tmp).expect("creating the TMPDIR of the self-test");
+    let mut command = std::process::Command::new(git_bash());
     command
         .arg(script)
         .arg("--self-test")
@@ -3195,8 +3201,11 @@ fn run_self_test(
     for (name, _) in JUDGE_ENVIRONMENT {
         command.env_remove(name);
     }
+    command.envs(env.iter().copied());
+    if own_tmpdir {
+        command.env("TMPDIR", &tmp);
+    }
     let output = command
-        .envs(env.iter().copied())
         .output()
         .expect("running the self-test of a judge script");
     let mut left: Vec<String> = entries_under(&home)
@@ -3213,8 +3222,83 @@ fn run_self_test(
 }
 
 /// What `script --self-test` leaves in HOME and XDG_CACHE_HOME (D-J7b). See `run_self_test`.
-fn left_by_self_test(script: &Path, tag: &str) -> Vec<String> {
-    run_self_test(script, tag, &[]).1
+fn left_by_self_test(script: &Path) -> Vec<String> {
+    run_self_test(script, &[], false).1
+}
+
+/// Concurrent launches at most (CI-J7). A self-test is a bash script that starts its own processes
+/// and mostly waits on them, so the cost is wall time. Six slots serve the thirteen launches of a
+/// round without queuing each behind the last, and cap how many of their processes run at once next
+/// to the rest of the binary's tests. Chosen here, not measured: the orchestrator measures it in
+/// the whole-judge run, and a different number is a change of this constant only.
+const SELF_TEST_THREADS: usize = 6;
+
+/// Runs `run` on every name, at most `SELF_TEST_THREADS` at a time, and gives the results back in
+/// the order of `names` (CI-J7). A panic in one of the launches is re-raised here, so the test
+/// fails with that message and does not abort the binary.
+fn in_parallel<'a, T: Send>(names: &[&'a str], run: impl Fn(&'a str) -> T + Sync) -> Vec<T> {
+    let slots: Vec<Mutex<Option<T>>> = names.iter().map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..SELF_TEST_THREADS.min(names.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&name) = names.get(index) else {
+                            break;
+                        };
+                        let value = run(name);
+                        *slots[index].lock().expect(
+                            "each slot is written once, by the worker that took its index",
+                        ) = Some(value);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            if let Err(panic) = worker.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("no launch panicked, so no slot was poisoned")
+                .expect("every name was taken by a worker")
+        })
+        .collect()
+}
+
+/// One run of a self-test under the judge's exported environment, with what it left (CI-J7).
+struct SelfTestRun {
+    output: std::process::Output,
+    left: Vec<String>,
+}
+
+/// The one run of each script of SCRIPTS_WITH_SELF_TEST under JUDGE_ENVIRONMENT and a TMPDIR of its
+/// own (CI-J7). CI-J3 reads all of them, and the ten `*_can_actually_fail` tests read their own
+/// script's run from here, so the judge's environment is launched once per script and not once per
+/// test. Whichever asks first fills it: the result is the same either way.
+static JUDGE_ENV_SELF_TESTS: OnceLock<Vec<(&'static str, SelfTestRun)>> = OnceLock::new();
+
+/// The run of `name` under the judge's exported environment (CI-J7). Its output is what the test
+/// asserts on, with the same messages it had when it launched the script itself.
+fn judge_env_self_test(name: &str) -> &'static SelfTestRun {
+    let runs = JUDGE_ENV_SELF_TESTS.get_or_init(|| {
+        let runs = in_parallel(&SCRIPTS_WITH_SELF_TEST, |script_name| {
+            let script = repo_root().join("scripts").join(script_name);
+            let (output, left) = run_self_test(&script, &JUDGE_ENVIRONMENT, true);
+            SelfTestRun { output, left }
+        });
+        SCRIPTS_WITH_SELF_TEST.iter().copied().zip(runs).collect()
+    });
+    runs.iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, run)| run)
+        .unwrap_or_else(|| panic!("{name} is not one of SCRIPTS_WITH_SELF_TEST"))
 }
 
 /// The self-tests of the judge's scripts are hermetic (D-J7b). Each script that sources
@@ -3233,7 +3317,7 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
         "#!/usr/bin/env bash\nmkdir -p \"$HOME/.cache/x\"\nexit 0\n",
     )
     .expect("writing the liar fixture");
-    let caught = left_by_self_test(&liar, "liar");
+    let caught = left_by_self_test(&liar);
     let _ = std::fs::remove_dir_all(&liar_dir);
     assert!(
         !caught.is_empty(),
@@ -3250,13 +3334,15 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
         !sourcing.is_empty(),
         "no script of SCRIPTS_WITH_SELF_TEST sources gate-lock.sh: the check would prove nothing"
     );
-    let mut leftovers = Vec::new();
-    for name in sourcing {
-        let left = left_by_self_test(&repo_root().join("scripts").join(name), name);
-        if !left.is_empty() {
-            leftovers.push(format!("scripts/{name} --self-test left behind: {left:?}"));
-        }
-    }
+    let lefts = in_parallel(&sourcing, |name| {
+        left_by_self_test(&repo_root().join("scripts").join(name))
+    });
+    let leftovers: Vec<String> = sourcing
+        .iter()
+        .zip(lefts)
+        .filter(|(_, left)| !left.is_empty())
+        .map(|(name, left)| format!("scripts/{name} --self-test left behind: {left:?}"))
+        .collect();
     assert!(
         leftovers.is_empty(),
         "a self-test of the judge wrote into the HOME or the XDG_CACHE_HOME it was given. A \
@@ -3387,8 +3473,8 @@ fn every_self_test_passes_under_the_judges_exported_environment() {
         "#!/usr/bin/env bash\nif [[ -z \"${GATE_SERVER_SYSTEM_ID:-}\" ]]; then\n  echo \"OK  self-test: probe\"\nfi\n",
     )
     .expect("writing the probe");
-    let bare = run_self_test(&probe, "judge-probe-bare", &[]).0;
-    let judged = run_self_test(&probe, "judge-probe", &JUDGE_ENVIRONMENT).0;
+    let bare = run_self_test(&probe, &[], false).0;
+    let judged = run_self_test(&probe, &JUDGE_ENVIRONMENT, false).0;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         self_test_passed(&bare) && !self_test_passed(&judged),
@@ -3397,14 +3483,20 @@ fn every_self_test_passes_under_the_judges_exported_environment() {
     );
 
     let mut failed = Vec::new();
+    let mut leftovers = Vec::new();
     for name in SCRIPTS_WITH_SELF_TEST {
-        let script = repo_root().join("scripts").join(name);
-        let run = run_self_test(&script, &format!("judge-env-{name}"), &JUDGE_ENVIRONMENT).0;
-        if !self_test_passed(&run) {
+        let run = judge_env_self_test(name);
+        if !self_test_passed(&run.output) {
             failed.push(format!(
                 "scripts/{name} exited {:?}: {}",
-                run.status.code(),
-                failure_line(&run)
+                run.output.status.code(),
+                failure_line(&run.output)
+            ));
+        }
+        if !run.left.is_empty() {
+            leftovers.push(format!(
+                "scripts/{name} --self-test left behind: {:?}",
+                run.left
             ));
         }
     }
@@ -3412,6 +3504,11 @@ fn every_self_test_passes_under_the_judges_exported_environment() {
         failed.is_empty(),
         "these self-tests do not pass under the judge's exported environment: they inherit it. \
          Unset what the region inherits, at its start (CI-J3): {failed:#?}"
+    );
+    assert!(
+        leftovers.is_empty(),
+        "a self-test run under the judge's exported environment wrote into the HOME or the \
+         XDG_CACHE_HOME it was given (CI-J3, D-J7b): {leftovers:#?}"
     );
 }
 
