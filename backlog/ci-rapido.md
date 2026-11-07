@@ -446,3 +446,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   one line), D-F4j → `--lab-builds` per lab (`lab builds: hit|miss|unknown`), `CARGO_PROFILE_DEV_DEBUG=0` from one source
   that also enters the seed key (D-F4t; the next run rebuilds the seed once, ≈70 s). QA: 1 Compiling per lab, 0 Dirty,
   54/54 classes, run 2 < 230 s. Implementer started in worktree `Memorys-ci-f4d` (from 2aa31e9).
+- 2026-11-07 07:50 · **F3.1 committed** on `feat/ci-rapido-f31`: red `45c5765` (gate_history_contract exit 101, 20 of 23
+  FAILED; U1 `unknown argument '--units'`), code `39ac8f4`. Verified on a copy with those files: gate_history_contract
+  **23/23**, gate_dag_contract 14/14, local_gate_contract 61/61, clippy clean, rustfmt clean, 12 hermetic self-tests rc 0
+  with HOME/XDG empty. Handoff validated (`tests: frozen`, commit 39ac8f4). Improver (CC ≤ 6, types, no duplicates)
+  started before the merge into the batch.
