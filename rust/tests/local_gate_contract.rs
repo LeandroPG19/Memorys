@@ -1831,11 +1831,12 @@ const SELF_TEST_END: &str = "# --- self-test end ---";
 /// Every script of `scripts/` that has a `--self-test` mode, in the order
 /// `read_dir` + sort gives. Two-way on purpose: a script that gains a mode, or
 /// loses its own, is red until this list says so.
-const SCRIPTS_WITH_SELF_TEST: [&str; 12] = [
+const SCRIPTS_WITH_SELF_TEST: [&str; 13] = [
     "advisory-exceptions.sh",
     "codigo-muerto.sh",
     "crap-gate.sh",
     "gate-audit.sh",
+    "gate-cluster.sh",
     "gpu-placement-check.sh",
     "merge-gate.sh",
     "mutants-gate.sh",
