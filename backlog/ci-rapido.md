@@ -627,3 +627,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   R, e2e = E, each on its own cluster); only files cross processes (the release binary; REL_SHA recomputed; E provisions
   its own brain_gate through the one provisioning function). Split: **F3.3b-0** (F3.1's history fixes, Python) now,
   **F3.3b-1** (merge-gate wiring, table rows P, B1, DC, TB, CV, M, joined log, serial history, T/LB) next.
+- 2026-11-07 07:17 · **Eighth full run (lanes, `b9fe4e0`): 1134.7 s, exit 2.** Everything through the `--features
+  docs` round passed (CI-J5 fixed it; the docs round took 330 s), then crap-gate in lane `cov`: `FAIL: lane cov has a URL
+  that is not a socket under no root (D-F2i)` — run_in_lane hands the child DATABASE_URL, GATE_LANE and the sysid but
+  not GATE_CLUSTER_ROOT, so the child's guard has no root. Slice **F2b-fix** (worktree `Memorys-ci-f2bfix`): the root in
+  run_in_lane's env, in JUDGE_ENVIRONMENT, D-F2i not relaxed. Peak 13.8 GB, CPU 3652 s. Serial estimate for the whole
+  judge once crap (≈60 s) and mutants (≈220 s) run: ≈24 min; the DAG (F3.3b-1 + F3.3c) is what takes it under 15.
