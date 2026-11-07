@@ -654,3 +654,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   CPU 5729 s. Slice **CI-J6**: the two lines re-set by the file's own rule (one run alone: k = 1.5 → local_gate_contract
   110/331, gate_dag_contract 7/23), owner and expiry; plus a read of why the contract costs 220 s (it sits on the dbg
   chain, the DAG's critical path).
+- 2026-11-07 08:07 · **CI-J6 committed and merged:** `dcfef60` (linux local_gate_contract 110/331, gate_dag_contract
+  7/23, by the file's rule from the ninth run; red before = test-times --judge over that log exits 1; after: «OK test times
+  on linux: 122 binaries within their ceilings», self-test OK, both checked by me); merged `8a9c4cc`. Next full run after
+  F3.3b-1's verification, on the head with the chains.
