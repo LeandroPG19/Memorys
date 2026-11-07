@@ -517,3 +517,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   read the SKIP. Order-dependent, three faces of one cause. Slice **T-GUARD** on `release/0.31.0` (worktree
   `Memorys-guard`, spec `guard-chunk-protocol.spec.md`): a deterministic interleaving test (two connections, an
   observable barrier, no sleep), then the guard in both helpers; merged into the batch afterwards.
+- 2026-11-07 11:10 · F4d verified with cargo: red on the worktree (local_gate_contract 57/60: the locator
+  `each_mutant_builds_only_the_lib_test_it_runs`, plus two that run the red mutants self-test), green copy: 12 hermetic
+  self-tests OK with HOME/XDG empty, contract **60/61**: `no_script_looks_for_the_cache_where_the_binary_does_not` flags
+  the F4d.7 row's `find "$HOME" "$XDG_CACHE_HOME"` line (mutants-gate.sh:2565). Back to the implementer (the row uses
+  its own variable; the contract stays).
