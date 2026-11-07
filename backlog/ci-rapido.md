@@ -463,3 +463,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   self-tests OK, **local_gate_contract 58/59**: `no_judge_script_prints_a_database_url_with_its_credentials` flags
   `gate_cluster_url`'s printf of the URL with its password → it assigns through `printf -v` into a caller-named
   variable (pass 1d/2d). verif-f2a's loop missed gate-audit/gate-cluster (wrong pattern): fixed.
+- 2026-11-07 08:40 · F3.1 improver: gate_history.py max CC 23 → 5 (lower_bounds split; the «null, not zero» rule
+  written once), gate-dag.py max 7 → 6 (bound 7 → 2, is_step_sample 4 → 2, dead `rounded` removed); one JSONL reader,
+  one root, one REPO; full annotations (ParamSpec on the no-verdict decorator); ruff F,B,UP,TC clean. Harness identical
+  before/after (0 fails, ALL SAME) and an in-process equivalence of 12 000 seeded cases EQUIV-IDENTICAL, six sabotages
+  EQUIV-DIFFERENT. Seen, left for F3.3: `registrar` loses the run line on a unit naming an unknown step (no verdict
+  change). Both contracts queued under pesado before the refactor commit.
