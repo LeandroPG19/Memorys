@@ -1798,6 +1798,7 @@ pub(crate) mod tests {
     /// The subscriber is the thread's default, not the global one, so a test
     /// running beside this one can neither write into the capture nor see it.
     fn warnings_while<T>(f: impl FnOnce() -> T) -> (T, String) {
+        crate::envs::quiet_global_subscriber();
         #[derive(Clone, Default)]
         struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 

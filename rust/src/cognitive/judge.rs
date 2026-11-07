@@ -1235,6 +1235,7 @@ mod parse_tests {
     /// see it. Two copies are one too many: the place to unify them is
     /// `crate::envs`, next to `ScopedEnv` and `scratch_root`.
     fn warnings_while<T>(f: impl FnOnce() -> T) -> (T, String) {
+        crate::envs::quiet_global_subscriber();
         #[derive(Clone, Default)]
         struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 

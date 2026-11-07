@@ -313,6 +313,7 @@ mod trace_tests {
 
     /// What `f` logged at WARN or above on the thread that runs it.
     fn warnings_while(f: impl FnOnce()) -> String {
+        crate::envs::quiet_global_subscriber();
         #[derive(Clone, Default)]
         struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -382,4 +383,55 @@ mod trace_tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// A global subscriber that records nothing and answers `Interest::sometimes`.
+///
+/// Once it is global, no callsite can cache `never` from a thread without a
+/// subscriber: the macro asks the thread's own default on each event. The
+/// test-only helpers that capture WARN lines call `quiet_global_subscriber`
+/// first, so the interest of their callsites is fixed by this subscriber and
+/// not by whichever thread reaches them first.
+#[cfg(test)]
+struct QuietSubscriber;
+
+#[cfg(test)]
+impl tracing::subscriber::Subscriber for QuietSubscriber {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::WARN)
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Installs `QuietSubscriber` as the process's global default, once.
+#[cfg(test)]
+pub(crate) fn quiet_global_subscriber() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(QuietSubscriber);
+    });
 }
