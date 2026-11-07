@@ -1236,6 +1236,18 @@ FAKE
 fi
 # --- self-test end ---
 
+# CI-F3.3a (D-F3y, spec §4): the lanes of this script in idx order, as scripts/gate-dag.txt names them.
+# --lane <id> runs the one lane it names; a missing or unknown id is refused here, before the lock.
+DAG_LANES=(CL D1 D2 NLI D3 B3 R E)
+run_lane=""
+if [[ "${1:-}" == --lane ]]; then
+  [[ -n "${2:-}" ]] || { echo "FAIL: --lane needs a lane id, one of: ${DAG_LANES[*]}" >&2; exit 2; }
+  case " ${DAG_LANES[*]} " in
+    *" $2 "*) run_lane="$2" ;;
+    *) echo "FAIL: no such lane: $2 (the lanes are: ${DAG_LANES[*]})" >&2; exit 2 ;;
+  esac
+fi
+
 inherit_gate_lock "$GATE_LOCK" || acquire_gate_lock "$GATE_LOCK" || exit 1
 [[ -z "$GATE_LOCK_HELD" ]] || exit_file_running
 trap on_exit EXIT
@@ -1625,18 +1637,23 @@ provision_gate_db() {
 
 gate_cargo_jobs
 
+lane_CL() {
 echo "=== cargo fmt --check ==="
 cargo fmt --check
 
 echo "=== cargo clippy (--all-targets: without it, tests/ is never linted) ==="
 cargo clippy --all-targets -- -D warnings
+}
 
+lane_D1() {
 echo "=== throwaway database for every mutating step ==="
 provision_gate_db
 
 echo "=== cargo test (unit + smoke) ==="
 DATABASE_URL="$GATE_DATABASE_URL" cargo test
+}
 
+lane_D2() {
 echo "=== DB integration tests (--ignored) ==="
 export DATABASE_URL="$GATE_DATABASE_URL"
 # Every tests/*.rs is discovered, not listed. The list used to be written by hand
@@ -1668,13 +1685,18 @@ CUBA_APP_ROLE=0 run_counted admin-role 1 cargo test --test v020_audit_update_app
 
 require_present "tests that need the embedding model" "$ONNX_MODEL_PATH/model_quantized.onnx" \
   run_counted embedding-model 1 cargo test --test v016_chunking -- --ignored --nocapture
+}
 
+lane_NLI() {
 require_present "tests that need the NLI model" "$CUBA_NLI_PATH" \
   run_counted nli 1 cargo test --test nli_entailment --test nli_cost --test nli_probe -- --ignored --nocapture
+}
 
+lane_D3() {
 require_generative_llm "tests that need a generative LLM (extract / relation-scan)" \
   run_counted generative-llm 1 cargo test --test v016_extract_without_sampling --test v017_relation_scan \
              -- --ignored --nocapture
+}
 
 # The release build carries --features cuda. Without it, gpu::wants_gpu() returns false
 # unconditionally, CUBA_RERANK_DEVICE=gpu goes inert, and the reranker runs on CPU at
@@ -1700,6 +1722,7 @@ sha_unchanged() {
   fi
 }
 
+lane_B3() {
 echo "=== release build (one cargo call with --no-run, the feature set production runs) ==="
 export CARGO_BUILD_JOBS="$GATE_RELEASE_JOBS"
 cargo test --release --features cuda --no-run --lib --test v017_rerank_gpu
@@ -1714,6 +1737,7 @@ cargo build --release --features cuda --bins --message-format=json >"$b3g_json" 
 check_fresh "$b3g_json" || { rm -f "$b3g_json"; exit 1; }
 rm -f "$b3g_json"
 sha_unchanged "after B3g"
+}
 
 # --features cuda here too. The feature set is part of what cargo fingerprints,
 # so a second release call asking for a different one rebuilds this same target
@@ -1742,6 +1766,7 @@ sha_unchanged "after B3g"
 # machine with no reranker installed must still hear whether its placement
 # contracts hold. The model-bound ones stay behind the guard, where a missing
 # model is a FAIL and never a skip.
+lane_R() {
 echo "=== reranker placement contracts (GPU feature live, no model needed) ==="
 run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
 
@@ -1766,7 +1791,12 @@ require_present "reranker tests (release: 387s in debug, seconds here)" \
 check_section_lines
 
 sha_unchanged "before E2E"
+}
 
+lane_E() {
+export DATABASE_URL="$GATE_DATABASE_URL"
+REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
+REL_SHA="${REL_SHA:-$(release_sha "$REL_BIN")}"
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
 CUBA_BINARY_PATH="$(resolve_binary_path)"
 export CUBA_BINARY_PATH
@@ -1886,6 +1916,16 @@ DATABASE_URL="$EVAL_DATABASE_URL" "$EVAL_BIN" eval \
 queries_lines="$(grep -c . "$EVAL_QUERIES" || true)"
 check_eval "$eval_json" "$queries_lines" || { rm -f "$eval_json"; exit 1; }
 rm -f "$eval_json"
+}
+
+# D-F3y: without arguments the lanes run in idx order; --lane <id> runs the one named above.
+if [[ -n "$run_lane" ]]; then
+  "lane_$run_lane"
+  exit 0
+fi
+for lane in "${DAG_LANES[@]}"; do
+  "lane_$lane"
+done
 
 echo ""
 echo "All tests passed."

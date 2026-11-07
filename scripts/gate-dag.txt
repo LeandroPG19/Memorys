@@ -1,0 +1,14 @@
+# scripts/gate-dag.txt: the steps that run-all-tests.sh owns, one per line (CI-F3, D-F3a, D-F3b).
+# <idx> <id> <deps> <recursos> <clase> <cpu> <ram_gb> <dur_s> <orden…>
+# idx: serial order, multiples of 10. deps: ids of this table, or '-'. recursos: target:T, cluster:C, models,
+# comma separated, or '-'. clase: normal, exclusive or boundary. cpu, ram_gb, dur_s: starting values for a step
+# without history, from the measurements of ci-rapido-F3.spec.md §0.1. The id of a step is its --lane name in
+# run-all-tests.sh (DAG_LANES). The steps of merge-gate.sh (P, B1, DC, TB, CV, M) enter in F3.3b.
+20 CL - target:T_clip normal 2 2 25 scripts/run-all-tests.sh --lane CL
+40 D1 - target:T_dbg,cluster:C_dbg normal 8 8 180 scripts/run-all-tests.sh --lane D1
+41 D2 D1 target:T_dbg,cluster:C_dbg,models normal 8 8 90 scripts/run-all-tests.sh --lane D2
+42 NLI D2 target:T_dbg,cluster:C_dbg,models exclusive 8 4 25 scripts/run-all-tests.sh --lane NLI
+43 D3 D2 target:T_dbg,cluster:C_dbg normal 4 4 25 scripts/run-all-tests.sh --lane D3
+50 B3 - target:T_rel normal 12 16 300 scripts/run-all-tests.sh --lane B3
+51 R B3 target:T_rel,cluster:C_relh,models normal 8 12 240 scripts/run-all-tests.sh --lane R
+60 E B3,D1 target:T_rel,cluster:C_e2e,models normal 8 12 125 scripts/run-all-tests.sh --lane E

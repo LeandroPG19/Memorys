@@ -271,6 +271,30 @@ Until 0.31 the project ignored advisories in two lists that did not agree: `rust
 
 E2E asserts `cuba_decreto` query `count >= 1` after record. That used to pass with count 0.
 
+## Lanes of run-all-tests.sh (CI-F3.3a)
+
+`scripts/run-all-tests.sh` is split into one function per lane: `lane_CL` (fmt and clippy),
+`lane_D1` (throwaway database and the plain tests), `lane_D2` (the `--ignored` tests and the
+admin-role and embedding ones), `lane_NLI`, `lane_D3` (the generative-LLM tests), `lane_B3` (the
+release build and its freshness check), `lane_R` (the reranker contracts) and `lane_E` (the E2E,
+the doctor, the MCP live session and the eval smoke).
+
+- Without arguments the lanes run in the order of `DAG_LANES` in the script, which is the `idx`
+  order of `scripts/gate-dag.txt`. That is the serial judge, and its output is the same as before
+  the split.
+- `scripts/run-all-tests.sh --lane <id>` runs only that lane. A missing id, or one that is not in
+  `DAG_LANES`, exits 2 before the lock is taken, before any lane is made and before cargo runs.
+- `scripts/gate-dag.txt` is the table of the steps: `<idx> <id> <deps> <recursos> <clase> <cpu>
+  <ram_gb> <dur_s> <orden…>`. A test of the contracts reads it and checks that every `--lane` is a
+  row, that every row has its function, that `DAG_LANES` is the table in `idx` order, that the
+  graph has no cycle and that `R` and `E` depend on `B3`, which builds the binary they read.
+- The lanes assume their dependencies have run: `--lane E` needs the release binary of `B3`
+  (it recomputes `REL_BIN` and `REL_SHA` when they are not set) and the `brain_gate` database that
+  `D1` provisions. The DAG scheduler that enforces this is CI-F3.3c; until then the serial run
+  is the only one that runs the lanes.
+- `DATABASE_URL` is exported as `GATE_DATABASE_URL` by `lane_D2` and again by `lane_E`, so each
+  lane reaches `brain_gate` on its own.
+
 ## Publishing
 
 ```bash
