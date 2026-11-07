@@ -228,7 +228,7 @@ jobs = min(cores / 2, GB available / 4, 6), never below 1
 
 0.30 took `v029_accounts_over_real_http` from 553 s to 10.9 s and `v042_health_says_what_degraded` from 31 s to 1.5 s by hand, and nothing stopped them from drifting back. `scripts/test-times.sh` is the last step of `merge-gate.sh` and pins every binary's time, in both directions.
 
-- **What is measured.** The gate's own log (`~/.cache/cuba-gate/merge-gate.log`), from its start to the line `=== end of timed steps ===`, printed after the `--features docs` step: every `cargo test` of `run-all-tests.sh` and the `--features docs` step. Each binary is a `Running …` (or `Doc-tests …`) header and the first `test result: … finished in X.XXs` after it; its time is the sum over every call that ran it. `tests/<name>.rs` is `<name>`; unittests are `lib:<crate>` and `bin:<crate>` (the library and the binary of this crate share the stem `memory_industry`); doc-tests are `doc:<crate>`. Windows (`tests\x.rs`, `.exe`, CRLF) and Linux give the same keys. The instrumented run of `crap-gate.sh` and the mutation step are not timed.
+- **What is measured.** The gate's own log (`~/.cache/cuba-gate/merge-gate.log`), from its start to the line `=== end of timed steps ===`, which the planner prints before the first untimed row (`crap-gate`, then the mutation step: class `untimed` in `scripts/gate-dag.txt`): every `cargo test` of `run-all-tests.sh` and the `--features docs` step, and nothing of the untimed rows. Each binary is a `Running …` (or `Doc-tests …`) header and the first `test result: … finished in X.XXs` after it; its time is the sum over every call that ran it. `tests/<name>.rs` is `<name>`; unittests are `lib:<crate>` and `bin:<crate>` (the library and the binary of this crate share the stem `memory_industry`); doc-tests are `doc:<crate>`. Windows (`tests\x.rs`, `.exe`, CRLF) and Linux give the same keys. The instrumented run of `crap-gate.sh` and the mutation step are not timed.
 - **Why text.** `cargo test` on stable has no machine-readable timing: libtest's `--format json` needs `-Z unstable-options`, and `nextest` cannot be the verdict here (it splits a binary into processes, and this crate keeps global state behind a `Mutex`). The summary line of libtest is the one stable source, and the reader refuses anything it cannot pair: a header without a result before the next header or the boundary, a log without the boundary or without a single timed binary, are exit 2.
 - **The ceilings.** `scripts/test-time-ceilings.txt`, one line per binary and host: `<os> <binary> <floor_s> <ceiling_s> <owner> <expires> <reason>`. A host (`windows` under Git Bash, `linux`) is judged by its own lines: the CPU-only Linux judge runs the reranker in 213 s and Windows on its GPU in 6 s, so one number for both would let a 30x regression on Windows through. A binary with no line has a ceiling of **10 s** and no floor: every regression 0.30 fixed measured more than 10 s on both hosts, and the slowest binary with no line measures under 7.
 - **Two ways.** Over the ceiling is red. Under the floor is red too: the line no longer describes the binary, and has to come down with it. The floor is half the fastest run and the ceiling 1.3 x the slowest (1.5 with fewer than three complete runs on that host), because the noise is per binary: 1.05x for `v029_accounts_over_real_http`, 2.9x for `v029_bridge_against_the_real_daemon`, 3.2x for a test that waits on a generative LLM over the network. One factor wide enough for the noisy ones would leave the steady ones loose.
@@ -286,13 +286,21 @@ the doctor, the MCP live session and the eval smoke).
   order given, in one process and with one database (CI-F3.3b-1). A missing id, or one that is not in
   `DAG_LANES`, anywhere in the list, exits 2 before the lock is taken, before any lane is made and
   before cargo runs.
-- `merge-gate.sh` launches those lanes as chains, in idx order, one process and one cluster each: `dbg`
-  (CL, D1, D2, NLI, D3), `b3` (B3), `rel` (R) and `e2e` (E). Then `docs`, `cov` and `mut` as before.
-  Between processes only files cross: `rel` and `e2e` find the release binary of `b3` by its path.
+- `merge-gate.sh` hands the table to the planner, `scripts/gate-dag.py`, once its preamble has run (the lock,
+  the server check, the sweep, the audit's cheap steps are the first row). The planner runs the eight rows of
+  `scripts/gate-dag.txt` in idx order: `P`, `DBG` (CL, D1, D2, NLI, D3), `B3`, `REL` (R), `E2E` (E), `DC` (the
+  `--features docs` pass), `CV` (crap-gate) and `M` (mutants-gate). Each row is `merge-gate.sh --step <id>`, a
+  process of its own with one cluster, and the work of a row is its `step_<id>()` function in merge-gate.sh.
+  Between processes only files cross: `REL` and `E2E` find the release binary of `B3` by its path.
+- A row runs only with the ticket the planner hands it (`CUBA_GATE_LANE_TOKEN`): `--step` checks the ticket
+  without spending it, and the lane it starts spends it. Run by hand without one, `--step` exits 2 and takes
+  no lock. A red row stops the planner at its idx; the boundary line `=== end of timed steps ===` is printed
+  by the planner before its first untimed row (CV), and `test-times --judge` reads the log up to it.
 - `scripts/gate-dag.txt` is the table of the steps: `<idx> <id> <deps> <recursos> <clase> <cpu>
-  <ram_gb> <dur_s> <orden…>`. A test of the contracts reads it and checks that every `--lane` is a
-  row, that every row has its function, that `DAG_LANES` is the table in `idx` order, that the
-  graph has no cycle and that `R` and `E` depend on `B3`, which builds the binary they read.
+  <ram_gb> <dur_s> <orden…>`. A test of the contracts reads it and checks its eight rows, their deps and
+  durations, that every row's order is its `--step`, that every `--lane` of a row is a function of
+  run-all-tests.sh, that `DAG_LANES` is those lanes in `idx` order, that the graph has no cycle and that
+  `REL` and `E2E` depend on `B3`, which builds the binary they read.
 - The lanes assume their dependencies have run: `--lane R` and `--lane E` need the release binary of
   `B3` on disk (they recompute `REL_BIN` and `REL_SHA` from it), and `--lane E` provisions `brain_gate`
   itself when the database is missing, with the same provision `D1` uses. The DAG scheduler that

@@ -1671,9 +1671,14 @@ write_receipt() {
 # process itself is the signal's (143, 129): bash raises it again after this trap, so
 # the verdict is the file, and the process just has not passed.
 GATE_REACHED_END=""
+GATE_PLANNER=""
 on_exit() {
   local code=$? tenths=0 stopped=0
   gate_cluster_down_all
+  if [[ -n "$GATE_PLANNER" ]]; then
+    kill -TERM "$GATE_PLANNER" 2>/dev/null || true
+    wait "$GATE_PLANNER" 2>/dev/null || true
+  fi
   if (( code == 0 )) && [[ -z "$GATE_REACHED_END" ]]; then
     code=2
     stopped=1
@@ -1694,6 +1699,7 @@ on_exit() {
   release_gate_lock
 }
 
+gate_main() {
 acquire_gate_lock "$GATE_LOCK" || exit 1
 exit_file_running
 trap on_exit EXIT
@@ -1911,6 +1917,41 @@ fi
 export GATE_SERVER_SYSTEM_ID="$GATE_JUDGE_SYSID"
 fi
 
+# CI-F3.3b-2 (D-F3b, spec F3.3b-1b): the rows of scripts/gate-dag.txt run here, one `merge-gate.sh --step <id>` each,
+# in the planner's order: GATE_DAG=0 is the series in idx order, GATE_DAG=1 the DAG. Its verdict is this gate's: a red row
+# stops the gate with its own code, and the rows after it do not start.
+# The line where the timed steps end (D-F2c, spec F3.3b-1b-iii): test-times.sh judges the log up to it. The planner
+# prints it before the first untimed row (CV, class untimed in gate-dag.txt), so the output of CV and M is not judged.
+TIMED_STEPS_END='=== end of timed steps ==='
+# In the background and waited for: a signal to this gate interrupts the wait and its exit trap stops the planner, which
+# stops its steps, so a stopped gate does not go on with the rows after the one it was in (found on 2026-11-07 with INT).
+python3 -I "$ROOT/scripts/gate-dag.py" run --table "$ROOT/scripts/gate-dag.txt" --timed-end "$TIMED_STEPS_END" &
+GATE_PLANNER=$!
+planner_rc=0
+wait "$GATE_PLANNER" || planner_rc=$?
+GATE_PLANNER=""
+(( planner_rc == 0 )) || exit "$planner_rc"
+
+echo "=== test times (scripts/test-time-ceilings.txt) ==="
+# Last, so a time red (drift, not broken behaviour) still leaves the verdicts of
+# codigo-muerto, crap-gate and mutants-gate in the same run. The log it reads is
+# this gate's own, written through tee: wait (30 s at most) for the boundary line
+# to reach the file, or a fast run reads it cut and the judge refuses it with 2.
+# grep -c reads to the end: with grep -q the early exit hands tr a SIGPIPE, and
+# under pipefail a log of a few MB would read as "not there yet" for the 30 s.
+for _ in $(seq 300); do
+  (( $(tr -d '\r' <"$GATE_LOG" 2>/dev/null | grep -cxF "$TIMED_STEPS_END") )) && break
+  sleep 0.1
+done
+"$ROOT/scripts/test-times.sh" --judge "$GATE_LOG" --until "$TIMED_STEPS_END"
+
+GATE_REACHED_END=1
+echo ""
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║  MERGE GATE PASSED — safe to merge (local CI 100%)       ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+}
+
 # One lane per step (D-F2c): the step's server is made here, and its URL, GATE_LANE and
 # GATE_SERVER_SYSTEM_ID are in the environment of that step only. The lane is taken down after its step,
 # whatever the step said. With a DATABASE_URL of the operator there are no lanes: the step runs as it did.
@@ -1933,6 +1974,13 @@ run_in_lane() {
   return "$rc"
 }
 
+# --- the rows of the judge (CI-F3.3b-2) ---------------------------------------------------------
+# The planner starts each row as `merge-gate.sh --step <id>`, a process of its own that reads this file from the top.
+# The flow above is gate_main, which only the else branch of the dispatch at the end calls, so the rows are defined
+# here, after it, and before the dispatch. Each row is one process and one cluster (D-F3b): DBG (CL..D3) shares one
+# throwaway database; B3 builds the release binary; REL and E2E find that binary on disk again (lane_R and lane_E in
+# run-all-tests.sh), so no variable crosses processes.
+step_P() {
 # The advisories are judged before the 20-minute test run: a judge idle for days
 # found its new advisory half an hour in, when 3 s would have said it. cargo audit
 # is the only judge of them (cargo deny below reads licenses, bans and sources,
@@ -2001,52 +2049,69 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 
 # The copy of the real corpus is not a judge step (P1 a): respaldo-memoria.timer,
 # outside this repo, makes it. The judge never touches the live server.
+}
 
-# CI-F3.3b-1 (D-F3b): the --lane steps of scripts/gate-dag.txt, as chains, in idx order. A chain is one
-# process and one cluster: dbg (CL..D3) shares one throwaway database; b3 builds the release binary; rel and
-# e2e find that binary on disk again (lane_R and lane_E in run-all-tests.sh), so no variable crosses processes.
-run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane NLI --lane D3
-run_in_lane b3 "$ROOT/scripts/run-all-tests.sh" --lane B3
-run_in_lane rel "$ROOT/scripts/run-all-tests.sh" --lane R
-run_in_lane e2e "$ROOT/scripts/run-all-tests.sh" --lane E
+step_DBG() {
+  run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane NLI --lane D3
+}
+step_B3() {
+  run_in_lane b3 "$ROOT/scripts/run-all-tests.sh" --lane B3
+}
+step_REL() {
+  run_in_lane rel "$ROOT/scripts/run-all-tests.sh" --lane R
+}
+step_E2E() {
+  run_in_lane e2e "$ROOT/scripts/run-all-tests.sh" --lane E
+}
+step_DC() {
+  # The identity is asked again before the --features docs step, which reads the database after run-all-tests.sh:
+  # a server that changed under the run is refused here (D-J1c, A2). A lane is judged when it is made, so only the
+  # server of the operator is asked again.
+  [[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
+  # The models of the --features docs step are the ones of the full run (CI-J5): the same function sets them.
+  gate_model_env
+  echo "=== cargo clippy/test --features docs ==="
+  run_in_lane docs "$BASH" -c 'cd "$1" && cargo clippy --all-targets --features docs -- -D warnings && cargo test --features docs' gate "$ROOT/rust"
+}
+step_CV() {
+  echo "=== crap-gate (coverage floor) ==="
+  run_in_lane cov "$ROOT/scripts/crap-gate.sh"
+}
+step_M() {
+  echo "=== mutants-gate ==="
+  run_in_lane mut "$ROOT/scripts/mutants-gate.sh"
+}
 
-# The identity is asked again before the --features docs step, which reads the database
-# after run-all-tests.sh: a server that changed under the run is refused here (D-J1c, A2).
-# A lane is judged when it is made, so only the server of the operator is asked again.
-[[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
-# The models of the --features docs step are the ones of the full run (CI-J5): the same function sets them.
-gate_model_env
-echo "=== cargo clippy/test --features docs ==="
-run_in_lane docs "$BASH" -c 'cd "$1" && cargo clippy --all-targets --features docs -- -D warnings && cargo test --features docs' gate "$ROOT/rust"
+# CI-F3.3b-2 (D-F3b, D-F3k): `merge-gate.sh --step <id>` runs one row. The planner starts it with its lane ticket. A row
+# takes no lock and writes no verdict: its ticket is checked here, and the lane it starts is the one that spends it.
+gate_step_main() {
+  local id="$1"
+  [[ -n "${CUBA_GATE_LANE_TOKEN:-}" && -n "${CUBA_GATE_LOCK_OWNER:-}" && -n "${GATE_LOCK:-}" ]] \
+    || gate_refuse "--step runs one row of scripts/gate-dag.txt, which the planner (gate-dag.py) starts with its lane ticket. Run scripts/merge-gate.sh for the whole gate."
+  lane_token_check "$GATE_LOCK" "$CUBA_GATE_LOCK_OWNER" || exit 2
+  GATE_LANES=""
+  if [[ -z "${DATABASE_URL:-}" && "$(uname -s)" == Linux ]]; then
+    GATE_LANES=1
+  fi
+  trap 'gate_cluster_down_all' EXIT
+  trap 'exit 2' INT
+  case "$id" in
+    P) step_P ;;
+    DBG) step_DBG ;;
+    B3) step_B3 ;;
+    REL) step_REL ;;
+    E2E) step_E2E ;;
+    DC) step_DC ;;
+    CV) step_CV ;;
+    M) step_M ;;
+    *) gate_refuse "--step: $id is no row of scripts/gate-dag.txt" ;;
+  esac
+}
 
-# The line where the timed steps end (D-F2c): test-times.sh sums the `finished in` of the
-# test calls above it (run-all-tests.sh and --features docs) and nothing after. It is printed
-# here, after the --features docs step, and not at the npm step, which runs before the first
-# compile now. One source for the step that prints it and for the judge that stops at it.
-TIMED_STEPS_END='=== end of timed steps ==='
-echo "$TIMED_STEPS_END"
-
-echo "=== crap-gate (coverage floor) ==="
-run_in_lane cov "$ROOT/scripts/crap-gate.sh"
-
-echo "=== mutants-gate ==="
-run_in_lane mut "$ROOT/scripts/mutants-gate.sh"
-
-echo "=== test times (scripts/test-time-ceilings.txt) ==="
-# Last, so a time red (drift, not broken behaviour) still leaves the verdicts of
-# codigo-muerto, crap-gate and mutants-gate in the same run. The log it reads is
-# this gate's own, written through tee: wait (30 s at most) for the boundary line
-# to reach the file, or a fast run reads it cut and the judge refuses it with 2.
-# grep -c reads to the end: with grep -q the early exit hands tr a SIGPIPE, and
-# under pipefail a log of a few MB would read as "not there yet" for the 30 s.
-for _ in $(seq 300); do
-  (( $(tr -d '\r' <"$GATE_LOG" 2>/dev/null | grep -cxF "$TIMED_STEPS_END") )) && break
-  sleep 0.1
-done
-"$ROOT/scripts/test-times.sh" --judge "$GATE_LOG" --until "$TIMED_STEPS_END"
-
-GATE_REACHED_END=1
-echo ""
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  MERGE GATE PASSED — safe to merge (local CI 100%)       ║"
-echo "╚══════════════════════════════════════════════════════════╝"
+# The dispatch: one row of the table, or the whole gate. Bash reads this file from the top, and the rows and gate_main
+# are defined before this line, so the call always finds them.
+if [[ "${1:-}" == --step ]]; then
+  gate_step_main "${2:-}"
+else
+  gate_main
+fi

@@ -46,7 +46,8 @@ TICK_S = 1.0
 SAFETY = 1.25
 WINDOW = 5
 MIN_RESERVE = 4 * GIB
-CLASSES = frozenset({"normal", "exclusive", "boundary"})
+# CI-F3.3b-2 (spec F3.3b-1b-iii): `untimed` schedules as `normal`; its block is past the judge's boundary line.
+CLASSES = frozenset({"normal", "exclusive", "boundary", "untimed"})
 EXCLUSIVE = frozenset({"exclusive", "boundary"})
 ALLOWED_ENV = frozenset(
     {
@@ -423,11 +424,14 @@ NOMBRE_COTA = {"paso": "longest step", "cpu": "CPU", "ram": "RAM"}
 
 
 class Planner:
-    def __init__(self, steps: list[Step], dag: bool, tabla: str) -> None:
+    def __init__(self, steps: list[Step], dag: bool, tabla: str, timed_end: str | None = None) -> None:
         self.steps = steps
         self.by_id = {s.id: s for s in steps}
         self.dag = dag
         self.tabla = tabla
+        # CI-F3.3b-2: the line the judge of the test times reads up to; printed once, before the first untimed block.
+        self.timed_end = timed_end
+        self.timed_end_printed = False
         self.modo = "dag" if dag else "serie"
         self.t0 = time.monotonic()
         self.run_dir = make_run_dir()
@@ -737,10 +741,15 @@ class Planner:
             self.cursor += 1
 
     def emit_block(self, step: Step) -> None:
+        if step.clase == "untimed" and self.timed_end and not self.timed_end_printed:
+            print(self.timed_end)
+            self.timed_end_printed = True
         text = read_text(step.log) or ""
         sys.stdout.write(text)
         if text and not text.endswith("\n"):
             sys.stdout.write("\n")
+        # CI-F3.3b-2 (D-F3e): the block reaches the pipe when its step ends, not when the planner does.
+        sys.stdout.flush()
 
     # loop
 
@@ -910,12 +919,18 @@ def cgroup_entry(path: str) -> Callable[[], None]:
     return enter
 
 
-def run_table(path: str) -> int:
+def stop_on_term(_signum: int, _frame: object) -> NoReturn:
+    """CI-F3.3b-2: the gate's exit trap sends TERM here; the exit unwinds through execute, which kills the steps."""
+    raise SystemExit(2)
+
+
+def run_table(path: str, timed_end: str | None = None) -> int:
     mode = os.environ.get("GATE_DAG", "0")
     if mode not in ("0", "1"):
         die(f"GATE_DAG is {mode!r}; it has to be 0 (series) or 1 (DAG)")
+    signal.signal(signal.SIGTERM, stop_on_term)
     steps = parse_table(path)
-    return Planner(steps, mode == "1", sha256_of(path)).execute()
+    return Planner(steps, mode == "1", sha256_of(path), timed_end).execute()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -923,9 +938,10 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="run a step table: GATE_DAG=0 series, GATE_DAG=1 DAG")
     run.add_argument("--table", required=True)
+    run.add_argument("--timed-end", default=None, help="the line printed before the first untimed block (CI-F3.3b-2)")
     args = parser.parse_args(argv)
     try:
-        return run_table(args.table)
+        return run_table(args.table, args.timed_end)
     except Refusal as err:
         sys.stderr.write(f"FAIL: {err}\n")
         return 2
