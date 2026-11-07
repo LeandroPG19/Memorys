@@ -581,3 +581,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   into the batch `343df5f` (clean merge with F4d's mutants-gate and contract changes). Integrated verification of the head
   queued (fmt, the three contract binaries, clippy --all-targets). Note: with an external DATABASE_URL the judge keeps
   the old single-server path (C5); the lanes run only with DATABASE_URL empty — the next full run is made that way.
+- 2026-11-07 06:12 · Debugger on the eval red: **the fixture, not the parsing.** The 24 lines of smoke-corpus.jsonl
+  come in pairs sharing an entity; with the real embedder loaded, `cuba_cronica add`'s semantic dedup (same entity,
+  cosine > 0.92, cronica.rs:707-729) reinforces line 2 against line 1 and answers `reinforced_id`; deterministic; the
+  self-tests' double said «inserted» to everything. Slice **CI-J4** (spec J-F1 §13, worktree `Memorys-ci-j4`): a
+  rust/tests binary that seeds every line through the real binary and model (unit step, no `#[ignore]`), then one entity
+  per line (no content change; the judge's seeded = fixture = count guard untouched). **F3.3 started** in parallel
+  (worktree `Memorys-ci-f33` from 97563fb): the DAG wired into merge-gate/run-all-tests with `GATE_DAG=0` by default.
