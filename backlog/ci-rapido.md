@@ -658,3 +658,11 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   7/23, by the file's rule from the ninth run; red before = test-times --judge over that log exits 1; after: «OK test times
   on linux: 122 binaries within their ceilings», self-test OK, both checked by me); merged `8a9c4cc`. Next full run after
   F3.3b-1's verification, on the head with the chains.
+- 2026-11-07 08:09 · Why local_gate_contract costs 110 s a round (read, not run): J3 runs the 13 self-tests in series
+  inside one test (90–112 s) and J7b' runs 8 in series (85–107 s); ten single tests run each self-test again with the
+  inherited environment — 31 launches, 250–314 CPU-s per round, twice (normal and docs). Slice **CI-J7** (spec J-F1 §15,
+  worktree `Memorys-ci-j7`): parallel launches inside J3 and J7b' with a fixed cap of 6 threads (U3) and one run per
+  script in J3's foreign environment shared by OnceLock with the ten single tests (U1, plus an own TMPDIR); J7b' is not
+  merged into J3 (U2 would blind it to the default-under-HOME leaks). Estimate ≈40–45 s a round; the ceiling line is
+  re-set from the measure (two-way: the 110 s floor would turn a 45 s round red). Skipping the docs round for this binary
+  (U4) is not done: it is Leandro's call under ci-rapido.md.
