@@ -121,6 +121,40 @@ def sha256_of(path: str) -> str:
         return hashlib.sha256(fh.read()).hexdigest()
 
 
+def git_state(root: str) -> tuple[str | None, bool | None]:
+    """The sha of HEAD and whether the tree is dirty (D-F3s). Where git cannot say, None: never a guess."""
+    try:
+        sha = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--verify", "-q", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        estado = subprocess.run(
+            ["git", "-C", root, "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None, None
+    return (sha or None), bool(estado.strip())
+
+
+def loadavg() -> float | None:
+    """The one-minute load of the machine, from /proc/loadavg; None where it cannot be read."""
+    text = read_text("/proc/loadavg")
+    try:
+        return float(text.split()[0]) if text else None
+    except (ValueError, IndexError):
+        return None
+
+
+def system_psi() -> dict[str, float | None]:
+    """The system's pressure (some avg10) for cpu, memory and io, read at the end of the run."""
+    return {name: psi_some_avg10(f"/proc/pressure/{name}") for name in ("cpu", "memory", "io")}
+
+
 # --- the step table -----------------------------------------------------------
 
 
@@ -397,7 +431,16 @@ class Planner:
         self.t0 = time.monotonic()
         self.run_dir = make_run_dir()
         self.run_id = os.path.basename(self.run_dir)
-        self.corrida = gate_history.run_start(self.modo, None, None, tabla, run=self.run_id)
+        root = repo_root()
+        sha, arbol_sucio = git_state(root)
+        self.corrida: gate_history.Corrida | None = gate_history.run_start(
+            self.modo,
+            sha,
+            gate_history.huella(root),
+            tabla,
+            run=self.run_id,
+            arbol_sucio=arbol_sucio,
+        )
         self.hist_steps, self.hist_runs = load_history(tabla)
         self.scope = scope_dir()
         self.delegado = delegate(self.scope)
@@ -533,7 +576,8 @@ class Planner:
                 preexec_fn=cgroup_entry(step.cg) if step.cg else None,
             )
         step.t_start = self.now()
-        step.paso = gate_history.step_start(self.corrida, step.idx, step.id)
+        if self.corrida is not None:
+            step.paso = gate_history.step_start(self.corrida, step.idx, step.id)
         step.state = "running"
         self.sample_step(step)
 
@@ -608,6 +652,8 @@ class Planner:
         }
 
     def record_step(self, step: Step) -> None:
+        if self.corrida is None or step.paso is None:
+            return
         gate_history.step_end(
             self.corrida,
             step.paso,
@@ -794,7 +840,14 @@ class Planner:
             f"R={self.ram / GIB:.2f} GiB; mode={self.modo}"
         )
 
+    def ran_steps(self) -> list[Step]:
+        return [s for s in self.steps if s.rc is not None]
+
     def annotate_run(self, code: int) -> None:
+        if self.corrida is None:
+            return
+        picos = [s.mem_peak for s in self.ran_steps()]
+        oom = [s.oom_kill for s in self.ran_steps()]
         gate_history.run_end(
             self.corrida,
             code,
@@ -803,6 +856,11 @@ class Planner:
             LB_run=self.lb_run,
             C=self.cpu,
             R=self.ram,
+            mem_peak=max(picos) if picos and all(p is not None for p in picos) else None,
+            psi=system_psi(),
+            load=loadavg(),
+            hilos=self.cpu,
+            oom_kill=sum(oom) if oom and all(o is not None for o in oom) else None,
         )
 
 

@@ -415,6 +415,26 @@ if [[ "${1:-}" == "--self-test" ]]; then
   bash "$SELF" --units "$tmp/U1.cut.log" >/dev/null 2>&1 || rc=$?
   want_rc "U1.cut" 2
 
+  # U2 (CI-F3.3b-0, D-F3s): a binary that a signal killed has no `finished in` and no count. --units
+  # prints it after the others as `<key> - - -<signal>`. --count still refuses the log, as it refuses a
+  # cut one: a killed binary is no pass.
+  {
+    printf '     Running unittests src/lib.rs (target/debug/deps/memory_industry-0123456789abcdef)\n\n'
+    printf 'running 1 test\ntest a ... ok\n\n'
+    printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.00s\n\n'
+    printf '     Running tests/smoke.rs (target/debug/deps/smoke-0123456789abcdef)\n\n'
+    printf 'running 1 test\ntest s ... ok\n\n'
+    printf "error: process didn't exit successfully: \`target/debug/deps/smoke-0123456789abcdef\` (signal: 11, SIGSEGV: invalid memory reference)\n"
+  } >"$tmp/U2.log"
+  rc=0
+  bash "$SELF" --units "$tmp/U2.log" >"$tmp/U2.out" 2>&1 || rc=$?
+  want_rc "U2" 0
+  [[ "$(cat "$tmp/U2.out")" == "$(printf '%s\n' 'lib:memory_industry 200 1 0' 'smoke - - -11')" ]] \
+    || self_fail "U2: --units printed '$(cat "$tmp/U2.out")', want 'lib:memory_industry 200 1 0' (the finished binary) and then 'smoke - - -11' (the killed one: no time, no count, signal 11)"
+  rc=0
+  bash "$SELF" --count "$tmp/U2.log" >"$tmp/U2.count.out" 2>&1 || rc=$?
+  want_rc "U2.count" 2
+
   echo "OK  self-test: test-times sums each binary's finished-in over both cargo shapes up to the boundary, prints the 10 slowest, and is red for a ceiling passed, the default passed, a floor undercut, a dead or expired line and a malformed one, all in one run; a log it cannot read is exit 2"
   exit 0
 fi
@@ -478,6 +498,7 @@ parse_log() {
       if (line ~ /^unittests /) { unit = 1; sub(/^unittests /, "", line) }
       src = line;  sub(/ \(.*$/, "", src);  gsub(/\\/, "/", src)
       path = line; sub(/^[^ ]+ \(/, "", path); sub(/\)$/, "", path); gsub(/\\/, "/", path)
+      pendpath = path; sub(/\.exe$/, "", pendpath)
       n = split(path, parts, "/")
       key = parts[n]
       sub(/\.exe$/, "", key)
@@ -491,7 +512,19 @@ parse_log() {
       key = $0
       sub(/^ +Doc-tests /, "", key)
       if (pending != "" && !unpaired) { unpaired = 1; ulineno = pline; ukey = pending }
-      pending = "doc:" key; pline = NR
+      pending = "doc:" key; pline = NR; pendpath = ""
+      next
+    }
+    /^error: process didn.t exit successfully: `.*` \(signal: [0-9]+/ {
+      p = $0
+      sub(/^[^`]*`/, "", p)
+      sub(/`.*$/, "", p)
+      gsub(/\\/, "/", p)
+      sub(/\.exe$/, "", p)
+      sig = $0
+      sub(/^.*\(signal: /, "", sig)
+      sub(/[^0-9].*$/, "", sig)
+      if (pending != "" && p == pendpath) { kn++; kkey[kn] = pending; ksig[kn] = sig }
       next
     }
     /^test result: (ok|FAILED)\. .*finished in [0-9]+(\.[0-9]+)?s$/ {
@@ -520,6 +553,7 @@ parse_log() {
       for (i = 1; i <= count; i++) print "C", order[i], cnt[order[i]]
       for (i = 1; i <= count; i++) print "N", order[i], fl[order[i]]
       if (badcount != "") print "B", badcount
+      for (i = 1; i <= kn; i++) print "K", kkey[i], ksig[i]
       print "F", found + 0
       if (unpaired) print "U", ulineno, ukey
     }
@@ -716,8 +750,9 @@ if [[ "${1:-}" == "--units" ]]; then
   [[ -f "$LOG" ]] || die2 "no log at $LOG"
 
   parsed="$(parse_log "$LOG" "" 0)"
-  declare -A units_cs=() units_n=() units_f=()
+  declare -A units_cs=() units_n=() units_f=() units_kill=()
   units_order=()
+  units_kill_order=()
   nbin=0
   problem=""
   while IFS=$'\t' read -r kind a b; do
@@ -725,14 +760,18 @@ if [[ "${1:-}" == "--units" ]]; then
       H) units_order+=("$a"); units_cs[$a]=$b; nbin=$((nbin + 1)) ;;
       C) units_n[$a]=$b ;;
       N) units_f[$a]=$b ;;
+      K) units_kill_order+=("$a"); units_kill[$a]=$b; nbin=$((nbin + 1)) ;;
       B) problem="$LOG: $a has a 'test result' line with no passed and failed count" ;;
-      U) problem="$LOG:${a}: ${b} has no 'test result' line before the next binary or the end of the log; the log is cut or interleaved, and the count will not guess" ;;
+      U) [[ -n "${units_kill[$b]:-}" ]] || problem="$LOG:${a}: ${b} has no 'test result' line before the next binary or the end of the log; the log is cut or interleaved, and the count will not guess" ;;
     esac
   done <<<"$parsed"
   [[ -z "$problem" ]] || die2 "$problem"
   (( nbin > 0 )) || die2 "no test binary was run in $LOG: a section that ran nothing is not a pass"
   for k in "${units_order[@]}"; do
     printf '%s %s %s %s\n' "$k" "${units_cs[$k]}" "${units_n[$k]}" "${units_f[$k]}"
+  done
+  for k in "${units_kill_order[@]}"; do
+    printf '%s - - -%s\n' "$k" "${units_kill[$k]}"
   done
   exit 0
 fi
