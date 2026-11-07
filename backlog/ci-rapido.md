@@ -451,3 +451,15 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   **23/23**, gate_dag_contract 14/14, local_gate_contract 61/61, clippy clean, rustfmt clean, 12 hermetic self-tests rc 0
   with HOME/XDG empty. Handoff validated (`tests: frozen`, commit 39ac8f4). Improver (CC ≤ 6, types, no duplicates)
   started before the merge into the batch.
+- 2026-11-07 08:10 · **Third full new-judge run (`4905e85`) stopped at 171 s** (exit 101) in local_gate_contract, 59/61:
+  run-all-tests.sh --self-test («alone» row) and mutants-gate.sh --self-test (J1.9) refused by the common sysid guard —
+  inside the judge, `cargo test` inherits `GATE_SERVER_SYSTEM_ID` (the real :5490) and the rows' fake psql answers
+  another id. No per-slice verification could see it (they all run the contract outside the judge). New slice **CI-J3**
+  (spec J-F1 §12): a closed list of what the judge exports to children; a contract runs every self-test with each set to
+  a foreign value, and a second contract keeps the list complete both ways against the `export` lines; the fix lives in
+  the regions (test code only). Implementer started in worktree `Memorys-ci-j3` (from cf07332).
+- 2026-11-07 08:10 · **F2a verified with cargo:** red on the worktree (row A1 `gate_cluster_check: command not found`;
+  contract 59/59 there), copy: gate-cluster self-test OK in 7 s with HOME/XDG empty and no postgres left, 12 other
+  self-tests OK, **local_gate_contract 58/59**: `no_judge_script_prints_a_database_url_with_its_credentials` flags
+  `gate_cluster_url`'s printf of the URL with its password → it assigns through `printf -v` into a caller-named
+  variable (pass 1d/2d). verif-f2a's loop missed gate-audit/gate-cluster (wrong pattern): fixed.
