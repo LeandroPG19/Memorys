@@ -1785,7 +1785,7 @@ run_in_lane() {
     return
   fi
   gate_lane_up "$lane"
-  env DATABASE_URL="$LANE_URL" GATE_LANE="$lane" GATE_SERVER_SYSTEM_ID="$LANE_SYSID" "$@" || rc=$?
+  env DATABASE_URL="$LANE_URL" GATE_LANE="$lane" GATE_SERVER_SYSTEM_ID="$LANE_SYSID" GATE_CLUSTER_ROOT="$GATE_CLUSTER_ROOT" "$@" || rc=$?
   gate_cluster_down "$lane"
   return "$rc"
 }
