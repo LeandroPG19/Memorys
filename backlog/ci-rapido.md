@@ -796,3 +796,6 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   exports only; the planner's per-step environment (D-F3j) escaped it. Slice **CI-J9**: the token unset by the process
   that spends it, CUBA_GATE_LANE_TOKEN in JUDGE_ENVIRONMENT and unset in the regions that take the lock, and the
   completeness contract extended to the planner's closed list.
+- 2026-11-07 11:10 · **CI-J9 committed and merged:** red `c8c8c0e` (gate_lane_token 11/12), fix `a74683a`
+  (local_gate 76/76 incl. J3 with JUDGE_ENVIRONMENT at 27 names, lane token 12/12, gate_dag 22/22, gate_history 33/33,
+  doc 26/26, ci 10/10); merged `f4d0e83`. Sixteenth full run (through the planner, serial) started.
