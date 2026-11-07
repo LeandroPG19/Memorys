@@ -757,3 +757,11 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   receipt for 40771e4.** Unit + smoke 41→289 (**248 s**, was 310: CI-J7's contract is 86.60 s for both rounds, within
   44/133), --ignored 289→407, **release build cold 407→561 (154 s: T-RLS changed rust/src)**, reranker 563→792, E2E
   792→907, docs 907→1234, crap 48 s, mutants 133 s. The cold release build explains the +112 s against the eleventh run.
+- 2026-11-07 09:49 · F3.3b-1b-ii delivered (8-row table P..M, `merge-gate --step <id>` checking the ticket and
+  leaving it to the lane to spend, the flow wrapped in gate_main, the planner in the background with wait so a signal
+  still stops the run, emit_block flush, SIGTERM in the planner exit 2; red: «the planner did not start the rows of
+  gate-dag.txt in idx order»; 13 self-tests green on the copy; 47 contract checks imitated). Decisions 1–10 accepted.
+  **One precision risk closed before cargo:** with the end-of-timed-steps marker after the whole planner, test-times
+  would also count crap's llvm-cov and mutants' `finished in` lines (a second lib:memory_industry, new binaries) — the
+  timed set must stay today's (the run-all-tests rounds and docs). CV and M become untimed rows, with a contract, a row
+  and a sabotage.
