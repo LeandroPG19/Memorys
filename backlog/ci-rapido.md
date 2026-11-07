@@ -602,3 +602,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   fix `36f5cb3` (24 lines in, 2.67 s; eval_seed.py --check-fixture OK; run-all-tests self-test OK); merged `ead5aee`.
   **Seventh full run started in lanes mode** (DATABASE_URL empty: each test step on its own ephemeral PG 18.6 cluster,
   serial), on ead5aee — the first run of F2b's lanes against the real tree.
+- 2026-11-07 06:26 · F3.3a delivered (pass 1: four contracts and the `--lane` self-test rows; pass 2 as a patch:
+  `scripts/gate-dag.txt` with 8 steps CL, D1, D2, NLI, D3, B3, R, E; eight `lane_<id>()` wrapping the existing blocks
+  without moving code; `DAG_LANES` in idx order; an unknown or empty `--lane` is exit 2 before the lock). Red: `F3.3a:
+  --lane NOPE exits 1, not 2`. 13 self-tests OK under CI-J3's environment; the contracts imitated in python green; four
+  contract sabotages and one row sabotage red. Accepted: E depends on B3 **and D1** (the doctor uses brain_gate).
+  Verification with cargo queued behind the seventh run.
