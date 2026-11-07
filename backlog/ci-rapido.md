@@ -730,3 +730,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   Handlers that also filter by project_id in SQL were safe; anything relying on RLS alone was not. Slice **T-RLS** on
   release/0.31.0 (worktree `Memorys-rls`): a deterministic test (one connection held as the barrier, the second must open;
   plus a row-level check as cuba_app on its own database), then `after_connect` sets `rls_scope()` and propagates errors.
+- 2026-11-07 09:07 · F3.3b-1b-i verified with cargo: red as expected (gate_dag 14/15 on the ticket test); green copy:
+  gate_dag 15/15, gate_history 33/33, doc 26/26, ci 10/10, but local_gate 70/71 (GATE_LOCK exported and not in
+  JUDGE_ENVIRONMENT) and gate_lane_token 6/7 (a refused token does not exit 2, and says nothing on stderr). Back to the
+  implementer.
