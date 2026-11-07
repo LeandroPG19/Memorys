@@ -734,3 +734,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   gate_dag 15/15, gate_history 33/33, doc 26/26, ci 10/10, but local_gate 70/71 (GATE_LOCK exported and not in
   JUDGE_ENVIRONMENT) and gate_lane_token 6/7 (a refused token does not exit 2, and says nothing on stderr). Back to the
   implementer.
+- 2026-11-07 09:11 · T-RLS verified with cargo: scenario 1 (a new connection carries the active project) **red on the
+  worktree** (db.rs:1157) and green with the fix; the whole lib 1198 passed, 18 ignored. But scenario 2 (row level, as
+  cuba_app) is **green against the hole** — it does not discriminate, and that questions the reach of the hole ("sees all
+  projects"). Back to the implementer: read the real tenant_isolation policy, say what a '' scope sees, make scenario 2
+  red against the hole or remove it with the reason. Not committed until then.
