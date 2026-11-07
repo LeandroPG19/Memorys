@@ -666,3 +666,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   merged into J3 (U2 would blind it to the default-under-HOME leaks). Estimate ≈40–45 s a round; the ceiling line is
   re-set from the measure (two-way: the 110 s floor would turn a 45 s round red). Skipping the docs round for this binary
   (U4) is not done: it is Leandro's call under ci-rapido.md.
+- 2026-11-07 08:12 · **F3.3b-1 committed and merged:** red `8835d91` (run-all-tests «--lane CL --lane D1 did not run CL
+  and then D1», merge-gate C1; contract 67/71), code `e2dafb2` (contract 71/71, gate_dag 14/14, gate_history 33/33, 13
+  self-tests OK); merged `d093eec` with CI-J6's ceilings. Tenth full run (lanes, chains) started on d093eec. F3.3b-1b
+  started in worktree `Memorys-ci-f33b1b`.
