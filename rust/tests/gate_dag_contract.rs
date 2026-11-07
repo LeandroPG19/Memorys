@@ -19,6 +19,8 @@
 //! - A step runs in parallel only if its table has a serial run in the history (D-F3p). These
 //!   tests seed that history with `GATE_DAG=0` on the same table before measuring.
 //! - A scope without `cgroup.subtree_control` is not delegated: the planner runs in series (D-F3h).
+//! - A step starts with SIGINT and SIGQUIT at their default, even when the planner was started with them
+//!   ignored, as a background job of a non-interactive bash leaves them (CI-J10).
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -240,15 +242,33 @@ impl Fixture {
 
     /// `run_env` with the planner of another tree (CI-F3.3c, D-F3g): each tree names its own targets.
     fn run_planner_at(&self, planner: &Path, gate_dag: &str, extra: &[(&str, &str)]) -> Run {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let out_path = self.base.join(format!("salida-{n}.txt"));
-        let err_path = self.base.join(format!("error-{n}.txt"));
-        let mut child = Command::new("python3")
+        let mut command = Command::new("python3");
+        command
             .arg("-I")
             .arg(planner)
             .arg("run")
             .arg("--table")
-            .arg(&self.table)
+            .arg(&self.table);
+        self.run_command(command, gate_dag, extra)
+    }
+
+    /// The planner started the way merge-gate.sh starts it (CI-J10): a background job of a non-interactive bash,
+    /// which gives its children SIGINT and SIGQUIT ignored on entry. `sh` sets the same two ignores before its exec.
+    fn run_planner_ignoring_int(&self, gate_dag: &str, extra: &[(&str, &str)]) -> Run {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' INT QUIT; exec python3 -I \"$0\" run --table \"$1\"")
+            .arg(repo_root().join("scripts/gate-dag.py"))
+            .arg(&self.table);
+        self.run_command(command, gate_dag, extra)
+    }
+
+    fn run_command(&self, mut command: Command, gate_dag: &str, extra: &[(&str, &str)]) -> Run {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let out_path = self.base.join(format!("salida-{n}.txt"));
+        let err_path = self.base.join(format!("error-{n}.txt"));
+        let mut child = command
             .env("GATE_DAG", gate_dag)
             .env("CI_TIEMPOS_DIR", &self.history)
             .env("HOME", &self.home)
@@ -260,7 +280,7 @@ impl Fixture {
             .stdout(Stdio::from(File::create(&out_path).expect("stdout file")))
             .stderr(Stdio::from(File::create(&err_path).expect("stderr file")))
             .spawn()
-            .expect("python3 -I scripts/gate-dag.py");
+            .expect("the planner");
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut timed_out = false;
         let code = loop {
@@ -1212,5 +1232,118 @@ fn a_target_root_that_cannot_be_made_is_refused_with_2_and_named() {
     assert!(
         !fx.control.join("env-DBG.txt").exists(),
         "the step started although its target root cannot be made"
+    );
+}
+
+// --- CI-J10: the steps the planner starts take SIGINT and SIGQUIT at their default --------------------------
+
+/// SIGINT is signal 2, bit 1 of the SigIgn mask of /proc/<pid>/status; SIGQUIT is signal 3, bit 2.
+const INT_AND_QUIT: u64 = (1 << 1) | (1 << 2);
+
+/// The mask of a `SigIgn:` line of /proc/<pid>/status.
+fn sig_ignored(line: &str) -> u64 {
+    let hex = line
+        .split_whitespace()
+        .last()
+        .unwrap_or_else(|| panic!("no SigIgn in {line:?}"));
+    u64::from_str_radix(hex, 16).unwrap_or_else(|e| panic!("SigIgn {hex:?} is not hex: {e}"))
+}
+
+/// A one-step table (CI-J10): the step is `/bin/sh <script> <id> <args…> <control>`, with its defaults written.
+fn one_step_table(fx: &mut Fixture, script: &Path, id: &str, args: &[&str]) {
+    let mut order = vec![
+        "/bin/sh".to_string(),
+        script.display().to_string(),
+        id.to_string(),
+    ];
+    order.extend(args.iter().map(|arg| arg.to_string()));
+    order.push(fx.control.display().to_string());
+    write(
+        &fx.table,
+        &format!("10 {id} - - normal 1 5 1 {}\n", order.join(" ")),
+    );
+    fx.steps.push((10, id.to_string()));
+    fx.write_defaults(id);
+}
+
+/// The step records its own SigIgn and the one of its parent, the planner. $1 id, $2 control directory.
+const SIGIGN_SH: &str = r#"#!/bin/sh
+id="$1"
+control="$2"
+grep '^SigIgn' /proc/$$/status > "$control/sigign-$id.txt"
+grep '^SigIgn' /proc/$PPID/status > "$control/sigign-parent-$id.txt"
+"#;
+
+/// The step of the D2 row seen through the planner: it runs the gate in the foreground, as cargo test runs the
+/// gate copy, and sends that gate INT while it waits. $1 id, $2 the gate, $3 control directory.
+const STEP_GATE_SH: &str = r#"#!/bin/sh
+id="$1"
+gate="$2"
+control="$3"
+( sleep 1; kill -INT "$(cat "$control/gate-$id.pid")" ) &
+sh "$gate" "$control" "$id"
+echo "$?" > "$control/gate-rc-$id.txt"
+"#;
+
+/// The gate: a trap that exits 2 on INT, then a wait. Without that INT it reports `survived` and exits 0 (D2).
+/// $1 control directory, $2 id.
+const GATE_SH: &str = r#"#!/bin/sh
+control="$1"
+id="$2"
+trap 'echo trapped > "$control/gate-$id.txt"; exit 2' INT
+echo "$$" > "$control/gate-$id.pid"
+sleep 3 &
+wait $!
+echo survived > "$control/gate-$id.txt"
+exit 0
+"#;
+
+#[test]
+fn a_step_the_planner_starts_has_sigint_and_sigquit_at_their_default() {
+    let mut fx = Fixture::new("j10-sigign", CPU_FOUR, MEM_OPEN);
+    let step = fx.base.join("paso-sigign.sh");
+    write(&step, SIGIGN_SH);
+    one_step_table(&mut fx, &step, "P", &[]);
+    let run = fx.run_planner_ignoring_int("0", &[]);
+    assert_green(&run, "a planner started with INT and QUIT ignored");
+    let parent = sig_ignored(&read(&fx.control.join("sigign-parent-P.txt")));
+    let step_mask = sig_ignored(&read(&fx.control.join("sigign-P.txt")));
+    assert_eq!(
+        parent & INT_AND_QUIT,
+        INT_AND_QUIT,
+        "the precondition is not met: the planner does not ignore INT and QUIT (SigIgn {parent:#x})"
+    );
+    assert_eq!(
+        step_mask & INT_AND_QUIT,
+        0,
+        "the step has INT or QUIT ignored (SigIgn {step_mask:#x}, its planner's {parent:#x}): \
+         a trap of its gate cannot stop on INT"
+    );
+}
+
+#[test]
+fn a_gate_under_a_planner_step_stops_on_int_through_its_trap() {
+    let mut fx = Fixture::new("j10-d2", CPU_FOUR, MEM_OPEN);
+    let step = fx.base.join("paso-gate.sh");
+    let gate = fx.base.join("gate.sh");
+    write(&step, STEP_GATE_SH);
+    write(&gate, GATE_SH);
+    one_step_table(&mut fx, &step, "P", &[gate.to_str().expect("utf-8 path")]);
+    let run = fx.run_planner_ignoring_int("0", &[]);
+    assert_green(
+        &run,
+        "a planner started with INT and QUIT ignored, whose step runs a gate",
+    );
+    let trapped = read(&fx.control.join("gate-P.txt"));
+    assert_eq!(
+        trapped.trim(),
+        "trapped",
+        "the gate did not take INT through its trap (it wrote {trapped:?}): a D2 row would leave 0"
+    );
+    let rc = read(&fx.control.join("gate-rc-P.txt"));
+    assert_eq!(
+        rc.trim(),
+        "2",
+        "a gate stopped by INT must exit 2, not {rc:?}"
     );
 }
