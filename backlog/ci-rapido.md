@@ -670,3 +670,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   and then D1», merge-gate C1; contract 67/71), code `e2dafb2` (contract 71/71, gate_dag 14/14, gate_history 33/33, 13
   self-tests OK); merged `d093eec` with CI-J6's ceilings. Tenth full run (lanes, chains) started on d093eec. F3.3b-1b
   started in worktree `Memorys-ci-f33b1b`.
+- 2026-11-07 08:15 · **Tenth full run (lanes, chains, `d093eec`): 105.3 s, exit 101** in the unit step:
+  `doc_contract::the_gate_writes_its_own_exit_code_where_a_reader_can_find_it` — «scripts/merge-gate.sh runs
+  "$ROOT/scripts/run-all-tests.sh"»: the contract finds merge-gate's first test step by the literal call line, which
+  F3.3b-1 turned into chained `--lane` calls. My slice verifications ran local_gate, gate_dag and gate_history only;
+  five other test binaries read the judge scripts (ci_contract, doc_contract, v025, v027, v045). From now on every
+  judge-slice verification also runs ci_contract and doc_contract. Slice **CI-J8**: the locator finds the first
+  run-all-tests call however it is written (the intent — the trap armed before the first step that can fail — kept).
