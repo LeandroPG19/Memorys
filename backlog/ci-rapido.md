@@ -542,3 +542,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   F2b-1 delivered: caller rows A1, C1, C5, D1, D2, A3, j11 and j16 rewritten (D5), a fake gate-cluster library in the
   regions, PGPASSWORD in gate_require_judge_server, D-F2i, docs «The judge's servers»; 13 self-tests OK under CI-J3's
   environment; 7 sabotages red. Verification queued.
+- 2026-11-07 05:25 · **Fifth full run (`2a41261`): 104.9 s, exit 101** in the unit step: lib 1193 passed, 1 failed —
+  `cognitive::judge::parse_tests::an_error_reply_is_empty_and_its_redacted_cause_is_logged` («logged: ""»: the warning
+  was not captured). It passed in the fourth run: intermittent, suspected the global callsite-interest cache of
+  tracing against a per-thread capture subscriber. A debugger reads it; no rerun to approve.
+- 2026-11-07 05:25 · **F4d committed** on `feat/ci-rapido-f4d`: red `08d3f43` (self-test F4b.2; contract 59/61), code
+  `5ff2aee` (self-test OK 34.6 s, 12 hermetic self-tests OK, local_gate_contract **61/61** with a clean green build).
+  QA (two real mutants runs, MUTANTS_JOBS=2, outcomes kept, classes against F0) queued after F2b-1's verification.
