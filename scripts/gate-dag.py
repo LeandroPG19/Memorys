@@ -481,7 +481,8 @@ class Planner:
         self.scope = scope_dir()
         self.delegado = delegate(self.scope)
         self.cpu, self.ram = capacities()
-        self.cpu_cap = math.floor(SAFETY * self.cpu)
+        # CI-F3.3c: the cores admitted never add up past the machine's (C), not 1,25·C: SAFETY is for RAM only.
+        self.cpu_cap = self.cpu
         self.red: Step | None = None
         self.no_verdict: str | None = None
         self.cursor = 0

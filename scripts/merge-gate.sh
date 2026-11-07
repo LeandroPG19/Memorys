@@ -2110,7 +2110,11 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 }
 
 step_DBG() {
-  run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane NLI --lane D3
+  run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane D3
+}
+# CI-F3.3c (D-F3l): the NLI assertion (nli_entailment, < 500 ms) runs alone, and it opens no database, so no cluster.
+step_NLI() {
+  "$ROOT/scripts/run-all-tests.sh" --lane NLI
 }
 step_B3() {
   run_in_lane b3 "$ROOT/scripts/run-all-tests.sh" --lane B3
@@ -2162,6 +2166,7 @@ gate_step_main() {
   case "$id" in
     P) step_P ;;
     DBG) step_DBG ;;
+    NLI) step_NLI ;;
     B3) step_B3 ;;
     REL) step_REL ;;
     E2E) step_E2E ;;
