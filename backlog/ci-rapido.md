@@ -784,3 +784,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   now start cold: decision 3), B3/REL/E2E share T_rel. Checked what a fresh --step lacks: only GATE_OWNER. Next:
   **F3.3c-2** (D-F3c's `fresh` and CARGO_BUILD_JOBS per chain within the cgroup) and the DAG activation trial. Disk now
   621 GB free; up to four targets per tree ≈ 60–100 GB. Verification queued.
+- 2026-11-07 10:50 · **F3.3c-1 committed and merged:** red `c023ebc` (merge-gate A1 «GATE_OWNER is empty»; local_gate
+  72/75; gate_dag 18/22), code `f6462df` (local_gate **75/75**, gate_dag 22/22, lane token 10/10, gate_history 33/33,
+  doc 26/26, ci 10/10). A foreign CARGO_TARGET_DIR (CI-J3's /nonexistent-ajeno) made target creation raise; now exit 2
+  with its reason; GATE_OWNER is read from the lock's record and crossed with CUBA_GATE_LOCK_OWNER (a foreign inherited
+  owner refused: row step_judge). Merged `b91aa8e`. Fifteenth full run (through the planner, serial) started on it.
