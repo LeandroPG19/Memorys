@@ -4054,9 +4054,10 @@ fn each_mutant_builds_only_the_lib_test_it_runs() {
         "mutants-gate.sh still passes `-- --lib search::`: the --lib after the `--` reaches the \
          test only, so every mutant's build compiles all the test binaries"
     );
+    // D-F4u (F4d): the call is `cargo-mutants mutants` with CARGO=<shim> (D-F4m), not `cargo mutants`.
     let start = body
-        .find("\ncargo mutants \\\n")
-        .expect("mutants-gate.sh has no `cargo mutants \\` invocation")
+        .find("\ncargo-mutants mutants \\\n")
+        .expect("mutants-gate.sh has no `cargo-mutants mutants \\` invocation")
         + 1;
     let end = start
         + body[start..]
