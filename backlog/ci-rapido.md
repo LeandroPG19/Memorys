@@ -777,3 +777,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   (`dag: T=4.11 … mode=serie`). Handed to the F3.3c implementer as its first item: the fake library demands an owner
   like the real one, a --step DBG row, --step sets GATE_OWNER from the lock's owner, and a list of what else gate_main
   prepares that a fresh --step process lacks.
+- 2026-11-07 10:23 · F3.3c delivered as **F3.3c-1** (cut accepted): --step sets GATE_OWNER from the lock's owner after
+  the ticket check (the fake cluster library now demands an owner as the real one does; rows step_owner, step_dead), and
+  D-F3g — a target per row and per tree (`<CARGO_TARGET_DIR>/<tree>-<12 hex of its realpath>/<T_x>`, a `.gate-tree`
+  marker, two trees never share, a marker naming another tree refused before the step), DC → T_docs, CV → T_cov (both
+  now start cold: decision 3), B3/REL/E2E share T_rel. Checked what a fresh --step lacks: only GATE_OWNER. Next:
+  **F3.3c-2** (D-F3c's `fresh` and CARGO_BUILD_JOBS per chain within the cgroup) and the DAG activation trial. Disk now
+  621 GB free; up to four targets per tree ≈ 60–100 GB. Verification queued.
