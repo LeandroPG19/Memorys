@@ -1471,4 +1471,168 @@ mod tests {
             );
         }
     }
+
+    /// The same server as `url`, another database: the path's last segment replaced,
+    /// the query string (if any) kept.
+    fn database_named(url: &str, name: &str) -> String {
+        let (base, query) = match url.split_once('?') {
+            Some((base, query)) => (base, Some(query)),
+            None => (url, None),
+        };
+        let (prefix, _) = base
+            .rsplit_once('/')
+            .expect("DATABASE_URL names a database");
+        match query {
+            Some(query) => format!("{prefix}/{name}?{query}"),
+            None => format!("{prefix}/{name}"),
+        }
+    }
+
+    /// T-GUARD. A pool that opens while another test rewrites the newest row of
+    /// _sqlx_migrations must wait for that test. The pools under test are the ones the
+    /// chunk and protocol helpers open, because those are the tests that failed.
+    ///
+    /// The rewrite happens in a database of its own, not in the one DATABASE_URL names.
+    /// This test creates it on the same server, migrates it, and points DATABASE_URL at
+    /// it under GLOBAL_STATE_GUARD, so the helpers open their pool there. The variable is
+    /// restored before the guard is released, and the database is dropped at the end.
+    /// Other tests do not share this window, because they hold the guard while they run.
+    /// The helpers read DATABASE_URL at their first poll, which is inside the window, and
+    /// once they hold the guard, which is after it closes.
+    ///
+    /// The window: the newest row is deleted and committed, and its re-insertion is left
+    /// uncommitted. A pool opened inside it sees that migration as pending and runs it.
+    /// Every statement of 0065 is guarded, so the run reaches sqlx's own INSERT into
+    /// _sqlx_migrations, which waits on the uncommitted row by its primary key. When the
+    /// window closes, that INSERT fails with 23505 _sqlx_migrations_pkey.
+    ///
+    /// Why the barrier is deterministic in both states. The test runtime is
+    /// current_thread, so the helpers run only when this task yields, and they have no
+    /// timer. Between two observations nothing changes except the database and the guard.
+    /// - Without the guard in the helpers, each helper reaches Postgres and, at its
+    ///   INSERT, waits on the window's transaction: pg_stat_activity shows it with
+    ///   wait_event_type = 'Lock' and wait_event = 'transactionid'. The loop stops there.
+    /// - With the guard, the first await of each helper is GLOBAL_STATE_GUARD.lock(),
+    ///   which this test holds. Nothing ever waits on the private _sqlx_migrations, so the
+    ///   loop runs out its observations and the window closes with both helpers still
+    ///   parked on the guard, which is the state the Gherkin asks for.
+    /// The count of observations is the only bound. It counts database round trips, not
+    /// time, and with the guard the outcome does not depend on it.
+    ///
+    /// It needs DATABASE_URL, like the other integration tests: without it, it fails and
+    /// says which variable is missing.
+    #[tokio::test]
+    async fn a_pool_opened_inside_a_rewrite_of_the_newest_migration_row_waits_for_it() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const OBSERVATIONS: u32 = 2_000;
+        static NEXT_WINDOW: AtomicU32 = AtomicU32::new(0);
+
+        let window = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let shared = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL env var required for integration tests");
+        let name = format!(
+            "gate_guard_{}_{}",
+            std::process::id(),
+            NEXT_WINDOW.fetch_add(1, Ordering::Relaxed)
+        );
+        let private = database_named(&shared, &name);
+
+        let observer = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&shared)
+            .await
+            .expect("connect to the server DATABASE_URL names");
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&observer)
+            .await
+            .expect("create the private database");
+        crate::db::create_admin_pool(&private)
+            .await
+            .expect("migrate the private database")
+            .close()
+            .await;
+
+        unsafe { std::env::set_var("DATABASE_URL", &private) };
+
+        let writer = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&private)
+            .await
+            .expect("connect to the private database");
+        let embedded: i64 = MIGRATOR
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .expect("the binary embeds migrations");
+        let row: (i64, String, Vec<u8>, bool, i64) = sqlx::query_as(
+            "DELETE FROM _sqlx_migrations WHERE version = $1
+             RETURNING version, description, checksum, success, execution_time",
+        )
+        .bind(embedded)
+        .fetch_one(&writer)
+        .await
+        .expect("the newest migration row is what this test borrows");
+
+        let mut reinsert = writer.begin().await.expect("open the window");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations
+                (version, description, installed_on, checksum, success, execution_time)
+             VALUES ($1, $2, NOW(), $3, $4, $5)",
+        )
+        .bind(row.0)
+        .bind(&row.1)
+        .bind(&row.2)
+        .bind(row.3)
+        .bind(row.4)
+        .execute(&mut *reinsert)
+        .await
+        .expect("re-insert the row, uncommitted");
+
+        let chunk = tokio::spawn(async { crate::sync::chunk::tests::test_pool().await });
+        let protocol = tokio::spawn(async { crate::protocol::tests::test_pool().await });
+
+        for _ in 0..OBSERVATIONS {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = $1 AND wait_event_type = 'Lock'
+                   AND wait_event = 'transactionid'
+                   AND query LIKE '%INSERT INTO _sqlx_migrations%'",
+            )
+            .bind(&name)
+            .fetch_one(&observer)
+            .await
+            .expect("read pg_stat_activity");
+            if waiting > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let still_waiting = !chunk.is_finished() && !protocol.is_finished();
+        reinsert.commit().await.expect("close the window");
+        writer.close().await;
+        unsafe { std::env::set_var("DATABASE_URL", &shared) };
+        drop(window);
+
+        let mut failures = Vec::new();
+        for helper in [chunk, protocol] {
+            match helper.await {
+                Ok(pool) => pool.close().await,
+                Err(failure) => failures.push(failure),
+            }
+        }
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .execute(&observer)
+            .await
+            .expect("drop the private database");
+        if let Some(failure) = failures.into_iter().next() {
+            std::panic::resume_unwind(failure.into_panic());
+        }
+        assert!(
+            still_waiting,
+            "a helper finished while the window was still open: it did not wait for the guard \
+             or for the row"
+        );
+    }
 }
