@@ -76,10 +76,6 @@ def repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def rounded(value: float | None, digits: int = 3) -> float | None:
-    return None if value is None else round(value, digits)
-
-
 def read_text(path: str) -> str | None:
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -312,10 +308,14 @@ def is_serial_run(record: dict[str, Any], tabla: str) -> bool:
     return record.get("modo") == "serie" and record.get("tabla") == tabla and record.get("rc") == 0
 
 
+def is_duration(seg: Any) -> bool:
+    """A number of seconds above 0: a bool or a 0 is not one to learn from (H9)."""
+    return isinstance(seg, (int, float)) and not isinstance(seg, bool) and seg > 0
+
+
 def is_step_sample(record: dict[str, Any], tabla: str) -> bool:
-    """A step of a green serial run of this table, with a duration above 0 to learn from (H9)."""
-    seg = record.get("seg")
-    return is_serial_run(record, tabla) and isinstance(seg, (int, float)) and not isinstance(seg, bool) and seg > 0
+    """A step of a green serial run of this table, with a duration to learn from."""
+    return is_serial_run(record, tabla) and is_duration(record.get("seg"))
 
 
 def load_history(tabla: str) -> tuple[dict[Any, list[dict[str, Any]]], list[dict[str, Any]]]:
@@ -753,25 +753,32 @@ class Planner:
     def all_measured(self, values: dict[str, Any]) -> bool:
         return all(values.get(s.id) is not None for s in self.steps)
 
-    def bound(self, dur: dict[str, Any], cpu: dict[str, Any], anon: dict[str, Any]) -> tuple[float | None, str]:
-        """LB over the run's steps, from gate_history.lower_bounds; None while a duration is unmeasured."""
-        if not self.all_measured(dur):
-            return None, ""
+    def lower_bounds(self, dur: dict[str, Any], cpu: dict[str, Any], anon: dict[str, Any]) -> dict[str, Any]:
+        """gate_history.lower_bounds over this table's steps; a dependency cycle is a refusal."""
         records = [
             {"id": s.id, "seg": dur[s.id], "cpu_s": cpu.get(s.id), "anon_max": anon.get(s.id)}
             for s in self.steps
         ]
         table = {"C": self.cpu, "R": self.ram, "deps": {s.id: s.deps for s in self.steps}}
         try:
-            result = gate_history.lower_bounds(records, table)
+            return gate_history.lower_bounds(records, table)
         except ValueError as err:
             die(str(err))
-        cota = result["cota"]
+
+    def bound_text(self, cota: str | None, dur: dict[str, Any]) -> str:
+        """The term that gave the bound, the critical path spelled out step by step."""
         if cota == "camino":
             rank, nxt = ranks(self.steps, dur)
             _, chain_text = critical_chain(self.steps, rank, nxt)
-            return result["LB"], f"critical path: {chain_text}"
-        return result["LB"], NOMBRE_COTA.get(cota or "", "")
+            return f"critical path: {chain_text}"
+        return NOMBRE_COTA.get(cota or "", "")
+
+    def bound(self, dur: dict[str, Any], cpu: dict[str, Any], anon: dict[str, Any]) -> tuple[float | None, str]:
+        """LB over the run's steps, from gate_history.lower_bounds; None while a duration is unmeasured."""
+        if not self.all_measured(dur):
+            return None, ""
+        result = self.lower_bounds(dur, cpu, anon)
+        return result["LB"], self.bound_text(result["cota"], dur)
 
     def summary(self) -> None:
         total = self.now()

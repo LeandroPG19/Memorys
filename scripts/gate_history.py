@@ -25,7 +25,14 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import ParamSpec, TextIO, TypeVar
+
+    P = ParamSpec("P")
+    R = TypeVar("R")
 
 REPO = "memory-industry"
 FLAKE_DAYS = 7
@@ -76,11 +83,11 @@ def _aviso(texto: str) -> None:
         sys.stderr.write(f"history: {texto}; the verdict does not change\n")
 
 
-def _sin_veredicto(fn: Callable[..., Any]) -> Callable[..., Any]:
+def _sin_veredicto(fn: Callable[P, R]) -> Callable[P, R | None]:
     """The history never gives a verdict: any failure in it is one warning and no exit change."""
 
     @functools.wraps(fn)
-    def dentro(*args: Any, **kwargs: Any) -> Any:
+    def dentro(*args: P.args, **kwargs: P.kwargs) -> R | None:
         try:
             return fn(*args, **kwargs)
         except Exception as err:
@@ -96,6 +103,16 @@ def _r(valor: float | None, digitos: int = 3) -> float | None:
 
 def _reloj(corrida: Corrida) -> float:
     return time.monotonic() - corrida.t0
+
+
+def _todos_medidos(valores: list[Any]) -> list[Any] | None:
+    """The values when there is at least one and none is null. A sum over steps that one of them
+    did not measure is not a smaller number: it is no number."""
+    return valores if valores and all(v is not None for v in valores) else None
+
+
+def _columna(registros: list[dict[str, Any]], campo: str) -> list[Any] | None:
+    return _todos_medidos([r.get(campo) for r in registros])
 
 
 def leer_jsonl(path: str) -> list[dict[str, Any]]:
@@ -123,7 +140,7 @@ def _plazo_candado() -> float:
         return LOCK_TIMEOUT_S
 
 
-def _tomar(candado: Any) -> bool:
+def _tomar(candado: TextIO) -> bool:
     """Takes the lock without waiting past GATE_HISTORY_LOCK_TIMEOUT_S (2 s by default)."""
     limite = time.monotonic() + _plazo_candado()
     while True:
@@ -273,37 +290,46 @@ def _test_times_units(log_path: str) -> str | None:
     return res.stdout
 
 
-def _verde_reciente(clave: str, paso_id: str, sha: str, huella: str) -> bool:
-    """A green run of this binary, of this step, for the same sha and huella within FLAKE_DAYS."""
+def _dias_recientes() -> list[str]:
+    """The day folders of the history within FLAKE_DAYS; a name that is not a day is not one."""
     limite = datetime.now(timezone.utc).date() - timedelta(days=FLAKE_DAYS)
+    raiz = history_root()
     try:
-        carpetas = os.listdir(history_root())
+        carpetas = os.listdir(raiz)
     except OSError:
-        return False
+        return []
+    recientes: list[str] = []
     for carpeta in carpetas:
         try:
             dia = datetime.strptime(carpeta, "%Y%m%d").date()
         except ValueError:
             continue
-        if dia < limite:
-            continue
-        for reg in leer_jsonl(os.path.join(history_root(), carpeta, "unidades.jsonl")):
-            if (
-                reg.get("clave") == clave
-                and reg.get("id") == paso_id
-                and reg.get("sha") == sha
-                and reg.get("huella") == huella
-                and reg.get("rc") == 0
-            ):
-                return True
-    return False
+        if dia >= limite:
+            recientes.append(os.path.join(raiz, carpeta))
+    return recientes
 
 
-@_sin_veredicto
-def units(corrida: Corrida, paso: Paso, log_path: str) -> None:
-    salida = _test_times_units(log_path)
-    if salida is None:
-        return
+def _verde_reciente(clave: str, paso_id: str, sha: str, huella: str) -> bool:
+    """A green run of this binary, of this step, for the same sha and huella within FLAKE_DAYS."""
+    buscado = {"clave": clave, "id": paso_id, "sha": sha, "huella": huella, "rc": 0}
+    return any(
+        all(reg.get(campo) == valor for campo, valor in buscado.items())
+        for carpeta in _dias_recientes()
+        for reg in leer_jsonl(os.path.join(carpeta, "unidades.jsonl"))
+    )
+
+
+def _es_flaky(corrida: Corrida, paso: Paso, reg: dict[str, Any]) -> bool:
+    """A red binary that was green for the same sha, huella and step: diagnosis only."""
+    return (
+        reg["rc"] != 0
+        and corrida.sha is not None
+        and corrida.huella is not None
+        and _verde_reciente(reg["clave"], paso.id, corrida.sha, corrida.huella)
+    )
+
+
+def _unidades(corrida: Corrida, paso: Paso, salida: str, log_path: str) -> list[dict[str, Any]]:
     registros: list[dict[str, Any]] = []
     for linea in salida.splitlines():
         try:
@@ -327,13 +353,17 @@ def units(corrida: Corrida, paso: Paso, log_path: str) -> None:
             )
         except ValueError:
             _aviso(f"units: the line {linea!r} of {log_path} is not <key> <cs> <tests> <failed>; skipped")
+    return registros
+
+
+@_sin_veredicto
+def units(corrida: Corrida, paso: Paso, log_path: str) -> None:
+    salida = _test_times_units(log_path)
+    if salida is None:
+        return
+    registros = _unidades(corrida, paso, salida, log_path)
     for reg in registros:
-        if (
-            reg["rc"] != 0
-            and corrida.sha is not None
-            and corrida.huella is not None
-            and _verde_reciente(reg["clave"], paso.id, corrida.sha, corrida.huella)
-        ):
+        if _es_flaky(corrida, paso, reg):
             _escribir(
                 "flaky.jsonl",
                 {
@@ -359,8 +389,8 @@ def _cerrar(
     C: int | None,
     R: int | None,
 ) -> None:
-    cpus = corrida.cpus
-    cpu_total = sum(cpus) if cpus and all(c is not None for c in cpus) else None
+    cpus = _todos_medidos(corrida.cpus)
+    cpu_total = None if cpus is None else sum(cpus)
     registro = {
         "repo": REPO,
         "modo": corrida.modo,
@@ -413,24 +443,21 @@ def _camino(
     return memo[paso_id]
 
 
-def lower_bounds(records: list[dict[str, Any]], table: dict[str, Any]) -> dict[str, Any]:
-    """LB = max(camino critico, sum(cpu_s)/C, sum(anon_max*seg)/R, max seg) over one run's steps.
+def _cota_cpu(records: list[dict[str, Any]], table: dict[str, Any]) -> float | None:
+    cpus = _columna(records, "cpu_s")
+    if cpus is None or not table.get("C"):
+        return None
+    return sum(cpus) / table["C"]
 
-    A term that needs a value nobody measured, or a capacity of 0, is left out; the answer is never
-    a 0 for it. A dependency cycle raises ValueError naming it.
-    """
-    todos_seg = all(r.get("seg") is not None for r in records)
-    seg = {r["id"]: float(r["seg"]) for r in records if r.get("seg") is not None}
-    cotas: dict[str, float | None] = {nombre: None for nombre in COTAS}
-    if records and todos_seg:
-        memo: dict[str, float] = {}
-        cotas["camino"] = max(_camino(i, seg, table["deps"], memo) for i in seg)
-        cotas["paso"] = max(seg.values())
-    cpus = [r.get("cpu_s") for r in records]
-    if records and table.get("C") and all(c is not None for c in cpus):
-        cotas["cpu"] = sum(cpus) / table["C"]
-    if records and todos_seg and table.get("R") and all(r.get("anon_max") is not None for r in records):
-        cotas["ram"] = sum(r["anon_max"] * seg[r["id"]] for r in records) / table["R"]
+
+def _cota_ram(records: list[dict[str, Any]], seg: dict[str, float], table: dict[str, Any]) -> float | None:
+    if _columna(records, "seg") is None or _columna(records, "anon_max") is None or not table.get("R"):
+        return None
+    return sum(r["anon_max"] * seg[r["id"]] for r in records) / table["R"]
+
+
+def _la_mayor(cotas: dict[str, float | None]) -> dict[str, Any]:
+    """The largest measured term; on a tie, the first one in COTAS."""
     LB: float | None = None
     cota: str | None = None
     for nombre in COTAS:
@@ -438,6 +465,23 @@ def lower_bounds(records: list[dict[str, Any]], table: dict[str, Any]) -> dict[s
         if valor is not None and (LB is None or valor > LB):
             LB, cota = valor, nombre
     return {"LB": LB, "cota": cota}
+
+
+def lower_bounds(records: list[dict[str, Any]], table: dict[str, Any]) -> dict[str, Any]:
+    """LB = max(camino critico, sum(cpu_s)/C, sum(anon_max*seg)/R, max seg) over one run's steps.
+
+    A term that needs a value nobody measured, or a capacity of 0, is left out; the answer is never
+    a 0 for it. A dependency cycle raises ValueError naming it.
+    """
+    seg = {r["id"]: float(r["seg"]) for r in records if r.get("seg") is not None}
+    cotas: dict[str, float | None] = dict.fromkeys(COTAS)
+    if _columna(records, "seg") is not None:
+        memo: dict[str, float] = {}
+        cotas["camino"] = max(_camino(i, seg, table["deps"], memo) for i in seg)
+        cotas["paso"] = max(seg.values())
+    cotas["cpu"] = _cota_cpu(records, table)
+    cotas["ram"] = _cota_ram(records, seg, table)
+    return _la_mayor(cotas)
 
 
 @_sin_veredicto
