@@ -509,3 +509,11 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   database: failed to run sqlx migrations … duplicate key value violates unique constraint "_sqlx_migrations_pkey"»
   (17 of 18 passed). Looks like a first-time race of migrations under parallel tests on the new :5490 server (the old
   judge's :5489 passed it in F0). A debugger reads it (no rerun to approve: a race between two connections is the bug).
+- 2026-11-07 11:00 · Debugger on the `--ignored` red: **not the server, a latent race since 12-ago in lib tests.**
+  `db::tests::a_database_behind_the_binary_is_refused_instead_of_dying_mid_import` (db.rs:1116) holds
+  GLOBAL_STATE_GUARD while it deletes and re-inserts the newest `_sqlx_migrations` row (outside sqlx's advisory lock)
+  and sets CUBA_SKIP_MIGRATIONS=1; the `test_pool()` helpers of sync/chunk.rs and protocol.rs open a pool without the
+  guard, so they can migrate inside that window (23505 `_sqlx_migrations_pkey`, 2.8 ms after the db.rs test ended) or
+  read the SKIP. Order-dependent, three faces of one cause. Slice **T-GUARD** on `release/0.31.0` (worktree
+  `Memorys-guard`, spec `guard-chunk-protocol.spec.md`): a deterministic interleaving test (two connections, an
+  observable barrier, no sleep), then the guard in both helpers; merged into the batch afterwards.
