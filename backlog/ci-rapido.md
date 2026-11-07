@@ -389,3 +389,25 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   time, root/lane/owner not validated. Clean: identity of the sweep on real PG 18.6, Docker postgres (uid 70/999) never
   killable, no bare wait, the password never printed. Decision: spec «F2a · correcciones de la revisión» K1–K10 as pass
   1b/2b; the password in psql's argv in gate-lock.sh goes to F2b. The queued verif-f2a was stopped.
+- 2026-11-07 04:55 · The full new-judge run did not run: when it got pesado, medir-juez.sh refused (exit 2) because I
+  had appended to this backlog in the same tree (a measurement needs the exact tree). Fixed by measuring from a detached,
+  clean worktree `Memorys-ci-medir` at `4f34314` (F1+F4, same code as `5c71048`); requeued under pesado.
+- 2026-11-07 05:30 · F3.1 pass 1b/2b delivered: 14 new contract tests (23 total; the 9 old ones untouched), H7–H11 and
+  the three P2, plus a per-process broken-lock flag (after one timeout a process skips later writes). Python harness:
+  13/14 new tests red against the old pass 2 (the 14th is a guard), 14/14 green with 2b; 12 sabotages red; the planner's
+  exit, normalized output and step fields identical to F3.2 (GATE_DAG 0 and 1, green and red, first and learning run).
+  h8 with the lock held: 1.06 s with the flag, 4.08 s without (limit 2.5 s, timeout injected at 1 s). Verification
+  queued under pesado (verif-f31.sh).
+- 2026-11-07 06:00 · **mtime experiment (three arms, same seed, the seed's profile env): the refuter's diagnosis
+  holds.** A (copy without mtimes, like cargo-mutants' fs::copy): 78 Compiling before it stopped, 12 roots «the
+  dependency X was rebuilt (T1, Δ after …)», 0 other Dirty reasons (it then failed on rustls' build script: `cp
+  --no-preserve=all` drops the exec bit, an artifact of the arm, not of cargo-mutants). B (same copy, one mtime for the
+  whole target): **Compiling=1, Fresh=304**. C (cp -a): **Compiling=1, Fresh=304**. So one mtime on a lab's target
+  before its first build removes the ≈100–120 s per run; the fix (cargo shim for cargo-mutants, D-F4j over every lab)
+  becomes slice **F4d**, after F2/F3.1 free the implementers.
+- 2026-11-07 06:00 · **The first full run of the new judge stopped at 3.8 s on `cargo fmt --check`** (exit 1, the cheap
+  step first, as designed): local_gate_contract.rs (16 hunks) and v046 (4) were never formatted — every verification
+  of the batch ran the contracts but never fmt. Fixed in `13c4443` (rustfmt only; token-identical except whitespace,
+  commas and closure braces). The verification scripts now check rustfmt of the new contracts. Lesson: a slice's own
+  checks include fmt and clippy of what it touched (trabajo-en-lotes), and I skipped them. Measuring tree moved to
+  `13c4443`; F3.1 verification and the measurement queued back to back under pesado.
