@@ -92,7 +92,7 @@ gate_cluster_down_all() {
   rm -f "$HOME/lanes.open"
 }
 FAKE
-    printf '#!/bin/sh\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
+    printf '#!/bin/sh\n[ "${1:-}" = --check-models ] || [ -n "${DATABASE_URL:-}" ] || { echo "FAIL: DATABASE_URL is not set, or is empty (stand-in)" >&2; exit 2; }\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
     for s in codigo-muerto crap-gate; do
       printf '#!/bin/sh\necho %s >>"$HOME/steps"\necho "${DATABASE_URL-unset}" >>"$HOME/%s.urls"\necho "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset}" >>"$HOME/%s.lanes"\nexit 0\n' "$s" "$s" "$s" >"$t/scripts/$s.sh"
     done
@@ -901,7 +901,9 @@ FAKE
 up dbg
 run-all-tests --lane CL --lane D1 --lane D2 --lane D3
 down dbg
+up nli
 run-all-tests --lane NLI
+down nli
 up b3
 run-all-tests --lane B3
 down b3

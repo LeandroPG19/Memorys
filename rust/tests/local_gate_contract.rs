@@ -4963,10 +4963,11 @@ fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
     }
 }
 
-/// CI-F3.3c (D-F3l, V9, V10): the NLI clock assertion runs in a row of its own, exclusive, after DBG (it needs DBG's
-/// target built), and DBG no longer names it. NLI opens no database, so its row names no cluster.
+/// CI-F3.3c (D-F3l, V9, V10) and CI-J12: the NLI clock assertion runs in a row of its own, exclusive, after DBG (it needs
+/// DBG's target built), and DBG no longer names it. Its tests open no database, but run-all-tests refuses to run without
+/// the judge's server (gate_require_judge_server), so the row runs in a cluster of its own, as the other rows that call it.
 #[test]
-fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_no_cluster() {
+fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_its_own_cluster() {
     let table = read("scripts/gate-dag.txt");
     let row_of = |id: &str| -> String {
         table
@@ -4986,8 +4987,8 @@ fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_no_cluster() {
         "NLI measured 1199 ms under contention against a 500 ms assertion, so it runs alone: {nli}"
     );
     assert!(
-        !tok[3].split(',').any(|r| r.starts_with("cluster:")),
-        "NLI opens no database, so its row names no cluster: {nli}"
+        tok[3].split(',').any(|r| r == "cluster:C_nli"),
+        "NLI runs with the judge's server, so its row names a cluster of its own (CI-J12): {nli}"
     );
     let gate = read("scripts/merge-gate.sh");
     let nli_body = step_body(&gate, "NLI").expect("merge-gate.sh has a step_NLI()");
@@ -4997,8 +4998,8 @@ fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_no_cluster() {
         "step_NLI runs the NLI lane alone"
     );
     assert!(
-        !nli_body.iter().any(|line| line.contains("run_in_lane")),
-        "step_NLI opens no cluster: the NLI tests read no database"
+        nli_body.iter().any(|line| line.contains("run_in_lane nli")),
+        "step_NLI runs its lane in a cluster of its own (CI-J12): run-all-tests refuses to run without the judge's server"
     );
     let dbg_body = step_body(&gate, "DBG").expect("merge-gate.sh has a step_DBG()");
     assert_eq!(
