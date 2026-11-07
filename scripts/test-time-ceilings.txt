@@ -38,6 +38,8 @@
 # floor = floor(0.5 x 220.26). linux gate_dag_contract had no line and the default 10 s; it gets
 # 7/23 from 15.14 s = 7.57 s + 7.57 s; ceiling = ceil(1.5 x 15.14), floor = floor(0.5 x 15.14).
 # k = 1.5 because there is one run. The windows lines are not touched: this host does not measure them.
+# CI-J7 (7-nov, orquestador-0.31) re-sets linux local_gate_contract to 44/133 from one measurement of the binary alone under
+# pesado: 44.18 s per round, 2 x 44.18 = 88.36 s; floor = floor(0.5 x 88.36) = 44, ceiling = ceil(1.5 x 88.36) = 133.
 
 windows v029_bridge_against_the_real_daemon 52 399 orquestador-0.31 2026-11-30 a real daemon and the bridge against it, run by the plain cargo test and again by --features docs; 105.9-306.2 s in five runs, the widest spread of the judge and not explained yet
 windows local_gate_contract 58 217 orquestador-0.31 2026-11-30 every gate script's --self-test, each a throwaway gate tree of stand-ins, run twice; Git Bash forks slowly (16 s on linux); 116.5-166.5 s
@@ -57,7 +59,7 @@ linux lib:memory_industry 23 71 orquestador-0.31 2026-11-30 the unit tests, run 
 linux v029_accounts_over_real_http 5 16 orquestador-0.31 2026-11-30 real HTTP daemons over scratch databases, cloned from a template since T4a: 10.41 s in the F0 run of 2d61589 (6-nov-2026, one run; ceiling = ceil(1.5 x 10.41), floor = floor(0.5 x 10.41)); fcebc6c measured 33.5-39.3 s before the clone, and 635-847 s before 0.30: the ceiling still catches a return to that
 linux v017_relation_scan 9 33 orquestador-0.31 2026-11-30 asks the generative LLM over the network; 19.2-21.7 s
 linux v016_extract_without_sampling 5 26 orquestador-0.31 2026-11-30 asks the generative LLM over the network; 11.6-16.8 s
-linux local_gate_contract 110 331 orquestador-0.31 2026-11-30 the --self-test of the 13 gate scripts (SCRIPTS_WITH_SELF_TEST), each a throwaway gate tree of stand-ins; the contracts of the lot (D-J7b hermetic self-tests, CI-J3 under the judge's exported environment) run each of them more than once per round, and the judge runs two rounds (plain and --features docs): 112.21 s + 108.05 s = 220.26 s in the carriles run 20261107-073815, one run alone under pesado; 22.7 s in the F0 run of 2d61589 (6-nov-2026), 16.2 s before
+linux local_gate_contract 44 133 orquestador-0.31 2026-11-30 the --self-test of the 13 gate scripts (SCRIPTS_WITH_SELF_TEST) under the judge's exported environment, one OnceLock run per script and six launches at a time (CI-J7); measured from the binary alone under pesado, 44.18 s per round, both rounds summed 88.36 s (the serial figure was 110/331, 220.26 s in the carriles run 20261107-073815); pending: to be set again by the next complete judge run
 linux gate_dag_contract 7 23 orquestador-0.31 2026-11-30 gate_dag_contract, run in both rounds (plain and --features docs): 7.57 s + 7.57 s = 15.14 s in the carriles run 20261107-073815, one run alone under pesado; it had no line, so the default 10 s applied
 linux v025_a_stuck_sync_fails_instead_of_hanging 5 16 orquestador-0.31 2026-11-30 waits for a stuck sync to give up, which is what it proves; 10.2 s
 linux v029_doctor_reads_only_its_world 3 13 orquestador-0.31 2026-11-30 7.9-8.4 s, too close to the default to live under it
