@@ -3270,9 +3270,12 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
 /// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
 /// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
 /// self-test that takes it as its own fixture's identity is red under any other value.
-const JUDGE_ENVIRONMENT: [(&str, &str); 20] = [
+const JUDGE_ENVIRONMENT: [(&str, &str); 21] = [
     ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
     ("GATE_SERVER_SYSTEM_ID", "1"),
+    // F2b-fix (D-F2i): the root of the clusters is not exported, and run_in_lane hands it to the step of a
+    // lane. A self-test must not inherit a real root: the rows that read it unset it at their start.
+    ("GATE_CLUSTER_ROOT", "/nonexistent-ajeno/clusters"),
     // CI-F2 (D-F2i): merge-gate.sh exports the lane of each step. Not exported yet: this entry
     // is red until the code of F2b exports it, and a self-test must not inherit a real lane.
     ("GATE_LANE", "ajena"),
