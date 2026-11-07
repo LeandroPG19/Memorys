@@ -496,3 +496,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   Verification queued. **F2b started** (worktree `Memorys-ci-f2b` from 058cb55): wiring in serial mode, rows A3, D5,
   C1–C5, E1, E2, the 107-byte boundary, the caller's D2, rewrites of j11_unset/j11_empty/j16_unset, contracts, the
   password out of psql's argv in gate-lock.sh.
+- 2026-11-07 10:20 · F2b too large for one round: the implementer delivered only part of pass 1 (merge-gate j11_unset/
+  j11_empty rewritten per D-F2c/D-F2k, row A3, contracts E2 and C4, GATE_LANE added to JUDGE_ENVIRONMENT; red
+  `j11_unset: no FAIL line names initdb and docs/gate.md`). Split (my decision; reverted by merging them back):
+  **F2b-1** = the caller's rows only (A1 order, C1, C5, D1, D2, E1; run-all-tests j16 → D5) with an injected fake
+  `gate_cluster_up` instead of new PG fixtures, plus the code in merge-gate/run-all-tests/gate-lock (PGPASSWORD,
+  D-F2i) and the docs part E2 needs; **F2b-2** = the real-cluster contract (B1–B3), the rest of docs and AGENTS.md. The
+  library rows already in F2a's self-test (A2, D3, D4/K4, K5–K10, the long path) are not duplicated in the caller.
