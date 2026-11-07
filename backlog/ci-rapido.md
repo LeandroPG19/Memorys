@@ -789,3 +789,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   doc 26/26, ci 10/10). A foreign CARGO_TARGET_DIR (CI-J3's /nonexistent-ajeno) made target creation raise; now exit 2
   with its reason; GATE_OWNER is read from the lock's record and crossed with CUBA_GATE_LOCK_OWNER (a foreign inherited
   owner refused: row step_judge). Merged `b91aa8e`. Fifteenth full run (through the planner, serial) started on it.
+- 2026-11-07 10:54 · **Fifteenth full run (`b91aa8e`): 191.7 s, exit 101** — DBG's unit step: local_gate_contract 4 red
+  inside the real judge: the contract's self-tests inherit **CUBA_GATE_LANE_TOKEN** from the DBG step (the planner hands
+  it), so their inner gates take the token path and are refused («this lane does not descend from the gate that holds
+  the lock», «no unused ticket … holds this token»), and D2 left '0'. CI-J3's list-completeness contract scans bash
+  exports only; the planner's per-step environment (D-F3j) escaped it. Slice **CI-J9**: the token unset by the process
+  that spends it, CUBA_GATE_LANE_TOKEN in JUDGE_ENVIRONMENT and unset in the regions that take the lock, and the
+  completeness contract extended to the planner's closed list.
