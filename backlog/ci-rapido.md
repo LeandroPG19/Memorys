@@ -598,3 +598,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   fixture one entity per line; eval_seed.py tells deduplicated from reinforced_id); its verification with the real
   model queued. F3.3a pass 1 delivered (four contracts on the table, the lanes, the graph and gate-audit), pass 2 in
   progress; B3 stays its own lane (E depends on B3, so E and R run in parallel after it).
+- 2026-11-07 06:21 · **CI-J4 closed:** red `6ba8570` (fixture line 4: reinforced_id — real binary, real model, 2.33 s),
+  fix `36f5cb3` (24 lines in, 2.67 s; eval_seed.py --check-fixture OK; run-all-tests self-test OK); merged `ead5aee`.
+  **Seventh full run started in lanes mode** (DATABASE_URL empty: each test step on its own ephemeral PG 18.6 cluster,
+  serial), on ead5aee — the first run of F2b's lanes against the real tree.
