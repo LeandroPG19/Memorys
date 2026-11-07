@@ -415,6 +415,26 @@ if [[ "${1:-}" == "--self-test" ]]; then
   bash "$SELF" --units "$tmp/U1.cut.log" >/dev/null 2>&1 || rc=$?
   want_rc "U1.cut" 2
 
+  # U2 (CI-F3.3b-0, D-F3s): a binary that a signal killed has no `finished in` and no count. --units
+  # prints it after the others as `<key> - - -<signal>`. --count still refuses the log, as it refuses a
+  # cut one: a killed binary is no pass.
+  {
+    printf '     Running unittests src/lib.rs (target/debug/deps/memory_industry-0123456789abcdef)\n\n'
+    printf 'running 1 test\ntest a ... ok\n\n'
+    printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.00s\n\n'
+    printf '     Running tests/smoke.rs (target/debug/deps/smoke-0123456789abcdef)\n\n'
+    printf 'running 1 test\ntest s ... ok\n\n'
+    printf "error: process didn't exit successfully: \`target/debug/deps/smoke-0123456789abcdef\` (signal: 11, SIGSEGV: invalid memory reference)\n"
+  } >"$tmp/U2.log"
+  rc=0
+  bash "$SELF" --units "$tmp/U2.log" >"$tmp/U2.out" 2>&1 || rc=$?
+  want_rc "U2" 0
+  [[ "$(cat "$tmp/U2.out")" == "$(printf '%s\n' 'lib:memory_industry 200 1 0' 'smoke - - -11')" ]] \
+    || self_fail "U2: --units printed '$(cat "$tmp/U2.out")', want 'lib:memory_industry 200 1 0' (the finished binary) and then 'smoke - - -11' (the killed one: no time, no count, signal 11)"
+  rc=0
+  bash "$SELF" --count "$tmp/U2.log" >"$tmp/U2.count.out" 2>&1 || rc=$?
+  want_rc "U2.count" 2
+
   echo "OK  self-test: test-times sums each binary's finished-in over both cargo shapes up to the boundary, prints the 10 slowest, and is red for a ceiling passed, the default passed, a floor undercut, a dead or expired line and a malformed one, all in one run; a log it cannot read is exit 2"
   exit 0
 fi

@@ -236,13 +236,22 @@ impl Fixture {
 
 /// `python3 -I -c <prelude + body> <scripts dir> <args…>`. `root` None removes CI_TIEMPOS_DIR.
 fn py(fx: &Fixture, body: &str, args: &[&str], root: Option<&Path>) -> Output {
+    py_en(fx, &scripts(), body, args, root)
+}
+
+/// `py` with the modules taken from `dir`. `-B` keeps bytecode out of `dir`: `-I` ignores the
+/// PYTHON* variables, so PYTHONDONTWRITEBYTECODE alone writes `__pycache__` next to the scripts
+/// (F3.3b-0, correction 7). The variable stays for the children that do not run under `-I`.
+fn py_en(fx: &Fixture, dir: &Path, body: &str, args: &[&str], root: Option<&Path>) -> Output {
     let code = format!("{PRE}{body}");
     let mut cmd = Command::new("python3");
     cmd.arg("-I")
+        .arg("-B")
         .arg("-c")
         .arg(code)
-        .arg(scripts())
+        .arg(dir)
         .args(args)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("HOME", &fx.home)
         .env("TMPDIR", &fx.tmp);
     match root {
@@ -260,8 +269,10 @@ fn py(fx: &Fixture, body: &str, args: &[&str], root: Option<&Path>) -> Output {
 fn registrar(fx: &Fixture, root: Option<&Path>, manifest: &Value) -> Output {
     let mut cmd = Command::new("python3");
     cmd.arg("-I")
+        .arg("-B")
         .arg(scripts().join("gate_history.py"))
         .arg("registrar")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("HOME", &fx.home)
         .env("TMPDIR", &fx.tmp)
         .stdin(Stdio::piped())
@@ -851,8 +862,10 @@ fn plan(base: &Path, table: &Path, root: &Path, script_dir: &Path, extra: &[(&st
 fn registrar_stdin(root: &Path, home: &Path, stdin: &str, env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("python3");
     cmd.arg("-I")
+        .arg("-B")
         .arg(scripts().join("gate_history.py"))
         .arg("registrar")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("CI_TIEMPOS_DIR", root)
         .env("HOME", home)
         .env("TMPDIR", home)
@@ -1305,3 +1318,434 @@ fn units_salta_una_linea_inesperada_y_sigue() {
     );
     assert_eq!(unidades[0]["clave"].as_str(), Some("smoke"));
 }
+
+/// Cargo's shape of a binary that a signal killed: the finished library binary, then a test binary
+/// with no `test result` line, and the error cargo prints for it.
+const LOG_SENAL: &str = r#"
+     Running unittests src/lib.rs (target/debug/deps/memory_industry-0123456789abcdef)
+
+running 2 tests
+test a ... ok
+test b ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.51s
+
+     Running tests/smoke.rs (target/debug/deps/smoke-0123456789abcdef)
+
+running 1 test
+test s ... ok
+
+error: process didn't exit successfully: `target/debug/deps/smoke-0123456789abcdef` (signal: 11, SIGSEGV: invalid memory reference)
+"#;
+
+/// One run with one step measured and every system figure given to `run_end` (F3.3b-0, correction 3).
+const BODY_CIERRE: &str = r#"
+corrida = gh.run_start(modo="dag", sha="s", huella="h", tabla="tabla-f33b0")
+paso = gh.step_start(corrida, 10, "fmt")
+gh.step_end(corrida, paso, rc=0, espera_s=0.0, cpu_s=1.0, mem_peak=1048576, anon_max=524288, oom_kill=0, psi={"cpu": 0.5, "memory": None, "io": 0.1})
+gh.run_end(corrida, rc=0, T=10.0, LB_ref=4.0, LB_run=8.0, C=4, R=10737418240, mem_peak=2097152, psi={"cpu": 1.5, "memory": None, "io": 0.2}, load=3.5, hilos=24, oom_kill=0)
+"#;
+
+/// A run that measured nothing but its own clock. Every system figure is null.
+const BODY_CIERRE_NULO: &str = r#"
+corrida = gh.run_start(modo="serie", sha="s", huella="h", tabla="tabla-f33b0")
+gh.run_end(corrida, rc=0)
+"#;
+
+/// Prints the huella of every path in argv as a JSON list, null where git cannot say.
+const BODY_HUELLA: &str = r#"
+print(json.dumps([gh.huella(ruta) for ruta in sys.argv[2:]]))
+"#;
+
+/// `git` in `dir` with the identity its commits need. Only the test's own repositories.
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=contrato",
+            "-c",
+            "user.email=contrato@example.invalid",
+        ])
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        show(&out)
+    );
+}
+
+/// A repository with one commit. `sin_rastrear` writes an untracked src/x.rs; `tocado` changes the
+/// committed file without committing it.
+fn repo_con(dir: &Path, sin_rastrear: Option<&str>, tocado: Option<&str>) {
+    fs::create_dir_all(dir).expect("the repository folder");
+    git(dir, &["init", "-q"]);
+    write(&dir.join("base.txt"), "uno\n");
+    git(dir, &["add", "base.txt"]);
+    git(dir, &["commit", "-q", "-m", "base"]);
+    if let Some(texto) = tocado {
+        write(&dir.join("base.txt"), texto);
+    }
+    if let Some(texto) = sin_rastrear {
+        fs::create_dir_all(dir.join("src")).expect("the src folder");
+        write(&dir.join("src/x.rs"), texto);
+    }
+}
+
+/// Spec F3.3b-0, correction 1 (F3.1, «para F3.3»): a unit that names a step the manifest does not
+/// have is one `history:` line that names it. The run, its steps and its index line are written as usual.
+#[test]
+fn registrar_avisa_la_unidad_huerfana_y_escribe_la_corrida() {
+    let fx = Fixture::new("huerfana");
+    let log = fx.log("tests.log", LOG_DOS);
+    let mut manifiesto = manifest(&log);
+    manifiesto["unidades"] = json!([
+        {"id": "tests", "log": log.display().to_string()},
+        {"id": "NOPE", "log": log.display().to_string()}
+    ]);
+    let out = registrar(&fx, Some(fx.root.as_path()), &manifiesto);
+    assert_ok(
+        &out,
+        "registrar with a unit that names no step of its manifest",
+    );
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("NOPE"),
+        "the orphan unit is not named on stderr: {}",
+        show(&out)
+    );
+    assert_eq!(
+        records(&fx.root, "corridas.jsonl").len(),
+        1,
+        "the run line is missing: {}",
+        show(&out)
+    );
+    assert_eq!(
+        records(&fx.root, "indice.jsonl").len(),
+        1,
+        "the index line is missing: {}",
+        show(&out)
+    );
+    assert_eq!(
+        records(&fx.root, "pasos.jsonl").len(),
+        2,
+        "the step lines are missing: {}",
+        show(&out)
+    );
+    assert_eq!(
+        records(&fx.root, "unidades.jsonl").len(),
+        2,
+        "the units of the known step are missing: {}",
+        show(&out)
+    );
+}
+
+/// Spec F3.3b-0, correction 2: the huella is the sha256 of `git diff HEAD --binary` and of every
+/// untracked file. Two trees that differ only by an untracked `.rs` have different huellas; the same
+/// bytes in another folder have the same one, so the path is not part of it.
+#[test]
+fn la_huella_mira_los_no_rastreados_y_los_cambios_sin_commit() {
+    let fx = Fixture::new("huella");
+    let limpio = fx.base.join("limpio");
+    let con_a = fx.base.join("con-a");
+    let con_b = fx.base.join("con-b");
+    let con_a_en_otra_carpeta = fx.base.join("otra").join("con-a");
+    let tocado = fx.base.join("tocado");
+    repo_con(&limpio, None, None);
+    repo_con(&con_a, Some("fn a() {}\n"), None);
+    repo_con(&con_b, Some("fn b() {}\n"), None);
+    repo_con(&con_a_en_otra_carpeta, Some("fn a() {}\n"), None);
+    repo_con(&tocado, None, Some("dos\n"));
+    let rutas: Vec<String> = [&limpio, &con_a, &con_b, &con_a_en_otra_carpeta, &tocado]
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let args: Vec<&str> = rutas.iter().map(String::as_str).collect();
+    let out = py_en(&fx, &scripts(), BODY_HUELLA, &args, None);
+    assert_ok(&out, "gate_history.huella over five repositories");
+    let listas: Vec<Option<String>> = serde_json::from_str(&text(&out.stdout))
+        .unwrap_or_else(|e| panic!("huella printed no JSON list ({e}): {}", show(&out)));
+    let h: Vec<String> = listas
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.unwrap_or_else(|| panic!("the huella of repository {i} is null: {}", show(&out)))
+        })
+        .collect();
+    assert!(
+        h.iter().all(|v| v.len() == 64),
+        "a huella is not a sha256 in hex: {h:?}"
+    );
+    assert_ne!(
+        h[0], h[1],
+        "an untracked src/x.rs did not change the huella: the clean tree and con-a are equal"
+    );
+    assert_ne!(
+        h[1], h[2],
+        "two untracked .rs with other bytes gave the same huella: {h:?}"
+    );
+    assert_eq!(
+        h[1], h[3],
+        "the same tree in another folder gave another huella: the path must not take part"
+    );
+    assert_ne!(
+        h[0], h[4],
+        "a change to a tracked file that is not committed did not change the huella"
+    );
+}
+
+/// Spec F3.3b-0, correction 2: outside a repository the huella is null, never a guessed value.
+#[test]
+fn la_huella_es_null_fuera_de_git() {
+    let fx = Fixture::new("huella-nula");
+    let carpeta = fx.base.join("sin-git");
+    fs::create_dir_all(&carpeta).expect("a folder that is no repository");
+    let ruta = carpeta.display().to_string();
+    let out = py_en(&fx, &scripts(), BODY_HUELLA, &[ruta.as_str()], None);
+    assert_ok(&out, "gate_history.huella outside git");
+    assert_eq!(
+        text(&out.stdout).trim(),
+        "[null]",
+        "a folder outside git must give a null huella: {}",
+        show(&out)
+    );
+}
+
+/// Spec F3.3b-0, correction 3: the run line carries the system's pressure, the load, the threads,
+/// the two gaps to the bounds, the run's peak and its OOM kills.
+#[test]
+fn run_end_registra_presion_carga_hilos_brechas_y_oom() {
+    let fx = Fixture::new("cierre");
+    let out = py(&fx, BODY_CIERRE, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "a run with its system figures");
+    let corridas = records(&fx.root, "corridas.jsonl");
+    let linea = corridas
+        .first()
+        .unwrap_or_else(|| panic!("no run line: {}", show(&out)));
+    assert_eq!(linea["brecha_ref"], json!(2.5), "T/LB_ref is 10/4: {linea}");
+    assert_eq!(
+        linea["brecha_run"],
+        json!(1.25),
+        "T/LB_run is 10/8: {linea}"
+    );
+    assert_eq!(linea["mem_peak"], json!(2097152), "{linea}");
+    assert_eq!(
+        linea["psi"],
+        json!({"cpu": 1.5, "memory": null, "io": 0.2}),
+        "the pressure of the system is not the run's: {linea}"
+    );
+    assert_eq!(linea["load"], json!(3.5), "{linea}");
+    assert_eq!(linea["hilos"], json!(24), "{linea}");
+    assert_eq!(linea["oom_kill"], json!(0), "{linea}");
+}
+
+/// Spec F3.3b-0, correction 3: what nobody measured is null, never 0 and never an invented value.
+#[test]
+fn run_end_sin_medidas_escribe_null_y_no_cero() {
+    let fx = Fixture::new("cierre-nulo");
+    let out = py(&fx, BODY_CIERRE_NULO, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "a run that measured nothing but its clock");
+    let linea = records(&fx.root, "corridas.jsonl")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no run line: {}", show(&out)));
+    for campo in [
+        "mem_peak",
+        "psi",
+        "load",
+        "hilos",
+        "oom_kill",
+        "brecha_ref",
+        "brecha_run",
+    ] {
+        assert!(
+            linea.get(campo).is_some_and(Value::is_null),
+            "{campo} must be a key of the run line and null when nobody measured it: {linea}"
+        );
+    }
+}
+
+/// Spec F3.3b-0, correction 3 through the serial writer: `registrar` hands the bounds, the pressure
+/// and the threads of the manifest to the run line.
+#[test]
+fn registrar_pasa_cotas_presion_y_hilos_a_la_corrida() {
+    let fx = Fixture::new("registrar-cierre");
+    let log = fx.log("tests.log", LOG_DOS);
+    let mut manifiesto = manifest(&log);
+    manifiesto["T"] = json!(10.0);
+    manifiesto["LB_ref"] = json!(4.0);
+    manifiesto["LB_run"] = json!(8.0);
+    manifiesto["C"] = json!(4);
+    manifiesto["R"] = json!(10737418240u64);
+    manifiesto["mem_peak"] = json!(2097152);
+    manifiesto["psi"] = json!({"cpu": 1.5, "memory": null, "io": 0.2});
+    manifiesto["load"] = json!(3.5);
+    manifiesto["hilos"] = json!(24);
+    manifiesto["oom_kill"] = json!(0);
+    let out = registrar(&fx, Some(fx.root.as_path()), &manifiesto);
+    assert_ok(&out, "registrar with the figures of the run");
+    let linea = records(&fx.root, "corridas.jsonl")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no run line: {}", show(&out)));
+    assert_eq!(linea["brecha_ref"], json!(2.5), "{linea}");
+    assert_eq!(linea["brecha_run"], json!(1.25), "{linea}");
+    assert_eq!(linea["load"], json!(3.5), "{linea}");
+    assert_eq!(linea["hilos"], json!(24), "{linea}");
+    assert_eq!(linea["psi"]["cpu"], json!(1.5), "{linea}");
+}
+
+/// Spec F3.3b-0, correction 5: a binary that a signal killed keeps its unit, with `rc` the signal
+/// as a negative number and no `finished_in`. The binary that finished keeps its own line.
+#[test]
+fn un_binario_muerto_por_senal_deja_su_unidad_con_rc_y_sin_finished_in() {
+    let fx = Fixture::new("senal");
+    let log = fx.log("senal.log", LOG_SENAL);
+    let out = registrar(&fx, Some(fx.root.as_path()), &manifest(&log));
+    assert_ok(
+        &out,
+        "registrar over a log with a binary killed by a signal",
+    );
+    assert!(
+        !text(&out.stderr).contains("units not read"),
+        "the units of the whole step were lost: {}",
+        show(&out)
+    );
+    let unidades = records(&fx.root, "unidades.jsonl");
+    assert_eq!(
+        unidades.len(),
+        2,
+        "want the finished binary and the killed one: {unidades:?}"
+    );
+    let muerto = unidades
+        .iter()
+        .find(|u| u["clave"] == json!("smoke"))
+        .unwrap_or_else(|| panic!("no unit for smoke: {unidades:?}"));
+    assert_eq!(
+        muerto["rc"],
+        json!(-11),
+        "a binary killed by signal 11 has rc -11: {muerto}"
+    );
+    assert!(
+        muerto["finished_in"].is_null()
+            && muerto["tests"].is_null()
+            && muerto["fallados"].is_null(),
+        "a killed binary has no time and no count: {muerto}"
+    );
+    let vivo = unidades
+        .iter()
+        .find(|u| u["clave"] == json!("lib:memory_industry"))
+        .unwrap_or_else(|| panic!("no unit for lib:memory_industry: {unidades:?}"));
+    assert_eq!(vivo["finished_in"], json!(21.51), "{vivo}");
+    assert_eq!(vivo["rc"], json!(0), "{vivo}");
+}
+
+/// Spec F3.3b-0, correction 7: a contract that imports the modules writes no bytecode next to them.
+/// `-I` alone wrote `__pycache__`; PYTHONDONTWRITEBYTECODE does nothing under `-I`, so the launcher
+/// passes `-B`.
+#[test]
+fn el_lanzador_de_los_contratos_no_escribe_pycache() {
+    let fx = Fixture::new("pycache-lanzador");
+    let copia = fx.base.join("scripts");
+    fs::create_dir_all(&copia).expect("the copy of the scripts");
+    fs::copy(
+        scripts().join("gate_history.py"),
+        copia.join("gate_history.py"),
+    )
+    .expect("copy gate_history.py");
+    let out = py_en(&fx, &copia, "print(gh.REPO)\n", &[], None);
+    assert_ok(&out, "importing gate_history from a copy of the scripts");
+    assert!(
+        !copia.join("__pycache__").exists(),
+        "the import wrote bytecode next to the module in {}",
+        copia.display()
+    );
+}
+
+/// Spec F3.3b-0, correction 4: a planner run records the sha of HEAD and the huella of the tree,
+/// not nulls.
+#[test]
+fn el_planificador_registra_el_sha_y_la_huella_del_arbol() {
+    let base = scratch("sha-huella");
+    let table = table_file(&base, "tabla.txt", "10 a - - normal 1 5 0.05 /bin/true\n");
+    let root = base.join("historial");
+    let p = plan(&base, &table, &root, &scripts(), &[]);
+    assert_eq!(p.code, Some(0), "one green step: {}{}", p.out, p.err);
+    let linea = records(&root, "corridas.jsonl")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no run line: {}", p.err));
+    let git_head = Command::new("git")
+        .arg("-C")
+        .arg(repo_root())
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .output()
+        .expect("git rev-parse");
+    let head = String::from_utf8_lossy(&git_head.stdout).trim().to_string();
+    assert_eq!(
+        linea["sha"].as_str(),
+        Some(head.as_str()),
+        "the run's sha is not HEAD: {linea}"
+    );
+    let huella = linea["huella"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the run's huella is null: {linea}"));
+    assert_eq!(huella.len(), 64, "the huella is not a sha256: {huella}");
+}
+
+/// Spec F3.3b-0, correction 6: a run that the history could not start is None for the planner. The
+/// planner does not hand that None to the history's functions, so no `AttributeError` reaches stderr,
+/// and the verdict is the steps' own.
+#[test]
+fn sin_corrida_de_historia_el_planificador_no_pasa_none() {
+    let base = scratch("sin-corrida");
+    let table = table_file(&base, "tabla.txt", "10 a - - normal 1 5 0.05 /bin/true\n");
+    let root = base.join("historial");
+    let (cgroups, proc_self) = fake_cgroup(&base);
+    let home = base.join("home");
+    fs::create_dir_all(&home).expect("home");
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg("-B")
+        .arg("-c")
+        .arg(CORRIDA_NONE)
+        .arg(scripts())
+        .arg(&table)
+        .env("GATE_DAG", "0")
+        .env("CI_TIEMPOS_DIR", &root)
+        .env("HOME", &home)
+        .env("TMPDIR", &base)
+        .env("GATE_CGROUP_ROOT", &cgroups)
+        .env("GATE_PROC_SELF_CGROUP", &proc_self)
+        .output()
+        .expect("python3 -I -c the planner with no run");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a green table with no history run: {}",
+        show(&out)
+    );
+    let err = text(&out.stderr);
+    assert!(
+        !err.contains("AttributeError"),
+        "the planner handed None to the history, which failed on it: {err}"
+    );
+}
+
+/// Runs the planner with `run_start` replaced by None. argv: scripts dir, table.
+const CORRIDA_NONE: &str = r#"
+import importlib.util
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+import gate_history
+gate_history.run_start = lambda *args, **kwargs: None
+spec = importlib.util.spec_from_file_location("gate_dag", os.path.join(sys.argv[1], "gate-dag.py"))
+gate_dag = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate_dag)
+sys.exit(gate_dag.main(["run", "--table", sys.argv[2]]))
+"#;
