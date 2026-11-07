@@ -576,3 +576,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   (dedup o refuerzo de otra fila)`. First full run ever to reach the seeded eval CI-J built (only stand-ins had run it).
   Peak memory 10.5 GB, CPU 2453 s. A debugger reads it. In series this head should land near 25 min with docs, crap and
   mutants still to come; the lanes (F2b + F3.3) are what take it under 15.
+- 2026-11-07 06:08 · **F2b-1 committed and merged:** red `8e9af29` (merge-gate j11_unset, run-all-tests j16_unset; contract
+  60/65), code `f039e3d` (contract **65/65**, 13 hermetic self-tests OK under CI-J3's environment, no postgres left); merged
+  into the batch `343df5f` (clean merge with F4d's mutants-gate and contract changes). Integrated verification of the head
+  queued (fmt, the three contract binaries, clippy --all-targets). Note: with an external DATABASE_URL the judge keeps
+  the old single-server path (C5); the lanes run only with DATABASE_URL empty — the next full run is made that way.
