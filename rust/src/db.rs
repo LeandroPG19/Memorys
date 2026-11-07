@@ -1111,6 +1111,177 @@ mod tests {
         );
     }
 
+    /// T-RLS, scenario 1. A connection the pool opens while a request runs must carry
+    /// the active project, as a reused one does. before_acquire stamps the scope only on
+    /// connections that come out of the idle queue, so a new one gets its scope from
+    /// after_connect alone. The first connection is held as a barrier, so the query that
+    /// reads the setting is the one that makes the pool open the second.
+    #[tokio::test]
+    async fn a_connection_opened_during_a_request_carries_the_active_project() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL env var required for integration tests");
+        let pool = pool_options()
+            .max_connections(2)
+            .min_connections(0)
+            .connect_lazy_with(connect_options(&url).expect("valid DATABASE_URL"));
+
+        let project = uuid::Uuid::new_v4();
+        crate::session::set(uuid::Uuid::new_v4(), Some(project));
+
+        let at_start = pool.size();
+        let barrier = pool
+            .acquire()
+            .await
+            .expect("take connection 1 as the barrier");
+        let open_before = pool.size();
+        let (seen,): (String,) =
+            sqlx::query_as("SELECT current_setting('app.current_project', true)")
+                .fetch_one(&pool)
+                .await
+                .expect("read app.current_project on the connection the pool opens");
+        let open_after = pool.size();
+
+        drop(barrier);
+        pool.close().await;
+        crate::session::clear();
+
+        assert_eq!(
+            at_start, 0,
+            "the pool must start with no connection open: connect_with would open one and \
+             hand it out as an idle connection, so the barrier would not be a new one"
+        );
+        assert_eq!(
+            open_before, 1,
+            "the barrier must be the only connection open before the query"
+        );
+        assert_eq!(
+            open_after, 2,
+            "the query has to make the pool open connection 2, the path this test is about"
+        );
+        assert_eq!(
+            seen,
+            project.to_string(),
+            "a connection the pool opens during a request must carry the active project from \
+             after_connect: before_acquire only runs on connections taken from the idle queue"
+        );
+    }
+
+    /// T-RLS, scenario 2: the rows. Same barrier as scenario 1, as the application role in
+    /// a private database that is dropped at the end. The first connection is held, so the
+    /// counts run on the second, which the pool opens and after_connect scopes. connect_with
+    /// would open one connection at construction and hand it out as idle, and the first
+    /// query would then be stamped by before_acquire: that is why the pool is lazy. The
+    /// own-row count is an anchor: if it is 0, the scope hides everything and the other
+    /// count proves nothing.
+    #[tokio::test]
+    async fn a_new_connection_as_the_app_role_counts_no_row_of_another_project() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let shared = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL env var required for integration tests");
+        let name = format!(
+            "gate_rls_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+        let private = database_named(&shared, &name);
+
+        let observer = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&shared)
+            .await
+            .expect("connect to the server DATABASE_URL names");
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&observer)
+            .await
+            .expect("create the private database");
+
+        crate::session::clear();
+        let observed: anyhow::Result<(String, i64, i64, u32, u32, u32)> = async {
+            let admin = crate::db::create_admin_pool(&private).await?;
+            let mine = crate::project::upsert_project(&admin, "gate_rls_active").await?;
+            let other = crate::project::upsert_project(&admin, "gate_rls_other").await?;
+            for (entity, project, content) in [
+                ("gate_rls_mine", mine, "row of the active project"),
+                ("gate_rls_other", other, "row of the other project"),
+            ] {
+                sqlx::query(
+                    "WITH entity AS (
+                        INSERT INTO brain_entities (name, entity_type, project_id)
+                        VALUES ($1, 'concept', $2::uuid)
+                        RETURNING id
+                     )
+                     INSERT INTO brain_observations
+                        (entity_id, content, observation_type, source, importance, project_id)
+                     SELECT id, $3::text, 'fact', 'agent', 0.5, $2::uuid FROM entity",
+                )
+                .bind(entity)
+                .bind(project)
+                .bind(content)
+                .execute(&admin)
+                .await?;
+            }
+            admin.close().await;
+
+            crate::session::set(uuid::Uuid::new_v4(), Some(mine));
+            let app_url = crate::setup::runtime_database_url(&private);
+            let app = pool_options()
+                .max_connections(2)
+                .min_connections(0)
+                .connect_lazy_with(connect_options(&app_url)?);
+            let at_start = app.size();
+            let barrier = app.acquire().await?;
+            let open_before = app.size();
+            let (user, own, foreign): (String, i64, i64) = sqlx::query_as(
+                "SELECT current_user::text,
+                        (SELECT COUNT(*) FROM brain_observations WHERE project_id = $1),
+                        (SELECT COUNT(*) FROM brain_observations WHERE project_id = $2)",
+            )
+            .bind(mine)
+            .bind(other)
+            .fetch_one(&app)
+            .await?;
+            let open_after = app.size();
+            drop(barrier);
+            app.close().await;
+            Ok((user, own, foreign, at_start, open_before, open_after))
+        }
+        .await;
+
+        crate::session::clear();
+        let dropped = sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .execute(&observer)
+            .await;
+        let (user, own, foreign, at_start, open_before, open_after) = observed.expect(
+            "the row scenario needs the private database and the application role: without \
+             a pgpass_app password the URL stays the admin's, and the scenario fails here",
+        );
+        dropped.expect("drop the private database");
+        assert_eq!(
+            user, "cuba_app",
+            "the counts have to come from the application role; if this is the admin, the \
+             pgpass_app password is missing and the scenario proves nothing"
+        );
+        assert_eq!(at_start, 0, "the pool must start with no connection open");
+        assert_eq!(
+            open_before, 1,
+            "the barrier must be the only connection open before the count"
+        );
+        assert_eq!(
+            open_after, 2,
+            "the count has to make the pool open connection 2: the path this scenario is about"
+        );
+        assert_eq!(
+            own, 1,
+            "anchor: the connection must see the row of its own active project, or the scope \
+             hides every row and the count of the other project proves nothing"
+        );
+        assert_eq!(
+            foreign, 0,
+            "a connection the pool opens must not see a row of another project: its scope is \
+             the active project, not the empty one"
+        );
+    }
+
     #[tokio::test]
     #[ignore]
     async fn a_database_behind_the_binary_is_refused_instead_of_dying_mid_import() {
