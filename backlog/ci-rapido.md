@@ -799,3 +799,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
 - 2026-11-07 11:10 · **CI-J9 committed and merged:** red `c8c8c0e` (gate_lane_token 11/12), fix `a74683a`
   (local_gate 76/76 incl. J3 with JUDGE_ENVIRONMENT at 27 names, lane token 12/12, gate_dag 22/22, gate_history 33/33,
   doc 26/26, ci 10/10); merged `f4d0e83`. Sixteenth full run (through the planner, serial) started.
+- 2026-11-07 11:13 · **Sixteenth full run (`f4d0e83`): 91.3 s, exit 101** — DBG's unit step, local_gate_contract 74/76:
+  merge-gate's self-test row D2 «a gate stopped by INT left '0' in its exit file, not 2» (also under J3). Green in every
+  per-slice verification; red only inside the real judge. Reading: F3.3b-1b-ii runs the planner as a **background job**
+  of merge-gate; a non-interactive bash starts background jobs with SIGINT and SIGQUIT **ignored**, the ignore is
+  inherited by every step and below, and a shell cannot trap a signal ignored at its entry — so the self-test's inner
+  gate never sees its INT. Slice **CI-J10**: the planner gives its steps the default disposition of INT and QUIT, with a
+  test that a step under an ignoring parent sees them default (/proc SigIgn), and the D2 row run under an ignored INT.
