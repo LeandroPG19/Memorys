@@ -570,3 +570,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   failed — deterministic), fix `652e777` (both green; the whole lib 1196 passed, 18 ignored); fast-forwarded into
   release/0.31.0, merged into the batch `484e4ad`. Sixth full run started on 484e4ad (F1, F4, F4d, F2a lib, F3.1,
   CI-J/J2/J3, T-GUARD, T-TRACE; serial, no lanes yet).
+- 2026-11-07 06:03 · **Sixth full run (`484e4ad`): 960.8 s, exit 1, the furthest yet** — fmt/clippy/cheap block in
+  19 s, unit + smoke 297 s, --ignored 73 s, model sections, release build 150 s, reranker 209 s, E2E 116 s, live session
+  12 s, then red in the **eval harness smoke**: `FAIL: the eval seeding exited 1: FAIL: fixture line 2: no se insertó
+  (dedup o refuerzo de otra fila)`. First full run ever to reach the seeded eval CI-J built (only stand-ins had run it).
+  Peak memory 10.5 GB, CPU 2453 s. A debugger reads it. In series this head should land near 25 min with docs, crap and
+  mutants still to come; the lanes (F2b + F3.3) are what take it under 15.
