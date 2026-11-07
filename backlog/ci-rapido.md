@@ -748,3 +748,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   again on the hole (left "" / right the project), green with the fix; whole lib 1198. Scenario 2 still green on the hole:
   likely PgPoolOptions::connect warms one idle connection that before_acquire then scopes; it gets the same barrier as
   scenario 1 (connect_lazy, one held, the count on the second, size() == 2), or it goes.
+- 2026-11-07 09:19 · **T-RLS closed (security fix in the product):** red `39c883f` — both tests red on the hole: a new
+  pool connection's `app.current_project` is "" instead of the active project, and **as cuba_app it counts 1 row of another
+  project instead of 0** (the leak shown at row level); fix `fbe6632` (after_connect sets rls_scope() and fails closed) —
+  both green, the whole lib 1198 passed. Fast-forwarded into release/0.31.0, merged into the batch `40771e4`. The test
+  that should have caught it used max_connections(1); the pool's `connect_with` warms an idle connection that hid it too.
