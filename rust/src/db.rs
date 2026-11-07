@@ -231,10 +231,10 @@ fn pool_options() -> PgPoolOptions {
                     .execute(&mut *conn)
                     .await
                     .ok();
-                sqlx::query("SELECT set_config('app.current_project', '', false)")
+                sqlx::query("SELECT set_config('app.current_project', $1, false)")
+                    .bind(crate::project::rls_scope())
                     .execute(&mut *conn)
-                    .await
-                    .ok();
+                    .await?;
                 sqlx::query("SELECT set_config('cuba.node_name', $1, false)")
                     .bind(&node)
                     .execute(&mut *conn)
