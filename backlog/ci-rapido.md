@@ -712,3 +712,12 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   the row count at all», 14 rows before, 6 after: another test deleted rows of the shared brain_gate between its two whole-
   table counts. Passed in the eleventh run on the same tree except CI-J7 (test file of the contract only): order-dependent.
   A debugger reads it (no rerun to approve).
+- 2026-11-07 09:00 · F3.3b-1b-i delivered (the lock token; the cut accepted): rust/tests/gate_lane_token_contract.rs
+  (7 tests with real bash owners and descendants: own token inherits once, a foreign token, a dead owner, a non-descendant
+  and a reused token refused with exit 2 without taking the lock, no token = the direct-child inheritance as before), a
+  planner test that a step under the lock gets a one-use ticket; code: gate-lock.sh (token branch, /proc ancestry,
+  ticket renamed .used.<pid>), gate-dag.py writes the ticket and passes CUBA_GATE_LANE_TOKEN, run-all-tests uses
+  inherit_or_acquire, merge-gate exports GATE_LOCK. Lesson: bash execs the last command of `bash -c`, so a test owner
+  ending in `bash -c "$CONSUMER"` becomes its own direct child — ancestry tests end with `:`. Note: every token refusal is
+  exit 2 (D-F3k said 1 for a second presentation; the spec text follows the decision). F3.3b-1b-ii (the 8-row table,
+  --step, the planner in series, flush, TB out) next. Verification queued.
