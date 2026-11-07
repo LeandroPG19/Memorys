@@ -688,3 +688,5 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   socket to 139 bytes, over the 107 of sun_path — gate-cluster's guard right, the path shortened (st-<pid>-<n>, TMPDIR
   base/t, margin computed). (The base run's one red, every_gate_entry_point_is_executable_in_the_index, is an artifact of
   measuring it from a git archive: not a repository.)
+- 2026-11-07 08:24 · **CI-J8 committed and merged** (`8417979`, doc_contract 26/26, ci_contract 10/10;
+  red = the tenth run): merged `1c8eda7`. Eleventh full run (lanes, chains) next, on this head.
