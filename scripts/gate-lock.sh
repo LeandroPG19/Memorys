@@ -242,6 +242,28 @@ lane_token_inherit() {
   fi
 }
 
+# CI-F3.3b-2 (D-F3k, spec F3.3b-1b-ii): the checks of lane_token_inherit without spending the ticket. A row the
+# planner starts (`merge-gate.sh --step`) reads its ticket with this, and leaves it to the lane it starts, which
+# spends it through lane_token_inherit.
+lane_token_check() {
+  local lock="$1" record="$2" pid ticket
+  pid="$(record_field pid "$record")"
+  if [[ "$(cat "$lock/owner" 2>/dev/null || true)" != "$record" ]] || ! owner_alive "$record"; then
+    lane_token_refuse "the gate that holds the lock is not running (pid $pid)"
+    return 1
+  fi
+  if ! descends_from "$$" "$pid"; then
+    lane_token_refuse "this step does not descend from the gate that holds the lock (pid $pid)"
+    return 1
+  fi
+  for ticket in "$lock"/lanes/*; do
+    [[ -f "$ticket" && "$ticket" != *.used.* ]] || continue
+    [[ "$(cat "$ticket")" == "$CUBA_GATE_LANE_TOKEN" ]] && return 0
+  done
+  lane_token_refuse "no unused ticket in $lock/lanes holds this token (it was spent, or never made)"
+  return 1
+}
+
 # Renames the one unused ticket that holds the token to <ticket>.used.<pid>. 0 when this call took it.
 take_lane_ticket() {
   local lock="$1" token="$2" ticket

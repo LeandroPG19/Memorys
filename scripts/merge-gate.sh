@@ -55,6 +55,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
     local t="$tmp/$1" s
     mkdir -p "$t/scripts" "$t/rust" "$t/bin" "$t/home/.cache/cuba-gate"
     cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" "$t/scripts/"
+    # CI-F3.3b-2: the steps run through the planner (gate-dag.py) from the table of gate-dag.txt, which
+    # reads gate_history.py beside it, so the stand-in tree carries all three.
+    cp "$ROOT/scripts/gate-dag.py" "$ROOT/scripts/gate_history.py" "$ROOT/scripts/gate-dag.txt" "$t/scripts/"
     # CI-F2 (F2b-1): the library of the judge's lanes is a stand-in with the same functions and no
     # Postgres. The rows of this self-test prove the wiring of merge-gate.sh (what each step is given,
     # and in what order its lanes are made and taken down); the library's own rows are in
@@ -93,6 +96,11 @@ FAKE
     # make the cheap step red (D-F2a). The loop above keeps crap-gate as it was.
     printf '%s\n' '#!/bin/sh' 'echo codigo-muerto >>"$HOME/steps"' \
       'exit "${FAKE_CODIGO_MUERTO_EXIT:-0}"' >"$t/scripts/codigo-muerto.sh"
+    # CI-F3.3b-2: the planner's red row makes crap-gate the red step: FAKE_CRAP_EXIT is its verdict.
+    printf '%s\n' '#!/bin/sh' 'echo crap-gate >>"$HOME/steps"' \
+      'echo "${DATABASE_URL-unset}" >>"$HOME/crap-gate.urls"' \
+      'echo "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset}" >>"$HOME/crap-gate.lanes"' \
+      'exit "${FAKE_CRAP_EXIT:-0}"' >"$t/scripts/crap-gate.sh"
     # The gate asks mutants-gate.sh --refuse-targets before any step, so that
     # call is not the mutation step and does not go in the order.
     printf '%s\n' '#!/bin/sh' \
@@ -107,7 +115,8 @@ FAKE
     printf '%s\n' '#!/bin/sh' \
       'echo "test-times $*" >>"$HOME/steps"' \
       'echo "${DATABASE_URL-unset}" >>"$HOME/test-times.url"' \
-      'prev=""; for a in "$@"; do [ "$prev" = --judge ] && cp "$a" "$HOME/times.seen"; prev="$a"; done' \
+      'log=""; untl=""; prev=""; for a in "$@"; do [ "$prev" = --judge ] && log="$a"; [ "$prev" = --until ] && untl="$a"; prev="$a"; done' \
+      'awk -v u="$untl" '"'"'{ print } $0 == u { exit }'"'"' "$log" >"$HOME/times.seen"' \
       'exit "${FAKE_TIMES_EXIT:-0}"' >"$t/scripts/test-times.sh"
     # advisory-exceptions.sh (G6): what it was called with goes in the order, the
     # report it was told to judge is copied as the gate had made it, and
@@ -311,7 +320,9 @@ FAKE
 
   # Killed in the middle, the way the kernel or Windows kills under memory
   # pressure: no trap runs, and the file must not read as a verdict.
-  fake_tree killed 'kill -9 "$PPID"; exit 0'
+  # CI-F3.3b-2: the steps run one level deeper (the planner starts each row), so the signal names the gate itself,
+  # the pid of its lock record, and not the step's parent.
+  fake_tree killed 'kill -9 "$(printf "%s\n" "$CUBA_GATE_LOCK_OWNER" | sed -n "s/^pid=\([0-9]*\) .*/\1/p")"; exit 0'
   run_copy killed
   (( rc != 0 )) || self_fail "a gate killed in the middle exited 0"
   [[ "$(exit_file killed)" == "running pid="* ]] \
@@ -329,7 +340,9 @@ FAKE
   # nohup (the gate itself, the way a long run is launched) has it ignored on entry, bash
   # cannot reset a signal ignored on entry, and a row that passes or fails by how its
   # runner was started is not a row: the first version of this one failed the real gate.
-  git_tree stopped_term 'kill -TERM "$PPID"; exit 0'
+  # One signal, not one per lane: the signal waits for the gate's verdict in its exit trap, and a second one
+  # would kill it there (CI-F3.3b-2: the planner runs more than one call of run-all-tests).
+  git_tree stopped_term '[ -e "$HOME/signalled" ] || { touch "$HOME/signalled"; kill -TERM "$(printf "%s\n" "$CUBA_GATE_LOCK_OWNER" | sed -n "s/^pid=\([0-9]*\) .*/\1/p")"; }; exit 0'
   run_copy stopped_term
   (( rc != 0 )) || self_fail "G9: a gate stopped by SIGTERM exited 0: $(cat "$tmp/stopped_term.out")"
   [[ "$(exit_file stopped_term)" == 2 ]] \
@@ -760,7 +773,10 @@ FAKE
       || self_fail "$name: something was printed between the banner and the OK line: '${lines[at-2]}' / '${lines[at-1]}'"
     [[ "${lines[at+1]:-}" == "OK  judge server :$port (cluster_name=memory-industry-gate, system_identifier=7701731310526959658)" ]] \
       || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the OK of the judge server on :$port"
-    [[ "${lines[at+2]:-}" == "=== cargo audit ===" ]] \
+    # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
+    planner_gap=0
+    [[ "${lines[at+2]:-}" =~ ^dag:\ P\ env: ]] && planner_gap=1
+    [[ "${lines[at+2+planner_gap]:-}" == "=== cargo audit ===" ]] \
       || self_fail "$name: the line after the judge's OK is '${lines[at+2]:-}', not the banner of cargo audit, the first step after the readiness check"
     if grep -qxF "$answer" "$tmp/$name.out"; then
       self_fail "$name: pg_isready's own answer is a line of the output: $(cat "$tmp/$name.out")"
@@ -798,8 +814,11 @@ FAKE
     want="OK  judge server :$port (cluster_name=$cluster, system_identifier=7701731310526959658)"
     at="$(grep -nxF -- "$want" "$tmp/$name.out" | head -1 | cut -d: -f1)"
     [[ -n "$at" ]] || self_fail "$name: no line '$want': $(cat "$tmp/$name.out")"
-    [[ "$(sed -n "$((at+1))p" "$tmp/$name.out")" == "=== cargo audit ===" ]] \
-      || self_fail "$name: the line after the judge's OK is not the banner of cargo audit: $(cat "$tmp/$name.out")"
+    # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
+    next="$(sed -n "$((at+1))p" "$tmp/$name.out")"
+    [[ "$next" =~ ^dag:\ P\ env: ]] && next="$(sed -n "$((at+2))p" "$tmp/$name.out")"
+    [[ "$next" == "=== cargo audit ===" ]] \
+      || self_fail "$name: the line after the judge's OK (and the planner's line for P) is not the banner of cargo audit: $(cat "$tmp/$name.out")"
     grep -qxF 'PGOPTIONS=-c default_transaction_read_only=on' "$tmp/$name/home/psql.env" 2>/dev/null \
       || self_fail "$name: the identity query did not run read-only: $(cat "$tmp/$name/home/psql.env" 2>/dev/null || true)"
     # A F2b: the password goes to libpq in PGPASSWORD, for that one call, and never in the argv of psql
@@ -960,9 +979,11 @@ down mut'
   grep -qx 'up docs' "$tmp/d1/home/steps" && self_fail "D1: the docs lane was made after the failed run-all-tests: $(cat "$tmp/d1/home/steps")"
   # D2: a gate stopped by TERM, HUP or INT, during its first lane, takes that lane down (down-all) and
   # leaves 2 in its exit file.
+  # CI-F3.3b-2: the signal names the gate by its lock record (the steps run one level deeper, under the planner).
+  d2_body='echo "run-all-tests${*:+ $*}" >>"$HOME/steps"; if [ "${1:-}" != --check-models ] && [ ! -e "$HOME/signalled" ]; then touch "$HOME/signalled"; kill -"$D2_SIG" "$(printf "%s\n" "$CUBA_GATE_LOCK_OWNER" | sed -n "s/^pid=\([0-9]*\) .*/\1/p")"; fi; sleep 2; exit 0'
   for sig in TERM HUP INT; do
-    fake_tree "d2_$sig" "echo \"run-all-tests\${*:+ \$*}\" >>\"\$HOME/steps\"; [ \"\${1:-}\" = --check-models ] || kill -$sig \"\$PPID\"; sleep 2; exit 0"
-    run_copy_as unset "d2_$sig" ""
+    fake_tree "d2_$sig" "$d2_body"
+    run_copy_as unset "d2_$sig" "" "D2_SIG=$sig"
     [[ "$(exit_file "d2_$sig")" == 2 ]] \
       || self_fail "D2: a gate stopped by $sig left '$(exit_file "d2_$sig")' in its exit file, not 2: $(cat "$tmp/d2_$sig.out")"
     grep -qx 'down-all' "$tmp/d2_$sig/home/steps" \
@@ -1158,7 +1179,10 @@ down mut'
     (( at >= 0 )) || self_fail "$name: no 'OK  Postgres' line: $(cat "$tmp/$name.out")"
     [[ "${lines[at]}" == "OK  Postgres :$port (container $container)" ]] \
       || self_fail "$name: the line said '${lines[at]}', not the port and the container that answered"
-    [[ "${lines[at+1]:-}" == "=== cargo audit ===" ]] \
+    # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
+    planner_gap=0
+    [[ "${lines[at+1]:-}" =~ ^dag:\ P\ env: ]] && planner_gap=1
+    [[ "${lines[at+1+planner_gap]:-}" == "=== cargo audit ===" ]] \
       || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the banner of cargo audit"
     if [[ -n "$password" ]] && grep -qF "$password" "$tmp/$name.out"; then
       self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
@@ -1459,6 +1483,109 @@ exit 0'
   [[ -n "$docs_at" && -n "$bound_at" ]] && (( bound_at > docs_at )) \
     || self_fail "F2.3: the boundary '$until_arg' is not a line of the log after the --features docs step (docs at '${docs_at:-none}', boundary at '${bound_at:-none}')"
 
+  # CI-F3.3b-2 (D-F3b, spec F3.3b-1b): the steps of the judge are the rows of scripts/gate-dag.txt, run by the
+  # planner (gate-dag.py) after the preamble and before the boundary line. Each row is `merge-gate.sh --step <id>`,
+  # which the planner starts with its lane ticket (D-F3k).
+  fake_tree planner "$run_all_steps"
+  run_copy planner ""
+  (( rc == 0 )) || self_fail "planner: a gate whose every step passed exited $rc: $(cat "$tmp/planner.out")"
+  dag_order="$(sed -n 's/^dag: \([A-Za-z0-9]*\) env:.*/\1/p' "$tmp/planner.out" | tr '\n' ' ')"
+  [[ "$dag_order" == "P DBG B3 REL E2E DC CV M " ]] \
+    || self_fail "planner: the planner did not start the rows of gate-dag.txt in idx order (it started: '$dag_order')"
+  # The boundary line is printed by the planner before the first untimed row (CV), after the block of docs and before
+  # the block of crap-gate: the judge of the test times reads up to it, so CV and M are not judged (CI-F3.3b-2).
+  dc_at="$(grep -nxF '=== cargo clippy/test --features docs ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
+  bound_at="$(grep -nxF '=== end of timed steps ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
+  crap_at="$(grep -nxF '=== crap-gate (coverage floor) ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
+  mut_at="$(grep -nxF '=== mutants-gate ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
+  sum_at="$(grep -n '^dag: T=' "$tmp/planner.out" | head -1 | cut -d: -f1)"
+  times_at="$(grep -nxF '=== test times (scripts/test-time-ceilings.txt) ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
+  [[ -n "$dc_at" && -n "$bound_at" && -n "$crap_at" && -n "$mut_at" && -n "$sum_at" && -n "$times_at" ]] \
+    && (( dc_at < bound_at && bound_at < crap_at && crap_at < mut_at && mut_at < sum_at && sum_at < times_at )) \
+    || self_fail "planner: the boundary is not printed between the docs block and the untimed rows (docs at ${dc_at:-none}, boundary at ${bound_at:-none}, crap-gate at ${crap_at:-none}, mutants-gate at ${mut_at:-none}, summary at ${sum_at:-none}, test times at ${times_at:-none})"
+  # A red step stops the planner at its idx (D-F3d): the steps after it do not start, the gate exits with the step's
+  # own code, and neither the mutation step nor the test times run.
+  fake_tree planner_red "$run_all_steps"
+  run_copy_as "$judge_test_url" planner_red "" FAKE_CRAP_EXIT=1
+  (( rc == 1 )) || self_fail "planner red: crap-gate exited 1 and the gate exited $rc, not 1: $(cat "$tmp/planner_red.out")"
+  grep -qxF 'mutants-gate' "$tmp/planner_red/home/steps" \
+    && self_fail "planner red: mutants-gate started after crap-gate went red: $(steps_of planner_red)"
+  grep -q '^test-times ' "$tmp/planner_red/home/steps" \
+    && self_fail "planner red: the test times ran after a red step: $(steps_of planner_red)"
+  grep -qF 'FAIL: CV exited 1' "$tmp/planner_red.out" \
+    || self_fail "planner red: the planner does not name the red row CV: $(cat "$tmp/planner_red.out")"
+  [[ "$(exit_file planner_red)" == 1 ]] \
+    || self_fail "planner red: the exit file says '$(exit_file planner_red)', not 1"
+  # CI-F3.3b-2 (spec F3.3b-1b-iii): the rows that are not timed are CV and M, the rows after the docs step. The judge of
+  # the test times reads this gate's log only up to the boundary line the planner prints before the first of them, so a
+  # crap-gate whose output carries a timed `finished in` line does not change the judgement, and the boundary is not the
+  # end of the planner (that would judge CV and M too).
+  fake_tree untimed "$run_all_steps"
+  printf '%s\n' '#!/bin/sh' 'echo crap-gate >>"$HOME/steps"' \
+    'echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 99.00s"' \
+    'exit 0' >"$tmp/untimed/scripts/crap-gate.sh"
+  run_copy untimed ""
+  (( rc == 0 )) || self_fail "untimed: a gate whose every step passed exited $rc: $(cat "$tmp/untimed.out")"
+  judged="$tmp/untimed/home/times.seen"
+  until_arg="$(sed -n 's/^test-times .*--until //p' "$tmp/untimed/home/steps" | tail -1)"
+  [[ "$until_arg" == '=== end of timed steps ===' ]] \
+    || self_fail "untimed: the judge of the test times was told to stop at '$until_arg', not at the boundary line of the planner"
+  grep -qxF '=== cargo clippy/test --features docs ===' "$judged" \
+    || self_fail "untimed: the judge does not hold the docs block, the last timed row: $(cat "$judged" 2>/dev/null)"
+  grep -qF 'finished in 99.00s' "$judged" \
+    && self_fail "untimed: the output of an untimed row (crap-gate, a finished-in line) reached the judge of the test times"
+  # The step mode is not a gate: it takes no lock and writes no verdict, and it runs only with the ticket the planner
+  # hands it (D-F3k). Without one it exits 2 before any step, and says what it needs.
+  fake_tree step_alone "$run_all_steps"
+  step_rc=0
+  env -i PATH="$tmp/step_alone/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_alone/home" \
+    "$BASH" "$tmp/step_alone/scripts/merge-gate.sh" --step DBG >"$tmp/step_alone.out" 2>&1 || step_rc=$?
+  (( step_rc == 2 )) || self_fail "--step without a ticket exited $step_rc, not 2: $(cat "$tmp/step_alone.out")"
+  grep -qF -- '--step' "$tmp/step_alone.out" \
+    || self_fail "--step without a ticket does not say what it needs: $(cat "$tmp/step_alone.out")"
+  [[ -z "$(steps_of step_alone)" ]] || self_fail "--step without a ticket ran a step: $(steps_of step_alone)"
+  # The tree starts its exit file at 0 (fake_tree): a step that wrote the verdict would change it.
+  [[ ! -e "$tmp/step_alone/home/.cache/cuba-gate/lock" && "$(exit_file step_alone)" == 0 ]] \
+    || self_fail "--step without a ticket took the gate lock or wrote the exit file: '$(exit_file step_alone)'"
+  # The planner's ticket, its owner alive and an ancestor of the step (this shell): the step checks the ticket, starts
+  # its lane with the token in the environment of the lane's run-all-tests, and leaves the lock and the ticket as they
+  # were, because the lane is the one that spends the ticket (gate-lock.sh, lane_token_check).
+  step_run_all='echo "run-all-tests${*:+ $*} token=${CUBA_GATE_LANE_TOKEN-unset}" >>"$HOME/steps"'
+  fake_tree step_ok "$step_run_all"
+  step_lock="$tmp/step_ok/home/.cache/cuba-gate/lock"
+  mkdir -p "$step_lock/lanes"
+  owner_record "$$" fixture-owner >"$step_lock/owner"
+  printf '%s' tok-planted >"$step_lock/lanes/20-DBG"
+  step_owner_before="$(cat "$step_lock/owner")"
+  step_rc=0
+  env -i PATH="$tmp/step_ok/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_ok/home" GATE_LOCK="$step_lock" \
+    CUBA_GATE_LOCK_OWNER="$step_owner_before" CUBA_GATE_LANE_TOKEN=tok-planted \
+    "$BASH" "$tmp/step_ok/scripts/merge-gate.sh" --step DBG >"$tmp/step_ok.out" 2>&1 || step_rc=$?
+  (( step_rc == 0 )) || self_fail "--step with its ticket exited $step_rc, not 0: $(cat "$tmp/step_ok.out")"
+  [[ "$(grep -E '^(up |down |run-all-tests)' "$tmp/step_ok/home/steps")" == "$(printf '%s\n' 'up dbg' 'run-all-tests --lane CL --lane D1 --lane D2 --lane NLI --lane D3 token=tok-planted' 'down dbg')" ]] \
+    || self_fail "--step with its ticket did not run the lane of DBG with the token in its environment: $(steps_of step_ok)"
+  [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-planted ]] \
+    || self_fail "--step spent the ticket its lane has to spend"
+  [[ "$(cat "$step_lock/owner")" == "$step_owner_before" ]] \
+    || self_fail "--step changed the owner record of the gate lock"
+  [[ "$(exit_file step_ok)" == 0 ]] \
+    || self_fail "--step wrote the exit file of the gate that owns the lock: '$(exit_file step_ok)'"
+  # A ticket that is not the planner's (here, another token) is refused by name, before any lane starts.
+  fake_tree step_foreign "$step_run_all"
+  step_lock="$tmp/step_foreign/home/.cache/cuba-gate/lock"
+  mkdir -p "$step_lock/lanes"
+  owner_record "$$" fixture-owner >"$step_lock/owner"
+  printf '%s' tok-planted >"$step_lock/lanes/20-DBG"
+  step_rc=0
+  env -i PATH="$tmp/step_foreign/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_foreign/home" GATE_LOCK="$step_lock" \
+    CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-other \
+    "$BASH" "$tmp/step_foreign/scripts/merge-gate.sh" --step DBG >"$tmp/step_foreign.out" 2>&1 || step_rc=$?
+  (( step_rc == 2 )) || self_fail "--step with a foreign ticket exited $step_rc, not 2: $(cat "$tmp/step_foreign.out")"
+  grep -qF 'lane token refused' "$tmp/step_foreign.out" \
+    || self_fail "--step with a foreign ticket does not say it was refused: $(cat "$tmp/step_foreign.out")"
+  [[ -z "$(steps_of step_foreign)" ]] || self_fail "--step with a foreign ticket ran a step: $(steps_of step_foreign)"
+  [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-planted ]] || self_fail "--step with a foreign ticket spent the planner's ticket"
+
   echo "OK  self-test: the exit file says running while a gate runs and holds the whole"
   echo "    gate's verdict at the end, a step after the tests included; a gate killed"
   echo "    in the middle leaves 'running', never an old 0; a refused gate leaves it alone."
@@ -1544,9 +1671,14 @@ write_receipt() {
 # process itself is the signal's (143, 129): bash raises it again after this trap, so
 # the verdict is the file, and the process just has not passed.
 GATE_REACHED_END=""
+GATE_PLANNER=""
 on_exit() {
   local code=$? tenths=0 stopped=0
   gate_cluster_down_all
+  if [[ -n "$GATE_PLANNER" ]]; then
+    kill -TERM "$GATE_PLANNER" 2>/dev/null || true
+    wait "$GATE_PLANNER" 2>/dev/null || true
+  fi
   if (( code == 0 )) && [[ -z "$GATE_REACHED_END" ]]; then
     code=2
     stopped=1
@@ -1567,6 +1699,7 @@ on_exit() {
   release_gate_lock
 }
 
+gate_main() {
 acquire_gate_lock "$GATE_LOCK" || exit 1
 exit_file_running
 trap on_exit EXIT
@@ -1784,6 +1917,41 @@ fi
 export GATE_SERVER_SYSTEM_ID="$GATE_JUDGE_SYSID"
 fi
 
+# CI-F3.3b-2 (D-F3b, spec F3.3b-1b): the rows of scripts/gate-dag.txt run here, one `merge-gate.sh --step <id>` each,
+# in the planner's order: GATE_DAG=0 is the series in idx order, GATE_DAG=1 the DAG. Its verdict is this gate's: a red row
+# stops the gate with its own code, and the rows after it do not start.
+# The line where the timed steps end (D-F2c, spec F3.3b-1b-iii): test-times.sh judges the log up to it. The planner
+# prints it before the first untimed row (CV, class untimed in gate-dag.txt), so the output of CV and M is not judged.
+TIMED_STEPS_END='=== end of timed steps ==='
+# In the background and waited for: a signal to this gate interrupts the wait and its exit trap stops the planner, which
+# stops its steps, so a stopped gate does not go on with the rows after the one it was in (found on 2026-11-07 with INT).
+python3 -I "$ROOT/scripts/gate-dag.py" run --table "$ROOT/scripts/gate-dag.txt" --timed-end "$TIMED_STEPS_END" &
+GATE_PLANNER=$!
+planner_rc=0
+wait "$GATE_PLANNER" || planner_rc=$?
+GATE_PLANNER=""
+(( planner_rc == 0 )) || exit "$planner_rc"
+
+echo "=== test times (scripts/test-time-ceilings.txt) ==="
+# Last, so a time red (drift, not broken behaviour) still leaves the verdicts of
+# codigo-muerto, crap-gate and mutants-gate in the same run. The log it reads is
+# this gate's own, written through tee: wait (30 s at most) for the boundary line
+# to reach the file, or a fast run reads it cut and the judge refuses it with 2.
+# grep -c reads to the end: with grep -q the early exit hands tr a SIGPIPE, and
+# under pipefail a log of a few MB would read as "not there yet" for the 30 s.
+for _ in $(seq 300); do
+  (( $(tr -d '\r' <"$GATE_LOG" 2>/dev/null | grep -cxF "$TIMED_STEPS_END") )) && break
+  sleep 0.1
+done
+"$ROOT/scripts/test-times.sh" --judge "$GATE_LOG" --until "$TIMED_STEPS_END"
+
+GATE_REACHED_END=1
+echo ""
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║  MERGE GATE PASSED — safe to merge (local CI 100%)       ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+}
+
 # One lane per step (D-F2c): the step's server is made here, and its URL, GATE_LANE and
 # GATE_SERVER_SYSTEM_ID are in the environment of that step only. The lane is taken down after its step,
 # whatever the step said. With a DATABASE_URL of the operator there are no lanes: the step runs as it did.
@@ -1806,6 +1974,13 @@ run_in_lane() {
   return "$rc"
 }
 
+# --- the rows of the judge (CI-F3.3b-2) ---------------------------------------------------------
+# The planner starts each row as `merge-gate.sh --step <id>`, a process of its own that reads this file from the top.
+# The flow above is gate_main, which only the else branch of the dispatch at the end calls, so the rows are defined
+# here, after it, and before the dispatch. Each row is one process and one cluster (D-F3b): DBG (CL..D3) shares one
+# throwaway database; B3 builds the release binary; REL and E2E find that binary on disk again (lane_R and lane_E in
+# run-all-tests.sh), so no variable crosses processes.
+step_P() {
 # The advisories are judged before the 20-minute test run: a judge idle for days
 # found its new advisory half an hour in, when 3 s would have said it. cargo audit
 # is the only judge of them (cargo deny below reads licenses, bans and sources,
@@ -1874,52 +2049,69 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 
 # The copy of the real corpus is not a judge step (P1 a): respaldo-memoria.timer,
 # outside this repo, makes it. The judge never touches the live server.
+}
 
-# CI-F3.3b-1 (D-F3b): the --lane steps of scripts/gate-dag.txt, as chains, in idx order. A chain is one
-# process and one cluster: dbg (CL..D3) shares one throwaway database; b3 builds the release binary; rel and
-# e2e find that binary on disk again (lane_R and lane_E in run-all-tests.sh), so no variable crosses processes.
-run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane NLI --lane D3
-run_in_lane b3 "$ROOT/scripts/run-all-tests.sh" --lane B3
-run_in_lane rel "$ROOT/scripts/run-all-tests.sh" --lane R
-run_in_lane e2e "$ROOT/scripts/run-all-tests.sh" --lane E
+step_DBG() {
+  run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane NLI --lane D3
+}
+step_B3() {
+  run_in_lane b3 "$ROOT/scripts/run-all-tests.sh" --lane B3
+}
+step_REL() {
+  run_in_lane rel "$ROOT/scripts/run-all-tests.sh" --lane R
+}
+step_E2E() {
+  run_in_lane e2e "$ROOT/scripts/run-all-tests.sh" --lane E
+}
+step_DC() {
+  # The identity is asked again before the --features docs step, which reads the database after run-all-tests.sh:
+  # a server that changed under the run is refused here (D-J1c, A2). A lane is judged when it is made, so only the
+  # server of the operator is asked again.
+  [[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
+  # The models of the --features docs step are the ones of the full run (CI-J5): the same function sets them.
+  gate_model_env
+  echo "=== cargo clippy/test --features docs ==="
+  run_in_lane docs "$BASH" -c 'cd "$1" && cargo clippy --all-targets --features docs -- -D warnings && cargo test --features docs' gate "$ROOT/rust"
+}
+step_CV() {
+  echo "=== crap-gate (coverage floor) ==="
+  run_in_lane cov "$ROOT/scripts/crap-gate.sh"
+}
+step_M() {
+  echo "=== mutants-gate ==="
+  run_in_lane mut "$ROOT/scripts/mutants-gate.sh"
+}
 
-# The identity is asked again before the --features docs step, which reads the database
-# after run-all-tests.sh: a server that changed under the run is refused here (D-J1c, A2).
-# A lane is judged when it is made, so only the server of the operator is asked again.
-[[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
-# The models of the --features docs step are the ones of the full run (CI-J5): the same function sets them.
-gate_model_env
-echo "=== cargo clippy/test --features docs ==="
-run_in_lane docs "$BASH" -c 'cd "$1" && cargo clippy --all-targets --features docs -- -D warnings && cargo test --features docs' gate "$ROOT/rust"
+# CI-F3.3b-2 (D-F3b, D-F3k): `merge-gate.sh --step <id>` runs one row. The planner starts it with its lane ticket. A row
+# takes no lock and writes no verdict: its ticket is checked here, and the lane it starts is the one that spends it.
+gate_step_main() {
+  local id="$1"
+  [[ -n "${CUBA_GATE_LANE_TOKEN:-}" && -n "${CUBA_GATE_LOCK_OWNER:-}" && -n "${GATE_LOCK:-}" ]] \
+    || gate_refuse "--step runs one row of scripts/gate-dag.txt, which the planner (gate-dag.py) starts with its lane ticket. Run scripts/merge-gate.sh for the whole gate."
+  lane_token_check "$GATE_LOCK" "$CUBA_GATE_LOCK_OWNER" || exit 2
+  GATE_LANES=""
+  if [[ -z "${DATABASE_URL:-}" && "$(uname -s)" == Linux ]]; then
+    GATE_LANES=1
+  fi
+  trap 'gate_cluster_down_all' EXIT
+  trap 'exit 2' INT
+  case "$id" in
+    P) step_P ;;
+    DBG) step_DBG ;;
+    B3) step_B3 ;;
+    REL) step_REL ;;
+    E2E) step_E2E ;;
+    DC) step_DC ;;
+    CV) step_CV ;;
+    M) step_M ;;
+    *) gate_refuse "--step: $id is no row of scripts/gate-dag.txt" ;;
+  esac
+}
 
-# The line where the timed steps end (D-F2c): test-times.sh sums the `finished in` of the
-# test calls above it (run-all-tests.sh and --features docs) and nothing after. It is printed
-# here, after the --features docs step, and not at the npm step, which runs before the first
-# compile now. One source for the step that prints it and for the judge that stops at it.
-TIMED_STEPS_END='=== end of timed steps ==='
-echo "$TIMED_STEPS_END"
-
-echo "=== crap-gate (coverage floor) ==="
-run_in_lane cov "$ROOT/scripts/crap-gate.sh"
-
-echo "=== mutants-gate ==="
-run_in_lane mut "$ROOT/scripts/mutants-gate.sh"
-
-echo "=== test times (scripts/test-time-ceilings.txt) ==="
-# Last, so a time red (drift, not broken behaviour) still leaves the verdicts of
-# codigo-muerto, crap-gate and mutants-gate in the same run. The log it reads is
-# this gate's own, written through tee: wait (30 s at most) for the boundary line
-# to reach the file, or a fast run reads it cut and the judge refuses it with 2.
-# grep -c reads to the end: with grep -q the early exit hands tr a SIGPIPE, and
-# under pipefail a log of a few MB would read as "not there yet" for the 30 s.
-for _ in $(seq 300); do
-  (( $(tr -d '\r' <"$GATE_LOG" 2>/dev/null | grep -cxF "$TIMED_STEPS_END") )) && break
-  sleep 0.1
-done
-"$ROOT/scripts/test-times.sh" --judge "$GATE_LOG" --until "$TIMED_STEPS_END"
-
-GATE_REACHED_END=1
-echo ""
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  MERGE GATE PASSED — safe to merge (local CI 100%)       ║"
-echo "╚══════════════════════════════════════════════════════════╝"
+# The dispatch: one row of the table, or the whole gate. Bash reads this file from the top, and the rows and gate_main
+# are defined before this line, so the call always finds them.
+if [[ "${1:-}" == --step ]]; then
+  gate_step_main "${2:-}"
+else
+  gate_main
+fi

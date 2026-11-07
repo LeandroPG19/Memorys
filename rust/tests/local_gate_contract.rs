@@ -4450,10 +4450,33 @@ fn dag_rows() -> Vec<(u32, String, Vec<String>, String)> {
         .collect()
 }
 
-/// The id a row runs with `--lane`, or None for a row that runs something else.
-fn lane_of(line: &str) -> Option<String> {
-    let rest = line.split("--lane ").nth(1)?;
-    rest.split_whitespace().next().map(String::from)
+/// The body of `step_<id>()` in merge-gate.sh: the lines between its header and the `}` that closes it.
+/// CI-F3.3b-2: a row of the table is a step of merge-gate.sh, and the --lane ids it runs are in its body.
+fn step_body(gate: &str, id: &str) -> Option<Vec<String>> {
+    let header = format!("step_{id}() {{");
+    let mut lines = gate.lines();
+    lines.find(|line| line.trim_end() == header)?;
+    let mut body = Vec::new();
+    for line in lines {
+        if line == "}" {
+            return Some(body);
+        }
+        body.push(line.to_string());
+    }
+    None
+}
+
+/// The --lane ids a step body runs, in the order its text gives them.
+fn lanes_in(body: &[String]) -> Vec<String> {
+    body.iter()
+        .flat_map(|line| {
+            line.split("--lane ")
+                .skip(1)
+                .filter_map(|rest| rest.split_whitespace().next())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Whether `from` reaches `to` through its deps. The depth bound keeps a cycle from looping forever.
@@ -4476,27 +4499,35 @@ fn depends_on(
 }
 
 #[test]
-fn every_lane_of_the_step_table_is_a_function_of_run_all_tests() {
+fn every_row_of_the_step_table_is_a_step_of_merge_gate_whose_lanes_are_run_all_tests_functions() {
+    let gate = read("scripts/merge-gate.sh");
     let suite = read("scripts/run-all-tests.sh");
-    let mut lanes = 0;
-    for (idx, id, _, line) in &dag_rows() {
-        let Some(lane) = lane_of(line) else {
-            continue;
-        };
-        lanes += 1;
-        assert_eq!(
-            &lane, id,
-            "row {idx}: the --lane of a step is the step's own id"
-        );
-        assert!(
-            suite.contains(&format!("lane_{id}() {{")),
-            "row {idx}: run-all-tests.sh has no function lane_{id}() for --lane {id}"
-        );
-    }
+    let rows = dag_rows();
     assert!(
-        lanes > 0,
-        "gate-dag.txt names no --lane: the table does not drive run-all-tests.sh"
+        !rows.is_empty(),
+        "gate-dag.txt has no rows: the planner has nothing to run"
     );
+    for (idx, id, _, line) in &rows {
+        let order = line
+            .split_whitespace()
+            .skip(8)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            order,
+            format!("bash scripts/merge-gate.sh --step {id}"),
+            "row {idx}: the order of a row is its step of merge-gate.sh (CI-F3.3b-2)"
+        );
+        let body = step_body(&gate, id).unwrap_or_else(|| {
+            panic!("row {idx}: merge-gate.sh has no step_{id}() function for the row")
+        });
+        for lane in lanes_in(&body) {
+            assert!(
+                suite.contains(&format!("lane_{lane}() {{")),
+                "step_{id}: run-all-tests.sh has no function lane_{lane}() for --lane {lane}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -4514,9 +4545,18 @@ fn run_all_tests_without_arguments_runs_its_lanes_in_idx_order() {
         .split_whitespace()
         .map(String::from)
         .collect();
+    let gate = read("scripts/merge-gate.sh");
     let mut rows = dag_rows();
     rows.sort_by_key(|row| row.0);
-    let expected: Vec<String> = rows.iter().filter_map(|row| lane_of(&row.3)).collect();
+    let expected: Vec<String> = rows
+        .iter()
+        .flat_map(|row| {
+            lanes_in(
+                &step_body(&gate, &row.1)
+                    .unwrap_or_else(|| panic!("merge-gate.sh has no step_{}() function", row.1)),
+            )
+        })
+        .collect();
     assert_eq!(
         order, expected,
         "DAG_LANES must list the --lane steps of the table in idx order"
@@ -4550,7 +4590,7 @@ fn the_step_graph_has_no_cycle_and_every_consumer_has_its_producer_above_it() {
             rows.len()
         );
     }
-    for consumer in ["R", "E"] {
+    for consumer in ["REL", "E2E"] {
         assert!(
             depends_on(&rows, consumer, "B3", 0),
             "{consumer} reads T_rel and does not depend on B3 (C2)"
@@ -4558,35 +4598,165 @@ fn the_step_graph_has_no_cycle_and_every_consumer_has_its_producer_above_it() {
     }
 }
 
-// CI-F3.3b-1 (D-F3b, spec §4 F3.3b): merge-gate.sh launches the --lane steps of the table as chains, one
-// process and one cluster per chain. Together the chains name every --lane row exactly once, in idx order,
-// so a row that is added to the table and not to a chain (or the reverse) is a red here.
+// CI-F3.3b-2 (D-F3b, spec F3.3b-1b): merge-gate.sh hands the table to the planner (gate-dag.py) once, after its
+// preamble (the lock, the server check and the sweep) and before the boundary line that test-times reads up to.
 #[test]
-fn merge_gate_launches_every_lane_of_the_table_once_and_in_idx_order() {
+fn merge_gate_runs_the_table_through_the_planner_once_after_its_preamble() {
     let gate = read("scripts/merge-gate.sh");
-    let mut launched: Vec<String> = Vec::new();
-    for line in gate.lines() {
-        let line = line.trim_start();
-        if !line.starts_with("run_in_lane ") || !line.contains("run-all-tests.sh\" --lane ") {
-            continue;
-        }
-        launched.extend(
-            line.split("--lane ")
-                .skip(1)
-                .filter_map(|rest| rest.split_whitespace().next())
-                .map(String::from),
+    let code: String = outside_self_test(&gate)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let planner_call = "python3 -I \"$ROOT/scripts/gate-dag.py\" run --table \"$ROOT/scripts/gate-dag.txt\" --timed-end \"$TIMED_STEPS_END\"";
+    let calls = code
+        .lines()
+        .filter(|line| line.contains(planner_call))
+        .count();
+    assert_eq!(
+        calls, 1,
+        "merge-gate.sh must run the planner over gate-dag.txt exactly once, with the boundary line it prints, found {calls}"
+    );
+    let sweep = first_code_line(&code, "gate_cluster_sweep")
+        .expect("merge-gate.sh has no lane sweep outside its self-test");
+    let planner = first_code_line(&code, planner_call).expect("planner call");
+    // The planner prints the boundary before the first untimed row. merge-gate must not print it after the planner:
+    // that would put the output of CV and M before the judge's boundary (CI-F3.3b-2).
+    assert!(
+        code.lines()
+            .all(|line| line.trim() != "echo \"$TIMED_STEPS_END\""),
+        "merge-gate.sh prints the boundary line itself, after the planner: the judge would read the untimed rows"
+    );
+    let judge = first_code_line(
+        &code,
+        "test-times.sh\" --judge \"$GATE_LOG\" --until \"$TIMED_STEPS_END\"",
+    )
+    .expect("merge-gate.sh does not judge the test times up to the boundary line");
+    assert!(
+        sweep < planner && planner < judge,
+        "merge-gate.sh must run sweep ({sweep}), planner ({planner}) and the test times ({judge}) in that order"
+    );
+}
+
+// CI-F3.3b-2 (spec F3.3b-1b-iii): the judge of the test times reads this gate's log up to the boundary line, and that
+// line sits before the first untimed row of gate-dag.txt. The untimed rows are CV and M and only them, they come after
+// every timed row in idx order, and the planner is the one that receives and prints the boundary.
+#[test]
+fn the_judge_of_the_test_times_stops_before_the_untimed_rows_and_only_they_are_untimed() {
+    let mut rows = dag_rows();
+    rows.sort_by_key(|row| row.0);
+    let class_of = |line: &str| {
+        line.split_whitespace()
+            .nth(4)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let untimed: Vec<String> = rows
+        .iter()
+        .filter(|row| class_of(row.3.as_str()) == "untimed")
+        .map(|row| row.1.clone())
+        .collect();
+    assert_eq!(
+        untimed,
+        vec!["CV".to_string(), "M".to_string()],
+        "the untimed rows of gate-dag.txt are CV and M: their output is past the judge's boundary"
+    );
+    let first_untimed = rows
+        .iter()
+        .position(|row| class_of(row.3.as_str()) == "untimed")
+        .expect("gate-dag.txt has an untimed row");
+    assert!(
+        rows[..first_untimed]
+            .iter()
+            .all(|row| class_of(row.3.as_str()) == "normal"),
+        "a timed row comes after the first untimed row in idx order: the boundary would cut it"
+    );
+    let planner = read("scripts/gate-dag.py");
+    assert!(
+        planner.contains("\"--timed-end\""),
+        "scripts/gate-dag.py has no --timed-end option: the boundary would not come from the planner"
+    );
+    assert!(
+        planner.contains("\"untimed\""),
+        "scripts/gate-dag.py does not know the class untimed of gate-dag.txt"
+    );
+}
+
+// CI-F3.3b-2 (D-F3k, spec F3.3b-1b-ii): a step launched by the planner is `merge-gate.sh --step <id>`. The
+// dispatch of the step mode is what decides between a step and the whole gate, and the whole gate (gate_main,
+// the flow that takes the lock) is called only from its else branch: a step never reaches the lock.
+#[test]
+fn merge_gate_answers_the_step_mode_before_its_gate_runs() {
+    let gate = read("scripts/merge-gate.sh");
+    let code: String = outside_self_test(&gate)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let step_mode = first_code_line(&code, "if [[ \"${1:-}\" == --step ]]; then")
+        .expect("merge-gate.sh has no --step mode outside its self-test");
+    let gate_run = code
+        .lines()
+        .position(|line| line.trim() == "gate_main")
+        .expect("merge-gate.sh does not call gate_main, the whole gate, outside its self-test");
+    assert!(
+        step_mode < gate_run,
+        "the --step mode is on line {} and the whole gate is called on line {}: a step must be answered before the gate, which takes the lock",
+        step_mode + 1,
+        gate_run + 1
+    );
+}
+
+// CI-F3.3b-2 (spec F3.3b-1b, «la tabla»): the eight rows of the judge, with their order, their dependencies and
+// their starting durations. The order of a row is its step; the dependencies are the spec's (DBG, B3, DC, CV and M
+// wait for P; REL waits for B3; E2E waits for B3 and DBG). B1 does not enter the table.
+#[test]
+fn the_step_table_has_the_eight_rows_of_the_judge_with_their_deps_and_durations() {
+    // The class of CV and M is `untimed` (CI-F3.3b-2): their output is past the judge's boundary line.
+    let expected = [
+        (10, "P", "-", "20", "normal"),
+        (20, "DBG", "P", "421", "normal"),
+        (30, "B3", "P", "150", "normal"),
+        (40, "REL", "B3", "221", "normal"),
+        (50, "E2E", "B3,DBG", "113", "normal"),
+        (60, "DC", "P", "325", "normal"),
+        (70, "CV", "P", "45", "untimed"),
+        (80, "M", "P", "136", "untimed"),
+    ];
+    let table = read("scripts/gate-dag.txt");
+    let rows: Vec<Vec<&str>> = table
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        expected.len(),
+        "gate-dag.txt has {} rows, the judge has {}",
+        rows.len(),
+        expected.len()
+    );
+    for (row, (idx, id, deps, dur, class)) in rows.iter().zip(expected) {
+        assert_eq!(row[0], idx.to_string(), "row {id}: its idx");
+        assert_eq!(row[1], id, "row {idx}: its id");
+        assert_eq!(row[2], deps, "row {id}: its deps");
+        assert_eq!(
+            row[4], class,
+            "row {id}: its class (untimed rows are past the judge's boundary)"
+        );
+        assert_eq!(row[7], dur, "row {id}: its starting dur_s");
+        assert_eq!(
+            row[8..].join(" "),
+            format!("bash scripts/merge-gate.sh --step {id}"),
+            "row {id}: its order"
         );
     }
     assert!(
-        !launched.is_empty(),
-        "merge-gate.sh launches no chain of gate-dag.txt: no run_in_lane names run-all-tests.sh --lane"
-    );
-    let mut rows = dag_rows();
-    rows.sort_by_key(|row| row.0);
-    let expected: Vec<String> = rows.iter().filter_map(|row| lane_of(&row.3)).collect();
-    assert_eq!(
-        launched, expected,
-        "the chains of merge-gate.sh must name the --lane rows of gate-dag.txt once each, in idx order"
+        read("scripts/gate-dag.txt").lines().any(|line| {
+            line.starts_with('#')
+                && line.contains("criterio")
+                && line.contains("cpu")
+                && line.contains("ram")
+        }),
+        "gate-dag.txt must state the criterion of the cpu and ram of its rows in a comment"
     );
 }
 
