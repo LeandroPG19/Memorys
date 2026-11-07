@@ -1504,7 +1504,7 @@ exit 0'
   run_copy planner ""
   (( rc == 0 )) || self_fail "planner: a gate whose every step passed exited $rc: $(cat "$tmp/planner.out")"
   dag_order="$(sed -n 's/^dag: \([A-Za-z0-9]*\) env:.*/\1/p' "$tmp/planner.out" | tr '\n' ' ')"
-  [[ "$dag_order" == "P DBG B3 REL E2E DC CV M " ]] \
+  [[ "$dag_order" == "P DBG NLI B3 REL E2E DC CV M " ]] \
     || self_fail "planner: the planner did not start the rows of gate-dag.txt in idx order (it started: '$dag_order')"
   # The boundary line is printed by the planner before the first untimed row (CV), after the block of docs and before
   # the block of crap-gate: the judge of the test times reads up to it, so CV and M are not judged (CI-F3.3b-2).
