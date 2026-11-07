@@ -753,3 +753,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   project instead of 0** (the leak shown at row level); fix `fbe6632` (after_connect sets rls_scope() and fails closed) —
   both green, the whole lib 1198 passed. Fast-forwarded into release/0.31.0, merged into the batch `40771e4`. The test
   that should have caught it used max_connections(1); the pool's `connect_with` warms an idle connection that hid it too.
+- 2026-11-07 09:44 · **Thirteenth full run (`40771e4`, with CI-J7 and T-RLS): green again — 1415.2 s, exit 0,
+  receipt for 40771e4.** Unit + smoke 41→289 (**248 s**, was 310: CI-J7's contract is 86.60 s for both rounds, within
+  44/133), --ignored 289→407, **release build cold 407→561 (154 s: T-RLS changed rust/src)**, reranker 563→792, E2E
+  792→907, docs 907→1234, crap 48 s, mutants 133 s. The cold release build explains the +112 s against the eleventh run.
