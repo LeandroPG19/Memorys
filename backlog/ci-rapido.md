@@ -476,3 +476,11 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   `f71cffb` (F3.1), `9e04a47` (F2a).** Seen: the contract's `python3 -c 'import gate_history'` leaves
   `scripts/__pycache__` in the tree (gitignored; to F3.3: PYTHONDONTWRITEBYTECODE in the contract's launcher). F2a's
   improver/architect pass goes with F2b.
+- 2026-11-07 09:30 · CI-J3 delivered (no cargo yet): `run_self_test(script, tag, env)` behind J7b''s launcher; a
+  `JUDGE_ENVIRONMENT` of **19** names, measured (the spec's 10 were incomplete: run-all-tests also exports ONNX_MODEL_PATH,
+  CUBA_RERANKER_PATH, CUBA_NLI_PATH and CUBA_EMBEDDING_DIM, which break its own self-test when inherited, plus five that
+  do not), one exclusion (TMPDIR: a missing one breaks every mktemp, not a foreign value); the region fixes in three
+  scripts (crap-gate too, by the same sysid), `unset` at the start of each region; bash table: before, crap-gate,
+  mutants-gate and run-all-tests red under the foreign environment, after, 12/12 OK. Decision (mine): TMPDIR stays
+  excluded; whether the judge should refuse a missing TMPDIR is a production change left out (gate-lock.sh keeps an
+  inherited TMPDIR on disk without checking it exists) — noted as debt. Red/green with cargo queued.
