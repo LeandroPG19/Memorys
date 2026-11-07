@@ -702,3 +702,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   70/70 in 44.18 s, list identical, clippy clean) and `78949a3` (linux local_gate_contract 44/133 from that measure);
   merged `ddf9662`. Twelfth full run (serial, lanes) started on ddf9662 to confirm it whole. F3.3b-1b restarted with the
   redesign (rows are chains, the planner runs the series) in worktree `Memorys-ci-f33b1b2` from ddf9662.
+- 2026-11-07 08:53 · F3.3b-1b stopped before writing: a step the planner launches is not merge-gate's direct child, so
+  `inherit_gate_lock` (PPID) refuses it. Decided: D-F3k's minimum enters now (a one-use token per step, the owner alive
+  and an **ancestor** of the process, reuse = exit 2; the serial PPID inheritance unchanged); TB leaves the table
+  (merge-gate runs test-times after the planner, D-F3b); emit_block flushes; deps and start values fixed from the eleventh
+  run. Allowed cut if it does not fit: token first, then table + --step + planner.
