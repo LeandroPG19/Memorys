@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import fcntl
 import functools
+import hashlib
 import json
 import os
 import subprocess
@@ -74,6 +75,30 @@ class Paso:
 def history_root() -> str:
     base = os.environ.get("CI_TIEMPOS_DIR") or os.path.expanduser("~/.cache/ci-tiempos")
     return os.path.join(base, REPO)
+
+
+def huella(raiz: str) -> str | None:
+    """The tree's huella (D-F3s): sha256 of `git diff HEAD --binary`, then the name and the bytes of
+    every untracked file, in byte order of the name. None when git cannot say: a null is never a
+    fingerprint."""
+    raiz_b = os.fsencode(raiz)
+    try:
+        diff = subprocess.run(
+            ["git", "-C", raiz, "diff", "HEAD", "--binary"], capture_output=True, check=True
+        ).stdout
+        sin_rastrear = subprocess.run(
+            ["git", "-C", raiz, "ls-files", "--others", "--exclude-standard", "-z"],
+            capture_output=True,
+            check=True,
+        ).stdout
+        digest = hashlib.sha256(diff)
+        for nombre in sorted(n for n in sin_rastrear.split(b"\0") if n):
+            digest.update(b"\0untracked\0" + nombre + b"\0")
+            with open(os.path.join(raiz_b, nombre), "rb") as fh:
+                digest.update(fh.read())
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return digest.hexdigest()
 
 
 def _aviso(texto: str) -> None:
@@ -329,27 +354,51 @@ def _es_flaky(corrida: Corrida, paso: Paso, reg: dict[str, Any]) -> bool:
     )
 
 
+def _registro_unidad(
+    corrida: Corrida,
+    paso: Paso,
+    clave: str,
+    finished_in: float | None,
+    tests: int | None,
+    fallados: int | None,
+    rc: int,
+) -> dict[str, Any]:
+    return {
+        "repo": REPO,
+        "modo": corrida.modo,
+        "tabla": corrida.tabla,
+        "run": corrida.run,
+        "id": paso.id,
+        "idx": paso.idx,
+        "sha": corrida.sha,
+        "huella": corrida.huella,
+        "clave": clave,
+        "finished_in": finished_in,
+        "tests": tests,
+        "fallados": fallados,
+        "rc": rc,
+    }
+
+
 def _unidades(corrida: Corrida, paso: Paso, salida: str, log_path: str) -> list[dict[str, Any]]:
     registros: list[dict[str, Any]] = []
     for linea in salida.splitlines():
         try:
             clave, cs, tests, fallados = linea.rsplit(" ", 3)
+            if cs == "-":
+                # A binary a signal killed (D-F3s): no time and no count, and the fourth field is -signal.
+                registros.append(_registro_unidad(corrida, paso, clave, None, None, None, int(fallados)))
+                continue
             registros.append(
-                {
-                    "repo": REPO,
-                    "modo": corrida.modo,
-                    "tabla": corrida.tabla,
-                    "run": corrida.run,
-                    "id": paso.id,
-                    "idx": paso.idx,
-                    "sha": corrida.sha,
-                    "huella": corrida.huella,
-                    "clave": clave,
-                    "finished_in": round(int(cs) / 100, 2),
-                    "tests": int(tests),
-                    "fallados": int(fallados),
-                    "rc": 0 if int(fallados) == 0 else 1,
-                }
+                _registro_unidad(
+                    corrida,
+                    paso,
+                    clave,
+                    round(int(cs) / 100, 2),
+                    int(tests),
+                    int(fallados),
+                    0 if int(fallados) == 0 else 1,
+                )
             )
         except ValueError:
             _aviso(f"units: the line {linea!r} of {log_path} is not <key> <cs> <tests> <failed>; skipped")
@@ -380,6 +429,13 @@ def units(corrida: Corrida, paso: Paso, log_path: str) -> None:
         _escribir("unidades.jsonl", reg)
 
 
+def _brecha(total: float | None, cota: float | None) -> float | None:
+    """T over a lower bound, the gap D-F3t prints; null while either is unmeasured or the bound is 0."""
+    if total is None or cota is None or cota <= 0:
+        return None
+    return _r(total / cota, 3)
+
+
 def _cerrar(
     corrida: Corrida,
     rc: int,
@@ -388,6 +444,12 @@ def _cerrar(
     LB_run: float | None,
     C: int | None,
     R: int | None,
+    *,
+    mem_peak: int | None = None,
+    psi: dict[str, float | None] | None = None,
+    load: float | None = None,
+    hilos: int | None = None,
+    oom_kill: int | None = None,
 ) -> None:
     cpus = _todos_medidos(corrida.cpus)
     cpu_total = None if cpus is None else sum(cpus)
@@ -405,8 +467,15 @@ def _cerrar(
         "cpu_s": _r(cpu_total),
         "LB_ref": _r(LB_ref),
         "LB_run": _r(LB_run),
+        "brecha_ref": _brecha(total, LB_ref),
+        "brecha_run": _brecha(total, LB_run),
         "C": C,
         "R": R,
+        "mem_peak": mem_peak,
+        "psi": psi,
+        "load": _r(load, 2),
+        "hilos": hilos,
+        "oom_kill": oom_kill,
         "fecha": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     _escribir("corridas.jsonl", registro)
@@ -423,9 +492,27 @@ def run_end(
     LB_run: float | None = None,
     C: int | None = None,
     R: int | None = None,
+    mem_peak: int | None = None,
+    psi: dict[str, float | None] | None = None,
+    load: float | None = None,
+    hilos: int | None = None,
+    oom_kill: int | None = None,
 ) -> None:
-    """The library's own run end: a missing T is the module clock's."""
-    _cerrar(corrida, rc, _reloj(corrida) if T is None else T, LB_ref, LB_run, C, R)
+    """The library's own run end: a missing T is the module clock's. What nobody measured is None."""
+    _cerrar(
+        corrida,
+        rc,
+        _reloj(corrida) if T is None else T,
+        LB_ref,
+        LB_run,
+        C,
+        R,
+        mem_peak=mem_peak,
+        psi=psi,
+        load=load,
+        hilos=hilos,
+        oom_kill=oom_kill,
+    )
 
 
 def _camino(
@@ -494,6 +581,8 @@ def registrar(manifiesto: dict[str, Any]) -> None:
         run=manifiesto.get("run"),
         arbol_sucio=manifiesto.get("arbol_sucio"),
     )
+    if corrida is None:
+        return
     pasos: dict[str, Paso] = {}
     for p in manifiesto["pasos"]:
         paso = Paso(p["idx"], p["id"], 0.0)
@@ -514,8 +603,29 @@ def registrar(manifiesto: dict[str, Any]) -> None:
         )
         pasos[p["id"]] = paso
     for u in manifiesto.get("unidades", []):
-        units(corrida, pasos[u["id"]], u["log"])
-    _cerrar(corrida, manifiesto["rc"], manifiesto.get("T"), None, None, None, None)
+        paso = pasos.get(u.get("id"))
+        if paso is None:
+            # A unit with no step of the manifest: named, skipped, and the run is written as usual (F3.3b-0).
+            sys.stderr.write(
+                f"history: unit {u.get('id')!r} names a step the manifest does not have; "
+                f"its log {u.get('log')!r} is not read; the verdict does not change\n"
+            )
+            continue
+        units(corrida, paso, u["log"])
+    _cerrar(
+        corrida,
+        manifiesto["rc"],
+        manifiesto.get("T"),
+        manifiesto.get("LB_ref"),
+        manifiesto.get("LB_run"),
+        manifiesto.get("C"),
+        manifiesto.get("R"),
+        mem_peak=manifiesto.get("mem_peak"),
+        psi=manifiesto.get("psi"),
+        load=manifiesto.get("load"),
+        hilos=manifiesto.get("hilos"),
+        oom_kill=manifiesto.get("oom_kill"),
+    )
 
 
 def main(argv: list[str]) -> int:
