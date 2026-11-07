@@ -265,8 +265,10 @@ def add_observation(session: McpStdio, number: int, row: Dict[str, Any]) -> None
     )
     # Dedup and reinforcement answer ok without inserting a row; counting
     # them would let the eval read fewer observations than the fixture has.
-    if body.get("deduplicated") or "reinforced_id" in body:
-        raise SeedError(f"fixture line {number}: no se insertó (dedup o refuerzo de otra fila)")
+    if body.get("deduplicated"):
+        raise SeedError(f"fixture line {number}: no se insertó (deduplicated: se fundió con otra fila)")
+    if "reinforced_id" in body:
+        raise SeedError(f"fixture line {number}: no se insertó (reinforced_id: refuerza otra fila)")
 
 
 def seed(binary: Path, database_url: str, fixture: Path) -> int:
