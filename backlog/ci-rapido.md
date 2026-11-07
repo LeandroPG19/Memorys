@@ -831,3 +831,5 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   targets), peak 18.0 GB. The planner's own summary: **LB_run = 578.77 s (critical path P → DBG → E2E)** — the DAG's
   lower bound on this tree, 9.6 min; T/LB_run 2.63 in series. v017_relation_scan over the four whole runs: 19.18, 9.45,
   11.24, 8.47 s → by the file's rule (≥ 3 runs, k = 1.3) floor 4, ceiling 25. Slice CI-J11 for that line.
+
+- **7-nov 12:08 · CI-J11 fusionada** (`60a8725`, merge `bb86e37`). `linux v017_relation_scan` pasa de 9/33 a **4/25** por la regla (cuatro corridas completas bajo `pesado`: 19,18 / 9,45 / 11,24 / 8,47 s). Evidencia: `test-times --judge` sobre el log de la 17.ª corrida sin marcas → rc 0 (123 binarios dentro); con el fichero anterior → rc 1 (suelo 9). `test-times --self-test` rc 0. Hallazgo: en `log-con-hora.txt` de la 17.ª las marcas llegan en ráfagas, porque el planificador vuelca el log de cada fila al terminarla; por eso el 8,47 no se puede comprobar por marcas (el suelo sale 4 igual con 9,45). Es un artefacto de `medir-juez.sh`, no del juez: el juez lee su log crudo.
