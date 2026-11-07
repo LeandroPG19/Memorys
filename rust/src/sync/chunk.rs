@@ -222,7 +222,7 @@ pub fn payload_hash(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(trust.updated_at, None);
     }
 
-    async fn test_pool() -> sqlx::PgPool {
+    pub(crate) async fn test_pool() -> sqlx::PgPool {
         let url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL env var required for integration tests");
         crate::db::create_pool(&url)

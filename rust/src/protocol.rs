@@ -1498,7 +1498,7 @@ async fn read_resource(pool: &PgPool, uri: &str) -> Result<Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1927,7 +1927,7 @@ mod tests {
         }
     }
 
-    async fn test_pool() -> PgPool {
+    pub(crate) async fn test_pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL env var required for integration tests");
         db::create_pool(&url)
