@@ -819,3 +819,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   implementer.
 - 2026-11-07 11:36 · **CI-J10 committed and merged:** red `3a64b56` (gate_dag 22/24), fix `e4cb6a7` (gate_dag 24/24,
   local_gate 76/76, the rest green); merged `f0cf37d`. Seventeenth full run (serial, through the planner) started.
+- 2026-11-07 11:46 · F3.3c-2 corrections delivered (the two F3.3b-1b-ii contracts skip NAME=value tokens and count
+  `exclusive` as timed, NLI's block emitted before the boundary in idx order — checked in flush(); DAG_LANES = CL D1 D2 D3
+  NLI B3 R E; F1.2 accepts each row's jobs and stays red on an unset one). The implementer saw merge-gate's D2_INT row fail
+  2 of 3 on the unpatched base 75b2a7a too — the same INT-ignored mechanism CI-J10 just fixed in the planner (that base
+  does not carry CI-J10); not retried to pass. Re-verification queued; the seventeenth full run (with CI-J10) will tell
+  whether D2 is green inside the real judge.
