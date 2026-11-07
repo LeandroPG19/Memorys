@@ -17,10 +17,8 @@ column is parsed and ignored until F3.4.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import glob
 import hashlib
-import json
 import math
 import os
 import re
@@ -31,14 +29,18 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, NoReturn
+
+# No bytecode next to the scripts (J7): the judge does not write __pycache__ into the tree.
+sys.dont_write_bytecode = True
+# -I leaves the script's own folder off sys.path: gate_history.py sits beside this file.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate_history  # noqa: E402
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
 GIB = 1 << 30
-REPO = "memory-industry"
 TICK_S = 1.0
 SAFETY = 1.25
 WINDOW = 5
@@ -60,7 +62,6 @@ ALLOWED_ENV = frozenset(
     }
 )
 NAME_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
-_warned = False
 
 
 class Refusal(Exception):
@@ -73,10 +74,6 @@ def die(message: str) -> NoReturn:
 
 def repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def rounded(value: float | None, digits: int = 3) -> float | None:
-    return None if value is None else round(value, digits)
 
 
 def read_text(path: str) -> str | None:
@@ -168,6 +165,7 @@ class Step:
         self.mem_peak: int | None = None
         self.oom_kill: int | None = None
         self.psi: dict[str, float | None] | None = None
+        self.paso: gate_history.Paso | None = None
 
 
 def parse_env(rest: list[str], step_id: str) -> tuple[dict[str, str], list[str]]:
@@ -306,61 +304,29 @@ def capacities() -> tuple[int, int]:
 # --- history ------------------------------------------------------------------
 
 
-def history_root() -> str:
-    return os.environ.get("CI_TIEMPOS_DIR") or os.path.expanduser("~/.cache/ci-tiempos")
-
-
-def read_jsonl(path: str) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(record, dict):
-                    records.append(record)
-    except OSError:
-        pass
-    return records
-
-
 def is_serial_run(record: dict[str, Any], tabla: str) -> bool:
     return record.get("modo") == "serie" and record.get("tabla") == tabla and record.get("rc") == 0
 
 
+def is_duration(seg: Any) -> bool:
+    """A number of seconds above 0: a bool or a 0 is not one to learn from (H9)."""
+    return isinstance(seg, (int, float)) and not isinstance(seg, bool) and seg > 0
+
+
 def is_step_sample(record: dict[str, Any], tabla: str) -> bool:
     """A step of a green serial run of this table, with a duration to learn from."""
-    return is_serial_run(record, tabla) and isinstance(record.get("seg"), (int, float))
+    return is_serial_run(record, tabla) and is_duration(record.get("seg"))
 
 
 def load_history(tabla: str) -> tuple[dict[Any, list[dict[str, Any]]], list[dict[str, Any]]]:
     steps_by_id: dict[Any, list[dict[str, Any]]] = {}
     runs: list[dict[str, Any]] = []
-    for day in sorted(glob.glob(os.path.join(history_root(), REPO, "*"))):
-        for record in read_jsonl(os.path.join(day, "pasos.jsonl")):
+    for day in sorted(glob.glob(os.path.join(gate_history.history_root(), "*"))):
+        for record in gate_history.leer_jsonl(os.path.join(day, "pasos.jsonl")):
             if is_step_sample(record, tabla):
                 steps_by_id.setdefault(record.get("id"), []).append(record)
-        runs += [r for r in read_jsonl(os.path.join(day, "corridas.jsonl")) if is_serial_run(r, tabla)]
+        runs += [r for r in gate_history.leer_jsonl(os.path.join(day, "corridas.jsonl")) if is_serial_run(r, tabla)]
     return steps_by_id, runs
-
-
-def annotate(name: str, record: dict[str, Any]) -> None:
-    """Appends one record under flock. A failed write never changes the verdict."""
-    global _warned
-    day = datetime.now(timezone.utc).strftime("%Y%m%d")
-    folder = os.path.join(history_root(), REPO, day)
-    try:
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, name), "a", encoding="utf-8") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-            fh.flush()
-    except OSError as err:
-        if not _warned:
-            _warned = True
-            sys.stderr.write(f"note: history not written in {folder} ({err}); the verdict does not change\n")
 
 
 # --- critical path ------------------------------------------------------------
@@ -418,6 +384,9 @@ def known_values(done: list[Step], attr: str) -> dict[str, Any]:
     return {s.id: getattr(s, attr) for s in done if getattr(s, attr) is not None}
 
 
+NOMBRE_COTA = {"paso": "longest step", "cpu": "CPU", "ram": "RAM"}
+
+
 class Planner:
     def __init__(self, steps: list[Step], dag: bool, tabla: str) -> None:
         self.steps = steps
@@ -428,6 +397,7 @@ class Planner:
         self.t0 = time.monotonic()
         self.run_dir = make_run_dir()
         self.run_id = os.path.basename(self.run_dir)
+        self.corrida = gate_history.run_start(self.modo, None, None, tabla, run=self.run_id)
         self.hist_steps, self.hist_runs = load_history(tabla)
         self.scope = scope_dir()
         self.delegado = delegate(self.scope)
@@ -563,6 +533,7 @@ class Planner:
                 preexec_fn=cgroup_entry(step.cg) if step.cg else None,
             )
         step.t_start = self.now()
+        step.paso = gate_history.step_start(self.corrida, step.idx, step.id)
         step.state = "running"
         self.sample_step(step)
 
@@ -637,28 +608,20 @@ class Planner:
         }
 
     def record_step(self, step: Step) -> None:
-        annotate(
-            "pasos.jsonl",
-            {
-                "repo": REPO,
-                "modo": self.modo,
-                "tabla": self.tabla,
-                "run": self.run_id,
-                "id": step.id,
-                "idx": step.idx,
-                "inicio": rounded(step.t_start),
-                "fin": rounded(step.t_end),
-                "seg": rounded(step.t_end - step.t_start),
-                "rc": step.rc,
-                "parado": step.parado,
-                "espera_s": rounded(step.t_start - step.t_ready),
-                "motivo": step.motivo,
-                "cpu_s": rounded(step.cpu_s),
-                "mem_peak": step.mem_peak,
-                "anon_max": step.anon_max,
-                "oom_kill": step.oom_kill,
-                "psi": step.psi,
-            },
+        gate_history.step_end(
+            self.corrida,
+            step.paso,
+            step.rc,
+            inicio=step.t_start,
+            fin=step.t_end,
+            espera_s=step.t_start - step.t_ready,
+            motivo=step.motivo,
+            parado=step.parado,
+            cpu_s=step.cpu_s,
+            mem_peak=step.mem_peak,
+            anon_max=step.anon_max,
+            oom_kill=step.oom_kill,
+            psi=step.psi,
         )
 
     # verdict
@@ -790,25 +753,32 @@ class Planner:
     def all_measured(self, values: dict[str, Any]) -> bool:
         return all(values.get(s.id) is not None for s in self.steps)
 
-    def resource_terms(self, dur: dict[str, float], cpu: dict[str, Any], anon: dict[str, Any]) -> dict[str, float]:
-        """The CPU and RAM terms of the bound, each only when every step has its number."""
-        terms: dict[str, float] = {}
-        if self.all_measured(cpu):
-            terms["CPU"] = sum(cpu[s.id] for s in self.steps) / self.cpu
-        if self.ram > 0 and self.all_measured(anon):
-            terms["RAM"] = sum(anon[s.id] * dur[s.id] for s in self.steps) / self.ram
-        return terms
+    def lower_bounds(self, dur: dict[str, Any], cpu: dict[str, Any], anon: dict[str, Any]) -> dict[str, Any]:
+        """gate_history.lower_bounds over this table's steps; a dependency cycle is a refusal."""
+        records = [
+            {"id": s.id, "seg": dur[s.id], "cpu_s": cpu.get(s.id), "anon_max": anon.get(s.id)}
+            for s in self.steps
+        ]
+        table = {"C": self.cpu, "R": self.ram, "deps": {s.id: s.deps for s in self.steps}}
+        try:
+            return gate_history.lower_bounds(records, table)
+        except ValueError as err:
+            die(str(err))
+
+    def bound_text(self, cota: str | None, dur: dict[str, Any]) -> str:
+        """The term that gave the bound, the critical path spelled out step by step."""
+        if cota == "camino":
+            rank, nxt = ranks(self.steps, dur)
+            _, chain_text = critical_chain(self.steps, rank, nxt)
+            return f"critical path: {chain_text}"
+        return NOMBRE_COTA.get(cota or "", "")
 
     def bound(self, dur: dict[str, Any], cpu: dict[str, Any], anon: dict[str, Any]) -> tuple[float | None, str]:
-        """LB = max(critical path, sum(cpu_s)/C, sum(anon*seg)/R, longest step); None if unmeasured."""
+        """LB over the run's steps, from gate_history.lower_bounds; None while a duration is unmeasured."""
         if not self.all_measured(dur):
             return None, ""
-        rank, nxt = ranks(self.steps, dur)
-        chain_len, chain = critical_chain(self.steps, rank, nxt)
-        terms = {"critical path": chain_len, "longest step": max(dur.values())}
-        terms.update(self.resource_terms(dur, cpu, anon))
-        which = max(terms, key=terms.get)
-        return terms[which], (f"critical path: {chain}" if which == "critical path" else which)
+        result = self.lower_bounds(dur, cpu, anon)
+        return result["LB"], self.bound_text(result["cota"], dur)
 
     def summary(self) -> None:
         total = self.now()
@@ -825,21 +795,14 @@ class Planner:
         )
 
     def annotate_run(self, code: int) -> None:
-        annotate(
-            "corridas.jsonl",
-            {
-                "repo": REPO,
-                "modo": self.modo,
-                "tabla": self.tabla,
-                "run": self.run_id,
-                "rc": code,
-                "T": rounded(self.now()),
-                "LB_ref": rounded(self.lb_ref),
-                "LB_run": rounded(self.lb_run),
-                "C": self.cpu,
-                "R": self.ram,
-                "fecha": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            },
+        gate_history.run_end(
+            self.corrida,
+            code,
+            T=self.now(),
+            LB_ref=self.lb_ref,
+            LB_run=self.lb_run,
+            C=self.cpu,
+            R=self.ram,
         )
 
 

@@ -380,6 +380,41 @@ if [[ "${1:-}" == "--self-test" ]]; then
   bash "$SELF" --count "$tmp/p1.cut.log" >/dev/null 2>&1 || p1_rc=$?
   (( p1_rc == 2 )) || self_fail "P1 seed $p1_seed: a log cut after a header with no result line exited $p1_rc, not 2"
 
+  # U1 (F3.1, D-F3s): --units LOG is the parser of --count with the time and the failed count
+  # of each binary: `<key> <centiseconds> <tests> <failed>`, in order of first appearance, the
+  # doc-tests included. The Git Bash shape (backslashes, .exe, CRLF) prints the same lines as
+  # the Linux one. A header with no result line is exit 2, as for --count.
+  units_block() {
+    local os="$1" key="$2" secs="$3" passed="$4" failed="$5" sep='/' exe='' result=ok
+    if [[ "$os" == windows ]]; then sep='\'; exe='.exe'; fi
+    (( failed == 0 )) || result=FAILED
+    case "$key" in
+      lib:*) emit "$os" "     Running unittests src${sep}lib.rs (target${sep}debug${sep}deps${sep}${key#lib:}-0123456789abcdef${exe})" ;;
+      doc:*) emit "$os" "   Doc-tests ${key#doc:}" ;;
+      *)     emit "$os" "     Running tests${sep}${key}.rs (target${sep}debug${sep}deps${sep}${key}-0123456789abcdef${exe})" ;;
+    esac
+    emit "$os" ""
+    emit "$os" "test result: $result. $passed passed; $failed failed; 0 ignored; 0 measured; 0 filtered out; finished in ${secs}s"
+    emit "$os" ""
+  }
+  for os in linux windows; do
+    {
+      units_block "$os" slow 40.00 3 0
+      units_block "$os" lib:memory_industry 21.51 4 0
+      units_block "$os" doc:memory_industry 0.27 2 1
+      units_block "$os" slow 12.50 1 0
+    } >"$tmp/U1.$os.log"
+    rc=0
+    bash "$SELF" --units "$tmp/U1.$os.log" >"$tmp/U1.$os.out" 2>&1 || rc=$?
+    want_rc "U1.$os" 0
+    [[ "$(cat "$tmp/U1.$os.out")" == "$(printf '%s\n' 'slow 5250 4 0' 'lib:memory_industry 2151 4 0' 'doc:memory_industry 27 3 1')" ]] \
+      || self_fail "U1.$os: --units printed '$(cat "$tmp/U1.$os.out")', want 'slow 5250 4 0' (the two slow blocks: 40.00 + 12.50 s, 3 + 1 tests), 'lib:memory_industry 2151 4 0', 'doc:memory_industry 27 3 1' (passed + failed, 1 failed)"
+  done
+  printf '     Running tests/cut.rs (target/debug/deps/cut-0123456789abcdef)\n' >"$tmp/U1.cut.log"
+  rc=0
+  bash "$SELF" --units "$tmp/U1.cut.log" >/dev/null 2>&1 || rc=$?
+  want_rc "U1.cut" 2
+
   echo "OK  self-test: test-times sums each binary's finished-in over both cargo shapes up to the boundary, prints the 10 slowest, and is red for a ceiling passed, the default passed, a floor undercut, a dead or expired line and a malformed one, all in one run; a log it cannot read is exit 2"
   exit 0
 fi
@@ -405,6 +440,7 @@ fi
 #                 [--ceilings FILE] [--tests-dir DIR]
 #   exit 0 green, 1 a time or a ceilings line is red, 2 it could not judge.
 #   test-times.sh --count LOG   the tests each binary ran (below, with its format)
+#   test-times.sh --units LOG   per binary: time, tests and failed (F3.1, below)
 
 # 10 s: every regression 0.30 fixed measured more than that on both hosts (the
 # smallest, 10.13 s), and the slowest binary with no line measures 6.7 s on
@@ -464,22 +500,25 @@ parse_log() {
       sub(/^.*finished in /, "", t); sub(/s$/, "", t)
       cs = int(t * 100 + 0.5)
       n = $0
+      nf = 0
       if (n ~ /^test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; /) {
         sub(/^test result: [^.]*\. /, "", n)
         split(n, f, /[^0-9]+/)
         n = f[1] + f[2]
+        nf = f[2]
       } else {
         n = -1
       }
-      if (!(pending in sum)) { order[++count] = pending; sum[pending] = 0; cnt[pending] = 0 }
+      if (!(pending in sum)) { order[++count] = pending; sum[pending] = 0; cnt[pending] = 0; fl[pending] = 0 }
       sum[pending] += cs
-      if (n < 0) badcount = pending; else cnt[pending] += n
+      if (n < 0) badcount = pending; else { cnt[pending] += n; fl[pending] += nf }
       pending = ""
     }
     END {
       if (pending != "" && !unpaired) { unpaired = 1; ulineno = pline; ukey = pending }
       for (i = 1; i <= count; i++) print "H", order[i], sum[order[i]]
       for (i = 1; i <= count; i++) print "C", order[i], cnt[order[i]]
+      for (i = 1; i <= count; i++) print "N", order[i], fl[order[i]]
       if (badcount != "") print "B", badcount
       print "F", found + 0
       if (unpaired) print "U", ulineno, ukey
@@ -663,6 +702,38 @@ if [[ "${1:-}" == "--count" ]]; then
   [[ -z "$problem" ]] || die2 "$problem"
   (( nbin > 0 )) || die2 "no test binary was run in $LOG: a section that ran nothing is not a pass"
   printf '%s' "$counted"
+  exit 0
+fi
+
+# --units LOG (F3.1, D-F3r): the parser of --count with the time and the failed count of each
+# binary, for the history of times (scripts/gate_history.py). One line per binary, in order of
+# first appearance: `<key> <centiseconds> <tests> <failed>`, tests = passed + failed.
+#   exit 0 read; 2 the log cannot be read or paired, or it names no binary.
+if [[ "${1:-}" == "--units" ]]; then
+  shift
+  LOG="${1:-}"
+  [[ $# -eq 1 ]] || die2 "--units takes one log and nothing else: --units LOG"
+  [[ -f "$LOG" ]] || die2 "no log at $LOG"
+
+  parsed="$(parse_log "$LOG" "" 0)"
+  declare -A units_cs=() units_n=() units_f=()
+  units_order=()
+  nbin=0
+  problem=""
+  while IFS=$'\t' read -r kind a b; do
+    case "$kind" in
+      H) units_order+=("$a"); units_cs[$a]=$b; nbin=$((nbin + 1)) ;;
+      C) units_n[$a]=$b ;;
+      N) units_f[$a]=$b ;;
+      B) problem="$LOG: $a has a 'test result' line with no passed and failed count" ;;
+      U) problem="$LOG:${a}: ${b} has no 'test result' line before the next binary or the end of the log; the log is cut or interleaved, and the count will not guess" ;;
+    esac
+  done <<<"$parsed"
+  [[ -z "$problem" ]] || die2 "$problem"
+  (( nbin > 0 )) || die2 "no test binary was run in $LOG: a section that ran nothing is not a pass"
+  for k in "${units_order[@]}"; do
+    printf '%s %s %s %s\n' "$k" "${units_cs[$k]}" "${units_n[$k]}" "${units_f[$k]}"
+  done
   exit 0
 fi
 
