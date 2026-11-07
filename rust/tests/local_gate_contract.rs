@@ -1260,7 +1260,9 @@ fn a_release_cargo_call_in_the_gate_carries_the_features_the_release_build_used(
         .collect();
     let no_run: Vec<Vec<String>> = cargo_invocations(&suite_code)
         .into_iter()
-        .filter(|args| args.iter().any(|arg| arg == "--release") && args.iter().any(|arg| arg == "--no-run"))
+        .filter(|args| {
+            args.iter().any(|arg| arg == "--release") && args.iter().any(|arg| arg == "--no-run")
+        })
         .collect();
     assert_eq!(
         no_run.len(),
@@ -1290,7 +1292,8 @@ fn a_release_cargo_call_in_the_gate_carries_the_features_the_release_build_used(
             args.join(" ")
         );
         assert_eq!(
-            expected, features,
+            expected,
+            features,
             "`cargo {}` in scripts/build-gpu.sh asks for {features:?}, while the gate's release \
              build asks for {expected:?}. A person who runs build-gpu.sh has to compile what the \
              judge tested",
@@ -1402,7 +1405,10 @@ fn the_cheap_steps_come_before_the_first_build() {
         ("cargo fmt --check", "cargo fmt --check"),
         ("codigo-muerto.sh", "$ROOT/scripts/codigo-muerto.sh\""),
         ("node npm/install.test.js", "node npm/install.test.js"),
-        ("run-all-tests.sh --check-models", "run-all-tests.sh\" --check-models"),
+        (
+            "run-all-tests.sh --check-models",
+            "run-all-tests.sh\" --check-models",
+        ),
     ] {
         let at = first_code_line(&code, needle).unwrap_or_else(|| {
             panic!("scripts/merge-gate.sh has no `{step}` step outside its self-test")
@@ -2897,7 +2903,10 @@ const LIVE_PORT_DEFINITION: &str = "GATE_LIVE_PORT=5488";
 /// whose fixtures carry URLs. Python has no regions, so all of it is code.
 fn default_url_defects(name: &str, body: &str) -> Vec<String> {
     let lines: Vec<(usize, &str)> = if name.ends_with(".py") {
-        body.lines().enumerate().map(|(i, line)| (i + 1, line)).collect()
+        body.lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line))
+            .collect()
     } else {
         outside_self_test(body)
     };
@@ -2908,9 +2917,15 @@ fn default_url_defects(name: &str, body: &str) -> Vec<String> {
             if name == LIVE_PORT_HOME && line.trim() == LIVE_PORT_DEFINITION {
                 None
             } else if line.contains("5488") {
-                Some(format!("{name}:{n}: names the live port 5488: {}", line.trim()))
+                Some(format!(
+                    "{name}:{n}: names the live port 5488: {}",
+                    line.trim()
+                ))
             } else if names_a_default_url(line) {
-                Some(format!("{name}:{n}: gives DATABASE_URL a default: {}", line.trim()))
+                Some(format!(
+                    "{name}:{n}: gives DATABASE_URL a default: {}",
+                    line.trim()
+                ))
             } else {
                 None
             }
@@ -3030,10 +3045,17 @@ fn prints_a_database_url_with_credentials(line: &str) -> bool {
     if !prints {
         return false;
     }
-    let masked = ["#*@", "##*@", "%@*", "%%@*"].iter().any(|m| line.contains(*m));
-    let names_it = ["$DATABASE_URL", "${DATABASE_URL", "{DATABASE_URL}", "{DATABASE_URL:"]
+    let masked = ["#*@", "##*@", "%@*", "%%@*"]
         .iter()
-        .any(|v| line.contains(*v));
+        .any(|m| line.contains(*m));
+    let names_it = [
+        "$DATABASE_URL",
+        "${DATABASE_URL",
+        "{DATABASE_URL}",
+        "{DATABASE_URL:",
+    ]
+    .iter()
+    .any(|v| line.contains(*v));
     if names_it && !masked {
         return true;
     }
@@ -3054,8 +3076,14 @@ fn prints_a_database_url_with_credentials(line: &str) -> bool {
 fn no_judge_script_prints_a_database_url_with_its_credentials() {
     for (what, line) in [
         ("a shell echo of the variable", "echo \"DB: $DATABASE_URL\""),
-        ("a Python f-string of the variable", "print(f\"DB:     {DATABASE_URL}\")"),
-        ("a literal URL with a password", "echo \"postgresql://gate:pw0@127.0.0.1:5489/brain\""),
+        (
+            "a Python f-string of the variable",
+            "print(f\"DB:     {DATABASE_URL}\")",
+        ),
+        (
+            "a literal URL with a password",
+            "echo \"postgresql://gate:pw0@127.0.0.1:5489/brain\"",
+        ),
     ] {
         assert!(
             prints_a_database_url_with_credentials(line),
@@ -3063,10 +3091,22 @@ fn no_judge_script_prints_a_database_url_with_its_credentials() {
         );
     }
     for (what, line) in [
-        ("the host, port and database of the variable", "echo \"DB: ${DATABASE_URL#*@}\""),
-        ("a message that names the variable", "echo \"DATABASE_URL is not set\""),
-        ("a Python print with no URL", "print(\"DB: judge server\", port)"),
-        ("a read of the variable with no print", "DATABASE_URL = os.environ[\"DATABASE_URL\"]"),
+        (
+            "the host, port and database of the variable",
+            "echo \"DB: ${DATABASE_URL#*@}\"",
+        ),
+        (
+            "a message that names the variable",
+            "echo \"DATABASE_URL is not set\"",
+        ),
+        (
+            "a Python print with no URL",
+            "print(\"DB: judge server\", port)",
+        ),
+        (
+            "a read of the variable with no print",
+            "DATABASE_URL = os.environ[\"DATABASE_URL\"]",
+        ),
     ] {
         assert!(
             !prints_a_database_url_with_credentials(line),
@@ -3078,7 +3118,10 @@ fn no_judge_script_prints_a_database_url_with_its_credentials() {
     for name in judge_scripts() {
         let body = read(&name);
         let lines: Vec<(usize, &str)> = if name.ends_with(".py") {
-            body.lines().enumerate().map(|(i, line)| (i + 1, line)).collect()
+            body.lines()
+                .enumerate()
+                .map(|(i, line)| (i + 1, line))
+                .collect()
         } else {
             outside_self_test(&body)
         };
@@ -3167,8 +3210,11 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
     let _ = std::fs::remove_dir_all(&liar_dir);
     std::fs::create_dir_all(&liar_dir).expect("creating the liar fixture");
     let liar = liar_dir.join("liar.sh");
-    std::fs::write(&liar, "#!/usr/bin/env bash\nmkdir -p \"$HOME/.cache/x\"\nexit 0\n")
-        .expect("writing the liar fixture");
+    std::fs::write(
+        &liar,
+        "#!/usr/bin/env bash\nmkdir -p \"$HOME/.cache/x\"\nexit 0\n",
+    )
+    .expect("writing the liar fixture");
     let caught = left_by_self_test(&liar, "liar");
     let _ = std::fs::remove_dir_all(&liar_dir);
     assert!(
@@ -3249,7 +3295,10 @@ fn the_python_clients_refuse_without_database_url() {
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
         .expect("making the stand-in executable");
 
-    for client in ["rust/tests/e2e_all_tools.py", "scripts/mcp_live_session_test.py"] {
+    for client in [
+        "rust/tests/e2e_all_tools.py",
+        "scripts/mcp_live_session_test.py",
+    ] {
         let _ = std::fs::remove_file(&mark);
         let out = Command::new("python3")
             .arg(repo_root().join(client))
@@ -3304,7 +3353,9 @@ fn every_gate_step_after_the_guard_gets_the_verified_url() {
 
     let guard = first_line_where(&gate, |l| l.contains("gate_require_judge_server"));
     let audit = first_line_where(&gate, |l| l.contains("=== cargo audit ==="));
-    let suite = first_line_where(&gate, |l| l.starts_with("\"$ROOT/scripts/run-all-tests.sh\""));
+    let suite = first_line_where(&gate, |l| {
+        l.starts_with("\"$ROOT/scripts/run-all-tests.sh\"")
+    });
     let (Some(guard), Some(audit), Some(suite)) = (guard, audit, suite) else {
         panic!(
             "merge-gate.sh must call gate_require_judge_server (found on {guard:?}), print \
@@ -3336,7 +3387,8 @@ fn every_gate_step_after_the_guard_gets_the_verified_url() {
         assignments[0]
     );
     assert!(
-        gate.iter().any(|(_, l)| l.starts_with("export GATE_SERVER_SYSTEM_ID=")),
+        gate.iter()
+            .any(|(_, l)| l.starts_with("export GATE_SERVER_SYSTEM_ID=")),
         "merge-gate.sh does not export GATE_SERVER_SYSTEM_ID, the system_identifier it verified, \
          so run-all-tests.sh has nothing to compare against"
     );
@@ -3347,9 +3399,9 @@ fn every_gate_step_after_the_guard_gets_the_verified_url() {
         "scripts/run-all-tests.sh",
     ] {
         let body = read(script);
-        let calls_guard = outside_self_test(&body)
-            .iter()
-            .any(|(_, l)| !l.trim_start().starts_with('#') && l.contains("gate_require_judge_server"));
+        let calls_guard = outside_self_test(&body).iter().any(|(_, l)| {
+            !l.trim_start().starts_with('#') && l.contains("gate_require_judge_server")
+        });
         assert!(
             calls_guard,
             "{script} runs cargo with whatever DATABASE_URL it inherits and does not call \
@@ -3444,7 +3496,9 @@ fn the_eval_reads_a_seeded_scratch_database_and_never_the_live_one() {
         .iter()
         .map(|(_, l)| *l)
         .find(|l| l.trim_start().starts_with("DATABASE_URL=\"$"))
-        .expect("the eval call names no DATABASE_URL, so it would reach whatever the environment holds");
+        .expect(
+            "the eval call names no DATABASE_URL, so it would reach whatever the environment holds",
+        );
     let var = env_line.trim_start()["DATABASE_URL=\"$".len()..]
         .split('"')
         .next()
@@ -3531,7 +3585,9 @@ fn every_section_with_a_count_runs_and_every_count_has_a_section() {
                 }
                 if let Some(section) = tokens.get(at + 1) {
                     let shaped = section.starts_with(|c: char| c.is_ascii_lowercase())
-                        && section.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+                        && section
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
                     if shaped {
                         out.push(section.to_string());
                     }

@@ -76,12 +76,18 @@ const SEED: [&str; 3] = [
 
 /// The rows `SEED` leaves, as (what to count, how many).
 const SEEDED: [(&str, i64); 3] = [
-    ("SELECT count(*) FROM brain_entities WHERE name LIKE 'v046-%'", 2),
+    (
+        "SELECT count(*) FROM brain_entities WHERE name LIKE 'v046-%'",
+        2,
+    ),
     (
         "SELECT count(*) FROM brain_observations WHERE content LIKE 'v046 observation%'",
         2,
     ),
-    ("SELECT count(*) FROM brain_relations WHERE relation_type = 'v046'", 1),
+    (
+        "SELECT count(*) FROM brain_relations WHERE relation_type = 'v046'",
+        1,
+    ),
 ];
 
 /// One line per column, index and constraint of the public schema, sorted, so
@@ -198,7 +204,9 @@ async fn cut_then_head(url: String, cut: i64, reference: &Shape) -> Vec<String> 
             .await
             .expect("counting the seeded rows");
         if got != want {
-            problems.push(format!("seeded rows went missing: `{count}` gives {got}, not {want}"));
+            problems.push(format!(
+                "seeded rows went missing: `{count}` gives {got}, not {want}"
+            ));
         }
     }
     let shape = shape_of(&pool).await;
@@ -291,7 +299,11 @@ async fn a_database_at_any_cut_comes_up_to_head_with_its_rows_and_the_schema_of_
     assert!(
         failures.is_empty(),
         "{} of {} cuts ({cuts:?}) do not come up to head as a fresh database does: {failures:#?}",
-        failures.iter().map(|f| f.split(':').next().unwrap_or("")).collect::<std::collections::BTreeSet<_>>().len(),
+        failures
+            .iter()
+            .map(|f| f.split(':').next().unwrap_or(""))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
         cuts.len()
     );
 }
