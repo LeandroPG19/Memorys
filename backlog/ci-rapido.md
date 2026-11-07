@@ -743,3 +743,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   green; gate_dag 14/15), code `5cf5753` (token 7/7, gate_dag 15/15, local_gate 71/71, gate_history 33/33, doc 26/26, ci
   10/10); merged `bf678f4`. Spec: every token refusal is exit 2. F3.3b-1b-ii (the 8-row table, merge-gate --step, the
   planner in series, flush, TB out) started in worktree `Memorys-ci-f33b1b3` from bf678f4.
+- 2026-11-07 09:16 · T-RLS: the policy text (0017:31-40) confirms the reach — with a '' or unset scope cuba_app sees
+  every project's rows (the RESTRICTIVE principal layer does not restrict while brain_principals is empty). Scenario 1 red
+  again on the hole (left "" / right the project), green with the fix; whole lib 1198. Scenario 2 still green on the hole:
+  likely PgPoolOptions::connect warms one idle connection that before_acquire then scopes; it gets the same barrier as
+  scenario 1 (connect_lazy, one held, the count on the second, size() == 2), or it goes.
