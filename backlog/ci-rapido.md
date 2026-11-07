@@ -770,3 +770,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   33/33, doc 26/26, ci 10/10, 13 self-tests OK); merged `6b22e40`. The judge now runs its table through the planner in
   series. Fourteenth full run started on 6b22e40: the first through the planner, and the first that seeds the serial
   history the DAG needs before it parallelises (D8).
+- 2026-11-07 10:15 · **Fourteenth full run (`6b22e40`, the first through the planner): 4.5 s, exit 2.** P passed, then
+  DBG: «GATE_OWNER is empty, so no lane can say whose it is» — `merge-gate --step` is a new process, gate-lock.sh leaves
+  GATE_OWNER empty and only gate_main sets it after taking the lock; the self-test's fake cluster library did not demand
+  an owner as the real one does. The planner then stopped B3..M as the serial order demands and printed its summary
+  (`dag: T=4.11 … mode=serie`). Handed to the F3.3c implementer as its first item: the fake library demands an owner
+  like the real one, a --step DBG row, --step sets GATE_OWNER from the lock's owner, and a list of what else gate_main
+  prepares that a fresh --step process lacks.
