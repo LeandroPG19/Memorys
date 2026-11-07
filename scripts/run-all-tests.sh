@@ -285,6 +285,11 @@ on_exit() {
 #   ./scripts/run-all-tests.sh --self-test
 # --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
+  # CI-J3: the judge hands its children these names (JUDGE_ENVIRONMENT in local_gate_contract.rs).
+  # The rows here read the ones that change their answer, so this self-test starts without them:
+  # a row that needs one sets it itself.
+  unset GATE_SERVER_SYSTEM_ID CUBA_BINARY_PATH ONNX_MODEL_PATH CUBA_RERANKER_PATH CUBA_NLI_PATH \
+    CUBA_EMBEDDING_DIM
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.
   hermetic="$(mktemp -d)"

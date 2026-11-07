@@ -3166,25 +3166,37 @@ fn relative_to(root: &Path, path: &Path) -> String {
         .into_owned()
 }
 
-/// What `script --self-test` leaves in the two places a judge script writes to (D-J7b): HOME and
-/// XDG_CACHE_HOME, each a fresh, empty directory of the test's own. This environment inherits
-/// `XDG_CACHE_HOME` from the login, and `gate_linux_env` puts its temp under it, so an empty HOME
-/// alone proves nothing. TMPDIR is removed, as an unset TMPDIR is what the script gets here. The
-/// exit code is not read: what the run left is the answer.
-fn left_by_self_test(script: &Path, tag: &str) -> Vec<String> {
+/// Runs `script --self-test` with HOME and XDG_CACHE_HOME, each a fresh, empty directory of the
+/// run's own, and `env` set on top (CI-J3). The judge's names are removed from the inherited
+/// environment first, so a run gets exactly what `env` gives it for them. Returns the run and what
+/// it left in those two directories. This environment inherits `XDG_CACHE_HOME` from the login, and `gate_linux_env`
+/// puts its temp under it, so an empty HOME alone proves nothing. TMPDIR is removed, as an unset
+/// TMPDIR is what the script gets here. The exit code is not read by the leftovers: what the run
+/// left is the answer.
+fn run_self_test(
+    script: &Path,
+    tag: &str,
+    env: &[(&str, &str)],
+) -> (std::process::Output, Vec<String>) {
     let base = std::env::temp_dir().join(format!("selftest-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let home = base.join("home");
     let cache = base.join("xdg-cache");
     std::fs::create_dir_all(&home).expect("creating the empty HOME of the self-test");
     std::fs::create_dir_all(&cache).expect("creating the empty XDG_CACHE_HOME of the self-test");
-    let _ = std::process::Command::new("bash")
+    let mut command = std::process::Command::new("bash");
+    command
         .arg(script)
         .arg("--self-test")
         .current_dir(repo_root())
         .env("HOME", &home)
         .env("XDG_CACHE_HOME", &cache)
-        .env_remove("TMPDIR")
+        .env_remove("TMPDIR");
+    for (name, _) in JUDGE_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    let output = command
+        .envs(env.iter().copied())
         .output()
         .expect("running the self-test of a judge script");
     let mut left: Vec<String> = entries_under(&home)
@@ -3197,7 +3209,12 @@ fn left_by_self_test(script: &Path, tag: &str) -> Vec<String> {
             .map(|entry| format!("XDG_CACHE_HOME/{entry}")),
     );
     let _ = std::fs::remove_dir_all(&base);
-    left
+    (output, left)
+}
+
+/// What `script --self-test` leaves in HOME and XDG_CACHE_HOME (D-J7b). See `run_self_test`.
+fn left_by_self_test(script: &Path, tag: &str) -> Vec<String> {
+    run_self_test(script, tag, &[]).1
 }
 
 /// The self-tests of the judge's scripts are hermetic (D-J7b). Each script that sources
@@ -3245,6 +3262,232 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
         "a self-test of the judge wrote into the HOME or the XDG_CACHE_HOME it was given. A \
          self-test has to leave both as it found them (D-J7b), or a judge that runs next to it \
          loses its output: {leftovers:#?}"
+    );
+}
+
+/// What the judge hands its children in the environment (CI-J3): every name its scripts export
+/// outside their self-tests, and CUBA_GATE_EXIT_FILE, which gate-lock.sh reads from the login. Each
+/// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
+/// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
+/// self-test that takes it as its own fixture's identity is red under any other value.
+const JUDGE_ENVIRONMENT: [(&str, &str); 19] = [
+    ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
+    ("GATE_SERVER_SYSTEM_ID", "1"),
+    ("CUBA_GATE_LOCK_OWNER", "ajeno-0000"),
+    ("CUBA_GATE_EXIT_FILE", "/nonexistent-ajeno/run.exit"),
+    ("CARGO_BUILD_JOBS", "1"),
+    ("GATE_CARGO_JOBS_FROM_GATE", "1"),
+    ("CARGO_TARGET_DIR", "/nonexistent-ajeno/target"),
+    (
+        "CUBA_PEER_DATABASE_URL",
+        "postgresql://ajena:ajena@127.0.0.1:1/ajena",
+    ),
+    ("CUBA_BINARY_PATH", "/nonexistent-ajeno/binary"),
+    ("CUBA_JUDGE", "ajeno"),
+    ("ONNX_MODEL_PATH", "/nonexistent-ajeno/onnx"),
+    ("ORT_DYLIB_PATH", "/nonexistent-ajeno/ort.so"),
+    ("CUBA_RERANKER_PATH", "/nonexistent-ajeno/reranker"),
+    ("CUBA_NLI_PATH", "/nonexistent-ajeno/nli"),
+    ("CUBA_EMBEDDING_DIM", "7"),
+    ("CUBA_EMBED_MODEL", "ajeno"),
+    ("CUBA_POOLING", "ajeno"),
+    ("PYTHONUTF8", "0"),
+    ("PYTHONIOENCODING", "latin-1"),
+];
+
+/// The names the judge's scripts export that no self-test is handed, each with its reason (CI-J3).
+/// Excluded names still have to be exported, or the entry is stale.
+const NOT_HANDED_DOWN: [(&str, &str); 1] = [(
+    "TMPDIR",
+    "gate-lock.sh keeps the TMPDIR it is given when it is on disk, and does not check that it \
+     exists: a missing one breaks every mktemp of every self-test. The judge does not own a foreign \
+     TMPDIR that exists to test with, so there is no value to hand here. Open: whether the judge \
+     should refuse a TMPDIR that does not exist (gate-lock.sh, gate_tmpdir_on_disk)",
+)];
+
+/// The judge's scripts that export into the environment of what they launch.
+const JUDGE_EXPORTERS: [&str; 3] = ["merge-gate.sh", "run-all-tests.sh", "gate-lock.sh"];
+
+/// Whether a self-test passed: it exited 0 and printed its `OK  self-test:` line.
+fn self_test_passed(run: &std::process::Output) -> bool {
+    run.status.success()
+        && String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .any(|line| line.starts_with("OK  self-test:"))
+}
+
+/// The line a failed self-test ends on: its last `FAIL` line, else its last line.
+fn failure_line(run: &std::process::Output) -> String {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    lines
+        .iter()
+        .rev()
+        .find(|line| line.contains("FAIL"))
+        .or(lines.last())
+        .cloned()
+        .unwrap_or_else(|| "(no output)".to_string())
+}
+
+/// The names a line exports, when the line starts with `export`: `export A=1 B="x y"` gives A and
+/// B, and the first word that is neither a name nor an assignment ends the list. A line that only
+/// quotes the word (an echo, a comment) exports nothing.
+fn exported_names(line: &str) -> Vec<String> {
+    let Some(words) = line.trim_start().strip_prefix("export ") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for word in words.split_whitespace() {
+        let name = word.split_once('=').map_or(word, |(name, _)| name);
+        let is_name = !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !is_name {
+            break;
+        }
+        names.push(name.to_string());
+    }
+    names
+}
+
+/// Whether `text` mentions `name` as a whole word.
+fn names_word(text: &str, name: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word == name)
+}
+
+/// CI-J3. The self-tests of the judge's scripts run inside the judge, which hands them its
+/// exported environment (JUDGE_ENVIRONMENT). Each one must pass with those values: a self-test that
+/// reads an inherited name as its own fixture is a test of the judge's machine, not of the script.
+#[test]
+fn every_self_test_passes_under_the_judges_exported_environment() {
+    // The launcher has to hand the judge's names over, or the passes below prove nothing. A probe
+    // that prints its OK line only while GATE_SERVER_SYSTEM_ID is unset passes bare and fails
+    // under the judge's names.
+    let dir = std::env::temp_dir().join(format!("selftest-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("creating the directory of the probe");
+    let probe = dir.join("probe.sh");
+    std::fs::write(
+        &probe,
+        "#!/usr/bin/env bash\nif [[ -z \"${GATE_SERVER_SYSTEM_ID:-}\" ]]; then\n  echo \"OK  self-test: probe\"\nfi\n",
+    )
+    .expect("writing the probe");
+    let bare = run_self_test(&probe, "judge-probe-bare", &[]).0;
+    let judged = run_self_test(&probe, "judge-probe", &JUDGE_ENVIRONMENT).0;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        self_test_passed(&bare) && !self_test_passed(&judged),
+        "the launcher does not hand the judge's environment to a self-test, so the passes of the \
+         real self-tests prove nothing"
+    );
+
+    let mut failed = Vec::new();
+    for name in SCRIPTS_WITH_SELF_TEST {
+        let script = repo_root().join("scripts").join(name);
+        let run = run_self_test(&script, &format!("judge-env-{name}"), &JUDGE_ENVIRONMENT).0;
+        if !self_test_passed(&run) {
+            failed.push(format!(
+                "scripts/{name} exited {:?}: {}",
+                run.status.code(),
+                failure_line(&run)
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "these self-tests do not pass under the judge's exported environment: they inherit it. \
+         Unset what the region inherits, at its start (CI-J3): {failed:#?}"
+    );
+}
+
+/// CI-J3. JUDGE_ENVIRONMENT plus NOT_HANDED_DOWN is every name the judge's scripts export outside
+/// their self-tests, and nothing else. A new export without a decision is red, and so is a listed
+/// name that the scripts no longer mention, or an excluded one the judge no longer exports.
+#[test]
+fn the_judges_exported_environment_list_is_complete() {
+    // The scan has to be able to fail before a clean answer from it means anything.
+    assert_eq!(
+        exported_names("    export ZZ_A=1 ZZ_B=\"x y\" # note"),
+        vec!["ZZ_A", "ZZ_B"]
+    );
+    assert_eq!(
+        exported_names("export CUBA_BINARY_PATH"),
+        vec!["CUBA_BINARY_PATH"]
+    );
+    assert!(
+        exported_names("echo \"or export PATH=<dir>\"").is_empty(),
+        "a line that only quotes `export` exports nothing"
+    );
+
+    let mut exported: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut code = String::new();
+    for file in JUDGE_EXPORTERS {
+        let body = read(&format!("scripts/{file}")).replace("\r\n", "\n");
+        for (_, line) in outside_self_test(&body) {
+            exported.extend(exported_names(line));
+            code.push_str(line);
+            code.push('\n');
+        }
+    }
+    assert!(
+        !exported.is_empty(),
+        "no export found in the judge's scripts: the scan is broken"
+    );
+
+    let handed: Vec<&str> = JUDGE_ENVIRONMENT.iter().map(|(name, _)| *name).collect();
+    let excluded: Vec<&str> = NOT_HANDED_DOWN.iter().map(|(name, _)| *name).collect();
+
+    let unlisted: Vec<&String> = exported
+        .iter()
+        .filter(|name| !handed.contains(&name.as_str()) && !excluded.contains(&name.as_str()))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "the judge exports these names outside its self-tests and neither JUDGE_ENVIRONMENT nor \
+         NOT_HANDED_DOWN lists them. Give each one a foreign value in JUDGE_ENVIRONMENT, or an \
+         excluded entry with its reason (CI-J3): {unlisted:#?}"
+    );
+
+    let stale: Vec<&str> = handed
+        .iter()
+        .chain(excluded.iter())
+        .copied()
+        .filter(|&name| !names_word(&code, name))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these listed names no longer appear outside the self-tests of the judge's scripts: \
+         {stale:?}. Remove them from the list (CI-J3)"
+    );
+
+    let not_exported: Vec<&str> = excluded
+        .iter()
+        .copied()
+        .filter(|&name| !exported.contains(name))
+        .collect();
+    assert!(
+        not_exported.is_empty(),
+        "these excluded names are not exported by the judge any more, so the exclusion is \
+         stale: {not_exported:?}"
+    );
+
+    let both: Vec<&str> = handed
+        .iter()
+        .copied()
+        .filter(|&name| excluded.contains(&name))
+        .collect();
+    assert!(
+        both.is_empty(),
+        "these names are both handed a foreign value and excluded: {both:?}"
     );
 }
 

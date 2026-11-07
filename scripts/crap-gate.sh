@@ -12,6 +12,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 #   ./scripts/crap-gate.sh --self-test
 # --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
+  # CI-J3: the judge hands its children GATE_SERVER_SYSTEM_ID, the identity of its real server. The
+  # rows here answer with their own identity, so this self-test starts without the judge's.
+  unset GATE_SERVER_SYSTEM_ID
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.
   hermetic="$(mktemp -d)"

@@ -729,6 +729,9 @@ mutants_seed_stamp() { # path, size and mtime of every file of the seed (D-F4i)
 # every one of them 1.000, which is the point.
 self_test() {
   local rc
+  # CI-J3: the judge hands its children GATE_SERVER_SYSTEM_ID, the identity of its real server. The
+  # rows here answer with their own identity, so this self-test starts without the judge's.
+  unset GATE_SERVER_SYSTEM_ID
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.
   # Global, not local: the EXIT trap reads it after this function has exited.
