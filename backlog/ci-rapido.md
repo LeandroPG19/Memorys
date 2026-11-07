@@ -329,7 +329,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   cluster_name=memory-industry-gate, durability off, restart unless-stopped (the old :5489 one stays for the old
   judge's F0 run 2). First full run of the new judge in series (F1+F4, before F2/F3 wiring) started under pesado,
   measured like F0.
-- 2026-11-07 03:10 · **F2 split** (my decision; reverted by merging the two halves back into one task): **F2a** =
+- 2026-11-07 03:39 · **F2 split** (my decision; reverted by merging the two halves back into one task): **F2a** =
   `scripts/gate-cluster.sh` standalone (library + hermetic self-test, its own rows B5 with an injectable ready
   timeout so no row waits 30 s, D1, D2, D5, D6, A3, the long `sun_path`), entering `SCRIPTS_WITH_SELF_TEST`
   ([&str; 13]); **F2b** = the wiring into merge-gate/run-all-tests, contracts C1–C5/E1/E2 and the rewrite of the
@@ -338,7 +338,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   in memory: a bare `wait` also waits for a postmaster child; a parent killed by `set -e` leaves orphan postmasters
   (trap + dead-owner sweep); `yes -- -D`. The full new-judge run (F1+F4) is still queued behind Mapupita's
   e2e-c2b under pesado (waiting since 02:57).
-- 2026-11-07 03:20 · Notion synced: CI-F2 and CI-F3 «En curso» (F3.0 and F3.2 commits and evidence), CI-F4 «Hecha» 2/2
+- 2026-11-07 03:39 · Notion synced: CI-F2 and CI-F3 «En curso» (F3.0 and F3.2 commits and evidence), CI-F4 «Hecha» 2/2
   with «Qué se hizo», CI-J2 appended to CI-J; Decisiones rows for PGDG, the change-point rule, the unsigned .exe, npm
   OIDC and the F2 split; Bugs y lecciones rows for J7, the shared target, the NLI latency under contention (open, F3)
   and the bash/postgres lessons. NPM-OIDC registered (batch table, outside the batch) and in Notion. **F3.1 started**
@@ -346,7 +346,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   imports it in pass 2, its frozen contract unchanged), `test-times.sh --units`, contracts in
   gate_history_contract.rs; the merge-gate wiring and its J7b' row move to F3.3. A refuter reads cargo-mutants'
   lab copy (no compiling) for the 204-crate first build per lab.
-- 2026-11-07 03:35 · F4 seed miss, the refuter's reading (cargo-mutants v27.1.0 `src/copy_tree.rs`, the kept logs of
+- 2026-11-07 03:39 · F4 seed miss, the refuter's reading (cargo-mutants v27.1.0 `src/copy_tree.rs`, the kept logs of
   f4-medida-144115): not a path and not a flag. cargo-mutants copies the stage into each lab with `fs::copy` (reflink
   fails on this ext4: `os error 95`; with reflink it would still set mtime = now), so the seed's target lands with
   fresh, unordered mtimes; 68 independent roots (`the dependency X was rebuilt (T1, Δ after …)`, all inside the copy
@@ -357,7 +357,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   every lab's first build. Side finding: the seed key does not record `CARGO_PROFILE_DEV_DEBUG=0` (passed as a
   prefix, not in the environment where the key is computed). Three-arm experiment (fs::copy-like / one mtime /
   cp -a) queued under pesado before any change.
-- 2026-11-07 04:00 · **F2a delivered** (implementer): gate-cluster.sh pass 1 in `Memorys-ci-f2` (red: `A1 …
+- 2026-11-07 03:39 · **F2a delivered** (implementer): gate-cluster.sh pass 1 in `Memorys-ci-f2` (red: `A1 …
   gate_cluster_check: command not found`), pass 2 in scratch `f2copy` (OK); `SCRIPTS_WITH_SELF_TEST` → 13. New rows B5
   (`GATE_CLUSTER_READY_TIMEOUT_S=1`, ~1 s), D1, D2 (`gate_cluster_down_all` in a TERM trap), long path (>107 B socket =
   exit 2 before anything), D6 (no row creates the default root). Two rows fixed that gave a false green (D4 took the exit
@@ -365,14 +365,14 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   caller. 17 sabotages red; the 12 other hermetic self-tests OK on a full copy. **A3 and D5 move to F2b** (they exercise
   merge-gate/run-all-tests, not the library), together with a boundary row at exactly 107 bytes. Verification queued
   under pesado (`verif-f2a.sh`); a reviewer reads pass 2 (kill/rm paths first).
-- 2026-11-07 04:00 · **F3.1 delivered** (implementer): pass 1 in `Memorys-ci-f31` (gate_history_contract.rs, 9 tests,
+- 2026-11-07 03:39 · **F3.1 delivered** (implementer): pass 1 in `Memorys-ci-f31` (gate_history_contract.rs, 9 tests,
   all expected red in their first assert; test-times row U1, red `unknown argument '--units'`), pass 2 in scratch `f31copy`
   (gate_history.py; gate-dag.py imports it, its own writer removed, same fields, corridas.jsonl only gains fields;
   `--units` with a new parse_log class `N` that --count/--judge ignore). 33 Python checks of the contract bodies, 0 fails;
   H1–H6 sabotages red through that harness. Gap noted: no planner fixture for H2 (cpu_s null under a fake cgroup without
   cpu.stat) → F3.3. Verification queued under pesado (`verif-f31.sh`: red, 13 self-tests, three contracts, clippy); a
   reviewer reads pass 2.
-- 2026-11-07 04:25 · F3.1 review (reviewer, reproduced in /tmp/rev-f31): **P0 latent** (from F3.2, copied by F3.1): a
+- 2026-11-07 03:39 · F3.1 review (reviewer, reproduced in /tmp/rev-f31): **P0 latent** (from F3.2, copied by F3.1): a
   non-UTF-8 byte in an old jsonl makes `load_history` raise and the planner exit 1 without running a step; `registrar`
   the same. **P1:** an unbounded `flock` hangs the planner; `registrar` writes 0.0 where nothing was measured and the
   planner takes it as a sample; the flake mark does not compare the step id (lib and lib-ignored share a key). Clean:
@@ -381,7 +381,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   three P2 (no `__pycache__`, one bounds formula, `units()` tolerant) go in now as pass 1b/2b; the huella that also
   hashes untracked files, the remaining D-F3s run fields and units of a signal-killed binary go to F3.3. The queued
   verif-f31 was stopped (it would verify a superseded pass 2).
-- 2026-11-07 04:45 · F2a review (reviewer, reproduced): no confirmed P0. **P1:** `down` can send QUIT/KILL to a recycled
+- 2026-11-07 03:39 · F2a review (reviewer, reproduced): no confirmed P0. **P1:** `down` can send QUIT/KILL to a recycled
   pid (bash reaps background children at once; no identity check as in the sweep); a live owner in another PID namespace
   looks dead to the sweep; six self-test rows green for another cause (the sweep's -D and exe checks not tested apart,
   B4 not reached, D3 hangs instead of failing, D1/D3 go through the 10 s KILL, D6 blind to deletions, D1 code 1 reuses a
@@ -389,29 +389,29 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   time, root/lane/owner not validated. Clean: identity of the sweep on real PG 18.6, Docker postgres (uid 70/999) never
   killable, no bare wait, the password never printed. Decision: spec «F2a · correcciones de la revisión» K1–K10 as pass
   1b/2b; the password in psql's argv in gate-lock.sh goes to F2b. The queued verif-f2a was stopped.
-- 2026-11-07 04:55 · The full new-judge run did not run: when it got pesado, medir-juez.sh refused (exit 2) because I
+- 2026-11-07 03:54 · The full new-judge run did not run: when it got pesado, medir-juez.sh refused (exit 2) because I
   had appended to this backlog in the same tree (a measurement needs the exact tree). Fixed by measuring from a detached,
   clean worktree `Memorys-ci-medir` at `4f34314` (F1+F4, same code as `5c71048`); requeued under pesado.
-- 2026-11-07 05:30 · F3.1 pass 1b/2b delivered: 14 new contract tests (23 total; the 9 old ones untouched), H7–H11 and
+- 2026-11-07 03:54 · F3.1 pass 1b/2b delivered: 14 new contract tests (23 total; the 9 old ones untouched), H7–H11 and
   the three P2, plus a per-process broken-lock flag (after one timeout a process skips later writes). Python harness:
   13/14 new tests red against the old pass 2 (the 14th is a guard), 14/14 green with 2b; 12 sabotages red; the planner's
   exit, normalized output and step fields identical to F3.2 (GATE_DAG 0 and 1, green and red, first and learning run).
   h8 with the lock held: 1.06 s with the flag, 4.08 s without (limit 2.5 s, timeout injected at 1 s). Verification
   queued under pesado (verif-f31.sh).
-- 2026-11-07 06:00 · **mtime experiment (three arms, same seed, the seed's profile env): the refuter's diagnosis
+- 2026-11-07 03:54 · **mtime experiment (three arms, same seed, the seed's profile env): the refuter's diagnosis
   holds.** A (copy without mtimes, like cargo-mutants' fs::copy): 78 Compiling before it stopped, 12 roots «the
   dependency X was rebuilt (T1, Δ after …)», 0 other Dirty reasons (it then failed on rustls' build script: `cp
   --no-preserve=all` drops the exec bit, an artifact of the arm, not of cargo-mutants). B (same copy, one mtime for the
   whole target): **Compiling=1, Fresh=304**. C (cp -a): **Compiling=1, Fresh=304**. So one mtime on a lab's target
   before its first build removes the ≈100–120 s per run; the fix (cargo shim for cargo-mutants, D-F4j over every lab)
   becomes slice **F4d**, after F2/F3.1 free the implementers.
-- 2026-11-07 06:00 · **The first full run of the new judge stopped at 3.8 s on `cargo fmt --check`** (exit 1, the cheap
+- 2026-11-07 03:54 · **The first full run of the new judge stopped at 3.8 s on `cargo fmt --check`** (exit 1, the cheap
   step first, as designed): local_gate_contract.rs (16 hunks) and v046 (4) were never formatted — every verification
   of the batch ran the contracts but never fmt. Fixed in `13c4443` (rustfmt only; token-identical except whitespace,
   commas and closure braces). The verification scripts now check rustfmt of the new contracts. Lesson: a slice's own
   checks include fmt and clippy of what it touched (trabajo-en-lotes), and I skipped them. Measuring tree moved to
   `13c4443`; F3.1 verification and the measurement queued back to back under pesado.
-- 2026-11-07 06:20 · F2a pass 1b/2b delivered (K1–K10): 32 rows red against the old pass 2, the copy OK in **7 s**
+- 2026-11-07 04:04 · F2a pass 1b/2b delivered (K1–K10): 32 rows red against the old pass 2, the copy OK in **7 s**
   (was 33 s: no row waits for the 10 s QUIT→KILL any more); every K sabotage red with its own line; 13 hermetic
   self-tests OK. Stand-ins are small ELF binaries built with cc per run (the identity check needs exe = bindir/postgres).
   **Rejected:** D6 creating a sentinel in the real `/tmp/memory-industry-gate-<uid>` (under F3 lanes it would race real
@@ -419,64 +419,64 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   points it at its own temporary; cluster logs go under `${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/clusters`
   and the region leaves HOME/XDG empty (J7b'); one hand check of K8 on real PG 18.6. Back to the implementer.
   **F4d** (one mtime per mutants lab) handed to an especificador.
-- 2026-11-07 06:50 · **F3.1 verified with cargo:** red on the worktree (gate_history_contract exit 101, 20 FAILED; U1
+- 2026-11-07 04:04 · **F3.1 verified with cargo:** red on the worktree (gate_history_contract exit 101, 20 FAILED; U1
   `unknown argument '--units'`); on the copy gate_dag_contract 14/14, local_gate_contract 61/61, clippy clean, 12
   hermetic self-tests rc 0 with HOME/XDG empty, **gate_history_contract 22/23**: `la_marca_de_intermitente_compara_sha_y_huella`
   finds no flake (`[]`), likely the H10 id comparison against the fixture; rustfmt finds diffs in the new contract.
   Back to the implementer (cause first; a frozen test is not changed without my decision).
-- 2026-11-07 06:50 · **Second full new-judge run stopped at 107 s** (exit 101): lib test
+- 2026-11-07 04:04 · **Second full new-judge run stopped at 107 s** (exit 101): lib test
   `doctor::d3_the_real_check_tells_a_held_port_from_an_address_nobody_owns` (192.0.2.1:8787 held under mirrored
   networking) — the bug already fixed on release/0.31.0 (`2d61589`), which the batch did not carry. Merged
   release/0.31.0 into the batch: `4905e85` (d3 on port 0 and the 0.31 test-time lines). Lib before that: 1192 passed,
   1 failed. Measuring tree moved to `4905e85`.
-- 2026-11-07 06:50 · F2a pass 1c/2c delivered: default root `${GATE_CLUSTER_TMP:-/tmp}/memory-industry-gate-<uid>` (one
+- 2026-11-07 04:04 · F2a pass 1c/2c delivered: default root `${GATE_CLUSTER_TMP:-/tmp}/memory-industry-gate-<uid>` (one
   line), the region on its own temporary with a live sentinel (D6 by name and mtime), K11 computes the default without
   creating it, logs under `${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/clusters` (K7 logs); HOME/XDG empty in all
   13 self-tests; 20 sabotages red; self-test 8 s. K8 on real PG 18.6 by hand: with PGPORT=5488 and PGHOSTADDR=127.0.0.1
   inherited, the lane listens only on `.s.PGSQL.5432`, no TCP, `select 1` through the URL, up in 491 ms (initdb 323,
   ready 168), down leaves nothing. F2a verification and then the third full run queued under pesado.
-- 2026-11-07 07:20 · F3.1: the failing flake test was the fixture: its three seeds had no step `id`, which H10 now
+- 2026-11-07 04:11 · F3.1: the failing flake test was the fixture: its three seeds had no step `id`, which H10 now
   compares and every real `units()` record carries. Approved (still pass 1, no red commit yet): `"id": "tests"` in the
   three seeds; rustfmt applied (only token change: the `use` order rustfmt imposes). Harness: 0 fails on 2b, 13/14 red on
   the old pass 2. Cargo re-verification queued.
-- 2026-11-07 07:20 · **F4d specified** (spec F4 §«F4d · un mtime por laboratorio», handoff ci-rapido-F4d.yml,
+- 2026-11-07 04:11 · **F4d specified** (spec F4 §«F4d · un mtime por laboratorio», handoff ci-rapido-F4d.yml,
   validar-handoff OK): direct `cargo-mutants mutants …` with `CARGO=<shim>` (D-F4m; `--list` stays without it), the shim
   as a production mode `--cargo-shim` acting only in a lab once (D-F4n, D-F4q, D-F4r), **epoch = the seed's newest
   mtime, not the judge's start** (D-F4p: the start would make freshly extracted registry files look newer; reverted in
   one line), D-F4j → `--lab-builds` per lab (`lab builds: hit|miss|unknown`), `CARGO_PROFILE_DEV_DEBUG=0` from one source
   that also enters the seed key (D-F4t; the next run rebuilds the seed once, ≈70 s). QA: 1 Compiling per lab, 0 Dirty,
   54/54 classes, run 2 < 230 s. Implementer started in worktree `Memorys-ci-f4d` (from 2aa31e9).
-- 2026-11-07 07:50 · **F3.1 committed** on `feat/ci-rapido-f31`: red `45c5765` (gate_history_contract exit 101, 20 of 23
+- 2026-11-07 04:15 · **F3.1 committed** on `feat/ci-rapido-f31`: red `45c5765` (gate_history_contract exit 101, 20 of 23
   FAILED; U1 `unknown argument '--units'`), code `39ac8f4`. Verified on a copy with those files: gate_history_contract
   **23/23**, gate_dag_contract 14/14, local_gate_contract 61/61, clippy clean, rustfmt clean, 12 hermetic self-tests rc 0
   with HOME/XDG empty. Handoff validated (`tests: frozen`, commit 39ac8f4). Improver (CC ≤ 6, types, no duplicates)
   started before the merge into the batch.
-- 2026-11-07 08:10 · **Third full new-judge run (`4905e85`) stopped at 171 s** (exit 101) in local_gate_contract, 59/61:
+- 2026-11-07 04:19 · **Third full new-judge run (`4905e85`) stopped at 171 s** (exit 101) in local_gate_contract, 59/61:
   run-all-tests.sh --self-test («alone» row) and mutants-gate.sh --self-test (J1.9) refused by the common sysid guard —
   inside the judge, `cargo test` inherits `GATE_SERVER_SYSTEM_ID` (the real :5490) and the rows' fake psql answers
   another id. No per-slice verification could see it (they all run the contract outside the judge). New slice **CI-J3**
   (spec J-F1 §12): a closed list of what the judge exports to children; a contract runs every self-test with each set to
   a foreign value, and a second contract keeps the list complete both ways against the `export` lines; the fix lives in
   the regions (test code only). Implementer started in worktree `Memorys-ci-j3` (from cf07332).
-- 2026-11-07 08:10 · **F2a verified with cargo:** red on the worktree (row A1 `gate_cluster_check: command not found`;
+- 2026-11-07 04:19 · **F2a verified with cargo:** red on the worktree (row A1 `gate_cluster_check: command not found`;
   contract 59/59 there), copy: gate-cluster self-test OK in 7 s with HOME/XDG empty and no postgres left, 12 other
   self-tests OK, **local_gate_contract 58/59**: `no_judge_script_prints_a_database_url_with_its_credentials` flags
   `gate_cluster_url`'s printf of the URL with its password → it assigns through `printf -v` into a caller-named
   variable (pass 1d/2d). verif-f2a's loop missed gate-audit/gate-cluster (wrong pattern): fixed.
-- 2026-11-07 08:40 · F3.1 improver: gate_history.py max CC 23 → 5 (lower_bounds split; the «null, not zero» rule
+- 2026-11-07 04:26 · F3.1 improver: gate_history.py max CC 23 → 5 (lower_bounds split; the «null, not zero» rule
   written once), gate-dag.py max 7 → 6 (bound 7 → 2, is_step_sample 4 → 2, dead `rounded` removed); one JSONL reader,
   one root, one REPO; full annotations (ParamSpec on the no-verdict decorator); ruff F,B,UP,TC clean. Harness identical
   before/after (0 fails, ALL SAME) and an in-process equivalence of 12 000 seeded cases EQUIV-IDENTICAL, six sabotages
   EQUIV-DIFFERENT. Seen, left for F3.3: `registrar` loses the run line on a unit naming an unknown step (no verdict
   change). Both contracts queued under pesado before the refactor commit.
-- 2026-11-07 09:00 · **F2a committed** (`feat/ci-rapido-f2`): red `87256df` (row A1 `gate_cluster_check: command not
+- 2026-11-07 04:27 · **F2a committed** (`feat/ci-rapido-f2`): red `87256df` (row A1 `gate_cluster_check: command not
   found`), code `df50fe4`; verified on a copy: local_gate_contract 59/59, the 13 hermetic self-tests OK with HOME/XDG
   empty (gate-cluster 7–8 s), no postgres left. Handoff validated (implementador→mejorador, frozen). **F3.1 improver
   committed** `bff10b4` (gate_history_contract 23/23, gate_dag_contract 14/14 on it). **Both merged into the batch:
   `f71cffb` (F3.1), `9e04a47` (F2a).** Seen: the contract's `python3 -c 'import gate_history'` leaves
   `scripts/__pycache__` in the tree (gitignored; to F3.3: PYTHONDONTWRITEBYTECODE in the contract's launcher). F2a's
   improver/architect pass goes with F2b.
-- 2026-11-07 09:30 · CI-J3 delivered (no cargo yet): `run_self_test(script, tag, env)` behind J7b''s launcher; a
+- 2026-11-07 04:38 · CI-J3 delivered (no cargo yet): `run_self_test(script, tag, env)` behind J7b''s launcher; a
   `JUDGE_ENVIRONMENT` of **19** names, measured (the spec's 10 were incomplete: run-all-tests also exports ONNX_MODEL_PATH,
   CUBA_RERANKER_PATH, CUBA_NLI_PATH and CUBA_EMBEDDING_DIM, which break its own self-test when inherited, plus five that
   do not), one exclusion (TMPDIR: a missing one breaks every mktemp, not a foreign value); the region fixes in three
@@ -484,11 +484,11 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   mutants-gate and run-all-tests red under the foreign environment, after, 12/12 OK. Decision (mine): TMPDIR stays
   excluded; whether the judge should refuse a missing TMPDIR is a production change left out (gate-lock.sh keeps an
   inherited TMPDIR on disk without checking it exists) — noted as debt. Red/green with cargo queued.
-- 2026-11-07 09:50 · **CI-J3 committed and merged:** red `4b79cd6` (every_self_test… FAILED: crap-gate and mutants-gate
+- 2026-11-07 04:44 · **CI-J3 committed and merged:** red `4b79cd6` (every_self_test… FAILED: crap-gate and mutants-gate
   J1.9 with sysid 1 inherited, run-all-tests with the reranker at /nonexistent-ajeno; the list contract green, the list
   being complete), fix `4fb2b10` (region lines only), local_gate_contract **63/63**; merged `058cb55`. Fourth full run of
   the new judge started on `058cb55` (F1+F4+F2a lib+F3.1+J3, serial).
-- 2026-11-07 09:50 · F4d delivered (pass 1 in `Memorys-ci-f4d`, pass 2 in scratch): rows F4d.1–F4d.7 with doubles of cargo
+- 2026-11-07 04:44 · F4d delivered (pass 1 in `Memorys-ci-f4d`, pass 2 in scratch): rows F4d.1–F4d.7 with doubles of cargo
   and cargo-mutants, F4b.2's DEBUG arm now «same key» plus an OPT_LEVEL arm, F4b.8 into F4d.4, the contract locator to
   `cargo-mutants mutants`; red `F4b.2 CARGO_PROFILE_DEV_DEBUG: a debug setting from outside built another seed`, green
   38 s; 12 of 17 sabotages red by their own row, 4 caught first by another row, 1 (renamed cargo-mutants double) aborts
@@ -496,20 +496,20 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   Verification queued. **F2b started** (worktree `Memorys-ci-f2b` from 058cb55): wiring in serial mode, rows A3, D5,
   C1–C5, E1, E2, the 107-byte boundary, the caller's D2, rewrites of j11_unset/j11_empty/j16_unset, contracts, the
   password out of psql's argv in gate-lock.sh.
-- 2026-11-07 10:20 · F2b too large for one round: the implementer delivered only part of pass 1 (merge-gate j11_unset/
+- 2026-11-07 04:49 · F2b too large for one round: the implementer delivered only part of pass 1 (merge-gate j11_unset/
   j11_empty rewritten per D-F2c/D-F2k, row A3, contracts E2 and C4, GATE_LANE added to JUDGE_ENVIRONMENT; red
   `j11_unset: no FAIL line names initdb and docs/gate.md`). Split (my decision; reverted by merging them back):
   **F2b-1** = the caller's rows only (A1 order, C1, C5, D1, D2, E1; run-all-tests j16 → D5) with an injected fake
   `gate_cluster_up` instead of new PG fixtures, plus the code in merge-gate/run-all-tests/gate-lock (PGPASSWORD,
   D-F2i) and the docs part E2 needs; **F2b-2** = the real-cluster contract (B1–B3), the rest of docs and AGENTS.md. The
   library rows already in F2a's self-test (A2, D3, D4/K4, K5–K10, the long path) are not duplicated in the caller.
-- 2026-11-07 10:40 · **Fourth full run (`058cb55`): 412.9 s, exit 101** — past fmt, clippy (16 s), the throwaway
+- 2026-11-07 04:51 · **Fourth full run (`058cb55`): 412.9 s, exit 101** — past fmt, clippy (16 s), the throwaway
   brain_gate (fresh, 43 tables), cargo test unit + smoke (≈295 s), then red in the `--ignored` step: lib test
   `sync::chunk::tests::a_deleted_fact_leaves_a_tombstone_even_though_its_key_is_not_called_id` → «connect to test
   database: failed to run sqlx migrations … duplicate key value violates unique constraint "_sqlx_migrations_pkey"»
   (17 of 18 passed). Looks like a first-time race of migrations under parallel tests on the new :5490 server (the old
   judge's :5489 passed it in F0). A debugger reads it (no rerun to approve: a race between two connections is the bug).
-- 2026-11-07 11:00 · Debugger on the `--ignored` red: **not the server, a latent race since 12-ago in lib tests.**
+- 2026-11-07 04:57 · Debugger on the `--ignored` red: **not the server, a latent race since 12-ago in lib tests.**
   `db::tests::a_database_behind_the_binary_is_refused_instead_of_dying_mid_import` (db.rs:1116) holds
   GLOBAL_STATE_GUARD while it deletes and re-inserts the newest `_sqlx_migrations` row (outside sqlx's advisory lock)
   and sets CUBA_SKIP_MIGRATIONS=1; the `test_pool()` helpers of sync/chunk.rs and protocol.rs open a pool without the
@@ -517,14 +517,17 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   read the SKIP. Order-dependent, three faces of one cause. Slice **T-GUARD** on `release/0.31.0` (worktree
   `Memorys-guard`, spec `guard-chunk-protocol.spec.md`): a deterministic interleaving test (two connections, an
   observable barrier, no sleep), then the guard in both helpers; merged into the batch afterwards.
-- 2026-11-07 11:10 · F4d verified with cargo: red on the worktree (local_gate_contract 57/60: the locator
+- 2026-11-07 04:58 · F4d verified with cargo: red on the worktree (local_gate_contract 57/60: the locator
   `each_mutant_builds_only_the_lib_test_it_runs`, plus two that run the red mutants self-test), green copy: 12 hermetic
   self-tests OK with HOME/XDG empty, contract **60/61**: `no_script_looks_for_the_cache_where_the_binary_does_not` flags
   the F4d.7 row's `find "$HOME" "$XDG_CACHE_HOME"` line (mutants-gate.sh:2565). Back to the implementer (the row uses
   its own variable; the contract stays).
-- 2026-11-07 11:30 · T-GUARD pass 1 stopped on the no-skips hook (`#[ignore]` cannot be added; not worked around).
+- 2026-11-07 05:03 · T-GUARD pass 1 stopped on the no-skips hook (`#[ignore]` cannot be added; not worked around).
   Decision (mine): the interleaving test runs in the **normal** lib `cargo test` (the judge's unit step already has
   DATABASE_URL, run-all-tests.sh:1585), fails if DATABASE_URL is missing, and opens the dangerous window only on its
   **own throwaway database** (DATABASE_URL switched under GLOBAL_STATE_GUARD, dropped at the end), so the parallel lib
   tests never see it. No section count changes (the unit step is not a `run_counted` section). Reverted by moving the
   test back under the `--ignored` convention once the hook allows it.
+
+- 2026-11-07 05:10 · **Correction:** the 7-nov entries from «04:00» on were stamped with invented times (up to «11:30»);
+  each one now carries the time of the commit that recorded it (git blame), which is when it was written.
