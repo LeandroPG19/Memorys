@@ -3356,7 +3356,7 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
 /// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
 /// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
 /// self-test that takes it as its own fixture's identity is red under any other value.
-const JUDGE_ENVIRONMENT: [(&str, &str); 22] = [
+const JUDGE_ENVIRONMENT: [(&str, &str); 27] = [
     ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
     // CI-F3.3b-1b-i (D-F3k): merge-gate.sh exports the lock's directory so that the planner can write the
     // lane tickets under it. gate-lock.sh assigns GATE_LOCK itself, so no self-test reads what it inherits.
@@ -3386,6 +3386,15 @@ const JUDGE_ENVIRONMENT: [(&str, &str); 22] = [
     ("CUBA_EMBEDDING_DIM", "7"),
     ("CUBA_EMBED_MODEL", "ajeno"),
     ("CUBA_POOLING", "ajeno"),
+    // CI-J9: the planner hands a step the token of its lane ticket (gate-dag.py, D-F3j). A self-test
+    // that inherits it spends or refuses a ticket of a gate it is not part of.
+    ("CUBA_GATE_LANE_TOKEN", "ajena-0000"),
+    // CI-J9: the planner names these per step (ALLOWED_ENV in gate-dag.py) and the judge does not export
+    // them. They get a foreign value, so a self-test that reads one of them fails here, not under the planner.
+    ("CUBA_EMBED_INTRA_THREADS", "7"),
+    ("CUBA_NLI_INTRA_THREADS", "7"),
+    ("CUBA_RERANK_INTRA_THREADS", "7"),
+    ("MUTANTS_JOBS", "7"),
     ("PYTHONUTF8", "0"),
     ("PYTHONIOENCODING", "latin-1"),
 ];
@@ -3563,16 +3572,19 @@ fn the_judges_exported_environment_list_is_complete() {
          excluded entry with its reason (CI-J3): {unlisted:#?}"
     );
 
+    // CI-J9: a name the planner sets is not exported by the judge's scripts; the planner's own list is
+    // where it is still named, so it is not stale while the planner names it.
+    let planner = planner_allowed_names(&read("scripts/gate-dag.py"));
     let stale: Vec<&str> = handed
         .iter()
         .chain(excluded.iter())
         .copied()
-        .filter(|&name| !names_word(&code, name))
+        .filter(|&name| !names_word(&code, name) && !planner.iter().any(|p| p.as_str() == name))
         .collect();
     assert!(
         stale.is_empty(),
-        "these listed names no longer appear outside the self-tests of the judge's scripts: \
-         {stale:?}. Remove them from the list (CI-J3)"
+        "these listed names no longer appear outside the self-tests of the judge's scripts, nor in \
+         the planner's ALLOWED_ENV: {stale:?}. Remove them from the list (CI-J3, CI-J9)"
     );
 
     let not_exported: Vec<&str> = excluded
@@ -3594,6 +3606,58 @@ fn the_judges_exported_environment_list_is_complete() {
     assert!(
         both.is_empty(),
         "these names are both handed a foreign value and excluded: {both:?}"
+    );
+}
+
+/// The names of the planner's ALLOWED_ENV literal in `gate-dag.py` (CI-J9): the closed list of what a step's
+/// environment may change (D-F3j). Read from the file, so a name the planner adds is judged without this
+/// test changing.
+fn planner_allowed_names(dag: &str) -> Vec<String> {
+    let Some(start) = dag.find("ALLOWED_ENV = frozenset(") else {
+        return Vec::new();
+    };
+    let literal = &dag[start..];
+    let end = literal.find("\n)").unwrap_or(literal.len());
+    literal[..end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// CI-J9. The planner puts names in a step's environment (ALLOWED_ENV), and the judge hands its children
+/// its own (JUDGE_ENVIRONMENT). A name the planner sets that neither list judges is red: the judge would
+/// hand a self-test the planner's value of it without anyone deciding so. The other direction is the
+/// stale check of CI-J3, which now also counts the planner's list as a place where a name is still named.
+#[test]
+fn every_name_the_planner_puts_in_a_step_is_judged() {
+    // The scan has to be able to fail before a clean answer from it means anything.
+    let fixture = "ALLOWED_ENV = frozenset(\n    {\n        \"AA_B\",\n        \"CC\",\n    }\n)\nOTHER = {\"ZZ\"}\n";
+    assert_eq!(
+        planner_allowed_names(fixture),
+        vec!["AA_B".to_string(), "CC".to_string()],
+        "the scan of the planner's ALLOWED_ENV must read its names and nothing after the closing paren"
+    );
+
+    let planner = planner_allowed_names(&read("scripts/gate-dag.py"));
+    assert!(
+        planner.len() >= 5,
+        "the planner's ALLOWED_ENV has {} names: the scan of gate-dag.py is broken",
+        planner.len()
+    );
+
+    let handed: Vec<&str> = JUDGE_ENVIRONMENT.iter().map(|(name, _)| *name).collect();
+    let excluded: Vec<&str> = NOT_HANDED_DOWN.iter().map(|(name, _)| *name).collect();
+    let unjudged: Vec<&String> = planner
+        .iter()
+        .filter(|name| !handed.contains(&name.as_str()) && !excluded.contains(&name.as_str()))
+        .collect();
+    assert!(
+        unjudged.is_empty(),
+        "the planner puts these names in a step's environment, and neither JUDGE_ENVIRONMENT nor \
+         NOT_HANDED_DOWN says what the judge does with them (CI-J9). Give each one a foreign value in \
+         JUDGE_ENVIRONMENT, or an excluded entry with its reason: {unjudged:#?}"
     );
 }
 

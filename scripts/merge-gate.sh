@@ -37,8 +37,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # set GATE_LANE themselves, through the gate.
   # CI-J5: the model names are the judge's (JUDGE_ENVIRONMENT). The rows that read them set them.
   # F2b-fix: the root of the clusters is the judge's too; a row that needs one sets it, or takes the stand-in's default.
+  # CI-J9: the lane token is the judge's too. A row that spends a ticket sets it itself; a self-test that
+  # inherits one would spend or refuse a ticket of a gate it is not part of.
   unset GATE_LANE GATE_CLUSTER_ROOT ONNX_MODEL_PATH ORT_DYLIB_PATH CUBA_RERANKER_PATH CUBA_NLI_PATH CUBA_EMBEDDING_DIM \
-    CUBA_EMBED_MODEL CUBA_POOLING
+    CUBA_EMBED_MODEL CUBA_POOLING CUBA_GATE_LANE_TOKEN
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.
   hermetic="$(mktemp -d)"
