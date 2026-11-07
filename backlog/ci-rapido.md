@@ -799,3 +799,35 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
 - 2026-11-07 11:10 · **CI-J9 committed and merged:** red `c8c8c0e` (gate_lane_token 11/12), fix `a74683a`
   (local_gate 76/76 incl. J3 with JUDGE_ENVIRONMENT at 27 names, lane token 12/12, gate_dag 22/22, gate_history 33/33,
   doc 26/26, ci 10/10); merged `f4d0e83`. Sixteenth full run (through the planner, serial) started.
+- 2026-11-07 11:13 · **Sixteenth full run (`f4d0e83`): 91.3 s, exit 101** — DBG's unit step, local_gate_contract 74/76:
+  merge-gate's self-test row D2 «a gate stopped by INT left '0' in its exit file, not 2» (also under J3). Green in every
+  per-slice verification; red only inside the real judge. Reading: F3.3b-1b-ii runs the planner as a **background job**
+  of merge-gate; a non-interactive bash starts background jobs with SIGINT and SIGQUIT **ignored**, the ignore is
+  inherited by every step and below, and a shell cannot trap a signal ignored at its entry — so the self-test's inner
+  gate never sees its INT. Slice **CI-J10**: the planner gives its steps the default disposition of INT and QUIT, with a
+  test that a step under an ignoring parent sees them default (/proc SigIgn), and the D2 row run under an ignored INT.
+- 2026-11-07 11:19 · F3.3c-2 delivered: per-row CARGO_BUILD_JOBS and ORT pools in the table (none existed: every step
+  asked nproc = 24 jobs), the planner's CPU cap at C instead of 1.25·C, NLI split out of DBG into an **exclusive** row
+  (its 500 ms clock assertion runs alone), MUTANTS_JOBS=6 for M. Decisions D1–D7 accepted (spec F3 «F3.3c-2»). The
+  implementer's admission simulation: GATE_DAG=1 ≈ 614 s (≈10 min), critical path P → DBG → E2E 554 s, CPU bound
+  ≈509 s — not measured. Residual clock risk: v029_accounts, v029_auto_host_beacon, v042 stay in DBG. Verification queued.
+- 2026-11-07 11:28 · F3.3c-2 verified with cargo: red as expected; green copy gate_dag 24/24, lane token 12/12,
+  history/doc/ci green, but local_gate 73/78 and merge-gate's self-test red (F1.2 expects the gate's jobs where the row now
+  sets them; two F3.3b-1b-ii contracts do not skip the NAME=value tokens or count `exclusive` as timed; DAG_LANES still
+  lists NLI before D3). Decision: NLI moves after D3 in DAG_LANES (same tests, two independent sections reordered), and
+  NLI stays a timed row — its block is emitted before the boundary in idx order even if it runs last. Back to the
+  implementer.
+- 2026-11-07 11:36 · **CI-J10 committed and merged:** red `3a64b56` (gate_dag 22/24), fix `e4cb6a7` (gate_dag 24/24,
+  local_gate 76/76, the rest green); merged `f0cf37d`. Seventeenth full run (serial, through the planner) started.
+- 2026-11-07 11:46 · F3.3c-2 corrections delivered (the two F3.3b-1b-ii contracts skip NAME=value tokens and count
+  `exclusive` as timed, NLI's block emitted before the boundary in idx order — checked in flush(); DAG_LANES = CL D1 D2 D3
+  NLI B3 R E; F1.2 accepts each row's jobs and stays red on an unset one). The implementer saw merge-gate's D2_INT row fail
+  2 of 3 on the unpatched base 75b2a7a too — the same INT-ignored mechanism CI-J10 just fixed in the planner (that base
+  does not carry CI-J10); not retried to pass. Re-verification queued; the seventeenth full run (with CI-J10) will tell
+  whether D2 is green inside the real judge.
+- 2026-11-07 12:03 · **Seventeenth full run (`f0cf37d`, serial through the planner, with CI-J9 and CI-J10): every step
+  green — D2 included — and red only at test times:** `v017_relation_scan took 8.47 s, under the floor of 9 s of its line`
+  (the two-way ceiling doing its job: the generative-LLM test got faster). 1520.3 s (DC and CV started cold in their own
+  targets), peak 18.0 GB. The planner's own summary: **LB_run = 578.77 s (critical path P → DBG → E2E)** — the DAG's
+  lower bound on this tree, 9.6 min; T/LB_run 2.63 in series. v017_relation_scan over the four whole runs: 19.18, 9.45,
+  11.24, 8.47 s → by the file's rule (≥ 3 runs, k = 1.3) floor 4, ceiling 25. Slice CI-J11 for that line.
