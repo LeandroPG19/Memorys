@@ -1852,6 +1852,8 @@ run_in_lane dbg "$ROOT/scripts/run-all-tests.sh"
 # after run-all-tests.sh: a server that changed under the run is refused here (D-J1c, A2).
 # A lane is judged when it is made, so only the server of the operator is asked again.
 [[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
+# The models of the --features docs step are the ones of the full run (CI-J5): the same function sets them.
+gate_model_env
 echo "=== cargo clippy/test --features docs ==="
 run_in_lane docs "$BASH" -c 'cd "$1" && cargo clippy --all-targets --features docs -- -D warnings && cargo test --features docs' gate "$ROOT/rust"
 
