@@ -230,6 +230,11 @@ impl Fixture {
     }
 
     fn run(&self, gate_dag: &str) -> Run {
+        self.run_env(gate_dag, &[])
+    }
+
+    /// `run` with more variables for the planner (CI-F3.3b-1b-i: the gate lock and its owner).
+    fn run_env(&self, gate_dag: &str, extra: &[(&str, &str)]) -> Run {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let out_path = self.base.join(format!("salida-{n}.txt"));
         let err_path = self.base.join(format!("error-{n}.txt"));
@@ -244,6 +249,7 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("TMPDIR", &self.tmp)
+            .envs(extra.iter().copied())
             .env("GATE_CGROUP_ROOT", &self.cgroups)
             .env("GATE_PROC_SELF_CGROUP", &self.proc_self)
             .stdout(Stdio::from(File::create(&out_path).expect("stdout file")))
@@ -856,4 +862,35 @@ fn gate_dag_zero_runs_exactly_the_series() {
             "{id} did not run exactly once in series"
         );
     }
+}
+
+// CI-F3.3b-1b-i (D-F3k): a step the planner starts under the gate's lock gets a one-use ticket in the
+// lock's lanes directory, named <idx>-<id> and holding the token it passes in CUBA_GATE_LANE_TOKEN. The
+// lane spends that ticket to inherit the lock (tests/gate_lane_token_contract.rs). A planner run with no
+// lock writes nothing and passes no token, as before.
+#[test]
+fn a_step_under_the_gate_lock_gets_a_one_use_ticket_in_the_lock() {
+    let mut fx = Fixture::new("lane-ticket", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "P", "-", "0", "")]);
+    let lock = fx.base.join("lock");
+    let owner = "pid=1 start=1 where=test since=test token=test";
+    let run = fx.run_env(
+        "0",
+        &[
+            ("GATE_LOCK", lock.to_str().expect("utf-8 path")),
+            ("CUBA_GATE_LOCK_OWNER", owner),
+        ],
+    );
+    assert_green(&run, "a step under the gate lock");
+    let env = read(&fx.control.join("env-P.txt"));
+    let token = env
+        .lines()
+        .find_map(|line| line.strip_prefix("CUBA_GATE_LANE_TOKEN="))
+        .unwrap_or_else(|| panic!("the step got no CUBA_GATE_LANE_TOKEN: {env}"));
+    assert!(!token.is_empty(), "the lane token is empty");
+    let ticket = read(&lock.join("lanes").join("10-P"));
+    assert_eq!(
+        ticket, token,
+        "the ticket in the lock's lanes directory must hold the token the step got"
+    );
 }
