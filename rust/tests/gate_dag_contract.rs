@@ -864,6 +864,131 @@ fn gate_dag_zero_runs_exactly_the_series() {
     }
 }
 
+/// CI-F3.3b-2 (spec F3.3b-1b-iii): with `--timed-end`, the planner prints the boundary line once, before the block of
+/// the first row of class `untimed`, and after the blocks of the timed rows before it. merge-gate.sh judges the test
+/// times up to that line, so the output of the untimed rows never reaches the judge.
+#[test]
+fn the_timed_end_line_is_printed_once_before_the_first_untimed_block() {
+    let mut fx = Fixture::new("marca-no-cronometrada", CPU_FOUR, MEM_OPEN);
+    fx.table(&[
+        (10, "s10", "-", "0.1", ""),
+        (20, "s20", "-", "0.1", ""),
+        (30, "s30", "-", "0.1", ""),
+    ]);
+    // s20 and s30 are the untimed rows: their class is `untimed` in the table.
+    let text: String = read(&fx.table)
+        .lines()
+        .map(|line| {
+            if line.starts_with("20 s20 ") || line.starts_with("30 s30 ") {
+                line.replacen(" normal ", " untimed ", 1)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    write(&fx.table, &text);
+    let output = Command::new("python3")
+        .arg("-I")
+        .arg(repo_root().join("scripts/gate-dag.py"))
+        .arg("run")
+        .arg("--table")
+        .arg(&fx.table)
+        .arg("--timed-end")
+        .arg("=== end of timed steps ===")
+        .env("GATE_DAG", "0")
+        .env("CI_TIEMPOS_DIR", &fx.history)
+        .env("HOME", &fx.home)
+        .env("XDG_CACHE_HOME", fx.home.join(".cache"))
+        .env("TMPDIR", &fx.tmp)
+        .env("GATE_CGROUP_ROOT", &fx.cgroups)
+        .env("GATE_PROC_SELF_CGROUP", &fx.proc_self)
+        .output()
+        .expect("python3 -I scripts/gate-dag.py");
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the planner exited {:?}: {out}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let at = |needle: &str| {
+        out.lines()
+            .position(|line| line == needle)
+            .unwrap_or_else(|| panic!("no line `{needle}` in the planner's stdout: {out}"))
+    };
+    let marks = out
+        .lines()
+        .filter(|line| *line == "=== end of timed steps ===")
+        .count();
+    assert_eq!(
+        marks, 1,
+        "the boundary line must be printed once, found {marks}: {out}"
+    );
+    let (p10, mark, p20) = (
+        at("=== s10 banner"),
+        at("=== end of timed steps ==="),
+        at("=== s20 banner"),
+    );
+    assert!(
+        p10 < mark && mark < p20,
+        "the boundary (line {mark}) must sit between the timed block of s10 ({p10}) and the first untimed block of s20 ({p20})"
+    );
+}
+
+/// CI-F3.3b-2 (D-F3e): a block reaches the pipe when its step ends, before the next step starts. Without the flush
+/// the blocks of a series sit in python's buffer until the planner exits, and a gate cut between two steps shows
+/// none of the steps it had already finished.
+#[test]
+fn a_finished_block_is_written_before_the_next_step_starts() {
+    let mut fx = Fixture::new("flush-bloque", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "s10", "-", "0.1", ""), (20, "s20", "-", "4", "")]);
+    let out_path = fx.base.join("salida-flush.txt");
+    let mut child = Command::new("python3")
+        .arg("-I")
+        .arg(repo_root().join("scripts/gate-dag.py"))
+        .arg("run")
+        .arg("--table")
+        .arg(&fx.table)
+        .env("GATE_DAG", "0")
+        .env("CI_TIEMPOS_DIR", &fx.history)
+        .env("HOME", &fx.home)
+        .env("XDG_CACHE_HOME", fx.home.join(".cache"))
+        .env("TMPDIR", &fx.tmp)
+        .env("GATE_CGROUP_ROOT", &fx.cgroups)
+        .env("GATE_PROC_SELF_CGROUP", &fx.proc_self)
+        .stdout(Stdio::from(File::create(&out_path).expect("stdout file")))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("python3 -I scripts/gate-dag.py");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if read(&out_path).contains("=== s10 banner") {
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            panic!(
+                "the planner ended (exit {:?}) before the block of s10 reached its stdout: {}",
+                status.code(),
+                read(&out_path)
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the block of s10 never reached stdout: {}", read(&out_path));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "the block of s10 reached stdout only when the planner had already ended, so it sat in the buffer \
+         and a gate cut between two steps would have shown none of it"
+    );
+    let _ = child.wait();
+}
+
 // CI-F3.3b-1b-i (D-F3k): a step the planner starts under the gate's lock gets a one-use ticket in the
 // lock's lanes directory, named <idx>-<id> and holding the token it passes in CUBA_GATE_LANE_TOKEN. The
 // lane spends that ticket to inherit the lock (tests/gate_lane_token_contract.rs). A planner run with no

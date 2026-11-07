@@ -272,3 +272,72 @@ fn a_direct_child_without_a_token_still_inherits_as_before() {
         out.text()
     );
 }
+
+/// The step's own check, as `--step` runs it before its lane: it reads the ticket and spends nothing.
+const CHECK_ONLY: &str = r#"
+. "$LIB"
+lock="$T/lock"
+lane_token_check "$lock" "$CUBA_GATE_LOCK_OWNER"
+echo "check=$?"
+"#;
+
+/// The step's check, then the lane's inheritance: the lane still inherits, because the check spent nothing.
+const CHECK_THEN_LANE: &str = r#"
+. "$LIB"
+lock="$T/lock"
+lane_token_check "$lock" "$CUBA_GATE_LOCK_OWNER" || exit 9
+inherit_gate_lock "$lock"
+echo "rc=$?"
+"#;
+
+// CI-F3.3b-2 (D-F3k, spec F3.3b-1b-ii): `--step` checks the planner's ticket and spends nothing. The lane that
+// the step starts is the one that spends it, so the step never takes a ticket its own lane needs.
+#[test]
+fn a_step_check_reads_the_ticket_and_spends_nothing() {
+    let body = format!("{OWN_RECORD}\n{VIA_PLANNER}\n");
+    let out = owner("step-check", &body, "tok", "tok", CHECK_ONLY);
+    assert!(
+        out.out.contains("check=0"),
+        "the step's check refused the ticket the planner planted\n{}",
+        out.text()
+    );
+    assert!(
+        !ticket_spent(&out.lock),
+        "the step's check spent the ticket its lane has to spend"
+    );
+}
+
+#[test]
+fn a_lane_inherits_after_its_step_checked_the_ticket() {
+    let body = format!("{OWN_RECORD}\n{VIA_PLANNER}\n");
+    let out = owner("step-then-lane", &body, "tok", "tok", CHECK_THEN_LANE);
+    assert!(
+        out.out.contains("rc=0"),
+        "the lane was refused after its step checked the ticket\n{}",
+        out.text()
+    );
+    assert!(
+        ticket_spent(&out.lock),
+        "the lane inherited without spending its ticket"
+    );
+}
+
+#[test]
+fn a_step_check_refuses_a_ticket_that_is_not_the_planted_one_and_spends_nothing() {
+    let body = format!("{OWN_RECORD}\n{VIA_PLANNER}\n");
+    let out = owner("step-foreign", &body, "other", "tok", CHECK_ONLY);
+    assert!(
+        out.out.contains("check=1"),
+        "the step's check accepted a token that is not planted\n{}",
+        out.text()
+    );
+    assert!(
+        out.err.contains("lane token refused"),
+        "the refusal does not say it was a lane token: {}",
+        out.err
+    );
+    assert!(
+        !ticket_spent(&out.lock),
+        "a refused check spent the planted ticket"
+    );
+}

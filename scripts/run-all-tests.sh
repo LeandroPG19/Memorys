@@ -443,6 +443,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
     mkdir -p "$t/scripts" "$t/rust"
     cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" "$ROOT/scripts/gate-cluster.sh" \
        "$ROOT/scripts/run-all-tests.sh" "$ROOT/scripts/mutants-gate.sh" "$t/scripts/"
+    # CI-F3.3b-2: merge-gate.sh runs its steps through the planner, which reads this table and gate_history.py.
+    cp "$ROOT/scripts/gate-dag.py" "$ROOT/scripts/gate_history.py" "$ROOT/scripts/gate-dag.txt" "$t/scripts/"
     cp "$ROOT/package.json" "$t/"
     printf '#!/bin/sh\nexit 0\n' >"$t/scripts/advisory-exceptions.sh"
     chmod +x "$t/scripts/advisory-exceptions.sh"
