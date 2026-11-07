@@ -640,3 +640,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
 - 2026-11-07 07:38 · **F2b-fix committed and merged:** red `700a5c2` (merge-gate row «the step of lane cov did not see
   GATE_CLUSTER_ROOT»; contract 68/70), fix `f6a7277` (contract 70/70, gate_dag 14/14, gate_history 23/23); merged `c8dcdba`.
   Ninth full run (lanes) started on c8dcdba; F3.3b-1 started in worktree `Memorys-ci-f33b1` from c8dcdba.
+- 2026-11-07 07:54 · F3.3b-1 delivered, cut (accepted): run-all-tests takes several `--lane` in one call (validated
+  before the lock), R and E re-read the release binary (REL_BIN/REL_SHA recomputed), E provisions its own brain_gate only
+  when missing; merge-gate runs four chains on their clusters — dbg (CL D1 D2 NLI D3), b3, rel (R), e2e (E) — then docs,
+  cov and mut as before; a contract that the chains cover every lane of the table once, in idx order. Found and fixed in
+  the copy: lane_B3's release CARGO_BUILD_JOBS leaked into E's provisioning (restored), check_section_lines per chain.
+  Red: `--lane CL --lane D1 did not run CL and then D1`, merge-gate C1. **F3.3b-1b** (to come): table rows P, B1, DC, TB,
+  CV, M, the joined log, the serial history and the T/LB summary. Verification queued.
