@@ -450,7 +450,23 @@ gate_require_judge_server() {
   command -v psql >/dev/null 2>&1 \
     || gate_refuse "psql is not on PATH, so the judge cannot read which server DATABASE_URL names (cluster_name and system_identifier). Install the PostgreSQL client tools."
   port="$(gate_url_port "$url")"
-  identity="$(PGOPTIONS='-c default_transaction_read_only=on' psql -X -At -F '|' -d "${url%/*}/postgres" \
+  # The password goes to libpq in PGPASSWORD, for this one call, and never in the argv of psql (A F2b):
+  # ps shows the argv to every user. The maintenance database is asked without it, and the value is
+  # decoded here, since libpq reads PGPASSWORD raw and the URL carries it percent-encoded.
+  local base head hostpart user dsn userinfo pw
+  base="${url%/*}/postgres"
+  head="${base%%:*}"
+  hostpart="${base#*@}"
+  userinfo="${base#*://}"
+  userinfo="${userinfo%%@*}"
+  user="${userinfo%%:*}"
+  dsn="${head}://${user}@${hostpart}"
+  pw=""
+  if [[ "$userinfo" == *:* ]]; then
+    pw="${userinfo#*:}"
+    pw="$(printf '%b' "${pw//%/\\x}")"
+  fi
+  identity="$(PGPASSWORD="$pw" PGOPTIONS='-c default_transaction_read_only=on' psql -X -At -F '|' -d "$dsn" \
     -c "select current_setting('cluster_name'), system_identifier from pg_control_system()" 2>/dev/null)" || identity=""
   identity="${identity%$'\r'}"
   [[ "$identity" =~ $identity_re ]] \
@@ -463,6 +479,20 @@ gate_require_judge_server() {
   # the run is refused here, at every step that asks, and not only in run-all-tests.sh.
   if [[ -n "${GATE_SERVER_SYSTEM_ID:-}" && "$GATE_SERVER_SYSTEM_ID" != "$sysid" ]]; then
     gate_refuse "the server changed under this run: merge-gate.sh read system_identifier $GATE_SERVER_SYSTEM_ID and this run reads $sysid on the same DATABASE_URL. Nothing is judged; find out what answers on that port."
+  fi
+  # D-F2i: a lane (GATE_LANE set) is judged by its own name and by its own socket under this root. Its
+  # cluster_name is memory-industry-gate-<lane> and nothing else, and its URL is never TCP.
+  if [[ -n "${GATE_LANE:-}" ]]; then
+    [[ "$cn" == "memory-industry-gate-$GATE_LANE" ]] \
+      || gate_refuse "lane $GATE_LANE is served by '$cn' (system_identifier $sysid), not by memory-industry-gate-$GATE_LANE: lanes do not cross (D-F2i)."
+    [[ -n "${GATE_CLUSTER_ROOT:-}" && "${url#*@}" == "${GATE_CLUSTER_ROOT//\//%2F}%2F"* ]] \
+      || gate_refuse "lane $GATE_LANE has a URL that is not a socket under ${GATE_CLUSTER_ROOT:-no root} (D-F2i): a lane is never TCP."
+    GATE_JUDGE_SYSID="$sysid"
+    local sockdir="${url#*@}"
+    sockdir="${sockdir%:*}"
+    sockdir="${sockdir%/*}"
+    echo "OK  judge server $GATE_LANE socket $(printf '%b' "${sockdir//%/\\x}") (cluster_name=$cn, system_identifier=$sysid)"
+    return 0
   fi
   GATE_JUDGE_SYSID="$sysid"
   echo "OK  judge server :$port (cluster_name=$cn, system_identifier=$sysid)"

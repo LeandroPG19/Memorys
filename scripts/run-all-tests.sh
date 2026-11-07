@@ -201,6 +201,8 @@ fi
 # COMMENT, and the exit drops only those still carrying it.
 # shellcheck source=scripts/gate-lock.sh
 source "$ROOT/scripts/gate-lock.sh"
+# shellcheck source=scripts/gate-cluster.sh
+source "$ROOT/scripts/gate-cluster.sh"
 GATE_OWNED_DBS=()
 
 # The admin connection and psql_url are defined further down; these three only
@@ -268,6 +270,7 @@ release_owned_databases() {
 # parent's to write.
 on_exit() {
   local code=$?
+  gate_cluster_down_all
   [[ -z "$GATE_LOCK_HELD" ]] || exit_file_verdict "$code"
   release_owned_databases
   release_gate_lock
@@ -1205,7 +1208,20 @@ trap on_exit EXIT
 # carry the cluster_name mark is refused here, whatever its port. Under merge-gate.sh
 # this repeats the check, which costs nothing. The system_identifier merge-gate.sh
 # read must be the one this run reads (D-J1c).
-gate_require_judge_server "${DATABASE_URL:-}"
+# D5 (CI-F2, D-F2c): run on its own, with no DATABASE_URL, on Linux, this script makes its dbg lane after
+# taking the lock, runs against that lane, and takes it down on exit (on_exit). Under merge-gate.sh the
+# lock is inherited (CUBA_GATE_LOCK_OWNER) and merge-gate.sh has made the lane of the step: nothing here.
+# --check-models asks no server, so it makes no lane and needs none.
+if [[ -z "${DATABASE_URL:-}" && -z "${CUBA_GATE_LOCK_OWNER:-}" && "${1:-}" != --check-models && "$(uname -s)" == Linux ]]; then
+  unset GATE_SERVER_SYSTEM_ID
+  gate_cluster_check
+  gate_cluster_sweep
+  gate_cluster_up dbg
+  export DATABASE_URL="$GATE_CLUSTER_URL" GATE_LANE=dbg
+fi
+if [[ "${1:-}" != --check-models || -n "${DATABASE_URL:-}" ]]; then
+  gate_require_judge_server "${DATABASE_URL:-}"
+fi
 
 # Under HOME/.cache and nowhere else, because that is where the binary keeps
 # them: envs::home() joins `.cache` to HOME, and nothing in the crate reads

@@ -14,6 +14,8 @@ cd "$ROOT"
 #   ./scripts/run-all-tests.sh --self-test   (its fixtures drive this script too)
 # shellcheck source=scripts/gate-lock.sh
 source "$ROOT/scripts/gate-lock.sh"
+# shellcheck source=scripts/gate-cluster.sh
+source "$ROOT/scripts/gate-cluster.sh"
 
 # --- self-test: the exit file against the fixtures that have to stop it ------
 # ~/.cache/cuba-gate/run.exit is what gets read when the session that launched
@@ -1501,6 +1503,7 @@ write_receipt() {
 GATE_REACHED_END=""
 on_exit() {
   local code=$? tenths=0 stopped=0
+  gate_cluster_down_all
   if (( code == 0 )) && [[ -z "$GATE_REACHED_END" ]]; then
     code=2
     stopped=1
@@ -1524,6 +1527,9 @@ on_exit() {
 acquire_gate_lock "$GATE_LOCK" || exit 1
 exit_file_running
 trap on_exit EXIT
+# bash does not run the EXIT trap for an INT that arrives while a child is running (measured in the
+# D2 rows): this trap makes the verdict 2 and lets on_exit take the lanes down and write the exit file.
+trap 'exit 2' INT
 export CUBA_GATE_LOCK_OWNER="$GATE_OWNER"
 
 # Whatever this commit's earlier receipt said, this run is its verdict now: a
@@ -1542,6 +1548,11 @@ exec 3>&1 4>&2
 exec > >(tee "$GATE_LOG") 2>&1
 GATE_TEE=$!
 [[ -z "$GATE_NO_RECEIPT" ]] || echo "note: this run will leave no receipt for scripts/release.sh: $GATE_NO_RECEIPT"
+# D-F2k: a DATABASE_URL of the operator is the server of every step, and no lane is made. Said before the
+# banner, so the lines the readiness check prints stay where they were.
+if [[ -n "${DATABASE_URL:-}" ]]; then
+  echo "note: DATABASE_URL names a server this judge did not make, so every step shares that server and no lane is made (D-F2k)"
+fi
 
 # CARGO_BUILD_JOBS for every cargo call of this run, counted once (CI-F1, D-F1a): the CPUs
 # of the cgroup this gate runs in, under nproc's. Before the banner, because the banner
@@ -1623,7 +1634,20 @@ fi
 # brain_gate from is refused before libpq is asked, for the reason gate-lock.sh
 # gives: it would judge one server ready and create the throwaway databases on another.
 export DATABASE_URL="${DATABASE_URL:-}"
-gate_require_given_database_url "$DATABASE_URL"
+GATE_LANES=""
+if [[ -z "$DATABASE_URL" && "$(uname -s)" == Linux ]]; then
+  GATE_LANES=1
+fi
+if [[ -n "$GATE_LANES" ]]; then
+  # A lane reads its own identity when it is made: an inherited GATE_SERVER_SYSTEM_ID is not this run's.
+  unset GATE_SERVER_SYSTEM_ID
+  # D-F2c, D-F2j: with no DATABASE_URL on Linux, each step gets a lane this gate makes under the cluster
+  # root. The library's cheap checks come before the audit (a judge without the binaries or the locale is
+  # refused in seconds), and the sweep takes what a judge that died left behind, before the audit too.
+  gate_cluster_check
+  gate_cluster_sweep
+else
+  gate_require_given_database_url "$DATABASE_URL"
 
 # Without pg_isready the server is asked through the container that publishes the
 # port DATABASE_URL names, not through one picked by name: the name says nothing
@@ -1713,6 +1737,29 @@ fi
 # Before cargo audit, the first step that uses the network. The system_identifier it
 # read goes to run-all-tests.sh, which reads it again and refuses a server that changed (D-J1c).
 export GATE_SERVER_SYSTEM_ID="$GATE_JUDGE_SYSID"
+fi
+
+# One lane per step (D-F2c): the step's server is made here, and its URL, GATE_LANE and
+# GATE_SERVER_SYSTEM_ID are in the environment of that step only. The lane is taken down after its step,
+# whatever the step said. With a DATABASE_URL of the operator there are no lanes: the step runs as it did.
+gate_lane_up() {
+  gate_cluster_up "$1"
+  GATE_LANE="$1" gate_require_judge_server "$GATE_CLUSTER_URL"
+  LANE_URL="$GATE_CLUSTER_URL"
+  LANE_SYSID="$GATE_JUDGE_SYSID"
+}
+run_in_lane() {
+  local lane="$1" rc=0
+  shift
+  if [[ -z "$GATE_LANES" ]]; then
+    "$@"
+    return
+  fi
+  gate_lane_up "$lane"
+  env DATABASE_URL="$LANE_URL" GATE_LANE="$lane" GATE_SERVER_SYSTEM_ID="$LANE_SYSID" "$@" || rc=$?
+  gate_cluster_down "$lane"
+  return "$rc"
+}
 
 # The advisories are judged before the 20-minute test run: a judge idle for days
 # found its new advisory half an hour in, when 3 s would have said it. cargo audit
@@ -1783,14 +1830,14 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 # The copy of the real corpus is not a judge step (P1 a): respaldo-memoria.timer,
 # outside this repo, makes it. The judge never touches the live server.
 
-"$ROOT/scripts/run-all-tests.sh"
+run_in_lane dbg "$ROOT/scripts/run-all-tests.sh"
 
 # The identity is asked again before the --features docs step, which reads the database
 # after run-all-tests.sh: a server that changed under the run is refused here (D-J1c, A2).
-gate_require_judge_server "$DATABASE_URL"
+# A lane is judged when it is made, so only the server of the operator is asked again.
+[[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
 echo "=== cargo clippy/test --features docs ==="
-(cd "$ROOT/rust" && cargo clippy --all-targets --features docs -- -D warnings)
-(cd "$ROOT/rust" && cargo test --features docs)
+run_in_lane docs "$BASH" -c 'cd "$1" && cargo clippy --all-targets --features docs -- -D warnings && cargo test --features docs' gate "$ROOT/rust"
 
 # The line where the timed steps end (D-F2c): test-times.sh sums the `finished in` of the
 # test calls above it (run-all-tests.sh and --features docs) and nothing after. It is printed
@@ -1800,10 +1847,10 @@ TIMED_STEPS_END='=== end of timed steps ==='
 echo "$TIMED_STEPS_END"
 
 echo "=== crap-gate (coverage floor) ==="
-"$ROOT/scripts/crap-gate.sh"
+run_in_lane cov "$ROOT/scripts/crap-gate.sh"
 
 echo "=== mutants-gate ==="
-"$ROOT/scripts/mutants-gate.sh"
+run_in_lane mut "$ROOT/scripts/mutants-gate.sh"
 
 echo "=== test times (scripts/test-time-ceilings.txt) ==="
 # Last, so a time red (drift, not broken behaviour) still leaves the verdicts of
