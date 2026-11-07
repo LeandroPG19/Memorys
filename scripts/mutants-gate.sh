@@ -651,6 +651,8 @@ PY
 # keys are kept. Nothing writes into a seed during a run: each run mutates a stage with a
 # copy of it (cp -a, so no inode is shared), and the seed is compared before and after.
 MUTANTS_SEED_FORMAT=seed-v1
+# D-F4t: the one source of the profile the mutation builds use, in the key, in the seed build and in cargo-mutants.
+MUTANTS_PROFILE_ENV=(CARGO_PROFILE_DEV_DEBUG=0)
 mutants_seed_inputs() { # the inputs the key is the hash of (D-F4d)
   local f v
   printf 'format=%s\n' "$MUTANTS_SEED_FORMAT"
@@ -679,8 +681,7 @@ mutants_seed_prune() { # keeps the two newest keys under the seed root, and only
 }
 mutants_seed_ensure() {
   local key tmpdir pkg start left
-  SEED_BUILT=0
-  mutants_seed_inputs > "$OUT_DIR/seed-key.txt"
+  ( export "${MUTANTS_PROFILE_ENV[@]}"; mutants_seed_inputs ) > "$OUT_DIR/seed-key.txt"
   key="$(sha256sum "$OUT_DIR/seed-key.txt" | cut -d' ' -f1)"
   SEED_DIR="$SEED_ROOT/$key"
   [[ ! -d "$SEED_DIR/target" ]] || return 0
@@ -692,7 +693,7 @@ mutants_seed_ensure() {
   mutants_copy_tree "$ROOT/rust" "$tmpdir/src"
   pkg="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/rust/Cargo.toml" 2>/dev/null | head -n 1 || true)"
   start=$SECONDS
-  if ! (cd "$tmpdir/src" && CARGO_TARGET_DIR="$tmpdir/target" CARGO_PROFILE_DEV_DEBUG=0 \
+  if ! (cd "$tmpdir/src" && env "${MUTANTS_PROFILE_ENV[@]}" CARGO_TARGET_DIR="$tmpdir/target" \
       CARGO_BUILD_JOBS="$GATE_CARGO_JOBS" cargo test --no-run --lib --package="memory-industry@$pkg"); then
     rm -rf "$tmpdir"
     echo "FAIL: the mutation seed did not build; its dependencies are above" >&2
@@ -708,7 +709,6 @@ mutants_seed_ensure() {
   fi
   rm -rf "$tmpdir/src"
   mv -T "$tmpdir" "$SEED_DIR" || { rm -rf "$tmpdir"; return 1; }
-  SEED_BUILT=1
   echo "seed: built $key in $((SECONDS - start)) s"
   mutants_seed_prune
 }
@@ -719,6 +719,105 @@ mutants_stage_make() { # this run's stage: a copy of rust/ and of the seed's tar
 }
 mutants_seed_stamp() { # path, size and mtime of every file of the seed (D-F4i)
   (cd "$1" && find . -printf '%p %s %T@\n' | LC_ALL=C sort)
+}
+# D-F4n..D-F4r (F4d): the cargo that cargo-mutants calls for a lab. In a lab it gives the lab's target one
+# mtime, once, so that cargo does not rebuild the 204 dependencies that fs::copy made look older than their
+# sources. Everywhere else, and in every case, it hands the same argv to the real cargo.
+mutants_cargo_shim() { # ARGS: cargo's own
+  local real="${MUTANTS_SHIM_REAL_CARGO:-}" scr="${MUTANTS_SHIM_SCRATCH:-}" epoch="${MUTANTS_SHIM_EPOCH:-}" log="${MUTANTS_SHIM_LOG:-}" lab start ms n
+  if [[ -z "$real" || ! -x "$real" ]]; then
+    echo "FAIL: no cargo to hand to the shim" >&2
+    exit 2
+  fi
+  lab="$(pwd -P)"
+  if [[ -n "$scr" && "$(dirname "$lab")" == "$scr" && "$(basename "$lab")" == cargo-mutants-*.tmp \
+        && -d "$lab/target" && ! -L "$lab/target" && ! -e "$lab/target/.mi-mtime-normalized" \
+        && "$epoch" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    start=$(date +%s%3N)
+    : > "$lab/target/.mi-mtime-normalized"
+    find "$lab/target" -xdev -exec touch -h -d "@$epoch" -- {} + 2>/dev/null || { echo "warning: mtime shim: normalize failed in $(basename "$lab")" >&2; [[ -z "$log" ]] || echo "normalize failed in $(basename "$lab")" >> "$log"; }
+    ms=$(( $(date +%s%3N) - start ))
+    n="$(find "$lab/target" | wc -l)"
+    [[ -z "$log" ]] || echo "normalized $(basename "$lab") @$epoch $n entries $ms ms" >> "$log"
+  fi
+  export CARGO="$real"
+  unset MUTANTS_SHIM_REAL_CARGO MUTANTS_SHIM_SCRATCH MUTANTS_SHIM_EPOCH MUTANTS_SHIM_LOG
+  exec "$real" "$@"
+}
+# D-F4j' (F4d): the first build of each lab, in the order of outcomes.json, and the shim's line. Neither is a
+# verdict: the exit is 0 always. A miss is time, not precision (D-F4j).
+mutants_lab_builds() { # OUTCOMES
+  "$PY" - "$1" <<'PY'
+import json, os, re, sys
+
+path = sys.argv[1]
+base = os.path.dirname(os.path.abspath(path))
+shim_log = os.path.join(os.path.dirname(base), "mtime-shim.log")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+COMPILING = re.compile(r"^\s*Compiling (\S+) v\S+ \((.*)\)\s*$")
+
+def build_phase(lines):
+    compiles, in_build = [], False
+    for raw in lines:
+        line = ANSI.sub("", raw)
+        if line.startswith("*** ") and " test --no-run" in line:
+            in_build = True
+        elif in_build and line.startswith("*** result:"):
+            break
+        elif in_build and re.match(r"^\s*Compiling ", line):
+            m = COMPILING.match(line)
+            compiles.append((m.group(1), m.group(2)) if m else ("?", ""))
+    return compiles
+
+try:
+    outcomes = json.load(open(path, encoding="utf-8"))["outcomes"]
+    if not isinstance(outcomes, list):
+        raise ValueError("outcomes is not a list")
+except Exception as err:
+    print(f"lab builds: unknown (the outcomes do not read: {err})")
+    sys.exit(0)
+
+labs = {}
+for outcome in outcomes:
+    rel = outcome.get("log_path") if isinstance(outcome, dict) else None
+    if not isinstance(rel, str):
+        continue
+    try:
+        with open(os.path.join(base, rel), encoding="utf-8", errors="replace") as log:
+            compiles = build_phase(log.read().splitlines())
+    except OSError:
+        continue
+    named = [path_ for crate, path_ in compiles if crate == "memory-industry"]
+    if not named:
+        continue
+    lab = os.path.basename(named[0])
+    if lab not in labs:
+        labs[lab] = (len(compiles), compiles[0][0] == "memory-industry")
+
+if not labs:
+    print("lab builds: unknown (no log of the outcomes names a lab)")
+    sys.exit(0)
+k = len(labs)
+misses = [(lab, n) for lab, (n, only_crate) in labs.items() if not (n == 1 and only_crate)]
+if misses:
+    detail = "; ".join(f"{lab}: {n} crates in its first build" for lab, n in misses)
+    print(f"lab builds: miss in {len(misses)} of {k} labs ({detail})")
+else:
+    print(f"lab builds: hit in {k} of {k} labs (each first build compiled 1 crate)")
+
+if os.path.exists(shim_log):
+    with open(shim_log, encoding="utf-8", errors="replace") as log:
+        rows = [line.split() for line in log.read().splitlines() if line.strip()]
+    done = [r for r in rows if r[0] == "normalized" and len(r) >= 6]
+    failed = [r[-1] for r in rows if r[:2] == ["normalize", "failed"]]
+    epoch = done[0][2][1:] if done else "?"
+    line = f"mtime shim: normalized {len(done)} of {k} labs at @{epoch}"
+    if done:
+        line += " (" + "; ".join(f"{r[1]} {r[5]} ms" for r in done) + ")"
+    if failed:
+        line += f"; failed in {', '.join(failed)}"
+    print(line)
+PY
 }
 
 # --- self-test begin ---
@@ -2485,6 +2584,12 @@ REAL
 }
 # --- self-test end ---
 
+# The stand-in cargo of the mutation step (D-F4n) runs in every call cargo-mutants makes: it comes before the
+# library is sourced, which it does not need.
+if [[ "${1:-}" == --cargo-shim ]]; then
+  mutants_cargo_shim "${@:2}"
+fi
+
 # The modes below size the jobs through gate-lock.sh's cgroup reader (D-J5b), so the
 # library is sourced before any of them. Sourcing defines functions and variables only:
 # gate_linux_env, which sets up the Linux environment of a gate run, stays on the path
@@ -2500,6 +2605,10 @@ case "${1:-}" in
     [[ -n "${2:-}" && -f "$2" ]] || { echo "FAIL: --check-builds needs an outcomes.json (got '${2:-}')" >&2; exit 1; }
     check_builds "$2"
     exit $?
+    ;;
+  "--lab-builds")
+    mutants_lab_builds "${2:-}"
+    exit 0
     ;;
   "--compare-classes")
     compare_classes "${2:-}" "${3:-}" || exit $?
@@ -2552,9 +2661,16 @@ fi
 
 cd "$ROOT/rust"
 
-if ! command -v cargo-mutants >/dev/null 2>&1 && ! cargo mutants --version >/dev/null 2>&1; then
+if ! command -v cargo-mutants >/dev/null 2>&1; then
   echo "FAIL: cargo-mutants is required. Install: cargo install cargo-mutants" >&2
   exit 1
+fi
+# D-F4o: the shim hands its call to the cargo this step sees, and to no other. It is resolved here, before the
+# seed, because the seed is built with cargo too: with no cargo there is no mutant to run (F4d.6).
+MUTANTS_SHIM_REAL_CARGO="$(command -v cargo || true)"
+if [[ -z "$MUTANTS_SHIM_REAL_CARGO" || ! -x "$MUTANTS_SHIM_REAL_CARGO" ]]; then
+  echo "FAIL: no cargo to hand to the shim (command -v cargo found none): no mutant runs" >&2
+  exit 2
 fi
 
 MUTANTS_MIN_KILL="${MUTANTS_MIN_KILL:-0.7}"
@@ -2651,6 +2767,12 @@ mutants_seed_ensure || exit $?
 mutants_stage_make || exit $?
 mutants_tree_guard "$ROOT/rust" "$MUTANTS_STAGE/rust" || exit $?
 mutants_seed_stamp "$SEED_DIR/target" > "$OUT_DIR/seed.before" || exit $?
+# D-F4p: the epoch is the newest mtime of the seed (the third field of seed.before), never the start of this run.
+seed_epoch="$(awk '{print $NF}' "$OUT_DIR/seed.before" | LC_ALL=C sort -n | tail -n 1)"
+shim_scratch="$(cd "$MUTANTS_SCRATCH" && pwd -P)"
+mkdir -p "$OUT_DIR/bin"
+printf '%s\n' '#!/bin/sh' "exec bash '$ROOT/scripts/mutants-gate.sh' --cargo-shim \"\$@\"" > "$OUT_DIR/bin/cargo-shim"
+chmod +x "$OUT_DIR/bin/cargo-shim"
 
 # --timeout is 180, not 90. That budget was set when this ran two at a time;
 # at six, a slow test reported TIMEOUT instead of the CAUGHT it actually was,
@@ -2667,9 +2789,11 @@ mutants_seed_stamp "$SEED_DIR/target" > "$OUT_DIR/seed.before" || exit $?
 # command only: on 2026-10-13 7.6 of the 14.1 GB of a copy's target were .pdb,
 # and with it off the copy was 8.94 GB, 37 % smaller. Prefix assignments, so
 # nothing else in the gate sees them.
-TMP="$SCRATCH_NATIVE" TEMP="$SCRATCH_NATIVE" TMPDIR="$MUTANTS_SCRATCH" CARGO_PROFILE_DEV_DEBUG=0 \
-CARGO_BUILD_JOBS="$mutants_build_jobs" \
-cargo mutants \
+env "${MUTANTS_PROFILE_ENV[@]}" TMP="$SCRATCH_NATIVE" TEMP="$SCRATCH_NATIVE" TMPDIR="$MUTANTS_SCRATCH" \
+CARGO="$OUT_DIR/bin/cargo-shim" CARGO_BUILD_JOBS="$mutants_build_jobs" \
+MUTANTS_SHIM_SCRATCH="$shim_scratch" MUTANTS_SHIM_EPOCH="$seed_epoch" \
+MUTANTS_SHIM_REAL_CARGO="$MUTANTS_SHIM_REAL_CARGO" MUTANTS_SHIM_LOG="$OUT_DIR/mtime-shim.log" \
+cargo-mutants mutants \
   "${MUTANTS_FILES[@]}" \
   --dir "$MUTANTS_STAGE/rust" \
   --copy-target=true \
@@ -2696,18 +2820,9 @@ if [[ ! -f "$MUTANTS_JSON" ]]; then
   exit 1
 fi
 
-# CI-F4 (D-F4j): the compiles of the baseline say whether the seed was hit. A miss is a line,
+# CI-F4 (D-F4j', F4d): the first build of each lab says whether the seed's mtimes were hit. A miss is a line,
 # not a verdict: cargo rebuilds what is missing, and the time is what the step's ceiling watches.
-if (( SEED_BUILT == 0 )); then
-  compiled="$(grep -c '^ *Compiling ' "$OUT_DIR/mutants.out/log/baseline.log" 2>/dev/null || true)"
-  noun=crates
-  (( compiled == 1 )) && noun=crate
-  if (( compiled <= 1 )); then
-    echo "seed: hit ($compiled $noun compiled in the baseline)"
-  else
-    echo "seed: miss ($compiled $noun compiled in the baseline)"
-  fi
-fi
+mutants_lab_builds "$MUTANTS_JSON"
 
 check_builds "$MUTANTS_JSON"
 
