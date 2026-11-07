@@ -811,3 +811,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   (its 500 ms clock assertion runs alone), MUTANTS_JOBS=6 for M. Decisions D1–D7 accepted (spec F3 «F3.3c-2»). The
   implementer's admission simulation: GATE_DAG=1 ≈ 614 s (≈10 min), critical path P → DBG → E2E 554 s, CPU bound
   ≈509 s — not measured. Residual clock risk: v029_accounts, v029_auto_host_beacon, v042 stay in DBG. Verification queued.
+- 2026-11-07 11:28 · F3.3c-2 verified with cargo: red as expected; green copy gate_dag 24/24, lane token 12/12,
+  history/doc/ci green, but local_gate 73/78 and merge-gate's self-test red (F1.2 expects the gate's jobs where the row now
+  sets them; two F3.3b-1b-ii contracts do not skip the NAME=value tokens or count `exclusive` as timed; DAG_LANES still
+  lists NLI before D3). Decision: NLI moves after D3 in DAG_LANES (same tests, two independent sections reordered), and
+  NLI stays a timed row — its block is emitted before the boundary in idx order even if it runs last. Back to the
+  implementer.
