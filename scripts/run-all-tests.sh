@@ -1187,6 +1187,42 @@ FAKE
   grep -qF 'sha256 changed before E2E' "$tmp/f33c.out" \
     || self_fail "F3.3: a change after the gpu:: release call is not named 'sha256 changed before E2E': $(cat "$tmp/f33c.out")"
 
+  # CI-F3.3a (D-F3y, spec §4 F3.3a): --lane <id> runs one step of the table and nothing else. A missing
+  # or unknown id is refused before the lock, a lane or cargo is touched. Each row runs the script in a
+  # fake tree (full_tree), so it reads what the real script does, with cargo, psql and the lane library
+  # as stand-ins.
+  lane_run() {
+    local name="$1" t="$tmp/$1"
+    shift
+    full_tree "$name"
+    rc=0
+    env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT HOME="$t/home" \
+      PATH="$t/bin:/usr/bin:/bin" DATABASE_URL="$rat_url" CARGO_TARGET_DIR="$t/target" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      ONNX_MODEL_PATH="$t/models" CUBA_RERANKER_PATH="$t/reranker" CUBA_NLI_PATH="$t/nli-model" \
+      MEMORY_INDUSTRY_LLM_PROVIDER=ollama \
+      "$BASH" "$t/scripts/run-all-tests.sh" "$@" >"$tmp/$name.out" 2>&1 || rc=$?
+  }
+  lane_run lane_unknown --lane NOPE
+  (( rc == 2 )) || self_fail "F3.3a: --lane NOPE exits $rc, not 2: $(cat "$tmp/lane_unknown.out")"
+  grep -q 'no such lane: NOPE' "$tmp/lane_unknown.out" \
+    || self_fail "F3.3a: --lane NOPE does not name the lane it refuses: $(cat "$tmp/lane_unknown.out")"
+  [[ ! -e "$tmp/lane_unknown/home/cargo.calls" && ! -e "$tmp/lane_unknown/home/order.log" ]] \
+    || self_fail "F3.3a: a refused --lane touched cargo or a lane: $(cat "$tmp/lane_unknown/home/cargo.calls" "$tmp/lane_unknown/home/order.log" 2>/dev/null)"
+  lane_run lane_bare --lane
+  (( rc == 2 )) || self_fail "F3.3a: --lane with no id exits $rc, not 2: $(cat "$tmp/lane_bare.out")"
+  grep -q 'needs a lane id' "$tmp/lane_bare.out" \
+    || self_fail "F3.3a: --lane with no id does not say so: $(cat "$tmp/lane_bare.out")"
+  [[ ! -e "$tmp/lane_bare/home/cargo.calls" ]] || self_fail "F3.3a: --lane with no id ran cargo"
+  lane_run lane_d2 --lane D2
+  (( rc == 0 )) || self_fail "F3.3a: --lane D2 exits $rc, not 0: $(cat "$tmp/lane_d2.out")"
+  grep -q -- '--ignored' "$tmp/lane_d2/home/cargo.calls" 2>/dev/null \
+    || self_fail "F3.3a: --lane D2 ran none of its --ignored tests: $(cat "$tmp/lane_d2/home/cargo.calls" 2>/dev/null)"
+  grep -Eq -- 'fmt|clippy|--release' "$tmp/lane_d2/home/cargo.calls" 2>/dev/null \
+    && self_fail "F3.3a: --lane D2 ran another lane's cargo call: $(cat "$tmp/lane_d2/home/cargo.calls")"
+  grep -q 'All tests passed' "$tmp/lane_d2.out" \
+    && self_fail "F3.3a: --lane D2 printed the verdict of the whole run"
+
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
   echo "    else; the run-all-tests.sh merge-gate launches works under its lock and"

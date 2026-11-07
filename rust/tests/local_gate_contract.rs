@@ -4181,3 +4181,155 @@ fn no_gate_script_builds_a_tcp_url_for_a_lane() {
         "the lane URL has to be built in exactly one place (gate_cluster_url), found {constructions} (C4)"
     );
 }
+// --- CI-F3.3a: the step table and the lanes of run-all-tests.sh ---------------------------------
+// D-F3a: scripts/gate-dag.txt is the one source of the steps. D-F3y: a run without arguments keeps
+// the idx order. §5.1 C2: the table and the --lane names do not drift, the graph has no cycle, and
+// a consumer of the release artifact (T_rel) has its producer B3 above it.
+
+/// One row of scripts/gate-dag.txt as (idx, id, deps, whole line). Blank lines and comments are skipped.
+fn dag_rows() -> Vec<(u32, String, Vec<String>, String)> {
+    read("scripts/gate-dag.txt")
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            assert!(
+                fields.len() >= 8,
+                "a gate-dag.txt row has at least 8 fields: {line}"
+            );
+            let idx: u32 = fields[0]
+                .parse()
+                .expect("the idx of a gate-dag.txt row is a number");
+            let deps = if fields[2] == "-" {
+                Vec::new()
+            } else {
+                fields[2].split(',').map(String::from).collect()
+            };
+            (idx, fields[1].to_string(), deps, line.to_string())
+        })
+        .collect()
+}
+
+/// The id a row runs with `--lane`, or None for a row that runs something else.
+fn lane_of(line: &str) -> Option<String> {
+    let rest = line.split("--lane ").nth(1)?;
+    rest.split_whitespace().next().map(String::from)
+}
+
+/// Whether `from` reaches `to` through its deps. The depth bound keeps a cycle from looping forever.
+fn depends_on(
+    rows: &[(u32, String, Vec<String>, String)],
+    from: &str,
+    to: &str,
+    depth: usize,
+) -> bool {
+    if depth > rows.len() {
+        return false;
+    }
+    rows.iter()
+        .find(|row| row.1.as_str() == from)
+        .is_some_and(|row| {
+            row.2
+                .iter()
+                .any(|dep| dep.as_str() == to || depends_on(rows, dep.as_str(), to, depth + 1))
+        })
+}
+
+#[test]
+fn every_lane_of_the_step_table_is_a_function_of_run_all_tests() {
+    let suite = read("scripts/run-all-tests.sh");
+    let mut lanes = 0;
+    for (idx, id, _, line) in &dag_rows() {
+        let Some(lane) = lane_of(line) else {
+            continue;
+        };
+        lanes += 1;
+        assert_eq!(
+            &lane, id,
+            "row {idx}: the --lane of a step is the step's own id"
+        );
+        assert!(
+            suite.contains(&format!("lane_{id}() {{")),
+            "row {idx}: run-all-tests.sh has no function lane_{id}() for --lane {id}"
+        );
+    }
+    assert!(
+        lanes > 0,
+        "gate-dag.txt names no --lane: the table does not drive run-all-tests.sh"
+    );
+}
+
+#[test]
+fn run_all_tests_without_arguments_runs_its_lanes_in_idx_order() {
+    let suite = read("scripts/run-all-tests.sh");
+    let order_line = suite
+        .lines()
+        .find(|line| line.starts_with("DAG_LANES=("))
+        .expect(
+            "run-all-tests.sh names its lanes in one DAG_LANES=(...) line, in idx order (D-F3y)",
+        );
+    let order: Vec<String> = order_line
+        .trim_start_matches("DAG_LANES=(")
+        .trim_end_matches(')')
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let mut rows = dag_rows();
+    rows.sort_by_key(|row| row.0);
+    let expected: Vec<String> = rows.iter().filter_map(|row| lane_of(&row.3)).collect();
+    assert_eq!(
+        order, expected,
+        "DAG_LANES must list the --lane steps of the table in idx order"
+    );
+}
+
+#[test]
+fn the_step_graph_has_no_cycle_and_every_consumer_has_its_producer_above_it() {
+    let rows = dag_rows();
+    for (idx, id, deps, _) in &rows {
+        for dep in deps {
+            assert!(
+                rows.iter().any(|row| row.1 == *dep),
+                "row {idx} {id}: its dep {dep} is not a row of gate-dag.txt"
+            );
+        }
+    }
+    let mut placed: Vec<String> = Vec::new();
+    while placed.len() < rows.len() {
+        let before = placed.len();
+        for (_, id, deps, _) in &rows {
+            let ready = deps.iter().all(|dep| placed.contains(dep));
+            if ready && !placed.contains(id) {
+                placed.push(id.clone());
+            }
+        }
+        assert!(
+            placed.len() > before,
+            "gate-dag.txt has a cycle: {} of {} rows can be placed, the rest wait on each other",
+            placed.len(),
+            rows.len()
+        );
+    }
+    for consumer in ["R", "E"] {
+        assert!(
+            depends_on(&rows, consumer, "B3", 0),
+            "{consumer} reads T_rel and does not depend on B3 (C2)"
+        );
+    }
+}
+
+#[test]
+fn no_judge_script_names_the_gate_audit_outside_its_comments() {
+    for script in ["scripts/merge-gate.sh", "scripts/run-all-tests.sh"] {
+        for (number, line) in read(script).lines().enumerate() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            assert!(
+                !line.contains("gate-audit.sh"),
+                "{script}:{}: a judge script names gate-audit.sh outside a comment; it is a manual tool (D-A9)",
+                number + 1
+            );
+        }
+    }
+}
