@@ -614,3 +614,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   that round without the model env run-all-tests chooses. Slice **CI-J5** (spec J-F1 §14, worktree `Memorys-ci-j5`): one
   `gate_model_env` in gate-lock.sh for both rounds, a contract that it is the only place, a merge-gate row. Step times in
   lanes: unit 318 s, --ignored 68 s, models 48 s, release build + reranker 217 s, E2E 101 s, live 12 s, eval 5 s.
+- 2026-11-07 06:57 · **F3.3a committed and merged:** red `d463d02` (`F3.3a: --lane NOPE exits 1, not 2`; contract 64/69),
+  code `e3a22b7` (contract **69/69**, gate_dag 14/14, gate_history 23/23, 13 hermetic self-tests OK). **CI-J5 committed and
+  merged:** red `0703cd9` (merge-gate J5 row; contract the_model_environment_is_set_in_one_place FAILED), fix `53a1c0b`
+  (contract **66/66**). Both merged clean into the batch: `b9fe4e0`. Debt noted: F3.3a's red row reached the old judge
+  server :5489 through the unpatched script (a throwaway server, never :5488; the green exits 2 before the lock);
+  CI-J5's `demo.sh` exception has a reason but no owner or expiry (same format as CI-J3's). Eighth full run (lanes mode)
+  started on b9fe4e0.
