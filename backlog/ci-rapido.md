@@ -556,3 +556,13 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   before). Not T-GUARD (no judge.rs or tracing change in that diff). Slice **T-TRACE** on release/0.31.0 (worktree
   `Memorys-trace`): a test on its own callsite plus a child-process rerun that is red every time, then a global no-op
   subscriber answering `Interest::sometimes` installed once per process, called from the three capture helpers.
+- 2026-11-07 05:42 · **F4d QA passed and merged** (`f4de3a8`): two real mutants-gate runs with
+  MUTANTS_JOBS=2 — run 1 **265.9 s** (seed rebuilt once in 48 s, its key now carries the profile), run 2 **219.4 s**
+  (target < 230 s); `lab builds: hit in 2 of 2 labs (each first build compiled 1 crate)`, mtime shim 24–29 ms per lab;
+  54 mutants, 53 caught, 1 unviable, kill rate 1.000; **54/54 classes identical to F0**. The mutants step: 1053 s (F0)
+  → 279 s (F4) → 219 s (F4d). Seed directory 2.1 GB (the two newest keys).
+- 2026-11-07 05:42 · F2b-1 verified with cargo: red as expected on the worktree (j11_unset, j16_unset; contract
+  60/65); green copy: 13 hermetic self-tests OK, no postgres left, contract **62/65** — three contracts on pass 2
+  code: two DATABASE_URL assignments in merge-gate (one verified value only), gate-lock.sh:457 builds the DSN with
+  printf of ${url…} (the credentials detector), a new cargo call before the cheap block (fmt after the first
+  compile). Back to the implementer.
