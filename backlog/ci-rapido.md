@@ -42,6 +42,8 @@ Decisions of the user (2026-11-05):
 | F6 | `quality-gate` Q1 (exact) and Q2 (after the equivalence study) | ≈3 h → ≈60–80 min |
 | F7 | Port the generic pieces to Mapupita-Rust and the CI template | — |
 
+Outside the batch (Leandro, 2026-11-06): **NPM-OIDC**, npm trusted publishing (OIDC from `publish.yml`, no long-lived npm token); its own task, after 0.31. The Windows `.exe` stays unsigned.
+
 Design (DAG, lanes, the counts): `~/.claude/plans/necesito-que-entres-en-shimmying-sun.md`, §3.
 The critical path is ≈500 s (mutants and release + reranker tie); the estimate is 9.6–10.8 min.
 
@@ -327,3 +329,63 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   cluster_name=memory-industry-gate, durability off, restart unless-stopped (the old :5489 one stays for the old
   judge's F0 run 2). First full run of the new judge in series (F1+F4, before F2/F3 wiring) started under pesado,
   measured like F0.
+- 2026-11-07 03:10 · **F2 split** (my decision; reverted by merging the two halves back into one task): **F2a** =
+  `scripts/gate-cluster.sh` standalone (library + hermetic self-test, its own rows B5 with an injectable ready
+  timeout so no row waits 30 s, D1, D2, D5, D6, A3, the long `sun_path`), entering `SCRIPTS_WITH_SELF_TEST`
+  ([&str; 13]); **F2b** = the wiring into merge-gate/run-all-tests, contracts C1–C5/E1/E2 and the rewrite of the
+  frozen CI-J rows j11_unset/j11_empty/j16_unset. The implementer's four decisions accepted: pg_config required,
+  `--pwfile PATH`, `PGPORT=5432` in socket URLs, `source` without dispatch (`BASH_SOURCE == $0`). Lessons recorded
+  in memory: a bare `wait` also waits for a postmaster child; a parent killed by `set -e` leaves orphan postmasters
+  (trap + dead-owner sweep); `yes -- -D`. The full new-judge run (F1+F4) is still queued behind Mapupita's
+  e2e-c2b under pesado (waiting since 02:57).
+- 2026-11-07 03:20 · Notion synced: CI-F2 and CI-F3 «En curso» (F3.0 and F3.2 commits and evidence), CI-F4 «Hecha» 2/2
+  with «Qué se hizo», CI-J2 appended to CI-J; Decisiones rows for PGDG, the change-point rule, the unsigned .exe, npm
+  OIDC and the F2 split; Bugs y lecciones rows for J7, the shared target, the NLI latency under contention (open, F3)
+  and the bash/postgres lessons. NPM-OIDC registered (batch table, outside the batch) and in Notion. **F3.1 started**
+  in worktree `Memorys-ci-f31` (from 5c71048), in parallel with F2a: gate_history.py with one writer (gate-dag.py
+  imports it in pass 2, its frozen contract unchanged), `test-times.sh --units`, contracts in
+  gate_history_contract.rs; the merge-gate wiring and its J7b' row move to F3.3. A refuter reads cargo-mutants'
+  lab copy (no compiling) for the 204-crate first build per lab.
+- 2026-11-07 03:35 · F4 seed miss, the refuter's reading (cargo-mutants v27.1.0 `src/copy_tree.rs`, the kept logs of
+  f4-medida-144115): not a path and not a flag. cargo-mutants copies the stage into each lab with `fs::copy` (reflink
+  fails on this ext4: `os error 95`; with reflink it would still set mtime = now), so the seed's target lands with
+  fresh, unordered mtimes; 68 independent roots (`the dependency X was rebuilt (T1, Δ after …)`, all inside the copy
+  window), different between runs (an ordering race), 135 transitive; lab 2 is copied again from the stage. Cost per
+  run ≈100–120 s (first build per lab 75/52 s and 55/50 s, others ≈5–8 s). Rivals refuted: path in the fingerprint
+  (406 units Fresh under the new path), cap-lints/RUSTFLAGS (none), baseline in the original tree. Proposed fix: a
+  cargo shim for cargo-mutants that sets one mtime on a lab's target before its first build, plus D-F4j counting
+  every lab's first build. Side finding: the seed key does not record `CARGO_PROFILE_DEV_DEBUG=0` (passed as a
+  prefix, not in the environment where the key is computed). Three-arm experiment (fs::copy-like / one mtime /
+  cp -a) queued under pesado before any change.
+- 2026-11-07 04:00 · **F2a delivered** (implementer): gate-cluster.sh pass 1 in `Memorys-ci-f2` (red: `A1 …
+  gate_cluster_check: command not found`), pass 2 in scratch `f2copy` (OK); `SCRIPTS_WITH_SELF_TEST` → 13. New rows B5
+  (`GATE_CLUSTER_READY_TIMEOUT_S=1`, ~1 s), D1, D2 (`gate_cluster_down_all` in a TERM trap), long path (>107 B socket =
+  exit 2 before anything), D6 (no row creates the default root). Two rows fixed that gave a false green (D4 took the exit
+  2 of «owner from another host»; D6 did not count the root itself). The library no longer sets `set -euo pipefail` on its
+  caller. 17 sabotages red; the 12 other hermetic self-tests OK on a full copy. **A3 and D5 move to F2b** (they exercise
+  merge-gate/run-all-tests, not the library), together with a boundary row at exactly 107 bytes. Verification queued
+  under pesado (`verif-f2a.sh`); a reviewer reads pass 2 (kill/rm paths first).
+- 2026-11-07 04:00 · **F3.1 delivered** (implementer): pass 1 in `Memorys-ci-f31` (gate_history_contract.rs, 9 tests,
+  all expected red in their first assert; test-times row U1, red `unknown argument '--units'`), pass 2 in scratch `f31copy`
+  (gate_history.py; gate-dag.py imports it, its own writer removed, same fields, corridas.jsonl only gains fields;
+  `--units` with a new parse_log class `N` that --count/--judge ignore). 33 Python checks of the contract bodies, 0 fails;
+  H1–H6 sabotages red through that harness. Gap noted: no planner fixture for H2 (cpu_s null under a fake cgroup without
+  cpu.stat) → F3.3. Verification queued under pesado (`verif-f31.sh`: red, 13 self-tests, three contracts, clippy); a
+  reviewer reads pass 2.
+- 2026-11-07 04:25 · F3.1 review (reviewer, reproduced in /tmp/rev-f31): **P0 latent** (from F3.2, copied by F3.1): a
+  non-UTF-8 byte in an old jsonl makes `load_history` raise and the planner exit 1 without running a step; `registrar`
+  the same. **P1:** an unbounded `flock` hangs the planner; `registrar` writes 0.0 where nothing was measured and the
+  planner takes it as a sample; the flake mark does not compare the step id (lib and lib-ignored share a key). Clean:
+  no verdict change with the root a file, read-only, `.candado` a dir or bad-but-UTF-8 JSON; the same 18 step fields;
+  `--count`/`--judge` byte-identical on 33 real logs. Decision (spec «F3.1 · correcciones de la revisión»): H7–H11 plus
+  three P2 (no `__pycache__`, one bounds formula, `units()` tolerant) go in now as pass 1b/2b; the huella that also
+  hashes untracked files, the remaining D-F3s run fields and units of a signal-killed binary go to F3.3. The queued
+  verif-f31 was stopped (it would verify a superseded pass 2).
+- 2026-11-07 04:45 · F2a review (reviewer, reproduced): no confirmed P0. **P1:** `down` can send QUIT/KILL to a recycled
+  pid (bash reaps background children at once; no identity check as in the sweep); a live owner in another PID namespace
+  looks dead to the sweep; six self-test rows green for another cause (the sweep's -D and exe checks not tested apart,
+  B4 not reached, D3 hangs instead of failing, D1/D3 go through the 10 s KILL, D6 blind to deletions, D1 code 1 reuses a
+  log). P2: empty pid taken as alive, inherited PGPORT/PGHOSTADDR redirect the server, the ready wait counts loops not
+  time, root/lane/owner not validated. Clean: identity of the sweep on real PG 18.6, Docker postgres (uid 70/999) never
+  killable, no bare wait, the password never printed. Decision: spec «F2a · correcciones de la revisión» K1–K10 as pass
+  1b/2b; the password in psql's argv in gate-lock.sh goes to F2b. The queued verif-f2a was stopped.
