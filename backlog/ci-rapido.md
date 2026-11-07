@@ -633,3 +633,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   not GATE_CLUSTER_ROOT, so the child's guard has no root. Slice **F2b-fix** (worktree `Memorys-ci-f2bfix`): the root in
   run_in_lane's env, in JUDGE_ENVIRONMENT, D-F2i not relaxed. Peak 13.8 GB, CPU 3652 s. Serial estimate for the whole
   judge once crap (≈60 s) and mutants (≈220 s) run: ≈24 min; the DAG (F3.3b-1 + F3.3c) is what takes it under 15.
+- 2026-11-07 07:24 · **F3.3b-0 committed and merged:** red `6510adc` (gate_history_contract 24/33, U2 exited 2), fix
+  `75d863e` (gate_history 33/33, gate_dag 14/14, local_gate 70/70, 13 self-tests OK); merged `72917cb`. Open note: the
+  `__pycache__` test is not red in pass 1 (the launcher is test code); its red was seen only in the implementer's harness.
+  F3.3b-1 waits for F2b-fix (both touch merge-gate's run_in_lane).
