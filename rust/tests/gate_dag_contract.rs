@@ -627,6 +627,88 @@ fn admission_never_goes_over_the_ram_cap() {
     }
 }
 
+/// Rows that name their class (CI-F3.3c): (idx, id, class, seconds), with no resources and no environment.
+fn table_with_class(fx: &mut Fixture, rows: &[(u32, &str, &str, &str)]) {
+    let mut text = String::new();
+    for &(idx, id, class, secs) in rows {
+        text.push_str(&format!(
+            "{idx} {id} - - {class} 1 5 {secs} /bin/sh {} {id} {secs} {}\n",
+            fx.script.display(),
+            fx.control.display()
+        ));
+        fx.steps.push((idx, id.to_string()));
+    }
+    write(&fx.table, &text);
+    for (_, id) in &fx.steps {
+        fx.write_defaults(id);
+    }
+}
+
+/// Spec (CI-F3.3c, D-F3p): la CPU admitida no pasa de la CPU de la máquina, C, y no de 1,25·C. Tres pasos de unos 1,6
+/// núcleos medidos sobre una máquina de 4 CPU: dos caben (3,2) y el tercero (4,8) no. Con la cota de 1,25·C (5) entraría.
+#[test]
+fn admission_never_goes_over_the_cpu_of_the_machine() {
+    let mut fx = Fixture::new("cpu", CPU_FOUR, MEM_OPEN);
+    fx.table(&[
+        (10, "a", "-", "0.6", ""),
+        (20, "b", "-", "0.6", ""),
+        (30, "c", "-", "0.6", ""),
+    ]);
+    for id in ["a", "b", "c"] {
+        fx.usage(id, CPU_SECOND);
+    }
+    fx.seed();
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run("1");
+    assert_green(&run, "DAG");
+    let pasos = appended(&fx.history, "pasos.jsonl", &before);
+    for i in &pasos {
+        let start = num(i, "inicio");
+        let cores: f64 = pasos
+            .iter()
+            .filter(|j| num(j, "inicio") <= start && start < num(j, "fin"))
+            .map(|j| num(j, "cpu_s") / (num(j, "fin") - num(j, "inicio")))
+            .sum();
+        assert!(
+            cores <= 4.0 + 0.25,
+            "CPU over the machine at t={start}: {cores:.2} cores alive, the machine has 4"
+        );
+    }
+}
+
+/// Spec (CI-F3.3c, D-F3l): un paso exclusive no comparte tiempo con ningún otro, aunque esté listo antes que ellos.
+/// Guarda: el planificador ya lo cumplía antes de F3.3c; el contrato de la tabla es lo que la fila NLI pide.
+#[test]
+fn an_exclusive_step_shares_no_time_with_another_step() {
+    let mut fx = Fixture::new("exclusive", CPU_FOUR, MEM_OPEN);
+    table_with_class(
+        &mut fx,
+        &[
+            (10, "a", "normal", "0.5"),
+            (20, "x", "exclusive", "0.5"),
+            (30, "b", "normal", "0.5"),
+            (40, "c", "normal", "0.5"),
+        ],
+    );
+    fx.seed();
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run("1");
+    assert_green(&run, "DAG");
+    let pasos = appended(&fx.history, "pasos.jsonl", &before);
+    let x = by_id(&pasos, "x");
+    for other in pasos.iter().filter(|j| j["id"] != "x") {
+        assert!(
+            !overlaps(x, other),
+            "exclusive x overlaps {}: x=[{}, {}) other=[{}, {})",
+            other["id"],
+            num(x, "inicio"),
+            num(x, "fin"),
+            num(other, "inicio"),
+            num(other, "fin")
+        );
+    }
+}
+
 /// Spec: un paso que no cabe ni en una máquina vacía corre solo (D-F3p). Sin bloqueo.
 #[test]
 fn a_step_bigger_than_the_machine_runs_alone() {

@@ -4615,9 +4615,11 @@ fn every_row_of_the_step_table_is_a_step_of_merge_gate_whose_lanes_are_run_all_t
         "gate-dag.txt has no rows: the planner has nothing to run"
     );
     for (idx, id, _, line) in &rows {
+        // CI-F3.3c (D-F3j): leading NAME=value tokens are the step's environment; the order is what follows them.
         let order = line
             .split_whitespace()
             .skip(8)
+            .skip_while(|token| token.contains('='))
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(
@@ -4771,11 +4773,17 @@ fn the_judge_of_the_test_times_stops_before_the_untimed_rows_and_only_they_are_u
         .iter()
         .position(|row| class_of(row.3.as_str()) == "untimed")
         .expect("gate-dag.txt has an untimed row");
+    // CI-F3.3c: timed is every row that is not untimed, normal or exclusive. NLI is exclusive and timed: it runs last
+    // in time, but its block is printed in idx order, before CV, so the boundary line still comes after it.
     assert!(
         rows[..first_untimed]
             .iter()
-            .all(|row| class_of(row.3.as_str()) == "normal"),
+            .all(|row| matches!(class_of(row.3.as_str()).as_str(), "normal" | "exclusive")),
         "a timed row comes after the first untimed row in idx order: the boundary would cut it"
+    );
+    assert!(
+        rows[..first_untimed].iter().any(|row| row.1 == "NLI"),
+        "NLI is a timed row (exclusive) and its finished-in lines must be judged: it has to sit before the boundary"
     );
     let planner = read("scripts/gate-dag.py");
     assert!(
@@ -4812,15 +4820,18 @@ fn merge_gate_answers_the_step_mode_before_its_gate_runs() {
     );
 }
 
-// CI-F3.3b-2 (spec F3.3b-1b, «la tabla»): the eight rows of the judge, with their order, their dependencies and
+// CI-F3.3b-2 (spec F3.3b-1b, «la tabla»): the rows of the judge, with their order, their dependencies and
 // their starting durations. The order of a row is its step; the dependencies are the spec's (DBG, B3, DC, CV and M
 // wait for P; REL waits for B3; E2E waits for B3 and DBG). B1 does not enter the table.
+// CI-F3.3c (D-F3l): NLI leaves DBG for its own row, exclusive, after DBG (it needs the target DBG built). Its clock
+// assertion (nli_entailment, < 500 ms) measured 1199 ms under contention. The dur of NLI is not measured yet.
 #[test]
-fn the_step_table_has_the_eight_rows_of_the_judge_with_their_deps_and_durations() {
+fn the_step_table_has_the_nine_rows_of_the_judge_with_their_deps_and_durations() {
     // The class of CV and M is `untimed` (CI-F3.3b-2): their output is past the judge's boundary line.
     let expected = [
         (10, "P", "-", "20", "normal"),
         (20, "DBG", "P", "421", "normal"),
+        (25, "NLI", "DBG", "60", "exclusive"),
         (30, "B3", "P", "150", "normal"),
         (40, "REL", "B3", "221", "normal"),
         (50, "E2E", "B3,DBG", "113", "normal"),
@@ -4850,8 +4861,14 @@ fn the_step_table_has_the_eight_rows_of_the_judge_with_their_deps_and_durations(
             "row {id}: its class (untimed rows are past the judge's boundary)"
         );
         assert_eq!(row[7], dur, "row {id}: its starting dur_s");
+        // CI-F3.3c (D-F3j): leading NAME=value tokens are the step's environment, and the order is what follows them.
+        let order: Vec<&str> = row[8..]
+            .iter()
+            .copied()
+            .skip_while(|token| token.contains('='))
+            .collect();
         assert_eq!(
-            row[8..].join(" "),
+            order.join(" "),
             format!("bash scripts/merge-gate.sh --step {id}"),
             "row {id}: its order"
         );
@@ -4864,6 +4881,134 @@ fn the_step_table_has_the_eight_rows_of_the_judge_with_their_deps_and_durations(
                 && line.contains("ram")
         }),
         "gate-dag.txt must state the criterion of the cpu and ram of its rows in a comment"
+    );
+}
+
+/// The NAME=value tokens that lead a row's order: the environment the planner gives that step (D-F3j).
+fn row_env(line: &str) -> Vec<(String, String)> {
+    line.split_whitespace()
+        .skip(8)
+        .take_while(|token| token.contains('='))
+        .filter_map(|token| {
+            token
+                .split_once('=')
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn row_value(env: &[(String, String)], name: &str) -> Option<String> {
+    env.iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.clone())
+}
+
+/// CI-F3.3c (D-F3j, D-F3m, V6): a row that builds names its cargo jobs, and a row with models names the three ORT pools
+/// with the values the serial judge uses on this 24-thread machine (available_parallelism()/2 capped at 4, 4 and 8).
+/// E2E names none. A row's cpu is the most it asks for (its jobs or its widest pool), so the planner never admits a row
+/// that asks for more than the table says.
+#[test]
+fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
+    const POOLS: [(&str, &str); 3] = [
+        ("CUBA_EMBED_INTRA_THREADS", "4"),
+        ("CUBA_NLI_INTRA_THREADS", "4"),
+        ("CUBA_RERANK_INTRA_THREADS", "8"),
+    ];
+    for line in read("scripts/gate-dag.txt").lines() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let tok: Vec<&str> = line.split_whitespace().collect();
+        let id = tok[1];
+        let cpu: u32 = tok[5]
+            .parse()
+            .expect("the cpu column of a row is a whole number");
+        let env = row_env(line);
+        let jobs: Option<u32> = row_value(&env, "CARGO_BUILD_JOBS").map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("row {id}: CARGO_BUILD_JOBS is not a number: {line}"))
+        });
+        let recursos: Vec<&str> = tok[3].split(',').collect();
+        let builds = recursos.iter().any(|r| r.starts_with("target:"));
+        let models = recursos.contains(&"models");
+        if builds {
+            let n = jobs.unwrap_or_else(|| {
+                panic!("row {id} builds in a target and names no CARGO_BUILD_JOBS: {line}")
+            });
+            assert!(
+                (1..=cpu).contains(&n),
+                "row {id}: CARGO_BUILD_JOBS={n} is not between 1 and its cpu {cpu}: {line}"
+            );
+        }
+        let mut widest = jobs.unwrap_or(0);
+        for (name, value) in POOLS {
+            let want = if models && id != "E2E" {
+                Some(value)
+            } else {
+                None
+            };
+            assert_eq!(
+                row_value(&env, name).as_deref(),
+                want,
+                "row {id}: {name} (models rows set the three pools, E2E sets none): {line}"
+            );
+            if let Some(v) = want {
+                widest = widest.max(v.parse().expect("a pool is a whole number"));
+            }
+        }
+        assert!(
+            cpu >= widest,
+            "row {id}: cpu {cpu} is less than the widest thing it asks for ({widest}): {line}"
+        );
+    }
+}
+
+/// CI-F3.3c (D-F3l, V9, V10): the NLI clock assertion runs in a row of its own, exclusive, after DBG (it needs DBG's
+/// target built), and DBG no longer names it. NLI opens no database, so its row names no cluster.
+#[test]
+fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_no_cluster() {
+    let table = read("scripts/gate-dag.txt");
+    let row_of = |id: &str| -> String {
+        table
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some(id))
+            .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"))
+            .to_string()
+    };
+    let nli = row_of("NLI");
+    let tok: Vec<&str> = nli.split_whitespace().collect();
+    assert_eq!(
+        tok[2], "DBG",
+        "NLI waits for DBG, which builds its binaries: {nli}"
+    );
+    assert_eq!(
+        tok[4], "exclusive",
+        "NLI measured 1199 ms under contention against a 500 ms assertion, so it runs alone: {nli}"
+    );
+    assert!(
+        !tok[3].split(',').any(|r| r.starts_with("cluster:")),
+        "NLI opens no database, so its row names no cluster: {nli}"
+    );
+    let gate = read("scripts/merge-gate.sh");
+    let nli_body = step_body(&gate, "NLI").expect("merge-gate.sh has a step_NLI()");
+    assert_eq!(
+        lanes_in(&nli_body),
+        vec!["NLI".to_string()],
+        "step_NLI runs the NLI lane alone"
+    );
+    assert!(
+        !nli_body.iter().any(|line| line.contains("run_in_lane")),
+        "step_NLI opens no cluster: the NLI tests read no database"
+    );
+    let dbg_body = step_body(&gate, "DBG").expect("merge-gate.sh has a step_DBG()");
+    assert_eq!(
+        lanes_in(&dbg_body),
+        ["CL", "D1", "D2", "D3"].map(String::from).to_vec(),
+        "step_DBG no longer runs the NLI lane: it has its own row"
+    );
+    assert!(
+        gate.lines().any(|line| line.trim() == "NLI) step_NLI ;;"),
+        "the --step dispatch names the NLI row"
     );
 }
 
