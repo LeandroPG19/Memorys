@@ -3494,6 +3494,143 @@ fn the_judges_exported_environment_list_is_complete() {
     );
 }
 
+/// CI-J5. The seven names that choose the models are set in one place, `gate_model_env` (gate-lock.sh),
+/// and both callers run it: run-all-tests.sh for the full run and merge-gate.sh before the
+/// --features docs step. A second assignment is a second source, and the docs step would test other
+/// models than the full run.
+const MODEL_ENVIRONMENT: [&str; 7] = [
+    "ONNX_MODEL_PATH",
+    "ORT_DYLIB_PATH",
+    "CUBA_RERANKER_PATH",
+    "CUBA_NLI_PATH",
+    "CUBA_EMBEDDING_DIM",
+    "CUBA_EMBED_MODEL",
+    "CUBA_POOLING",
+];
+
+/// The scripts that set a model name outside gate_model_env, each with its reason (CI-J5). An
+/// excluded script still has to set one, or its entry is stale.
+const MODEL_NAMES_ELSEWHERE: [(&str, &str); 1] = [(
+    "demo.sh",
+    "a presentation of the binary: it picks its own cache, and no gate runs it (record-demo-gif.sh does)",
+)];
+
+/// The model names a line of shell sets: an export, or a default `NAME="${NAME:-...}"`. A prefix
+/// assignment for one command (`ONNX_MODEL_PATH="" \`) sets nothing for the gate and is not one.
+fn sets_model_names(line: &str) -> Vec<&'static str> {
+    let exported = exported_names(line);
+    let trimmed = line.trim_start();
+    MODEL_ENVIRONMENT
+        .iter()
+        .copied()
+        .filter(|name| {
+            exported.iter().any(|e| e.as_str() == *name)
+                || (trimmed.starts_with(&format!("{name}="))
+                    && trimmed.contains(&format!("${{{name}:-")))
+        })
+        .collect()
+}
+
+/// CI-J5. The model names are set once, in gate_model_env, and the two callers run it. The detector
+/// is judged first, on lines that must and must not count.
+#[test]
+fn the_model_environment_is_set_in_one_place() {
+    assert_eq!(
+        sets_model_names(r#"    export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-$CACHE/models}""#),
+        vec!["ONNX_MODEL_PATH"]
+    );
+    assert_eq!(
+        sets_model_names(r#"CUBA_POOLING="${CUBA_POOLING:-cls}""#),
+        vec!["CUBA_POOLING"]
+    );
+    for not_a_set in [
+        r#"if [[ "$CUBA_EMBEDDING_DIM" != "384" ]]; then"#,
+        r#"    ONNX_MODEL_PATH="" \"#,
+        r#"DATABASE_URL="$GATE_DATABASE_URL" CUBA_APP_ROLE=0 ONNX_MODEL_PATH="" \"#,
+    ] {
+        assert!(
+            sets_model_names(not_a_set).is_empty(),
+            "`{not_a_set}` sets no model name for the gate, so it must not be counted"
+        );
+    }
+
+    let gate_lock = read("scripts/gate-lock.sh").replace("\r\n", "\n");
+    let lines: Vec<&str> = gate_lock.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("gate_model_env() {"))
+        .expect("scripts/gate-lock.sh has no gate_model_env: the model environment is set nowhere");
+    let end = start
+        + lines[start..]
+            .iter()
+            .position(|line| *line == "}")
+            .expect("gate_model_env has no closing brace at column 0");
+
+    let mut scripts: Vec<String> = std::fs::read_dir(repo_root().join("scripts"))
+        .expect("scripts/ is readable")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".sh"))
+        .collect();
+    scripts.sort();
+
+    let mut inside: Vec<&str> = Vec::new();
+    let mut outside: Vec<String> = Vec::new();
+    let mut seen_elsewhere: Vec<String> = Vec::new();
+    for name in &scripts {
+        let body = read(&format!("scripts/{name}")).replace("\r\n", "\n");
+        for (n, line) in outside_self_test(&body) {
+            let names = sets_model_names(line);
+            if names.is_empty() {
+                continue;
+            }
+            let at = n - 1;
+            if name == "gate-lock.sh" && at > start && at < end {
+                inside.extend(names);
+            } else if MODEL_NAMES_ELSEWHERE
+                .iter()
+                .any(|(file, _)| *file == name.as_str())
+            {
+                seen_elsewhere.push(name.clone());
+            } else {
+                outside.push(format!("scripts/{name}:{n}: {}", line.trim()));
+            }
+        }
+    }
+    assert!(
+        outside.is_empty(),
+        "these lines set a model name outside gate_model_env, a second source for the models of \
+         the gate (CI-J5): {outside:#?}"
+    );
+    let missing: Vec<&str> = MODEL_ENVIRONMENT
+        .iter()
+        .copied()
+        .filter(|name| !inside.contains(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "gate_model_env does not set these names: {missing:?} (CI-J5)"
+    );
+    for (file, _) in MODEL_NAMES_ELSEWHERE {
+        assert!(
+            seen_elsewhere.iter().any(|seen| seen.as_str() == file),
+            "scripts/{file} no longer sets a model name, so its entry in MODEL_NAMES_ELSEWHERE is \
+             stale (CI-J5)"
+        );
+    }
+
+    for caller in ["run-all-tests.sh", "merge-gate.sh"] {
+        let body = read(&format!("scripts/{caller}")).replace("\r\n", "\n");
+        assert!(
+            outside_self_test(&body)
+                .iter()
+                .any(|(_, line)| line.trim() == "gate_model_env"),
+            "scripts/{caller} does not call gate_model_env, so it runs with models the gate did not \
+             choose (CI-J5)"
+        );
+    }
+}
+
 /// The section counts come from one counter, `test-times.sh --count` (D-J4c, D-J4d): the script
 /// reads no `test result:` line itself, so there is one parse of a cargo log, not two.
 #[test]
