@@ -817,3 +817,5 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   lists NLI before D3). Decision: NLI moves after D3 in DAG_LANES (same tests, two independent sections reordered), and
   NLI stays a timed row — its block is emitted before the boundary in idx order even if it runs last. Back to the
   implementer.
+- 2026-11-07 11:36 · **CI-J10 committed and merged:** red `3a64b56` (gate_dag 22/24), fix `e4cb6a7` (gate_dag 24/24,
+  local_gate 76/76, the rest green); merged `f0cf37d`. Seventeenth full run (serial, through the planner) started.
