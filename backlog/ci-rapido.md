@@ -765,3 +765,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   would also count crap's llvm-cov and mutants' `finished in` lines (a second lib:memory_industry, new binaries) — the
   timed set must stay today's (the run-all-tests rounds and docs). CV and M become untimed rows, with a contract, a row
   and a sabotage.
+- 2026-11-07 10:14 · **F3.3b-1b-ii committed and merged:** red `8699c92` (merge-gate planner row; local_gate 65/74,
+  lane token 7/10, gate_dag 15/17), code `8d201a0` (local_gate **74/74**, lane token 10/10, gate_dag 17/17, gate_history
+  33/33, doc 26/26, ci 10/10, 13 self-tests OK); merged `6b22e40`. The judge now runs its table through the planner in
+  series. Fourteenth full run started on 6b22e40: the first through the planner, and the first that seeds the serial
+  history the DAG needs before it parallelises (D8).
