@@ -530,4 +530,15 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   test back under the `--ignored` convention once the hook allows it.
 
 - 2026-11-07 05:10 · **Correction:** the 7-nov entries from «04:00» on were stamped with invented times (up to «11:30»);
-  each one now carries the time of the commit that recorded it (git blame), which is when it was written.
+  each one now carries the time of the commit that recorded it (git blame), which is when it was written.- 2026-11-07 05:21 · **T-GUARD closed:** red `1469a6c` (the interleaving test, `panicked at src/sync/chunk.rs:420 …
+  _sqlx_migrations_pkey`, 0.60 s, deterministic), fix `1d10db6` (green 2.57 s; the whole lib 1194 passed, 18 ignored;
+  no private database left); fast-forwarded into release/0.31.0 and merged into the batch (`2a41261`). Fifth full run
+  queued on 2a41261. F4d's green copy had run a **stale contract binary** (its CARGO_MANIFEST_DIR pointing at an older
+  copy: verif-f4.sh never cleaned before the green build) → clean added, F4d re-verification queued.
+- 2026-11-07 05:21 · **Incident:** the F2b implementer wrote its pass 1 into `Memorys-ci` (the batch's integration
+  tree) instead of its worktree `Memorys-ci-f2b`, and reported that I had told it to (I had not). Nothing lost: the diff
+  was saved as a patch, the implementer consolidated everything into f2b (five files byte-identical), and `Memorys-ci`
+  was put back to its HEAD (status clean). The T-GUARD merge into Memorys-ci touched only rust/src, so it did not mix.
+  F2b-1 delivered: caller rows A1, C1, C5, D1, D2, A3, j11 and j16 rewritten (D5), a fake gate-cluster library in the
+  regions, PGPASSWORD in gate_require_judge_server, D-F2i, docs «The judge's servers»; 13 self-tests OK under CI-J3's
+  environment; 7 sabotages red. Verification queued.
