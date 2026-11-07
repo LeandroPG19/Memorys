@@ -4458,6 +4458,38 @@ fn the_step_graph_has_no_cycle_and_every_consumer_has_its_producer_above_it() {
     }
 }
 
+// CI-F3.3b-1 (D-F3b, spec §4 F3.3b): merge-gate.sh launches the --lane steps of the table as chains, one
+// process and one cluster per chain. Together the chains name every --lane row exactly once, in idx order,
+// so a row that is added to the table and not to a chain (or the reverse) is a red here.
+#[test]
+fn merge_gate_launches_every_lane_of_the_table_once_and_in_idx_order() {
+    let gate = read("scripts/merge-gate.sh");
+    let mut launched: Vec<String> = Vec::new();
+    for line in gate.lines() {
+        let line = line.trim_start();
+        if !line.starts_with("run_in_lane ") || !line.contains("run-all-tests.sh\" --lane ") {
+            continue;
+        }
+        launched.extend(
+            line.split("--lane ")
+                .skip(1)
+                .filter_map(|rest| rest.split_whitespace().next())
+                .map(String::from),
+        );
+    }
+    assert!(
+        !launched.is_empty(),
+        "merge-gate.sh launches no chain of gate-dag.txt: no run_in_lane names run-all-tests.sh --lane"
+    );
+    let mut rows = dag_rows();
+    rows.sort_by_key(|row| row.0);
+    let expected: Vec<String> = rows.iter().filter_map(|row| lane_of(&row.3)).collect();
+    assert_eq!(
+        launched, expected,
+        "the chains of merge-gate.sh must name the --lane rows of gate-dag.txt once each, in idx order"
+    );
+}
+
 #[test]
 fn no_judge_script_names_the_gate_audit_outside_its_comments() {
     for script in ["scripts/merge-gate.sh", "scripts/run-all-tests.sh"] {
