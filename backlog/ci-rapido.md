@@ -469,3 +469,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   before/after (0 fails, ALL SAME) and an in-process equivalence of 12 000 seeded cases EQUIV-IDENTICAL, six sabotages
   EQUIV-DIFFERENT. Seen, left for F3.3: `registrar` loses the run line on a unit naming an unknown step (no verdict
   change). Both contracts queued under pesado before the refactor commit.
+- 2026-11-07 09:00 · **F2a committed** (`feat/ci-rapido-f2`): red `87256df` (row A1 `gate_cluster_check: command not
+  found`), code `df50fe4`; verified on a copy: local_gate_contract 59/59, the 13 hermetic self-tests OK with HOME/XDG
+  empty (gate-cluster 7–8 s), no postgres left. Handoff validated (implementador→mejorador, frozen). **F3.1 improver
+  committed** `bff10b4` (gate_history_contract 23/23, gate_dag_contract 14/14 on it). **Both merged into the batch:
+  `f71cffb` (F3.1), `9e04a47` (F2a).** Seen: the contract's `python3 -c 'import gate_history'` leaves
+  `scripts/__pycache__` in the tree (gitignored; to F3.3: PYTHONDONTWRITEBYTECODE in the contract's launcher). F2a's
+  improver/architect pass goes with F2b.
