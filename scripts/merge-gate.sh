@@ -35,7 +35,9 @@ source "$ROOT/scripts/gate-cluster.sh"
 if [[ "${1:-}" == "--self-test" ]]; then
   # CI-F2 (D-F2i): the lane of a step is not inherited (JUDGE_ENVIRONMENT). The rows that make lanes
   # set GATE_LANE themselves, through the gate.
-  unset GATE_LANE
+  # CI-J5: the model names are the judge's (JUDGE_ENVIRONMENT). The rows that read them set them.
+  unset GATE_LANE ONNX_MODEL_PATH ORT_DYLIB_PATH CUBA_RERANKER_PATH CUBA_NLI_PATH CUBA_EMBEDDING_DIM \
+    CUBA_EMBED_MODEL CUBA_POOLING
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.
   hermetic="$(mktemp -d)"
@@ -175,6 +177,7 @@ FAKE
       'echo "${DATABASE_URL-unset}" >>"$HOME/cargo.urls"' \
       'echo "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset} $*" >>"$HOME/cargo.lanes"' \
       'echo "${CARGO_BUILD_JOBS-unset} $*" >>"$HOME/cargo.jobs"' \
+      'echo "${ONNX_MODEL_PATH-unset} ${CUBA_EMBEDDING_DIM-unset} $*" >>"$HOME/cargo.models"' \
       'if [ "$1" = audit ] && [ "${2:-}" = --json ]; then' \
       '  echo "$PWD" >"$HOME/audit_json.cwd"' \
       '  if [ -e .cargo/audit.toml ]; then echo present >"$HOME/audit_json.audit_toml"; fi' \
@@ -895,6 +898,19 @@ down mut'
   docs_ok="$(grep -cE '^docs postgresql://cuba:fakepw@[^ ]*%2Fdocs\.fk0000:5432/brain 7701731310526959658 (clippy|test) .*--features docs' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
   (( docs_lines >= 2 && docs_lines == docs_ok )) \
     || self_fail "C1: the docs steps did not all see the URL and GATE_LANE of lane docs: $(cat "$tmp/c1/home/cargo.lanes")"
+  # CI-J5: the --features docs step reads the models the full run reads. The HOME of this row has the
+  # embedder where the binary keeps it, and the stand-in cargo of each docs call records the two
+  # variables it was given: ONNX_MODEL_PATH and CUBA_EMBEDDING_DIM.
+  fake_tree j5 "$lane_body"
+  mkdir -p "$tmp/j5/home/.cache/memory-industry/models"
+  : >"$tmp/j5/home/.cache/memory-industry/models/model_quantized.onnx"
+  run_copy_as unset j5 ""
+  (( rc == 0 )) || self_fail "J5: the gate with the embedder under its HOME exited $rc: $(cat "$tmp/j5.out")"
+  j5_docs="$(grep -c -- '--features docs' "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
+  j5_docs_ok="$(awk -v p="$tmp/j5/home/.cache/memory-industry/models" '/--features docs/ && $1 == p && $2 == "384"' \
+    "$tmp/j5/home/cargo.models" 2>/dev/null | wc -l | tr -d ' ')"
+  (( j5_docs >= 2 && j5_docs == j5_docs_ok )) \
+    || self_fail "J5: the --features docs step did not get ONNX_MODEL_PATH=<HOME>/.cache/memory-industry/models and CUBA_EMBEDDING_DIM=384 as the full run does; it got: $(cat "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
   # C5: a DATABASE_URL the operator gives still governs, as it does today: no lane is made, every step
   # gets that URL, and the gate says the lanes share that server.
   ext='postgresql://gate:pw0@127.0.0.1:5489/brain'
@@ -1836,6 +1852,8 @@ run_in_lane dbg "$ROOT/scripts/run-all-tests.sh"
 # after run-all-tests.sh: a server that changed under the run is refused here (D-J1c, A2).
 # A lane is judged when it is made, so only the server of the operator is asked again.
 [[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
+# The models of the --features docs step are the ones of the full run (CI-J5): the same function sets them.
+gate_model_env
 echo "=== cargo clippy/test --features docs ==="
 run_in_lane docs "$BASH" -c 'cd "$1" && cargo clippy --all-targets --features docs -- -D warnings && cargo test --features docs' gate "$ROOT/rust"
 

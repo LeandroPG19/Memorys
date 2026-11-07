@@ -1271,46 +1271,8 @@ if [[ "${1:-}" != --check-models || -n "${DATABASE_URL:-}" ]]; then
   gate_require_judge_server "${DATABASE_URL:-}"
 fi
 
-# Under HOME/.cache and nowhere else, because that is where the binary keeps
-# them: envs::home() joins `.cache` to HOME, and nothing in the crate reads
-# XDG_CACHE_HOME. This used to honour it, as gpu-placement-check.sh did until
-# it was fixed for the same reason, and on a machine that sets it the gate
-# pointed ONNX_MODEL_PATH at a directory `models all` never wrote.
-CACHE_NEW="$HOME/.cache/memory-industry"
-CACHE_OLD="$HOME/.cache/cuba-memorys"
-# Prefer the cache that actually has the embedder. An empty memory-industry/
-# dir (e.g. only audit_key) must not steal paths from a populated cuba-memorys/.
-if [[ -f "$CACHE_NEW/models/model_quantized.onnx" ]]; then
-  CACHE="$CACHE_NEW"
-elif [[ -f "$CACHE_OLD/models/model_quantized.onnx" ]]; then
-  CACHE="$CACHE_OLD"
-elif [[ -d "$CACHE_NEW" ]]; then
-  CACHE="$CACHE_NEW"
-elif [[ -d "$CACHE_OLD" ]]; then
-  CACHE="$CACHE_OLD"
-else
-  CACHE="$CACHE_NEW"
-fi
-# Paths must match `memory-industry models all` (see rust/src/models_cli.rs).
-export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-$CACHE/models}"
-if [[ -z "${ORT_DYLIB_PATH:-}" ]]; then
-  if [[ -f "$CACHE/onnxruntime/libonnxruntime.so" ]]; then
-    export ORT_DYLIB_PATH="$CACHE/onnxruntime/libonnxruntime.so"
-  elif [[ -f "$CACHE/onnxruntime/onnxruntime.dll" ]]; then
-    export ORT_DYLIB_PATH="$CACHE/onnxruntime/onnxruntime.dll"
-  elif [[ -f "$CACHE_OLD/onnxruntime/onnxruntime.dll" ]]; then
-    export ORT_DYLIB_PATH="$CACHE_OLD/onnxruntime/onnxruntime.dll"
-  elif [[ -f "$CACHE_OLD/onnxruntime/libonnxruntime.so" ]]; then
-    export ORT_DYLIB_PATH="$CACHE_OLD/onnxruntime/libonnxruntime.so"
-  else
-    export ORT_DYLIB_PATH="$CACHE/onnxruntime/libonnxruntime.so"
-  fi
-fi
-export CUBA_RERANKER_PATH="${CUBA_RERANKER_PATH:-$CACHE/reranker}"
-export CUBA_NLI_PATH="${CUBA_NLI_PATH:-$CACHE/models-nli}"
-export CUBA_EMBEDDING_DIM="${CUBA_EMBEDDING_DIM:-384}"
-export CUBA_EMBED_MODEL="${CUBA_EMBED_MODEL:-e5-small}"
-export CUBA_POOLING="${CUBA_POOLING:-cls}"
+# The model paths are chosen once, in gate_model_env (gate-lock.sh, CI-J5); merge-gate.sh calls it too.
+gate_model_env
 
 # D-F2b (CI-F1): merge-gate.sh asks for the models before its first compile, with the paths
 # exported above, so a missing model is seconds and not the first section. Nothing compiles.
