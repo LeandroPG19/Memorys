@@ -698,3 +698,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   DAG estimate from these numbers (chains as rows): critical path P 20 + DBG 421 + E2E 113 ≈ 554 s (9.2 min), the other
   chains under it (B3+REL 222, DC 325, CV 45, M 136); with κ = 1.2 ≈ 11 min; with CI-J7 (−66 s per contract round)
   ≈ 10 min. What remains: F3.3b-1b (the table through the planner), F3.3c (GATE_DAG=1, per-chain targets), ABBA.
+- 2026-11-07 08:49 · **CI-J7 committed and merged:** `3ef45c2` (the contract: one run per script, six launches at a time;
+  70/70 in 44.18 s, list identical, clippy clean) and `78949a3` (linux local_gate_contract 44/133 from that measure);
+  merged `ddf9662`. Twelfth full run (serial, lanes) started on ddf9662 to confirm it whole. F3.3b-1b restarted with the
+  redesign (rows are chains, the planner runs the series) in worktree `Memorys-ci-f33b1b2` from ddf9662.
