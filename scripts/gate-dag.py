@@ -629,7 +629,7 @@ class Planner:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
-                preexec_fn=cgroup_entry(step.cg) if step.cg else None,
+                preexec_fn=step_entry(step.cg),
             )
         step.t_start = self.now()
         if self.corrida is not None:
@@ -951,6 +951,22 @@ def cgroup_entry(path: str) -> Callable[[], None]:
                 fh.write(str(os.getpid()))
         except OSError:
             pass
+
+    return enter
+
+
+def step_entry(path: str | None) -> Callable[[], None]:
+    """Runs in the child before exec (CI-J10): SIGINT and SIGQUIT back to their default, then the step's cgroup if it
+    has one. The planner was started as a background job of merge-gate.sh, where bash ignores both on entry and cannot
+    reset them, so every step and everything under it (a gate's trap for INT, D2) would inherit them ignored. The
+    planner's own disposition is not touched: stop_on_term is its TERM."""
+    enter_cgroup = cgroup_entry(path) if path else None
+
+    def enter() -> None:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+        if enter_cgroup is not None:
+            enter_cgroup()
 
     return enter
 
