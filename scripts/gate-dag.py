@@ -8,10 +8,11 @@ backup). The verdict is the series one: the red with the lowest idx wins, the st
 finish, the ones after it are killed (D-F3d). A kernel kill (OOM, or a signal the planner did not
 send) gives no verdict: exit 2 (D-F3f).
 
-Not in F3.2: the model and cluster semaphores (D-F3q), the lane token (D-F3k), the target per lane
-(D-F3g), the removal of old run directories (D-F3i) and the per-binary launcher (D-F3u). `exclusive`
-and `boundary` run alone, after every lower idx: the conservative form of D-F3l. The resource
-column is parsed and ignored until F3.4.
+Not in F3.2: the model and cluster semaphores (D-F3q), the removal of old run directories (D-F3i) and
+the per-binary launcher (D-F3u). `exclusive` and `boundary` run alone, after every lower idx: the
+conservative form of D-F3l. The resource column names the target of a row (CI-F3.3c, D-F3g): the step
+builds under CARGO_TARGET_DIR/<tree key>/<target>, and a target that another tree marked is refused
+before the step starts. The other resources are parsed and ignored until F3.4.
 """
 
 from __future__ import annotations
@@ -166,6 +167,7 @@ class Step:
         idx: int,
         step_id: str,
         deps: list[str],
+        recursos: list[str],
         clase: str,
         cpu: float,
         ram_gb: float,
@@ -176,6 +178,7 @@ class Step:
         self.idx = idx
         self.id = step_id
         self.deps = deps
+        self.recursos = recursos
         self.clase = clase
         self.cpu_tab = cpu
         self.ram_tab = ram_gb
@@ -220,6 +223,31 @@ def parse_env(rest: list[str], step_id: str) -> tuple[dict[str, str], list[str]]
     return env, rest
 
 
+def target_dir(name: str) -> str:
+    """CI-F3.3c (D-F3g): the target of a resource is <CARGO_TARGET_DIR>/<tree key>/<name>. The tree key is the name of
+    the tree's directory and 12 hex of the sha256 of its realpath, so two trees under one root never share a target.
+    The directory names its tree in .gate-tree, and one that names another tree is refused before cargo runs."""
+    root = os.environ.get("CARGO_TARGET_DIR", "")
+    if not root:
+        die(f"target {name}: CARGO_TARGET_DIR is not set, so there is no root to put the target under (D-F3g)")
+    tree = os.path.realpath(repo_root())
+    key = f"{os.path.basename(tree)}-{hashlib.sha256(tree.encode()).hexdigest()[:12]}"
+    path = os.path.join(root, key, name)
+    marker = os.path.join(path, ".gate-tree")
+    try:
+        os.makedirs(path, exist_ok=True)
+        named = read_text(marker)
+        if named is None:
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write(f"{tree}\n")
+    except OSError as err:
+        die(f"target {path} cannot be made or marked ({err}); CARGO_TARGET_DIR has to be a directory this user can write (D-F3g)")
+    named = read_text(marker)
+    if named is not None and named.strip() != tree:
+        die(f"target {path} belongs to {named.strip()}, not to {tree}: refused before cargo runs (D-F3g)")
+    return path
+
+
 def parse_row(line: str, number: int) -> Step:
     tok = line.split()
     if len(tok) < 9:
@@ -231,8 +259,11 @@ def parse_row(line: str, number: int) -> Step:
     if tok[4] not in CLASSES:
         die(f"table line {number}: class {tok[4]} is not normal, exclusive or boundary")
     deps = [] if tok[2] == "-" else tok[2].split(",")
+    recursos = [] if tok[3] == "-" else tok[3].split(",")
+    if sum(r.startswith("target:") for r in recursos) > 1:
+        die(f"table line {number}: a row names one target, and {tok[1]} names more (D-F3g)")
     env, argv = parse_env(tok[8:], tok[1])
-    return Step(idx, tok[1], deps, tok[4], cpu, ram_gb, dur, env, argv)
+    return Step(idx, tok[1], deps, recursos, tok[4], cpu, ram_gb, dur, env, argv)
 
 
 def unique_steps(steps: list[Step]) -> dict[str, Step]:
@@ -564,6 +595,11 @@ class Planner:
         env = dict(os.environ)
         env["TMPDIR"] = tmp
         env.update(step.env)
+        targets = [r[len("target:"):] for r in step.recursos if r.startswith("target:")]
+        if targets:
+            if "CARGO_TARGET_DIR" in step.env:
+                die(f"step {step.id} names CARGO_TARGET_DIR and a target: the target sets it (D-F3g)")
+            env["CARGO_TARGET_DIR"] = target_dir(targets[0])
         env.pop("CUBA_GATE_LANE_TOKEN", None)
         if token is not None:
             env["CUBA_GATE_LANE_TOKEN"] = token

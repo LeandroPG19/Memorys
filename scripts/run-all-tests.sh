@@ -411,7 +411,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # merge-gate.sh as the second gate: refused before it has checked, backed
   # up or built anything.
   second_exit=0
-  env -u CUBA_GATE_LOCK_OWNER -u DATABASE_URL HOME="$tmp/home" PATH="/usr/bin:/bin" \
+  env -u CUBA_GATE_LOCK_OWNER -u DATABASE_URL -u CARGO_TARGET_DIR HOME="$tmp/home" PATH="/usr/bin:/bin" \
       "$BASH" "$ROOT/scripts/merge-gate.sh" >"$tmp/merge-second.out" 2>&1 || second_exit=$?
   grep -q "another gate is running: pid $live" "$tmp/merge-second.out" \
     || self_fail "a second merge-gate did not refuse at once, naming the first (exit $second_exit): $(cat "$tmp/merge-second.out")"
@@ -480,7 +480,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
     'exit 1' >"$tmp/bin/cargo"
   chmod +x "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin/cargo" "$tmp/bin/node"
   held_exit=0
-  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home2" DATABASE_URL="$rat_url" \
+  # CI-F3.3c (the judge's names): the gate of this tree takes its target root from its own HOME, not from the judge's
+  # CARGO_TARGET_DIR, which no user can make (gate-dag.py refuses it with 2 by name).
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u CARGO_TARGET_DIR HOME="$tmp/home2" DATABASE_URL="$rat_url" \
       PATH="$tmp/bin:/usr/bin:/bin" SKIP_BACKUP=1 \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$tmp/tree2/scripts/merge-gate.sh" >"$tmp/merge-held.out" 2>&1 || held_exit=$?
@@ -506,7 +508,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   mkdir -p "$tmp/home3/.cache/cuba-gate"
   printf '0\n' >"$tmp/home3/.cache/cuba-gate/run.exit"
   alone_exit=0
-  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home3" DATABASE_URL="$rat_url" \
+  env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u CARGO_TARGET_DIR HOME="$tmp/home3" DATABASE_URL="$rat_url" \
       PATH="$tmp/bin:/usr/bin:/bin" \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$ROOT/scripts/run-all-tests.sh" >"$tmp/alone.out" 2>&1 || alone_exit=$?
@@ -531,7 +533,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     'kill -9 "$(printf "%s\n" "$CUBA_GATE_LOCK_OWNER" | sed -n "s/^pid=\([0-9]*\) .*/\1/p")"' \
     'exit 1' >"$tmp/bin4/cargo"
   chmod +x "$tmp/bin4/cargo"
-  { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE HOME="$tmp/home4" DATABASE_URL="$rat_url" \
+  { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u CARGO_TARGET_DIR HOME="$tmp/home4" DATABASE_URL="$rat_url" \
       PATH="$tmp/bin4:/usr/bin:/bin" SKIP_BACKUP=1 \
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       "$BASH" "$tmp/tree4/scripts/merge-gate.sh" >"$tmp/merge-killed.out" 2>&1 || true; } 2>/dev/null

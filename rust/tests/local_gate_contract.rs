@@ -4450,6 +4450,49 @@ fn dag_rows() -> Vec<(u32, String, Vec<String>, String)> {
         .collect()
 }
 
+/// CI-F3.3c (D-F3g): every row that compiles builds in a target of its own, and the rows that read the release binary
+/// read the one B3 builds. Two compiling rows in one target would wait on its lock and build over each other.
+#[test]
+fn each_row_that_compiles_has_a_target_of_its_own_and_the_release_readers_share_b3s() {
+    let rows = dag_rows();
+    let target_of = |id: &str| -> String {
+        let (_, _, _, line) = rows
+            .iter()
+            .find(|(_, row, _, _)| row.as_str() == id)
+            .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"));
+        line.split_whitespace()
+            .nth(3)
+            .and_then(|recursos| recursos.split(',').find_map(|r| r.strip_prefix("target:")))
+            .unwrap_or_else(|| panic!("row {id} names no target: {line}"))
+            .to_string()
+    };
+    for (id, target) in [
+        ("DBG", "T_dbg"),
+        ("DC", "T_docs"),
+        ("CV", "T_cov"),
+        ("M", "T_mut"),
+        ("B3", "T_rel"),
+        ("REL", "T_rel"),
+        ("E2E", "T_rel"),
+    ] {
+        assert_eq!(
+            target_of(id),
+            target,
+            "row {id} must build in its own target"
+        );
+    }
+    let compiling: Vec<String> = ["DBG", "DC", "CV", "M", "B3"]
+        .iter()
+        .map(|id| target_of(id))
+        .collect();
+    let unique: std::collections::BTreeSet<&String> = compiling.iter().collect();
+    assert_eq!(
+        unique.len(),
+        compiling.len(),
+        "two compiling rows share a target: {compiling:?}"
+    );
+}
+
 /// The body of `step_<id>()` in merge-gate.sh: the lines between its header and the `}` that closes it.
 /// CI-F3.3b-2: a row of the table is a step of merge-gate.sh, and the --lane ids it runs are in its body.
 fn step_body(gate: &str, id: &str) -> Option<Vec<String>> {

@@ -235,12 +235,17 @@ impl Fixture {
 
     /// `run` with more variables for the planner (CI-F3.3b-1b-i: the gate lock and its owner).
     fn run_env(&self, gate_dag: &str, extra: &[(&str, &str)]) -> Run {
+        self.run_planner_at(&repo_root().join("scripts/gate-dag.py"), gate_dag, extra)
+    }
+
+    /// `run_env` with the planner of another tree (CI-F3.3c, D-F3g): each tree names its own targets.
+    fn run_planner_at(&self, planner: &Path, gate_dag: &str, extra: &[(&str, &str)]) -> Run {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let out_path = self.base.join(format!("salida-{n}.txt"));
         let err_path = self.base.join(format!("error-{n}.txt"));
         let mut child = Command::new("python3")
             .arg("-I")
-            .arg(repo_root().join("scripts/gate-dag.py"))
+            .arg(planner)
             .arg("run")
             .arg("--table")
             .arg(&self.table)
@@ -1017,5 +1022,195 @@ fn a_step_under_the_gate_lock_gets_a_one_use_ticket_in_the_lock() {
     assert_eq!(
         ticket, token,
         "the ticket in the lock's lanes directory must hold the token the step got"
+    );
+}
+
+// --- CI-F3.3c (D-F3g): the target of a row is its own directory, per tree and per name ----------------------
+
+/// A table whose rows name their resources (the `recursos` column of D-F3a), which `table` leaves at `-`.
+/// Rows are (idx, id, resources, seconds); each is a step of its own, with no dependencies.
+fn table_with_resources(fx: &mut Fixture, rows: &[(u32, &str, &str, &str)]) {
+    let mut text = String::new();
+    for &(idx, id, resources, secs) in rows {
+        text.push_str(&format!(
+            "{idx} {id} - {resources} normal 1 5 {secs} /bin/sh {} {id} {secs} {}\n",
+            fx.script.display(),
+            fx.control.display()
+        ));
+        fx.steps.push((idx, id.to_string()));
+    }
+    write(&fx.table, &text);
+    for (_, id) in &fx.steps {
+        fx.write_defaults(id);
+    }
+}
+
+/// The CARGO_TARGET_DIR a step saw, from the environment PASO_SH dumped into its control directory.
+fn target_seen_by(fx: &Fixture, id: &str) -> Option<String> {
+    read(&fx.control.join(format!("env-{id}.txt")))
+        .lines()
+        .find_map(|line| line.strip_prefix("CARGO_TARGET_DIR=").map(str::to_string))
+}
+
+/// Spec D-F3g: a step that names a target builds in <CARGO_TARGET_DIR>/<tree key>/<target>, and the directory of the
+/// target writes the realpath of its tree in .gate-tree. The root is the gate's own CARGO_TARGET_DIR.
+#[test]
+fn a_step_with_a_target_builds_in_its_own_directory_of_its_tree() {
+    let mut fx = Fixture::new("d3g-propio", CPU_FOUR, MEM_OPEN);
+    let root = fx.base.join("target-root");
+    table_with_resources(&mut fx, &[(10, "DBG", "target:T_dbg", "1")]);
+    let run = fx.run_env(
+        "0",
+        &[("CARGO_TARGET_DIR", root.to_str().expect("utf-8 path"))],
+    );
+    assert_green(&run, "a step that names a target");
+    let seen = PathBuf::from(target_seen_by(&fx, "DBG").expect("the step got no CARGO_TARGET_DIR"));
+    assert_eq!(
+        seen.file_name().and_then(|name| name.to_str()),
+        Some("T_dbg"),
+        "the step must build in the directory of its target, not in the gate's root: {}",
+        seen.display()
+    );
+    assert_eq!(
+        seen.parent().and_then(Path::parent),
+        Some(root.as_path()),
+        "the tree key sits directly under the gate's CARGO_TARGET_DIR: {}",
+        seen.display()
+    );
+    let named = read(&seen.join(".gate-tree"));
+    assert_eq!(
+        named.trim(),
+        fs::canonicalize(repo_root())
+            .expect("repo root")
+            .display()
+            .to_string(),
+        "the target does not name the tree it belongs to: {named}"
+    );
+}
+
+/// Spec C4 (D-F3g): two trees with the same directory name and one target root never share a target, and a target
+/// that another tree marked is refused with 2 before cargo is called: the step does not start.
+#[test]
+fn two_trees_under_one_target_root_never_share_a_target() {
+    let mut fx = Fixture::new("d3g-dos-arboles", CPU_FOUR, MEM_OPEN);
+    let root = fx.base.join("target-root");
+    table_with_resources(&mut fx, &[(10, "DBG", "target:T_dbg", "1")]);
+    let env = [("CARGO_TARGET_DIR", root.to_str().expect("utf-8 path"))];
+    let mut trees = Vec::new();
+    for name in ["a", "b"] {
+        let scripts = fx.base.join(name).join("memory-industry").join("scripts");
+        fs::create_dir_all(&scripts).expect("tree");
+        for file in ["gate-dag.py", "gate_history.py", "gate-lock.sh"] {
+            fs::copy(repo_root().join("scripts").join(file), scripts.join(file))
+                .expect("copy of the planner");
+        }
+        trees.push(scripts.parent().expect("tree root").to_path_buf());
+    }
+    let mut targets = Vec::new();
+    for tree in &trees {
+        let _ = fs::remove_file(fx.control.join("env-DBG.txt"));
+        let run = fx.run_planner_at(&tree.join("scripts/gate-dag.py"), "0", &env);
+        assert_green(&run, "a tree of its own, with a target root");
+        targets.push(PathBuf::from(
+            target_seen_by(&fx, "DBG").expect("the step got no CARGO_TARGET_DIR"),
+        ));
+    }
+    assert_ne!(
+        targets[0],
+        targets[1],
+        "two trees, one target: both trees build in {}",
+        targets[0].display()
+    );
+    for (tree, target) in trees.iter().zip(&targets) {
+        assert_eq!(
+            read(&target.join(".gate-tree")).trim(),
+            fs::canonicalize(tree).expect("tree").display().to_string(),
+            "the target of {} does not name it",
+            tree.display()
+        );
+    }
+    let _ = fs::remove_file(fx.control.join("env-DBG.txt"));
+    write(
+        &targets[0].join(".gate-tree"),
+        &format!("{}\n", fs::canonicalize(&trees[1]).expect("tree").display()),
+    );
+    let run = fx.run_planner_at(&trees[0].join("scripts/gate-dag.py"), "0", &env);
+    assert_eq!(
+        run.code,
+        Some(2),
+        "a target that another tree marked must be refused with 2 before cargo: {}",
+        run.text()
+    );
+    assert!(
+        !fx.control.join("env-DBG.txt").exists(),
+        "the step started although its target belongs to another tree"
+    );
+}
+
+/// The planner of D-F3g changes CARGO_TARGET_DIR only for a step that names a target: a step without one keeps the
+/// gate's own value, as it did before.
+#[test]
+fn a_step_without_a_target_keeps_the_gates_cargo_target() {
+    let mut fx = Fixture::new("d3g-sin-target", CPU_FOUR, MEM_OPEN);
+    let root = fx.base.join("target-root");
+    table_with_resources(&mut fx, &[(10, "P", "-", "1")]);
+    let run = fx.run_env(
+        "0",
+        &[("CARGO_TARGET_DIR", root.to_str().expect("utf-8 path"))],
+    );
+    assert_green(&run, "a step without a target");
+    assert_eq!(
+        target_seen_by(&fx, "P").as_deref(),
+        root.to_str(),
+        "a step with no target got another CARGO_TARGET_DIR"
+    );
+}
+
+/// A step that names a target with no CARGO_TARGET_DIR to root it under is refused before the step starts (D-F3g).
+#[test]
+fn a_target_without_a_cargo_target_root_is_refused_before_the_step() {
+    let mut fx = Fixture::new("d3g-sin-raiz", CPU_FOUR, MEM_OPEN);
+    table_with_resources(&mut fx, &[(10, "DBG", "target:T_dbg", "1")]);
+    let run = fx.run_env("0", &[("CARGO_TARGET_DIR", "")]);
+    assert_eq!(
+        run.code,
+        Some(2),
+        "a target with no root must be refused with 2: {}",
+        run.text()
+    );
+    assert!(
+        !fx.control.join("env-DBG.txt").exists(),
+        "the step started although it has no root for its target"
+    );
+}
+
+/// D-F3g, the judge's names: a CARGO_TARGET_DIR that cannot be made (here, a file where a directory has to be) is
+/// refused with 2 and a line that names it, never a traceback. The judge's environment can hand over a root that is
+/// not one this user can write.
+#[test]
+fn a_target_root_that_cannot_be_made_is_refused_with_2_and_named() {
+    let mut fx = Fixture::new("d3g-raiz-no-creable", CPU_FOUR, MEM_OPEN);
+    let blocker = fx.base.join("blocker");
+    write(&blocker, "a file, not a directory\n");
+    let root = blocker.join("target");
+    table_with_resources(&mut fx, &[(10, "DBG", "target:T_dbg", "1")]);
+    let run = fx.run_env(
+        "0",
+        &[("CARGO_TARGET_DIR", root.to_str().expect("utf-8 path"))],
+    );
+    assert_eq!(
+        run.code,
+        Some(2),
+        "a target root that cannot be made must exit 2: {}",
+        run.text()
+    );
+    assert!(
+        run.err.contains("cannot be made") && !run.err.contains("Traceback"),
+        "the refusal must name the root and not be a traceback: {}",
+        run.err
+    );
+    assert!(
+        !fx.control.join("env-DBG.txt").exists(),
+        "the step started although its target root cannot be made"
     );
 }

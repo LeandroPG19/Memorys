@@ -308,6 +308,19 @@ the doctor, the MCP live session and the eval smoke).
 - `DATABASE_URL` is exported as `GATE_DATABASE_URL` by `lane_D2` and again by `lane_E`, so each
   lane reaches `brain_gate` on its own.
 
+## Targets per tree and the DAG switch (CI-F3.3c)
+
+- A row of `scripts/gate-dag.txt` that names `target:<T>` builds under
+  `CARGO_TARGET_DIR/<tree key>/<T>`, where the tree key is the name of the tree's directory and 12 hex of
+  the sha256 of its realpath. The directory writes that realpath in `.gate-tree`. A target whose
+  `.gate-tree` names another tree is refused with exit 2 before cargo runs, and the step does not start.
+- The rows that compile have one target each: `DBG` `T_dbg`, `DC` `T_docs`, `CV` `T_cov`, `M` `T_mut`,
+  `B3` `T_rel`. The release readers `REL` and `E2E` read the `T_rel` that `B3` builds.
+- A step without a `target:` keeps the `CARGO_TARGET_DIR` of the gate.
+- `GATE_DAG=0` (series, the default) and `GATE_DAG=1` (DAG) read the same table. The switch is the
+  environment of `gate-dag.py`; `merge-gate.sh` does not set it. Changing `scripts/gate-dag.txt`
+  changes its hash, so the planner starts that table in series until the history has a serial run of it.
+
 ## Publishing
 
 ```bash
