@@ -825,3 +825,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   2 of 3 on the unpatched base 75b2a7a too — the same INT-ignored mechanism CI-J10 just fixed in the planner (that base
   does not carry CI-J10); not retried to pass. Re-verification queued; the seventeenth full run (with CI-J10) will tell
   whether D2 is green inside the real judge.
+- 2026-11-07 12:03 · **Seventeenth full run (`f0cf37d`, serial through the planner, with CI-J9 and CI-J10): every step
+  green — D2 included — and red only at test times:** `v017_relation_scan took 8.47 s, under the floor of 9 s of its line`
+  (the two-way ceiling doing its job: the generative-LLM test got faster). 1520.3 s (DC and CV started cold in their own
+  targets), peak 18.0 GB. The planner's own summary: **LB_run = 578.77 s (critical path P → DBG → E2E)** — the DAG's
+  lower bound on this tree, 9.6 min; T/LB_run 2.63 in series. v017_relation_scan over the four whole runs: 19.18, 9.45,
+  11.24, 8.47 s → by the file's rule (≥ 3 runs, k = 1.3) floor 4, ceiling 25. Slice CI-J11 for that line.
