@@ -677,3 +677,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   five other test binaries read the judge scripts (ci_contract, doc_contract, v025, v027, v045). From now on every
   judge-slice verification also runs ci_contract and doc_contract. Slice **CI-J8**: the locator finds the first
   run-all-tests call however it is written (the intent — the trap armed before the first step that can fail — kept).
+- 2026-11-07 08:16 · F3.3b-1b did not fit as designed (no chain column in the table, P/DC/CV/M/TB are not lanes,
+  serial history and T/LB would need new bash). Decision (spec F3 «F3.3b-1b · la fila de la tabla es la cadena»): **a table
+  row is a chain** (P, DBG, B3, REL, E2E, DC, CV, M, TB), its command `merge-gate.sh --step <id>`, and merge-gate runs
+  the table **through the F3.2 planner in both modes** — the series (GATE_DAG=0) then writes its history and its T/LB
+  summary through what F3.1/F3.2/F3.3b-0 already built, and GATE_DAG=1 needs no new wiring. B1 out; start values from the
+  ninth run of this tree. Restarted on top of CI-J7 once that is merged (both touch local_gate_contract.rs).
