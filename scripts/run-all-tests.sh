@@ -1223,6 +1223,62 @@ FAKE
   grep -q 'All tests passed' "$tmp/lane_d2.out" \
     && self_fail "F3.3a: --lane D2 printed the verdict of the whole run"
 
+  # CI-F3.3b-1 (D-F3b, spec §4 F3.3b): several --lane in one call run in the order they are given, in one
+  # process: CL and D1 share one throwaway database, made once. A refused list touches neither cargo nor a lane.
+  # release_run NAME ARGS...: the whole script in NAME's tree with one call's arguments, and the release binary
+  # that B3 leaves under the target (so R and E find it as they would after B3 in the same judge).
+  release_run() {
+    local name="$1" t="$tmp/$1"
+    shift
+    full_tree "$name"
+    cp "$t/standin/memory-industry" "$t/target/release/memory-industry"
+    printf '{"content":"fake observation"}\n%.0s' 1 2 3 4 5 >"$t/rust/eval-datasets/smoke-corpus.jsonl"
+    rc=0
+    env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT HOME="$t/home" \
+      PATH="$t/bin:/usr/bin:/bin" DATABASE_URL="$rat_url" CARGO_TARGET_DIR="$t/target" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      ONNX_MODEL_PATH="$t/models" CUBA_RERANKER_PATH="$t/reranker" CUBA_NLI_PATH="$t/nli-model" \
+      MEMORY_INDUSTRY_LLM_PROVIDER=ollama \
+      "$BASH" "$t/scripts/run-all-tests.sh" "$@" >"$tmp/$name.out" 2>&1 || rc=$?
+  }
+  release_run lane_pair --lane CL --lane D1
+  (( rc == 0 )) || self_fail "F3.3b-1: --lane CL --lane D1 exits $rc, not 0: $(cat "$tmp/lane_pair.out")"
+  pair_clippy="$(grep -n -m1 'clippy' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
+  pair_test="$(grep -n -m1 '^test$' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
+  [[ -n "$pair_clippy" && -n "$pair_test" && "$pair_clippy" -lt "$pair_test" ]] \
+    || self_fail "F3.3b-1: --lane CL --lane D1 did not run CL and then D1 in that order (clippy at ${pair_clippy:-none}, test at ${pair_test:-none}): $(cat "$tmp/lane_pair/home/cargo.calls" 2>/dev/null)"
+  [[ "$(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_pair/home/psql.calls" 2>/dev/null || true)" == 1 ]] \
+    || self_fail "F3.3b-1: the two lanes of one call did not share one database (CREATE DATABASE brain_gate seen $(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_pair/home/psql.calls" 2>/dev/null || echo 0) times)"
+  grep -q 'All tests passed' "$tmp/lane_pair.out" \
+    && self_fail "F3.3b-1: a list of lanes printed the verdict of the whole run"
+  release_run lane_pair_bad --lane D2 --lane NOPE
+  (( rc == 2 )) || self_fail "F3.3b-1: a list with an unknown lane in its second place exits $rc, not 2: $(cat "$tmp/lane_pair_bad.out")"
+  grep -q 'no such lane: NOPE' "$tmp/lane_pair_bad.out" \
+    || self_fail "F3.3b-1: the refused list does not name the lane it refuses: $(cat "$tmp/lane_pair_bad.out")"
+  [[ ! -e "$tmp/lane_pair_bad/home/cargo.calls" && ! -e "$tmp/lane_pair_bad/home/order.log" ]] \
+    || self_fail "F3.3b-1: a refused list touched cargo or a lane: $(cat "$tmp/lane_pair_bad/home/cargo.calls" "$tmp/lane_pair_bad/home/order.log" 2>/dev/null)"
+  release_run lane_pair_bare --lane D2 --lane
+  (( rc == 2 )) || self_fail "F3.3b-1: a list ending in --lane with no id exits $rc, not 2: $(cat "$tmp/lane_pair_bare.out")"
+  grep -q 'needs a lane id' "$tmp/lane_pair_bare.out" \
+    || self_fail "F3.3b-1: a list ending in --lane with no id does not say so: $(cat "$tmp/lane_pair_bare.out")"
+  [[ ! -e "$tmp/lane_pair_bare/home/cargo.calls" ]] || self_fail "F3.3b-1: a list ending in --lane with no id ran cargo"
+
+  # CI-F3.3b-1 (D-F3q): R in its own process reads REL_BIN and REL_SHA from the release binary on disk, as E
+  # already does. Before this, R used REL_BIN from a process that had run B3, and alone it died on it unset.
+  release_run lane_r_alone --lane R
+  (( rc == 0 )) || self_fail "F3.3b-1: --lane R alone exits $rc, not 0 (it has no REL_BIN of its own): $(cat "$tmp/lane_r_alone.out")"
+  grep -q 'unbound variable' "$tmp/lane_r_alone.out" \
+    && self_fail "F3.3b-1: --lane R alone died on a variable it does not set: $(cat "$tmp/lane_r_alone.out")"
+  grep -q 'sha256 changed' "$tmp/lane_r_alone.out" \
+    && self_fail "F3.3b-1: --lane R alone reports a sha256 change with nothing changed: $(cat "$tmp/lane_r_alone.out")"
+
+  # CI-F3.3b-1 (D-F3b, D-F3r of the spec §1.1): E in its own process provisions brain_gate when the database is
+  # not there, the same provision D1 makes. D1 and E in one call share it, so E makes it only when it is missing.
+  release_run lane_e_alone --lane E
+  (( rc == 0 )) || self_fail "F3.3b-1: --lane E alone exits $rc, not 0: $(cat "$tmp/lane_e_alone.out")"
+  [[ "$(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null || true)" == 1 ]] \
+    || self_fail "F3.3b-1: --lane E alone did not provision brain_gate (CREATE DATABASE brain_gate seen $(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null || echo 0) times): $(cat "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null)"
+
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
   echo "    else; the run-all-tests.sh merge-gate launches works under its lock and"
