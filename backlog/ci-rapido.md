@@ -683,3 +683,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   the table **through the F3.2 planner in both modes** — the series (GATE_DAG=0) then writes its history and its T/LB
   summary through what F3.1/F3.2/F3.3b-0 already built, and GATE_DAG=1 needs no new wiring. B1 out; start values from the
   ninth run of this tree. Restarted on top of CI-J7 once that is merged (both touch local_gate_contract.rs).
+- 2026-11-07 08:23 · CI-J7 measured: **local_gate_contract 108.6 s → 41.9 s a round** (same 70 tests, list identical,
+  clippy and rustfmt clean), but 69/70: its per-launch base path (uuid + script name + own TMPDIR) pushes gate-cluster's
+  socket to 139 bytes, over the 107 of sun_path — gate-cluster's guard right, the path shortened (st-<pid>-<n>, TMPDIR
+  base/t, margin computed). (The base run's one red, every_gate_entry_point_is_executable_in_the_index, is an artifact of
+  measuring it from a git archive: not a repository.)
