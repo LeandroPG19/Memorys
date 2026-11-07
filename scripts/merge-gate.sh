@@ -36,7 +36,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # CI-F2 (D-F2i): the lane of a step is not inherited (JUDGE_ENVIRONMENT). The rows that make lanes
   # set GATE_LANE themselves, through the gate.
   # CI-J5: the model names are the judge's (JUDGE_ENVIRONMENT). The rows that read them set them.
-  unset GATE_LANE ONNX_MODEL_PATH ORT_DYLIB_PATH CUBA_RERANKER_PATH CUBA_NLI_PATH CUBA_EMBEDDING_DIM \
+  # F2b-fix: the root of the clusters is the judge's too; a row that needs one sets it, or takes the stand-in's default.
+  unset GATE_LANE GATE_CLUSTER_ROOT ONNX_MODEL_PATH ORT_DYLIB_PATH CUBA_RERANKER_PATH CUBA_NLI_PATH CUBA_EMBEDDING_DIM \
     CUBA_EMBED_MODEL CUBA_POOLING
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.
@@ -898,6 +899,18 @@ down mut'
   docs_ok="$(grep -cE '^docs postgresql://cuba:fakepw@[^ ]*%2Fdocs\.fk0000:5432/brain 7701731310526959658 (clippy|test) .*--features docs' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
   (( docs_lines >= 2 && docs_lines == docs_ok )) \
     || self_fail "C1: the docs steps did not all see the URL and GATE_LANE of lane docs: $(cat "$tmp/c1/home/cargo.lanes")"
+  # F2b-fix (D-F2i): the step of a lane is judged by gate_require_judge_server, which refuses a lane's
+  # URL unless GATE_CLUSTER_ROOT names the root of the clusters. The root is the gate's own shell variable
+  # (not exported, as in the judge), so it reaches a step only if run_in_lane hands it over. The crap-gate
+  # stand-in records what it was given; the root of this row is the stand-in library's default under its HOME.
+  fake_tree f2bfix "$lane_body"
+  printf '%s\n' '#!/bin/sh' 'echo "${GATE_CLUSTER_ROOT-unset}" >>"$HOME/crap-gate.roots"' 'exit 0' \
+    >"$tmp/f2bfix/scripts/crap-gate.sh"
+  f2bfix_root="$tmp/f2bfix/home/cluster-root"
+  run_copy_as unset f2bfix ""
+  (( rc == 0 )) || self_fail "F2b-fix: the gate without DATABASE_URL on Linux exited $rc: $(cat "$tmp/f2bfix.out")"
+  grep -qxF "$f2bfix_root" "$tmp/f2bfix/home/crap-gate.roots" 2>/dev/null \
+    || self_fail "F2b-fix: the step of lane cov did not see GATE_CLUSTER_ROOT=$f2bfix_root: a lane's step is refused without it (D-F2i), and run_in_lane must hand it over with the lane's URL. It got: $(cat "$tmp/f2bfix/home/crap-gate.roots" 2>/dev/null)"
   # CI-J5: the --features docs step reads the models the full run reads. The HOME of this row has the
   # embedder where the binary keeps it, and the stand-in cargo of each docs call records the two
   # variables it was given: ONNX_MODEL_PATH and CUBA_EMBEDDING_DIM.
