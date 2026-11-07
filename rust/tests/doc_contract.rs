@@ -593,11 +593,20 @@ fn the_gate_writes_its_own_exit_code_where_a_reader_can_find_it() {
     // and no capture, and each time the result was read from a file that was
     // never going to appear. Since 0.28 merge-gate.sh writes the verdict, so
     // that a deny or mutation failure after the tests is not reported as 0.
-    for (script, first_step) in [
-        ("scripts/run-all-tests.sh", "=== cargo fmt --check ==="),
+    // CI-J8 (F3.3b-1): merge-gate.sh also names run-all-tests.sh inside its self-test block, which
+    // sits above the trap, so its first real step is searched for after that block's end. Since
+    // F3.3b-1 the step is one call per chain, with or without arguments behind the path, so the
+    // old search for the path followed by a newline found nothing.
+    for (script, first_step, after_self_test) in [
+        (
+            "scripts/run-all-tests.sh",
+            "=== cargo fmt --check ===",
+            None,
+        ),
         (
             "scripts/merge-gate.sh",
-            "\"$ROOT/scripts/run-all-tests.sh\"\n",
+            "\"$ROOT/scripts/run-all-tests.sh\"",
+            Some("# --- self-test end ---"),
         ),
     ] {
         let gate = read(script);
@@ -608,9 +617,19 @@ fn the_gate_writes_its_own_exit_code_where_a_reader_can_find_it() {
         let trap = gate
             .find("trap on_exit EXIT")
             .unwrap_or_else(|| panic!("{script} installs its exit trap"));
-        let step = gate
-            .rfind(first_step)
-            .unwrap_or_else(|| panic!("{script} runs {first_step}"));
+        let step = match after_self_test {
+            Some(marker) => {
+                let body = gate
+                    .find(marker)
+                    .unwrap_or_else(|| panic!("{script} closes its self-test with {marker}"));
+                body + gate[body..]
+                    .find(first_step)
+                    .unwrap_or_else(|| panic!("{script} runs {first_step} after its self-test"))
+            }
+            None => gate
+                .rfind(first_step)
+                .unwrap_or_else(|| panic!("{script} runs {first_step}")),
+        };
         assert!(
             trap < step,
             "{script}: the trap has to be armed before the first step that can fail, or a \
