@@ -300,3 +300,138 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod trace_tests {
+    const AVISO: &str = "aviso de un callsite que solo alcanza un test de envs";
+
+    /// A callsite of its own: only the test below reaches it, so no other test
+    /// can register it first.
+    fn warn_at_this_callsite() {
+        tracing::warn!("{AVISO}");
+    }
+
+    /// What `f` logged at WARN or above on the thread that runs it.
+    fn warnings_while(f: impl FnOnce()) -> String {
+        crate::envs::quiet_global_subscriber();
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&capture.0.lock().expect("capture lock")).into_owned()
+    }
+
+    #[test]
+    fn a_warning_another_thread_reached_first_is_still_captured() {
+        let logged = warnings_while(|| {
+            std::thread::scope(|s| {
+                s.spawn(warn_at_this_callsite)
+                    .join()
+                    .expect("the other thread finishes");
+            });
+            warn_at_this_callsite();
+        });
+        assert!(
+            logged.contains(AVISO),
+            "the warning this callsite raised on the capturing thread is in the capture, \
+             even though another thread without a subscriber reached the callsite first; \
+             logged: {logged:?}"
+        );
+    }
+
+    /// The same case in a fresh process where the capture is the only live
+    /// dispatcher: there the first registration is the one that caches `never`.
+    #[test]
+    fn the_same_case_in_a_fresh_process_where_the_capture_is_the_only_dispatcher() {
+        let (_crate_name, in_crate) = module_path!()
+            .split_once("::")
+            .expect("a module path starts with the crate");
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test binary knows where it lives"),
+        )
+        .arg(format!(
+            "{in_crate}::a_warning_another_thread_reached_first_is_still_captured"
+        ))
+        .args(["--exact", "--test-threads=1"])
+        .output()
+        .expect("the test binary runs again");
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success() && printed.contains("1 passed"),
+            "the child run did not pass exactly one test:\n{printed}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// A global subscriber that records nothing and answers `Interest::sometimes`.
+///
+/// Once it is global, no callsite can cache `never` from a thread without a
+/// subscriber: the macro asks the thread's own default on each event. The
+/// test-only helpers that capture WARN lines call `quiet_global_subscriber`
+/// first, so the interest of their callsites is fixed by this subscriber and
+/// not by whichever thread reaches them first.
+#[cfg(test)]
+struct QuietSubscriber;
+
+#[cfg(test)]
+impl tracing::subscriber::Subscriber for QuietSubscriber {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::WARN)
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Installs `QuietSubscriber` as the process's global default, once.
+#[cfg(test)]
+pub(crate) fn quiet_global_subscriber() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(QuietSubscriber);
+    });
+}
