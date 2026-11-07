@@ -503,3 +503,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   `gate_cluster_up` instead of new PG fixtures, plus the code in merge-gate/run-all-tests/gate-lock (PGPASSWORD,
   D-F2i) and the docs part E2 needs; **F2b-2** = the real-cluster contract (B1–B3), the rest of docs and AGENTS.md. The
   library rows already in F2a's self-test (A2, D3, D4/K4, K5–K10, the long path) are not duplicated in the caller.
+- 2026-11-07 10:40 · **Fourth full run (`058cb55`): 412.9 s, exit 101** — past fmt, clippy (16 s), the throwaway
+  brain_gate (fresh, 43 tables), cargo test unit + smoke (≈295 s), then red in the `--ignored` step: lib test
+  `sync::chunk::tests::a_deleted_fact_leaves_a_tombstone_even_though_its_key_is_not_called_id` → «connect to test
+  database: failed to run sqlx migrations … duplicate key value violates unique constraint "_sqlx_migrations_pkey"»
+  (17 of 18 passed). Looks like a first-time race of migrations under parallel tests on the new :5490 server (the old
+  judge's :5489 passed it in F0). A debugger reads it (no rerun to approve: a race between two connections is the bug).
