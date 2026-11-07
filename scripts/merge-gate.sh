@@ -31,6 +31,9 @@ source "$ROOT/scripts/gate-lock.sh"
 #   ./scripts/merge-gate.sh --self-test
 # --- self-test begin ---
 if [[ "${1:-}" == "--self-test" ]]; then
+  # CI-F2 (D-F2i): the lane of a step is not inherited (JUDGE_ENVIRONMENT). The rows that make lanes
+  # set GATE_LANE themselves, through the gate.
+  unset GATE_LANE
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.
   hermetic="$(mktemp -d)"
@@ -47,9 +50,39 @@ if [[ "${1:-}" == "--self-test" ]]; then
     local t="$tmp/$1" s
     mkdir -p "$t/scripts" "$t/rust" "$t/bin" "$t/home/.cache/cuba-gate"
     cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" "$t/scripts/"
+    # CI-F2 (F2b-1): the library of the judge's lanes is a stand-in with the same functions and no
+    # Postgres. The rows of this self-test prove the wiring of merge-gate.sh (what each step is given,
+    # and in what order its lanes are made and taken down); the library's own rows are in
+    # gate-cluster.sh --self-test. Every call goes in the steps, in order.
+    cat >"$t/scripts/gate-cluster.sh" <<'FAKE'
+GATE_CLUSTER_ROOT="${GATE_CLUSTER_ROOT:-$HOME/cluster-root}"
+GATE_CLUSTER_URL=""
+GATE_PG_BINDIR="${GATE_PG_BINDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/pgbin}"
+gate_cluster_check() {
+  [ -x "$GATE_PG_BINDIR/initdb" ] || {
+    echo "FAIL: $GATE_PG_BINDIR/initdb is not there: the judge's Postgres is not installed (stand-in). docs/gate.md, The judge's servers, says how to install it." >&2
+    exit 2
+  }
+  echo check >>"$HOME/steps"
+  echo "OK  postgres 18.6 + pgvector 0.8.7 (stand-in)"
+}
+gate_cluster_sweep() { echo sweep >>"$HOME/steps"; }
+gate_cluster_up() {
+  echo "up $1" >>"$HOME/steps"
+  touch "$HOME/lanes.open"
+  GATE_CLUSTER_URL="postgresql://cuba:fakepw@${GATE_CLUSTER_ROOT//\//%2F}%2F$1.fk0000:5432/brain"
+  echo "OK  cluster $1 up in 1 ms (stand-in)"
+}
+gate_cluster_down() { echo "down $1" >>"$HOME/steps"; rm -f "$HOME/lanes.open"; echo "OK  cluster $1 down"; }
+gate_cluster_down_all() {
+  [ -e "$HOME/lanes.open" ] || return 0
+  echo down-all >>"$HOME/steps"
+  rm -f "$HOME/lanes.open"
+}
+FAKE
     printf '#!/bin/sh\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
     for s in codigo-muerto crap-gate; do
-      printf '#!/bin/sh\necho %s >>"$HOME/steps"\necho "${DATABASE_URL-unset}" >>"$HOME/%s.urls"\nexit 0\n' "$s" "$s" >"$t/scripts/$s.sh"
+      printf '#!/bin/sh\necho %s >>"$HOME/steps"\necho "${DATABASE_URL-unset}" >>"$HOME/%s.urls"\necho "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset}" >>"$HOME/%s.lanes"\nexit 0\n' "$s" "$s" "$s" >"$t/scripts/$s.sh"
     done
     # CI-F1: codigo-muerto alone takes FAKE_CODIGO_MUERTO_EXIT as its verdict, so a row can
     # make the cheap step red (D-F2a). The loop above keeps crap-gate as it was.
@@ -60,6 +93,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     printf '%s\n' '#!/bin/sh' \
       '[ "${1:-}" = --refuse-targets ] || echo mutants-gate >>"$HOME/steps"' \
       '[ "${1:-}" = --refuse-targets ] || echo "${DATABASE_URL-unset}" >>"$HOME/mutants-gate.urls"' \
+      '[ "${1:-}" = --refuse-targets ] || echo "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset}" >>"$HOME/mutants-gate.lanes"' \
       'echo "mutants caught=9 missed=1 timeout=0 unviable=0 kill_rate=0.900 min=0.800"' \
       >"$t/scripts/mutants-gate.sh"
     # test-times.sh: what it was called with goes in the order, the log it was
@@ -67,6 +101,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # FAKE_TIMES_EXIT is its verdict.
     printf '%s\n' '#!/bin/sh' \
       'echo "test-times $*" >>"$HOME/steps"' \
+      'echo "${DATABASE_URL-unset}" >>"$HOME/test-times.url"' \
       'prev=""; for a in "$@"; do [ "$prev" = --judge ] && cp "$a" "$HOME/times.seen"; prev="$a"; done' \
       'exit "${FAKE_TIMES_EXIT:-0}"' >"$t/scripts/test-times.sh"
     # advisory-exceptions.sh (G6): what it was called with goes in the order, the
@@ -99,8 +134,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
     printf '%s\n' '#!/bin/sh' \
       'for a in "$@"; do printf "%s\n" "$a"; done >>"$HOME/psql.args"' \
       'printf "PGOPTIONS=%s\n" "${PGOPTIONS-}" >>"$HOME/psql.env"' \
+      'printf "PGPASSWORD=%s\n" "${PGPASSWORD-}" >>"$HOME/psql.env"' \
       'if [ -n "${FAKE_PSQL_EXIT:-}" ]; then echo "${FAKE_PSQL_STDERR:-psql: fake failure}" >&2; exit "$FAKE_PSQL_EXIT"; fi' \
-      'echo "${FAKE_PSQL_CLUSTER_NAME-memory-industry-gate}|${FAKE_PSQL_SYSID-7701731310526959658}"' \
+      'lane="$(printf "%s" "$*" | sed -n "s/.*%2F\([a-z][a-z0-9-]*\)\.[A-Za-z0-9]\{6\}:5432.*/\1/p")"' \
+      'if [ -n "$lane" ] && [ -z "${FAKE_PSQL_CLUSTER_NAME+x}" ]; then name="memory-industry-gate-$lane"; else name="${FAKE_PSQL_CLUSTER_NAME-memory-industry-gate}"; fi' \
+      'echo "$name|${FAKE_PSQL_SYSID-7701731310526959658}"' \
       'exit 0' >"$t/bin/psql"
     # gate_linux_env reads the version of node, and package.json says which one
     # is the oldest the gate accepts.
@@ -112,6 +150,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # CI-F1: nproc says how many cores the machine has. The gate takes the cgroup's CPUs
     # under it (D-F1a), so a row that gives a cgroup of 8 under 24 cores expects 8.
     printf '#!/bin/sh\necho "${FAKE_NPROC:-24}"\n' >"$t/bin/nproc"
+    # CI-F2 (D-F2c, D-F2k): the judge's Postgres binaries, in a bindir of their own. initdb is a
+    # stand-in that only records its call and fails, so a row that must not make a cluster can see
+    # that none was made (A3), and the rows that do can see what came next.
+    mkdir -p "$t/pgbin"
+    printf '%s\n' '#!/bin/sh' 'echo initdb >>"$HOME/initdb.calls"' 'exit 1' >"$t/pgbin/initdb"
+    chmod +x "$t/pgbin/initdb"
     printf '{"engines":{"node":">=18"}}\n' >"$t/package.json"
     # cargo fails the one subcommand named in FAIL_AT, and not its --version
     # probe, so the gate gets past "is cargo-deny installed" to the check. Each
@@ -127,6 +171,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     printf '%s\n' '#!/bin/sh' \
       'echo "cargo $*" >>"$HOME/steps"' \
       'echo "${DATABASE_URL-unset}" >>"$HOME/cargo.urls"' \
+      'echo "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset} $*" >>"$HOME/cargo.lanes"' \
       'echo "${CARGO_BUILD_JOBS-unset} $*" >>"$HOME/cargo.jobs"' \
       'if [ "$1" = audit ] && [ "${2:-}" = --json ]; then' \
       '  echo "$PWD" >"$HOME/audit_json.cwd"' \
@@ -751,25 +796,132 @@ if [[ "${1:-}" == "--self-test" ]]; then
       || self_fail "$name: the line after the judge's OK is not the banner of cargo audit: $(cat "$tmp/$name.out")"
     grep -qxF 'PGOPTIONS=-c default_transaction_read_only=on' "$tmp/$name/home/psql.env" 2>/dev/null \
       || self_fail "$name: the identity query did not run read-only: $(cat "$tmp/$name/home/psql.env" 2>/dev/null || true)"
-    grep -qxF "postgresql://gate:$password@127.0.0.1:$port/postgres" "$tmp/$name/home/psql.args" 2>/dev/null \
+    # A F2b: the password goes to libpq in PGPASSWORD, for that one call, and never in the argv of psql
+    # (ps shows argv to every user). The maintenance database is asked of the same server, without it.
+    grep -qxF "postgresql://gate@127.0.0.1:$port/postgres" "$tmp/$name/home/psql.args" 2>/dev/null \
       || self_fail "$name: the identity query was not asked of the maintenance database of the same server: $(cat "$tmp/$name/home/psql.args" 2>/dev/null || true)"
+    grep -qxF "PGPASSWORD=$password" "$tmp/$name/home/psql.env" 2>/dev/null \
+      || self_fail "$name: the identity query did not get the password in PGPASSWORD for that call: $(cat "$tmp/$name/home/psql.env" 2>/dev/null || true)"
+    if grep -qF "$password" "$tmp/$name/home/psql.args" 2>/dev/null; then
+      self_fail "$name: the password of DATABASE_URL is in the argv of psql: $(cat "$tmp/$name/home/psql.args")"
+    fi
     if grep -qF "$password" "$tmp/$name.out"; then
       self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
     fi
   }
-  # J1.1: no DATABASE_URL, unset or empty, is refused before anybody is asked, and
-  # the refusal names it and says where the judge's server is set up.
+  # J1.1, rewritten by CI-F2 (D-F2c, D-F2k): without DATABASE_URL, unset or empty, on Linux the
+  # judge makes its own lanes, so J1.1's refusal moves to the step that makes them. Here the bindir
+  # has no initdb (A2, "sin initdb"): the gate stops before pg_isready, psql or cargo, and its FAIL
+  # line names initdb and docs/gate.md, never :5488. J1.1's intent (no URL, never the live corpus)
+  # is kept by this row and by A3.
   for form in unset empty; do
     fake_tree "j11_$form" "echo \"$ran_marker\""
-    if [[ "$form" == unset ]]; then run_copy_as unset "j11_$form" ""; else run_copy_as "" "j11_$form" ""; fi
+    if [[ "$form" == unset ]]; then
+      run_copy_as unset "j11_$form" "" GATE_PG_BINDIR="$tmp/j11_$form/nopg"
+    else
+      run_copy_as "" "j11_$form" "" GATE_PG_BINDIR="$tmp/j11_$form/nopg"
+    fi
     pg_stopped "j11_$form" 2
     [[ ! -e "$tmp/j11_$form/home/pg_isready.args" && ! -e "$tmp/j11_$form/home/psql.args" ]] \
-      || self_fail "j11_$form: a server was asked with no DATABASE_URL: $(pg_args "j11_$form") $(cat "$tmp/j11_$form/home/psql.args" 2>/dev/null || true)"
-    fail_line_with "j11_$form" DATABASE_URL 'docs/gate.md' \
-      || self_fail "j11_$form: no FAIL line names DATABASE_URL and docs/gate.md: $(cat "$tmp/j11_$form.out")"
+      || self_fail "j11_$form: a server was asked with no DATABASE_URL and no initdb: $(pg_args "j11_$form") $(cat "$tmp/j11_$form/home/psql.args" 2>/dev/null || true)"
+    fail_line_with "j11_$form" initdb 'docs/gate.md' \
+      || self_fail "j11_$form: no FAIL line names initdb and docs/gate.md: $(cat "$tmp/j11_$form.out")"
     if grep -q '5488' "$tmp/j11_$form.out"; then
       self_fail "j11_$form: the refusal names :5488, the live corpus: $(cat "$tmp/j11_$form.out")"
     fi
+  done
+  # A3 (CI-F2): off Linux, without DATABASE_URL, the refusal is J1.1's: exit 2 naming DATABASE_URL and
+  # docs/gate.md, and no initdb was called, whatever the bindir holds.
+  fake_tree a3_not_linux "echo \"$ran_marker\""
+  printf '%s\n' '#!/bin/sh' 'if [ "${1:-}" = -s ]; then echo MINGW64_NT-10.0; else exec /usr/bin/uname "$@"; fi' \
+    >"$tmp/a3_not_linux/bin/uname"
+  chmod +x "$tmp/a3_not_linux/bin/uname"
+  run_copy_as unset a3_not_linux "" GATE_PG_BINDIR="$tmp/a3_not_linux/pgbin"
+  pg_stopped a3_not_linux 2
+  [[ ! -e "$tmp/a3_not_linux/home/initdb.calls" ]] \
+    || self_fail "a3_not_linux: initdb was called off Linux: $(cat "$tmp/a3_not_linux/home/initdb.calls")"
+  fail_line_with a3_not_linux DATABASE_URL 'docs/gate.md' \
+    || self_fail "a3_not_linux: no FAIL line names DATABASE_URL and docs/gate.md: $(cat "$tmp/a3_not_linux.out")"
+  # CI-F2 (F2b-1), the caller's rows. Without DATABASE_URL on Linux, merge-gate.sh makes one lane per
+  # step (dbg, docs, cov, mut), each with its own URL and GATE_LANE, and takes it down after its step.
+  # run-all-tests.sh records what it was given for the full run; the lanes' stand-in (fake_tree) records
+  # every call in the steps. lane_body is the run-all-tests stand-in of every row below.
+  lane_body='echo "run-all-tests${*:+ $*}" >>"$HOME/steps"; [ "${1:-}" = --check-models ] || echo "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset}" >>"$HOME/run-all.lanes"'
+  # A1: the cheap check and the sweep of the lanes come before the first cargo (the audit).
+  fake_tree a1 "$lane_body"
+  run_copy_as unset a1 ""
+  (( rc == 0 )) || self_fail "A1: the gate without DATABASE_URL on Linux exited $rc: $(cat "$tmp/a1.out")"
+  first_cargo="$(grep -n -m1 '^cargo ' "$tmp/a1/home/steps" 2>/dev/null | cut -d: -f1 || true)"
+  first_check="$(grep -n -m1 '^check$' "$tmp/a1/home/steps" 2>/dev/null | cut -d: -f1 || true)"
+  first_sweep="$(grep -n -m1 '^sweep$' "$tmp/a1/home/steps" 2>/dev/null | cut -d: -f1 || true)"
+  [[ -n "$first_check" && -n "$first_cargo" && "$first_check" -lt "$first_cargo" ]] \
+    || self_fail "A1: the lane check does not come before cargo (check at ${first_check:-none}, cargo at ${first_cargo:-none}): $(cat "$tmp/a1/home/steps")"
+  [[ -n "$first_sweep" && "$first_sweep" -lt "$first_cargo" ]] \
+    || self_fail "A1: the sweep of the cluster root does not come before cargo (sweep at ${first_sweep:-none}): $(cat "$tmp/a1/home/steps")"
+  [[ "$(grep -n -m1 '^=== cargo audit ===$' "$tmp/a1.out" 2>/dev/null | cut -d: -f1 || true)" -gt "$(grep -n -m1 '^OK  postgres 18.6' "$tmp/a1.out" 2>/dev/null | cut -d: -f1 || true)" ]] 2>/dev/null \
+    || self_fail "A1: the OK of the Postgres check is not printed before the banner of cargo audit: $(cat "$tmp/a1.out")"
+  # C1: each step gets its own lane: the order of the lanes and the steps, and what each step saw.
+  fake_tree c1 "$lane_body"
+  run_copy_as unset c1 ""
+  (( rc == 0 )) || self_fail "C1: the gate without DATABASE_URL on Linux exited $rc: $(cat "$tmp/c1.out")"
+  lane_order='run-all-tests --check-models
+up dbg
+run-all-tests
+down dbg
+up docs
+cargo clippy --all-targets --features docs -- -D warnings
+cargo test --features docs
+down docs
+up cov
+crap-gate
+down cov
+up mut
+mutants-gate
+down mut'
+  [[ "$(grep -E '^(up |down |run-all-tests|crap-gate|mutants-gate|cargo .*--features docs)' "$tmp/c1/home/steps")" == "$lane_order" ]] \
+    || self_fail "C1: the lanes and the steps are not in the order of D-F2c (up, its step, down, per lane): $(cat "$tmp/c1/home/steps")"
+  grep -qxE 'dbg postgresql://cuba:fakepw@[^ ]*%2Fdbg\.fk0000:5432/brain 7701731310526959658' "$tmp/c1/home/run-all.lanes" \
+    || self_fail "C1: the full run did not see the URL and GATE_SERVER_SYSTEM_ID of its lane dbg: $(cat "$tmp/c1/home/run-all.lanes" 2>/dev/null)"
+  grep -qxE 'cov postgresql://cuba:fakepw@[^ ]*%2Fcov\.fk0000:5432/brain 7701731310526959658' "$tmp/c1/home/crap-gate.lanes" \
+    || self_fail "C1: crap-gate did not see the URL of lane cov: $(cat "$tmp/c1/home/crap-gate.lanes" 2>/dev/null)"
+  grep -qxE 'mut postgresql://cuba:fakepw@[^ ]*%2Fmut\.fk0000:5432/brain 7701731310526959658' "$tmp/c1/home/mutants-gate.lanes" \
+    || self_fail "C1: mutants-gate did not see the URL of lane mut: $(cat "$tmp/c1/home/mutants-gate.lanes" 2>/dev/null)"
+  # The environment of the gate itself carries no lane's URL when it reaches the last step (test-times).
+  [[ -e "$tmp/c1/home/test-times.url" && ( "$(cat "$tmp/c1/home/test-times.url")" == unset || -z "$(cat "$tmp/c1/home/test-times.url")" ) ]] \
+    || self_fail "C1: a lane's DATABASE_URL reached test-times, which runs after the lanes: $(cat "$tmp/c1/home/test-times.url")"
+  docs_lines="$(grep -c -- '--features docs' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
+  docs_ok="$(grep -cE '^docs postgresql://cuba:fakepw@[^ ]*%2Fdocs\.fk0000:5432/brain 7701731310526959658 (clippy|test) .*--features docs' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
+  (( docs_lines >= 2 && docs_lines == docs_ok )) \
+    || self_fail "C1: the docs steps did not all see the URL and GATE_LANE of lane docs: $(cat "$tmp/c1/home/cargo.lanes")"
+  # C5: a DATABASE_URL the operator gives still governs, as it does today: no lane is made, every step
+  # gets that URL, and the gate says the lanes share that server.
+  ext='postgresql://gate:pw0@127.0.0.1:5489/brain'
+  fake_tree c5 "$lane_body"
+  run_copy_as "$ext" c5 "" FAKE_PG_ANSWER='127.0.0.1:5489 - accepting connections' FAKE_PSQL_CLUSTER_NAME=memory-industry-gate
+  (( rc == 0 )) || self_fail "C5: a gate with an external DATABASE_URL exited $rc: $(cat "$tmp/c5.out")"
+  if grep -qE '^(up |down|check$|sweep$)' "$tmp/c5/home/steps"; then
+    self_fail "C5: a lane was made or swept with an external DATABASE_URL: $(cat "$tmp/c5/home/steps")"
+  fi
+  awk -v u="$ext" '$2 != u { bad = 1 } END { exit bad }' "$tmp/c5/home/cargo.lanes" \
+    || self_fail "C5: a step did not see the external DATABASE_URL: $(cat "$tmp/c5/home/cargo.lanes")"
+  grep -q '^note: .*share' "$tmp/c5.out" \
+    || self_fail "C5: the gate does not say that the lanes share the external server (note: ... share): $(cat "$tmp/c5.out")"
+  # D1: a lane is taken down after its step, even when the step fails, and nothing after it runs.
+  fake_tree d1 'echo "run-all-tests${*:+ $*}" >>"$HOME/steps"; [ "${1:-}" = --check-models ] && exit 0; exit 1'
+  run_copy_as unset d1 ""
+  (( rc == 1 )) || self_fail "D1: the gate whose run-all-tests failed exited $rc, not 1: $(cat "$tmp/d1.out")"
+  [[ "$(exit_file d1)" == 1 ]] || self_fail "D1: the exit file says '$(exit_file d1)', not 1"
+  grep -qx 'down dbg' "$tmp/d1/home/steps" || self_fail "D1: lane dbg was not taken down after its failed step: $(cat "$tmp/d1/home/steps")"
+  grep -qx 'up docs' "$tmp/d1/home/steps" && self_fail "D1: the docs lane was made after the failed run-all-tests: $(cat "$tmp/d1/home/steps")"
+  # D2: a gate stopped by TERM, HUP or INT, during its first lane, takes that lane down (down-all) and
+  # leaves 2 in its exit file.
+  for sig in TERM HUP INT; do
+    fake_tree "d2_$sig" "echo \"run-all-tests\${*:+ \$*}\" >>\"\$HOME/steps\"; [ \"\${1:-}\" = --check-models ] || kill -$sig \"\$PPID\"; sleep 2; exit 0"
+    run_copy_as unset "d2_$sig" ""
+    [[ "$(exit_file "d2_$sig")" == 2 ]] \
+      || self_fail "D2: a gate stopped by $sig left '$(exit_file "d2_$sig")' in its exit file, not 2: $(cat "$tmp/d2_$sig.out")"
+    grep -qx 'down-all' "$tmp/d2_$sig/home/steps" \
+      || self_fail "D2: a gate stopped by $sig did not take its lane down (down-all): $(cat "$tmp/d2_$sig/home/steps" 2>/dev/null)"
   done
   # J1.2: a server that answers but is not marked is refused whatever its port,
   # and the refusal says the port, the cluster_name it read and the system_identifier.
