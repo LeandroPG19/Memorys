@@ -484,3 +484,15 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   mutants-gate and run-all-tests red under the foreign environment, after, 12/12 OK. Decision (mine): TMPDIR stays
   excluded; whether the judge should refuse a missing TMPDIR is a production change left out (gate-lock.sh keeps an
   inherited TMPDIR on disk without checking it exists) — noted as debt. Red/green with cargo queued.
+- 2026-11-07 09:50 · **CI-J3 committed and merged:** red `4b79cd6` (every_self_test… FAILED: crap-gate and mutants-gate
+  J1.9 with sysid 1 inherited, run-all-tests with the reranker at /nonexistent-ajeno; the list contract green, the list
+  being complete), fix `4fb2b10` (region lines only), local_gate_contract **63/63**; merged `058cb55`. Fourth full run of
+  the new judge started on `058cb55` (F1+F4+F2a lib+F3.1+J3, serial).
+- 2026-11-07 09:50 · F4d delivered (pass 1 in `Memorys-ci-f4d`, pass 2 in scratch): rows F4d.1–F4d.7 with doubles of cargo
+  and cargo-mutants, F4b.2's DEBUG arm now «same key» plus an OPT_LEVEL arm, F4b.8 into F4d.4, the contract locator to
+  `cargo-mutants mutants`; red `F4b.2 CARGO_PROFILE_DEV_DEBUG: a debug setting from outside built another seed`, green
+  38 s; 12 of 17 sabotages red by their own row, 4 caught first by another row, 1 (renamed cargo-mutants double) aborts
+  the self-test before F4d.7. Found: the self-test wrote seeds into the hermetic cache since F1.1 (nobody checked).
+  Verification queued. **F2b started** (worktree `Memorys-ci-f2b` from 058cb55): wiring in serial mode, rows A3, D5,
+  C1–C5, E1, E2, the 107-byte boundary, the caller's D2, rewrites of j11_unset/j11_empty/j16_unset, contracts, the
+  password out of psql's argv in gate-lock.sh.
