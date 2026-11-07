@@ -707,3 +707,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   and an **ancestor** of the process, reuse = exit 2; the serial PPID inheritance unchanged); TB leaves the table
   (merge-gate runs test-times after the planner, D-F3b); emit_block flushes; deps and start values fixed from the eleventh
   run. Allowed cut if it does not fit: token first, then table + --step + planner.
+- 2026-11-07 08:56 · **Twelfth full run (`ddf9662`, with CI-J7): 354.7 s, exit 101** in lib-ignored:
+  `handlers::zafra::tests::prune_plans_before_it_deletes_and_stays_inside_the_active_project` — «a dry run must not change
+  the row count at all», 14 rows before, 6 after: another test deleted rows of the shared brain_gate between its two whole-
+  table counts. Passed in the eleventh run on the same tree except CI-J7 (test file of the contract only): order-dependent.
+  A debugger reads it (no rerun to approve).
