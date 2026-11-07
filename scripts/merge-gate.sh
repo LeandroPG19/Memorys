@@ -899,8 +899,9 @@ FAKE
   # cluster each: dbg (CL..D3), b3 (B3), rel (R), e2e (E). Then the --features docs step as before.
   lane_order='run-all-tests --check-models
 up dbg
-run-all-tests --lane CL --lane D1 --lane D2 --lane NLI --lane D3
+run-all-tests --lane CL --lane D1 --lane D2 --lane D3
 down dbg
+run-all-tests --lane NLI
 up b3
 run-all-tests --lane B3
 down b3
@@ -1421,8 +1422,10 @@ down mut'
     self_fail "F1.1: a cargo call did not see CARGO_BUILD_JOBS=8: $(cat "$tmp/f1jobs/home/cargo.jobs")"
   fi
 
-  # F1.2 (D-F1a): a CARGO_BUILD_JOBS the operator set is kept, every cargo call sees it,
-  # and the line that prints it says the operator named it.
+  # F1.2 (D-F1a, CI-F3.3c D-F3j): a CARGO_BUILD_JOBS the operator set is kept by every row that names none, and the
+  # line that prints it says the operator named it. A row whose line in gate-dag.txt names its jobs gives its calls
+  # those jobs instead (8, 12, 4 or 2 in the table), so a call sees the operator's 5 or the value of its row, and
+  # a call that sees no CARGO_BUILD_JOBS at all is red.
   cg_tree f1operator "800000 100000"
   fake_tree f1operator "$reads_while_running"
   run_copy f1operator "" CARGO_BUILD_JOBS=5 GATE_CGROUP_ROOT="$tmp/cg/f1operator/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1operator/self"
@@ -1430,9 +1433,14 @@ down mut'
   grep -qE '^cargo jobs=5 \(.*CARGO_BUILD_JOBS' "$tmp/f1operator.out" \
     || self_fail "F1.2: no 'cargo jobs=5 (...CARGO_BUILD_JOBS...' line says the operator named the jobs: $(grep 'cargo jobs' "$tmp/f1operator.out" || echo 'no such line')"
   [[ -s "$tmp/f1operator/home/cargo.jobs" ]] \
-    || self_fail "F1.2: no cargo call was recorded with CARGO_BUILD_JOBS=5"
-  if grep -qv '^5 ' "$tmp/f1operator/home/cargo.jobs"; then
-    self_fail "F1.2: a cargo call did not see the CARGO_BUILD_JOBS=5 the operator set: $(cat "$tmp/f1operator/home/cargo.jobs")"
+    || self_fail "F1.2: no cargo call was recorded"
+  if grep -q '^unset ' "$tmp/f1operator/home/cargo.jobs"; then
+    self_fail "F1.2: a cargo call saw no CARGO_BUILD_JOBS at all: $(cat "$tmp/f1operator/home/cargo.jobs")"
+  fi
+  grep -q '^5 ' "$tmp/f1operator/home/cargo.jobs" \
+    || self_fail "F1.2: no cargo call kept the CARGO_BUILD_JOBS=5 the operator set (a row that names none must keep it): $(cat "$tmp/f1operator/home/cargo.jobs")"
+  if grep -qvE '^(5|8|12|4|2) ' "$tmp/f1operator/home/cargo.jobs"; then
+    self_fail "F1.2: a cargo call saw neither the operator's 5 nor the jobs its row names in gate-dag.txt: $(cat "$tmp/f1operator/home/cargo.jobs")"
   fi
 
   # F2: the run-all-tests stand-in of the rows below answers --check-models (its verdict is
@@ -1496,7 +1504,7 @@ exit 0'
   run_copy planner ""
   (( rc == 0 )) || self_fail "planner: a gate whose every step passed exited $rc: $(cat "$tmp/planner.out")"
   dag_order="$(sed -n 's/^dag: \([A-Za-z0-9]*\) env:.*/\1/p' "$tmp/planner.out" | tr '\n' ' ')"
-  [[ "$dag_order" == "P DBG B3 REL E2E DC CV M " ]] \
+  [[ "$dag_order" == "P DBG NLI B3 REL E2E DC CV M " ]] \
     || self_fail "planner: the planner did not start the rows of gate-dag.txt in idx order (it started: '$dag_order')"
   # The boundary line is printed by the planner before the first untimed row (CV), after the block of docs and before
   # the block of crap-gate: the judge of the test times reads up to it, so CV and M are not judged (CI-F3.3b-2).
@@ -1568,7 +1576,7 @@ exit 0'
     CUBA_GATE_LOCK_OWNER="$step_owner_before" CUBA_GATE_LANE_TOKEN=tok-planted \
     "$BASH" "$tmp/step_ok/scripts/merge-gate.sh" --step DBG >"$tmp/step_ok.out" 2>&1 || step_rc=$?
   (( step_rc == 0 )) || self_fail "--step with its ticket exited $step_rc, not 0: $(cat "$tmp/step_ok.out")"
-  [[ "$(grep -E '^(up |down |run-all-tests)' "$tmp/step_ok/home/steps")" == "$(printf '%s\n' 'up dbg' 'run-all-tests --lane CL --lane D1 --lane D2 --lane NLI --lane D3 token=tok-planted' 'down dbg')" ]] \
+  [[ "$(grep -E '^(up |down |run-all-tests)' "$tmp/step_ok/home/steps")" == "$(printf '%s\n' 'up dbg' 'run-all-tests --lane CL --lane D1 --lane D2 --lane D3 token=tok-planted' 'down dbg')" ]] \
     || self_fail "--step with its ticket did not run the lane of DBG with the token in its environment: $(steps_of step_ok)"
   [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-planted ]] \
     || self_fail "--step spent the ticket its lane has to spend"
@@ -2102,7 +2110,11 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 }
 
 step_DBG() {
-  run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane NLI --lane D3
+  run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane D3
+}
+# CI-F3.3c (D-F3l): the NLI assertion (nli_entailment, < 500 ms) runs alone, and it opens no database, so no cluster.
+step_NLI() {
+  "$ROOT/scripts/run-all-tests.sh" --lane NLI
 }
 step_B3() {
   run_in_lane b3 "$ROOT/scripts/run-all-tests.sh" --lane B3
@@ -2154,6 +2166,7 @@ gate_step_main() {
   case "$id" in
     P) step_P ;;
     DBG) step_DBG ;;
+    NLI) step_NLI ;;
     B3) step_B3 ;;
     REL) step_REL ;;
     E2E) step_E2E ;;

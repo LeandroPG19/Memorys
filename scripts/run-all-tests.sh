@@ -1301,7 +1301,7 @@ fi
 # CI-F3.3a (D-F3y, spec §4): the lanes of this script in idx order, as scripts/gate-dag.txt names them.
 # --lane <id> runs the lane it names; several --lane run in the order given, in this one process, with one
 # database (CI-F3.3b-1). A missing or unknown id, in any place of the list, is refused here, before the lock.
-DAG_LANES=(CL D1 D2 NLI D3 B3 R E)
+DAG_LANES=(CL D1 D2 D3 NLI B3 R E)
 run_lanes=()
 while [[ "${1:-}" == --lane ]]; do
   [[ -n "${2:-}" ]] || { echo "FAIL: --lane needs a lane id, one of: ${DAG_LANES[*]}" >&2; exit 2; }
