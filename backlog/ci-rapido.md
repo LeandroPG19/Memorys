@@ -806,3 +806,8 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   inherited by every step and below, and a shell cannot trap a signal ignored at its entry — so the self-test's inner
   gate never sees its INT. Slice **CI-J10**: the planner gives its steps the default disposition of INT and QUIT, with a
   test that a step under an ignoring parent sees them default (/proc SigIgn), and the D2 row run under an ignored INT.
+- 2026-11-07 11:19 · F3.3c-2 delivered: per-row CARGO_BUILD_JOBS and ORT pools in the table (none existed: every step
+  asked nproc = 24 jobs), the planner's CPU cap at C instead of 1.25·C, NLI split out of DBG into an **exclusive** row
+  (its 500 ms clock assertion runs alone), MUTANTS_JOBS=6 for M. Decisions D1–D7 accepted (spec F3 «F3.3c-2»). The
+  implementer's admission simulation: GATE_DAG=1 ≈ 614 s (≈10 min), critical path P → DBG → E2E 554 s, CPU bound
+  ≈509 s — not measured. Residual clock risk: v029_accounts, v029_auto_host_beacon, v042 stay in DBG. Verification queued.
