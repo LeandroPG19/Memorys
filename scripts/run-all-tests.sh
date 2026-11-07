@@ -201,6 +201,8 @@ fi
 # COMMENT, and the exit drops only those still carrying it.
 # shellcheck source=scripts/gate-lock.sh
 source "$ROOT/scripts/gate-lock.sh"
+# shellcheck source=scripts/gate-cluster.sh
+source "$ROOT/scripts/gate-cluster.sh"
 GATE_OWNED_DBS=()
 
 # The admin connection and psql_url are defined further down; these three only
@@ -268,6 +270,7 @@ release_owned_databases() {
 # parent's to write.
 on_exit() {
   local code=$?
+  gate_cluster_down_all
   [[ -z "$GATE_LOCK_HELD" ]] || exit_file_verdict "$code"
   release_owned_databases
   release_gate_lock
@@ -288,7 +291,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # CI-J3: the judge hands its children these names (JUDGE_ENVIRONMENT in local_gate_contract.rs).
   # The rows here read the ones that change their answer, so this self-test starts without them:
   # a row that needs one sets it itself.
-  unset GATE_SERVER_SYSTEM_ID CUBA_BINARY_PATH ONNX_MODEL_PATH CUBA_RERANKER_PATH CUBA_NLI_PATH \
+  # CI-F2 (D-F2i): the lane of a step is not inherited either (JUDGE_ENVIRONMENT).
+  unset GATE_SERVER_SYSTEM_ID GATE_LANE CUBA_BINARY_PATH ONNX_MODEL_PATH CUBA_RERANKER_PATH CUBA_NLI_PATH \
     CUBA_EMBEDDING_DIM
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.
@@ -437,7 +441,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   gate_tree() {
     local t="$tmp/$1"
     mkdir -p "$t/scripts" "$t/rust"
-    cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" \
+    cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" "$ROOT/scripts/gate-cluster.sh" \
        "$ROOT/scripts/run-all-tests.sh" "$ROOT/scripts/mutants-gate.sh" "$t/scripts/"
     cp "$ROOT/package.json" "$t/"
     printf '#!/bin/sh\nexit 0\n' >"$t/scripts/advisory-exceptions.sh"
@@ -629,16 +633,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
       self_fail "$name: cargo ran after the refusal: $(cat "$tmp/$name.out")"
     fi
   }
-  for form in unset empty; do
-    url=''
-    [[ "$form" != unset ]] || url=unset
-    rat_refused "j16_$form" "$url" memory-industry-gate ''
-    rat_stopped "j16_$form" 2
-    [[ ! -e "$tmp/j16_$form/home/tools.calls" ]] \
-      || self_fail "j16_$form: a tool ran with no DATABASE_URL: $(cat "$tmp/j16_$form/home/tools.calls")"
-    grep -q '^FAIL: .*DATABASE_URL' "$tmp/j16_$form.out" \
-      || self_fail "j16_$form: no FAIL line names DATABASE_URL: $(cat "$tmp/j16_$form.out")"
-  done
+  # j16_unset and j16_empty (the refusal with no DATABASE_URL) are retired on Linux: they are the D5
+  # rows, after calibrate, where the tree and the lane's stand-in exist (CI-F2, F2b-1).
   rat_refused j16_unmarked "$rat_url" '' ''
   rat_stopped j16_unmarked 2
   grep -qx psql "$tmp/j16_unmarked/home/tools.calls" \
@@ -674,6 +670,26 @@ if [[ "${1:-}" == "--self-test" ]]; then
       "$t/home/.cache/cuba-gate" "$t/bin" "$t/standin" "$t/target/debug" "$t/target/release" \
       "$t/models" "$t/reranker"
     cp "$ROOT/scripts/run-all-tests.sh" "$ROOT/scripts/gate-lock.sh" "$ROOT/scripts/test-times.sh" "$t/scripts/"
+    # CI-F2 (F2b-1): the judge's lane library as a stand-in with the same functions and no Postgres.
+    # order.log records its calls in the order they came (the D5 rows read it).
+    cat >"$t/scripts/gate-cluster.sh" <<'FAKE'
+GATE_CLUSTER_ROOT="${GATE_CLUSTER_ROOT:-$HOME/cluster-root}"
+GATE_CLUSTER_URL=""
+gate_cluster_check() { :; }
+gate_cluster_sweep() { :; }
+gate_cluster_up() {
+  echo "up $1" >>"$HOME/order.log"
+  touch "$HOME/lanes.open"
+  GATE_CLUSTER_URL="postgresql://cuba:fakepw@${GATE_CLUSTER_ROOT//\//%2F}%2F$1.fk0000:5432/brain"
+  echo "OK  cluster $1 up in 1 ms (stand-in)"
+}
+gate_cluster_down() { echo "down $1" >>"$HOME/order.log"; rm -f "$HOME/lanes.open"; echo "OK  cluster $1 down"; }
+gate_cluster_down_all() {
+  [ -e "$HOME/lanes.open" ] || return 0
+  echo down-all >>"$HOME/order.log"
+  rm -f "$HOME/lanes.open"
+}
+FAKE
     [[ -z "${calib_file:-}" ]] || cp "$calib_file" "$t/scripts/test-section-counts.txt"
     cp "$ROOT/rust/eval-datasets/smoke.jsonl" "$t/rust/eval-datasets/"
     : >"$t/rust/tests/t1.rs"
@@ -726,7 +742,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
     printf '%s\n' '#!/bin/sh' \
       'echo "$*" >>"$HOME/psql.calls"' \
       'case "$*" in' \
-      '  *pg_control_system*) echo "${FAKE_PSQL_CLUSTER_NAME-memory-industry-gate}|${FAKE_PSQL_SYSID-7701731310526959658}" ;;' \
+      '  *pg_control_system*)' \
+      '    lane="$(printf "%s" "$*" | sed -n "s/.*%2F\([a-z][a-z0-9-]*\)\.[A-Za-z0-9]\{6\}:5432.*/\1/p")"' \
+      '    name="${FAKE_PSQL_CLUSTER_NAME-memory-industry-gate}"; [ -n "$lane" ] && [ -z "${FAKE_PSQL_CLUSTER_NAME+x}" ] && name="memory-industry-gate-$lane"' \
+      '    echo "$name|${FAKE_PSQL_SYSID-7701731310526959658}" ;;' \
       '  *atttypmod*) echo 384 ;;' \
       '  *information_schema.tables*) echo 20 ;;' \
       '  *shobj_description*) echo "" ;;' \
@@ -792,6 +811,38 @@ if [[ "${1:-}" == "--self-test" ]]; then
     calib_file="$tmp/calibrated-counts.txt"
   }
   calibrate
+
+  # D5 (CI-F2, F2b-1), run-all-tests.sh on its own: with no DATABASE_URL, unset or empty, on Linux, it
+  # makes its dbg lane, runs its tests against that lane's URL, and takes the lane down when it leaves.
+  # The rows replace j16_unset and j16_empty, which expected a refusal; on Linux that refusal is gone
+  # (D-F2c, D-F2k). order.log is what the lane stand-in was asked, in order.
+  d5_run() {
+    local name="$1" t="$tmp/$1"
+    shift
+    printf '%s\n' '{"content":"fake observation 1"}' '{"content":"fake observation 2"}' \
+      '{"content":"fake observation 3"}' '{"content":"fake observation 4"}' \
+      '{"content":"fake observation 5"}' >"$t/rust/eval-datasets/smoke-corpus.jsonl"
+    rc=0
+    env -u DATABASE_URL -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT HOME="$t/home" \
+      PATH="$t/bin:/usr/bin:/bin" CARGO_TARGET_DIR="$t/target" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      ONNX_MODEL_PATH="$t/models" CUBA_RERANKER_PATH="$t/reranker" CUBA_NLI_PATH="$t/nli-model" \
+      MEMORY_INDUSTRY_LLM_PROVIDER=ollama "$@" \
+      "$BASH" "$t/scripts/run-all-tests.sh" >"$tmp/$name.out" 2>&1 || rc=$?
+  }
+  for form in unset empty; do
+    full_tree "j16_$form"
+    if [[ "$form" == unset ]]; then d5_run "j16_$form"; else d5_run "j16_$form" DATABASE_URL=; fi
+    (( rc == 0 )) || self_fail "j16_$form: run-all-tests with no DATABASE_URL on Linux exited $rc, not 0: $(cat "$tmp/j16_$form.out")"
+    [[ "$(head -n 1 "$tmp/j16_$form/home/order.log" 2>/dev/null)" == "up dbg" ]] \
+      || self_fail "j16_$form: the first thing the judge asked its lane library was not 'up dbg': $(cat "$tmp/j16_$form/home/order.log" 2>/dev/null)"
+    [[ "$(tail -n 1 "$tmp/j16_$form/home/order.log" 2>/dev/null)" =~ ^(down\ dbg|down-all)$ ]] \
+      || self_fail "j16_$form: lane dbg was not taken down when run-all-tests left: $(cat "$tmp/j16_$form/home/order.log" 2>/dev/null)"
+    grep -qE '^DATABASE_URL=postgresql://cuba:fakepw@[^ ]*%2Fdbg\.fk0000:5432/[^ ]+ ' "$tmp/j16_$form/home/eval.calls" 2>/dev/null \
+      || self_fail "j16_$form: the tests did not run against the URL of lane dbg: $(cat "$tmp/j16_$form/home/eval.calls" 2>/dev/null)"
+    grep -q fakepw "$tmp/j16_$form.out" \
+      && self_fail "j16_$form: the output carries the password of the lane: $(cat "$tmp/j16_$form.out")"
+  done
 
   # J2.1: brain_gate is prepared with the binary cargo has just reported. A stale
   # binary planted where the old lookup looked is never run, and nothing is
@@ -1157,7 +1208,20 @@ trap on_exit EXIT
 # carry the cluster_name mark is refused here, whatever its port. Under merge-gate.sh
 # this repeats the check, which costs nothing. The system_identifier merge-gate.sh
 # read must be the one this run reads (D-J1c).
-gate_require_judge_server "${DATABASE_URL:-}"
+# D5 (CI-F2, D-F2c): run on its own, with no DATABASE_URL, on Linux, this script makes its dbg lane after
+# taking the lock, runs against that lane, and takes it down on exit (on_exit). Under merge-gate.sh the
+# lock is inherited (CUBA_GATE_LOCK_OWNER) and merge-gate.sh has made the lane of the step: nothing here.
+# --check-models asks no server, so it makes no lane and needs none.
+if [[ -z "${DATABASE_URL:-}" && -z "${CUBA_GATE_LOCK_OWNER:-}" && "${1:-}" != --check-models && "$(uname -s)" == Linux ]]; then
+  unset GATE_SERVER_SYSTEM_ID
+  gate_cluster_check
+  gate_cluster_sweep
+  gate_cluster_up dbg
+  export DATABASE_URL="$GATE_CLUSTER_URL" GATE_LANE=dbg
+fi
+if [[ "${1:-}" != --check-models || -n "${DATABASE_URL:-}" ]]; then
+  gate_require_judge_server "${DATABASE_URL:-}"
+fi
 
 # Under HOME/.cache and nowhere else, because that is where the binary keeps
 # them: envs::home() joins `.cache` to HOME, and nothing in the crate reads

@@ -3270,9 +3270,12 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
 /// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
 /// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
 /// self-test that takes it as its own fixture's identity is red under any other value.
-const JUDGE_ENVIRONMENT: [(&str, &str); 19] = [
+const JUDGE_ENVIRONMENT: [(&str, &str); 20] = [
     ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
     ("GATE_SERVER_SYSTEM_ID", "1"),
+    // CI-F2 (D-F2i): merge-gate.sh exports the lane of each step. Not exported yet: this entry
+    // is red until the code of F2b exports it, and a self-test must not inherit a real lane.
+    ("GATE_LANE", "ajena"),
     ("CUBA_GATE_LOCK_OWNER", "ajeno-0000"),
     ("CUBA_GATE_EXIT_FILE", "/nonexistent-ajeno/run.exit"),
     ("CARGO_BUILD_JOBS", "1"),
@@ -4097,5 +4100,84 @@ fn the_mutation_seed_lives_outside_the_swept_scratch() {
     assert!(
         !line.contains("MUTANTS_SCRATCH") && !line.contains("memory-industry-mutants"),
         "the mutation seed root `{line}` is under the scratch the judge sweeps: a seed there is swept away"
+    );
+}
+
+/// CI-F2, E2: the judge's Postgres versions, locale and zone are written once, as constants of
+/// gate-cluster.sh, and docs/gate.md and the script name the same values, the fingerprint of the
+/// signing key included. A change to one of them without the other is red here.
+#[test]
+fn the_judge_postgres_versions_are_written_once_and_the_doc_agrees() {
+    let cluster = read("scripts/gate-cluster.sh").replace("\r\n", "\n");
+    let doc = read("docs/gate.md");
+    for constant in [
+        "GATE_PG_VERSION=18.6",
+        "GATE_PGVECTOR_VERSION=0.8.7",
+        "GATE_PG_LOCALE=en_US.utf8",
+        "GATE_PG_TIMEZONE=Etc/UTC",
+    ] {
+        assert!(
+            cluster.lines().any(|line| line == constant),
+            "scripts/gate-cluster.sh does not set `{constant}` (E2)"
+        );
+    }
+    for value in [
+        "18.6",
+        "0.8.7",
+        "en_US.utf8",
+        "Etc/UTC",
+        "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8",
+    ] {
+        assert!(
+            cluster.contains(value),
+            "scripts/gate-cluster.sh does not say {value} (E2)"
+        );
+        assert!(
+            doc.contains(value),
+            "docs/gate.md does not say {value}, which scripts/gate-cluster.sh uses (E2)"
+        );
+    }
+}
+
+/// CI-F2, C4: no gate script builds a TCP URL for a lane. The one construction of a lane's URL is
+/// gate_cluster_url in gate-cluster.sh, a socket directory as the host; outside the self-test
+/// regions and the comments, no script names the live corpus port, listens on TCP, or writes a
+/// `postgresql://cuba:` URL except that one.
+#[test]
+fn no_gate_script_builds_a_tcp_url_for_a_lane() {
+    let mut constructions = 0;
+    for file in [
+        "scripts/gate-cluster.sh",
+        "scripts/merge-gate.sh",
+        "scripts/run-all-tests.sh",
+    ] {
+        let body = read(file).replace("\r\n", "\n");
+        for (number, line) in outside_self_test(&body) {
+            let code = line.trim_start();
+            if code.starts_with('#') {
+                continue;
+            }
+            assert!(
+                !code.contains("5488"),
+                "{file}:{number} names :5488 outside its self-test: `{line}`"
+            );
+            if code.contains("listen_addresses") {
+                assert!(
+                    code.contains("listen_addresses= ") || code.contains("listen_addresses=''"),
+                    "{file}:{number} listens on something other than the empty address: `{line}`"
+                );
+            }
+            if code.contains("postgresql://cuba:") {
+                assert_eq!(
+                    file, "scripts/gate-cluster.sh",
+                    "{file}:{number} builds a lane URL outside gate_cluster_url: `{line}`"
+                );
+                constructions += 1;
+            }
+        }
+    }
+    assert_eq!(
+        constructions, 1,
+        "the lane URL has to be built in exactly one place (gate_cluster_url), found {constructions} (C4)"
     );
 }

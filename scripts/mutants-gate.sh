@@ -831,6 +831,9 @@ self_test() {
   # CI-J3: the judge hands its children GATE_SERVER_SYSTEM_ID, the identity of its real server. The
   # rows here answer with their own identity, so this self-test starts without the judge's.
   unset GATE_SERVER_SYSTEM_ID
+  # CI-F2 (D-F2i): and the lane of a step, which the judge hands its children too (JUDGE_ENVIRONMENT). A
+  # lane is judged by its own name and socket, and no row here is a lane.
+  unset GATE_LANE
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.
   # Global, not local: the EXIT trap reads it after this function has exited.

@@ -51,7 +51,38 @@ Read this before trusting a green run (copied from the gate banner):
 - The eval smoke never reads the live corpus. It scores a throwaway database seeded from a synthetic fixture.
 - Tests with no `#[ignore]` that need a server create and drop their own database, and never write into the one `DATABASE_URL` points at. A developer with `DATABASE_URL` exported towards their real memory would otherwise seed it by running `cargo test`.
 
-## Starting the judge's server
+## The judge's servers
+
+On Linux, with no `DATABASE_URL`, the judge makes its own Postgres for each step, a **lane**, and takes it down when the step ends: `dbg` (`run-all-tests.sh`), `docs` (`clippy` and `test --features docs`), `cov` (`crap-gate.sh`) and `mut` (`mutants-gate.sh`). Each lane is a directory under `GATE_CLUSTER_ROOT` (by default `/tmp/memory-industry-gate-<uid>`, which is tmpfs), listens on its socket only (`listen_addresses` empty), has `fsync`, `synchronous_commit` and `full_page_writes` off, and is marked `cluster_name=memory-industry-gate-<lane>`. Its log goes to `~/.cache/cuba-gate/clusters/<lane>.log`. A judge that died leaves its lanes behind: the next one sweeps the ones whose owner is gone, after taking the lock, and touches nothing else.
+
+The versions are written once, in `scripts/gate-cluster.sh`, and this section says the same values:
+
+- PostgreSQL 18.6 and pgvector 0.8.7, the upstream versions the judge's image ran (Debian 12, PGDG);
+- locale `en_US.utf8` and time zone `Etc/UTC`, set at start and not in the data directory;
+- packages from the PGDG repository (`resolute-pgdg`), signed by the key with fingerprint `B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8`, checked before it is trusted, and held with `apt-mark hold`.
+
+Installed once, with `sudo` (dry run first; each block says what must come out):
+
+    sudo install -d /etc/postgresql-common
+    printf 'create_main_cluster = false\n' | sudo tee /etc/postgresql-common/createcluster.conf
+    sudo install -d /usr/share/postgresql-common/pgdg
+    sudo curl -fsS -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    gpg --show-keys --with-colons /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc | awk -F: '$1=="fpr"{print $10; exit}'   # B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8, or delete the file and stop
+    # the repository and its pin: /etc/apt/sources.list.d/pgdg.sources (Suites: resolute-pgdg, Signed-By the key) and /etc/apt/preferences.d/pgdg.pref (origin apt.postgresql.org, priority 100)
+    sudo apt-get update
+    sudo apt-get install postgresql-18=<18.6 revision of PGDG> postgresql-18-jit=<same> postgresql-18-pgvector=0.8.7-1.pgdg26.04+1
+    sudo apt-mark hold postgresql-18 postgresql-18-jit postgresql-18-pgvector
+    sudo locale-gen en_US.UTF-8
+    /usr/lib/postgresql/18/bin/postgres --version      # PostgreSQL 18.6
+    grep default_version /usr/share/postgresql/18/extension/vector.control   # '0.8.7'
+
+Before each run the judge checks these and exits 2, in seconds and before anything else, if one is missing: the binaries `initdb`, `postgres`, `pg_isready`, `pg_config` and `psql`; the server version; `default_version` of pgvector; the locale; and that `GATE_CLUSTER_ROOT` is absolute, on tmpfs and yours. Nothing is started when it refuses.
+
+To upgrade, change the constants in `scripts/gate-cluster.sh`, this section and the hold together, in one commit.
+
+## An external server (Windows, or a server of your own)
+
+With a `DATABASE_URL` the judge does not make lanes: every step runs against that server, and the gate says so with a `note:` line. The server must be marked as the judge's, as below.
 
 The judge runs only against a Postgres whose `cluster_name` says it is the judge's. The mark decides, not the port and not the container's name: a server without it is refused, whatever it is called (the live corpus among them).
 
