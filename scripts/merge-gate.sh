@@ -1873,7 +1873,13 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 # The copy of the real corpus is not a judge step (P1 a): respaldo-memoria.timer,
 # outside this repo, makes it. The judge never touches the live server.
 
-run_in_lane dbg "$ROOT/scripts/run-all-tests.sh"
+# CI-F3.3b-1 (D-F3b): the --lane steps of scripts/gate-dag.txt, as chains, in idx order. A chain is one
+# process and one cluster: dbg (CL..D3) shares one throwaway database; b3 builds the release binary; rel and
+# e2e find that binary on disk again (lane_R and lane_E in run-all-tests.sh), so no variable crosses processes.
+run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane NLI --lane D3
+run_in_lane b3 "$ROOT/scripts/run-all-tests.sh" --lane B3
+run_in_lane rel "$ROOT/scripts/run-all-tests.sh" --lane R
+run_in_lane e2e "$ROOT/scripts/run-all-tests.sh" --lane E
 
 # The identity is asked again before the --features docs step, which reads the database
 # after run-all-tests.sh: a server that changed under the run is refused here (D-J1c, A2).

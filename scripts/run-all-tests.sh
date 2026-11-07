@@ -1293,16 +1293,18 @@ fi
 # --- self-test end ---
 
 # CI-F3.3a (D-F3y, spec §4): the lanes of this script in idx order, as scripts/gate-dag.txt names them.
-# --lane <id> runs the one lane it names; a missing or unknown id is refused here, before the lock.
+# --lane <id> runs the lane it names; several --lane run in the order given, in this one process, with one
+# database (CI-F3.3b-1). A missing or unknown id, in any place of the list, is refused here, before the lock.
 DAG_LANES=(CL D1 D2 NLI D3 B3 R E)
-run_lane=""
-if [[ "${1:-}" == --lane ]]; then
+run_lanes=()
+while [[ "${1:-}" == --lane ]]; do
   [[ -n "${2:-}" ]] || { echo "FAIL: --lane needs a lane id, one of: ${DAG_LANES[*]}" >&2; exit 2; }
   case " ${DAG_LANES[*]} " in
-    *" $2 "*) run_lane="$2" ;;
+    *" $2 "*) run_lanes+=("$2") ;;
     *) echo "FAIL: no such lane: $2 (the lanes are: ${DAG_LANES[*]})" >&2; exit 2 ;;
   esac
-fi
+  shift 2
+done
 
 inherit_gate_lock "$GATE_LOCK" || acquire_gate_lock "$GATE_LOCK" || exit 1
 [[ -z "$GATE_LOCK_HELD" ]] || exit_file_running
@@ -1464,10 +1466,15 @@ check_section_lines() {
   done
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    case " $RAN_SECTIONS " in
-      *" $name "*) ;;
-      *) orphan+=" $name" ;;
-    esac
+    if (( ${#run_lanes[@]} == 0 )); then
+      case " $RAN_SECTIONS " in
+        *" $name "*) ;;
+        *) orphan+=" $name" ;;
+      esac
+    elif ! grep -qw -- "$name" "$ROOT/scripts/run-all-tests.sh"; then
+      # CI-F3.3b-1: a chain runs only some sections, so a line is an orphan when no section of the script has its name.
+      orphan+=" $name"
+    fi
   done <<<"$listed"
   if [[ -n "$missing" ]]; then
     echo "FAIL: scripts/test-section-counts.txt has no line for the section(s):$missing. Every section that runs tests states its count there, with its reason." >&2
@@ -1785,6 +1792,11 @@ sha_unchanged "after B3g"
 # contracts hold. The model-bound ones stay behind the guard, where a missing
 # model is a FAIL and never a skip.
 lane_R() {
+# CI-F3.3b-1 (D-F3q): B3 may have run in another process. R reads the release binary it left on disk, as
+# lane_E does, and checks it against its sha256 at the end.
+REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
+[[ -f "$REL_BIN" ]] || { echo "FAIL: no release binary at $REL_BIN: the B3 lane builds it (run --lane B3 first)." >&2; exit 1; }
+REL_SHA="${REL_SHA:-$(release_sha "$REL_BIN")}"
 echo "=== reranker placement contracts (GPU feature live, no model needed) ==="
 run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
 
@@ -1813,6 +1825,14 @@ sha_unchanged "before E2E"
 
 lane_E() {
 export DATABASE_URL="$GATE_DATABASE_URL"
+# CI-F3.3b-1: the e2e chain runs in a process of its own, with a cluster that has no brain_gate: E makes
+# it with the same provision D1 uses, and only when it is missing (D1 and E in one call share it).
+if [[ "$(psql_url "$ADMIN_DATABASE_URL" -Atc "SELECT count(*) FROM pg_database WHERE datname = '$GATE_DB'")" != 1 ]]; then
+  # lane_B3 exported the release job count for this whole process: the provision compiles the debug binary
+  # at the judge's count, as D1 does.
+  export CARGO_BUILD_JOBS="$GATE_CARGO_JOBS"
+  provision_gate_db
+fi
 REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
 REL_SHA="${REL_SHA:-$(release_sha "$REL_BIN")}"
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
@@ -1936,9 +1956,13 @@ check_eval "$eval_json" "$queries_lines" || { rm -f "$eval_json"; exit 1; }
 rm -f "$eval_json"
 }
 
-# D-F3y: without arguments the lanes run in idx order; --lane <id> runs the one named above.
-if [[ -n "$run_lane" ]]; then
-  "lane_$run_lane"
+# D-F3y: without arguments the lanes run in idx order; --lane <id>... runs the ones named above, in their order.
+if (( ${#run_lanes[@]} > 0 )); then
+  for lane in "${run_lanes[@]}"; do
+    "lane_$lane"
+  done
+  # CI-F3.3b-1: the counts of the sections this process ran are checked here too, since a chain does not reach lane_R's check.
+  check_section_lines
   exit 0
 fi
 for lane in "${DAG_LANES[@]}"; do

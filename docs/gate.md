@@ -282,16 +282,21 @@ the doctor, the MCP live session and the eval smoke).
 - Without arguments the lanes run in the order of `DAG_LANES` in the script, which is the `idx`
   order of `scripts/gate-dag.txt`. That is the serial judge, and its output is the same as before
   the split.
-- `scripts/run-all-tests.sh --lane <id>` runs only that lane. A missing id, or one that is not in
-  `DAG_LANES`, exits 2 before the lock is taken, before any lane is made and before cargo runs.
+- `scripts/run-all-tests.sh --lane <id>` runs only that lane. Several `--lane` in one call run in the
+  order given, in one process and with one database (CI-F3.3b-1). A missing id, or one that is not in
+  `DAG_LANES`, anywhere in the list, exits 2 before the lock is taken, before any lane is made and
+  before cargo runs.
+- `merge-gate.sh` launches those lanes as chains, in idx order, one process and one cluster each: `dbg`
+  (CL, D1, D2, NLI, D3), `b3` (B3), `rel` (R) and `e2e` (E). Then `docs`, `cov` and `mut` as before.
+  Between processes only files cross: `rel` and `e2e` find the release binary of `b3` by its path.
 - `scripts/gate-dag.txt` is the table of the steps: `<idx> <id> <deps> <recursos> <clase> <cpu>
   <ram_gb> <dur_s> <orden…>`. A test of the contracts reads it and checks that every `--lane` is a
   row, that every row has its function, that `DAG_LANES` is the table in `idx` order, that the
   graph has no cycle and that `R` and `E` depend on `B3`, which builds the binary they read.
-- The lanes assume their dependencies have run: `--lane E` needs the release binary of `B3`
-  (it recomputes `REL_BIN` and `REL_SHA` when they are not set) and the `brain_gate` database that
-  `D1` provisions. The DAG scheduler that enforces this is CI-F3.3c; until then the serial run
-  is the only one that runs the lanes.
+- The lanes assume their dependencies have run: `--lane R` and `--lane E` need the release binary of
+  `B3` on disk (they recompute `REL_BIN` and `REL_SHA` from it), and `--lane E` provisions `brain_gate`
+  itself when the database is missing, with the same provision `D1` uses. The DAG scheduler that
+  enforces the order is CI-F3.3c; until then the serial chains are the only ones that run the lanes.
 - `DATABASE_URL` is exported as `GATE_DATABASE_URL` by `lane_D2` and again by `lane_E`, so each
   lane reaches `brain_gate` on its own.
 
