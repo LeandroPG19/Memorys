@@ -566,3 +566,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   code: two DATABASE_URL assignments in merge-gate (one verified value only), gate-lock.sh:457 builds the DSN with
   printf of ${url…} (the credentials detector), a new cargo call before the cheap block (fmt after the first
   compile). Back to the implementer.
+- 2026-11-07 05:46 · **T-TRACE closed:** red `640f430` (both envs::trace_tests FAILED; the child run 0 passed, 1
+  failed — deterministic), fix `652e777` (both green; the whole lib 1196 passed, 18 ignored); fast-forwarded into
+  release/0.31.0, merged into the batch `484e4ad`. Sixth full run started on 484e4ad (F1, F4, F4d, F2a lib, F3.1,
+  CI-J/J2/J3, T-GUARD, T-TRACE; serial, no lanes yet).
