@@ -608,3 +608,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   --lane NOPE exits 1, not 2`. 13 self-tests OK under CI-J3's environment; the contracts imitated in python green; four
   contract sabotages and one row sabotage red. Accepted: E depends on B3 **and D1** (the doctor uses brain_gate).
   Verification with cargo queued behind the seventh run.
+- 2026-11-07 06:37 · **Seventh full run, the first in lanes mode (`ead5aee`, DATABASE_URL empty): 889.6 s, exit
+  101.** Every test step on its own ephemeral PG 18.6 cluster; **the eval smoke passed** (CI-J4) at 807–812 s; peak 14.0 GB,
+  CPU 2704 s. Red in the `--features docs` round: CI-J4's test «falta el modelo: ONNX_MODEL_PATH ("")» — merge-gate runs
+  that round without the model env run-all-tests chooses. Slice **CI-J5** (spec J-F1 §14, worktree `Memorys-ci-j5`): one
+  `gate_model_env` in gate-lock.sh for both rounds, a contract that it is the only place, a merge-gate row. Step times in
+  lanes: unit 318 s, --ignored 68 s, models 48 s, release build + reranker 217 s, E2E 101 s, live 12 s, eval 5 s.
