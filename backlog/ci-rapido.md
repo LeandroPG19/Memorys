@@ -411,3 +411,27 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   commas and closure braces). The verification scripts now check rustfmt of the new contracts. Lesson: a slice's own
   checks include fmt and clippy of what it touched (trabajo-en-lotes), and I skipped them. Measuring tree moved to
   `13c4443`; F3.1 verification and the measurement queued back to back under pesado.
+- 2026-11-07 06:20 · F2a pass 1b/2b delivered (K1–K10): 32 rows red against the old pass 2, the copy OK in **7 s**
+  (was 33 s: no row waits for the 10 s QUIT→KILL any more); every K sabotage red with its own line; 13 hermetic
+  self-tests OK. Stand-ins are small ELF binaries built with cc per run (the identity check needs exe = bindir/postgres).
+  **Rejected:** D6 creating a sentinel in the real `/tmp/memory-industry-gate-<uid>` (under F3 lanes it would race real
+  clusters and write outside its temporaries) → the default root becomes `${GATE_CLUSTER_TMP:-/tmp}/…` and the region
+  points it at its own temporary; cluster logs go under `${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/clusters`
+  and the region leaves HOME/XDG empty (J7b'); one hand check of K8 on real PG 18.6. Back to the implementer.
+  **F4d** (one mtime per mutants lab) handed to an especificador.
+- 2026-11-07 06:50 · **F3.1 verified with cargo:** red on the worktree (gate_history_contract exit 101, 20 FAILED; U1
+  `unknown argument '--units'`); on the copy gate_dag_contract 14/14, local_gate_contract 61/61, clippy clean, 12
+  hermetic self-tests rc 0 with HOME/XDG empty, **gate_history_contract 22/23**: `la_marca_de_intermitente_compara_sha_y_huella`
+  finds no flake (`[]`), likely the H10 id comparison against the fixture; rustfmt finds diffs in the new contract.
+  Back to the implementer (cause first; a frozen test is not changed without my decision).
+- 2026-11-07 06:50 · **Second full new-judge run stopped at 107 s** (exit 101): lib test
+  `doctor::d3_the_real_check_tells_a_held_port_from_an_address_nobody_owns` (192.0.2.1:8787 held under mirrored
+  networking) — the bug already fixed on release/0.31.0 (`2d61589`), which the batch did not carry. Merged
+  release/0.31.0 into the batch: `4905e85` (d3 on port 0 and the 0.31 test-time lines). Lib before that: 1192 passed,
+  1 failed. Measuring tree moved to `4905e85`.
+- 2026-11-07 06:50 · F2a pass 1c/2c delivered: default root `${GATE_CLUSTER_TMP:-/tmp}/memory-industry-gate-<uid>` (one
+  line), the region on its own temporary with a live sentinel (D6 by name and mtime), K11 computes the default without
+  creating it, logs under `${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/clusters` (K7 logs); HOME/XDG empty in all
+  13 self-tests; 20 sabotages red; self-test 8 s. K8 on real PG 18.6 by hand: with PGPORT=5488 and PGHOSTADDR=127.0.0.1
+  inherited, the lane listens only on `.s.PGSQL.5432`, no TCP, `select 1` through the URL, up in 491 ms (initdb 323,
+  ready 168), down leaves nothing. F2a verification and then the third full run queued under pesado.
