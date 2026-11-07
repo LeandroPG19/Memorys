@@ -1574,6 +1574,8 @@ trap on_exit EXIT
 # D2 rows): this trap makes the verdict 2 and lets on_exit take the lanes down and write the exit file.
 trap 'exit 2' INT
 export CUBA_GATE_LOCK_OWNER="$GATE_OWNER"
+# CI-F3.3b-1b-i: the planner writes its lane tickets under this lock's directory (gate-dag.py).
+export GATE_LOCK
 
 # Whatever this commit's earlier receipt said, this run is its verdict now: a
 # red run on it takes it away, and a green one writes it again. A dirty start
