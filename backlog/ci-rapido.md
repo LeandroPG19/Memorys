@@ -721,3 +721,12 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   ending in `bash -c "$CONSUMER"` becomes its own direct child — ancestry tests end with `:`. Note: every token refusal is
   exit 2 (D-F3k said 1 for a second presentation; the spec text follows the decision). F3.3b-1b-ii (the 8-row table,
   --step, the planner in series, flush, TB out) next. Verification queued.
+- 2026-11-07 09:02 · **Debugger on the zafra red: a real hole in project isolation, not a test race.** In sqlx-core
+  0.8.6 `before_acquire` runs only on connections taken from the idle queue; a connection **opened** inside an acquire runs
+  only `after_connect`, which db.rs sets to `app.current_project = ''` — so during a request with an active project,
+  every new pool connection sees **all projects** through `tenant_isolation` (cuba_app has no bypass). The two counts of
+  the zafra test fell on a new and a reused connection (14 vs 6). The test meant to guard it
+  (`released_connection_does_not_leak_app_current_project`) uses `max_connections(1)` and never opens a second one.
+  Handlers that also filter by project_id in SQL were safe; anything relying on RLS alone was not. Slice **T-RLS** on
+  release/0.31.0 (worktree `Memorys-rls`): a deterministic test (one connection held as the barrier, the second must open;
+  plus a row-level check as cuba_app on its own database), then `after_connect` sets `rls_scope()` and propagates errors.
