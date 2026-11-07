@@ -647,3 +647,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   the copy: lane_B3's release CARGO_BUILD_JOBS leaked into E's provisioning (restored), check_section_lines per chain.
   Red: `--lane CL --lane D1 did not run CL and then D1`, merge-gate C1. **F3.3b-1b** (to come): table rows P, B1, DC, TB,
   CV, M, the joined log, the serial history and the T/LB summary. Verification queued.
+- 2026-11-07 08:04 · **Ninth full run (lanes, `c8dcdba`): the first that ran the whole judge — 1493.1 s (24.9 min,
+  serial, F0 was 2121 s), exit 1 only at the last step, test times:** local_gate_contract 220.26 s over its ceiling of 25 s
+  (the batch's contracts now run every self-test several times, twice over: normal and docs rounds), gate_dag_contract
+  15.14 s over the default 10 s. Every other step green: crap 45 s, **mutants 126 s** (F4d), docs round 330 s. Peak 18.7 GB,
+  CPU 5729 s. Slice **CI-J6**: the two lines re-set by the file's own rule (one run alone: k = 1.5 → local_gate_contract
+  110/331, gate_dag_contract 7/23), owner and expiry; plus a read of why the contract costs 220 s (it sits on the dbg
+  chain, the DAG's critical path).
