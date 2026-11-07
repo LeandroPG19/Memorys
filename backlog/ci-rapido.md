@@ -621,3 +621,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   server :5489 through the unpatched script (a throwaway server, never :5488; the green exits 2 before the lock);
   CI-J5's `demo.sh` exception has a reason but no owner or expiry (same format as CI-J3's). Eighth full run (lanes mode)
   started on b9fe4e0.
+- 2026-11-07 07:01 · F3.3b does not fit: run-all-tests drops brain_gate in its on_exit, so one process per table step
+  breaks D2/NLI/D3, and B3→R→E share REL_BIN/REL_SHA through the environment. Decision (spec F3 «F3.3b · ciclo de vida»):
+  **the process is the chain** (run-all-tests takes several --lane in one call; merge-gate launches dbg = CL..D3, b3, rel =
+  R, e2e = E, each on its own cluster); only files cross processes (the release binary; REL_SHA recomputed; E provisions
+  its own brain_gate through the one provisioning function). Split: **F3.3b-0** (F3.1's history fixes, Python) now,
+  **F3.3b-1** (merge-gate wiring, table rows P, B1, DC, TB, CV, M, joined log, serial history, T/LB) next.
