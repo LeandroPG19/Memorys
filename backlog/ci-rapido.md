@@ -549,3 +549,10 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
 - 2026-11-07 05:25 · **F4d committed** on `feat/ci-rapido-f4d`: red `08d3f43` (self-test F4b.2; contract 59/61), code
   `5ff2aee` (self-test OK 34.6 s, 12 hermetic self-tests OK, local_gate_contract **61/61** with a clean green build).
   QA (two real mutants runs, MUTANTS_JOBS=2, outcomes kept, classes against F0) queued after F2b-1's verification.
+- 2026-11-07 05:30 · Debugger on the fifth run's red: **a race inside tracing-core 0.1.36, latent since 13-oct**: with the
+  capture subscriber the only live dispatcher (`has_just_one`), another libtest thread that first reaches the same
+  `warn!` (judge.rs:203) is asked through `Rebuilder::JustOne` with ITS thread's default (NoSubscriber) and caches
+  `Interest::never` for the whole process; the capturing test's warning is then dropped (the neighbour finished 0.2 ms
+  before). Not T-GUARD (no judge.rs or tracing change in that diff). Slice **T-TRACE** on release/0.31.0 (worktree
+  `Memorys-trace`): a test on its own callsite plus a child-process rerun that is red every time, then a global no-op
+  subscriber answering `Interest::sometimes` installed once per process, called from the three capture helpers.
