@@ -435,3 +435,14 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   13 self-tests; 20 sabotages red; self-test 8 s. K8 on real PG 18.6 by hand: with PGPORT=5488 and PGHOSTADDR=127.0.0.1
   inherited, the lane listens only on `.s.PGSQL.5432`, no TCP, `select 1` through the URL, up in 491 ms (initdb 323,
   ready 168), down leaves nothing. F2a verification and then the third full run queued under pesado.
+- 2026-11-07 07:20 · F3.1: the failing flake test was the fixture: its three seeds had no step `id`, which H10 now
+  compares and every real `units()` record carries. Approved (still pass 1, no red commit yet): `"id": "tests"` in the
+  three seeds; rustfmt applied (only token change: the `use` order rustfmt imposes). Harness: 0 fails on 2b, 13/14 red on
+  the old pass 2. Cargo re-verification queued.
+- 2026-11-07 07:20 · **F4d specified** (spec F4 §«F4d · un mtime por laboratorio», handoff ci-rapido-F4d.yml,
+  validar-handoff OK): direct `cargo-mutants mutants …` with `CARGO=<shim>` (D-F4m; `--list` stays without it), the shim
+  as a production mode `--cargo-shim` acting only in a lab once (D-F4n, D-F4q, D-F4r), **epoch = the seed's newest
+  mtime, not the judge's start** (D-F4p: the start would make freshly extracted registry files look newer; reverted in
+  one line), D-F4j → `--lab-builds` per lab (`lab builds: hit|miss|unknown`), `CARGO_PROFILE_DEV_DEBUG=0` from one source
+  that also enters the seed key (D-F4t; the next run rebuilds the seed once, ≈70 s). QA: 1 Compiling per lab, 0 Dirty,
+  54/54 classes, run 2 < 230 s. Implementer started in worktree `Memorys-ci-f4d` (from 2aa31e9).
