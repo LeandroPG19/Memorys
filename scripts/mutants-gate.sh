@@ -910,18 +910,26 @@ self_test() {
   # interrupted build, the probe of the stage's inodes and the touch of a seed file.
   cat > "$tmp/bin/cargo" <<'FAKE'
 #!/bin/bash
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$*" "${TMP:-}" "${TEMP:-}" "${TMPDIR:-}" "${CARGO_PROFILE_DEV_DEBUG:-}" "${CARGO_INCREMENTAL:-}" "${CARGO_BUILD_JOBS:-unset}" "${CARGO_TARGET_DIR:-}" "$PWD" >> "$FAKE_CALLS"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$*" "${TMP:-}" "${TEMP:-}" "${TMPDIR:-}" "${CARGO_PROFILE_DEV_DEBUG:-}" "${CARGO_INCREMENTAL:-}" "${CARGO_BUILD_JOBS:-unset}" "${CARGO_TARGET_DIR:-}" "$PWD" "${CARGO:-}" "$(env | grep -c '^MUTANTS_SHIM_' || true)" >> "$FAKE_CALLS"
 if [[ "$*" == -V ]]; then echo "cargo ${FAKE_CARGO_VERSION:-1.99.0 (fake)}"; exit 0; fi
 if [[ " $* " == *" --list "* ]]; then
   [[ -z "${FAKE_LIST_JSON:-}" ]] || cat "$FAKE_LIST_JSON"
   exit 0
 fi
-if [[ "$*" == "test --no-run --lib --package="* ]]; then
+if [[ "$1 $2" == "test --no-run" && " $* " == *" --package="* ]]; then
   t="$CARGO_TARGET_DIR"
   mkdir -p "$t/debug/deps" "$t/debug/.fingerprint/memory-industry-111" "$t/debug/.fingerprint/serde-444" \
     "$t/debug/incremental/memory_industry-222" "$t/debug/build/memory-industry-333"
-  : > "$t/debug/deps/libdep-aaaa.rlib"
-  : > "$t/debug/.fingerprint/serde-444/lib-serde"
+  [[ -e "$t/debug/deps/libdep-aaaa.rlib" ]] || : > "$t/debug/deps/libdep-aaaa.rlib"
+  [[ -e "$t/debug/.fingerprint/serde-444/lib-serde" ]] || : > "$t/debug/.fingerprint/serde-444/lib-serde"
+  if [[ "$(basename "$PWD")" == cargo-mutants-rust-*.tmp ]]; then
+    echo "   Compiling memory-industry v0.31.0 ($PWD)"
+    if (( $(find "$t" -type f ! -name '*memory*' ! -name .mi-mtime-normalized -printf '%T@\n' | LC_ALL=C sort -u | wc -l) > 1 )); then
+      echo "   Compiling dep1 v1.0.0"
+      echo "   Compiling dep2 v1.0.0"
+      echo "   Compiling dep3 v1.0.0"
+    fi
+  fi
   if [[ "${FAKE_BUILD_KILL:-0}" == 1 ]]; then
     # The judge itself dies in the middle of the build, SIGKILL, so no trap runs: the
     # case the seed's name protects against. The topmost process of this tree is the judge.
@@ -951,6 +959,42 @@ if [[ "$1" == mutants && " $* " == *" --file "* ]]; then
     esac
     prev="$a"
   done
+  if [[ -n "${FAKE_LABS:-}" ]]; then
+    # cargo-mutants 27.1.0 (F4d.3): one lab per job, a copy of --dir with a mtime of its own on
+    # each file (fs::copy), the baseline first in lab 1 and each mutant's build in its lab.
+    run_build() { # LAB LOG
+      {
+        echo "*** /usr/bin/cargo test --no-run --verbose --package=memory-industry@0.31.0 --lib"
+        (cd "$1" && CARGO_TARGET_DIR="$1/target" "${CARGO:-$0}" test --no-run --verbose --package=memory-industry@0.31.0 --lib)
+        echo "*** result: Success"
+      } > "$2" 2>&1
+    }
+    if [[ -n "${FAKE_STAGE_STAMP:-}" ]]; then (cd "$dir" && find target -printf '%p %s %T@\n' | LC_ALL=C sort) > "$FAKE_STAGE_STAMP"; fi
+    mapfile -t names < <(grep -o '"name":"[^"]*"' "${FAKE_LIST_JSON:-/dev/null}" | sed 's/^"name":"//; s/"$//')
+    mkdir -p "$out/mutants.out/log"
+    labs=()
+    for ((i = 1; i <= FAKE_LABS; i++)); do
+      lab="$(mktemp -u "$TMPDIR/cargo-mutants-rust-XXXXXX").tmp"
+      mkdir -p "$lab" && cp -r "$dir/." "$lab/"
+      n=0
+      while IFS= read -r -d '' f; do n=$((n + 1)); touch -d "@$((1700000000 + n))" "$f"; done < <(find "$lab/target" -print0)
+      labs+=("$lab")
+    done
+    run_build "${labs[0]}" "$out/mutants.out/log/baseline.log"
+    for ((j = 0; j < ${#names[@]}; j++)); do
+      run_build "${labs[$(( j % FAKE_LABS ))]}" "$out/mutants.out/log/mutant-$j.log"
+    done
+    {
+      printf '{"outcomes":[{"scenario":"Baseline","summary":"Success","log_path":"log/baseline.log","phase_results":[{"phase":"Build","process_status":"Success"},{"phase":"Test","process_status":"Success"}]}'
+      for ((j = 0; j < ${#names[@]}; j++)); do
+        printf ',{"scenario":{"Mutant":{"name":"%s"}},"summary":"CaughtMutant","log_path":"log/mutant-%s.log","phase_results":[{"phase":"Build","process_status":"Success"},{"phase":"Test","process_status":{"Failure":101}}]}' "${names[$j]}" "$j"
+      done
+      printf '],"total_mutants":%d,"caught":%d,"missed":0,"timeout":0,"unviable":0,"success":0,"cargo_mutants_version":"27.1.0"}\n' "${#names[@]}" "${#names[@]}"
+    } > "$out/mutants.out/outcomes.json"
+    if [[ -n "${FAKE_STAGE_STAMP:-}" ]]; then (cd "$dir" && find target -printf '%p %s %T@\n' | LC_ALL=C sort) > "$FAKE_STAGE_STAMP.after"; fi
+    [[ -n "${FAKE_KEEP_LABS:-}" ]] || rm -rf "${labs[@]}"
+    exit "${FAKE_MUTANTS_RC:-0}"
+  fi
   if [[ -n "${FAKE_PROBE_OUT:-}" ]]; then
     probe="$dir/target/debug/deps/libdep-aaaa.rlib"
     if [[ ! -e "$probe" ]]; then echo missing > "$FAKE_PROBE_OUT"
@@ -967,6 +1011,12 @@ if [[ "$1" == mutants && " $* " == *" --file "* ]]; then
 fi
 exit 0
 FAKE
+  # The cargo-mutants stand-in: it hands its argv to the cargo stand-in, which logs it (F4d.3).
+  cat > "$tmp/bin/cargo-mutants" <<'FAKE'
+#!/bin/bash
+echo via-cargo-mutants >> "$FAKE_CALLS"
+exec "$(dirname "$0")/cargo" "$@"
+FAKE
   cat > "$tmp/bin/rustc" <<'FAKE'
 #!/bin/bash
 echo "rustc ${FAKE_RUSTC_VERSION:-1.99.0 (fake)}"
@@ -980,7 +1030,7 @@ FAKE
     'printf "%s %s\n" "$*" "${PGOPTIONS:-}" >> "$FAKE_PSQL_CALLS"' \
     '[ "${FAKE_PSQL_EXIT:-0}" = 0 ] || exit "$FAKE_PSQL_EXIT"' \
     'printf "%s|%s\n" "${FAKE_PSQL_CLUSTER_NAME-memory-industry-gate}" "${FAKE_PSQL_SYSID-7701731310526959658}"' > "$tmp/bin/psql"
-  chmod +x "$tmp/bin/df" "$tmp/bin/cargo" "$tmp/bin/rustc" "$tmp/bin/psql"
+  chmod +x "$tmp/bin/df" "$tmp/bin/cargo" "$tmp/bin/cargo-mutants" "$tmp/bin/rustc" "$tmp/bin/psql"
 
   # The pure rule.
   plan() {
@@ -1064,12 +1114,12 @@ FAKE
     shift
     while [[ "${1:-}" != -- ]]; do extra+=("$1"); shift; done
     shift
-    local -a e=(HOME="$home" TMP="$sys_native" TEMP="$sys_native" TMPDIR="$sys"
+    local -a e=(HOME="$home" XDG_CACHE_HOME="$home/.cache" TMP="$sys_native" TEMP="$sys_native" TMPDIR="$sys"
                 PATH="$tmp/bin:$PATH" FAKE_DF_AVAIL_KB="$avail" FAKE_CALLS="$tmp/cargo.calls"
                 FAKE_PSQL_CALLS="$tmp/psql.calls")
     [[ -z "$per_copy" ]] || e+=(MUTANTS_SCRATCH_GB_PER_COPY="$per_copy")
     rc=0
-    env -u MUTANTS_SCRATCH_GB_PER_COPY -u MUTANTS_SCRATCH_DIR -u CUBA_GATE_LOCK_OWNER \
+    env -u CARGO -u MUTANTS_SCRATCH_GB_PER_COPY -u MUTANTS_SCRATCH_DIR -u CUBA_GATE_LOCK_OWNER \
         -u CUBA_GATE_MIN_FREE_GB -u MUTANTS_JOBS -u FAKE_DF_FAIL -u CARGO_BUILD_JOBS \
         -u CARGO_PROFILE_DEV_DEBUG -u CARGO_INCREMENTAL -u DATABASE_URL -u MUTANTS_KEEP_OUT \
         -u FAKE_PSQL_CLUSTER_NAME -u FAKE_PSQL_SYSID -u FAKE_PSQL_EXIT \
@@ -1938,8 +1988,13 @@ PY
   if (( rc != 0 )) || any_said 'seed: built' || [[ "$(seed_keys)" != "$before" ]]; then
     self_fail "F4b.2 CARGO_BUILD_JOBS: the same tree with another CARGO_BUILD_JOBS built a seed (CARGO_BUILD_JOBS is in the key): $(cat "$tmp/run.out" "$tmp/run.err")"
   fi
+  # D-F4u: a debug setting from outside is no longer a new seed; the mutation builds force it to 0 (D-F4t).
   f4b_run seedtree CARGO_PROFILE_DEV_DEBUG=1
-  f4b_new_key CARGO_PROFILE_DEV_DEBUG "$k1"
+  if (( rc != 0 )) || any_said 'seed: built' || [[ "$(seed_keys)" != "$before" ]]; then
+    self_fail "F4b.2 CARGO_PROFILE_DEV_DEBUG: a debug setting from outside built another seed (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  fi
+  f4b_run seedtree CARGO_PROFILE_DEV_OPT_LEVEL=1
+  f4b_new_key CARGO_PROFILE_DEV_OPT_LEVEL "$k1"
   k2="$last_key"
   f4b_run seedtree RUSTFLAGS='-C debuginfo=0'
   f4b_new_key RUSTFLAGS "$k2"
@@ -2075,18 +2130,7 @@ PY
   [[ -e "$home/.cache/memory-industry-gate/keep.txt" && -d "$home/.cache/memory-industry-gate/notes" ]] \
     || self_fail "F4b.7: something outside mutants-seed/ was removed"
 
-  # F4b.8: the baseline's compiles say whether the seed was hit; a miss is a line, not a red.
-  fresh
-  mk_crate_tree seedtree
-  f4b_run seedtree
-  f4b_run seedtree FAKE_BASELINE_LOG="$tmp/f4b/base1.log"
-  if (( rc != 0 )) || ! any_said 'seed: hit (1 crate compiled in the baseline)'; then
-    self_fail "F4b.8: one compile in the baseline with the seed present was not 'seed: hit (1 crate compiled in the baseline)' (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
-  fi
-  f4b_run seedtree FAKE_BASELINE_LOG="$tmp/f4b/base305.log"
-  if (( rc != 0 )) || ! any_said 'seed: miss (305 crates compiled in the baseline)'; then
-    self_fail "F4b.8: 305 compiles in the baseline were not a 'seed: miss' line that passes (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
-  fi
+  # F4b.8 moved to F4d.4 (D-F4u): the seed hit or miss is now the lab line, not the baseline's compiles.
 
   # --- F4c (the judge keeps the classes): MUTANTS_KEEP_OUT copies this run's mutants.out, green or
   # red, into a directory that is new or empty. Without it nothing is kept, as before.
@@ -2129,6 +2173,302 @@ PY
   ! any_said 'kept:' || self_fail "F4c.4: a run without MUTANTS_KEEP_OUT said 'kept:'"
   [[ -z "$(find "$home/.cache/memory-industry-gate/tmp" -maxdepth 1 -name 'memory-industry-mutants-out.*' -print -quit 2>/dev/null)" ]] \
     || self_fail "F4c.4: a run without MUTANTS_KEEP_OUT left a mutants-out directory behind"
+
+  # --- F4d (7-nov, D-F4m..D-F4v): one mtime per lab, the shim that gives it, and the lab line ---
+  f4d_stamp() { find "$1" -printf '%p %T@\n' | LC_ALL=C sort; }
+  f4d_real() { # the real cargo the shim hands to: its argv, its CARGO and the shim variables it sees
+    cat > "$1" <<'REAL'
+#!/bin/bash
+printf '%s|%s|%s\n' "$*" "${CARGO:-unset}" "$(env | grep -c '^MUTANTS_SHIM_' || true)" >> "$FAKE_REAL_LOG"
+printf x
+exit 7
+REAL
+    chmod +x "$1"
+  }
+  f4d_shim() { # DIR ARGS...: the shim as the cargo-mutants call runs it, with cwd DIR
+    local dir="$1"
+    shift
+    rc=0
+    (cd "$dir" && env CARGO="$tmp/f4d/wrapper" FAKE_REAL_LOG="$tmp/f4d/real.log" \
+      MUTANTS_SHIM_SCRATCH="$f4d_scr" MUTANTS_SHIM_EPOCH=1730000000.5 \
+      MUTANTS_SHIM_REAL_CARGO="$tmp/f4d/realcargo" MUTANTS_SHIM_LOG="$tmp/f4d/shim.log" \
+      bash "$ROOT/scripts/mutants-gate.sh" --cargo-shim "$@" >"$tmp/shim.out" 2>"$tmp/shim.err") || rc=$?
+  }
+
+  # F4d.1: the shim gives one lab its mtime once, leaves the rest alone, and hands the call on.
+  rm -rf "$tmp/f4d"
+  mkdir -p "$tmp/f4d/scr" "$tmp/f4d/fuera"
+  f4d_scr="$(cd "$tmp/f4d/scr" && pwd -P)"
+  lab="$f4d_scr/cargo-mutants-rust-AAAA.tmp"
+  mkdir -p "$lab/target/debug/deps"
+  : > "$lab/target/debug/deps/a.rlib"
+  : > "$lab/target/debug/b"
+  touch -d @1700000001.25 "$lab/target/debug/deps/a.rlib"
+  touch -d @1700000002.5 "$lab/target/debug/b"
+  : > "$tmp/f4d/fuera/out.txt"
+  touch -d @1600000000 "$tmp/f4d/fuera/out.txt"
+  ln -s "$tmp/f4d/fuera/out.txt" "$lab/target/link"
+  f4d_real "$tmp/f4d/realcargo"
+  f4d_shim "$lab" test --no-run --verbose
+  (( rc == 7 )) || self_fail "F4d.1: the shim did not end with the real cargo's exit 7 (exit $rc): $(cat "$tmp/shim.err")"
+  [[ "$(cat "$tmp/shim.out")" == x ]] || self_fail "F4d.1: the shim changed cargo's stdout: $(cat "$tmp/shim.out")"
+  IFS='|' read -r seen_argv seen_cargo seen_shim < "$tmp/f4d/real.log" || true
+  [[ "$seen_cargo" == "$tmp/f4d/realcargo" ]] || self_fail "F4d.1: the real cargo saw CARGO=$seen_cargo, not its own path"
+  [[ "$seen_argv" == 'test --no-run --verbose' ]] || self_fail "F4d.1: the real cargo did not get the same argv: $seen_argv"
+  [[ "$seen_shim" == 0 ]] || self_fail "F4d.1: the real cargo saw $seen_shim MUTANTS_SHIM_* variables"
+  [[ -e "$lab/target/.mi-mtime-normalized" ]] || self_fail "F4d.1: the shim left no marker in the lab"
+  bad="$(find "$lab/target" ! -name .mi-mtime-normalized -printf '%p %T@\n' | awk '$2 + 0 != 1730000000.5')"
+  [[ -z "$bad" ]] || self_fail "F4d.1: the shim left an entry with another mtime: $bad"
+  [[ "$(find "$tmp/f4d/fuera/out.txt" -printf '%T@')" == 1600000000.0* ]] || self_fail "F4d.1: the shim wrote through a symlink"
+  [[ "$(grep -c '^normalized ' "$tmp/f4d/shim.log" 2>/dev/null || true)" == 1 ]] \
+    && grep -qF 'normalized cargo-mutants-rust-AAAA.tmp @1730000000.5' "$tmp/f4d/shim.log" \
+    || self_fail "F4d.1: the shim did not write one 'normalized' line for the lab"
+  mkdir -p "$lab/target/nuevo"
+  : > "$lab/target/nuevo/x"
+  nuevo="$(find "$lab/target/nuevo/x" -printf '%T@')"
+  f4d_shim "$lab" test --no-run --verbose
+  (( rc == 7 )) || self_fail "F4d.1: the second call did not reach the real cargo (exit $rc)"
+  [[ "$(find "$lab/target/nuevo/x" -printf '%T@')" == "$nuevo" ]] \
+    && [[ "$(grep -c '^normalized ' "$tmp/f4d/shim.log")" == 1 ]] \
+    || self_fail "F4d.1: the shim normalized a lab twice"
+
+  # F4d.2: outside a lab the shim touches nothing, writes nothing, and still hands the call on.
+  rm -rf "$tmp/f4d"
+  mkdir -p "$tmp/f4d/scr" "$tmp/f4d/otro" "$tmp/f4d/fuera" "$tmp/f4d/cache/mutants-seed/k1"
+  f4d_scr="$(cd "$tmp/f4d/scr" && pwd -P)"
+  f4d_tree() {
+    mkdir -p "$1/target/debug"
+    : > "$1/target/debug/a"
+    : > "$1/target/debug/b"
+    touch -d @1700000100.5 "$1/target/debug/a"
+    touch -d @1700000200 "$1/target/debug/b"
+  }
+  f4d_tree "$f4d_scr/stage.X/rust"
+  f4d_tree "$tmp/f4d/cache/mutants-seed/k1"
+  f4d_tree "$f4d_scr"
+  f4d_tree "$f4d_scr/cargo-mutants-rust-B.tmp"
+  mkdir -p "$f4d_scr/cargo-mutants-rust-B.tmp/sub"
+  f4d_tree "$tmp/f4d/otro/cargo-mutants-rust-C.tmp"
+  mkdir -p "$f4d_scr/cargo-mutants-rust-D.tmp"
+  ln -s "$tmp/f4d/fuera" "$f4d_scr/cargo-mutants-rust-D.tmp/target"
+  : > "$tmp/f4d/fuera/out.txt"
+  f4d_real "$tmp/f4d/realcargo"
+  f4d_case() { # LABEL CWD WATCHED: the shim run in CWD must leave WATCHED as it was
+    local before after
+    before="$(f4d_stamp "$3")"
+    rm -f "$tmp/f4d/real.log" "$tmp/f4d/shim.log"
+    f4d_shim "$2" metadata --no-deps
+    after="$(f4d_stamp "$3")"
+    (( rc == 7 )) && [[ "$(cat "$tmp/shim.out")" == x ]] \
+      || self_fail "F4d.2 $1: the shim did not hand the call to cargo (exit $rc): $(cat "$tmp/shim.err")"
+    [[ "$before" == "$after" ]] || self_fail "F4d.2: the shim touched outside a lab: $2"
+    [[ ! -e "$3/.mi-mtime-normalized" ]] || self_fail "F4d.2: the shim touched outside a lab: $2 (it wrote a marker)"
+    [[ ! -s "$tmp/f4d/shim.log" ]] || self_fail "F4d.2: the shim wrote a line outside a lab: $2"
+    grep -q '^metadata --no-deps|' "$tmp/f4d/real.log" || self_fail "F4d.2 $1: the real cargo did not get the argv"
+  }
+  f4d_case stage "$f4d_scr/stage.X/rust" "$f4d_scr/stage.X/rust/target"
+  f4d_case seed "$tmp/f4d/cache/mutants-seed/k1" "$tmp/f4d/cache/mutants-seed/k1/target"
+  f4d_case scr "$f4d_scr" "$f4d_scr/target"
+  f4d_case sub "$f4d_scr/cargo-mutants-rust-B.tmp/sub" "$f4d_scr/cargo-mutants-rust-B.tmp/target"
+  f4d_case otro "$tmp/f4d/otro/cargo-mutants-rust-C.tmp" "$tmp/f4d/otro/cargo-mutants-rust-C.tmp/target"
+  f4d_case link "$f4d_scr/cargo-mutants-rust-D.tmp" "$tmp/f4d/fuera"
+
+  # F4d.3: the mutation step calls cargo-mutants directly, with the shim as CARGO and the seed's epoch.
+  fresh
+  mk_crate_tree seedtree
+  f4b_run seedtree
+  (( rc == 0 )) || self_fail "F4d.3: the seed did not build for the row (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  key="$(seed_keys)"
+  epoch="$(find "$seed_root/$key/target" -printf '%T@\n' | LC_ALL=C sort -n | tail -n 1)"
+  f4d_list2="$tmp/f4d/list2.json"
+  mklist "$f4d_list2" "${F4B_NAMES[0]}" "${F4B_NAMES[1]}"
+  rm -f "$tmp/cargo.calls" "$tmp/f4d/stage.before" "$tmp/f4d/stage.before.after"
+  f4b_run seedtree FAKE_LABS=2 FAKE_KEEP_LABS=1 FAKE_STAGE_STAMP="$tmp/f4d/stage.before" FAKE_LIST_JSON="$f4d_list2"
+  (( rc == 0 )) || self_fail "F4d.3: the run with two labs did not pass (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  mutants_col() { awk -F'\t' -v c="$1" '$1 ~ /^mutants --file/ {print $c; exit}' "$tmp/cargo.calls"; }
+  grep -qx via-cargo-mutants "$tmp/cargo.calls" \
+    || self_fail "F4d.3: cargo-mutants was not called directly with CARGO=<shim>: no call came through the cargo-mutants stand-in"
+  [[ "$(mutants_col 10)" == *memory-industry-mutants-out.*/bin/cargo-shim ]] \
+    || self_fail "F4d.3: cargo-mutants was not called directly with CARGO=<shim>: '$(mutants_col 10)'"
+  labcalls="$(awk -F'\t' '$1 == "test --no-run --verbose --package=memory-industry@0.31.0 --lib" {print $10 "\t" $11}' "$tmp/cargo.calls")"
+  [[ -n "$labcalls" ]] || self_fail "F4d.3: no lab build reached the cargo stand-in"
+  while IFS=$'\t' read -r c10 c11; do
+    [[ "$c10" == "$tmp/bin/cargo" && "$c11" == 0 ]] \
+      || self_fail "F4d.3: a lab build was called with CARGO='$c10' and $c11 shim variables, not the stand-in and 0"
+  done <<< "$labcalls"
+  labs_kept="$(find "$home" "$sys" -mindepth 1 -maxdepth 6 -name 'cargo-mutants-rust-*.tmp' -type d | LC_ALL=C sort)"
+  [[ "$(printf '%s\n' "$labs_kept" | grep -c .)" == 2 ]] || self_fail "F4d.3: the kept labs are not two: $labs_kept"
+  while IFS= read -r lab_kept; do
+    deps="$(find "$lab_kept/target" \( -name libdep-aaaa.rlib -o -name lib-serde \) -printf '%T@\n')"
+    [[ "$(printf '%s\n' "$deps" | grep -c .)" == 2 ]] || self_fail "F4d.3: a kept lab has no dependency files: $lab_kept"
+    [[ -z "$(printf '%s\n' "$deps" | awk -v e="$epoch" '$1 != e')" ]] \
+      || self_fail "F4d.3: the lab epoch is not the newest mtime of the seed: $epoch in $lab_kept"
+  done <<< "$labs_kept"
+  cmp -s "$tmp/f4d/stage.before" "$tmp/f4d/stage.before.after" || self_fail "F4d.3: the stage's target changed during the run"
+  any_said 'OK  seed unchanged' || self_fail "F4d.3: the seed was not seen unchanged"
+  any_said "mtime shim: normalized 2 of 2 labs at @$epoch" \
+    || self_fail "F4d.3: the lab line does not say 'mtime shim: normalized 2 of 2 labs at @$epoch': $(cat "$tmp/run.out" "$tmp/run.err")"
+
+  # F4d.4: the lab line reads the first build of each lab, in the order of outcomes.json.
+  f4d_build_log() { # LOG LAB N [DIFF TEST]: a build phase as cargo-mutants logs it
+    local log="$1" lab="$2" n="$3" i
+    mkdir -p "$(dirname "$log")"
+    {
+      for ((i = 0; i < ${4:-0}; i++)); do echo '   Compiling diffed v1.0.0'; done
+      echo '*** /usr/bin/cargo test --no-run --verbose --package=memory-industry@0.31.0 --lib'
+      echo "   Compiling memory-industry v0.31.0 ($lab)"
+      for ((i = 1; i < n; i++)); do echo "   Compiling dep$i v1.0.0"; done
+      echo '*** result: Success'
+      for ((i = 0; i < ${5:-0}; i++)); do echo '   Compiling tested v1.0.0'; done
+    } > "$log"
+  }
+  f4d_outcomes() { # FILE ENTRY...: ENTRY is NAME|LOG, and NAME BASE is the baseline
+    local file="$1" entry name log sep=""
+    shift
+    {
+      printf '{"outcomes":['
+      for entry in "$@"; do
+        name="${entry%%|*}"
+        log="${entry#*|}"
+        if [[ "$name" == BASE ]]; then
+          printf '%s{"scenario":"Baseline","summary":"Success","log_path":"%s"}' "$sep" "$log"
+        else
+          printf '%s{"scenario":{"Mutant":{"name":"%s"}},"summary":"CaughtMutant","log_path":"%s"}' "$sep" "$name" "$log"
+        fi
+        sep=,
+      done
+      printf ']}\n'
+    } > "$file"
+  }
+  f4d_lb() { rc=0; bash "$ROOT/scripts/mutants-gate.sh" --lab-builds "$1/outcomes.json" >"$tmp/lb.out" 2>"$tmp/lb.err" || rc=$?; }
+  f4d_la=/scr/cargo-mutants-rust-A.tmp
+  f4d_lbb=/scr/cargo-mutants-rust-B.tmp
+
+  d="$tmp/f4d/L1"
+  f4d_build_log "$d/log/b.log" "$f4d_la" 1
+  f4d_build_log "$d/log/m1.log" "$f4d_lbb" 1
+  f4d_build_log "$d/log/m2.log" "$f4d_la" 1
+  f4d_outcomes "$d/outcomes.json" "BASE|log/b.log" "m1|log/m1.log" "m2|log/m2.log"
+  f4d_lb "$d"
+  (( rc == 0 )) && grep -qF 'lab builds: hit in 2 of 2 labs' "$tmp/lb.out" \
+    || self_fail "F4d.4 L1: two labs whose first build is one crate did not say 'lab builds: hit in 2 of 2 labs' (exit $rc): $(cat "$tmp/lb.out" "$tmp/lb.err")"
+
+  d="$tmp/f4d/L2"
+  f4d_build_log "$d/log/b.log" "$f4d_la" 1
+  f4d_build_log "$d/log/m1.log" "$f4d_lbb" 204
+  f4d_build_log "$d/log/m2.log" "$f4d_lbb" 1
+  f4d_outcomes "$d/outcomes.json" "BASE|log/b.log" "m1|log/m1.log" "m2|log/m2.log"
+  f4d_lb "$d"
+  (( rc == 0 )) || self_fail "F4d.4: a miss changed the exit (L2): $(cat "$tmp/lb.err")"
+  grep -qF 'lab builds: miss in 1 of 2 labs (cargo-mutants-rust-B.tmp: 204 crates in its first build' "$tmp/lb.out" \
+    || self_fail "F4d.4 L2: the first build of lab B was not counted: $(cat "$tmp/lb.out")"
+
+  d="$tmp/f4d/L3"
+  f4d_build_log "$d/log/b.log" "$f4d_la" 204
+  f4d_build_log "$d/log/m1.log" "$f4d_lbb" 204
+  f4d_outcomes "$d/outcomes.json" "BASE|log/b.log" "m1|log/m1.log"
+  f4d_lb "$d"
+  (( rc == 0 )) || self_fail "F4d.4: a miss changed the exit (L3): $(cat "$tmp/lb.err")"
+  grep -qF 'lab builds: miss in 2 of 2 labs' "$tmp/lb.out" || self_fail "F4d.4 L3: two missed labs were not 'lab builds: miss in 2 of 2 labs': $(cat "$tmp/lb.out")"
+
+  d="$tmp/f4d/L4"
+  f4d_build_log "$d/log/b.log" "$f4d_la" 1
+  f4d_build_log "$d/log/zz.log" "$f4d_lbb" 204
+  f4d_build_log "$d/log/aa.log" "$f4d_lbb" 1
+  f4d_outcomes "$d/outcomes.json" "BASE|log/b.log" "zz|log/zz.log" "aa|log/aa.log"
+  f4d_lb "$d"
+  (( rc == 0 )) && grep -qF 'lab builds: miss in 1 of 2 labs' "$tmp/lb.out" \
+    || self_fail "F4d.4 L4: the first build in outcomes.json order was not the one counted (exit $rc): $(cat "$tmp/lb.out")"
+
+  d="$tmp/f4d/L5"
+  f4d_build_log "$d/log/b.log" "$f4d_la" 1 2 3
+  f4d_outcomes "$d/outcomes.json" "BASE|log/b.log"
+  f4d_lb "$d"
+  (( rc == 0 )) && grep -qF 'lab builds: hit in 1 of 1 labs' "$tmp/lb.out" \
+    || self_fail "F4d.4 L5: compiles outside the build phase were counted (exit $rc): $(cat "$tmp/lb.out")"
+
+  d="$tmp/f4d/L6"
+  mkdir -p "$d"
+  printf 'no es json\n' > "$d/outcomes.json"
+  f4d_lb "$d"
+  (( rc == 0 )) && grep -qF 'lab builds: unknown' "$tmp/lb.out" \
+    || self_fail "F4d.4 L6: a file with no outcomes was not 'lab builds: unknown' (exit $rc): $(cat "$tmp/lb.out" "$tmp/lb.err")"
+
+  fresh
+  mk_crate_tree seedtree
+  f4b_run seedtree
+  (( rc == 0 )) || self_fail "F4d.4: the seed did not build for the row (exit $rc)"
+  rm -f "$tmp/cargo.calls"
+  f4b_run seedtree FAKE_LABS=2 FAKE_LIST_JSON="$f4d_list2"
+  (( rc == 0 )) || self_fail "F4d.4: the run with two labs did not pass (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  any_said 'lab builds: hit in 2 of 2 labs' \
+    || self_fail "F4d.4: the run did not say 'lab builds: hit in 2 of 2 labs': $(cat "$tmp/run.out" "$tmp/run.err")"
+  any_said 'seed: hit (' && self_fail "F4d.4: the old 'seed: hit (' line is still printed"
+  any_said 'seed: miss (' && self_fail "F4d.4: the old 'seed: miss (' line is still printed"
+
+  # The same run with the touch of the shim taken out: the copy is a copy of the production script
+  # with that one line removed, and its labs must come out as a miss (the line sees what happens).
+  fresh
+  mk_crate_tree notouch
+  sed '/-exec touch -h -d/d' "$ROOT/scripts/mutants-gate.sh" > "$tmp/notouch/scripts/mutants-gate.sh"
+  f4b_run notouch
+  rm -f "$tmp/cargo.calls"
+  f4b_run notouch FAKE_LABS=2 FAKE_LIST_JSON="$f4d_list2"
+  any_said 'lab builds: miss in 2 of 2 labs' \
+    || self_fail "F4d.4: without the touch the labs were not 'miss in 2 of 2 labs': $(cat "$tmp/run.out" "$tmp/run.err")"
+
+  # F4d.5: the seed key records the profile the seed is built with, and the mutation builds get the same.
+  fresh
+  mk_crate_tree seedtree
+  f4b_run seedtree
+  (( rc == 0 )) || self_fail "F4d.5: the seed did not build (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  key="$(seed_keys)"
+  grep -qx 'CARGO_PROFILE_DEV_DEBUG=0' "$seed_root/$key/key.txt" \
+    || self_fail "F4d.5: the seed key does not record CARGO_PROFILE_DEV_DEBUG=0"
+  seed_debug="$(awk -F'\t' '$1 ~ /^test --no-run --lib / {print $5; exit}' "$tmp/cargo.calls")"
+  [[ "$seed_debug" == 0 ]] || self_fail "F4d.5: the seed was built with CARGO_PROFILE_DEV_DEBUG=$seed_debug"
+  [[ "$(awk -F'\t' '$1 ~ /^mutants --file/ {print $5; exit}' "$tmp/cargo.calls")" == 0 ]] \
+    || self_fail "F4d.5: the mutation builds did not get CARGO_PROFILE_DEV_DEBUG=0"
+
+  # F4d.6: without a cargo for the shim to hand the call to, no mutant is run.
+  fresh
+  mk_crate_tree seedtree
+  # The tools of /usr/bin and /bin, each one linked, but the rustup proxies: /usr/bin/cargo and rustc are
+  # links to rustup here, so no PATH that names /usr/bin can be without cargo.
+  mkdir -p "$tmp/f4d/nocargo"
+  for tool in /usr/bin/* /bin/*; do
+    name="${tool##*/}"
+    case "$name" in cargo|cargo-*|rustc|rustup|rust-*) continue ;; esac
+    if [[ -x "$tool" && ! -e "$tmp/f4d/nocargo/$name" ]]; then ln -s "$tool" "$tmp/f4d/nocargo/$name"; fi
+  done
+  node_bin="$(command -v node || true)"
+  [[ -z "$node_bin" ]] || ln -sf "$node_bin" "$tmp/f4d/nocargo/node"
+  printf '#!/bin/bash\nexec "$(dirname "$0")/cargo" "$@"\n' > "$tmp/f4d/nocargo/cargo-mutants"
+  chmod +x "$tmp/f4d/nocargo/cargo-mutants"
+  if env -i PATH="$tmp/f4d/nocargo" bash -c 'command -v cargo' >/dev/null 2>&1; then
+    self_fail "F4d.6: a cargo is still reachable from the row's PATH"
+  fi
+  rc=0
+  rm -f "$tmp/cargo.calls"
+  env -i HOME="$home" PATH="$tmp/f4d/nocargo" TMPDIR="$sys" XDG_CACHE_HOME="$home/.cache" \
+    MUTANTS_JOBS=2 FAKE_CALLS="$tmp/cargo.calls" \
+    bash "$tmp/seedtree/scripts/mutants-gate.sh" >"$tmp/run.out" 2>"$tmp/run.err" || rc=$?
+  (( rc == 2 )) || self_fail "F4d.6: with no cargo the run exited $rc, not 2: $(cat "$tmp/run.out" "$tmp/run.err")"
+  run_said 'no cargo to hand to the shim' || self_fail "F4d.6: the refusal does not say 'no cargo to hand to the shim': $(cat "$tmp/run.err")"
+  ! ran_mutants || self_fail "F4d.6: a mutant ran with no cargo for the shim"
+
+  # F4d.7: the self-test stays hermetic, and the mutation step still reaches cargo-mutants.
+  fresh
+  mk_crate_tree seedtree
+  f4b_run seedtree
+  (( rc == 0 )) && ran_mutants \
+    || self_fail "F4d.7: the mutation step did not reach cargo-mutants (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ -z "$(find "$hermetic/home" "$hermetic/cache" -mindepth 1 -print -quit)" ]] \
+    || self_fail "F4d.7: the hermetic home and cache of the self-test were written to"
+  [[ -z "$(find "$home" -name .mi-mtime-normalized -print -quit)" ]] \
+    || self_fail "F4d.7: a lab marker was left in the fixture's cache"
+  [[ -z "$(awk -F'\t' '$10 ~ /rustup|\.cargo/' "$tmp/cargo.calls")" ]] \
+    || self_fail "F4d.7: a process of the rows reached the real toolchain: $(awk -F'\t' '$10 ~ /rustup|\.cargo/' "$tmp/cargo.calls")"
 
   echo "OK  self-test: a build rustc refused with a diagnostic stays unviable; an NTSTATUS,"
   echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log,"
