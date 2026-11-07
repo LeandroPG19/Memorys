@@ -592,3 +592,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   «F3.3 · corte y decisiones»): **F3.3a** table + `run-all-tests.sh --lane` with the series identical, **F3.3b** merge-gate
   from the table in series + history + F3.1's «for F3.3» fixes, **F3.3c** GATE_DAG=1. Release lanes decided: `rel` (B3→R1→R2)
   and `e2e` (E), on F2b's run_in_lane. F3.3a started.
+- 2026-11-07 06:18 · **Integrated batch head `343df5f` verified** (F2b-1 + F4d + F3.1 + J3 + T-GUARD + T-TRACE): fmt
+  clean, local_gate_contract **65/65**, gate_dag_contract 14/14, gate_history_contract 23/23, clippy --all-targets clean.
+  CI-J4 delivered (a rust/tests binary seeding the 24 lines through the real binary over MCP stdio, as eval_seed.py does;
+  fixture one entity per line; eval_seed.py tells deduplicated from reinforced_id); its verification with the real
+  model queued. F3.3a pass 1 delivered (four contracts on the table, the lanes, the graph and gate-audit), pass 2 in
+  progress; B3 stays its own lane (E depends on B3, so E and R run in parallel after it).
