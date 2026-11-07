@@ -127,6 +127,26 @@ export CUBA_GATE_LOCK_OWNER="$record"
 /// A grandchild of the owner, the way the planner starts a step: owner -> planner -> lane.
 const VIA_PLANNER: &str = r#"bash -c 'bash -c "$1"; :' _ "$CONSUMER""#;
 
+/// The lane that spends its ticket, then runs a child of its own (CI-J9). The token must be gone from the
+/// lane's environment and from that child's.
+const CONSUMER_WITH_CHILD: &str = r#"
+. "$LIB"
+lock="$T/lock"
+inherit_gate_lock "$lock"
+echo "rc=$?"
+echo "lane=${CUBA_GATE_LANE_TOKEN-unset}"
+bash -c 'echo "child=${CUBA_GATE_LANE_TOKEN-unset}"'
+"#;
+
+/// The step the planner starts: checks its ticket and leaves it for the lane it starts (CI-J9, `--step`).
+const STEP_CHECK: &str = r#"
+. "$LIB"
+lock="$T/lock"
+lane_token_check "$lock" "$CUBA_GATE_LOCK_OWNER"
+echo "check=$?"
+echo "step=${CUBA_GATE_LANE_TOKEN-unset}"
+"#;
+
 #[test]
 fn a_planner_step_inherits_the_lock_through_its_ticket() {
     let body = format!("{OWN_RECORD}\n{VIA_PLANNER}\n");
@@ -145,6 +165,58 @@ fn a_planner_step_inherits_the_lock_through_its_ticket() {
     assert!(
         ticket_spent(&out.lock),
         "the inherited ticket must be spent (renamed to 2-D2.used.<pid>)\n{}",
+        out.text()
+    );
+}
+
+/// CI-J9. The lane that spends its ticket gives the token up: neither the lane nor a child it starts keeps
+/// it, so no test or script under the lane can present a ticket it does not own.
+#[test]
+fn a_spent_lane_token_does_not_reach_the_lane_or_its_children() {
+    let body = format!("{OWN_RECORD}\n{VIA_PLANNER}\n");
+    let out = owner("spent-token", &body, "tok-e", "tok-e", CONSUMER_WITH_CHILD);
+    assert!(
+        out.out.contains("rc=0"),
+        "a lane with the planted ticket must inherit the lock, or nothing below is tested\n{}",
+        out.text()
+    );
+    assert!(
+        out.out.contains("lane=unset"),
+        "the lane spent its ticket and still holds the token in its own environment\n{}",
+        out.text()
+    );
+    assert!(
+        out.out.contains("child=unset"),
+        "a child of the lane inherits the spent token, and a test or script it starts would present \
+         it as its own\n{}",
+        out.text()
+    );
+    assert!(
+        ticket_spent(&out.lock),
+        "the inherited ticket must be spent\n{}",
+        out.text()
+    );
+}
+
+/// CI-J9. `--step` checks the ticket and does not spend it: the token stays in the step's environment for the
+/// lane the step starts, which is the one that spends it.
+#[test]
+fn a_step_that_checks_its_ticket_leaves_the_token_for_its_lane() {
+    let body = format!("{OWN_RECORD}\n{VIA_PLANNER}\n");
+    let out = owner("step-check", &body, "tok-f", "tok-f", STEP_CHECK);
+    assert!(
+        out.out.contains("check=0"),
+        "a step with its planted ticket must pass the check\n{}",
+        out.text()
+    );
+    assert!(
+        out.out.contains("step=tok-f"),
+        "the check gave the token up, so the lane the step starts would be refused\n{}",
+        out.text()
+    );
+    assert!(
+        !ticket_spent(&out.lock),
+        "the check spent the ticket, which only the lane may do\n{}",
         out.text()
     );
 }

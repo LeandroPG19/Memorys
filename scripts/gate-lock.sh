@@ -185,6 +185,9 @@ inherit_gate_lock() {
   [[ -n "$record" ]] || return 1
   if [[ -n "${CUBA_GATE_LANE_TOKEN:-}" ]]; then
     lane_token_inherit "$lock" "$record" || return 1
+    # CI-J9: the ticket is spent, so the token goes with it: no child of this lane (a test, a script it
+    # starts) may present a token it does not own. --step only checks the ticket and keeps the token.
+    unset CUBA_GATE_LANE_TOKEN
   else
     [[ "$(record_field pid "$record")" == "$PPID" ]] || return 1
   fi

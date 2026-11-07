@@ -834,6 +834,9 @@ self_test() {
   # CI-F2 (D-F2i): and the lane of a step, which the judge hands its children too (JUDGE_ENVIRONMENT). A
   # lane is judged by its own name and socket, and no row here is a lane.
   unset GATE_LANE
+  # CI-J9: the lane token and the jobs are the judge's too (JUDGE_ENVIRONMENT). A row that spends a ticket,
+  # or names its jobs, sets them itself; the refusals of the memory rows name MUTANTS_JOBS= only when it is unset.
+  unset CUBA_GATE_LANE_TOKEN MUTANTS_JOBS
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.
   # Global, not local: the EXIT trap reads it after this function has exited.
