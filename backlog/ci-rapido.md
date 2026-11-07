@@ -690,3 +690,11 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   measuring it from a git archive: not a repository.)
 - 2026-11-07 08:24 · **CI-J8 committed and merged** (`8417979`, doc_contract 26/26, ci_contract 10/10;
   red = the tenth run): merged `1c8eda7`. Eleventh full run (lanes, chains) next, on this head.
+- 2026-11-07 08:47 · **ELEVENTH FULL RUN: THE FIRST GREEN OF THE NEW JUDGE — 1303.3 s (21.7 min), exit 0, «MERGE GATE
+  PASSED», receipt for 1c8eda7** (lanes mode, chains, still serial; peak 18.7 GB, CPU 4481 s). F0, the old judge on the same
+  machine: 2121 s and red. Step starts: cheap block + clippy 0–20 s, throwaway db 20, unit + smoke 40→350 (310 s), --ignored
+  350→418, model sections 418→461, release build 461→462 (warm), reranker 463→684 (221 s), E2E 684→780, live 780→793, eval
+  793→797, docs round 797→1122 (325 s), crap 1122→1167 (45 s), mutants 1167→1303 (136 s), test times OK (122 binaries).
+  DAG estimate from these numbers (chains as rows): critical path P 20 + DBG 421 + E2E 113 ≈ 554 s (9.2 min), the other
+  chains under it (B3+REL 222, DC 325, CV 45, M 136); with κ = 1.2 ≈ 11 min; with CI-J7 (−66 s per contract round)
+  ≈ 10 min. What remains: F3.3b-1b (the table through the planner), F3.3c (GATE_DAG=1, per-chain targets), ABBA.
