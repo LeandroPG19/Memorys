@@ -739,3 +739,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   cuba_app) is **green against the hole** — it does not discriminate, and that questions the reach of the hole ("sees all
   projects"). Back to the implementer: read the real tenant_isolation policy, say what a '' scope sees, make scenario 2
   red against the hole or remove it with the reason. Not committed until then.
+- 2026-11-07 09:16 · **F3.3b-1b-i committed and merged:** red `38479d9` (gate_lane_token_contract 1/7 — the one guard
+  green; gate_dag 14/15), code `5cf5753` (token 7/7, gate_dag 15/15, local_gate 71/71, gate_history 33/33, doc 26/26, ci
+  10/10); merged `bf678f4`. Spec: every token refusal is exit 2. F3.3b-1b-ii (the 8-row table, merge-gate --step, the
+  planner in series, flush, TB out) started in worktree `Memorys-ci-f33b1b3` from bf678f4.
