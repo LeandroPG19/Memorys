@@ -177,14 +177,80 @@ acquire_gate_lock() {
 # does a shell somebody copied it into. Only the direct child the holder
 # launched itself is the same gate. Inheriting does not set GATE_LOCK_HELD, so
 # the child's exit leaves the lock to the parent that took it.
+# CI-F3.3b-1b-i (D-F3k, minimal form). A lane that the planner starts is a grandchild of the
+# owner, so the direct-parent rule refuses it. When CUBA_GATE_LANE_TOKEN is set, the lane inherits
+# through its one-use ticket instead, and the parent rule does not apply (lane_token_inherit).
 inherit_gate_lock() {
   local lock="$1" record="${CUBA_GATE_LOCK_OWNER:-}"
   [[ -n "$record" ]] || return 1
-  [[ "$(record_field pid "$record")" == "$PPID" ]] || return 1
+  if [[ -n "${CUBA_GATE_LANE_TOKEN:-}" ]]; then
+    lane_token_inherit "$lock" "$record" || return 1
+  else
+    [[ "$(record_field pid "$record")" == "$PPID" ]] || return 1
+  fi
   [[ "$(cat "$lock/owner" 2>/dev/null || true)" == "$record" ]] || return 1
   owner_alive "$record" || return 1
   GATE_OWNER="$record"
   echo "note: running under the gate that holds the lock: $(describe_owner "$record")"
+}
+
+# A run that presents a lane token never takes the lock itself: a refused token is exit 2 (the lane
+# is not a second gate, and the planner must read it as a refusal). Without a token, the old rule:
+# inherit, or else acquire.
+inherit_or_acquire_gate_lock() {
+  local lock="$1"
+  if [[ -n "${CUBA_GATE_LANE_TOKEN:-}" ]]; then
+    inherit_gate_lock "$lock" && return 0
+    return 2
+  fi
+  inherit_gate_lock "$lock" || acquire_gate_lock "$lock"
+}
+
+lane_token_refuse() {
+  echo "FAIL: lane token refused: $1" >&2
+}
+
+# 0 when pid $1 descends from pid $2: walks the parents in /proc/<pid>/stat (field 4 is the parent,
+# read after the last ')' as proc_start does). Stops at init.
+descends_from() {
+  local pid="$1" stat fields
+  while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    read -ra fields <<<"${stat##*) }"
+    pid="${fields[1]:-}"
+    [[ "$pid" == "$2" ]] && return 0
+  done
+  return 1
+}
+
+# Checks in this order, with no side effect until the last one: the owner is the lock's owner and is
+# alive, this lane descends from it, and an unused ticket holds the token. Taking the ticket spends it.
+lane_token_inherit() {
+  local lock="$1" record="$2" pid
+  pid="$(record_field pid "$record")"
+  if [[ "$(cat "$lock/owner" 2>/dev/null || true)" != "$record" ]] || ! owner_alive "$record"; then
+    lane_token_refuse "the gate that holds the lock is not running (pid $pid)"
+    return 1
+  fi
+  if ! descends_from "$$" "$pid"; then
+    lane_token_refuse "this lane does not descend from the gate that holds the lock (pid $pid)"
+    return 1
+  fi
+  if ! take_lane_ticket "$lock" "$CUBA_GATE_LANE_TOKEN"; then
+    lane_token_refuse "no unused ticket in $lock/lanes holds this token (it was spent, or never made)"
+    return 1
+  fi
+}
+
+# Renames the one unused ticket that holds the token to <ticket>.used.<pid>. 0 when this call took it.
+take_lane_ticket() {
+  local lock="$1" token="$2" ticket
+  for ticket in "$lock"/lanes/*; do
+    [[ -f "$ticket" && "$ticket" != *.used.* ]] || continue
+    [[ "$(cat "$ticket")" == "$token" ]] || continue
+    mv "$ticket" "$ticket.used.$$" 2>/dev/null && return 0
+  done
+  return 1
 }
 
 # A holder that finds its lock gone or renamed says so: for some stretch of

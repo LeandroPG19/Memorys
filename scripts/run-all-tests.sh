@@ -1306,7 +1306,8 @@ while [[ "${1:-}" == --lane ]]; do
   shift 2
 done
 
-inherit_gate_lock "$GATE_LOCK" || acquire_gate_lock "$GATE_LOCK" || exit 1
+# CI-F3.3b-1b-i: a lane the planner started presents its token and inherits, or exits 2 (gate-lock.sh).
+inherit_or_acquire_gate_lock "$GATE_LOCK" || exit $?
 [[ -z "$GATE_LOCK_HELD" ]] || exit_file_running
 trap on_exit EXIT
 

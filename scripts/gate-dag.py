@@ -22,6 +22,7 @@ import hashlib
 import math
 import os
 import re
+import secrets
 import select
 import signal
 import statistics
@@ -541,12 +542,27 @@ class Planner:
 
     # steps
 
-    def step_env(self, step: Step) -> dict[str, str]:
+    def lane_ticket(self, step: Step) -> str | None:
+        """CI-F3.3b-1b-i (D-F3k): under the gate's lock, a one-use ticket for the step in the lock's lanes."""
+        lock = os.environ.get("GATE_LOCK")
+        if not lock or not os.environ.get("CUBA_GATE_LOCK_OWNER"):
+            return None
+        token = secrets.token_hex(16)
+        lanes = os.path.join(lock, "lanes")
+        os.makedirs(lanes, exist_ok=True)
+        with open(os.path.join(lanes, f"{step.idx}-{step.id}"), "w", encoding="utf-8") as fh:
+            fh.write(token)
+        return token
+
+    def step_env(self, step: Step, token: str | None = None) -> dict[str, str]:
         tmp = os.path.join(self.run_dir, "tmp", step.id)
         os.makedirs(tmp, exist_ok=True)
         env = dict(os.environ)
         env["TMPDIR"] = tmp
         env.update(step.env)
+        env.pop("CUBA_GATE_LANE_TOKEN", None)
+        if token is not None:
+            env["CUBA_GATE_LANE_TOKEN"] = token
         changed = sorted(k for k, v in env.items() if os.environ.get(k) != v)
         outside = [k for k in changed if k not in ALLOWED_ENV]
         if outside:
@@ -562,7 +578,7 @@ class Planner:
         return path
 
     def start(self, step: Step) -> None:
-        env = self.step_env(step)
+        env = self.step_env(step, self.lane_ticket(step))
         step.cg = self.cgroup_for(step)
         step.log = os.path.join(self.run_dir, "pasos", f"{step.idx}-{step.id}.log")
         with open(step.log, "wb") as log:
