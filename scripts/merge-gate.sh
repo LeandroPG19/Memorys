@@ -2137,6 +2137,12 @@ gate_step_main() {
   [[ -n "${CUBA_GATE_LANE_TOKEN:-}" && -n "${CUBA_GATE_LOCK_OWNER:-}" && -n "${GATE_LOCK:-}" ]] \
     || gate_refuse "--step runs one row of scripts/gate-dag.txt, which the planner (gate-dag.py) starts with its lane ticket. Run scripts/merge-gate.sh for the whole gate."
   lane_token_check "$GATE_LOCK" "$CUBA_GATE_LOCK_OWNER" || exit 2
+  # CI-F3.3c: GATE_OWNER is a shell variable that acquire_gate_lock sets in gate_main, and a step is a process of its
+  # own, so it starts empty. Its value is the record the lock holds now, which lane_token_check has just checked against
+  # the ticket and found alive. CUBA_GATE_LOCK_OWNER is only what the planner handed over: it is not read as the owner.
+  GATE_OWNER="$(cat "$GATE_LOCK/owner" 2>/dev/null || true)"
+  [[ -n "$GATE_OWNER" && "$GATE_OWNER" == "$CUBA_GATE_LOCK_OWNER" ]] \
+    || gate_refuse "--step: the lock's owner record is not the one the ticket was handed with, so no lane can name its owner"
   GATE_LANES=""
   if [[ -z "${DATABASE_URL:-}" && "$(uname -s)" == Linux ]]; then
     GATE_LANES=1

@@ -14,6 +14,6 @@
 30 B3 P target:T_rel normal 12 16 150 bash scripts/merge-gate.sh --step B3
 40 REL B3 target:T_rel,cluster:C_relh,models normal 8 12 221 bash scripts/merge-gate.sh --step REL
 50 E2E B3,DBG target:T_rel,cluster:C_e2e,models normal 8 12 113 bash scripts/merge-gate.sh --step E2E
-60 DC P target:T_dbg,cluster:C_docs normal 8 8 325 bash scripts/merge-gate.sh --step DC
-70 CV P cluster:C_cov untimed 4 4 45 bash scripts/merge-gate.sh --step CV
+60 DC P target:T_docs,cluster:C_docs normal 8 8 325 bash scripts/merge-gate.sh --step DC
+70 CV P target:T_cov,cluster:C_cov untimed 4 4 45 bash scripts/merge-gate.sh --step CV
 80 M P target:T_mut,cluster:C_mut untimed 8 8 136 bash scripts/merge-gate.sh --step M
