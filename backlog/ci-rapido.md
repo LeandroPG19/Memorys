@@ -588,3 +588,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   rust/tests binary that seeds every line through the real binary and model (unit step, no `#[ignore]`), then one entity
   per line (no content change; the judge's seeded = fixture = count guard untouched). **F3.3 started** in parallel
   (worktree `Memorys-ci-f33` from 97563fb): the DAG wired into merge-gate/run-all-tests with `GATE_DAG=0` by default.
+- 2026-11-07 06:15 · F3.3 does not fit one round (the implementer said so before writing anything). Split (spec F3
+  «F3.3 · corte y decisiones»): **F3.3a** table + `run-all-tests.sh --lane` with the series identical, **F3.3b** merge-gate
+  from the table in series + history + F3.1's «for F3.3» fixes, **F3.3c** GATE_DAG=1. Release lanes decided: `rel` (B3→R1→R2)
+  and `e2e` (E), on F2b's run_in_lane. F3.3a started.
