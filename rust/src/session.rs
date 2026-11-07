@@ -73,6 +73,10 @@ where
     SCOPE.scope(scope, fut).await
 }
 
+/// Serializes the tests of this crate that mutate process or database state shared by
+/// the others. A test of lib that opens a pool over DATABASE_URL takes it before it
+/// reads the variable: a window opened by another test (the migration row rewrite in
+/// db.rs) is invisible to a pool that opens outside the guard.
 #[cfg(test)]
 pub static GLOBAL_STATE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

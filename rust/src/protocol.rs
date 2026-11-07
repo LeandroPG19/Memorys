@@ -1927,7 +1927,13 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every test of this crate that opens a pool over DATABASE_URL takes
+    /// GLOBAL_STATE_GUARD first, and reads the variable only while it holds it: the
+    /// db.rs test that points DATABASE_URL at its own database and rewrites the newest
+    /// migration row there does so under that guard, and a pool opened outside it
+    /// migrates into that window and fails with 23505 _sqlx_migrations_pkey.
     pub(crate) async fn test_pool() -> PgPool {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         let url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL env var required for integration tests");
         db::create_pool(&url)
