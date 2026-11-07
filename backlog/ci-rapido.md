@@ -522,3 +522,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
   self-tests OK with HOME/XDG empty, contract **60/61**: `no_script_looks_for_the_cache_where_the_binary_does_not` flags
   the F4d.7 row's `find "$HOME" "$XDG_CACHE_HOME"` line (mutants-gate.sh:2565). Back to the implementer (the row uses
   its own variable; the contract stays).
+- 2026-11-07 11:30 · T-GUARD pass 1 stopped on the no-skips hook (`#[ignore]` cannot be added; not worked around).
+  Decision (mine): the interleaving test runs in the **normal** lib `cargo test` (the judge's unit step already has
+  DATABASE_URL, run-all-tests.sh:1585), fails if DATABASE_URL is missing, and opens the dangerous window only on its
+  **own throwaway database** (DATABASE_URL switched under GLOBAL_STATE_GUARD, dropped at the end), so the parallel lib
+  tests never see it. No section count changes (the unit step is not a `run_counted` section). Reverted by moving the
+  test back under the `--ignored` convention once the hook allows it.
