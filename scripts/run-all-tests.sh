@@ -1187,6 +1187,42 @@ FAKE
   grep -qF 'sha256 changed before E2E' "$tmp/f33c.out" \
     || self_fail "F3.3: a change after the gpu:: release call is not named 'sha256 changed before E2E': $(cat "$tmp/f33c.out")"
 
+  # CI-F3.3a (D-F3y, spec §4 F3.3a): --lane <id> runs one step of the table and nothing else. A missing
+  # or unknown id is refused before the lock, a lane or cargo is touched. Each row runs the script in a
+  # fake tree (full_tree), so it reads what the real script does, with cargo, psql and the lane library
+  # as stand-ins.
+  lane_run() {
+    local name="$1" t="$tmp/$1"
+    shift
+    full_tree "$name"
+    rc=0
+    env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT HOME="$t/home" \
+      PATH="$t/bin:/usr/bin:/bin" DATABASE_URL="$rat_url" CARGO_TARGET_DIR="$t/target" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      ONNX_MODEL_PATH="$t/models" CUBA_RERANKER_PATH="$t/reranker" CUBA_NLI_PATH="$t/nli-model" \
+      MEMORY_INDUSTRY_LLM_PROVIDER=ollama \
+      "$BASH" "$t/scripts/run-all-tests.sh" "$@" >"$tmp/$name.out" 2>&1 || rc=$?
+  }
+  lane_run lane_unknown --lane NOPE
+  (( rc == 2 )) || self_fail "F3.3a: --lane NOPE exits $rc, not 2: $(cat "$tmp/lane_unknown.out")"
+  grep -q 'no such lane: NOPE' "$tmp/lane_unknown.out" \
+    || self_fail "F3.3a: --lane NOPE does not name the lane it refuses: $(cat "$tmp/lane_unknown.out")"
+  [[ ! -e "$tmp/lane_unknown/home/cargo.calls" && ! -e "$tmp/lane_unknown/home/order.log" ]] \
+    || self_fail "F3.3a: a refused --lane touched cargo or a lane: $(cat "$tmp/lane_unknown/home/cargo.calls" "$tmp/lane_unknown/home/order.log" 2>/dev/null)"
+  lane_run lane_bare --lane
+  (( rc == 2 )) || self_fail "F3.3a: --lane with no id exits $rc, not 2: $(cat "$tmp/lane_bare.out")"
+  grep -q 'needs a lane id' "$tmp/lane_bare.out" \
+    || self_fail "F3.3a: --lane with no id does not say so: $(cat "$tmp/lane_bare.out")"
+  [[ ! -e "$tmp/lane_bare/home/cargo.calls" ]] || self_fail "F3.3a: --lane with no id ran cargo"
+  lane_run lane_d2 --lane D2
+  (( rc == 0 )) || self_fail "F3.3a: --lane D2 exits $rc, not 0: $(cat "$tmp/lane_d2.out")"
+  grep -q -- '--ignored' "$tmp/lane_d2/home/cargo.calls" 2>/dev/null \
+    || self_fail "F3.3a: --lane D2 ran none of its --ignored tests: $(cat "$tmp/lane_d2/home/cargo.calls" 2>/dev/null)"
+  grep -Eq -- 'fmt|clippy|--release' "$tmp/lane_d2/home/cargo.calls" 2>/dev/null \
+    && self_fail "F3.3a: --lane D2 ran another lane's cargo call: $(cat "$tmp/lane_d2/home/cargo.calls")"
+  grep -q 'All tests passed' "$tmp/lane_d2.out" \
+    && self_fail "F3.3a: --lane D2 printed the verdict of the whole run"
+
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
   echo "    else; the run-all-tests.sh merge-gate launches works under its lock and"
@@ -1199,6 +1235,18 @@ FAKE
   exit 0
 fi
 # --- self-test end ---
+
+# CI-F3.3a (D-F3y, spec §4): the lanes of this script in idx order, as scripts/gate-dag.txt names them.
+# --lane <id> runs the one lane it names; a missing or unknown id is refused here, before the lock.
+DAG_LANES=(CL D1 D2 NLI D3 B3 R E)
+run_lane=""
+if [[ "${1:-}" == --lane ]]; then
+  [[ -n "${2:-}" ]] || { echo "FAIL: --lane needs a lane id, one of: ${DAG_LANES[*]}" >&2; exit 2; }
+  case " ${DAG_LANES[*]} " in
+    *" $2 "*) run_lane="$2" ;;
+    *) echo "FAIL: no such lane: $2 (the lanes are: ${DAG_LANES[*]})" >&2; exit 2 ;;
+  esac
+fi
 
 inherit_gate_lock "$GATE_LOCK" || acquire_gate_lock "$GATE_LOCK" || exit 1
 [[ -z "$GATE_LOCK_HELD" ]] || exit_file_running
@@ -1589,18 +1637,23 @@ provision_gate_db() {
 
 gate_cargo_jobs
 
+lane_CL() {
 echo "=== cargo fmt --check ==="
 cargo fmt --check
 
 echo "=== cargo clippy (--all-targets: without it, tests/ is never linted) ==="
 cargo clippy --all-targets -- -D warnings
+}
 
+lane_D1() {
 echo "=== throwaway database for every mutating step ==="
 provision_gate_db
 
 echo "=== cargo test (unit + smoke) ==="
 DATABASE_URL="$GATE_DATABASE_URL" cargo test
+}
 
+lane_D2() {
 echo "=== DB integration tests (--ignored) ==="
 export DATABASE_URL="$GATE_DATABASE_URL"
 # Every tests/*.rs is discovered, not listed. The list used to be written by hand
@@ -1632,13 +1685,18 @@ CUBA_APP_ROLE=0 run_counted admin-role 1 cargo test --test v020_audit_update_app
 
 require_present "tests that need the embedding model" "$ONNX_MODEL_PATH/model_quantized.onnx" \
   run_counted embedding-model 1 cargo test --test v016_chunking -- --ignored --nocapture
+}
 
+lane_NLI() {
 require_present "tests that need the NLI model" "$CUBA_NLI_PATH" \
   run_counted nli 1 cargo test --test nli_entailment --test nli_cost --test nli_probe -- --ignored --nocapture
+}
 
+lane_D3() {
 require_generative_llm "tests that need a generative LLM (extract / relation-scan)" \
   run_counted generative-llm 1 cargo test --test v016_extract_without_sampling --test v017_relation_scan \
              -- --ignored --nocapture
+}
 
 # The release build carries --features cuda. Without it, gpu::wants_gpu() returns false
 # unconditionally, CUBA_RERANK_DEVICE=gpu goes inert, and the reranker runs on CPU at
@@ -1664,6 +1722,7 @@ sha_unchanged() {
   fi
 }
 
+lane_B3() {
 echo "=== release build (one cargo call with --no-run, the feature set production runs) ==="
 export CARGO_BUILD_JOBS="$GATE_RELEASE_JOBS"
 cargo test --release --features cuda --no-run --lib --test v017_rerank_gpu
@@ -1678,6 +1737,7 @@ cargo build --release --features cuda --bins --message-format=json >"$b3g_json" 
 check_fresh "$b3g_json" || { rm -f "$b3g_json"; exit 1; }
 rm -f "$b3g_json"
 sha_unchanged "after B3g"
+}
 
 # --features cuda here too. The feature set is part of what cargo fingerprints,
 # so a second release call asking for a different one rebuilds this same target
@@ -1706,6 +1766,7 @@ sha_unchanged "after B3g"
 # machine with no reranker installed must still hear whether its placement
 # contracts hold. The model-bound ones stay behind the guard, where a missing
 # model is a FAIL and never a skip.
+lane_R() {
 echo "=== reranker placement contracts (GPU feature live, no model needed) ==="
 run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
 
@@ -1730,7 +1791,12 @@ require_present "reranker tests (release: 387s in debug, seconds here)" \
 check_section_lines
 
 sha_unchanged "before E2E"
+}
 
+lane_E() {
+export DATABASE_URL="$GATE_DATABASE_URL"
+REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
+REL_SHA="${REL_SHA:-$(release_sha "$REL_BIN")}"
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
 CUBA_BINARY_PATH="$(resolve_binary_path)"
 export CUBA_BINARY_PATH
@@ -1850,6 +1916,16 @@ DATABASE_URL="$EVAL_DATABASE_URL" "$EVAL_BIN" eval \
 queries_lines="$(grep -c . "$EVAL_QUERIES" || true)"
 check_eval "$eval_json" "$queries_lines" || { rm -f "$eval_json"; exit 1; }
 rm -f "$eval_json"
+}
+
+# D-F3y: without arguments the lanes run in idx order; --lane <id> runs the one named above.
+if [[ -n "$run_lane" ]]; then
+  "lane_$run_lane"
+  exit 0
+fi
+for lane in "${DAG_LANES[@]}"; do
+  "lane_$lane"
+done
 
 echo ""
 echo "All tests passed."
