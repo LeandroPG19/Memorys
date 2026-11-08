@@ -2114,9 +2114,10 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 step_DBG() {
   run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane D3
 }
-# CI-F3.3c (D-F3l): the NLI assertion (nli_entailment, < 500 ms) runs alone, and it opens no database, so no cluster.
+# CI-F3.3c (D-F3l): the NLI assertion (nli_entailment, < 500 ms) runs alone. CI-J12: run-all-tests refuses to run without
+# the judge's server, so NLI runs in a cluster of its own, as the rows that call it do. Its tests open no database.
 step_NLI() {
-  "$ROOT/scripts/run-all-tests.sh" --lane NLI
+  run_in_lane nli "$ROOT/scripts/run-all-tests.sh" --lane NLI
 }
 step_B3() {
   run_in_lane b3 "$ROOT/scripts/run-all-tests.sh" --lane B3
