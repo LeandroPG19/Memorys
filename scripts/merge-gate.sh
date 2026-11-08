@@ -92,7 +92,7 @@ gate_cluster_down_all() {
   rm -f "$HOME/lanes.open"
 }
 FAKE
-    printf '#!/bin/sh\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
+    printf '#!/bin/sh\n[ "${1:-}" = --check-models ] || [ -n "${DATABASE_URL:-}" ] || { echo "FAIL: DATABASE_URL is not set, or is empty (stand-in)" >&2; exit 2; }\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
     for s in codigo-muerto crap-gate; do
       printf '#!/bin/sh\necho %s >>"$HOME/steps"\necho "${DATABASE_URL-unset}" >>"$HOME/%s.urls"\necho "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset}" >>"$HOME/%s.lanes"\nexit 0\n' "$s" "$s" "$s" >"$t/scripts/$s.sh"
     done
@@ -901,7 +901,9 @@ FAKE
 up dbg
 run-all-tests --lane CL --lane D1 --lane D2 --lane D3
 down dbg
+up nli
 run-all-tests --lane NLI
+down nli
 up b3
 run-all-tests --lane B3
 down b3
@@ -2112,9 +2114,10 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 step_DBG() {
   run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane D3
 }
-# CI-F3.3c (D-F3l): the NLI assertion (nli_entailment, < 500 ms) runs alone, and it opens no database, so no cluster.
+# CI-F3.3c (D-F3l): the NLI assertion (nli_entailment, < 500 ms) runs alone. CI-J12: run-all-tests refuses to run without
+# the judge's server, so NLI runs in a cluster of its own, as the rows that call it do. Its tests open no database.
 step_NLI() {
-  "$ROOT/scripts/run-all-tests.sh" --lane NLI
+  run_in_lane nli "$ROOT/scripts/run-all-tests.sh" --lane NLI
 }
 step_B3() {
   run_in_lane b3 "$ROOT/scripts/run-all-tests.sh" --lane B3

@@ -287,17 +287,20 @@ the doctor, the MCP live session and the eval smoke).
   `DAG_LANES`, anywhere in the list, exits 2 before the lock is taken, before any lane is made and
   before cargo runs.
 - `merge-gate.sh` hands the table to the planner, `scripts/gate-dag.py`, once its preamble has run (the lock,
-  the server check, the sweep, the audit's cheap steps are the first row). The planner runs the eight rows of
-  `scripts/gate-dag.txt` in idx order: `P`, `DBG` (CL, D1, D2, NLI, D3), `B3`, `REL` (R), `E2E` (E), `DC` (the
+  the server check, the sweep, the audit's cheap steps are the first row). The planner runs the nine rows of
+  `scripts/gate-dag.txt` in idx order: `P`, `DBG` (CL, D1, D2, D3), `NLI`, `B3`, `REL` (R), `E2E` (E), `DC` (the
   `--features docs` pass), `CV` (crap-gate) and `M` (mutants-gate). Each row is `merge-gate.sh --step <id>`, a
   process of its own with one cluster, and the work of a row is its `step_<id>()` function in merge-gate.sh.
+  `NLI` is an `exclusive` row: it asserts a clock (`nli_entailment` under 500 ms), so the planner runs nothing
+  next to it. Its tests open no database, but `run-all-tests.sh` runs only against a judge's server, so the row
+  has its own cluster like the others (CI-J12). It shares `T_dbg`, since it runs after `DBG` and alone.
   Between processes only files cross: `REL` and `E2E` find the release binary of `B3` by its path.
 - A row runs only with the ticket the planner hands it (`CUBA_GATE_LANE_TOKEN`): `--step` checks the ticket
   without spending it, and the lane it starts spends it. Run by hand without one, `--step` exits 2 and takes
   no lock. A red row stops the planner at its idx; the boundary line `=== end of timed steps ===` is printed
   by the planner before its first untimed row (CV), and `test-times --judge` reads the log up to it.
 - `scripts/gate-dag.txt` is the table of the steps: `<idx> <id> <deps> <recursos> <clase> <cpu>
-  <ram_gb> <dur_s> <orden…>`. A test of the contracts reads it and checks its eight rows, their deps and
+  <ram_gb> <dur_s> <orden…>`. A test of the contracts reads it and checks its nine rows, their deps and
   durations, that every row's order is its `--step`, that every `--lane` of a row is a function of
   run-all-tests.sh, that `DAG_LANES` is those lanes in `idx` order, that the graph has no cycle and that
   `REL` and `E2E` depend on `B3`, which builds the binary they read.
