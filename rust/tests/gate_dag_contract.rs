@@ -42,18 +42,6 @@ const CPU_ONE: &str = "100000 100000";
 const CPU_SECOND: u64 = 1_000_000;
 const ANON_A: u64 = 4_800_000_000;
 const ANON_BC: u64 = 4 * GIB;
-const ALLOWED: &[&str] = &[
-    "CARGO_TARGET_DIR",
-    "CARGO_BUILD_JOBS",
-    "TMPDIR",
-    "DATABASE_URL",
-    "GATE_SERVER_SYSTEM_ID",
-    "CUBA_EMBED_INTRA_THREADS",
-    "CUBA_NLI_INTRA_THREADS",
-    "CUBA_RERANK_INTRA_THREADS",
-    "MUTANTS_JOBS",
-    "CUBA_GATE_LANE_TOKEN",
-];
 
 const PASO_SH: &str = r#"#!/bin/sh
 # Fake step: $1 id, $2 seconds, $3 control directory.
@@ -341,6 +329,47 @@ fn write(path: &Path, body: &str) {
 
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
+}
+
+/// The names the planner accepts in the leading `NAME=value` tokens of a step (D-F3j), asked of the planner
+/// itself: `ALLOWED_ENV` in gate-dag.py is the one source of the list, and this contract holds no copy of it
+/// (CI-J13). The question has a deadline like every process of this file.
+fn planner_allowed_env() -> Vec<String> {
+    let base = scratch("allowed-env");
+    let out_path = base.join("salida.txt");
+    let err_path = base.join("error.txt");
+    let mut child = Command::new("python3")
+        .arg("-I")
+        .arg(repo_root().join("scripts/gate-dag.py"))
+        .arg("allowed-env")
+        .stdout(Stdio::from(File::create(&out_path).expect("stdout file")))
+        .stderr(Stdio::from(File::create(&err_path).expect("stderr file")))
+        .spawn()
+        .expect("python3");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let code = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status.code();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("`gate-dag.py allowed-env` did not answer in 30 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        code,
+        Some(0),
+        "`gate-dag.py allowed-env` has to print the closed list of the step environment and exit 0: {}",
+        read(&err_path)
+    );
+    read(&out_path)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
@@ -860,16 +889,57 @@ fn a_step_environment_differs_only_by_the_closed_list() {
             .map(|s| s.to_string()),
         )
         .collect();
+    let allowed = planner_allowed_env();
+    assert!(
+        !allowed.is_empty(),
+        "the planner named no variable of the closed list: the check below would let every name through"
+    );
     let env = read(&fx.control.join("env-e.txt"));
     let unexpected: Vec<&str> = env
         .lines()
         .filter_map(|l| l.split_once('=').map(|(name, _)| name))
-        .filter(|name| !known.contains(*name) && !ALLOWED.contains(name))
+        .filter(|name| !known.contains(*name) && !allowed.iter().any(|a| a.as_str() == *name))
         .collect();
     assert!(
         unexpected.is_empty(),
         "names outside the closed list reached the step: {unexpected:?}"
     );
+}
+
+/// CI-J13: the closed list of the step environment has one source, `ALLOWED_ENV` in gate-dag.py, and the planner
+/// says it (`gate-dag.py allowed-env`, one name per line). A contract that copied it by hand went on passing
+/// when the planner added a name.
+#[test]
+fn the_planner_says_its_own_closed_list_of_step_variables() {
+    let names = planner_allowed_env();
+    assert!(
+        names.len() >= 5,
+        "the planner listed {} names: it reads as an empty list and the contracts that use it would pass over \
+         nothing: {names:?}",
+        names.len()
+    );
+    for anchor in ["CARGO_TARGET_DIR", "TMPDIR"] {
+        assert!(
+            names.iter().any(|name| name == anchor),
+            "{anchor} is not in the list the planner printed: {names:?}"
+        );
+    }
+    let unique: HashSet<&String> = names.iter().collect();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "a name is listed twice: {names:?}"
+    );
+    for name in &names {
+        assert!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit()),
+            "`{name}` is not the name of an environment variable: {names:?}"
+        );
+    }
 }
 
 /// Spec: una variable fuera de la lista da exit 2 nombrándola (D-F3j).
