@@ -17,6 +17,194 @@ qg_mutants_jobs() {
   printf '%s\n' "${plan#jobs=}"
 }
 
+# The two modes that only read and write files (CI-F6, F6b). They are dispatched before anything else of this script
+# runs, so that the judge can call itself for them without the banner or the diff: `--cover-index` and `--merge-select`.
+QG_SELF="$ROOT/scripts/$(basename "${BASH_SOURCE[0]}")"
+qg_py() { command -v python3 2>/dev/null || command -v python 2>/dev/null || true; }
+
+# The mode `--cover-index LIST.json FNS_DIR OUT_DIR [REFUSED.tsv]` (D-F6h). LIST.json is `cargo mutants --list --json`;
+# FNS_DIR holds one `<test>.fns` per test, whose lines are `src/x.rs first last`, the lines of a function the test
+# entered. A test covers a mutant if a function it entered is in the mutant's file and its range holds the line
+# the mutant starts on: a superset of the tests that run that line, so a test is never left out that could catch it.
+# Writes OUT_DIR/select.tsv (`file line k tests`, the union over the mutants that start on that line) and
+# OUT_DIR/plan.tsv (`name group why k`): A0 for a mutant no test covers (`no-coverage`) or whose subset failed
+# without a mutant (REFUSED.tsv, `file line`: `preflight`), A1 with `subset` for the rest.
+qg_cover_index() {
+  local py
+  py="$(qg_py)"
+  [[ -n "$py" ]] || { echo "FAIL: python is required for --cover-index" >&2; return 2; }
+  if [[ $# -lt 3 || ! -f "$1" || ! -d "$2" || ! -d "$3" ]]; then
+    echo "FAIL: --cover-index needs LIST.json FNS_DIR OUT_DIR [REFUSED.tsv]" >&2
+    return 2
+  fi
+  "$py" - "$@" <<'PY'
+import json, os, sys
+
+list_path, fns_dir, out_dir = sys.argv[1:4]
+refused = set()
+if len(sys.argv) > 4:
+    for line in open(sys.argv[4], encoding="utf-8"):
+        if line.strip():
+            file, number = line.rstrip("\n").split("\t")
+            refused.add((file, int(number)))
+mutants = json.load(open(list_path, encoding="utf-8"))
+ranges = {}
+for entry in sorted(os.listdir(fns_dir)):
+    if not entry.endswith(".fns"):
+        continue
+    test = entry[: -len(".fns")]
+    for line in open(os.path.join(fns_dir, entry), encoding="utf-8"):
+        parts = line.split()
+        if len(parts) == 3:
+            ranges.setdefault(parts[0], []).append((int(parts[1]), int(parts[2]), test))
+
+def key(m):
+    return m["file"], m["span"]["start"]["line"]
+
+covering = {}
+for m in mutants:
+    file, line = key(m)
+    covering.setdefault((file, line), set()).update(t for first, last, t in ranges.get(file, []) if first <= line <= last)
+plan, table = [], {}
+for m in mutants:
+    k = key(m)
+    if k in refused:
+        plan.append((m["name"], "A0", "preflight", 0))
+    elif not covering[k]:
+        plan.append((m["name"], "A0", "no-coverage", 0))
+    else:
+        plan.append((m["name"], "A1", "subset", len(covering[k])))
+        table[k] = sorted(covering[k])
+with open(os.path.join(out_dir, "plan.tsv"), "w", encoding="utf-8") as f:
+    for row in plan:
+        f.write("\t".join(str(c) for c in row) + "\n")
+with open(os.path.join(out_dir, "select.tsv"), "w", encoding="utf-8") as f:
+    for (file, line), tests in sorted(table.items()):
+        f.write(f"{file}\t{line}\t{len(tests)}\t{' '.join(tests)}\n")
+a0 = sum(1 for row in plan if row[1] == "A0")
+print(f"cover index: {len(plan)} mutants, {a0} for the whole suite, {len(plan) - a0} with their tests")
+PY
+}
+
+# The mode `--merge-select OUT A0 A1 B [PLAN.tsv]` (D-F6m). Each pass is the path of its outcomes.json, or `-` for a
+# pass that did not run. The class of a mutant is the one the whole suite gave it: A0's, or B's for a mutant that its
+# subset in A1 did not catch; A1's own only if it is caught or unviable. Writes OUT (an outcomes.json of
+# cargo-mutants' shape, with the logs of every record resolved from OUT's directory, and `qg_select` on each mutant:
+# the pass and the size of its subset). Exit 0: every mutant caught or unviable; 4: the merge is sound and some
+# mutant is missed or timed out with the whole suite (named); 1: it cannot be merged (a missing confirmation, a
+# baseline that is not Success, totals that do not add up).
+qg_merge_select() {
+  local py
+  py="$(qg_py)"
+  [[ -n "$py" ]] || { echo "FAIL: python is required for --merge-select" >&2; return 2; }
+  if [[ $# -lt 4 ]]; then
+    echo "FAIL: --merge-select needs OUT A0 A1 B [PLAN.tsv]" >&2
+    return 2
+  fi
+  "$py" - "$@" <<'PY'
+import json, os, sys
+
+out_path = sys.argv[1]
+paths = {"A0": sys.argv[2], "A1": sys.argv[3], "B": sys.argv[4]}
+subset = {}
+if len(sys.argv) > 5:
+    for line in open(sys.argv[5], encoding="utf-8"):
+        if line.strip():
+            name, _group, _why, k = line.rstrip("\n").split("\t")
+            subset[name] = int(k)
+TIMEOUT = ("Timeout", "TimeoutMutant")
+CLASSES = {"caught": ("CaughtMutant",), "missed": ("MissedMutant",), "timeout": TIMEOUT, "unviable": ("Unviable",)}
+problems, passes = [], {}
+for label, path in paths.items():
+    if path == "-":
+        continue
+    data = json.load(open(path, encoding="utf-8"))
+    outcomes = data.get("outcomes")
+    if not isinstance(outcomes, list):
+        problems.append(f"pass {label}: {path} carries no per-mutant outcomes, so it cannot be merged")
+        continue
+    baselines = [o for o in outcomes if o.get("scenario") == "Baseline"]
+    mutants = {o["scenario"]["Mutant"]["name"]: o for o in outcomes if isinstance(o.get("scenario"), dict) and "Mutant" in o["scenario"]}
+    if len(baselines) != 1 or baselines[0].get("summary") != "Success":
+        problems.append(f"the baseline of pass {label} is {baselines[0].get('summary') if baselines else 'missing'}, not Success")
+    for field, names in CLASSES.items():
+        count = sum(1 for o in mutants.values() if o.get("summary") in names)
+        if data.get(field) != count:
+            problems.append(f"pass {label}: its totals do not add up: {field} is {data.get(field)} and its records hold {count}")
+    passes[label] = {"data": data, "baseline": baselines[0] if baselines else None, "mutants": mutants, "dir": os.path.dirname(os.path.abspath(path))}
+if not passes:
+    problems.append("no pass was run, so there is nothing to merge")
+
+final = {}
+for name, record in (passes.get("A0") or {"mutants": {}})["mutants"].items():
+    final[name] = (record, "A0")
+left_open = []
+for name, record in (passes.get("A1") or {"mutants": {}})["mutants"].items():
+    if name in final:
+        problems.append(f"{name} was judged in A0 and in A1")
+    elif record.get("summary") in ("CaughtMutant", "Unviable"):
+        final[name] = (record, "A1")
+    else:
+        left_open.append(name)
+confirmed = (passes.get("B") or {"mutants": {}})["mutants"]
+for name in left_open:
+    if name in confirmed:
+        final[name] = (confirmed[name], "B")
+    else:
+        problems.append(f"no row in pass B confirms {name}, which pass A1 left as {passes['A1']['mutants'][name].get('summary')}")
+for name in confirmed:
+    if name not in left_open:
+        problems.append(f"pass B holds {name}, which pass A1 did not leave open")
+if problems:
+    for problem in problems:
+        print(f"FAIL: {problem}", file=sys.stderr)
+    sys.exit(1)
+
+out_dir = os.path.dirname(os.path.abspath(out_path))
+def moved(record, label):
+    record = dict(record)
+    for field in ("log_path", "diff_path"):
+        rel = record.get(field)
+        if isinstance(rel, str) and rel:
+            record[field] = os.path.relpath(os.path.join(passes[label]["dir"], rel), out_dir)
+    return record
+records = []
+for name, (record, label) in final.items():
+    record = moved(record, label)
+    record["qg_select"] = {"pass": label, "subset": subset.get(name)}
+    records.append(record)
+first = next(label for label in ("A0", "A1", "B") if label in passes)
+count = lambda names: sum(1 for r in records if r.get("summary") in names)
+merged = {"outcomes": [moved(passes[first]["baseline"], first)] + records, "total_mutants": len(records),
+          "caught": count(CLASSES["caught"]), "missed": count(CLASSES["missed"]), "timeout": count(CLASSES["timeout"]),
+          "unviable": count(CLASSES["unviable"]), "success": count(("Success",)),
+          "cargo_mutants_version": passes[first]["data"].get("cargo_mutants_version")}
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(merged, f)
+by = {label: sum(1 for _, (_, p) in final.items() if p == label) for label in ("A0", "A1", "B")}
+print(f"merged: {len(records)} mutants: {merged['caught']} caught, {merged['missed']} missed, {merged['timeout']} timeout, "
+      f"{merged['unviable']} unviable (A0 {by['A0']}, A1 {by['A1']}, B {by['B']})")
+red = 0
+for record in records:
+    name = record["scenario"]["Mutant"]["name"]
+    if record.get("summary") in CLASSES["missed"]:
+        print(f"FAIL: mutant missed by the whole suite: {name}", file=sys.stderr)
+        red = 4
+    elif record.get("summary") in TIMEOUT:
+        print(f"FAIL: mutant timed out with the whole suite: {name}", file=sys.stderr)
+        red = 4
+sys.exit(red)
+PY
+}
+
+case "${1:-}" in
+  --cover-index | --merge-select)
+    mode_rc=0
+    if [[ "$1" == --cover-index ]]; then qg_cover_index "${@:2}" || mode_rc=$?; else qg_merge_select "${@:2}" || mode_rc=$?; fi
+    exit "$mode_rc"
+    ;;
+esac
+
 # Every --exclude-re entry of the mutation step, in one place so that the
 # exclusion checks below read exactly what the mutation run is handed. Each
 # entry's reason, owner and expiry date are in the comment over that step.
@@ -406,23 +594,29 @@ unused_exclusions() {
 # behind by an earlier one, and then to the same check the SIL uses: the rule
 # and its --self-test live in mutants-gate.sh, not in a copy here.
 #
-# CI-F6 (F6a, D-F6a): QG_SELECT chooses how the step reaches cargo-mutants.
+# CI-F6 (F6a, D-F6a; F6b, D-F6g..o): QG_SELECT chooses how the step reaches cargo-mutants.
 #   legacy  the call of before F6, byte for byte: `cargo mutants ... -- --lib`, the full copy of rust/ per job. It
 #           is the judge the study compares against (D-F6p), and the way back.
 #   full    the default: the same mutants and the same verdict through the lab of mutants-gate.sh (--lab-run),
 #           which builds only the lib test of each mutant from a seed of the dependencies (CI-F4).
-# A mode that selects each mutant's tests by coverage is not here: it is adopted only after a study of the
-# classes of every mutant, run against `legacy`, with 0 differences, noted in the backlog (D-F6q). Until then
-# the default stays `full`, which changes no test.
+#   cover   the same mutants and the same classes, judged with fewer tests (Q2) and the cheap verdicts first (Q3):
+#           a map says which functions each lib test enters; a mutant runs only the tests whose functions hold its
+#           line; the mutants no test covers run first with the whole suite (pass A0), the rest with their
+#           subset (A1), and every mutant that its subset did not catch, missed or timed out, runs again with the
+#           whole suite (B) before it counts. A caught with a subset is a caught: the test that fails is also in the
+#           whole suite. Anything the map cannot be trusted for turns it off and the step runs as `full`.
+# `cover` is not the default. It is adopted only after a study of the class of every mutant against `legacy`, with
+# 0 differences, noted in the backlog (D-F6q); until then the default stays `full`, which changes no test.
 #
-# QG_KEEP_OUT=DIR keeps the outcomes of this run in DIR/<mode>/ (green or red). It is a directory of this run's:
-# one that is not empty is exit 2 before anything is mutated, so that two runs never mix (D-F6f).
+# QG_KEEP_OUT=DIR keeps the outcomes of this run in DIR/<mode>/ (green or red): for cover, the plan, the three
+# passes and merged.json. It is a directory of this run's: one that is not empty is exit 2 before anything is
+# mutated, so that two runs never mix (D-F6f).
 mutate_and_judge() {
-  local out rc=0 want="${MUTANTS_JOBS:-}" mode="${QG_SELECT:-full}"
+  local out rc=0 prep=0 want="${MUTANTS_JOBS:-}" mode="${QG_SELECT:-full}"
   case "$mode" in
-    legacy | full) ;;
+    legacy | full | cover) ;;
     *)
-      echo "FAIL: QG_SELECT=$mode is not a mode of the mutation step (legacy or full). A mode that selects tests by coverage needs a study with 0 differences, noted in the backlog, before it is the default (D-F6q)." >&2
+      echo "FAIL: QG_SELECT=$mode is not a mode of the mutation step (legacy, full or cover). cover is not the default: it needs a study with 0 differences, noted in the backlog, before it is (D-F6q)." >&2
       return 2
       ;;
   esac
@@ -433,42 +627,68 @@ mutate_and_judge() {
     fi
     mkdir -p "$QG_KEEP_OUT" || return 2
   fi
-  echo "mode: $mode"
   [[ -n "$want" ]] || want="$(qg_mutants_jobs)" || return $?
   out="$(mktemp -d)"
-  if [[ "$mode" == full ]]; then
-    qg_mutate_full "$want" "$out" "${@}" || rc=1
-  else
-    qg_mutate_legacy "$want" "$out" "${@}" || rc=$?
+  if [[ "$mode" == cover ]]; then
+    qg_cover_prepare "$out" "$@" || prep=$?
+    case "$prep" in
+      0) ;;
+      3) mode=full ;;
+      *)
+        rm -rf "$out"
+        return "$prep"
+        ;;
+    esac
   fi
-  if [[ -f "$out/mutants.out/outcomes.json" ]]; then
-    "$ROOT/scripts/mutants-gate.sh" --check-builds "$out/mutants.out/outcomes.json" || rc=1
-  else
-    echo "no outcomes.json: cargo mutants built no mutant, so there is no build to judge"
+  echo "mode: $mode"
+  case "$mode" in
+    cover) qg_mutate_cover "$want" "$out" "$@" || rc=1 ;;
+    full) qg_mutate_full "$want" "$out" "$@" || rc=1 ;;
+    *) qg_mutate_legacy "$want" "$out" "$@" || rc=$? ;;
+  esac
+  # Every pass of cover went through the build check as it finished (qg_cover_pass).
+  if [[ "$mode" != cover ]]; then
+    if [[ -f "$out/mutants.out/outcomes.json" ]]; then
+      "$ROOT/scripts/mutants-gate.sh" --check-builds "$out/mutants.out/outcomes.json" || rc=1
+    else
+      echo "no outcomes.json: cargo mutants built no mutant, so there is no build to judge"
+    fi
   fi
-  if [[ -n "${QG_KEEP_OUT:-}" && -d "$out/mutants.out" ]]; then
-    mkdir -p "$QG_KEEP_OUT/$mode" && cp -a "$out/mutants.out/." "$QG_KEEP_OUT/$mode/" && echo "kept: $QG_KEEP_OUT/$mode"
+  if [[ -n "${QG_KEEP_OUT:-}" ]]; then
+    if [[ "$mode" == cover && -d "$out/cover" ]]; then
+      mkdir -p "$QG_KEEP_OUT/cover" && cp -a "$out/cover/." "$QG_KEEP_OUT/cover/" && echo "kept: $QG_KEEP_OUT/cover"
+    elif [[ -d "$out/mutants.out" ]]; then
+      mkdir -p "$QG_KEEP_OUT/$mode" && cp -a "$out/mutants.out/." "$QG_KEEP_OUT/$mode/" && echo "kept: $QG_KEEP_OUT/$mode"
+    fi
   fi
   rm -rf "$out"
   return "$rc"
 }
 
-# qg_mutate_full WANT OUT ARGS...: cargo-mutants through the lab of mutants-gate.sh. Everything around it (the
+# qg_lab_pass WANT OUT ARGS...: cargo-mutants over ARGS through the lab of mutants-gate.sh. Everything around it (the
 # disk, the scratch, the seed, the stage, the shim, the jobserver) is the lab's, and the lab's own --self-test
 # proves it; here is only what the diff judge adds: the exclusions, the timeout, and `--cargo-arg=--lib` so each
 # mutant builds the lib test and not the 116 binaries of tests/. Nothing goes after a `--`: a `-- --lib`
-# there reaches only the test phase (CI-F4, F4a). The verdict is cargo-mutants' exit: 2 (a mutant was missed)
-# and 3 (one timed out) are red; so is anything else that is not 0.
-qg_mutate_full() {
-  local want="$1" out="$2" lab_rc=0 crc
+# there reaches only the test phase (CI-F4, F4a). Returns the lab's exit (0: its guards held, whatever
+# cargo-mutants said; cargo-mutants' own exit is in OUT/cargo-mutants.rc).
+qg_lab_pass() {
+  local want="$1" out="$2" lab_rc=0
   shift 2
   "$ROOT/scripts/mutants-gate.sh" --lab-run "$out" "$want" -- "$@" \
     --exclude-re "$MUTANTS_EXCLUDE_RE" --timeout 90 --gitignore=false \
     --cargo-arg=--lib || lab_rc=$?
   if (( lab_rc != 0 )); then
     echo "FAIL: mutants-gate.sh --lab-run exited $lab_rc" >&2
-    return 1
   fi
+  return "$lab_rc"
+}
+
+# qg_mutate_full WANT OUT ARGS...: one pass over every mutant. The verdict is cargo-mutants' exit: 2 (a mutant was
+# missed) and 3 (one timed out) are red; so is anything else that is not 0.
+qg_mutate_full() {
+  local want="$1" out="$2" crc
+  shift 2
+  qg_lab_pass "$want" "$out" "$@" || return 1
   crc="$(cat "$out/cargo-mutants.rc" 2>/dev/null || true)"
   case "$crc" in
     0) return 0 ;;
@@ -525,6 +745,344 @@ qg_mutate_legacy() {
     --exclude-re "$MUTANTS_EXCLUDE_RE" --output "$native" \
     --timeout 90 --jobs "$jobs" --gitignore=false -- --lib) || rc=1
   return "$rc"
+}
+
+# --- CI-F6 (F6b): Q2 and Q3, the cover mode -------------------------------------------------------------------
+# The marker cargo-mutants 27.1.0 writes after every replacement (MUTATION_MARKER_COMMENT). A tree that already holds it
+# would make the shim of mutants-gate.sh take a lab for a mutated one, so cover does not run on it.
+QG_MARKER='/* ~ changed by cargo-mutants ~ */'
+
+# What cover needs and the machine may lack: cargo-llvm-cov, and llvm-profdata and llvm-cov in the sysroot of the
+# rustc that builds (the llvm-tools component). Without them cover does not run: that is the environment, exit 2,
+# and not a quiet fall back to full, which would hide that the mode asked for is not the mode that ran (D-F6j).
+qg_cover_tools() {
+  local sysroot host
+  local -a missing=()
+  command -v cargo-llvm-cov >/dev/null 2>&1 || missing+=("cargo-llvm-cov (cargo install cargo-llvm-cov)")
+  sysroot="$(rustc --print sysroot 2>/dev/null || true)"
+  host="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p' || true)"
+  QG_LLVM_BIN="$sysroot/lib/rustlib/$host/bin"
+  if [[ -z "$sysroot" || -z "$host" ]]; then
+    missing+=("rustc (it did not print its sysroot and its host)")
+  else
+    [[ -x "$QG_LLVM_BIN/llvm-profdata" ]] || missing+=("llvm-profdata in $QG_LLVM_BIN (rustup component add llvm-tools)")
+    [[ -x "$QG_LLVM_BIN/llvm-cov" ]] || missing+=("llvm-cov in $QG_LLVM_BIN (rustup component add llvm-tools)")
+  fi
+  if (( ${#missing[@]} > 0 )); then
+    echo "FAIL: QG_SELECT=cover needs what this machine lacks: ${missing[*]}. Nothing was mutated; QG_SELECT=full does not need them." >&2
+    return 2
+  fi
+}
+
+# The CPUs the judge counts (gate_cargo_jobs: nproc under the cgroup's cpu.max), the number of tests the map runs at
+# once. In a subshell, so that what gate-lock.sh sets and clears when it is read stays out of this one.
+qg_cover_jobs() {
+  local p
+  # shellcheck source=scripts/gate-lock.sh
+  p="$(source "$ROOT/scripts/gate-lock.sh" && gate_cargo_jobs >/dev/null && printf '%s' "$GATE_CARGO_JOBS")" || p=""
+  if [[ ! "$p" =~ ^[0-9]+$ ]] || (( p < 1 )); then
+    echo "FAIL: the CPUs of this judge could not be counted, so the map of QG_SELECT=cover cannot size its tests (set CARGO_BUILD_JOBS)" >&2
+    return 2
+  fi
+  printf '%s\n' "$p"
+}
+
+# At most $1 background jobs of this shell run at once. Each of them is bounded by its own `timeout`, so this waits
+# for no job that cannot end.
+qg_pool_slot() {
+  local running
+  while :; do
+    running="$(jobs -rp | wc -l)"
+    (( running < $1 )) && break
+    wait -n 2>/dev/null || true
+  done
+}
+
+# QG_COVER_WHY is what `cover: off (...)` says. 3 is "off", not a failure of the judge.
+qg_cover_build() { # CDIR: the lib test, instrumented, built into <the judge's target>/qg-cover (D-F6g)
+  local cdir="$1" tdir envs start=$SECONDS py
+  py="$(qg_py)"
+  # The target of the judge, and a directory of its own under it: crap-gate.sh builds with cfg(coverage) into the
+  # same target and the two would rebuild each other's crates.
+  tdir="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/memory-industry-qg-target}/qg-cover"
+  mkdir -p "$tdir" || { QG_COVER_WHY="the instrumented target $tdir could not be made"; return 3; }
+  # show-env is the instrumentation without cargo-llvm-cov's own runner: the flags, the wrapper, the profile name. Both
+  # target variables say the same directory, so the show-env, the build and the profiles agree on it.
+  envs="$(cd "$ROOT/rust" && CARGO_TARGET_DIR="$tdir" CARGO_LLVM_COV_TARGET_DIR="$tdir" cargo llvm-cov show-env --sh --no-cfg-coverage 2>"$cdir/show-env.err")" \
+    || { QG_COVER_WHY="cargo llvm-cov show-env failed: $(tail -n 1 "$cdir/show-env.err")"; return 3; }
+  if ! (cd "$ROOT/rust" && export CARGO_TARGET_DIR="$tdir" CARGO_LLVM_COV_TARGET_DIR="$tdir" && eval "$envs" \
+      && timeout 1800 cargo test --lib --no-run --message-format=json >"$cdir/build.json" 2>"$cdir/build.err"); then
+    QG_COVER_WHY="the instrumented lib test did not build: $(tail -n 1 "$cdir/build.err")"
+    return 3
+  fi
+  QG_COVER_BIN="$("$py" - "$cdir/build.json" <<'PY'
+import json, sys
+found = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    if m.get("reason") == "compiler-artifact" and m.get("executable") and m.get("profile", {}).get("test") \
+            and "lib" in m.get("target", {}).get("kind", []):
+        found.append(m["executable"])
+print(found[0] if len(found) == 1 else "")
+PY
+)"
+  if [[ -z "$QG_COVER_BIN" || ! -x "$QG_COVER_BIN" ]]; then
+    QG_COVER_WHY="the build named no single lib test executable"
+    return 3
+  fi
+  QG_COVER_BUILD_S=$((SECONDS - start))
+}
+
+# One test of the map: alone in its process, with a profile of its own, and what it entered reduced to the lines
+# `src/x.rs first last` of each function whose count is not 0 and whose file is in rust/src (the first and last line
+# of the regions of the function that are in that file: an expansion region of another file does not widen it).
+# The profile, the merged profile and the export of the test are deleted as soon as they are reduced. A test that
+# fails, or whose coverage cannot be read, leaves `<n>` in work/fail for the map to say.
+qg_cover_test() { # BIN N TEST CDIR
+  local bin="$1" n="$2" t="$3" cdir="$4" d="$4/work/$2" py
+  py="$(qg_py)"
+  mkdir -p "$d"
+  if ! (cd "$ROOT/rust" && LLVM_PROFILE_FILE="$d/%p-%m.profraw" timeout "${QG_COVER_TEST_TIMEOUT_S:-300}" "$bin" --exact "$t" --test-threads=1 -q >"$d/out" 2>&1); then
+    printf 'test\t%s\n' "$t" > "$cdir/work/fail/$n"
+  elif ! timeout 300 "$QG_LLVM_BIN/llvm-profdata" merge -sparse "$d"/*.profraw -o "$d/t.profdata" >"$d/tools.err" 2>&1 \
+    || ! timeout 300 "$QG_LLVM_BIN/llvm-cov" export -format=text -skip-expansions -instr-profile="$d/t.profdata" "$bin" >"$d/cov.json" 2>>"$d/tools.err" \
+    || ! "$py" "$cdir/reduce.py" "$ROOT/rust/src/" "$(cd "$ROOT/rust/src" && pwd -P)/" <"$d/cov.json" >"$cdir/fns/$t.fns"; then
+    printf 'measure\t%s\n' "$t" > "$cdir/work/fail/$n"
+    rm -f "$cdir/fns/$t.fns"
+  fi
+  rm -rf "$d"
+}
+
+# D-F6g: every test of the lib that is not ignored, one process each, P at a time. A map is a measure and not a
+# verdict: any test that fails alone, or whose coverage cannot be read, turns cover off (QG_COVER_WHY) and the step
+# runs as full, with the verdict full gives.
+qg_cover_map() { # CDIR P
+  local cdir="$1" p="$2" work="$1/work" start=$SECONDS n=0 t all ignored entered
+  local -a tests=() failed=() unread=()
+  mkdir -p "$work/fail" "$cdir/fns"
+  cat > "$cdir/reduce.py" <<'PY'
+import json, sys
+roots = sys.argv[1:]
+seen = set()
+for data in json.load(sys.stdin).get("data", []):
+    for fn in data.get("functions", []):
+        names = fn.get("filenames") or []
+        if not fn.get("count") or not names:
+            continue
+        rel = next(("src/" + names[0][len(root):] for root in roots if names[0].startswith(root)), None)
+        lines = [(r[0], r[2]) for r in fn.get("regions", []) if len(r) > 5 and r[5] == 0]
+        if rel and lines:
+            seen.add((rel, min(a for a, _ in lines), max(b for _, b in lines)))
+for rel, first, last in sorted(seen):
+    print(rel, first, last)
+PY
+  all="$(LLVM_PROFILE_FILE="$work/list-%p.profraw" "$QG_COVER_BIN" --list --format=terse 2>/dev/null | sed -n 's/: test$//p' || true)"
+  ignored="$(LLVM_PROFILE_FILE="$work/list-%p.profraw" "$QG_COVER_BIN" --list --ignored --format=terse 2>/dev/null | sed -n 's/: test$//p' || true)"
+  rm -f "$work"/list-*.profraw
+  mapfile -t tests < <(awk 'NR == FNR {skip[$0] = 1; next} NF && !($0 in skip)' <(printf '%s\n' "$ignored") <(printf '%s\n' "$all"))
+  if (( ${#tests[@]} == 0 )); then
+    QG_COVER_WHY="the instrumented lib test lists no test that is not ignored"
+    return 3
+  fi
+  for t in "${tests[@]}"; do
+    n=$((n + 1))
+    qg_pool_slot "$p"
+    qg_cover_test "$QG_COVER_BIN" "$n" "$t" "$cdir" &
+  done
+  wait || true
+  if compgen -G "$work/fail/*" >/dev/null; then
+    mapfile -t failed < <(cat "$work"/fail/* | awk -F'\t' '$1 == "test" {print $2}' | LC_ALL=C sort)
+    mapfile -t unread < <(cat "$work"/fail/* | awk -F'\t' '$1 == "measure" {print $2}' | LC_ALL=C sort)
+    QG_COVER_WHY=""
+    if (( ${#failed[@]} > 0 )); then
+      QG_COVER_WHY="${#failed[@]} test$([[ ${#failed[@]} == 1 ]] && echo " fails" || echo "s fail") alone in the map: $(printf '%s, ' "${failed[@]}" | sed 's/, $//')"
+    fi
+    if (( ${#unread[@]} > 0 )); then
+      [[ -z "$QG_COVER_WHY" ]] || QG_COVER_WHY+="; "
+      QG_COVER_WHY+="the coverage of ${#unread[@]} test$([[ ${#unread[@]} == 1 ]] || echo s) could not be read: $(printf '%s, ' "${unread[@]}" | sed 's/, $//')"
+    fi
+    return 3
+  fi
+  entered="$(cat "$cdir"/fns/*.fns 2>/dev/null | LC_ALL=C sort -u | wc -l)"
+  echo "cover map: ${#tests[@]} tests in $((SECONDS - start)) s (build $QG_COVER_BUILD_S s), $((entered)) functions entered"
+}
+
+# The premise of "caught with a subset" is that the subset passes without the mutant. Each distinct subset runs once
+# on the instrumented binary, with the default threads (D-F6i); one that fails sends every mutant that carries it to
+# A0, named. A flaky pair of tests costs time here, never a wrong class.
+qg_cover_subset() { # CDIR N TESTS
+  local d="$1/work/pre-$2"
+  local -a names=()
+  mkdir -p "$d"
+  read -ra names <<<"$3"
+  if ! (cd "$ROOT/rust" && LLVM_PROFILE_FILE="$d/%p-%m.profraw" timeout "${QG_COVER_TEST_TIMEOUT_S:-300}" "$QG_COVER_BIN" --exact "${names[@]}" >"$d/out" 2>&1); then
+    printf '%s\n' "$3" > "$1/work/pre-$2.failed"
+  fi
+  rm -rf "$d"
+}
+qg_cover_preflight() { # CDIR P
+  local cdir="$1" p="$2" n=0 subset f
+  local -a subsets=()
+  mapfile -t subsets < <(cut -f4 "$cdir/select.tsv" | LC_ALL=C sort -u)
+  for subset in "${subsets[@]}"; do
+    [[ -n "$subset" ]] || continue
+    n=$((n + 1))
+    qg_pool_slot "$p"
+    qg_cover_subset "$cdir" "$n" "$subset" &
+  done
+  wait || true
+  : > "$cdir/preflight.tsv"
+  if compgen -G "$cdir/work/pre-*.failed" >/dev/null; then
+    for f in "$cdir"/work/pre-*.failed; do
+      subset="$(cat "$f")"
+      echo "preflight: the tests $subset fail together without a mutant; their mutants go to the whole-suite pass A0"
+      awk -F'\t' -v s="$subset" '$4 == s {print $1 "\t" $2}' "$cdir/select.tsv" >> "$cdir/preflight.tsv"
+    done
+    bash "$QG_SELF" --cover-index "$cdir/list.json" "$cdir/fns" "$cdir" "$cdir/preflight.tsv" >/dev/null || return 1
+  fi
+}
+
+# What the cover mode needs before its first pass: 0 ready, 3 off (it says why, and the step runs as full), 2 when
+# the environment lacks what it was asked for, 1 when the plan itself broke.
+qg_cover_prepare() { # OUT ARGS...
+  local out="$1" cdir="$1/cover" marked p count py
+  shift
+  qg_cover_tools || return 2
+  py="$(qg_py)"
+  [[ -n "$py" ]] || { echo "FAIL: python is required for QG_SELECT=cover" >&2; return 2; }
+  mkdir -p "$cdir"
+  marked="$(grep -rlF --include='*.rs' -- "$QG_MARKER" "$ROOT/rust/src" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)"
+  if [[ -n "$marked" ]]; then
+    echo "cover: off (the tree holds cargo-mutants' marker in ${marked#"$ROOT/rust/"})"
+    return 3
+  fi
+  if ! (cd "$ROOT/rust" && cargo mutants --list --json "$@" --exclude-re "$MUTANTS_EXCLUDE_RE") >"$cdir/list.json" 2>"$cdir/list.err"; then
+    echo "cover: off (cargo mutants --list --json failed: $(tail -n 1 "$cdir/list.err"))"
+    return 3
+  fi
+  count="$("$py" -c 'import json, sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))))' "$cdir/list.json" 2>/dev/null || true)"
+  if [[ "$count" != [0-9]* ]] || (( count == 0 )); then
+    echo "cover: off (--list names no mutant to select the tests of)"
+    return 3
+  fi
+  p="$(qg_cover_jobs)" || return 2
+  qg_cover_build "$cdir" || { echo "cover: off ($QG_COVER_WHY)"; return 3; }
+  qg_cover_map "$cdir" "$p" || { echo "cover: off ($QG_COVER_WHY)"; return 3; }
+  bash "$QG_SELF" --cover-index "$cdir/list.json" "$cdir/fns" "$cdir" || return 1
+  qg_cover_preflight "$cdir" "$p" || return 1
+}
+
+# What a pass left that the next step reads. kind `open`: the mutants that are neither caught nor unviable, which
+# pass B has to confirm. kind `early`: the Q3 line of pass A0, and the names it missed or timed out.
+qg_outcomes_query() { # KIND OUTCOMES
+  local py
+  py="$(qg_py)"
+  "$py" - "$1" "$2" <<'PY'
+import json, sys
+
+kind = sys.argv[1]
+records = [(o["scenario"]["Mutant"]["name"], o.get("summary")) for o in json.load(open(sys.argv[2], encoding="utf-8"))["outcomes"]
+           if isinstance(o.get("scenario"), dict) and "Mutant" in o["scenario"]]
+if kind == "open":
+    for name, summary in records:
+        if summary not in ("CaughtMutant", "Unviable"):
+            print(name)
+else:
+    missed = [n for n, s in records if s == "MissedMutant"]
+    timeout = [n for n, s in records if s in ("Timeout", "TimeoutMutant")]
+    caught = sum(1 for _, s in records if s == "CaughtMutant")
+    print(f"early: {len(records)} mutants with no covering lib test ran first: {caught} caught, {len(missed)} missed, {len(timeout)} timeout")
+    for name in missed:
+        print(f"  missed: {name}")
+    for name in timeout:
+        print(f"  timeout: {name}")
+PY
+}
+
+# A pass measured exactly the mutants it was asked for, in both directions (D-F6l): the guard of mutants-gate.sh,
+# over a list of the names of the pass.
+qg_pass_guard() { # PASS OUTCOMES NAMES_FILE
+  local pass="$1" outcomes="$2" asked="$3" list="$3.list" py why
+  py="$(qg_py)"
+  "$py" -c 'import json, sys; print(json.dumps([{"name": l.rstrip("\n")} for l in open(sys.argv[1], encoding="utf-8") if l.strip()]))' "$asked" >"$list"
+  if ! why="$("$ROOT/scripts/mutants-gate.sh" --set-guard "$outcomes" "$list" 2>&1 >/dev/null)"; then
+    echo "FAIL: set differs in pass $pass: ${why#FAIL: }" >&2
+    return 1
+  fi
+}
+
+# One pass of cover: the mutants of $CDIR/<pass>.names, each with a --re of its own (the name, escaped as regex::escape
+# does, anchored), through the lab. Only A1 gets the selection in its environment. cargo-mutants' exit 2 and 3 are not
+# a verdict here (merged classes are); anything else, and any guard of the lab, is red. Sets QG_PASS_OUTCOMES, `-` for a
+# pass with no mutant.
+qg_cover_pass() { # PASS WANT CDIR ARGS...
+  local pass="$1" want="$2" cdir="$3" asked="$3/$1.names" count how name crc
+  local -a re_args=()
+  shift 3
+  QG_PASS_OUTCOMES=-
+  count=$(( $(wc -l <"$asked") ))
+  if (( count == 0 )); then
+    echo "pass $pass: 0 mutants, skipped"
+    return 0
+  fi
+  case "$pass" in
+    A0) how="the whole suite" ;;
+    A1) how="the tests that cover each" ;;
+    *) how="the whole suite, to confirm what A1 left open" ;;
+  esac
+  echo "pass $pass: $count mutants ($how)"
+  while IFS= read -r name; do
+    re_args+=(--re "^$(sed 's/[][\\.+*?()|{}^$#&~-]/\\&/g' <<<"$name")\$")
+  done <"$asked"
+  mkdir -p "$cdir/$pass"
+  (
+    if [[ "$pass" == A1 ]]; then export MUTANTS_SHIM_SELECT="$cdir/select.tsv"; else unset MUTANTS_SHIM_SELECT; fi
+    qg_lab_pass "$want" "$cdir/$pass" "$@" "${re_args[@]}"
+  ) || return 1
+  crc="$(cat "$cdir/$pass/cargo-mutants.rc" 2>/dev/null || true)"
+  case "$crc" in
+    0 | 2 | 3) ;;
+    *)
+      echo "FAIL: cargo-mutants rc=${crc:-unknown} in pass $pass" >&2
+      return 1
+      ;;
+  esac
+  if [[ ! -f "$cdir/$pass/mutants.out/outcomes.json" ]]; then
+    echo "FAIL: pass $pass left no outcomes.json (cargo-mutants rc=$crc)" >&2
+    return 1
+  fi
+  "$ROOT/scripts/mutants-gate.sh" --check-builds "$cdir/$pass/mutants.out/outcomes.json" || return 1
+  qg_pass_guard "$pass" "$cdir/$pass/mutants.out/outcomes.json" "$asked" || return 1
+  QG_PASS_OUTCOMES="$cdir/$pass/mutants.out/outcomes.json"
+}
+
+# The cover mode's three passes and its verdict (D-F6l, D-F6m, D-F6n, D-F6o). A0 first, with the whole suite, and its
+# line before A1 starts (Q3); then A1 with the subsets; then B with the whole suite over every mutant A1 left missed or
+# timed out. The classes are merged and the verdict is the merged one: a missed or timed out mutant is red, nothing
+# else is.
+qg_mutate_cover() { # WANT OUT ARGS...
+  local want="$1" cdir="$2/cover" a0 a1 merge_rc=0
+  shift 2
+  awk -F'\t' '$2 == "A0" {print $1}' "$cdir/plan.tsv" >"$cdir/A0.names"
+  awk -F'\t' '$2 == "A1" {print $1}' "$cdir/plan.tsv" >"$cdir/A1.names"
+  qg_cover_pass A0 "$want" "$cdir" "$@" || return 1
+  a0="$QG_PASS_OUTCOMES"
+  [[ "$a0" == - ]] || qg_outcomes_query early "$a0"
+  qg_cover_pass A1 "$want" "$cdir" "$@" || return 1
+  a1="$QG_PASS_OUTCOMES"
+  : >"$cdir/B.names"
+  [[ "$a1" == - ]] || qg_outcomes_query open "$a1" >"$cdir/B.names"
+  qg_cover_pass B "$want" "$cdir" "$@" || return 1
+  bash "$QG_SELF" --merge-select "$cdir/merged.json" "$a0" "$a1" "$QG_PASS_OUTCOMES" "$cdir/plan.tsv" || merge_rc=$?
+  case "$merge_rc" in
+    0 | 4) ;;
+    *) return 1 ;;
+  esac
+  "$ROOT/scripts/mutants-gate.sh" --set-guard "$cdir/merged.json" "$cdir/list.json" || return 1
+  (( merge_rc == 0 )) || return 1
 }
 
 # --- self-test: the CRAP filter gets a fixture that puts it in the red -------
@@ -1109,6 +1667,9 @@ FAKE
   mk_qtree qtree
   q_tree="$tmp/qtree"
   q_fresh() { rm -rf "$q_sys" "$q_home" "$tmp/cargo.invoked" "$tmp/cargo.calls" "$tmp/leak.debug"; mkdir -p "$q_sys" "$q_home"; }
+  # F6b: the directory of stand-ins that goes before $tmp/bin, or the whole PATH of a row; empty for every older row.
+  q_pre=""
+  q_path=""
   # mj [VAR=value]... -- ARGS...: mutate_and_judge ARGS in that tree, with the
   # fixture's HOME and temp dir and nothing of the caller's environment that
   # the step is meant to set itself. Its output lands in $tmp/mut.out and its
@@ -1129,7 +1690,7 @@ FAKE
         DATABASE_URL FAKE_MUTANTS_RC FAKE_NO_OUTCOMES FAKE_TOUCH_SEED
       # The seed of the lab lives under the cache: the fixture's own, which q_fresh empties.
       export HOME="$q_home" XDG_CACHE_HOME="$q_home/.cache" TMP="$q_sys_native" TEMP="$q_sys_native" TMPDIR="$q_sys" \
-        PATH="$tmp/bin:$PATH" FAKE_DF_AVAIL_KB="$q_avail" FAKE_CALLS_DIR="$q_calls"
+        PATH="${q_path:-${q_pre:+$q_pre:}$tmp/bin:$PATH}" FAKE_DF_AVAIL_KB="$q_avail" FAKE_CALLS_DIR="$q_calls"
       [[ -z "${qmode:-}" ]] || export QG_SELECT="$qmode"
       [[ -z "$q_per" ]] || export MUTANTS_SCRATCH_GB_PER_COPY="$q_per"
       for kv in ${extra[@]+"${extra[@]}"}; do export "${kv?}"; done
@@ -1411,6 +1972,735 @@ FAKE
     fi
   done
 
+
+  # ====================================================================================================
+  # --- F6b (CI-F6, D-F6g..o): Q2 and Q3. Each mutant is judged with the tests that cover it, the ones with no
+  # covering test go first, and every mutant the subset does not catch is confirmed with the whole suite ---
+  # The doubles below refuse what the real tools refuse (a cargo with no cargo-llvm-cov, a llvm-profdata with no
+  # input, a profile directory that is not there, a test name nobody listed) and answer with the shapes they
+  # really have: `cargo mutants --list --json` and outcomes.json of cargo-mutants 27.1.0 (copied from a real run),
+  # `cargo test --message-format=json`, libtest's `--list --format=terse`, and `llvm-cov export` as
+  # llvm.coverage.json.export 2.0.1 (a function has `count`, `regions` of [LineStart, ColumnStart, LineEnd,
+  # ColumnEnd, ExecutionCount, FileID, ExpandedFileID, Kind] and `filenames`). The six mutants and the coverage of
+  # each test are the table of the spec, F6b, Background.
+  cb="$tmp/cbin"
+  cb2="$tmp/cbin2"
+  csys="$tmp/csysroot"
+  cllvm="$csys/lib/rustlib/x86_64-unknown-linux-gnu/bin"
+  cfix="$tmp/cfix"
+  mkdir -p "$cb" "$cb2" "$cllvm" "$cfix/cov" "$cfix/fns" "$cfix/mg"
+
+  printf '%s\n' '#!/bin/sh' \
+    'case "$*" in' \
+    '  "--print sysroot") echo "${FAKE_SYSROOT:-/nonexistent-sysroot}" ;;' \
+    '  "-vV") echo "rustc 1.99.0 (fake)"; echo "host: x86_64-unknown-linux-gnu" ;;' \
+    '  *) echo "rustc 1.99.0 (fake)" ;;' \
+    'esac' > "$cb/rustc"
+
+  cat > "$cb/cargo" <<'CFAKE'
+#!/bin/bash
+case "${1:-}" in
+  -V) echo "cargo 1.99.0 (fake)"; exit 0 ;;
+  mutants) exec "$(dirname "$0")/cargo-mutants" "$@" ;;
+  llvm-cov)
+    if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+      echo "error: no such command: \`llvm-cov\`" >&2
+      exit 101
+    fi
+    exec cargo-llvm-cov "$@" ;;
+  test)
+    if [[ " $* " == *" --message-format=json "* ]]; then
+      printf 'build-map\t%s\t%s\t%s\n' "${CARGO_TARGET_DIR:-}" "${CARGO_LLVM_COV_TARGET_DIR:-}" "$*" >> "${FAKE_COVER_LOG:?}"
+      if [[ -n "${FAKE_BUILD_FAIL:-}" ]]; then
+        echo "error: could not compile \`memory-industry\` (lib test)" >&2
+        exit 101
+      fi
+      echo '{"reason":"compiler-artifact","package_id":"dep 1.0.0","target":{"kind":["lib"],"crate_types":["lib"],"name":"dep"},"profile":{"test":false},"executable":null}'
+      echo "{\"reason\":\"compiler-artifact\",\"package_id\":\"memory-industry 0.31.0\",\"target\":{\"kind\":[\"lib\"],\"crate_types\":[\"lib\"],\"name\":\"memory_industry\"},\"profile\":{\"test\":true},\"executable\":\"${FAKE_TEST_BIN:?}\"}"
+      echo '{"reason":"build-finished","success":true}'
+      exit 0
+    fi
+    if [[ " $* " == *" --no-run "* && " $* " == *" --package="* ]]; then
+      if [[ ! -f Cargo.toml ]]; then
+        echo "error: could not find \`Cargo.toml\` in \`$PWD\` or any parent directory" >&2
+        exit 101
+      fi
+      t="${CARGO_TARGET_DIR:?the seed build has no CARGO_TARGET_DIR}"
+      mkdir -p "$t/debug/deps" "$t/debug/.fingerprint/serde-444"
+      : > "$t/debug/deps/libdep-aaaa.rlib"
+      : > "$t/debug/.fingerprint/serde-444/lib-serde"
+      : > "$t/CACHEDIR.TAG"
+      exit 0
+    fi
+    # What cargo-mutants runs in a lab, through the shim: the test phase of one mutant.
+    printf 'test\t%s\t%s\n' "$*" "$(env | grep -c '^MUTANTS_SHIM_' || true)" >> "${FAKE_COVER_LOG:?}"
+    exit 0 ;;
+esac
+exit 0
+CFAKE
+
+  cat > "$cb/cargo-llvm-cov" <<'CFAKE'
+#!/bin/bash
+if [[ "${1:-}" != llvm-cov || "${2:-}" != show-env ]]; then
+  echo "error: this stand-in answers llvm-cov show-env" >&2
+  exit 1
+fi
+printf 'cover-env\t%s\t%s\t%s\n' "$*" "${CARGO_LLVM_COV_TARGET_DIR:-}" "${CARGO_TARGET_DIR:-}" >> "${FAKE_COVER_LOG:?}"
+if [[ " $* " != *" --sh "* ]]; then
+  echo "error: only --sh is understood here" >&2
+  exit 1
+fi
+t="${CARGO_LLVM_COV_TARGET_DIR:?no target dir}"
+printf "export %s='%s'\n" CARGO_LLVM_COV 1 CARGO_LLVM_COV_TARGET_DIR "$t" LLVM_PROFILE_FILE "$t/memory-industry-%p-%m.profraw" RUSTFLAGS '-C instrument-coverage'
+CFAKE
+
+  # The test binary of the instrumented lib: libtest's two listings and `--exact`. Like a coverage build it
+  # writes its profile at exit (to LLVM_PROFILE_FILE with %p and %m expanded, and nowhere if that directory is
+  # not there), and it logs what it was asked and how many profile files were lying about in the work directory.
+  cat > "$cb/fake-test-bin" <<'CFAKE'
+#!/bin/bash
+log="${FAKE_COVER_LOG:?}"
+dump() {
+  [[ -n "${LLVM_PROFILE_FILE:-}" ]] || return 0
+  local f="${LLVM_PROFILE_FILE//%p/$$}"
+  f="${f//%m/0}"
+  printf 'tests=%s\n' "$*" > "$f" 2>/dev/null || true
+}
+if [[ "${1:-}" == --list ]]; then
+  if [[ " $* " == *" --ignored "* ]]; then
+    echo "t_z: test"
+  else
+    printf '%s: test\n' t_a1 t_a2 t_a3 t_b t_k t_z
+  fi
+  dump list
+  exit 0
+fi
+if [[ "${1:-}" != --exact ]]; then
+  echo "error: this stand-in runs --list or --exact" >&2
+  exit 2
+fi
+shift
+names=()
+flags=()
+for a in "$@"; do
+  case "$a" in
+    -*) flags+=("$a") ;;
+    *) names+=("$a") ;;
+  esac
+done
+d="$(dirname "$(dirname "${LLVM_PROFILE_FILE:-/nonexistent/x}")")"
+left="$(find "$d" \( -name '*.profraw' -o -name '*.profdata' -o -name '*.json' \) 2>/dev/null | wc -l)"
+printf 'bin\t%s\t%s\t%s\tleftover=%s\n' "${names[*]}" "${flags[*]}" "${LLVM_PROFILE_FILE:-}" "$left" >> "$log"
+if [[ -n "${FAKE_HANG:-}" && "${names[*]}" == "$FAKE_HANG" ]]; then
+  sleep 15
+  echo hang-finished >> "$log"
+fi
+dump "${names[*]}"
+if [[ "${names[*]}" == "${FAKE_FAIL_ALONE:-}" || "${names[*]}" == "${FAKE_FAIL_TOGETHER:-}" ]]; then
+  echo "test failed: ${names[*]}" >&2
+  exit 101
+fi
+exit 0
+CFAKE
+
+  cat > "$cllvm/llvm-profdata" <<'CFAKE'
+#!/bin/bash
+if [[ "${1:-}" != merge ]]; then
+  echo "error: unknown subcommand" >&2
+  exit 1
+fi
+shift
+ins=()
+out=""
+while (($#)); do
+  case "$1" in
+    -sparse) ;;
+    -o) out="$2"; shift ;;
+    -*) ;;
+    *) ins+=("$1") ;;
+  esac
+  shift
+done
+if [[ ${#ins[@]} -eq 0 || -z "$out" ]]; then
+  echo "error: No input files specified. See llvm-profdata merge -help" >&2
+  exit 1
+fi
+for f in "${ins[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    echo "error: $f: No such file or directory" >&2
+    exit 1
+  fi
+done
+cat "${ins[@]}" > "$out"
+CFAKE
+
+  cat > "$cllvm/llvm-cov" <<'CFAKE'
+#!/bin/bash
+if [[ "${1:-}" != export ]]; then
+  echo "error: unknown subcommand" >&2
+  exit 1
+fi
+shift
+prof=""
+bin=""
+for a in "$@"; do
+  case "$a" in
+    -instr-profile=*) prof="${a#-instr-profile=}" ;;
+    -*) ;;
+    *) bin="$a" ;;
+  esac
+done
+if [[ ! -f "$prof" || ! -x "$bin" ]]; then
+  echo "error: no profile or no binary to export" >&2
+  exit 1
+fi
+t="$(sed -n 's/^tests=//p' "$prof" | head -n 1)"
+if [[ -f "${FAKE_COVEXPORT:?}/$t.json" ]]; then
+  cat "$FAKE_COVEXPORT/$t.json"
+else
+  echo '{"version":"2.0.1","type":"llvm.coverage.json.export","data":[{"files":[],"functions":[],"totals":{}}]}'
+fi
+CFAKE
+
+  # cargo-mutants, as the lab of mutants-gate.sh runs it. It lists the six mutants; it applies every --re it was
+  # given to their names (an unanchored search, as the real RegexSet does); it answers each with the class of the
+  # fixture for the whole suite, or for the subset when the selection is in its environment (the real one hands that
+  # environment to the shim); and for the baseline and each mutant it runs the REAL shim in a toy lab that carries
+  # cargo-mutants' marker at the mutant's line, so the test phase that reaches the cargo stand-in is the one the
+  # real chain would make. FAKE_A1_DEVIATION is a pass that leaves one out (drop) or adds one nobody asked for (extra).
+  cat > "$cb/cargo-mutants" <<'CFAKE'
+#!/usr/bin/env python3
+import json, os, re, shutil, subprocess, sys, tempfile
+
+args = sys.argv[1:]
+log = os.environ["FAKE_COVER_LOG"]
+calls = os.environ.get("FAKE_CALLS_DIR")
+if calls:
+    open(os.path.join(calls, "cargo.invoked"), "a").close()
+
+def note(*fields):
+    with open(log, "a", encoding="utf-8") as f:
+        f.write("\t".join(str(x) for x in fields) + "\n")
+
+def usage(why):
+    print(f"error: {why}", file=sys.stderr)
+    sys.exit(1)
+
+def values(flag):
+    return [args[i + 1] for i, a in enumerate(args[:-1]) if a == flag]
+
+if not args or args[0] != "mutants":
+    usage("the first argument of cargo-mutants is `mutants`")
+listed = json.load(open(os.environ["FAKE_LIST_JSON"], encoding="utf-8"))
+if "--list" in args:
+    note("list", " ".join(args))
+    if "--json" in args:
+        print(json.dumps(listed))
+    else:
+        print("\n".join(m["name"] for m in listed))
+    sys.exit(0)
+for flag in ("--jobs", "--jobserver-tasks"):
+    for v in values(flag):
+        if not v.isdigit():
+            usage(f"invalid value {v!r} for {flag}")
+out = (values("--output") or [None])[0]
+stage = (values("--dir") or [None])[0]
+if not out or not os.path.isdir(out):
+    usage(f"--output {out!r} is not a directory")
+if not stage or not os.path.isdir(stage):
+    usage(f"--dir {stage!r} is not a directory")
+patterns = values("--re")
+select = os.environ.get("MUTANTS_SHIM_SELECT")
+seq = 1
+if os.path.exists(log):
+    seq = sum(1 for line in open(log, encoding="utf-8") if line.startswith("pass\t")) + 1
+note("pass", seq, "yes" if select else "no", len(patterns))
+print(f"fake-cargo-mutants: pass {seq} select={'yes' if select else 'no'} re={len(patterns)}", flush=True)
+for p in patterns:
+    note("re", sum(1 for m in listed if re.search(p, m["name"])), p)
+chosen = [m for m in listed if not patterns or any(re.search(p, m["name"]) for p in patterns)]
+deviation = os.environ.get("FAKE_A1_DEVIATION") if select else None
+if deviation == "drop" and chosen:
+    chosen = chosen[:-1]
+elif deviation == "extra":
+    chosen = chosen + [m for m in listed if m not in chosen][:1]
+
+classes = {}
+for line in open(os.environ["FAKE_CLASSES"], encoding="utf-8"):
+    name, full, subset = line.rstrip("\n").split("\t")
+    classes[name] = (full, subset)
+
+# local_gate_contract.rs holds that this file never reads an exit status itself (the rule is mutants-gate.sh's), and
+# it checks by looking for the key's name: the key is spelled in two halves, as the stand-in of the older rows does.
+STATUS = "process" + "_status"
+cargo = os.environ.get("CARGO")
+scratch = os.environ.get("TMPDIR")
+def in_lab(mutant):
+    lab = tempfile.mkdtemp(prefix="cargo-mutants-rust-", suffix=".tmp", dir=scratch)
+    shutil.rmtree(lab)
+    shutil.copytree(stage, lab, symlinks=True)
+    if mutant:
+        path = os.path.join(lab, mutant["file"])
+        lines = open(path, encoding="utf-8").read().split("\n")
+        lines[mutant["span"]["start"]["line"] - 1] += " /* ~ changed by cargo-mutants ~ */"
+        open(path, "w", encoding="utf-8").write("\n".join(lines))
+    note("mutant", mutant["name"] if mutant else "baseline")
+    subprocess.run([cargo, "test", "--verbose", "--package=memory-industry@0.31.0", "--lib"], cwd=lab, check=False)
+    shutil.rmtree(lab)
+if cargo:
+    in_lab(None)
+    for m in chosen:
+        in_lab(m)
+
+os.makedirs(os.path.join(out, "mutants.out", "log"), exist_ok=True)
+def phases(cls):
+    return {
+        "CaughtMutant": [("Build", "Success"), ("Test", {"Failure": 101})],
+        "MissedMutant": [("Build", "Success"), ("Test", "Success")],
+        "Timeout": [("Build", "Success"), ("Test", "Timeout")],
+        "Unviable": [("Build", {"Failure": 101})],
+    }[cls]
+def record(i, m):
+    cls = classes[m["name"]][1 if select else 0]
+    rel = f"log/m{i}.log"
+    with open(os.path.join(out, "mutants.out", rel), "w", encoding="utf-8") as f:
+        f.write("*** mutation diff:\n*** /usr/bin/cargo test --no-run --verbose --package=memory-industry@0.31.0 --lib\n")
+        if cls == "Unviable":
+            f.write("error[E0308]: mismatched types\nerror: could not compile `memory-industry` (lib test)\n")
+        f.write("*** result: " + ("Failure(101)" if cls == "Unviable" else "Success") + "\n")
+    return {"scenario": {"Mutant": {"name": m["name"]}}, "summary": cls, "log_path": rel,
+            "phase_results": [{"phase": p, STATUS: s} for p, s in phases(cls)]}
+records = [record(i, m) for i, m in enumerate(chosen)]
+with open(os.path.join(out, "mutants.out", "log", "baseline.log"), "w", encoding="utf-8") as f:
+    f.write("*** baseline\n")
+baseline = {"scenario": "Baseline", "summary": "Success", "log_path": "log/baseline.log",
+            "phase_results": [{"phase": "Build", STATUS: "Success"}, {"phase": "Test", STATUS: "Success"}]}
+count = lambda cls: sum(1 for r in records if r["summary"] == cls)
+with open(os.path.join(out, "mutants.out", "outcomes.json"), "w", encoding="utf-8") as f:
+    json.dump({"outcomes": [baseline] + records, "total_mutants": len(records), "caught": count("CaughtMutant"),
+               "missed": count("MissedMutant"), "timeout": count("Timeout"), "unviable": count("Unviable"),
+               "success": 0, "cargo_mutants_version": "27.1.0"}, f)
+default_rc = 2 if count("MissedMutant") else 3 if count("Timeout") else 0
+sys.exit(int(os.environ.get("FAKE_PASS_RC") or default_rc))
+CFAKE
+  chmod +x "$cb/rustc" "$cb/cargo" "$cb/cargo-llvm-cov" "$cb/fake-test-bin" "$cb/cargo-mutants" "$cllvm/llvm-profdata" "$cllvm/llvm-cov"
+  # The same stand-ins with no cargo-llvm-cov, for the row that hides it; and a sysroot that lacks one tool each.
+  cp "$cb/rustc" "$cb/cargo" "$cb/cargo-mutants" "$cb/fake-test-bin" "$cb2/"
+  mkdir -p "$tmp/csys-noprof/lib/rustlib/x86_64-unknown-linux-gnu/bin" "$tmp/csys-nocov/lib/rustlib/x86_64-unknown-linux-gnu/bin"
+  cp "$cllvm/llvm-cov" "$tmp/csys-noprof/lib/rustlib/x86_64-unknown-linux-gnu/bin/"
+  cp "$cllvm/llvm-profdata" "$tmp/csys-nocov/lib/rustlib/x86_64-unknown-linux-gnu/bin/"
+  # PATH of the row that hides cargo-llvm-cov: the real one, less every directory that holds it.
+  c_hidden="$cb2:$tmp/bin"
+  IFS=: read -ra c_dirs <<< "$PATH"
+  for c_d in "${c_dirs[@]}"; do
+    [[ -e "$c_d/cargo-llvm-cov" ]] && continue
+    c_hidden+=":$c_d"
+  done
+  if (PATH="$c_hidden"; command -v cargo-llvm-cov >/dev/null 2>&1); then
+    st_fail "F6b.4: the fixture cannot hide cargo-llvm-cov: it is still found on $c_hidden"
+  fi
+  if ! (PATH="$c_hidden"; command -v timeout >/dev/null 2>&1 && command -v awk >/dev/null 2>&1 && command -v sed >/dev/null 2>&1 && command -v find >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1); then
+    st_fail "F6b.4: the fixture hides more than cargo-llvm-cov: timeout, awk, sed, find or python3 are gone from $c_hidden"
+  fi
+  sed -i "1s|.*|#!$py|" "$cb/cargo-mutants" "$cb2/cargo-mutants"
+
+  # The trees the rows run in: the crate of mk_qtree with two files of 60 lines, which are where the mutants are.
+  c_mk_tree() { # NAME
+    mk_qtree "$1"
+    local f i
+    for f in a b; do
+      for i in $(seq 60); do echo "// $f line $i"; done > "$tmp/$1/rust/src/$f.rs"
+    done
+  }
+  c_mk_tree ctree
+  c_mk_tree ctree-marker
+  c_marker='/* ~ changed by cargo-mutants ~ */'
+  sed -i "7s|\$| $c_marker|" "$tmp/ctree-marker/rust/src/b.rs"
+
+  # The fixtures, written once: the six mutants as `cargo mutants --list --json` prints them, the coverage each
+  # test has as llvm-cov exports it, the classes each mutant gets with the whole suite and with its subset, what
+  # the rule of the index has to make of them, and the outcomes.json of three passes for --merge-select.
+  "$py" -I - "$tmp/ctree" "$cfix" <<'CPY'
+import json, os, sys
+root, fix = sys.argv[1], sys.argv[2]
+def span(l1, c1, l2, c2):
+    return {"start": {"line": l1, "column": c1}, "end": {"line": l2, "column": c2}}
+def mutant(file, line, col, what, fn, fname):
+    return {"package": "memory-industry", "file": file, "function": {"function_name": fname, "return_type": "-> u32", "span": span(*fn)},
+            "span": span(line, col, line, col + 4), "replacement": "0", "genre": "FnValue", "name": f"{file}:{line}:{col}: {what}"}
+muts = [
+    mutant("src/a.rs", 10, 5, "replace f -> u32 with 0", (8, 1, 14, 2), "f"),
+    mutant("src/a.rs", 12, 9, "replace + with - in f", (8, 1, 14, 2), "f"),
+    mutant("src/a.rs", 30, 5, "replace g -> u32 with 1", (28, 1, 40, 2), "g"),
+    mutant("src/b.rs", 5, 5, "replace h -> u32 with 1", (3, 1, 9, 2), "h"),
+    mutant("src/b.rs", 20, 13, "replace == with != in k", (15, 1, 25, 2), "k"),
+    mutant("src/b.rs", 50, 5, "replace z -> u32 with 0", (48, 1, 55, 2), "z"),
+]
+names = [m["name"] for m in muts]
+def w(name, text):
+    with open(os.path.join(fix, name), "w", encoding="utf-8") as f:
+        f.write(text)
+json.dump(muts, open(os.path.join(fix, "list.json"), "w"))
+json.dump([], open(os.path.join(fix, "list-empty.json"), "w"))
+w("names.txt", "\n".join(names) + "\n")
+ESC = set("\\.+*?()|[]{}^$#&-~")
+def rx(name):  # regex::escape: exactly these, and not the space, which Python's re.escape would escape
+    return "^" + "".join("\\" + c if c in ESC else c for c in name) + "$"
+w("re.txt", "\n".join(rx(n) for n in names) + "\n")
+
+# What each test executed, in the export's shape. A function entered has count > 0; one that was not, count 0.
+def fn(name, path, count, l1, l2, extra=()):
+    full = path if path.startswith("/") else os.path.join(root, "rust", path)
+    return {"name": name, "count": count, "regions": [[l1, 1, l2, 2, count, 0, 0, 0], [l1 + 1, 5, l1 + 1, 9, count, 0, 0, 0]] + list(extra),
+            "branches": [], "filenames": [full]}
+dep = fn("dep::go", "/home/x/.cargo/registry/src/index/dep-1.0.0/src/lib.rs", 5, 1, 9)
+cov = {
+    "t_a1": [fn("f", "src/a.rs", 3, 8, 14, [[100, 1, 102, 1, 3, 1, 0, 0]]), fn("u", "src/a.rs", 0, 50, 60), dep],
+    "t_a2": [fn("f", "src/a.rs", 1, 8, 14)],
+    "t_a3": [fn("u", "src/a.rs", 2, 50, 60)],
+    "t_b": [fn("h", "src/b.rs", 1, 3, 9)],
+    "t_k": [fn("k", "src/b.rs", 0, 15, 25), fn("{closure#0}", "src/b.rs", 4, 18, 22)],
+    "t_z": [fn("z", "src/b.rs", 2, 48, 55)],
+}
+for t, functions in cov.items():
+    json.dump({"version": "2.0.1", "type": "llvm.coverage.json.export",
+               "data": [{"files": [], "functions": functions, "totals": {}}]}, open(os.path.join(fix, "cov", t + ".json"), "w"))
+# The same, as the reduction of each test: the lines `src/x.rs first last` the index reads (F6b.1).
+for t, lines in {"t_a1": ["src/a.rs 8 14"], "t_a2": ["src/a.rs 8 14"], "t_a3": ["src/a.rs 50 60"], "t_b": ["src/b.rs 3 9"], "t_k": ["src/b.rs 18 22"]}.items():
+    w(os.path.join("fns", t + ".fns"), "\n".join(lines) + "\n")
+
+# The rule of the index: a test covers a mutant if a function it entered is in the file and its range holds the line.
+def plan_line(i, group, why, k):
+    return f"{names[i]}\t{group}\t{why}\t{k}\n"
+w("plan.expected", plan_line(0, "A1", "subset", 2) + plan_line(1, "A1", "subset", 2) + plan_line(2, "A0", "no-coverage", 0)
+  + plan_line(3, "A1", "subset", 1) + plan_line(4, "A1", "subset", 1) + plan_line(5, "A0", "no-coverage", 0))
+w("select.expected", "src/a.rs\t10\t2\tt_a1 t_a2\nsrc/a.rs\t12\t2\tt_a1 t_a2\nsrc/b.rs\t5\t1\tt_b\nsrc/b.rs\t20\t1\tt_k\n")
+w("pre.tsv", "src/a.rs\t10\n")
+w("plan-pre.expected", plan_line(0, "A0", "preflight", 0) + plan_line(1, "A1", "subset", 2) + plan_line(2, "A0", "no-coverage", 0)
+  + plan_line(3, "A1", "subset", 1) + plan_line(4, "A1", "subset", 1) + plan_line(5, "A0", "no-coverage", 0))
+w("select-pre.expected", "src/a.rs\t12\t2\tt_a1 t_a2\nsrc/b.rs\t5\t1\tt_b\nsrc/b.rs\t20\t1\tt_k\n")
+
+# The class of each mutant with the whole suite and with its subset (D-F6l, F6b.7, F6b.8): m2 is missed by its
+# subset and caught by the suite; m4 times out with its subset and is missed by the suite; m3 nobody catches.
+C, M, T, U = "CaughtMutant", "MissedMutant", "Timeout", "Unviable"
+def table(rows):
+    return "".join(f"{n}\t{a}\t{b}\n" for n, (a, b) in zip(names, rows))
+w("classes.tsv", table([(C, C), (C, M), (M, M), (M, T), (U, U), (C, C)]))
+w("classes-green.tsv", table([(C, C), (C, C), (C, C), (C, C), (U, U), (C, C)]))
+w("classes-confirmed.tsv", table([(C, C), (C, M), (C, C), (C, C), (U, U), (C, C)]))
+w("merged.expected", "".join(f"{n}\t{c}\t{p}\t{k}\n" for n, c, p, k in sorted([
+    (names[0], C, "A1", 2), (names[1], C, "B", 2), (names[2], M, "A0", 0),
+    (names[3], M, "B", 1), (names[4], U, "A1", 1), (names[5], C, "A0", 0)])))
+
+# F6b.10: a name made of regex metacharacters, and another that differs only in the column.
+meta = ["src/a.rs:10:5: replace f -> Result<(&'static str, Option<String>)> with Ok((\"\", None))",
+        "src/a.rs:10:9: replace f -> Result<(&'static str, Option<String>)> with Ok((\"\", None))"]
+json.dump([mutant("src/a.rs", 10, int(n.split(":")[2]), n.split(": ", 1)[1], (8, 1, 14, 2), "f") for n in meta],
+          open(os.path.join(fix, "list-meta.json"), "w"))
+w("classes-meta.tsv", "".join(f"{n}\t{C}\t{C}\n" for n in meta))
+w("re-meta.txt", "\n".join(sorted(rx(n) for n in meta)) + "\n")
+
+# The outcomes.json of the three passes, as cargo-mutants 27.1.0 writes them (cut down to what is read).
+STATUS = "process" + "_status"  # spelled in two halves: see the stand-in of cargo-mutants above
+def rec(name, cls):
+    ph = {C: [("Build", "Success"), ("Test", {"Failure": 101})], M: [("Build", "Success"), ("Test", "Success")],
+          T: [("Build", "Success"), ("Test", "Timeout")], U: [("Build", {"Failure": 101})]}[cls]
+    return {"scenario": {"Mutant": {"name": name}}, "summary": cls, "log_path": "log/m.log",
+            "phase_results": [{"phase": p, STATUS: s} for p, s in ph]}
+def outcomes(rel, pairs, baseline="Success"):
+    recs = [rec(n, c) for n, c in pairs]
+    cnt = lambda c: sum(1 for _, k in pairs if k == c)
+    path = os.path.join(fix, "mg", rel, "mutants.out", "outcomes.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump({"outcomes": [{"scenario": "Baseline", "summary": baseline, "log_path": "log/baseline.log", "phase_results": []}] + recs,
+               "total_mutants": len(recs), "caught": cnt(C), "missed": cnt(M), "timeout": cnt(T), "unviable": cnt(U),
+               "success": 0, "cargo_mutants_version": "27.1.0"}, open(path, "w"))
+outcomes("A0", [(names[2], M), (names[5], C)])
+outcomes("A1", [(names[0], C), (names[1], M), (names[3], T), (names[4], U)])
+outcomes("A1-green", [(names[0], C), (names[1], C), (names[3], C), (names[4], U)])
+outcomes("A1-badbase", [(names[0], C), (names[1], M), (names[3], T), (names[4], U)], baseline="Failure")
+outcomes("B", [(names[1], C), (names[3], M)])
+outcomes("B-short", [(names[1], C)])
+outcomes("B-extra", [(names[0], C), (names[1], C), (names[3], M)])
+CPY
+  mapfile -t c_n < "$cfix/names.txt"
+  mapfile -t c_p < "$cfix/re.txt"
+  c_set() { printf '%s\n' "$@" | LC_ALL=C sort; }
+
+  # The modes of the script under test, run from a copy of it in a tree with no git and no crate: a mode that
+  # does not exist yet then falls into the main path of the copy, which finds nothing to judge, and the row
+  # fails on what it asserts and not on what it touched.
+  mkdir -p "$tmp/qmode/scripts" "$tmp/qmode/rust"
+  cp "$ROOT/scripts/quality-gate.sh" "$ROOT/scripts/mutants-gate.sh" "$ROOT/scripts/gate-lock.sh" "$tmp/qmode/scripts/"
+  [[ ! -f "$ROOT/package.json" ]] || cp "$ROOT/package.json" "$tmp/qmode/"
+  qg_mode() {
+    rc=0
+    (cd "$tmp" && PATH="$cb:$tmp/bin:$PATH" FAKE_COVER_LOG="$tmp/mode.log" bash "$tmp/qmode/scripts/quality-gate.sh" "$@") >"$tmp/mode.out" 2>"$tmp/mode.err" || rc=$?
+  }
+  qg_said() { grep -qF -- "$1" "$tmp/mode.out" "$tmp/mode.err"; }
+
+  # F6b.1 (D-F6h): the index. A test covers a mutant if a function it entered is in the mutant's file and its
+  # range holds the mutant's line. t_a3 entered another function of src/a.rs, outside every range there.
+  rm -rf "$cfix/idx"
+  mkdir -p "$cfix/idx"
+  qg_mode --cover-index "$cfix/list.json" "$cfix/fns" "$cfix/idx"
+  if (( rc != 0 )) || ! cmp -s "$cfix/select.expected" "$cfix/idx/select.tsv"; then
+    st_fail "F6b.1: --cover-index did not write the select.tsv of the rule (exit $rc; a test of another function of the same file, or a function outside the range, may have got in): $(cat "$cfix/idx/select.tsv" 2>&1 | tr '\t' ' ') / $(cat "$tmp/mode.err")"
+  fi
+  if ! cmp -s "$cfix/plan.expected" "$cfix/idx/plan.tsv"; then
+    st_fail "F6b.1: --cover-index did not put m3 and m6 in A0 with 'no-coverage' and the others in A1 with 'subset': $(diff "$cfix/plan.expected" "$cfix/idx/plan.tsv" | head -n 6)"
+  fi
+  # The same with a key the preflight refused: its mutants go to A0 with that reason and leave the table.
+  rm -rf "$cfix/idx2"
+  mkdir -p "$cfix/idx2"
+  qg_mode --cover-index "$cfix/list.json" "$cfix/fns" "$cfix/idx2" "$cfix/pre.tsv"
+  if (( rc != 0 )) || ! cmp -s "$cfix/select-pre.expected" "$cfix/idx2/select.tsv" || ! cmp -s "$cfix/plan-pre.expected" "$cfix/idx2/plan.tsv"; then
+    st_fail "F6b.11: --cover-index with a refused key did not send its mutant to A0 with 'preflight' and drop its row (exit $rc): $(cat "$cfix/idx2/plan.tsv" 2>&1 | tr '\t' ' ' | head -n 3)"
+  fi
+
+  # F6b.8 (D-F6m): the merge, over the outcomes.json of the three passes. The class of a mutant that its subset
+  # did not catch is the one the whole suite gave it.
+  c_fails() { grep -F -- "$1" "$tmp/mode.err" | grep -c '^FAIL' || true; }
+  c_mg() { qg_mode --merge-select "$cfix/mg/merged.json" "$@"; }
+  c_classes() {
+    "$py" -I - "$1" <<'CPY'
+import json, sys
+for o in json.load(open(sys.argv[1]))["outcomes"]:
+    if isinstance(o["scenario"], dict):
+        s = o.get("qg_select", {})
+        print(o["scenario"]["Mutant"]["name"], o["summary"], s.get("pass"), s.get("subset"), sep="\t")
+CPY
+  }
+  rm -f "$cfix/mg/merged.json"
+  c_mg "$cfix/mg/A0/mutants.out/outcomes.json" "$cfix/mg/A1/mutants.out/outcomes.json" "$cfix/mg/B/mutants.out/outcomes.json" "$cfix/plan.expected"
+  if (( rc != 4 )) || [[ "$(c_fails "${c_n[2]}")" == 0 || "$(c_fails "${c_n[3]}")" == 0 || "$(c_fails "${c_n[1]}")" != 0 ]]; then
+    st_fail "F6b.8: the merge of A0, A1 and B did not exit 4 with a FAIL for m3 and for m4 and none for m2, which B caught (exit $rc): $(cat "$tmp/mode.err")"
+  fi
+  if [[ "$(c_classes "$cfix/mg/merged.json" 2>&1 | LC_ALL=C sort)" != "$(LC_ALL=C sort "$cfix/merged.expected")" ]]; then
+    st_fail "F6b.8: the merged classes are not m1 Caught (A1), m2 Caught (B), m3 Missed (A0), m4 Missed (B), m5 Unviable (A1), m6 Caught (A0): $(c_classes "$cfix/mg/merged.json" 2>&1 | tr '\t' ' ')"
+  fi
+  "$py" -I - "$cfix/mg/merged.json" <<'CPY' || st_fail "F6b.8: merged.json does not carry the totals of its own records (3 caught, 2 missed, 0 timeout, 1 unviable) and a baseline"
+import json, sys
+d = json.load(open(sys.argv[1]))
+want = {"total_mutants": 6, "caught": 3, "missed": 2, "timeout": 0, "unviable": 1}
+assert all(d[k] == v for k, v in want.items()), d
+assert d["outcomes"][0]["scenario"] == "Baseline" and d["outcomes"][0]["summary"] == "Success"
+CPY
+  # Passes that were not invoked are `-`: A1 alone, all caught, is a green merge.
+  rm -f "$cfix/mg/merged.json"
+  c_mg - "$cfix/mg/A1-green/mutants.out/outcomes.json" -
+  (( rc == 0 )) && [[ "$(c_classes "$cfix/mg/merged.json" | wc -l)" == 4 ]] \
+    || st_fail "F6b.8: A1 alone with every mutant caught or unviable was not a green merge of 4 mutants (exit $rc): $(cat "$tmp/mode.err")"
+  # What cannot be merged is red, and not a verdict about a mutant: exit 1, with the reason.
+  c_mg_red() { # LABEL SAYING A0 A1 B
+    local label="$1" saying="$2"
+    shift 2
+    c_mg "$@"
+    (( rc == 1 )) && qg_said "$saying" || st_fail "F6b.8 $label: the merge did not exit 1 saying '$saying' (exit $rc): $(cat "$tmp/mode.out" "$tmp/mode.err")"
+  }
+  c_o() { printf '%s' "$cfix/mg/$1/mutants.out/outcomes.json"; }
+  c_mg_red 'a missed of A1 with no row in B' 'confirm' "$(c_o A0)" "$(c_o A1)" "$(c_o B-short)"
+  c_mg_red 'a missed of A1 and no B at all' 'confirm' "$(c_o A0)" "$(c_o A1)" -
+  c_mg_red 'a baseline that is not Success' 'baseline' "$(c_o A0)" "$(c_o A1-badbase)" "$(c_o B)"
+  c_mg_red 'a B row that A1 did not leave open' 'did not leave' "$(c_o A0)" "$(c_o A1)" "$(c_o B-extra)"
+
+  # --- the step, in the tree of the rows, with the stand-ins first on its PATH ---------------------------------
+  c_log="$tmp/cover.log"
+  c_tree=ctree
+  cj() { # [VAR=value]... -- ARGS...: mutate_and_judge in $tmp/$c_tree, from a fresh state, its output in $tmp/mut.out
+    local -a extra=()
+    while [[ "${1:-}" != -- ]]; do extra+=("$1"); shift; done
+    shift
+    q_fresh
+    rm -f "$c_log"
+    q_tree="$tmp/$c_tree"
+    q_pre="$cb"
+    mj FAKE_SYSROOT="$csys" FAKE_COVER_LOG="$c_log" FAKE_LIST_JSON="$cfix/list.json" FAKE_CLASSES="$cfix/classes.tsv" \
+      FAKE_COVEXPORT="$cfix/cov" FAKE_TEST_BIN="$cb/fake-test-bin" ${extra[@]+"${extra[@]}"} -- "$@"
+    q_pre=
+    q_tree="$tmp/qtree"
+  }
+  c_mfails() { grep -F -- "$1" "$tmp/mut.out" | grep -c '^FAIL' || true; }
+  c_bins() { awk -F'\t' -v n="$1" -v f="$2" '$1=="bin" && $2==n && $3==f {c++} END {print c+0}' "$c_log"; }
+  c_res() { awk -F'\t' -v s="$1" '$1=="pass" {p=$2} $1=="re" && p==s {print $3}' "$c_log" | LC_ALL=C sort; }
+  c_argv_of() { awk -F'\t' -v p="$1" -v m="$2" '$1=="pass" {q=$2} $1=="mutant" {n=$2} $1=="test" && q==p && n==m {print $2}' "$c_log"; }
+  c_base='test --verbose --package=memory-industry@0.31.0 --lib'
+
+  # F6b.2, F6b.7 and F6b.8 are one run: the six mutants, the map built from the tests, the three passes in their
+  # order, and the verdict. One job (CARGO_BUILD_JOBS=1) so that each test of the map starts alone, and the work
+  # directory it finds is the one the test before it left.
+  c_keep="$tmp/ckeep-main"
+  rm -rf "$c_keep"
+  cj CARGO_BUILD_JOBS=1 QG_SELECT=cover QG_KEEP_OUT="$c_keep" -- "${q_args[@]}"
+  mj_said 'mode: cover' || st_fail "F6b.7: the step with QG_SELECT=cover did not say 'mode: cover' (exit $mut_rc): $(cat "$tmp/mut.out")"
+  mj_said 'cover map: 5 tests' || st_fail "F6b.2: the map did not say 'cover map: 5 tests' (the ignored test is not one of them): $(cat "$tmp/mut.out")"
+  for c_t in t_a1 t_a2 t_a3 t_b t_k; do
+    [[ "$(c_bins "$c_t" '--test-threads=1 -q')" == 1 ]] \
+      || st_fail "F6b.2: the binary was not run exactly once as '--exact $c_t --test-threads=1 -q' ($(c_bins "$c_t" '--test-threads=1 -q') times)"
+  done
+  if awk -F'\t' '$1=="bin" && $2 ~ /t_z/ {found = 1} END {exit !found}' "$c_log"; then
+    st_fail "F6b.2: t_z, a test marked ignored, was run: $(grep -F t_z "$c_log")"
+  fi
+  [[ "$(awk -F'\t' '$1=="bin" && $3 ~ /test-threads/ {print $4}' "$c_log" | LC_ALL=C sort -u | wc -l)" == 5 ]] \
+    || st_fail "F6b.2: the five tests did not each get a LLVM_PROFILE_FILE of their own: $(awk -F'\t' '$1=="bin" {print $4}' "$c_log")"
+  [[ "$(awk -F'\t' '$1=="bin" && $5 != "leftover=0"' "$c_log" | wc -l)" == 0 ]] \
+    || st_fail "F6b.2: a test started with a profile, a merged profile or an export of an earlier one still on disk: $(awk -F'\t' '$1=="bin" && $5 != "leftover=0"' "$c_log")"
+  c_envs="$(awk -F'\t' '$1=="cover-env"' "$c_log")"
+  if [[ "$(wc -l <<<"$c_envs")" != 1 ]] || [[ "$(cut -f2 <<<"$c_envs")" != *' --sh'* || "$(cut -f2 <<<"$c_envs")" != *' --no-cfg-coverage'* ]]; then
+    st_fail "F6b.2: cargo llvm-cov show-env was not asked once for --sh and --no-cfg-coverage: $c_envs"
+  fi
+  c_tdir="$(awk -F'\t' '$1=="build-map" {print $3}' "$c_log")"
+  if [[ "$c_tdir" != "$tmp"/*/qg-cover || "$c_tdir" == "$tmp/ctree/"* || "$(awk -F'\t' '$1=="build-map" {print $2}' "$c_log")" != "$c_tdir" \
+    || "$(cut -f3 <<<"$c_envs")" != "$c_tdir" ]]; then
+    st_fail "F6b.2: the instrumented build did not go to <the judge's target>/qg-cover, outside the tree and the same for show-env and cargo: '$c_tdir' / $c_envs"
+  fi
+  [[ "$(awk -F'\t' '$1=="build-map" {print $4}' "$c_log")" == 'test --lib --no-run --message-format=json' ]] \
+    || st_fail "F6b.2: the instrumented build was not 'cargo test --lib --no-run --message-format=json': $(grep '^build-map' "$c_log")"
+  [[ "$(ls "$c_keep/cover/fns" | wc -l)" == 5 && "$(cat "$c_keep/cover/fns/t_a1.fns")" == 'src/a.rs 8 14' \
+    && "$(cat "$c_keep/cover/fns/t_k.fns")" == 'src/b.rs 18 22' && "$(cat "$c_keep/cover/fns/t_a3.fns")" == 'src/a.rs 50 60' ]] \
+    || st_fail "F6b.2: the functions each test entered were not reduced to 'src/a.rs 8 14' for t_a1 (a function of count 0, one outside rust/src and a region of another file do not count) and the closure for t_k: $(cd "$c_keep/cover/fns" && head -n 3 ./*.fns 2>&1)"
+  if [[ -n "$(find "$c_keep/cover" \( -name '*.profraw' -o -name '*.profdata' -o -name cov.json \) -print -quit)" \
+    || -n "$(find "$c_keep/cover" -name '*.json' ! -name list.json ! -name merged.json ! -name outcomes.json ! -name build.json -print -quit)" ]]; then
+    st_fail "F6b.2: the step left a profile, a merged profile or an export per test behind: $(find "$c_keep/cover" -name '*.profraw' -o -name '*.profdata' -o -name '*.json')"
+  fi
+  cmp -s "$cfix/plan.expected" "$c_keep/cover/plan.tsv" \
+    || st_fail "F6b.1: the plan of the step is not the one of the rule (m3 and m6 in A0, no coverage): $(diff "$cfix/plan.expected" "$c_keep/cover/plan.tsv" | head -n 6)"
+  # Preflight: each distinct subset ran once, with the default threads, and none of them failed.
+  for c_t in 't_a1 t_a2' t_b t_k; do
+    [[ "$(c_bins "$c_t" '')" == 1 ]] || st_fail "F6b.11: the subset '$c_t' was not run exactly once, without a mutant ($(c_bins "$c_t" '') times)"
+  done
+
+  # F6b.7 (Q3): the tests nobody covers go first, with the whole suite, and their red is said before A1 starts.
+  (( mut_rc != 0 )) || st_fail "F6b.8: m3 and m4 are missed by the whole suite and the step was green: $(cat "$tmp/mut.out")"
+  [[ "$(grep -c '^pass' "$c_log")" == 3 ]] || st_fail "F6b.7: cargo-mutants was not launched three times (A0, A1, B): $(grep '^pass' "$c_log")"
+  [[ "$(grep '^pass' "$c_log" | cut -f2-3 | tr '\t' ' ' | tr '\n' ',')" == '1 no,2 yes,3 no,' ]] \
+    || st_fail "F6b.7: A0 did not run first with the whole suite, then A1 with the selection, then B with the whole suite: $(grep '^pass' "$c_log" | tr '\t' ' ')"
+  [[ "$(c_res 1)" == "$(c_set "${c_p[2]}" "${c_p[5]}")" ]] || st_fail "F6b.7: A0 was not asked for exactly m3 and m6 (the ones no test covers): $(c_res 1)"
+  [[ "$(c_res 2)" == "$(c_set "${c_p[0]}" "${c_p[1]}" "${c_p[3]}" "${c_p[4]}")" ]] || st_fail "F6b.7: A1 was not asked for exactly m1, m2, m4 and m5: $(c_res 2)"
+  c_early="$(grep -n 'early: 2 mutants with no covering lib test ran first: 1 caught, 1 missed, 0 timeout' "$tmp/mut.out" | head -n 1 | cut -d: -f1)"
+  c_a1_at="$(grep -n 'fake-cargo-mutants: pass 2 ' "$tmp/mut.out" | head -n 1 | cut -d: -f1)"
+  [[ -n "$c_early" ]] || st_fail "F6b.7: the line 'early: 2 mutants with no covering lib test ran first: 1 caught, 1 missed, 0 timeout' is not in the output: $(cat "$tmp/mut.out")"
+  [[ -n "$c_a1_at" ]] && (( c_early < c_a1_at )) || st_fail "F6b.7: the early line came after A1 started (line $c_early against $c_a1_at)"
+  c_a0_at="$(grep -n 'fake-cargo-mutants: pass 1 ' "$tmp/mut.out" | head -n 1 | cut -d: -f1)"
+  sed -n "${c_a0_at},${c_a1_at}p" "$tmp/mut.out" | grep -qF -- "${c_n[2]}" \
+    || st_fail "F6b.7: the missed mutant of A0, m3, is not named between the start of A0 and the start of A1"
+
+  # F6b.8: B holds exactly what A1 left open (a missed and a timeout), and the verdict is the merged one.
+  [[ "$(c_res 3)" == "$(c_set "${c_p[1]}" "${c_p[3]}")" ]] \
+    || st_fail "F6b.8: B was not asked for exactly m2 (missed by its subset) and m4 (timed out with it): $(c_res 3)"
+  [[ "$(c_mfails "${c_n[2]}")" != 0 && "$(c_mfails "${c_n[3]}")" != 0 && "$(c_mfails "${c_n[1]}")" == 0 ]] \
+    || st_fail "F6b.8: the step did not fail naming m3 and m4 and not m2 (which the whole suite caught): $(grep '^FAIL' "$tmp/mut.out")"
+  if grep -qF 'cargo-mutants rc=' "$tmp/mut.out"; then
+    st_fail "F6b.8: the rc of A1 (2: a mutant of its subset was missed) decided the verdict, and B had not said yet: $(grep 'cargo-mutants rc=' "$tmp/mut.out")"
+  fi
+  [[ "$(c_classes "$c_keep/cover/merged.json" 2>&1 | LC_ALL=C sort)" == "$(LC_ALL=C sort "$cfix/merged.expected")" ]] \
+    || st_fail "F6b.8: the merged.json the step kept is not m1 Caught, m2 Caught (B), m3 Missed, m4 Missed (B), m5 Unviable, m6 Caught: $(c_classes "$c_keep/cover/merged.json" 2>&1 | tr '\t' ' ')"
+  bash "$ROOT/scripts/mutants-gate.sh" --check-builds "$c_keep/cover/merged.json" >"$tmp/cb.out" 2>&1 \
+    || st_fail "F6b.8: the merged.json cannot be judged by --check-builds from where it is kept (its logs do not resolve): $(cat "$tmp/cb.out")"
+  # The real shim, in the toy labs, handed cargo the subset of each mutant of A1 and the whole suite everywhere else.
+  [[ "$(c_argv_of 2 "${c_n[0]}")" == "$c_base -- --exact t_a1 t_a2" && "$(c_argv_of 2 "${c_n[1]}")" == "$c_base -- --exact t_a1 t_a2" \
+    && "$(c_argv_of 2 "${c_n[3]}")" == "$c_base -- --exact t_b" && "$(c_argv_of 2 "${c_n[4]}")" == "$c_base -- --exact t_k" ]] \
+    || st_fail "F6b.5: the tests of the mutants of A1 did not reach cargo as '-- --exact <their tests>': $(awk -F'\t' '$1=="pass"{q=$2} $1=="mutant"{n=$2} $1=="test" && q==2 {print n " => " $2}' "$c_log")"
+  if awk -F'\t' '$1=="pass" {q=$2} $1=="test" && q != 2 && $2 ~ /--exact/ {bad = 1} END {exit !bad}' "$c_log" \
+    || awk -F'\t' '$1=="test" && $3 != 0 {bad = 1} END {exit !bad}' "$c_log"; then
+    st_fail "F6b.7: A0 or B filtered the tests of a mutant, or cargo saw a MUTANTS_SHIM_* variable: $(grep '^test' "$c_log")"
+  fi
+  c_sl="$c_keep/cover/A1/select-shim.log"
+  [[ "$(LC_ALL=C sort "$c_sl")" == "$(printf '%s\n' 'full baseline' 'subset 1 src/b.rs:20' 'subset 1 src/b.rs:5' 'subset 2 src/a.rs:10' 'subset 2 src/a.rs:12' | LC_ALL=C sort)" ]] \
+    || st_fail "F6b.5: the selection log of A1 is not one 'subset' per mutant and one 'full baseline': $(cat "$c_sl" 2>&1)"
+  [[ ! -e "$c_keep/cover/A0/select-shim.log" && ! -e "$c_keep/cover/B/select-shim.log" ]] \
+    || st_fail "F6b.7: A0 or B ran with the selection in its environment"
+  for c_f in A0/mutants.out/outcomes.json A1/mutants.out/outcomes.json B/mutants.out/outcomes.json merged.json select.tsv plan.tsv list.json; do
+    [[ -s "$c_keep/cover/$c_f" ]] || st_fail "F6b.8: QG_KEEP_OUT did not keep cover/$c_f: $(ls -R "$c_keep" 2>&1 | head -n 30)"
+  done
+
+  # F6b.8, the other way round: when the whole suite confirms every missed of the subsets, the step is green,
+  # whatever cargo-mutants' exit was for A1. m2 is missed by its subset (rc 2) and caught by the suite.
+  cj CARGO_BUILD_JOBS=3 QG_SELECT=cover FAKE_CLASSES="$cfix/classes-confirmed.tsv" -- "${q_args[@]}"
+  if (( mut_rc != 0 )) || [[ "$(c_res 3)" != "$(c_set "${c_p[1]}")" ]] || mj_said 'FAIL'; then
+    st_fail "F6b.8: a missed of A1 that the whole suite caught did not leave a green step, with B asked for m2 alone (exit $mut_rc): $(cat "$tmp/mut.out")"
+  fi
+
+  # F6b.3: a test that fails alone turns cover off, and the step runs as full, with the same verdict full gives.
+  cj CARGO_BUILD_JOBS=2 QG_SELECT=cover FAKE_FAIL_ALONE=t_b FAKE_CLASSES="$cfix/classes-green.tsv" -- "${q_args[@]}"
+  if (( mut_rc != 0 )) || ! mj_said 'cover: off (1 test fails alone in the map: t_b)' || ! mj_said 'mode: full' || mj_said 'mode: cover'; then
+    st_fail "F6b.3: a test that fails alone did not leave 'cover: off (1 test fails alone in the map: t_b)' and 'mode: full', with the green verdict of full (exit $mut_rc): $(cat "$tmp/mut.out")"
+  fi
+  [[ "$(grep -c '^pass' "$c_log")" == 1 && "$(grep '^pass' "$c_log" | cut -f2-4 | tr '\t' ' ')" == '1 no 0' ]] \
+    || st_fail "F6b.3: cargo-mutants was not called once, with no --re and no selection, as full calls it: $(grep '^pass' "$c_log" | tr '\t' ' ')"
+  # A test that never finishes is one that fails: the map waits for each test as long as QG_COVER_TEST_TIMEOUT_S.
+  # The stand-in sleeps 15 s and then writes 'hang-finished': that line in the log is a wait nobody cut.
+  cj CARGO_BUILD_JOBS=2 QG_SELECT=cover FAKE_HANG=t_b QG_COVER_TEST_TIMEOUT_S=1 FAKE_CLASSES="$cfix/classes-green.tsv" -- "${q_args[@]}"
+  if grep -q '^hang-finished' "$c_log" || ! mj_said 'cover: off (1 test fails alone in the map: t_b)'; then
+    st_fail "F6b.3: a test that hangs was waited for until it finished instead of failing at QG_COVER_TEST_TIMEOUT_S=1, or did not turn cover off: $(cat "$tmp/mut.out")"
+  fi
+
+  # F6b.4: with no cargo-llvm-cov, or a sysroot without llvm-profdata or llvm-cov, cover does not run: exit 2,
+  # nothing mutated, naming what is missing. full, with the same PATH, never looks for them.
+  q_path="$c_hidden"
+  cj QG_SELECT=cover -- "${q_args[@]}"
+  if (( mut_rc != 2 )) || mj_invoked || ! mj_said 'cargo-llvm-cov'; then
+    st_fail "F6b.4: with no cargo-llvm-cov on PATH the step did not exit 2 naming it before cargo-mutants (exit $mut_rc): $(cat "$tmp/mut.out")"
+  fi
+  cj QG_SELECT=full FAKE_CLASSES="$cfix/classes-green.tsv" -- "${q_args[@]}"
+  if (( mut_rc != 0 )) || ! mj_invoked || ! mj_said 'mode: full'; then
+    st_fail "F6b.4: QG_SELECT=full with no cargo-llvm-cov on PATH did not run as it always does (exit $mut_rc): $(cat "$tmp/mut.out")"
+  fi
+  q_path=
+  for c_missing in profdata cov; do
+    cj QG_SELECT=cover FAKE_SYSROOT="$tmp/csys-no${c_missing/profdata/prof}" -- "${q_args[@]}"
+    if (( mut_rc != 2 )) || mj_invoked || ! mj_said "llvm-${c_missing}"; then
+      st_fail "F6b.4: with a sysroot that has no llvm-$c_missing the step did not exit 2 naming it before cargo-mutants (exit $mut_rc): $(cat "$tmp/mut.out")"
+    fi
+  done
+  cj QG_SELECT=full FAKE_SYSROOT="$tmp/csys-noprof" FAKE_CLASSES="$cfix/classes-green.tsv" -- "${q_args[@]}"
+  (( mut_rc == 0 )) && mj_said 'mode: full' || st_fail "F6b.4: QG_SELECT=full over a sysroot with no llvm-profdata did not run (exit $mut_rc): $(cat "$tmp/mut.out")"
+
+  # F6b.9: each pass measures exactly what it was asked, in both directions.
+  for c_dev in drop extra; do
+    cj QG_SELECT=cover FAKE_A1_DEVIATION="$c_dev" FAKE_CLASSES="$cfix/classes-green.tsv" -- "${q_args[@]}"
+    c_who="${c_n[4]}"
+    [[ "$c_dev" == extra ]] && c_who="${c_n[2]}"
+    if (( mut_rc == 0 )) || ! mj_said 'set differs in pass A1' || ! mj_said "$c_who"; then
+      st_fail "F6b.9: a pass A1 that ($c_dev) one mutant was not red with 'set differs in pass A1' naming $c_who (exit $mut_rc): $(cat "$tmp/mut.out")"
+    fi
+  done
+
+  # F6b.10: a name made of metacharacters is matched by its own --re and by no other, written with the escape of
+  # regex::escape (the space is not escaped) and anchored.
+  cj QG_SELECT=cover FAKE_LIST_JSON="$cfix/list-meta.json" FAKE_CLASSES="$cfix/classes-meta.tsv" -- "${q_args[@]}"
+  if (( mut_rc != 0 )) || [[ "$(c_res 1)" != "$(cat "$cfix/re-meta.txt")" ]]; then
+    st_fail "F6b.10: the --re of the two mutants are not the anchored, regex::escape'd names (exit $mut_rc): got $(c_res 1) / wanted $(cat "$cfix/re-meta.txt")"
+  fi
+  if [[ "$(awk -F'\t' '$1=="re" && $2 != 1' "$c_log" | wc -l)" != 0 ]]; then
+    st_fail "F6b.10: a --re selected the other column's mutant, or none: $(grep '^re' "$c_log")"
+  fi
+
+  # F6b.11: a subset that fails on its own, without a mutant, decides nothing: its mutants go to A0 and it is named.
+  c_keep="$tmp/ckeep-pre"
+  rm -rf "$c_keep"
+  cj CARGO_BUILD_JOBS=2 QG_SELECT=cover QG_KEEP_OUT="$c_keep" FAKE_FAIL_TOGETHER='t_a1 t_a2' FAKE_CLASSES="$cfix/classes-green.tsv" -- "${q_args[@]}"
+  if (( mut_rc != 0 )) || ! mj_said 'preflight' || ! mj_said 't_a1 t_a2' \
+    || [[ "$(awk -F'\t' '$3=="preflight" {print $1}' "$c_keep/cover/plan.tsv" | LC_ALL=C sort)" != "$(c_set "${c_n[0]}" "${c_n[1]}")" ]] \
+    || [[ "$(c_res 1)" != "$(c_set "${c_p[0]}" "${c_p[1]}" "${c_p[2]}" "${c_p[5]}")" || "$(c_res 2)" != "$(c_set "${c_p[3]}" "${c_p[4]}")" ]] \
+    || grep -q '^src/a.rs' "$c_keep/cover/select.tsv"; then
+    st_fail "F6b.11: the subset {t_a1, t_a2}, which fails without a mutant, did not send m1 and m2 to A0 with 'preflight' naming it, leave A1 with m4 and m5 and drop its rows (exit $mut_rc): $(cat "$tmp/mut.out"; cat "$c_keep/cover/plan.tsv" 2>&1)"
+  fi
+
+  # F6b.12: cargo-mutants' marker in the tree turns cover off before anything is built.
+  c_tree=ctree-marker
+  cj QG_SELECT=cover FAKE_CLASSES="$cfix/classes-green.tsv" -- "${q_args[@]}"
+  c_tree=ctree
+  if (( mut_rc != 0 )) || ! mj_said "cover: off (the tree holds cargo-mutants' marker in src/b.rs)" || ! mj_said 'mode: full' || grep -q '^build-map' "$c_log"; then
+    st_fail "F6b.12: a marker in rust/src/b.rs did not turn cover off before the map was built, with the step running as full (exit $mut_rc): $(cat "$tmp/mut.out")"
+  fi
+
+  # No mutant, no map: nothing to select the tests of.
+  cj QG_SELECT=cover FAKE_LIST_JSON="$cfix/list-empty.json" FAKE_CLASSES="$cfix/classes-green.tsv" -- "${q_args[@]}"
+  if ! mj_said 'cover: off (' || ! mj_said 'mode: full' || grep -q '^build-map' "$c_log"; then
+    st_fail "F6b.7: a diff with no mutants built a coverage map anyway, or did not say why cover was off: $(cat "$tmp/mut.out")"
+  fi
+
   echo "OK  self-test: the CRAP half reports CC violations, only CC violations, and"
   echo "    keys each function by name and ordinal, so moving one does not move its"
   echo "    key and two same-named functions in one file keep two; the ratchet is exact"
@@ -1424,7 +2714,13 @@ FAKE
   echo "    which sizes them from the memory that is available; the same rows hold for the judge as it was"
   echo "    (legacy) and for the one that mutates through the lab of mutants-gate.sh (full, the default),"
   echo "    which builds only the lib test, hands cargo-mutants the jobserver the judge counts, takes its"
-  echo "    verdict from cargo-mutants' exit and from the build check, and keeps its outcomes in QG_KEEP_OUT"
+  echo "    verdict from cargo-mutants' exit and from the build check, and keeps its outcomes in QG_KEEP_OUT;"
+  echo "    the cover mode builds a map of the functions each test enters, gives each mutant the tests whose"
+  echo "    functions hold its line, runs the mutants nobody covers first and says their verdict early, runs"
+  echo "    the rest with their tests, and confirms every missed and timed out one with the whole suite before"
+  echo "    it is a verdict; it turns itself off (and the step runs as full) for a test that fails alone, a marker"
+  echo "    of cargo-mutants in the tree or a subset that fails without a mutant, and refuses to run (exit 2) with"
+  echo "    no cargo-llvm-cov or no llvm-profdata/llvm-cov in the sysroot"
   exit 0
 fi
 # --- self-test end ---

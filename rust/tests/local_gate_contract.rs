@@ -4704,6 +4704,77 @@ fn the_reference_of_the_study_is_todays_judge() {
     );
 }
 
+/// What is wrong with how the second judge asks for the merge of its passes: some command that runs has to call
+/// `"$QG_SELF" --merge-select`. The bare word is the mode's own dispatcher, which merges nothing.
+fn merge_call_problems(commands: &[String]) -> Vec<String> {
+    if commands
+        .iter()
+        .any(|command| command.contains("\"$QG_SELF\" --merge-select"))
+    {
+        Vec::new()
+    } else {
+        vec!["no command calls `\"$QG_SELF\" --merge-select`".to_string()]
+    }
+}
+
+/// What is wrong with the section of docs/gate.md that explains the selection of tests by coverage: it has to
+/// exist, and it has to say that a missed mutant is confirmed with the whole suite, because that sentence is what
+/// lets a reader trust a `caught` that only ran a subset.
+fn selection_doc_problems(doc: &str) -> Vec<String> {
+    const HEADING: &str = "## Test selection by coverage (Q2)";
+    let Some(start) = doc.find(HEADING) else {
+        return vec![format!("docs/gate.md has no `{HEADING}` section")];
+    };
+    let rest = &doc[start + HEADING.len()..];
+    let section = &rest[..rest.find("\n## ").unwrap_or(rest.len())];
+    if section.contains("confirmed with the whole suite") {
+        Vec::new()
+    } else {
+        vec![format!(
+            "the `{HEADING}` section does not say that every missed and timed out mutant is `confirmed with the whole suite`"
+        )]
+    }
+}
+
+/// CI-F6 (F6b, D-F6m, D-F6n): a `caught` that only ran the tests that cover its mutant is trusted because
+/// anything the subset does not catch is run again with every test before it counts. The judge asks the merge of
+/// its passes for it, and the doc says so.
+#[test]
+fn every_missed_of_a_subset_is_confirmed_by_the_whole_suite() {
+    let dispatcher = vec![r#"if [[ "${1:-}" == --merge-select ]]; then"#.to_string()];
+    assert!(
+        !merge_call_problems(&dispatcher).is_empty(),
+        "the scan must be able to fail: it took the mode's dispatcher for a call"
+    );
+    assert!(
+        merge_call_problems(&[
+            r#"bash "$QG_SELF" --merge-select "$cdir/merged.json" "$a0" "$a1" "$b""#.to_string()
+        ])
+        .is_empty(),
+        "the scan flags a call that is right"
+    );
+    assert!(
+        !selection_doc_problems("# gate\n\n## Other\n\nconfirmed with the whole suite\n")
+            .is_empty(),
+        "the scan must be able to fail: it let through a doc with no section on the selection"
+    );
+    assert!(
+        !selection_doc_problems("## Test selection by coverage (Q2)\n\nsome words\n\n## Next\n\nconfirmed with the whole suite\n")
+            .is_empty(),
+        "the scan must be able to fail: it read the sentence of another section"
+    );
+
+    let script = read("scripts/quality-gate.sh").replace("\r\n", "\n");
+    let problems = merge_call_problems(&commands_outside_self_test(&script));
+    assert!(
+        problems.is_empty(),
+        "quality-gate.sh has to merge the classes of its three passes through its `--merge-select` mode: {problems:#?}"
+    );
+    let doc = read("docs/gate.md").replace("\r\n", "\n");
+    let problems = selection_doc_problems(&doc);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
 /// CI-F4 (F4b): the mutation seed lives under the cache of the gate, not under the scratch
 /// that the judge sweeps every six hours, so that it survives between runs.
 #[test]
