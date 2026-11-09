@@ -3226,6 +3226,42 @@ fn left_by_self_test(script: &Path) -> Vec<String> {
     run_self_test(script, &[], false).1
 }
 
+/// The default cluster root of gate-cluster.sh, computed by the script itself with GATE_CLUSTER_ROOT
+/// unset (CI-F2, K11): `${GATE_CLUSTER_TMP:-/tmp}/memory-industry-gate-<uid>`. `cluster_tmp` is the
+/// GATE_CLUSTER_TMP of the computation, so the root it names is one the test owns.
+fn default_cluster_root(cluster_tmp: &Path) -> std::path::PathBuf {
+    let output = std::process::Command::new(git_bash())
+        .arg("-c")
+        .arg("source \"$1\"; printf %s \"$GATE_CLUSTER_ROOT\"")
+        .arg("default-root")
+        .arg(repo_root().join("scripts").join("gate-cluster.sh"))
+        .env_remove("GATE_CLUSTER_ROOT")
+        .env("GATE_CLUSTER_TMP", cluster_tmp)
+        .output()
+        .expect("asking gate-cluster.sh for its default cluster root");
+    assert!(
+        output.status.success(),
+        "gate-cluster.sh did not say its default cluster root: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// What differs between two listings of a directory (`entries_under`): what went, and what came.
+fn listing_changes(before: &[String], after: &[String]) -> Vec<String> {
+    before
+        .iter()
+        .filter(|entry| !after.contains(*entry))
+        .map(|entry| format!("gone: {entry}"))
+        .chain(
+            after
+                .iter()
+                .filter(|entry| !before.contains(*entry))
+                .map(|entry| format!("new: {entry}")),
+        )
+        .collect()
+}
+
 /// Concurrent launches at most (CI-J7). A self-test is a bash script that starts its own processes
 /// and mostly waits on them, so the cost is wall time. Six slots serve the thirteen launches of a
 /// round without queuing each behind the last, and cap how many of their processes run at once next
@@ -3325,6 +3361,34 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
          so it cannot tell a clean self-test from a dirty one"
     );
 
+    // D6 (CI-F2): the same for the default cluster root, `${GATE_CLUSTER_TMP:-/tmp}/memory-industry-gate-<uid>`.
+    // Hermetic: the real root is where the judge's own lanes live (run_in_lane), so it is never listed. The
+    // fixture's liar writes into a root under a GATE_CLUSTER_TMP of its own, and the check must see that.
+    let fixture_tmp =
+        std::env::temp_dir().join(format!("selftest-root-liar-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&fixture_tmp);
+    std::fs::create_dir_all(&fixture_tmp)
+        .expect("creating the GATE_CLUSTER_TMP of the root fixture");
+    let fixture_tmp_text = fixture_tmp
+        .to_str()
+        .expect("the temp dir of the fixture is UTF-8");
+    let fixture_root = default_cluster_root(&fixture_tmp);
+    let root_liar = fixture_tmp.join("root-liar.sh");
+    std::fs::write(
+        &root_liar,
+        "#!/usr/bin/env bash\nmkdir -p \"$GATE_CLUSTER_TMP/memory-industry-gate-$(id -u)/liar\"\nexit 0\n",
+    )
+    .expect("writing the root liar fixture");
+    let fixture_before = entries_under(&fixture_root);
+    let _ = run_self_test(&root_liar, &[("GATE_CLUSTER_TMP", fixture_tmp_text)], false);
+    let fixture_changes = listing_changes(&fixture_before, &entries_under(&fixture_root));
+    let _ = std::fs::remove_dir_all(&fixture_tmp);
+    assert!(
+        !fixture_changes.is_empty(),
+        "the root check let through a script that writes under the default cluster root during its \
+         self-test, so it cannot tell a clean self-test from one that left a lane behind (D6)"
+    );
+
     let sourcing: Vec<&str> = SCRIPTS_WITH_SELF_TEST
         .iter()
         .copied()
@@ -3334,9 +3398,24 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
         !sourcing.is_empty(),
         "no script of SCRIPTS_WITH_SELF_TEST sources gate-lock.sh: the check would prove nothing"
     );
+    let cluster_tmp = self_test_parent().join(format!("ct-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cluster_tmp);
+    std::fs::create_dir_all(&cluster_tmp).expect("creating the GATE_CLUSTER_TMP of the self-tests");
+    let cluster_tmp_text = cluster_tmp
+        .to_str()
+        .expect("the GATE_CLUSTER_TMP of the self-tests is UTF-8");
+    let root = default_cluster_root(&cluster_tmp);
+    let root_before = entries_under(&root);
     let lefts = in_parallel(&sourcing, |name| {
-        left_by_self_test(&repo_root().join("scripts").join(name))
+        run_self_test(
+            &repo_root().join("scripts").join(name),
+            &[("GATE_CLUSTER_TMP", cluster_tmp_text)],
+            false,
+        )
+        .1
     });
+    let root_changes = listing_changes(&root_before, &entries_under(&root));
+    let _ = std::fs::remove_dir_all(&cluster_tmp);
     let leftovers: Vec<String> = sourcing
         .iter()
         .zip(lefts)
@@ -3348,6 +3427,13 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
         "a self-test of the judge wrote into the HOME or the XDG_CACHE_HOME it was given. A \
          self-test has to leave both as it found them (D-J7b), or a judge that runs next to it \
          loses its output: {leftovers:#?}"
+    );
+    assert!(
+        root_changes.is_empty(),
+        "a self-test of the judge changed the default cluster root {} (D6, CI-F2): {root_changes:#?}. \
+         A self-test that makes a lane has to name GATE_CLUSTER_ROOT, or the lane is left in the root \
+         of whoever runs next to it",
+        root.display()
     );
 }
 
@@ -4483,6 +4569,445 @@ fn no_gate_script_builds_a_tcp_url_for_a_lane() {
     assert_eq!(
         constructions, 1,
         "the lane URL has to be built in exactly one place (gate_cluster_url), found {constructions} (C4)"
+    );
+}
+
+/// The shell that makes lane t1 for a_lane_cluster_is_the_judges_own_throwaway_server. It sources the
+/// script it is given, takes every lane it made down on any exit, reports the lane, and holds until its
+/// stdin closes, so the test decides when the lane goes down. Its owner is an owner_record of its own pid
+/// (LANE_OWNER is the token), assigned after the source: gate-lock.sh sets GATE_OWNER to "" when it is
+/// sourced, so a GATE_OWNER from the environment would be lost, and gate-cluster refuses that.
+const LANE_SHELL: &str = r#"
+source "$1" || exit 2
+GATE_OWNER="$(owner_record "$$" "$LANE_OWNER")"
+trap 'gate_cluster_down_all >/dev/null' EXIT
+gate_cluster_up t1 >/dev/null || exit 2
+printf 'shell=%s\npostmaster=%s\ndir=%s\nwal_level=%s\nready\n' "$$" "${GATE_CLUSTER_PID[t1]}" "${GATE_CLUSTER_DIR[t1]}" "$GATE_PG_WAL_LEVEL"
+read -r _ || true
+exit 0
+"#;
+
+/// Holds a lane shell and makes sure the lane is gone: dropping it closes the shell's stdin, so the shell
+/// takes its lane down, and then removes the test's base directory. A failing assertion leaves no server.
+#[cfg(unix)]
+struct LaneShell {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    base: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl LaneShell {
+    /// Closes the shell's stdin and waits for it for at most `within`. A shell that is still there at the
+    /// deadline is killed, and the answer is None: a test that hangs has to fail, not wait for ever.
+    fn release(&mut self, within: std::time::Duration) -> Option<std::process::ExitStatus> {
+        drop(self.stdin.take());
+        self.wait_or_kill(within)
+    }
+
+    fn wait_or_kill(&mut self, within: std::time::Duration) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LaneShell {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.wait_or_kill(std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+/// The zone of the SERVER of a lane, asked through the psql of its bindir on the lane's socket. It is not asked
+/// through sqlx: sqlx sets TimeZone=UTC for every session it opens, so its `show timezone` says UTC whatever the
+/// server's zone is. The password goes to psql in PGPASSWORD, never in argv or in a message. The three answers
+/// are the zone name, the log zone name and the offset of now() from UTC in seconds.
+#[cfg(unix)]
+fn server_zone(bindir: &Path, dir: &Path, password: &str) -> Result<[String; 3], String> {
+    let mut command = std::process::Command::new(bindir.join("psql"));
+    command
+        .arg("-X")
+        .arg("-A")
+        .arg("-t")
+        .arg("-h")
+        .arg(dir)
+        .arg("-p")
+        .arg("5432")
+        .arg("-U")
+        .arg("cuba")
+        .arg("-d")
+        .arg("brain")
+        .arg("-c")
+        .arg("show timezone")
+        .arg("-c")
+        .arg("show log_timezone")
+        .arg("-c")
+        .arg("select extract(timezone from now())::int");
+    for name in [
+        "PGTZ",
+        "PGOPTIONS",
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGPORT",
+        "PGUSER",
+        "PGDATABASE",
+        "PGPASSFILE",
+        "PGSERVICE",
+    ] {
+        command.env_remove(name);
+    }
+    command.env("PGPASSWORD", password);
+    let output = command
+        .output()
+        .map_err(|why| format!("psql did not start: {why}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "psql exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    <[String; 3]>::try_from(lines)
+        .map_err(|lines| format!("psql answered {} lines, not three: {lines:?}", lines.len()))
+}
+
+/// CI-F2, B1 to B3 and E1: a lane of gate-cluster.sh is the judge's own throwaway server. It runs with the
+/// settings the script writes (D-F2d), its URL is a socket under its root, its postmaster is a child of the
+/// shell that made it, in that shell's cgroup, with stdin on /dev/null and its output on the lane's
+/// server.log, and it checks passwords on the socket too. Needs the PostgreSQL 18.6 binaries of docs/gate.md:
+/// without them gate-cluster.sh refuses the lane, and this test fails with that refusal.
+#[cfg(unix)]
+#[test]
+fn a_lane_cluster_is_the_judges_own_throwaway_server() {
+    use sqlx::Connection;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::FileTypeExt;
+    use std::process::{Command, Stdio};
+
+    let base = self_test_parent().join(format!("f2b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("home")).expect("creating the HOME of the lane");
+    std::fs::create_dir_all(base.join("cache")).expect("creating the XDG_CACHE_HOME of the lane");
+    let root = base.join("root");
+    let script = repo_root().join("scripts").join("gate-cluster.sh");
+    let stderr = std::fs::File::create(base.join("driver.err"))
+        .expect("creating the stderr of the lane shell");
+
+    let mut command = Command::new(git_bash());
+    command
+        .arg("-c")
+        .arg(LANE_SHELL)
+        .arg("lane-shell")
+        .arg(&script);
+    for (name, _) in JUDGE_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    command
+        .env("GATE_CLUSTER_ROOT", &root)
+        .env("LANE_OWNER", format!("f2b-contract-{}", std::process::id()))
+        .env("TZ", "America/Mexico_City")
+        .env("HOME", base.join("home"))
+        .env("XDG_CACHE_HOME", base.join("cache"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr));
+    let mut child = command
+        .spawn()
+        .expect("starting the bash that makes lane t1");
+    let stdin = child.stdin.take().expect("the lane shell's stdin is piped");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("the lane shell's stdout is piped");
+    let mut lane = LaneShell {
+        child,
+        stdin: Some(stdin),
+        base: base.clone(),
+    };
+
+    let driver_says = || std::fs::read_to_string(base.join("driver.err")).unwrap_or_default();
+    let lane_timeout = std::time::Duration::from_secs(60);
+    // The report is read on a thread of its own, up to the `ready` line the shell prints after its keys. The
+    // test waits for it at most `lane_timeout`: a shell that stops before `ready` gives EOF at once, and a
+    // shell that never gets there is a failure with its stderr, not a wait for ever.
+    let (report_tx, report_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut report: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if line == "ready" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                report.insert(key.to_string(), value.to_string());
+            }
+        }
+        let _ = report_tx.send(report);
+    });
+    let report = match report_rx.recv_timeout(lane_timeout) {
+        Ok(report) => report,
+        Err(_) => panic!(
+            "lane t1 did not report within {} s, so its shell is stuck. gate-cluster.sh says: {}",
+            lane_timeout.as_secs(),
+            driver_says()
+        ),
+    };
+    for key in ["shell", "postmaster", "dir", "wal_level"] {
+        assert!(
+            report.contains_key(key),
+            "lane t1 was not made: its shell gave no `{key}`. gate-cluster.sh says: {}",
+            driver_says()
+        );
+    }
+    let shell_pid: u32 = report["shell"]
+        .parse()
+        .expect("the shell's pid is a number");
+    let postmaster: u32 = report["postmaster"]
+        .parse()
+        .expect("the postmaster's pid is a number");
+    let dir = std::path::PathBuf::from(&report["dir"]);
+    let wal_level = report["wal_level"].clone();
+    // The URL is built here from the directory and the password file, never printed by the shell: the
+    // driver reports only the directory. Same shape as gate_cluster_url: the socket directory as the host.
+    let password =
+        std::fs::read_to_string(dir.join("pw")).expect("reading the password file of lane t1");
+    let url = format!(
+        "postgresql://cuba:{password}@{}:5432/brain",
+        dir.display().to_string().replace('/', "%2F")
+    );
+
+    let mut expected: Vec<(&str, String)> = vec![
+        ("show fsync", "off".to_string()),
+        ("show synchronous_commit", "off".to_string()),
+        ("show full_page_writes", "off".to_string()),
+        ("show cluster_name", "memory-industry-gate-t1".to_string()),
+        ("show max_connections", "300".to_string()),
+        ("show wal_level", wal_level.clone()),
+        ("show listen_addresses", String::new()),
+        ("show data_checksums", "on".to_string()),
+        (
+            "select current_setting('server_version_num')",
+            "180006".to_string(),
+        ),
+        (
+            "select default_version::text from pg_available_extensions where name = 'vector'",
+            "0.8.7".to_string(),
+        ),
+        (
+            "select datcollate::text from pg_database where datname = 'template1'",
+            "en_US.utf8".to_string(),
+        ),
+        (
+            "select pg_encoding_to_char(encoding)::text from pg_database where datname = 'template1'",
+            "UTF8".to_string(),
+        ),
+        (
+            "select count(*)::text from pg_database where datname = 'brain'",
+            "1".to_string(),
+        ),
+    ];
+    if wal_level == "minimal" {
+        expected.push(("show max_wal_senders", "0".to_string()));
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the queries of lane t1");
+    // The timeout is built inside the runtime: its Sleep needs the reactor when it is created, not when it is polled.
+    let outcome = runtime.block_on(async {
+        tokio::time::timeout(lane_timeout, async {
+            let mut conn = sqlx::PgConnection::connect(&url)
+                .await
+                .expect("connecting to lane t1 through its socket");
+            let mut answers: Vec<Result<String, String>> = Vec::new();
+            for (query, _) in &expected {
+                let sql: &str = query;
+                let answer: Result<String, sqlx::Error> =
+                    sqlx::query_scalar(sql).fetch_one(&mut conn).await;
+                answers.push(answer.map_err(|why| why.to_string()));
+            }
+            let division = match sqlx::query("select 1/0").execute(&mut conn).await {
+                Ok(_) => "no error".to_string(),
+                Err(why) => why
+                    .as_database_error()
+                    .map_or_else(|| why.to_string(), |db| db.message().to_string()),
+            };
+            let _ = conn.close().await;
+
+            // The same URL with another password: the lane's own password is the only one that is replaced,
+            // and the wrong one is never printed.
+            let wrong = url.replacen(password.as_str(), "not-the-password-of-this-lane", 1);
+            let refused = match sqlx::PgConnection::connect(&wrong).await {
+                Ok(_) => "connected".to_string(),
+                Err(why) => why
+                    .as_database_error()
+                    .and_then(|db| db.code())
+                    .map_or_else(|| "no SQLSTATE".to_string(), |code| code.to_string()),
+            };
+            (answers, division, refused, wrong != url)
+        })
+        .await
+    });
+    let Ok((answers, division, refused, wrong_differs)) = outcome else {
+        panic!(
+            "the queries on lane t1 did not finish within {} s. gate-cluster.sh says: {}",
+            lane_timeout.as_secs(),
+            driver_says()
+        );
+    };
+
+    let mut failures: Vec<String> = Vec::new();
+    for ((query, want), answer) in expected.iter().zip(answers) {
+        match answer {
+            Ok(got) if got == *want => {}
+            Ok(got) => failures.push(format!(
+                "`{query}` answers `{got}`, the lane should answer `{want}`"
+            )),
+            Err(why) => failures.push(format!("`{query}` fails: {why}")),
+        }
+    }
+    let bindir = std::path::PathBuf::from(
+        std::env::var("GATE_PG_BINDIR")
+            .unwrap_or_else(|_| "/usr/lib/postgresql/18/bin".to_string()),
+    );
+    match server_zone(&bindir, &dir, &password) {
+        Err(why) => failures.push(format!(
+            "the zone of the server of lane t1 could not be asked through psql: {why} (B1)"
+        )),
+        Ok([timezone, log_timezone, offset]) => {
+            for (name, got) in [
+                ("show timezone", &timezone),
+                ("show log_timezone", &log_timezone),
+            ] {
+                if got.as_str() != "UTC" && got.as_str() != "Etc/UTC" {
+                    failures.push(format!(
+                        "the server of lane t1 answers `{got}` to `{name}`, the lane should be in UTC (`UTC` or `Etc/UTC`): the zone of the host got in (B1)"
+                    ));
+                }
+            }
+            if offset != "0" {
+                failures.push(format!(
+                    "the offset of now() from UTC on the server of lane t1 is {offset} s, the lane should be 0 s: its zone is not UTC (B1)"
+                ));
+            }
+        }
+    }
+    if division != "division by zero" {
+        failures.push(format!(
+            "`select 1/0` says `{division}`, not the English `division by zero`"
+        ));
+    }
+    if !wrong_differs {
+        failures.push(
+            "the wrong password of the test is the lane's password: nothing is proved".to_string(),
+        );
+    }
+    if refused != "28P01" {
+        failures.push(format!(
+            "a wrong password for cuba through the socket gives SQLSTATE {refused}, not 28P01 (B2)"
+        ));
+    }
+
+    let on_socket = dir
+        .join(".s.PGSQL.5432")
+        .symlink_metadata()
+        .map(|meta| meta.file_type().is_socket())
+        .unwrap_or(false);
+    let under_root = dir.starts_with(&root);
+    if !(on_socket && under_root) {
+        failures.push(format!(
+            "lane t1 has no socket under its root (socket {on_socket}, under the root {under_root})"
+        ));
+    }
+    let data_fs = Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(dir.join("data"))
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default();
+    if data_fs != "tmpfs" && data_fs != "ramfs" {
+        failures.push(format!(
+            "the data directory of lane t1 is on `{data_fs}`, not on tmpfs"
+        ));
+    }
+
+    let ppid = std::fs::read_to_string(format!("/proc/{postmaster}/status"))
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:"))
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        });
+    if ppid != Some(shell_pid) {
+        failures.push(format!(
+            "the postmaster's parent is {ppid:?}, not the shell that made it ({shell_pid}) (B3)"
+        ));
+    }
+    let shell_cgroup = std::fs::read(format!("/proc/{shell_pid}/cgroup"));
+    let postmaster_cgroup = std::fs::read(format!("/proc/{postmaster}/cgroup"));
+    let same_cgroup = match (&shell_cgroup, &postmaster_cgroup) {
+        (Ok(shell), Ok(theirs)) => shell == theirs,
+        _ => false,
+    };
+    if !same_cgroup {
+        failures
+            .push("the postmaster is not in the cgroup of the shell that made it (B3)".to_string());
+    }
+    for (fd, want) in [
+        (0, std::path::PathBuf::from("/dev/null")),
+        (1, dir.join("server.log")),
+        (2, dir.join("server.log")),
+    ] {
+        let got = std::fs::read_link(format!("/proc/{postmaster}/fd/{fd}"));
+        if got.as_ref().ok() != Some(&want) {
+            failures.push(format!(
+                "descriptor {fd} of the postmaster is {got:?}, not {want:?} (B3)"
+            ));
+        }
+    }
+
+    match lane.release(lane_timeout) {
+        Some(status) if status.success() => {}
+        Some(status) => failures.push(format!(
+            "the lane shell exited with {status}: lane t1 was not taken down"
+        )),
+        None => failures.push(format!(
+            "the lane shell did not take lane t1 down within {} s: it was killed",
+            lane_timeout.as_secs()
+        )),
+    }
+    if Path::new(&format!("/proc/{postmaster}")).exists() {
+        failures.push("the postmaster outlives the lane's down".to_string());
+    }
+    if dir.exists() {
+        failures.push("the directory of lane t1 is still there after its down".to_string());
+    }
+
+    assert!(
+        failures.is_empty(),
+        "lane t1 is not the judge's own throwaway server: {failures:#?}\ngate-cluster.sh said: {}",
+        driver_says()
     );
 }
 // --- CI-F3.3a: the step table and the lanes of run-all-tests.sh ---------------------------------
