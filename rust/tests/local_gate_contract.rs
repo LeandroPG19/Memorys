@@ -4361,16 +4361,33 @@ fn each_mutant_builds_only_the_lib_test_it_runs() {
         "mutants-gate.sh still passes `-- --lib search::`: the --lib after the `--` reaches the \
          test only, so every mutant's build compiles all the test binaries"
     );
-    // D-F4u (F4d): the call is `cargo-mutants mutants` with CARGO=<shim> (D-F4m), not `cargo mutants`.
-    let start = body
-        .find("\ncargo-mutants mutants \\\n")
-        .expect("mutants-gate.sh has no `cargo-mutants mutants \\` invocation")
-        + 1;
-    let end = start
-        + body[start..]
-            .find("mutants_rc=$?")
-            .expect("the cargo mutants invocation has no `mutants_rc=$?` after it");
-    let call = &body[start..end];
+    // D-F6b (F6a): the call of the main path is `mutants_lab_run ... \`, the one that names the files and the
+    // filter. The `cargo-mutants mutants` it makes (the shim as CARGO, D-F4m, and the seed) now lives in the
+    // function, which the quality-gate.sh also calls through `--lab-run`: it is no longer a line of the main path.
+    let lines: Vec<&str> = body.lines().collect();
+    let first = lines
+        .iter()
+        .position(|line| line.starts_with("mutants_lab_run ") && line.ends_with('\\'))
+        .expect("the main path of mutants-gate.sh has no `mutants_lab_run ... \\` call over several lines");
+    let last = first
+        + lines[first..]
+            .iter()
+            .position(|line| !line.ends_with('\\'))
+            .expect("the mutants_lab_run call does not end: its last line still has a `\\`");
+    let call = lines[first..=last].join("\n");
+    let function = body
+        .split_once("\nmutants_lab_run() {")
+        .expect("mutants-gate.sh has no `mutants_lab_run() {` function")
+        .1
+        .split_once("\n}\n")
+        .expect("mutants_lab_run() is not closed by a `}` at the start of a line")
+        .0;
+    assert!(
+        function.contains("cargo-mutants mutants"),
+        "mutants_lab_run must be the one place that runs `cargo-mutants mutants`: the main path and \
+         quality-gate.sh both reach it, and a second copy of the call is a second lab to keep in step"
+    );
+    let call = call.as_str();
     let (build_side, test_side) = call
         .split_once("\n  -- ")
         .expect("the cargo mutants invocation has no `  -- ` line before its test arguments");
@@ -4383,6 +4400,216 @@ fn each_mutant_builds_only_the_lib_test_it_runs() {
         test_side.trim(),
         "search::",
         "after the `--` cargo mutants must receive exactly the test filter and nothing else"
+    );
+}
+
+/// The commands of `body` that run, as one line each: outside the self-test regions, with the comment
+/// lines gone, the `\` continuations joined and the blanks collapsed. A fixture or a comment may name the
+/// words a contract forbids; only a command that runs is judged.
+fn commands_outside_self_test(body: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut open = String::new();
+    for (_, line) in outside_self_test(body) {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        match line.trim_end().strip_suffix('\\') {
+            Some(head) => {
+                open.push(' ');
+                open.push_str(head);
+            }
+            None => {
+                open.push(' ');
+                open.push_str(line);
+                commands.push(open.split_whitespace().collect::<Vec<_>>().join(" "));
+                open.clear();
+            }
+        }
+    }
+    commands
+}
+
+/// What is wrong with the call of the second judge to the lab of mutants-gate.sh: it has to exist, pass
+/// `--cargo-arg=--lib` among the arguments of cargo-mutants, and pass no `--lib` after the `--` of those
+/// arguments (the first ` -- ` is the mode's own separator, the second one would be cargo-mutants').
+fn lab_call_problems(commands: &[String]) -> Vec<String> {
+    let Some(call) = commands
+        .iter()
+        .find(|command| command.contains("scripts/mutants-gate.sh\" --lab-run"))
+    else {
+        return vec!["no command calls `scripts/mutants-gate.sh\" --lab-run`".to_string()];
+    };
+    let Some((_, args)) = call.split_once(" -- ") else {
+        return vec![format!(
+            "the call has no `--` after the mode's own arguments: {call}"
+        )];
+    };
+    let mut problems = Vec::new();
+    if !args.contains("--cargo-arg=--lib") {
+        problems.push(format!(
+            "the call does not pass `--cargo-arg=--lib`: {call}"
+        ));
+    }
+    if let Some((_, after)) = args.split_once(" -- ")
+        && after.contains("--lib")
+    {
+        problems.push(format!(
+            "the call passes `--lib` after cargo-mutants' `--`: {call}"
+        ));
+    }
+    problems
+}
+
+/// CI-F6 (F6a, D-F6b): the second judge does not build a lab of its own. Its mutation step asks mutants-gate.sh
+/// for one (`--lab-run`), which holds the seed, the stage, the shim and the guards that F4 proved; a copy of any
+/// of them here would be a second lab to keep in step, which is the drift that `quality-gate.ps1` was.
+#[test]
+fn the_diff_judge_mutates_through_the_lab_of_mutants_gate() {
+    let good = vec![
+        "\"$ROOT/scripts/mutants-gate.sh\" --lab-run \"$out\" 2 -- \"$@\" --timeout 90 --cargo-arg=--lib"
+            .to_string(),
+    ];
+    assert!(
+        lab_call_problems(&good).is_empty(),
+        "the scan flags a call that is right"
+    );
+    for (what, bad) in [
+        (
+            "a bare --lib after the --",
+            "\"$ROOT/scripts/mutants-gate.sh\" --lab-run \"$out\" 2 -- --file a --cargo-arg=--lib -- --lib",
+        ),
+        (
+            "no --cargo-arg=--lib",
+            "\"$ROOT/scripts/mutants-gate.sh\" --lab-run \"$out\" 2 -- --file a --timeout 90",
+        ),
+        (
+            "no separator",
+            "\"$ROOT/scripts/mutants-gate.sh\" --lab-run \"$out\" 2",
+        ),
+    ] {
+        assert!(
+            !lab_call_problems(&[bad.to_string()]).is_empty(),
+            "the scan must be able to fail: it let through a call with {what}"
+        );
+    }
+    assert!(
+        !lab_call_problems(&[]).is_empty(),
+        "the scan must flag a script that never calls the lab"
+    );
+
+    let script = read("scripts/quality-gate.sh").replace("\r\n", "\n");
+    let commands = commands_outside_self_test(&script);
+    let problems = lab_call_problems(&commands);
+    assert!(
+        problems.is_empty(),
+        "quality-gate.sh has to run its full mutation through `scripts/mutants-gate.sh --lab-run`, building only the lib test: {problems:#?}"
+    );
+    for needle in [
+        "cargo-shim",
+        "mutants-seed",
+        "--copy-target",
+        "memory.max",
+        "MemoryMax",
+    ] {
+        let found: Vec<&String> = commands.iter().filter(|c| c.contains(needle)).collect();
+        assert!(
+            found.is_empty(),
+            "quality-gate.sh runs `{needle}` itself: the seed, the shim, the copy of the target and the memory of the \
+             cgroup are mutants-gate.sh's (D-F6b), and a second copy of any of them drifts: {found:#?}"
+        );
+    }
+}
+
+/// What is wrong with the default of the mutation mode: every default reads `QG_SELECT:-full`, and within a
+/// screen of it the script says that `cover` is adopted only after a study with 0 differences noted in the backlog.
+fn default_mode_problems(lines: &[(usize, &str)]) -> Vec<String> {
+    let Some(at) = lines
+        .iter()
+        .position(|(_, line)| line.contains("QG_SELECT:-"))
+    else {
+        return vec!["no line reads `QG_SELECT:-<default>`".to_string()];
+    };
+    let mut problems = Vec::new();
+    for (number, line) in lines {
+        if line.contains("QG_SELECT:-") && !line.contains("QG_SELECT:-full") {
+            problems.push(format!(
+                "line {number} defaults QG_SELECT to something that is not `full`: {line}"
+            ));
+        }
+    }
+    let window: String = lines[at.saturating_sub(25)..(at + 25).min(lines.len())]
+        .iter()
+        .map(|(_, line)| *line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for word in ["study", "0 differences", "backlog"] {
+        if !window.contains(word) {
+            problems.push(format!(
+                "within 25 lines of the default there is no `{word}`: the change to `cover` has to say it needs a study with 0 differences noted in the backlog (D-F6q)"
+            ));
+        }
+    }
+    problems
+}
+
+/// CI-F6 (F6a, D-F6a, D-F6q): `cover` selects the tests of each mutant, and what it spares is time that it only
+/// earns if the study shows the same class for every mutant. Until a study with 0 differences is in the backlog, the
+/// default is `full`, which changes no test.
+#[test]
+fn the_diff_judge_selects_tests_only_after_a_study() {
+    let fixture = [
+        (1, "mode=\"${QG_SELECT:-cover}\""),
+        (2, "# a study with 0 differences, in the backlog"),
+    ];
+    assert!(
+        !default_mode_problems(&fixture).is_empty(),
+        "the scan must be able to fail: it let through a default of `cover`"
+    );
+    let silent = [(1, "mode=\"${QG_SELECT:-full}\"")];
+    assert!(
+        !default_mode_problems(&silent).is_empty(),
+        "the scan must be able to fail: it let through a default that does not say a study is needed"
+    );
+
+    let script = read("scripts/quality-gate.sh").replace("\r\n", "\n");
+    let problems = default_mode_problems(&outside_self_test(&script));
+    assert!(problems.is_empty(), "quality-gate.sh: {problems:#?}");
+}
+
+/// CI-F6 (F6a, D-F6a, D-F6s): `legacy` is the reference of the study and the way back: the call of the step as it
+/// was before F6, which the study compares against. Its timeout, its `--gitignore=false` and the `-- --lib` that
+/// only reaches the test phase stay as they were, and it does not borrow the lab's flags.
+#[test]
+fn the_reference_of_the_study_is_todays_judge() {
+    let script = read("scripts/quality-gate.sh").replace("\r\n", "\n");
+    let commands = commands_outside_self_test(&script);
+    let legacy = commands
+        .iter()
+        .find(|c| c.contains("cargo mutants \"$@\""))
+        .expect("quality-gate.sh no longer has the `cargo mutants \"$@\"` call of today: `legacy` is that call, unchanged");
+    for needle in ["--timeout 90", "--gitignore=false"] {
+        assert!(
+            legacy.contains(needle),
+            "the legacy call lost `{needle}`, so it is no longer the judge the study compares with: {legacy}"
+        );
+    }
+    let tail = legacy
+        .rsplit_once(" -- --lib")
+        .map(|(_, tail)| tail.trim())
+        .unwrap_or_else(|| panic!("the legacy call has to end in `-- --lib`, as it did: {legacy}"));
+    assert!(
+        tail.is_empty() || tail.starts_with(')') || tail.starts_with("||"),
+        "the legacy call has something after its `-- --lib` (`{tail}`): the --lib after the `--` is the last argument, as it was"
+    );
+    for needle in ["--dir", "--copy-target", "--jobserver-tasks", "--cargo-arg"] {
+        assert!(
+            !legacy.contains(needle),
+            "the legacy call carries `{needle}`, which belongs to the lab of the full step: {legacy}"
+        );
+    }
+    assert!(
+        commands.iter().any(|c| c.contains("legacy")),
+        "quality-gate.sh does not name `legacy` in a command that runs (its self-test does, which proves nothing about the step)"
     );
 }
 

@@ -916,7 +916,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   fi
   mkdir -p "$tmp/bin"
   cat > "$tmp/fake_mutants.py" <<'PY'
-import json, os, sys
+import glob, json, os, sys
 args = sys.argv[1:]
 # Before anything is looked at, so that a run which never got here leaves no
 # trace and the self-test can say "cargo mutants was not invoked". One line per
@@ -924,10 +924,26 @@ args = sys.argv[1:]
 calls = os.environ.get("FAKE_CALLS_DIR")
 if calls:
     open(os.path.join(calls, "cargo.invoked"), "a").close()
-    seen = [os.environ.get(k, "") for k in ("TMP", "TEMP", "TMPDIR", "CARGO_PROFILE_DEV_DEBUG", "CARGO_INCREMENTAL")]
+    seen = [os.environ.get(k, "") for k in ("TMP", "TEMP", "TMPDIR", "CARGO_PROFILE_DEV_DEBUG", "CARGO_INCREMENTAL", "CARGO")]
     with open(os.path.join(calls, "cargo.calls"), "a", encoding="utf-8") as f:
         f.write("\t".join([" ".join(args)] + seen) + "\n")
-out = args[args.index("--output") + 1] if "--output" in args else None
+# What the real cargo-mutants 27.1.0 refuses before it mutates anything (exit 1, a usage error): a
+# stand-in that accepts what the real one rejects proves a call that would not run in the judge.
+def usage(why):
+    print(f"error: {why}", file=sys.stderr)
+    sys.exit(1)
+if not args or args[0] != "mutants":
+    usage("the first argument of cargo-mutants is `mutants`")
+def value(flag):
+    return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
+for flag in ("--jobs", "--jobserver-tasks"):
+    v = value(flag)
+    if flag in args and (v is None or not v.isdigit()):
+        usage(f"invalid value {v!r} for {flag}")
+d = value("--dir")
+if "--dir" in args and (d is None or not os.path.isdir(d)):
+    usage(f"--dir {d!r} is not a directory")
+out = value("--output")
 if not out or not os.path.isdir(out):
     print(f"stand-in cargo-mutants: --output {out!r} is not a directory this process can see")
     sys.exit(0)
@@ -941,18 +957,49 @@ def mutant(name, summary, phases):
 caught = mutant("src/a.rs:1:1: replace f with g", "CaughtMutant", [("Build", "Success"), ("Test", {"Failure": 101})])
 killed = mutant("src/a.rs:2:1: replace h with i", "Unviable", [("Build", {"Failure": -1073741502})])
 records = [caught] if os.environ.get("FAKE_OUTCOME") == "genuine" else [caught, killed]
-os.makedirs(os.path.join(out, "mutants.out"), exist_ok=True)
-with open(os.path.join(out, "mutants.out", "outcomes.json"), "w", encoding="utf-8") as f:
-    json.dump({"outcomes": records, "total_mutants": len(records), "caught": 1, "missed": 0,
-               "timeout": 0, "unviable": len(records) - 1, "success": 0}, f)
+if os.environ.get("FAKE_TOUCH_SEED"):
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.environ.get("HOME", ""), ".cache")
+    for seeded in glob.glob(os.path.join(cache, "memory-industry-gate", "mutants-seed", "*", "target", "debug", "deps", "libdep-aaaa.rlib")):
+        os.utime(seeded, (1, 1))
+if not os.environ.get("FAKE_NO_OUTCOMES"):
+    os.makedirs(os.path.join(out, "mutants.out"), exist_ok=True)
+    with open(os.path.join(out, "mutants.out", "outcomes.json"), "w", encoding="utf-8") as f:
+        json.dump({"outcomes": records, "total_mutants": len(records), "caught": 1, "missed": 0,
+                   "timeout": 0, "unviable": len(records) - 1, "success": 0}, f)
+sys.exit(int(os.environ.get("FAKE_MUTANTS_RC") or 0))
 PY
   # The stand-in's own script path is the fixture's business, not the code's
   # under test, so it is spelled natively here: with the rewriting off,
   # Python would not find /tmp/... either.
   fake_py="$(cygpath -m "$tmp/fake_mutants.py" 2>/dev/null || printf '%s' "$tmp/fake_mutants.py")"
   printf '%s\n' '#!/bin/sh' \
-    "MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 exec \"$py\" \"$fake_py\" \"\$@\"" > "$tmp/bin/cargo"
-  chmod +x "$tmp/bin/cargo"
+    "MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 exec \"$py\" \"$fake_py\" \"\$@\"" > "$tmp/bin/cargo-mutants"
+  # F6a: the mutation step reaches cargo-mutants in two ways, `cargo mutants` (legacy) and `cargo-mutants mutants`
+  # through the lab of mutants-gate.sh (full), and builds a seed with `cargo test --no-run`. This cargo answers
+  # all three, and refuses the way the real one does when it is not in a crate.
+  cat > "$tmp/bin/cargo" <<'FAKE'
+#!/bin/bash
+case "${1:-}" in
+  -V) echo "cargo 1.99.0 (fake)"; exit 0 ;;
+  mutants) exec "$(dirname "$0")/cargo-mutants" "$@" ;;
+  test)
+    if [[ " $* " == *" --no-run "* && " $* " == *" --package="* ]]; then
+      if [[ ! -f Cargo.toml ]]; then
+        echo "error: could not find \`Cargo.toml\` in \`$PWD\` or any parent directory" >&2
+        exit 101
+      fi
+      t="${CARGO_TARGET_DIR:?the seed build has no CARGO_TARGET_DIR}"
+      mkdir -p "$t/debug/deps" "$t/debug/.fingerprint/serde-444"
+      : > "$t/debug/deps/libdep-aaaa.rlib"
+      : > "$t/debug/.fingerprint/serde-444/lib-serde"
+      : > "$t/CACHEDIR.TAG"
+    fi
+    ;;
+esac
+exit 0
+FAKE
+  printf '%s\n' '#!/bin/sh' 'echo "rustc 1.99.0 (fake)"' > "$tmp/bin/rustc"
+  chmod +x "$tmp/bin/cargo" "$tmp/bin/cargo-mutants" "$tmp/bin/rustc"
 
   # --- G3: the mutation step does not fill the disk -------------------------------
   # On 2026-10-13 it ran out of disk (os error 112): every job copied rust/ with the
@@ -982,9 +1029,13 @@ PY
   # would turn every row red for a reason that is not the row's. package.json
   # comes along because gate_linux_env reads engines.node from it.
   mk_qtree() {
-    mkdir -p "$tmp/$1/scripts" "$tmp/$1/rust"
+    mkdir -p "$tmp/$1/scripts" "$tmp/$1/rust/src"
     cp "$ROOT/scripts/mutants-gate.sh" "$ROOT/scripts/gate-lock.sh" "$tmp/$1/scripts/"
     [[ ! -f "$ROOT/package.json" ]] || cp "$ROOT/package.json" "$tmp/$1/"
+    # A crate, for the seed that the lab of mutants-gate.sh builds (F6a).
+    printf '[package]\nname = "memory-industry"\nversion = "0.31.0"\n' > "$tmp/$1/rust/Cargo.toml"
+    printf 'version = 4\n' > "$tmp/$1/rust/Cargo.lock"
+    printf 'pub fn f() -> u32 { 1 }\n' > "$tmp/$1/rust/src/lib.rs"
   }
   mk_qtree qtree
   q_tree="$tmp/qtree"
@@ -1004,9 +1055,13 @@ PY
       ROOT="$q_tree"
       cd "$q_tree"
       unset CARGO_PROFILE_DEV_DEBUG CARGO_INCREMENTAL MUTANTS_JOBS MUTANTS_SCRATCH_DIR \
-        MUTANTS_SCRATCH_GB_PER_COPY CUBA_GATE_MIN_FREE_GB CUBA_GATE_LOCK_OWNER FAKE_DF_FAIL FAKE_OUTCOME
-      export HOME="$q_home" TMP="$q_sys_native" TEMP="$q_sys_native" TMPDIR="$q_sys" \
+        MUTANTS_SCRATCH_GB_PER_COPY CUBA_GATE_MIN_FREE_GB CUBA_GATE_LOCK_OWNER FAKE_DF_FAIL FAKE_OUTCOME \
+        QG_SELECT QG_KEEP_OUT MUTANTS_KEEP_OUT CARGO_BUILD_JOBS GATE_CARGO_JOBS_FROM_GATE CARGO_TARGET_DIR CARGO \
+        DATABASE_URL FAKE_MUTANTS_RC FAKE_NO_OUTCOMES FAKE_TOUCH_SEED
+      # The seed of the lab lives under the cache: the fixture's own, which q_fresh empties.
+      export HOME="$q_home" XDG_CACHE_HOME="$q_home/.cache" TMP="$q_sys_native" TEMP="$q_sys_native" TMPDIR="$q_sys" \
         PATH="$tmp/bin:$PATH" FAKE_DF_AVAIL_KB="$q_avail" FAKE_CALLS_DIR="$q_calls"
+      [[ -z "${qmode:-}" ]] || export QG_SELECT="$qmode"
       [[ -z "$q_per" ]] || export MUTANTS_SCRATCH_GB_PER_COPY="$q_per"
       for kv in ${extra[@]+"${extra[@]}"}; do export "${kv?}"; done
       inner=0
@@ -1022,115 +1077,270 @@ PY
   mj_field() { grep -m1 '^mutants' "$tmp/cargo.calls" | awk -F'\t' -v n="$1" '{print $n}'; }
   qnorm() { cygpath -m "$1" 2>/dev/null || printf '%s' "$1"; }
 
-  # QG1: not even one copy fits, so cargo mutants is never run.
-  q_fresh
-  q_avail=$((12 * kb))
-  mj MUTANTS_JOBS=3 -- --file src/a.rs
-  if (( mut_rc == 0 )) || mj_invoked || ! mj_said '12.0 GB' || ! mj_said '18.0 GB'; then
-    echo "FAIL self-test: QG1: with 12 GB free for a 10 GB copy and 8 GB reserve the step invoked cargo mutants, or did not say the 12.0 GB it had and the 18.0 GB it needed (exit $mut_rc, invoked: $(mj_invoked && echo yes || echo no)): $(cat "$tmp/mut.out")" >&2
-    exit 1
-  fi
-  # QG5: not knowing the free space is not having it.
+  # F6a (D-F6a, F6a.5): the rows of the disk, the jobs, the scratch, the profile and the build check hold for the
+  # judge as it is today (`legacy`) and for the one that mutates through the lab of mutants-gate.sh (`full`, the
+  # default). The assertion of each row is the same in both; only the call that reaches cargo-mutants differs.
+  for qmode in legacy full; do
+    # QG1: not even one copy fits, so cargo mutants is never run.
+    q_fresh
+    q_avail=$((12 * kb))
+    mj MUTANTS_JOBS=3 -- --file src/a.rs
+    if (( mut_rc == 0 )) || mj_invoked || ! mj_said '12.0 GB' || ! mj_said '18.0 GB'; then
+      echo "FAIL self-test: [$qmode] QG1: with 12 GB free for a 10 GB copy and 8 GB reserve the step invoked cargo mutants, or did not say the 12.0 GB it had and the 18.0 GB it needed (exit $mut_rc, invoked: $(mj_invoked && echo yes || echo no)): $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+    # QG5: not knowing the free space is not having it.
+    q_fresh
+    q_avail=$((500 * kb))
+    mj FAKE_DF_FAIL=1 -- --file src/a.rs
+    if (( mut_rc == 0 )) || mj_invoked || ! mj_said 'could not read the free space'; then
+      echo "FAIL self-test: [$qmode] QG5: a df that prints nothing did not stop the step before cargo mutants with 'could not read the free space' (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+    # QG2: an explicit MUTANTS_JOBS does not pass over the disk: 30 GB hold two
+    # copies of 10 GB over the 8 GB reserve, not three.
+    q_fresh
+    q_avail=$((30 * kb))
+    mj FAKE_OUTCOME=genuine MUTANTS_JOBS=3 -- --file src/a.rs
+    if (( mut_rc != 0 )) || ! mj_invoked || ! mj_said 'capped by disk: 3 wanted, 2 fit' \
+      || ! [[ "$(mj_field 1)" == *' --jobs 2 '* ]]; then
+      echo "FAIL self-test: [$qmode] QG2: MUTANTS_JOBS=3 over disk for 2 did not reach cargo mutants as --jobs 2 with 'capped by disk: 3 wanted, 2 fit' (exit $mut_rc, argv: $(mj_field 1)): $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+    # QG8 (G5): with no MUTANTS_JOBS the step does not size the jobs itself, it asks the
+    # one rule, mutants-gate.sh --default-jobs, which reads the memory that is available
+    # (the copy of the formula that used to live here read the total, and on 2026-10-14
+    # a VM with 63 GB and ~10 GB free got 6 jobs and two builds died). Its `memory:` line
+    # reaches this step's output, and cargo mutants gets a number between 1 and the ceiling.
+    q_fresh
+    q_avail=$((500 * kb))
+    mj FAKE_OUTCOME=genuine -- --file src/a.rs
+    if (( mut_rc != 0 )) || ! mj_invoked || ! mj_said 'memory:' \
+      || ! [[ "$(mj_field 1)" =~ --jobs\ [1-6]\  ]]; then
+      echo "FAIL self-test: [$qmode] QG8: with no MUTANTS_JOBS the step did not take its jobs from mutants-gate.sh --default-jobs: no 'memory:' line, or cargo mutants got no --jobs between 1 and 6 (exit $mut_rc, argv: $(mj_field 1)): $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+    # QG3 and QG7: cargo mutants gets the judge's scratch as its temp dir, in the
+    # three spellings (TMP and TEMP are what Windows reads, TMPDIR what Unix does),
+    # and debug info off (7.6 of the 14.1 GB of a copy's target were .pdb). That
+    # variable is for that one command: it is not in the step's environment after.
+    q_fresh
+    q_avail=$((500 * kb))
+    mj FAKE_OUTCOME=genuine -- --file src/a.rs
+    mj_invoked || { echo "FAIL self-test: [$qmode] QG3: with 500 GB free the step did not run cargo mutants: $(cat "$tmp/mut.out")" >&2; exit 1; }
+    for field in 2 3 4; do
+      if [[ "$(qnorm "$(mj_field "$field")")" != "$(qnorm "$q_scr")" ]]; then
+        echo "FAIL self-test: [$qmode] QG3: field $field of the cargo mutants call (TMP, TEMP, TMPDIR) was '$(mj_field "$field")', not the judge's scratch $q_scr" >&2
+        exit 1
+      fi
+    done
+    if [[ "$(mj_field 5)" != 0 ]]; then
+      echo "FAIL self-test: [$qmode] QG7: cargo mutants did not get CARGO_PROFILE_DEV_DEBUG=0 (got '$(mj_field 5)')" >&2
+      exit 1
+    fi
+    if [[ -n "$(cat "$tmp/leak.debug" 2>/dev/null)" ]]; then
+      echo "FAIL self-test: [$qmode] QG7: CARGO_PROFILE_DEV_DEBUG was still exported after the step returned: it is for one cargo mutants call, not for the rest of the judge" >&2
+      exit 1
+    fi
+    # QG4: the judge's own scratch is swept of what is older than 6 h before the
+    # disk is measured, and what is newer stays.
+    q_fresh
+    mkdir -p "$q_scr/cargo-mutants-rust-old.tmp" "$q_scr/cargo-mutants-rust-new.tmp"
+    : > "$q_scr/cargo-mutants-rust-old.tmp/x"
+    : > "$q_scr/cargo-mutants-rust-new.tmp/x"
+    touch -d '7 hours ago' "$q_scr/cargo-mutants-rust-old.tmp"
+    touch -d '1 hour ago' "$q_scr/cargo-mutants-rust-new.tmp"
+    # Only a scratch that carries the marker mutants-gate.sh wrote is swept (G4/C1).
+    : > "$q_scr/.memory-industry-mutants"
+    touch -d '7 hours ago' "$q_scr/.memory-industry-mutants"
+    mj FAKE_OUTCOME=genuine -- --file src/a.rs
+    if [[ -e "$q_scr/cargo-mutants-rust-old.tmp" || ! -d "$q_scr/cargo-mutants-rust-new.tmp" ]]; then
+      echo "FAIL self-test: [$qmode] QG4: the run did not sweep the 7 h old copy of the judge's scratch and leave the 1 h old one: $(ls "$q_scr" 2>&1)" >&2
+      exit 1
+    fi
+    if [[ ! -f "$q_scr/.memory-industry-mutants" ]]; then
+      echo "FAIL self-test: [$qmode] QG4: the sweep deleted the marker that makes the directory the judge's scratch" >&2
+      exit 1
+    fi
+    # QG8: a cargo target inside rust/ other than target/ is copied whole by
+    # cargo-mutants (25.8 GB of four of them on 2026-10-13), so the step stops
+    # before it, naming the directory.
+    mk_qtree qtaint
+    mkdir -p "$tmp/qtaint/rust/target-x"
+    : > "$tmp/qtaint/rust/target-x/CACHEDIR.TAG"
+    q_tree="$tmp/qtaint"
+    q_fresh
+    mj FAKE_OUTCOME=genuine -- --file src/a.rs
+    q_tree="$tmp/qtree"
+    if (( mut_rc == 0 )) || mj_invoked || ! mj_said 'target-x'; then
+      echo "FAIL self-test: [$qmode] QG8: a rust/target-x holding CACHEDIR.TAG did not stop the step before cargo mutants, naming it (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+
+    # The two runs that were here before G3, now in the fixture's tree and with room.
+    q_fresh
+    mj FAKE_OUTCOME=genuine -- --file src/a.rs
+    if (( mut_rc != 0 )) || ! grep -q 'all 0 refused by the compiler' "$tmp/mut.out"; then
+      echo "FAIL self-test: [$qmode] a mutation run with one genuine catch did not pass through the build check (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+    q_fresh
+    mj FAKE_OUTCOME=killed -- --file src/a.rs
+    if (( mut_rc == 0 )) || ! grep -q 'stopped 1 of 1 unviable' "$tmp/mut.out"; then
+      echo "FAIL self-test: [$qmode] a build the machine killed was not refused, so cargo-mutants and this script did not read the same outcomes.json (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+
+  done
+  qmode=
+
+  # --- F6a.1, F6a.2, F6a.6: the modes of the step, one row each ---------------------------------------
+  # The arguments are the ones the main path hands the step: the files, then the diff.
+  : > "$tmp/x.diff"
+  q_args=(--file src/a.rs --file src/b.rs --in-diff "$tmp/x.diff")
+  q_seed_root() { printf '%s' "$q_home/.cache/memory-industry-gate/mutants-seed"; }
+
+  # F6a.1: with no QG_SELECT the step mutates through the lab of mutants-gate.sh, builds only the lib test, and
+  # gets the jobserver the judge counts (CARGO_BUILD_JOBS=7 is that count here).
   q_fresh
   q_avail=$((500 * kb))
-  mj FAKE_DF_FAIL=1 -- --file src/a.rs
-  if (( mut_rc == 0 )) || mj_invoked || ! mj_said 'could not read the free space'; then
-    echo "FAIL self-test: QG5: a df that prints nothing did not stop the step before cargo mutants with 'could not read the free space' (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+  mj FAKE_OUTCOME=genuine CARGO_BUILD_JOBS=7 -- "${q_args[@]}"
+  if (( mut_rc != 0 )) || ! mj_invoked || ! mj_said 'mode: full'; then
+    echo "FAIL self-test: F6a.1: with no QG_SELECT the step did not run in 'mode: full' and pass (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
     exit 1
   fi
-  # QG2: an explicit MUTANTS_JOBS does not pass over the disk: 30 GB hold two
-  # copies of 10 GB over the 8 GB reserve, not three.
-  q_fresh
-  q_avail=$((30 * kb))
-  mj FAKE_OUTCOME=genuine MUTANTS_JOBS=3 -- --file src/a.rs
-  if (( mut_rc != 0 )) || ! mj_invoked || ! mj_said 'capped by disk: 3 wanted, 2 fit' \
-    || ! [[ "$(mj_field 1)" == *' --jobs 2 '* ]]; then
-    echo "FAIL self-test: QG2: MUTANTS_JOBS=3 over disk for 2 did not reach cargo mutants as --jobs 2 with 'capped by disk: 3 wanted, 2 fit' (exit $mut_rc, argv: $(mj_field 1)): $(cat "$tmp/mut.out")" >&2
+  q_line="$(mj_field 1)"
+  if [[ "$(grep -o -- '--file ' <<<"$q_line" | wc -l)" != 2 ]]; then
+    echo "FAIL self-test: F6a.1: cargo-mutants did not get --file twice: $q_line" >&2
     exit 1
   fi
-  # QG8 (G5): with no MUTANTS_JOBS the step does not size the jobs itself, it asks the
-  # one rule, mutants-gate.sh --default-jobs, which reads the memory that is available
-  # (the copy of the formula that used to live here read the total, and on 2026-10-14
-  # a VM with 63 GB and ~10 GB free got 6 jobs and two builds died). Its `memory:` line
-  # reaches this step's output, and cargo mutants gets a number between 1 and the ceiling.
-  q_fresh
-  q_avail=$((500 * kb))
-  mj FAKE_OUTCOME=genuine -- --file src/a.rs
-  if (( mut_rc != 0 )) || ! mj_invoked || ! mj_said 'memory:' \
-    || ! [[ "$(mj_field 1)" =~ --jobs\ [1-6]\  ]]; then
-    echo "FAIL self-test: QG8: with no MUTANTS_JOBS the step did not take its jobs from mutants-gate.sh --default-jobs: no 'memory:' line, or cargo mutants got no --jobs between 1 and 6 (exit $mut_rc, argv: $(mj_field 1)): $(cat "$tmp/mut.out")" >&2
-    exit 1
-  fi
-  # QG3 and QG7: cargo mutants gets the judge's scratch as its temp dir, in the
-  # three spellings (TMP and TEMP are what Windows reads, TMPDIR what Unix does),
-  # and debug info off (7.6 of the 14.1 GB of a copy's target were .pdb). That
-  # variable is for that one command: it is not in the step's environment after.
-  q_fresh
-  q_avail=$((500 * kb))
-  mj FAKE_OUTCOME=genuine -- --file src/a.rs
-  mj_invoked || { echo "FAIL self-test: QG3: with 500 GB free the step did not run cargo mutants: $(cat "$tmp/mut.out")" >&2; exit 1; }
-  for field in 2 3 4; do
-    if [[ "$(qnorm "$(mj_field "$field")")" != "$(qnorm "$q_scr")" ]]; then
-      echo "FAIL self-test: QG3: field $field of the cargo mutants call (TMP, TEMP, TMPDIR) was '$(mj_field "$field")', not the judge's scratch $q_scr" >&2
+  for want in ' --in-diff ' ' --exclude-re ' ' --timeout 90 ' ' --gitignore=false' ' --cargo-arg=--lib' ' --dir ' ' --copy-target=true'; do
+    if [[ "$q_line" != *"$want"* ]]; then
+      echo "FAIL self-test: F6a.1: cargo-mutants did not get '$want' from the full step: $q_line" >&2
       exit 1
     fi
   done
-  if [[ "$(mj_field 5)" != 0 ]]; then
-    echo "FAIL self-test: QG7: cargo mutants did not get CARGO_PROFILE_DEV_DEBUG=0 (got '$(mj_field 5)')" >&2
+  if [[ "$q_line" != *' --jobserver-tasks 7 '* ]]; then
+    echo "FAIL self-test: F6a.1: no --jobserver-tasks 7 (the cargo jobs of this run) in the call: $q_line" >&2
     exit 1
   fi
-  if [[ -n "$(cat "$tmp/leak.debug" 2>/dev/null)" ]]; then
-    echo "FAIL self-test: QG7: CARGO_PROFILE_DEV_DEBUG was still exported after the step returned: it is for one cargo mutants call, not for the rest of the judge" >&2
+  if [[ " $q_line " == *' --lib '* ]]; then
+    echo "FAIL self-test: F6a.1: the full step passes a bare --lib after the --, so every mutant builds all the test binaries: $q_line" >&2
     exit 1
   fi
-  # QG4: the judge's own scratch is swept of what is older than 6 h before the
-  # disk is measured, and what is newer stays.
+  q_stage="$(sed -n 's/.* --dir \([^ ]*\) .*/\1/p' <<<"$q_line")"
+  if [[ "$q_stage" != *memory-industry-mutants/stage.*/rust || -e "$q_stage" ]]; then
+    echo "FAIL self-test: F6a.1: --dir is '$q_stage': it is not a stage under the judge's scratch, or it is still there after the run" >&2
+    exit 1
+  fi
+  if [[ "$(mj_field 7)" != */bin/cargo-shim ]]; then
+    echo "FAIL self-test: F6a.1: CARGO was '$(mj_field 7)', not the cargo-shim of this run" >&2
+    exit 1
+  fi
+  for want in 'OK  tree' 'OK  seed unchanged' 'lab builds:'; do
+    mj_said "$want" || { echo "FAIL self-test: F6a.1: the full step did not say '$want': $(cat "$tmp/mut.out")" >&2; exit 1; }
+  done
+
+  # F6a.2: legacy is the call of today, byte for byte, with no seed, no stage, no shim and no jobserver.
   q_fresh
-  mkdir -p "$q_scr/cargo-mutants-rust-old.tmp" "$q_scr/cargo-mutants-rust-new.tmp"
-  : > "$q_scr/cargo-mutants-rust-old.tmp/x"
-  : > "$q_scr/cargo-mutants-rust-new.tmp/x"
-  touch -d '7 hours ago' "$q_scr/cargo-mutants-rust-old.tmp"
-  touch -d '1 hour ago' "$q_scr/cargo-mutants-rust-new.tmp"
-  # Only a scratch that carries the marker mutants-gate.sh wrote is swept (G4/C1).
-  : > "$q_scr/.memory-industry-mutants"
-  touch -d '7 hours ago' "$q_scr/.memory-industry-mutants"
-  mj FAKE_OUTCOME=genuine -- --file src/a.rs
-  if [[ -e "$q_scr/cargo-mutants-rust-old.tmp" || ! -d "$q_scr/cargo-mutants-rust-new.tmp" ]]; then
-    echo "FAIL self-test: QG4: the run did not sweep the 7 h old copy of the judge's scratch and leave the 1 h old one: $(ls "$q_scr" 2>&1)" >&2
+  mj FAKE_OUTCOME=genuine MUTANTS_JOBS=2 QG_SELECT=legacy CARGO_BUILD_JOBS=7 -- "${q_args[@]}"
+  q_line="$(mj_field 1)"
+  if (( mut_rc != 0 )) || ! mj_said 'mode: legacy' \
+    || [[ "$q_line" != "mutants --file src/a.rs --file src/b.rs --in-diff $tmp/x.diff --exclude-re $MUTANTS_EXCLUDE_RE --output "*" --timeout 90 --jobs 2 --gitignore=false -- --lib" ]]; then
+    echo "FAIL self-test: F6a.2: QG_SELECT=legacy did not call cargo-mutants exactly as the step did before F6 (exit $mut_rc): $q_line" >&2
     exit 1
   fi
-  if [[ ! -f "$q_scr/.memory-industry-mutants" ]]; then
-    echo "FAIL self-test: QG4: the sweep deleted the marker that makes the directory the judge's scratch" >&2
+  if [[ "$q_line" == *' --dir '* || "$q_line" == *'--copy-target'* || "$q_line" == *'--jobserver-tasks'* || "$(mj_field 7)" == *cargo-shim* ]] \
+    || [[ -n "$(ls -A "$(q_seed_root)" 2>/dev/null)" ]]; then
+    echo "FAIL self-test: F6a.2: legacy used the lab: a --dir, --copy-target, --jobserver-tasks, the shim as CARGO, or a seed under $(q_seed_root)" >&2
     exit 1
   fi
-  # QG8: a cargo target inside rust/ other than target/ is copied whole by
-  # cargo-mutants (25.8 GB of four of them on 2026-10-13), so the step stops
-  # before it, naming the directory.
-  mk_qtree qtaint
-  mkdir -p "$tmp/qtaint/rust/target-x"
-  : > "$tmp/qtaint/rust/target-x/CACHEDIR.TAG"
-  q_tree="$tmp/qtaint"
+  # An unknown mode is a refusal before anything is mutated or built.
   q_fresh
-  mj FAKE_OUTCOME=genuine -- --file src/a.rs
-  q_tree="$tmp/qtree"
-  if (( mut_rc == 0 )) || mj_invoked || ! mj_said 'target-x'; then
-    echo "FAIL self-test: QG8: a rust/target-x holding CACHEDIR.TAG did not stop the step before cargo mutants, naming it (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+  mj QG_SELECT=otra -- "${q_args[@]}"
+  if (( mut_rc != 2 )) || mj_invoked || ! mj_said 'QG_SELECT' || [[ -n "$(ls -A "$(q_seed_root)" 2>/dev/null)" ]]; then
+    echo "FAIL self-test: F6a.2: QG_SELECT=otra did not exit 2 naming QG_SELECT before cargo-mutants and before a seed (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
     exit 1
   fi
 
-  # The two runs that were here before G3, now in the fixture's tree and with room.
+  # F6a.6: the verdict of full. cargo-mutants' own exit decides, and its outcomes go through the build check
+  # whenever they exist. The outcomes here are a genuine catch, so a verdict that read only the build check
+  # would pass every row of the first group.
+  for q_rc in 2 3 4 70; do
+    q_fresh
+    mj FAKE_OUTCOME=genuine FAKE_MUTANTS_RC="$q_rc" -- "${q_args[@]}"
+    if (( mut_rc == 0 )) || ! mj_invoked; then
+      echo "FAIL self-test: F6a.6 rc $q_rc: cargo-mutants exited $q_rc over a clean outcomes.json and the step passed (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+  done
+  for q_rc in 4 70; do
+    q_fresh
+    mj FAKE_OUTCOME=genuine FAKE_MUTANTS_RC="$q_rc" -- "${q_args[@]}"
+    if ! mj_said "cargo-mutants rc=$q_rc"; then
+      echo "FAIL self-test: F6a.6 rc $q_rc: the red does not say 'cargo-mutants rc=$q_rc': $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+  done
   q_fresh
-  mj FAKE_OUTCOME=genuine -- --file src/a.rs
-  if (( mut_rc != 0 )) || ! grep -q 'all 0 refused by the compiler' "$tmp/mut.out"; then
-    echo "FAIL self-test: a mutation run with one genuine catch did not pass through the build check (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+  mj FAKE_OUTCOME=genuine FAKE_MUTANTS_RC=0 -- "${q_args[@]}"
+  if (( mut_rc != 0 )); then
+    echo "FAIL self-test: F6a.6 rc 0: a genuine catch with cargo-mutants' exit 0 was not green (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
     exit 1
   fi
+  # The build check judges the outcomes whatever the exit was: a killed build, with exit 2 and with exit 0.
+  for q_rc in 2 0; do
+    q_fresh
+    mj FAKE_OUTCOME=killed FAKE_MUTANTS_RC="$q_rc" -- "${q_args[@]}"
+    if (( mut_rc == 0 )) || ! mj_said 'stopped 1 of 1 unviable'; then
+      echo "FAIL self-test: F6a.6 rc $q_rc: the outcomes of a killed build were not judged by --check-builds (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+  done
   q_fresh
-  mj FAKE_OUTCOME=killed -- --file src/a.rs
-  if (( mut_rc == 0 )) || ! grep -q 'stopped 1 of 1 unviable' "$tmp/mut.out"; then
-    echo "FAIL self-test: a build the machine killed was not refused, so cargo-mutants and this script did not read the same outcomes.json (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+  mj FAKE_NO_OUTCOMES=1 FAKE_MUTANTS_RC=70 -- "${q_args[@]}"
+  if (( mut_rc == 0 )) || ! mj_said 'cargo-mutants rc=70'; then
+    echo "FAIL self-test: F6a.6: an exit 70 with no outcomes.json was not red naming 'cargo-mutants rc=70' (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
     exit 1
   fi
+  # A guard of the lab (the seed touched during the run) is red too, with the lab's own words.
+  q_fresh
+  mj FAKE_OUTCOME=genuine FAKE_TOUCH_SEED=1 -- "${q_args[@]}"
+  if (( mut_rc == 0 )) || ! mj_said 'the seed changed during the run'; then
+    echo "FAIL self-test: F6a.6: a seed touched during the run was not red with 'the seed changed during the run' (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+    exit 1
+  fi
+
+  # F6a.6 (D-F6f): QG_KEEP_OUT is a directory of this run's. One that is not empty stops the step before
+  # cargo-mutants and is not written to; a new or empty one keeps the outcomes of the run, green or red, in
+  # <dir>/<mode>/.
+  for q_mode in full legacy; do
+    q_fresh
+    q_keep="$tmp/keep-$q_mode"
+    rm -rf "$q_keep"
+    mkdir -p "$q_keep"
+    : > "$q_keep/leftover"
+    mj FAKE_OUTCOME=genuine QG_SELECT="$q_mode" QG_KEEP_OUT="$q_keep" -- "${q_args[@]}"
+    if (( mut_rc != 2 )) || mj_invoked || ! mj_said 'QG_KEEP_OUT' || [[ ! -f "$q_keep/leftover" || -e "$q_keep/$q_mode" ]]; then
+      echo "FAIL self-test: F6a.6 ($q_mode): a QG_KEEP_OUT that is not empty did not exit 2 naming QG_KEEP_OUT before cargo-mutants, or it was written to (exit $mut_rc): $(cat "$tmp/mut.out")" >&2
+      exit 1
+    fi
+    q_fresh
+    rm -rf "$q_keep"
+    mj FAKE_OUTCOME=genuine QG_SELECT="$q_mode" QG_KEEP_OUT="$q_keep" -- "${q_args[@]}"
+    if (( mut_rc != 0 )) || [[ ! -f "$q_keep/$q_mode/outcomes.json" ]]; then
+      echo "FAIL self-test: F6a.6 ($q_mode): a new QG_KEEP_OUT did not keep the outcomes in <dir>/$q_mode/outcomes.json (exit $mut_rc): $(ls -R "$q_keep" 2>&1)" >&2
+      exit 1
+    fi
+    q_fresh
+    rm -rf "$q_keep"
+    mkdir -p "$q_keep"
+    mj FAKE_OUTCOME=genuine FAKE_MUTANTS_RC=2 QG_SELECT="$q_mode" QG_KEEP_OUT="$q_keep" -- "${q_args[@]}"
+    if (( mut_rc == 0 )) || [[ ! -f "$q_keep/$q_mode/outcomes.json" ]]; then
+      echo "FAIL self-test: F6a.6 ($q_mode): a red run, into an empty QG_KEEP_OUT, did not keep its outcomes (exit $mut_rc): $(ls -R "$q_keep" 2>&1)" >&2
+      exit 1
+    fi
+  done
 
   echo "OK  self-test: the CRAP half reports CC violations, only CC violations, and"
   echo "    keys each function by name and ordinal, so moving one does not move its"
@@ -1142,7 +1352,10 @@ PY
   echo "    for the jobs the disk holds before cargo mutants, an explicit MUTANTS_JOBS included,"
   echo "    runs it in the judge's own scratch with debug info off, and stops at a cargo target"
   echo "    inside rust/; with no MUTANTS_JOBS its jobs come from mutants-gate.sh --default-jobs,"
-  echo "    which sizes them from the memory that is available"
+  echo "    which sizes them from the memory that is available; the same rows hold for the judge as it was"
+  echo "    (legacy) and for the one that mutates through the lab of mutants-gate.sh (full, the default),"
+  echo "    which builds only the lib test, hands cargo-mutants the jobserver the judge counts, takes its"
+  echo "    verdict from cargo-mutants' exit and from the build check, and keeps its outcomes in QG_KEEP_OUT"
   exit 0
 fi
 # --- self-test end ---

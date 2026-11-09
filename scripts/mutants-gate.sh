@@ -2578,6 +2578,113 @@ REAL
   [[ -z "$(awk -F'\t' '$10 ~ /rustup|\.cargo/' "$tmp/cargo.calls")" ]] \
     || self_fail "F4d.7: a process of the rows reached the real toolchain: $(awk -F'\t' '$10 ~ /rustup|\.cargo/' "$tmp/cargo.calls")"
 
+  # --- F6a (D-F6b, D-F6c): the lab of the mutation step is a mode of its own, and every run of it is
+  # given the jobserver the judge counts. The rows reuse the crate tree, the fake cargo and the outcomes
+  # of F4b above. A pass of quality-gate.sh calls this mode up to three times in one run, so a second
+  # call has to find the seed the first one built.
+  f6a_lab() { # OUT [VAR=value]... -- ARGS...: --lab-run in the seed tree, ARGS after its own --
+    local o="$1"
+    local -a extra=()
+    shift
+    while [[ "${1:-}" != -- ]]; do extra+=("$1"); shift; done
+    shift
+    in_tree seedtree XDG_CACHE_HOME="$home/.cache" FAKE_OUTCOMES_JSON="$tmp/f4b/ok.json" \
+      FAKE_LIST_JSON="$tmp/f4b/list.json" FAKE_BASELINE_LOG="$tmp/f4b/base1.log" \
+      ${extra[@]+"${extra[@]}"} -- --lab-run "$o" "$@"
+  }
+  f6a_out() { rm -rf "$tmp/f6a/$1"; mkdir -p "$tmp/f6a/$1"; printf '%s' "$tmp/f6a/$1"; }
+  f6a_argv() { grep -m1 '^mutants --file' "$tmp/cargo.calls" | cut -f1 || true; }
+  f6a_stage_of() { sed -n 's/.* --dir \([^ ]*\)\/rust.*/\1/p' <<<"$1"; }
+
+  # F6a.3: --lab-run does what the main path did, and nothing more. 30 GB hold two copies of 10 GB over
+  # the 8 GB reserve, so 3 wanted is jobs=2: the line is the disk's and not an echo of the argument.
+  fresh
+  mk_crate_tree seedtree
+  o1="$(f6a_out a)"
+  avail=$((30 * kb))
+  f6a_lab "$o1" CARGO_BUILD_JOBS=5 -- 3 -- --file src/search/mmr.rs --cargo-arg=--lib
+  avail=$((500 * kb))
+  (( rc == 0 )) || self_fail "F6a.3: --lab-run over a tree with a seed to build exited $rc, not 0: $(cat "$tmp/run.out" "$tmp/run.err")"
+  grep -qx 'jobs=2' "$tmp/run.out" \
+    || self_fail "F6a.3: --lab-run 3 over disk for 2 did not print 'jobs=2' on its own line: $(cat "$tmp/run.out" "$tmp/run.err")"
+  ran_mutants || self_fail "F6a.3: --lab-run did not reach cargo-mutants: $(cat "$tmp/run.out" "$tmp/run.err")"
+  f6a_line="$(f6a_argv)"
+  for want in ' --dir ' ' --copy-target=true' ' --jobs 2 ' ' --jobserver-tasks 5 ' ' --cargo-arg=--lib' " --output $o1"; do
+    [[ "$f6a_line" == *"$want"* ]] || self_fail "F6a.3: cargo-mutants did not get '$want' from --lab-run: $f6a_line"
+  done
+  [[ "$(mutants_col 10)" == *memory-industry-mutants-out.*/bin/cargo-shim || "$(mutants_col 10)" == "$o1"/bin/cargo-shim ]] \
+    || self_fail "F6a.3: cargo-mutants did not run with CARGO=<the shim of this run>: '$(mutants_col 10)'"
+  any_said 'seed: built' || self_fail "F6a.3: --lab-run did not build the seed it did not find"
+  any_said 'OK  tree' || self_fail "F6a.3: --lab-run did not judge the tree that is mutated"
+  any_said 'OK  seed unchanged' || self_fail "F6a.3: --lab-run did not compare the seed before and after"
+  any_said 'lab builds:' || self_fail "F6a.3: --lab-run did not print the lab line"
+  [[ "$(cat "$o1/cargo-mutants.rc" 2>/dev/null)" == 0 ]] \
+    || self_fail "F6a.3: $o1/cargo-mutants.rc does not hold cargo-mutants' exit 0: '$(cat "$o1/cargo-mutants.rc" 2>&1)'"
+  [[ -f "$o1/mutants.out/outcomes.json" ]] \
+    || self_fail "F6a.3: the outcomes are not in $o1/mutants.out: $(ls -A "$o1" 2>&1)"
+  f6a_stage="$(f6a_stage_of "$f6a_line")"
+  [[ -n "$f6a_stage" && "$(basename "$(dirname "$f6a_stage")")" == memory-industry-mutants && ! -e "$f6a_stage" ]] \
+    || self_fail "F6a.3: the stage '$f6a_stage' is not under the judge's scratch, or it is still there after the run"
+  seed_key_a="$(seed_keys)"
+
+  # F6a.3: a second call finds the seed, builds none, and keeps its own output apart from the first.
+  o2="$(f6a_out b)"
+  f6a_lab "$o2" -- 3 -- --file src/search/mmr.rs --cargo-arg=--lib
+  (( rc == 0 )) || self_fail "F6a.3: the second --lab-run exited $rc, not 0: $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ "$(grep -c '^test --no-run --lib ' "$tmp/cargo.calls")" == 1 && "$(seed_keys)" == "$seed_key_a" ]] \
+    || self_fail "F6a.3: the second --lab-run built a seed of its own instead of reusing the first: $(grep '^test --no-run' "$tmp/cargo.calls")"
+  [[ -f "$o2/mutants.out/outcomes.json" && -f "$o2/cargo-mutants.rc" ]] \
+    || self_fail "F6a.3: the second --lab-run left nothing in its own directory: $(ls -A "$o2" 2>&1)"
+
+  # F6a.3: cargo-mutants' own exit (2: a mutant was missed) is the file's business and not the mode's.
+  o3="$(f6a_out c)"
+  f6a_lab "$o3" FAKE_MUTANTS_RC=2 -- 3 -- --file src/search/mmr.rs --cargo-arg=--lib
+  (( rc == 0 )) || self_fail "F6a.3: --lab-run took cargo-mutants' exit 2 for its own (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ "$(cat "$o3/cargo-mutants.rc" 2>/dev/null)" == 2 ]] \
+    || self_fail "F6a.3: cargo-mutants exited 2 and $o3/cargo-mutants.rc says '$(cat "$o3/cargo-mutants.rc" 2>&1)'"
+
+  # F6a.3: a seed touched by the run is the mode's red (1), the seed is removed and the stage goes.
+  o4="$(f6a_out d)"
+  seedfile="$seed_root/$seed_key_a/target/debug/deps/libdep-aaaa.rlib"
+  rm -f "$tmp/cargo.calls"
+  f6a_lab "$o4" FAKE_TOUCH="$seedfile" -- 3 -- --file src/search/mmr.rs --cargo-arg=--lib
+  (( rc == 1 )) || self_fail "F6a.3: a seed touched during --lab-run exited $rc, not 1: $(cat "$tmp/run.out" "$tmp/run.err")"
+  any_said 'the seed changed during the run' \
+    || self_fail "F6a.3: the refusal does not say 'the seed changed during the run': $(cat "$tmp/run.out" "$tmp/run.err")"
+  [[ ! -e "$seed_root/$seed_key_a" ]] || self_fail "F6a.3: the touched seed was not removed"
+  f6a_stage="$(f6a_stage_of "$(f6a_argv)")"
+  [[ -n "$f6a_stage" && ! -e "$f6a_stage" ]] || self_fail "F6a.3: the stage '$f6a_stage' of a red run is still there"
+
+  # F6a.3: the negatives. No arguments, no `--`, no directory and a disk that holds no copy all stop the mode
+  # before cargo-mutants, and none of them is a green exit.
+  o5="$(f6a_out e)"
+  fresh
+  mk_crate_tree seedtree
+  in_tree seedtree XDG_CACHE_HOME="$home/.cache" -- --lab-run
+  (( rc == 2 )) && ! ran_mutants || self_fail "F6a.3: --lab-run with no arguments exited $rc, not 2 (or ran cargo-mutants): $(cat "$tmp/run.out" "$tmp/run.err")"
+  f6a_lab "$o5" -- 3 --file src/search/mmr.rs
+  (( rc == 2 )) && ! ran_mutants || self_fail "F6a.3: --lab-run with no '--' exited $rc, not 2 (or ran cargo-mutants): $(cat "$tmp/run.out" "$tmp/run.err")"
+  in_tree seedtree XDG_CACHE_HOME="$home/.cache" -- --lab-run "$o5"
+  (( rc == 2 )) && ! ran_mutants || self_fail "F6a.3: --lab-run with only a directory exited $rc, not 2 (or ran cargo-mutants): $(cat "$tmp/run.out" "$tmp/run.err")"
+  avail=$((12 * kb))
+  f6a_lab "$o5" -- 3 -- --file src/search/mmr.rs
+  avail=$((500 * kb))
+  (( rc != 0 )) && ! ran_mutants && grep -q '12.0 GB' "$tmp/run.err" \
+    || self_fail "F6a.3: with 12 GB free for a 10 GB copy --lab-run exited $rc, or ran cargo-mutants, or did not say the 12.0 GB: $(cat "$tmp/run.out" "$tmp/run.err")"
+
+  # F6a.4 (D-F6c): the main path is the same call, and its `mutants --file` line only gains the jobs the judge
+  # counts, before the --. Two values, so that a constant is not taken for the judge's count.
+  for jt in 5 3; do
+    fresh
+    mk_crate_tree seedtree
+    f4b_run seedtree CARGO_BUILD_JOBS="$jt"
+    (( rc == 0 )) || self_fail "F6a.4: the main path with CARGO_BUILD_JOBS=$jt did not pass (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+    argv="$(f6a_argv)"
+    if [[ "${argv%% -- *}" != *" --jobserver-tasks $jt "* || "${argv#* -- }" != search:: || "${argv%% -- *}" != *' --cargo-arg=--lib' ]]; then
+      self_fail "F6a.4: with CARGO_BUILD_JOBS=$jt the main path's cargo-mutants line did not carry '--jobserver-tasks $jt' before the --, with --cargo-arg=--lib last before it and search:: after: $argv"
+    fi
+  done
+
   echo "OK  self-test: a build rustc refused with a diagnostic stays unviable; an NTSTATUS,"
   echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log,"
   echo "    a build out of disk and a file whose total disagrees with its records are refused; a caught mutant"
