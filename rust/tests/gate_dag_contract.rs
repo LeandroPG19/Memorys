@@ -2077,3 +2077,799 @@ fn an_exclusive_step_does_not_start_beside_a_cgroup_that_still_has_processes() {
     fx.write_step("a", "cgroup.events", "populated 0\nfrozen 0\n");
     assert_green(&fx.run("1"), "populated 0");
 }
+
+// --- CI-J14: the planner holds on its first run in parallel -----------------------------------------------------------
+// J14a (the mode that ran), J14b and J14g (no step outlives the planner, and a killed row cleans up after itself), J14c
+// (the tmpfs pages of a step), J14d (a DATABASE_URL of the operator), J14e (an internal failure is no verdict), J14k and
+// J14l (the key and the numbers of the table). The cgroup tree is fake, as above; a step that must be alive when the
+// test talks to the planner is found by a duration no other test uses, which is in its command line.
+
+/// A planner that runs in the background: the test signals it while it works and then collects its answer.
+struct Live {
+    child: std::process::Child,
+    out_path: PathBuf,
+    err_path: PathBuf,
+}
+
+impl Live {
+    fn signal(&self, name: &str) {
+        let status = Command::new("kill")
+            .arg(format!("-{name}"))
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("kill");
+        assert!(status.success(), "kill -{name} {} failed", self.child.id());
+    }
+
+    /// The planner's exit, with a deadline of `secs`: a planner that does not stop is killed and reported as timed out.
+    fn collect(mut self, secs: u64) -> Run {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut timed_out = false;
+        let code = loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                break status.code();
+            }
+            if Instant::now() >= deadline {
+                timed_out = true;
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Run {
+            code,
+            timed_out,
+            out: read(&self.out_path),
+            err: read(&self.err_path),
+        }
+    }
+}
+
+impl Fixture {
+    /// `run_env` without waiting: the planner of this tree, started in the background.
+    fn spawn(&self, gate_dag: &str, extra: &[(&str, &str)]) -> Live {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let out_path = self.base.join(format!("salida-{n}.txt"));
+        let err_path = self.base.join(format!("error-{n}.txt"));
+        let child = Command::new("python3")
+            .arg("-I")
+            .arg(repo_root().join("scripts/gate-dag.py"))
+            .arg("run")
+            .arg("--table")
+            .arg(&self.table)
+            .env("GATE_DAG", gate_dag)
+            .env("CI_TIEMPOS_DIR", &self.history)
+            .env("HOME", &self.home)
+            .env("XDG_CACHE_HOME", self.home.join(".cache"))
+            .env("TMPDIR", &self.tmp)
+            .envs(extra.iter().copied())
+            .env("GATE_CGROUP_ROOT", &self.cgroups)
+            .env("GATE_PROC_SELF_CGROUP", &self.proc_self)
+            .stdout(Stdio::from(File::create(&out_path).expect("stdout file")))
+            .stderr(Stdio::from(File::create(&err_path).expect("stderr file")))
+            .spawn()
+            .expect("the planner");
+        Live {
+            child,
+            out_path,
+            err_path,
+        }
+    }
+
+    /// The text of the table as it is on disk, for the tests that rewrite it.
+    fn table_text(&self) -> String {
+        read(&self.table)
+    }
+
+    fn scope(&self) -> PathBuf {
+        self.cgroups.join("scope")
+    }
+}
+
+/// The pids of the processes whose command line holds `token`, this process excluded. A zombie has no command line, so
+/// it is not one.
+fn processes_with(token: &str) -> Vec<u32> {
+    let me = std::process::id();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != me)
+        .filter(|pid| {
+            fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|bytes| {
+                    String::from_utf8_lossy(&bytes)
+                        .replace('\0', " ")
+                        .contains(token)
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// True as soon as `check` holds, false after `secs` seconds.
+fn within(secs: u64, mut check: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if check() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// What is left of the processes with `token` after `secs` seconds, and then none: whatever survived is killed so a
+/// red test does not leave a sleep of 37 s behind.
+fn survivors_of(token: &str, secs: u64) -> Vec<u32> {
+    let _ = within(secs, || processes_with(token).is_empty());
+    let left = processes_with(token);
+    for pid in &left {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status();
+    }
+    left
+}
+
+/// The two-column rows of `bash_table`: (idx, id, seconds in the table, script).
+type BashRow<'a> = (u32, &'a str, &'a str, &'a PathBuf);
+
+/// A table whose steps run under bash, whose EXIT trap runs when TERM stops it (dash does not): `idx id - - normal 1 5
+/// secs /bin/bash <script> id secs control`.
+fn bash_table(fx: &mut Fixture, rows: &[BashRow]) {
+    let mut text = String::new();
+    for &(idx, id, secs, script) in rows {
+        text.push_str(&format!(
+            "{idx} {id} - - normal 1 5 {secs} /bin/bash {} {id} {secs} {}\n",
+            script.display(),
+            fx.control.display()
+        ));
+        fx.steps.push((idx, id.to_string()));
+    }
+    write(&fx.table, &text);
+    for (_, id) in &fx.steps {
+        fx.write_defaults(id);
+    }
+}
+
+/// A step that leaves a mark when its shell exits, whichever way. What it sleeps and how it exits come from the
+/// control directory (`sleep-<id>`, `rc-<id>`), so the series that seeds the history is short and the DAG run is long.
+/// It says it is up (`up-<id>`) once its trap is set, and waits for the step named in `wait-for-<id>` to say it is up, so
+/// a red that is only 0.1 s long cannot stop a step that has not set its trap yet, however loaded the machine is.
+/// $1 id, $2 seconds of the table, $3 control directory.
+const TRAP_SH: &str = r#"#!/bin/bash
+id="$1"
+control="$3"
+trap 'echo exited > "$control/mark-$id"' EXIT
+echo "=== $id banner"
+echo up > "$control/up-$id"
+if [ -f "$control/wait-for-$id" ]; then
+    other=$(cat "$control/wait-for-$id")
+    for _ in $(seq 400); do [ -e "$control/up-$other" ] && break; sleep 0.05; done
+fi
+rc=$(cat "$control/rc-$id" 2>/dev/null || echo 0)
+secs=$(cat "$control/sleep-$id" 2>/dev/null || echo 0.2)
+sleep "$secs" &
+wait $!
+exit "$rc"
+"#;
+
+/// A step that ignores TERM, and so does what it started: only SIGKILL stops it.
+const DEAF_SH: &str = r#"#!/bin/bash
+id="$1"
+control="$3"
+trap '' TERM
+echo "=== $id banner"
+echo up > "$control/up-$id"
+secs=$(cat "$control/sleep-$id" 2>/dev/null || echo 0.2)
+sleep "$secs" &
+wait
+"#;
+
+fn records_of(fx: &Fixture, name: &str, before: &HashMap<PathBuf, usize>) -> Vec<Value> {
+    appended(&fx.history, name, before)
+}
+
+/// J14a: `modo` is what ran. With GATE_DAG=1 and no serial history of this table the planner runs in series, so it
+/// records `serie`; the next run of the same table is the first that has history to learn from, and runs as a DAG. A
+/// run recorded as `dag` while it ran in series is never a serial run to learn from, so the DAG never started.
+#[test]
+fn a_run_is_recorded_with_the_mode_it_ran_in() {
+    let mut fx = Fixture::new("j14a", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "p", "-", "0.4", ""), (20, "q", "-", "0.4", "")]);
+    let before_steps = snapshot(&fx.history, "pasos.jsonl");
+    let before_runs = snapshot(&fx.history, "corridas.jsonl");
+    let first = fx.run("1");
+    assert_green(&first, "GATE_DAG=1 with no history");
+    assert!(
+        first
+            .text()
+            .contains("note: no serial history for this table"),
+        "the first run has no history and has to say it runs in series: {}",
+        first.text()
+    );
+    let steps = records_of(&fx, "pasos.jsonl", &before_steps);
+    let runs = records_of(&fx, "corridas.jsonl", &before_runs);
+    assert_eq!(steps.len(), 2, "two steps ran: {steps:?}");
+    for record in steps.iter().chain(runs.iter()) {
+        assert_eq!(
+            record["modo"].as_str(),
+            Some("serie"),
+            "a run that ran in series is recorded as serie, not by the flag: {record}"
+        );
+    }
+    assert!(
+        first.out.contains("mode=serie"),
+        "the summary says the mode that ran: {}",
+        first.out
+    );
+
+    let before_steps = snapshot(&fx.history, "pasos.jsonl");
+    let before_runs = snapshot(&fx.history, "corridas.jsonl");
+    let second = fx.run("1");
+    assert_green(&second, "GATE_DAG=1 after one run in series");
+    assert!(
+        !second.text().contains("note: no serial history"),
+        "the second run of the same table has history and runs as a DAG: {}",
+        second.text()
+    );
+    let steps = records_of(&fx, "pasos.jsonl", &before_steps);
+    assert!(
+        overlaps(by_id(&steps, "p"), by_id(&steps, "q")),
+        "the second run did not run p and q together: the first run was not counted as a serial run"
+    );
+    for record in steps
+        .iter()
+        .chain(records_of(&fx, "corridas.jsonl", &before_runs).iter())
+    {
+        assert_eq!(
+            record["modo"].as_str(),
+            Some("dag"),
+            "a run in parallel is recorded as dag: {record}"
+        );
+    }
+    assert!(second.out.contains("mode=dag"), "{}", second.out);
+}
+
+/// J14a: a scope that is not delegated runs in series whatever the flag says, so GATE_DAG=1 there is recorded as
+/// `serie`; with the delegation back, the same table already has its serial run and goes in parallel.
+#[test]
+fn an_undelegated_run_is_recorded_as_series_and_counts_as_history() {
+    let mut fx = Fixture::new("j14a-sin-delegar", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "p", "-", "0.4", ""), (20, "q", "-", "0.4", "")]);
+    fx.undelegate();
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let first = fx.run("1");
+    assert_green(&first, "GATE_DAG=1 without delegation");
+    assert!(
+        first.text().contains("note: the scope is not delegated"),
+        "{}",
+        first.text()
+    );
+    for record in records_of(&fx, "pasos.jsonl", &before) {
+        assert_eq!(
+            record["modo"].as_str(),
+            Some("serie"),
+            "it ran in series: {record}"
+        );
+    }
+    write(&fx.scope().join("cgroup.subtree_control"), "");
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let second = fx.run("1");
+    assert_green(&second, "GATE_DAG=1 with the delegation back");
+    let steps = records_of(&fx, "pasos.jsonl", &before);
+    assert!(
+        overlaps(by_id(&steps, "p"), by_id(&steps, "q")),
+        "the run in series of the undelegated scope is not history to learn from"
+    );
+}
+
+/// J14b: SIGHUP (a closed terminal) stops the planner as TERM does, and no step of the table outlives it. The step is
+/// a `sleep` of 37.5101 s; the planner ends with 2, and writes `cgroup.kill` of every `paso-*` of the scope, the one it
+/// started and the one it does not know (a step of an earlier planner that died).
+#[test]
+fn a_hangup_to_the_planner_leaves_no_step_alive() {
+    let mut fx = Fixture::new("j14b-hup", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "a", "-", "37.5101", "")]);
+    let known = fx.step_dir("a").join("cgroup.kill");
+    let ghost = fx.scope().join("paso-99-ghost");
+    fs::create_dir_all(&ghost).expect("the cgroup of a step the planner does not know");
+    write(&known, "");
+    write(&ghost.join("cgroup.kill"), "");
+    let live = fx.spawn("0", &[]);
+    assert!(
+        within(10, || !processes_with("37.5101").is_empty()),
+        "the step did not start in 10 s"
+    );
+    live.signal("HUP");
+    let run = live.collect(10);
+    let left = survivors_of("37.5101", 5);
+    assert!(
+        !run.timed_out,
+        "the planner did not stop on SIGHUP in 10 s: {}{}",
+        run.out, run.err
+    );
+    assert!(
+        left.is_empty(),
+        "SIGHUP to the planner left its step alive (pids {left:?}), and nobody owns it now"
+    );
+    assert_eq!(
+        run.code,
+        Some(2),
+        "SIGHUP stops the planner with 2, like TERM (no verdict): {}{}",
+        run.out,
+        run.err
+    );
+    assert_eq!(
+        read(&known).trim(),
+        "1",
+        "drain did not write cgroup.kill of the step it started"
+    );
+    assert_eq!(
+        read(&ghost.join("cgroup.kill")).trim(),
+        "1",
+        "drain did not write cgroup.kill of a paso-* it does not know: a step that outlived another planner stays alive"
+    );
+}
+
+/// J14b: a TERM in the window between `Popen` and the step being marked as running does not leave a started step that
+/// drain cannot see. The hook `GATE_DAG_TEST_TERM_AFTER_POPEN=1` has the planner send itself TERM right after `Popen`.
+#[test]
+fn a_term_right_after_the_step_starts_leaves_no_step_alive() {
+    let mut fx = Fixture::new("j14b-term", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "a", "-", "37.5102", "")]);
+    let run = fx.run_env("0", &[("GATE_DAG_TEST_TERM_AFTER_POPEN", "1")]);
+    let left = survivors_of("37.5102", 5);
+    assert!(
+        !run.timed_out,
+        "the planner did not stop on the TERM it sent itself in 30 s: {}{}",
+        run.out, run.err
+    );
+    assert!(
+        left.is_empty(),
+        "a TERM between Popen and the running state left the step alive (pids {left:?}): drain did not know it"
+    );
+    assert_eq!(
+        run.code,
+        Some(2),
+        "TERM stops the planner with 2: {}{}",
+        run.out,
+        run.err
+    );
+}
+
+/// J14b: a step that ended with processes still in its cgroup (a daemon that outlived it) gets `cgroup.kill`, the
+/// planner tries the rmdir again for a while (GATE_DAG_RMDIR_WAIT_S, 5 s by default) and, if the cgroup stays
+/// populated, names the orphans in a `note:`. The verdict is the step's own. With `populated 0` there is no note.
+#[test]
+fn a_step_that_leaves_processes_in_its_cgroup_is_named_an_orphan() {
+    let mut fx = Fixture::new("j14b-orphan", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "a", "-", "0.3", "")]);
+    let kill = fx.step_dir("a").join("cgroup.kill");
+    write(&kill, "");
+    fx.write_step("a", "cgroup.events", "populated 1\nfrozen 0\n");
+    let run = fx.run_env("0", &[("GATE_DAG_RMDIR_WAIT_S", "0.3")]);
+    assert_green(&run, "a step with an orphan");
+    let note = run
+        .text()
+        .lines()
+        .find(|line| line.starts_with("note:") && line.contains("orphan processes"))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no note names the orphan processes: {}", run.text()));
+    assert!(
+        note.contains("paso-10-a"),
+        "the note does not name the cgroup: {note}"
+    );
+    assert_eq!(
+        read(&kill).trim(),
+        "1",
+        "the planner did not write cgroup.kill of the step that left processes"
+    );
+
+    let mut fx = Fixture::new("j14b-sin-huerfanos", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "a", "-", "0.3", "")]);
+    fx.write_step("a", "cgroup.events", "populated 0\nfrozen 0\n");
+    let run = fx.run_env("0", &[("GATE_DAG_RMDIR_WAIT_S", "0.3")]);
+    assert_green(&run, "a step with no orphan");
+    assert!(
+        !run.text().contains("orphan"),
+        "a step that left nothing is named an orphan: {}",
+        run.text()
+    );
+}
+
+/// J14c: `anon` does not see the pages a tmpfs holds (`shmem`), which the postgres of each lane writes under the
+/// cluster root and which are charged to the scope. What the planner samples and records is anon + shmem: here 1 GiB
+/// and 2 GiB are 3 GiB.
+#[test]
+fn the_memory_of_a_step_counts_its_tmpfs_pages() {
+    let mut fx = Fixture::new("j14c-shmem", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "a", "-", "0.3", "")]);
+    fx.write_step(
+        "a",
+        "memory.stat",
+        &format!("anon {GIB}\nshmem {}\ninactive_file 0\n", 2 * GIB),
+    );
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    assert_green(&fx.run("0"), "a step with tmpfs pages");
+    let record = by_id(&records_of(&fx, "pasos.jsonl", &before), "a").clone();
+    assert_eq!(
+        record["anon_max"].as_u64(),
+        Some(3 * GIB),
+        "anon 1 GiB + shmem 2 GiB are 3 GiB of memory the step holds: {record}"
+    );
+}
+
+/// J14c: the estimate that admission reads is anon + shmem too. Two steps of 1 GiB of anon and 4 GiB of tmpfs each
+/// are 6,25 GiB apiece with the margin, so they do not share a 10 GiB scope; counted by anon alone they would (2,5).
+#[test]
+fn admission_counts_the_tmpfs_pages_of_a_step() {
+    let mut fx = Fixture::new("j14c-admision", CPU_FOUR, MEM_R10);
+    fx.table(&[(10, "a", "-", "0.5", ""), (20, "b", "-", "0.5", "")]);
+    for id in ["a", "b"] {
+        fx.write_step(
+            id,
+            "memory.stat",
+            &format!("anon {GIB}\nshmem {}\ninactive_file 0\n", 4 * GIB),
+        );
+    }
+    fx.seed();
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run("1");
+    assert_green(&run, "DAG");
+    let steps = records_of(&fx, "pasos.jsonl", &before);
+    assert!(
+        !overlaps(by_id(&steps, "a"), by_id(&steps, "b")),
+        "two steps with 5 GiB each shared a scope of 10 GiB: the tmpfs pages were not counted"
+    );
+    // The two are the same size, so which of them starts first depends on the durations the seed measured: the one that
+    // starts second is the one that waited.
+    let later = if num(by_id(&steps, "a"), "inicio") <= num(by_id(&steps, "b"), "inicio") {
+        "b"
+    } else {
+        "a"
+    };
+    let waiting = by_id(&steps, later);
+    assert!(
+        num(waiting, "espera_s") > 0.0 && waiting.to_string().contains("ram"),
+        "{later} started second and waited for RAM, and has to say so: {waiting}"
+    );
+}
+
+/// J14d: with a DATABASE_URL in the planner's environment every row shares one server (merge-gate makes no lanes), and
+/// sqlx drops databases by name, so the planner runs in series and says why. The control, without it, is parallel.
+#[test]
+fn an_external_database_url_forces_the_series() {
+    let mut fx = Fixture::new("j14d", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "p", "-", "0.4", ""), (20, "q", "-", "0.4", "")]);
+    fx.seed();
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let control = fx.run("1");
+    assert_green(&control, "the control, no DATABASE_URL");
+    assert!(
+        overlaps(
+            by_id(&records_of(&fx, "pasos.jsonl", &before), "p"),
+            by_id(&records_of(&fx, "pasos.jsonl", &before), "q")
+        ),
+        "the control did not run p and q together, so the scenario below proves nothing"
+    );
+
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run_env("1", &[("DATABASE_URL", "postgresql://x@h/b")]);
+    assert_green(&run, "a DATABASE_URL of the operator");
+    assert!(
+        run.text()
+            .lines()
+            .any(|line| line.starts_with("note:") && line.contains("DATABASE_URL")),
+        "the planner has to say that DATABASE_URL puts it in series: {}",
+        run.text()
+    );
+    let steps = records_of(&fx, "pasos.jsonl", &before);
+    assert!(
+        !overlaps(by_id(&steps, "p"), by_id(&steps, "q")),
+        "two rows shared the server of a DATABASE_URL: sqlx drops databases by name"
+    );
+}
+
+/// J14e: a failure of the planner itself (here, the cgroup directory of the step is a file, so it cannot be made) is
+/// exit 2 with the traceback on stderr, never the 1 of an uncaught exception, which merge-gate reads as a red test.
+/// The run directory is named, because the logs of the steps are in it.
+#[test]
+fn an_internal_failure_is_no_verdict_not_red() {
+    let mut fx = Fixture::new("j14e-interno", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "a", "-", "0.3", "")]);
+    let dir = fx.step_dir("a");
+    fs::remove_dir_all(&dir).expect("the cgroup directory of the step");
+    write(&dir, "not a directory");
+    let run = fx.run("0");
+    assert!(!run.timed_out, "did not finish in 30 s");
+    assert_eq!(
+        run.code,
+        Some(2),
+        "an OSError of the planner is no verdict (2), not a red test (1): {}{}",
+        run.out,
+        run.err
+    );
+    assert!(
+        run.err.contains("Traceback"),
+        "the traceback has to reach stderr: {}",
+        run.err
+    );
+    assert!(
+        run.text()
+            .contains(&format!("{}/memory-industry-dag.", fx.tmp.display())),
+        "the run directory has to be named: {}",
+        run.text()
+    );
+}
+
+/// J14e: when the planner fails inside, the blocks of the steps that finished are printed in idx order and the run
+/// directory is named. s10 (1 s) and s20 (0.1 s) run together, and s30, after s20, cannot start: s20's block was
+/// waiting for s10's, and s10 is stopped by the failure, so both have to come out, in order.
+#[test]
+fn an_internal_failure_prints_the_blocks_that_finished() {
+    let mut fx = Fixture::new("j14e-bloques", CPU_FOUR, MEM_OPEN);
+    fx.table(&[
+        (10, "s10", "-", "1.0", ""),
+        (20, "s20", "-", "0.1", ""),
+        (30, "s30", "s20", "0.1", ""),
+    ]);
+    fx.seed();
+    let dir = fx.step_dir("s30");
+    fs::remove_dir_all(&dir).expect("the cgroup directory of s30");
+    write(&dir, "not a directory");
+    let run = fx.run("1");
+    assert!(!run.timed_out, "did not finish in 30 s");
+    assert_eq!(run.code, Some(2), "{}{}", run.out, run.err);
+    let p10 = run
+        .out
+        .find("=== s10 banner")
+        .unwrap_or_else(|| panic!("the block of s10 was not printed: {}", run.out));
+    let p20 = run.out.find("=== s20 banner").unwrap_or_else(|| {
+        panic!(
+            "the block of s20, which finished, was not printed: {}",
+            run.out
+        )
+    });
+    assert!(p10 < p20, "the blocks are not in idx order: {}", run.out);
+    assert!(
+        run.text()
+            .contains(&format!("{}/memory-industry-dag.", fx.tmp.display())),
+        "the run directory has to be named: {}",
+        run.text()
+    );
+}
+
+/// J14e: a step the kernel killed (OOM) gives no verdict, and its log is not lost: the blocks of the steps that
+/// finished are printed in idx order (s10 is stopped by the planner, s20 died) and the run directory is named.
+#[test]
+fn an_oom_kill_prints_the_blocks_and_names_the_run_directory() {
+    let mut fx = Fixture::new("j14e-oom", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "s10", "-", "1.0", ""), (20, "s20", "-", "0.1", "")]);
+    fx.seed();
+    fx.oom("s20");
+    let run = fx.run("1");
+    assert_eq!(run.code, Some(2), "{}{}", run.out, run.err);
+    assert!(
+        run.err.contains("no verdict") && run.err.contains("s20"),
+        "{}",
+        run.err
+    );
+    let p10 = run
+        .out
+        .find("=== s10 banner")
+        .unwrap_or_else(|| panic!("the block of s10 was not printed: {}", run.out));
+    let p20 = run.out.find("=== s20 banner").unwrap_or_else(|| {
+        panic!(
+            "the block of s20, the step the kernel killed, was not printed: {}",
+            run.out
+        )
+    });
+    assert!(p10 < p20, "the blocks are not in idx order: {}", run.out);
+    assert!(
+        run.text()
+            .contains(&format!("{}/memory-industry-dag.", fx.tmp.display())),
+        "the run directory has to be named: {}",
+        run.text()
+    );
+}
+
+/// J14g: a row that fail-fast stops gets TERM before KILL, so the EXIT trap of its shell runs (the stage of the
+/// mutants, the clusters of a lane). s10 goes red as soon as s20 says it is up; s20, which sleeps 30 s, is stopped and
+/// its trap writes its mark. With KILL straight away the mark is not there.
+#[test]
+fn a_row_the_planner_stops_runs_its_exit_trap() {
+    let mut fx = Fixture::new("j14g-trap", CPU_FOUR, MEM_OPEN);
+    let script = fx.base.join("trap.sh");
+    write(&script, TRAP_SH);
+    bash_table(
+        &mut fx,
+        &[(10, "s10", "0.3", &script), (20, "s20", "0.3", &script)],
+    );
+    fx.seed();
+    for id in ["s10", "s20"] {
+        let _ = fs::remove_file(fx.control.join(format!("mark-{id}")));
+        let _ = fs::remove_file(fx.control.join(format!("up-{id}")));
+    }
+    fx.rc("s10", "1");
+    write(&fx.control.join("wait-for-s10"), "s20");
+    write(&fx.control.join("sleep-s10"), "0.1");
+    write(&fx.control.join("sleep-s20"), "30");
+    let run = fx.run("1");
+    assert!(
+        !run.timed_out,
+        "did not finish in 30 s: {}{}",
+        run.out, run.err
+    );
+    assert_eq!(
+        run.code,
+        Some(1),
+        "the red of s10 is the verdict: {}{}",
+        run.out,
+        run.err
+    );
+    assert_eq!(
+        read(&fx.control.join("mark-s10")).trim(),
+        "exited",
+        "the red step's own trap did not run: the scenario proves nothing"
+    );
+    assert_eq!(
+        read(&fx.control.join("mark-s20")).trim(),
+        "exited",
+        "s20 was stopped without TERM, so its EXIT trap did not run and it cleaned up nothing"
+    );
+}
+
+/// J14g: a row that ignores TERM dies by KILL when the wait ends (GATE_DAG_TERM_GRACE_S, 15 s by default, 1 s here),
+/// and the planner does not hang on it: nothing of it is left and the run ends well before the 30 s of the contract.
+#[test]
+fn a_row_that_ignores_term_dies_by_kill_when_the_grace_ends() {
+    let mut fx = Fixture::new("j14g-sordo", CPU_FOUR, MEM_OPEN);
+    let trap = fx.base.join("trap.sh");
+    let deaf = fx.base.join("sordo.sh");
+    write(&trap, TRAP_SH);
+    write(&deaf, DEAF_SH);
+    bash_table(
+        &mut fx,
+        &[(10, "s10", "0.3", &trap), (20, "s20", "0.3", &deaf)],
+    );
+    fx.seed();
+    for id in ["s10", "s20"] {
+        let _ = fs::remove_file(fx.control.join(format!("up-{id}")));
+    }
+    fx.rc("s10", "1");
+    write(&fx.control.join("wait-for-s10"), "s20");
+    write(&fx.control.join("sleep-s10"), "0.1");
+    write(&fx.control.join("sleep-s20"), "34.2718");
+    let started = Instant::now();
+    let run = fx.run_env("1", &[("GATE_DAG_TERM_GRACE_S", "1")]);
+    let took = started.elapsed();
+    let left = survivors_of("34.2718", 5);
+    assert!(
+        !run.timed_out && took < Duration::from_secs(12),
+        "the planner waited for a row that ignores TERM ({took:?}): {}{}",
+        run.out,
+        run.err
+    );
+    assert_eq!(run.code, Some(1), "{}{}", run.out, run.err);
+    assert!(
+        left.is_empty(),
+        "the row that ignores TERM was not killed when the grace ended (pids {left:?})"
+    );
+}
+
+/// J14k: the key of the history is the rows of the table, normalised: a comment, a blank line or wider spacing does
+/// not change it, so the history stays; a number of a row does, and then there is none. The key is the `tabla` field.
+#[test]
+fn a_comment_keeps_the_history_of_a_table_and_a_number_does_not() {
+    let mut fx = Fixture::new("j14k", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "p", "-", "0.4", ""), (20, "q", "-", "0.4", "")]);
+    fx.seed();
+    let seeded = appended(&fx.history, "pasos.jsonl", &HashMap::new());
+    let key = by_id(&seeded, "p")["tabla"].clone();
+    assert!(
+        key.is_string(),
+        "the series records the key of the table: {key}"
+    );
+
+    let original = fx.table_text();
+    write(
+        &fx.table,
+        &format!(
+            "# a comment above the rows\n\n{}\n# and one below\n",
+            original.replace(' ', "  ")
+        ),
+    );
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run("1");
+    assert_green(&run, "the table with a comment");
+    assert!(
+        !run.text().contains("note: no serial history"),
+        "a comment dropped the history: {}",
+        run.text()
+    );
+    let steps = records_of(&fx, "pasos.jsonl", &before);
+    assert_eq!(
+        by_id(&steps, "p")["tabla"],
+        key,
+        "a comment, a blank line and wider spacing changed the key of the table"
+    );
+    assert!(
+        overlaps(by_id(&steps, "p"), by_id(&steps, "q")),
+        "with its history kept the run is a DAG"
+    );
+
+    write(
+        &fx.table,
+        &original.replacen("normal 1 5 ", "normal 2 5 ", 1),
+    );
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run("1");
+    assert_green(&run, "the table with another number");
+    assert!(
+        run.text().contains("note: no serial history"),
+        "a number of a row changed and the history of the old table was used: {}",
+        run.text()
+    );
+    assert_ne!(
+        by_id(&records_of(&fx, "pasos.jsonl", &before), "p")["tabla"],
+        key,
+        "a number of a row did not change the key of the table"
+    );
+}
+
+/// J14l: the numbers of a row are finite and above 0. `nan`, `inf`, a negative or a 0 in cpu, ram_gb or dur_s is
+/// exit 2 naming the line, the step and the column, before anything starts; a row of good numbers is green.
+#[test]
+fn a_row_with_a_number_that_is_not_finite_and_above_zero_is_refused() {
+    let cases = [
+        ("cpu", "nan"),
+        ("cpu", "inf"),
+        ("cpu", "-1"),
+        ("cpu", "0"),
+        ("ram_gb", "nan"),
+        ("ram_gb", "-2"),
+        ("ram_gb", "0"),
+        ("dur_s", "inf"),
+        ("dur_s", "0"),
+    ];
+    for (column, bad) in cases {
+        let fx = Fixture::new("j14l", CPU_FOUR, MEM_OPEN);
+        let (cpu, ram, dur) = match column {
+            "cpu" => (bad, "5", "0.05"),
+            "ram_gb" => ("1", bad, "0.05"),
+            _ => ("1", "5", bad),
+        };
+        write(
+            &fx.table,
+            &format!("10 rowx - - normal {cpu} {ram} {dur} /bin/true\n"),
+        );
+        let run = fx.run("0");
+        assert!(!run.timed_out, "{column}={bad}: did not finish in 30 s");
+        assert_eq!(
+            run.code,
+            Some(2),
+            "{column}={bad}: exit {:?}, want 2\n{}{}",
+            run.code,
+            run.out,
+            run.err
+        );
+        assert!(
+            run.err.contains("table line 1")
+                && run.err.contains("rowx")
+                && run.err.contains(column),
+            "{column}={bad}: the refusal does not name the line, the step and the column: {}",
+            run.err
+        );
+    }
+    let fx = Fixture::new("j14l-verde", CPU_FOUR, MEM_OPEN);
+    write(&fx.table, "10 rowx - - normal 1 5 0.05 /bin/true\n");
+    assert_green(&fx.run("0"), "a row of good numbers");
+}
