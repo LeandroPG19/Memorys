@@ -8,10 +8,12 @@ license = "Apache-2.0"
 [[bin]]
 name = "memory-industry"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "cuba-memorys"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 half = "2"
