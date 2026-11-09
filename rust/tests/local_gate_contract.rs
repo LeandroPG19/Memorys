@@ -5028,3 +5028,289 @@ fn no_judge_script_names_the_gate_audit_outside_its_comments() {
         }
     }
 }
+
+/// CI-F5c (D-F5w, D-F5x): `memory-industry` and `cuba-memorys` are two `[[bin]]` of one file. Each gets its own test
+/// harness unless it says `test = false`, and `main.rs` has no tests, so every harness is a compile that runs 0 tests.
+/// G1 keeps the flag on both; G2 keeps `main.rs` from growing code that the flag would stop from ever running.
+struct ManifestBin {
+    name: String,
+    path: String,
+    test_false: bool,
+}
+
+fn manifest_bins(manifest: &str) -> Vec<ManifestBin> {
+    let mut bins: Vec<ManifestBin> = Vec::new();
+    let mut in_bin = false;
+    for raw in manifest.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            in_bin = line == "[[bin]]";
+            if in_bin {
+                bins.push(ManifestBin {
+                    name: String::new(),
+                    path: String::new(),
+                    test_false: false,
+                });
+            }
+            continue;
+        }
+        let (Some(bin), Some((key, value))) =
+            (bins.last_mut().filter(|_| in_bin), line.split_once('='))
+        else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        match key.trim() {
+            "name" => bin.name = value.to_string(),
+            "path" => bin.path = value.to_string(),
+            "test" => bin.test_false = value == "false",
+            _ => {}
+        }
+    }
+    bins
+}
+
+/// Every way the two bins can stop being what G1 requires, one line each. Empty means green.
+fn bin_harness_problems(manifest: &str) -> Vec<String> {
+    let bins = manifest_bins(manifest);
+    if bins.len() != 2 {
+        return vec![format!("found {} [[bin]], expected 2", bins.len())];
+    }
+    let mut problems = Vec::new();
+    for (i, bin) in bins.iter().enumerate() {
+        let other = &bins[1 - i];
+        if bin.path != "src/main.rs" || other.path != "src/main.rs" {
+            problems.push(format!(
+                "[[bin]] {} has path {:?} and {} has {:?}: both must be src/main.rs, or this guard has nothing to guard",
+                bin.name, bin.path, other.name, other.path
+            ));
+        } else if !bin.test_false {
+            problems.push(format!(
+                "{} shares {} with {} and has no test = false",
+                bin.name, bin.path, other.name
+            ));
+        }
+    }
+    let mut names: Vec<&str> = bins.iter().map(|b| b.name.as_str()).collect();
+    names.sort_unstable();
+    if names != ["cuba-memorys", "memory-industry"] {
+        problems.push(format!(
+            "[[bin]] names are {names:?}, expected cuba-memorys and memory-industry"
+        ));
+    }
+    problems
+}
+
+/// The attribute text of every `#[...]` on the line, with string literals cut out (`rename = "test"` is not a test).
+fn attributes_in(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(start) = rest.find("#[") {
+        let after = &rest[start + 2..];
+        let end = after.find(']').unwrap_or(after.len());
+        out.push(after[..end].split('"').step_by(2).collect::<String>());
+        rest = &after[end..];
+    }
+    out
+}
+
+fn names_a_test(attribute: &str) -> bool {
+    attribute
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == "test")
+}
+
+fn declares_out_of_line_module(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    if let Some(after_pub) = rest.strip_prefix("pub") {
+        rest = after_pub.trim_start();
+        if rest.starts_with('(') {
+            rest = rest
+                .split_once(')')
+                .map_or("", |(_, after)| after)
+                .trim_start();
+        }
+    }
+    let name = rest.strip_prefix("mod ")?.trim().strip_suffix(';')?;
+    Some(name.trim())
+}
+
+/// What a bin with `test = false` must not contain: test code and `mod x;` (its file would be one more place for tests).
+fn test_code_problems(path: &str, source: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let number = index + 1;
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        if attributes_in(line).iter().any(|a| names_a_test(a)) {
+            problems.push(format!(
+                "{path}:{number}: a test in a bin with test = false never runs"
+            ));
+        }
+        if let Some(name) = declares_out_of_line_module(line) {
+            problems.push(format!("{path}:{number}: mod {name}; would hide its tests"));
+        }
+    }
+    problems
+}
+
+const TWO_BINS_WITH_THE_FLAG: &str = "\
+[package]
+name = \"memory-industry\"
+
+[[bin]]
+name = \"memory-industry\"
+path = \"src/main.rs\"
+test = false
+
+[[bin]]
+name = \"cuba-memorys\"
+path = \"src/main.rs\"
+test = false
+
+[dependencies]
+half = \"2\"
+";
+
+#[test]
+fn los_bins_that_share_main_rs_all_carry_test_false() {
+    let problems = bin_harness_problems(&read("rust/Cargo.toml"));
+    assert!(
+        problems.is_empty(),
+        "rust/Cargo.toml: every [[bin]] compiled from src/main.rs needs test = false, or cargo builds a test harness per bin that runs 0 tests (CI-F5c):\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn los_bins_with_test_false_hide_no_tests_in_their_source() {
+    let manifest = read("rust/Cargo.toml");
+    let bins = manifest_bins(&manifest);
+    assert!(
+        !bins.is_empty(),
+        "rust/Cargo.toml has no [[bin]]: G2 would check nothing"
+    );
+    let mut paths: Vec<&str> = bins.iter().map(|b| b.path.as_str()).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let mut problems = Vec::new();
+    for path in paths {
+        let source = read(&format!("rust/{path}"));
+        assert!(
+            source.contains("fn main"),
+            "rust/{path} is declared as a [[bin]] but has no `fn main`: G2 is reading the wrong file"
+        );
+        problems.extend(test_code_problems(path, &source));
+    }
+    assert!(
+        problems.is_empty(),
+        "a [[bin]] with test = false is never compiled as a test; this code would stop running:\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn los_bins_guard_g1_goes_red_on_the_bin_that_lacks_test_false_and_only_on_it() {
+    assert_eq!(
+        bin_harness_problems(TWO_BINS_WITH_THE_FLAG),
+        Vec::<String>::new()
+    );
+    let sabotaged = TWO_BINS_WITH_THE_FLAG.replacen(
+        "path = \"src/main.rs\"\ntest = false\n\n[dependencies]",
+        "path = \"src/main.rs\"\n\n[dependencies]",
+        1,
+    );
+    assert_ne!(
+        sabotaged, TWO_BINS_WITH_THE_FLAG,
+        "the fixture sabotage must change the manifest"
+    );
+    assert_eq!(
+        bin_harness_problems(&sabotaged),
+        ["cuba-memorys shares src/main.rs with memory-industry and has no test = false"]
+    );
+    let flag_true = TWO_BINS_WITH_THE_FLAG.replacen("test = false", "test = true", 1);
+    assert_eq!(
+        bin_harness_problems(&flag_true),
+        ["memory-industry shares src/main.rs with cuba-memorys and has no test = false"]
+    );
+}
+
+#[test]
+fn los_bins_guard_g1_never_goes_green_by_finding_fewer_than_two_bins() {
+    let renamed = TWO_BINS_WITH_THE_FLAG.replacen("[[bin]]", "[[binx]]", 1);
+    assert_eq!(
+        bin_harness_problems(&renamed),
+        ["found 1 [[bin]], expected 2"]
+    );
+    assert_eq!(
+        bin_harness_problems("[package]\nname = \"x\"\n"),
+        ["found 0 [[bin]], expected 2"]
+    );
+    let third = format!(
+        "{TWO_BINS_WITH_THE_FLAG}\n[[bin]]\nname = \"third\"\npath = \"src/third.rs\"\ntest = false\n"
+    );
+    assert_eq!(
+        bin_harness_problems(&third),
+        ["found 3 [[bin]], expected 2"]
+    );
+    let moved =
+        TWO_BINS_WITH_THE_FLAG.replacen("path = \"src/main.rs\"", "path = \"src/other.rs\"", 1);
+    assert!(
+        bin_harness_problems(&moved)
+            .iter()
+            .any(|p| p.contains("both must be src/main.rs")),
+        "bins that no longer share src/main.rs leave G2 guarding the wrong file"
+    );
+}
+
+#[test]
+fn los_bins_guard_g2_goes_red_on_test_code_and_on_out_of_line_modules() {
+    let source = "fn main() {}\n\n#[cfg(test)] mod t { #[test] fn x() {} }\n";
+    assert_eq!(
+        test_code_problems("src/main.rs", source),
+        ["src/main.rs:3: a test in a bin with test = false never runs"]
+    );
+    let source = "fn main() {}\nmod extra;\npub mod more;\npub(crate) mod third;\n";
+    assert_eq!(
+        test_code_problems("src/main.rs", source),
+        [
+            "src/main.rs:2: mod extra; would hide its tests",
+            "src/main.rs:3: mod more; would hide its tests",
+            "src/main.rs:4: mod third; would hide its tests",
+        ]
+    );
+    for attribute in [
+        "#[test]",
+        "#[tokio::test]",
+        "#[tokio::test(flavor = \"multi_thread\")]",
+        "#[cfg(all(test, unix))]",
+        "#[cfg_attr(test, derive(Debug))]",
+    ] {
+        let source = format!("fn main() {{}}\n    {attribute}\nfn t() {{}}\n");
+        assert_eq!(
+            test_code_problems("src/main.rs", &source),
+            ["src/main.rs:2: a test in a bin with test = false never runs"],
+            "{attribute} must be caught"
+        );
+    }
+}
+
+#[test]
+fn los_bins_guard_g2_lets_ordinary_code_through() {
+    let source = "\
+#[global_allocator]
+static A: u8 = 0;
+// #[test] in a comment, and mod gone;
+/// #[cfg(test)]
+#[cfg(unix)]
+#[cfg(not(unix))]
+#[serde(rename = \"test\")]
+mod inline_is_fine {}
+fn main() { let mod_x = 1; let test = 2; }
+";
+    assert_eq!(
+        test_code_problems("src/main.rs", source),
+        Vec::<String>::new()
+    );
+}
