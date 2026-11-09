@@ -1678,10 +1678,35 @@ fn no_more_than_two_rows_with_models_are_alive_at_once() {
             "three steps with models alive at t={start}: {alive} of the rows with models were running"
         );
     }
-    let third = by_id(&pasos, "m3");
+    // The planner ranks by critical path with the durations of the history, so which of the three starts last is not
+    // fixed: exactly one row waits for the semaphore, and the other two never name it as their reason.
+    let waited: Vec<&str> = ["m1", "m2", "m3"]
+        .into_iter()
+        .filter(|id| {
+            let record = by_id(&pasos, id);
+            num(record, "espera_s") > 0.0 && record["motivo"].as_str() == Some("models")
+        })
+        .collect();
+    let named_models = ["m1", "m2", "m3"]
+        .into_iter()
+        .filter(|id| by_id(&pasos, id)["motivo"].as_str() == Some("models"))
+        .count();
     assert!(
-        num(third, "espera_s") > 0.0 && third["motivo"].as_str() == Some("models"),
-        "the third row with models must wait with espera_s > 0 and motivo models: {third}"
+        waited.len() == 1 && named_models == 1,
+        "exactly one of the three rows with models must wait with espera_s > 0 and motivo models, and the other two \
+         must not name models as their reason; got {} that waited and {named_models} that name models: {}",
+        waited.len(),
+        ["m1", "m2", "m3"]
+            .into_iter()
+            .map(|id| {
+                let r = by_id(&pasos, id);
+                format!(
+                    "{id}(inicio={}, espera_s={}, motivo={})",
+                    r["inicio"], r["espera_s"], r["motivo"]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 }
 
