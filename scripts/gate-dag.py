@@ -992,7 +992,11 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="run a step table: GATE_DAG=0 series, GATE_DAG=1 DAG")
     run.add_argument("--table", required=True)
     run.add_argument("--timed-end", default=None, help="the line printed before the first untimed block (CI-F3.3b-2)")
+    commands.add_parser("allowed-env", help="print the closed list of a step's environment, one name per line (CI-J13)")
     args = parser.parse_args(argv)
+    if args.command == "allowed-env":
+        sys.stdout.write("".join(f"{name}\n" for name in sorted(ALLOWED_ENV)))
+        return 0
     try:
         return run_table(args.table, args.timed_end)
     except Refusal as err:

@@ -2005,6 +2005,10 @@ echo ""
 # is this gate's verdict: exit 2, in the exit file, with the lock released.
 gate_linux_env
 
+# The targets of the trees that no longer exist, swept: after the lock (a gate that is refused has touched
+# nothing) and after gate_linux_env, which is what gives CARGO_TARGET_DIR its default (gate-lock.sh says why).
+gate_sweep_dead_targets
+
 # A cargo target inside rust/ (or a CARGO_TARGET_DIR that will be one) is copied
 # whole into every job of the mutation step, the last of this gate: it used to be
 # refused there, ~20 min of tests later. Nothing is printed unless it refuses; the

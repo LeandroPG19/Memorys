@@ -935,7 +935,7 @@ ga_run() { # --run: la auditoria de verdad, en serie y con la tabla de gate-dag.
   local tree_key t c arc=0 rc traced part gen
   local -a ids=() parts=() only_ids=() words=() rows=()
   local -A deps_of=() cls_of=()
-  local -A traced_id=([D1]=1 [D2]=1 [NLI]=1 [D3]=1 [R]=1 [E]=1 [DC]=1 [CV]=1 [M]=1)
+  local -A traced_id=([DBG]=1 [NLI]=1 [REL]=1 [E2E]=1 [DC]=1 [CV]=1 [M]=1)
   while (( $# )); do
     case "$1" in
       --step) only="${2:-}"; shift 2 ;;
