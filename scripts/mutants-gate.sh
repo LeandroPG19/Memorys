@@ -25,6 +25,12 @@
 #   ./scripts/mutants-gate.sh --default-jobs [CORES MEMINFO]
 #                                                   both, read from this machine
 #                                                   (quality-gate.sh asks this)
+#   ./scripts/mutants-gate.sh --lab-run OUT_DIR WANT_JOBS -- ARGS...
+#                                                   cargo-mutants over ARGS in the lab of this
+#                                                   script (seed, stage, shim, guards); prints
+#                                                   jobs=<n>, leaves cargo-mutants' exit in
+#                                                   OUT_DIR/cargo-mutants.rc and its output in
+#                                                   OUT_DIR/mutants.out (quality-gate.sh asks this)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -818,6 +824,83 @@ if os.path.exists(shim_log):
         line += f"; failed in {', '.join(failed)}"
     print(line)
 PY
+}
+
+# The stage is this run's and goes whatever the outcome (D-F4f); the scratch it lives in is the judge's own,
+# so only a stage.* directly under it is ever removed.
+mutants_stage_drop() {
+  if [[ -n "${MUTANTS_STAGE:-}" && "$MUTANTS_STAGE" == "${MUTANTS_SCRATCH:-}"/stage.* ]]; then
+    rm -rf "$MUTANTS_STAGE"
+  fi
+}
+
+# CI-F6 (F6a, D-F6b): the lab of both judges. The seed is built or found, this run's stage is made and judged to
+# be the tree that is judged, and cargo-mutants runs on the stage with the shim as CARGO; afterwards the seed is
+# compared with itself and the lab line is printed. quality-gate.sh reaches this through --lab-run and has none of
+# it of its own: a second copy of the seed or of the shim would be a second lab to keep in step.
+#   mutants_lab_run OUT_DIR JOBS ARGS...
+# OUT_DIR is where cargo-mutants writes (`--output`) and where the lab keeps its own files. ARGS are the
+# arguments of cargo-mutants after `mutants`; the lab's own go after the leading `--file` pairs, so the call
+# still reads `mutants --file ...` as it always has (the rows and the logs look for that line) and the caller's
+# `--cargo-arg=--lib` and `-- <test filter>` stay last. cargo-mutants' exit is MUTANTS_LAB_RC: whether it
+# found a missed mutant is the caller's verdict, and the return status is the guards' (1: red).
+# Needs MUTANTS_SCRATCH, SEED_ROOT, MUTANTS_SHIM_REAL_CARGO and GATE_CARGO_JOBS, which the callers set. It does
+# not use `set -e`: the callers run with it off, and every step here answers for its own status.
+mutants_lab_run() {
+  OUT_DIR="$1"
+  local jobs="$2" build_jobs shim_scratch seed_epoch scratch_native
+  local -a lead=()
+  shift 2
+  mutants_seed_ensure || return $?
+  mutants_stage_make || return $?
+  mutants_tree_guard "$ROOT/rust" "$MUTANTS_STAGE/rust" || return $?
+  mutants_seed_stamp "$SEED_DIR/target" > "$OUT_DIR/seed.before" || return $?
+  # D-F4p: the epoch is the newest mtime of the seed (the third field of seed.before), never the start of this run.
+  seed_epoch="$(awk '{print $NF}' "$OUT_DIR/seed.before" | LC_ALL=C sort -n | tail -n 1)"
+  shim_scratch="$(cd "$MUTANTS_SCRATCH" && pwd -P)"
+  scratch_native="$(cygpath -w "$MUTANTS_SCRATCH" 2>/dev/null || printf '%s' "$MUTANTS_SCRATCH")"
+  # The build of each mutant gets its share of the cores the gate counted (CI-F1, D-F1b): max(1, floor(N / jobs)).
+  build_jobs=$(( GATE_CARGO_JOBS / jobs ))
+  (( build_jobs >= 1 )) || build_jobs=1
+  mkdir -p "$OUT_DIR/bin"
+  printf '%s\n' '#!/bin/sh' "exec bash '$ROOT/scripts/mutants-gate.sh' --cargo-shim \"\$@\"" > "$OUT_DIR/bin/cargo-shim"
+  chmod +x "$OUT_DIR/bin/cargo-shim"
+  while [[ "${1:-}" == --file && $# -ge 2 ]]; do
+    lead+=("$1" "$2")
+    shift 2
+  done
+  # The scratch is the judge's own directory, in the three spellings of the temp dir: TMP and TEMP are what
+  # cargo-mutants reads on Windows (TMPDIR moves nothing there), TMPDIR what it reads on Unix. Debug info is off
+  # for this command only: on 2026-10-13 7.6 of the 14.1 GB of a copy's target were .pdb, and with it off the copy
+  # was 8.94 GB, 37 % smaller. Prefix assignments, so nothing else in the gate sees them. --jobserver-tasks is
+  # the CPUs the judge counts (D-F6c): with the jobserver cargo-mutants hands down, cargo takes its tokens and
+  # ignores -j, so the CARGO_BUILD_JOBS above bounds nothing and the number of tokens is what does.
+  MUTANTS_LAB_RC=0
+  env "${MUTANTS_PROFILE_ENV[@]}" TMP="$scratch_native" TEMP="$scratch_native" TMPDIR="$MUTANTS_SCRATCH" \
+  CARGO="$OUT_DIR/bin/cargo-shim" CARGO_BUILD_JOBS="$build_jobs" \
+  MUTANTS_SHIM_SCRATCH="$shim_scratch" MUTANTS_SHIM_EPOCH="$seed_epoch" \
+  MUTANTS_SHIM_REAL_CARGO="$MUTANTS_SHIM_REAL_CARGO" MUTANTS_SHIM_LOG="$OUT_DIR/mtime-shim.log" \
+  cargo-mutants mutants ${lead[@]+"${lead[@]}"} \
+    --dir "$MUTANTS_STAGE/rust" \
+    --copy-target=true \
+    --jobserver-tasks "$GATE_CARGO_JOBS" \
+    --jobs "$jobs" \
+    --output "$OUT_DIR" \
+    "$@" || MUTANTS_LAB_RC=$?
+  # CI-F4 (D-F4i): a run that changed the seed is refused, and the seed goes with it.
+  mutants_seed_stamp "$SEED_DIR/target" > "$OUT_DIR/seed.after" || return $?
+  if ! cmp -s "$OUT_DIR/seed.before" "$OUT_DIR/seed.after"; then
+    rm -rf "$SEED_DIR"
+    echo "FAIL: the seed changed during the run ($SEED_DIR); it is removed and the next run builds it again" >&2
+    return 1
+  fi
+  echo "OK  seed unchanged"
+  # CI-F4 (D-F4j', F4d): the first build of each lab says whether the seed's mtimes were hit. A miss is a line,
+  # not a verdict: cargo rebuilds what is missing, and the time is what the step's ceiling watches.
+  if [[ -f "$OUT_DIR/mutants.out/outcomes.json" ]]; then
+    mutants_lab_builds "$OUT_DIR/mutants.out/outcomes.json"
+  fi
+  return 0
 }
 
 # --- self-test begin ---
@@ -2760,6 +2843,35 @@ case "${1:-}" in
     mutants_default_jobs "${2:-}" "${3:-}" || exit $?
     exit 0
     ;;
+  "--lab-run")
+    # CI-F6 (F6a, D-F6b): what the main path below does around cargo-mutants, for another script. Exit 0 when the
+    # guards held, whatever cargo-mutants said (its exit is in OUT_DIR/cargo-mutants.rc); 1 when one of them did
+    # not (the tree, the seed); 2 for what the environment lacks or the arguments omit.
+    if [[ $# -lt 5 || "$4" != -- || -z "$2" ]]; then
+      echo "FAIL: --lab-run needs OUT_DIR WANT_JOBS -- ARGS... (got $# arguments)" >&2
+      exit 2
+    fi
+    lab_out="$2"
+    lab_want="$3"
+    shift 4
+    command -v cargo-mutants >/dev/null 2>&1 || { echo "FAIL: cargo-mutants is required. Install: cargo install cargo-mutants" >&2; exit 2; }
+    MUTANTS_SHIM_REAL_CARGO="$(command -v cargo || true)"
+    if [[ -z "$MUTANTS_SHIM_REAL_CARGO" || ! -x "$MUTANTS_SHIM_REAL_CARGO" ]]; then
+      echo "FAIL: no cargo to hand to the shim (command -v cargo found none): no mutant runs" >&2
+      exit 2
+    fi
+    mkdir -p "$lab_out" || exit 2
+    unset CARGO_TARGET_DIR
+    cd "$ROOT/rust"
+    mutants_prepare_scratch "$lab_want" || exit $?
+    gate_cargo_jobs
+    echo "jobs=$MUTANTS_PLANNED_JOBS"
+    SEED_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/mutants-seed"
+    trap mutants_stage_drop EXIT
+    mutants_lab_run "$lab_out" "$MUTANTS_PLANNED_JOBS" "$@" || exit $?
+    printf '%s\n' "$MUTANTS_LAB_RC" > "$lab_out/cargo-mutants.rc"
+    exit 0
+    ;;
   "") ;;
   *) echo "FAIL: unknown argument '$1'" >&2; exit 2 ;;
 esac
@@ -2796,11 +2908,7 @@ OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/memory-industry-mutants-out.XXXXXX")"
 # A green run takes its own directory away; a red one keeps it, and says where, for the diagnosis.
 mutants_keep_out() {
   local code=$?
-  # The stage is this run's and goes whatever the outcome (D-F4f); the scratch it lives in
-  # is the judge's own, so only a stage.* directly under it is ever removed.
-  if [[ -n "${MUTANTS_STAGE:-}" && "$MUTANTS_STAGE" == "${MUTANTS_SCRATCH:-}"/stage.* ]]; then
-    rm -rf "$MUTANTS_STAGE"
-  fi
+  mutants_stage_drop
   # CI-F4c: the run's mutants.out is kept whatever the outcome, when MUTANTS_KEEP_OUT named a
   # directory this run checked was new or empty (MUTANTS_KEEP_READY, set before cargo mutants).
   if [[ "${MUTANTS_KEEP_READY:-0}" == 1 && -d "$OUT_DIR/mutants.out" ]]; then
@@ -2838,7 +2946,6 @@ fi
 # decides before anything is copied.
 mutants_prepare_scratch "$MUTANTS_JOBS" || exit $?
 MUTANTS_JOBS="$MUTANTS_PLANNED_JOBS"
-SCRATCH_NATIVE="$(cygpath -w "$MUTANTS_SCRATCH" 2>/dev/null || printf '%s' "$MUTANTS_SCRATCH")"
 
 echo "=== cargo mutants (search cores with dense unit tests) ==="
 # judge.rs / tools.rs / full search/* generate 655 mutants (~12h) and miss
@@ -2858,11 +2965,9 @@ set +e
 # tests red in rrf.rs and eval/datasets.rs, on sources nobody had touched.
 unset CARGO_TARGET_DIR
 
-# Each mutant build takes its share of the cores the gate counted (CI-F1, D-F1b):
-# max(1, floor(N / MUTANTS_JOBS)), N being the gate's CARGO_BUILD_JOBS. --jobs is unchanged.
+# The cores the gate counted (CI-F1, D-F1b): mutants_lab_run gives each mutant build its share, and the
+# jobserver cargo-mutants hands down its tokens (D-F6c).
 gate_cargo_jobs
-mutants_build_jobs=$(( GATE_CARGO_JOBS / MUTANTS_JOBS ))
-(( mutants_build_jobs >= 1 )) || mutants_build_jobs=1
 
 # CI-F4c: MUTANTS_KEEP_OUT names the directory that keeps this run's mutants.out. It must be
 # new or empty, so that two runs never mix: otherwise the run stops here, before cargo mutants.
@@ -2878,17 +2983,9 @@ fi
 # CI-F4 (F4b): the seed is built or found, and this run's stage is a copy of rust/ with a copy
 # of the seed's target. Both before cargo mutants, never alongside it. The tree that is
 # mutated is judged the tree that is judged, and the seed is measured before the mutants run.
+# CI-F6 (D-F6b): all of that, the call and the seed's check after it are mutants_lab_run, which
+# quality-gate.sh reaches through --lab-run.
 SEED_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/mutants-seed"
-mutants_seed_ensure || exit $?
-mutants_stage_make || exit $?
-mutants_tree_guard "$ROOT/rust" "$MUTANTS_STAGE/rust" || exit $?
-mutants_seed_stamp "$SEED_DIR/target" > "$OUT_DIR/seed.before" || exit $?
-# D-F4p: the epoch is the newest mtime of the seed (the third field of seed.before), never the start of this run.
-seed_epoch="$(awk '{print $NF}' "$OUT_DIR/seed.before" | LC_ALL=C sort -n | tail -n 1)"
-shim_scratch="$(cd "$MUTANTS_SCRATCH" && pwd -P)"
-mkdir -p "$OUT_DIR/bin"
-printf '%s\n' '#!/bin/sh' "exec bash '$ROOT/scripts/mutants-gate.sh' --cargo-shim \"\$@\"" > "$OUT_DIR/bin/cargo-shim"
-chmod +x "$OUT_DIR/bin/cargo-shim"
 
 # --timeout is 180, not 90. That budget was set when this ran two at a time;
 # at six, a slow test reported TIMEOUT instead of the CAUGHT it actually was,
@@ -2899,46 +2996,21 @@ chmod +x "$OUT_DIR/bin/cargo-shim"
 # tries to run `--timeout` as a program. That is rc=127, and it is how this
 # script failed the gate once already.
 #
-# The scratch is the judge's own directory, in the three spellings of the temp
-# dir: TMP and TEMP are what cargo-mutants reads on Windows (TMPDIR moves
-# nothing there), TMPDIR what it reads on Unix. Debug info is off for this
-# command only: on 2026-10-13 7.6 of the 14.1 GB of a copy's target were .pdb,
-# and with it off the copy was 8.94 GB, 37 % smaller. Prefix assignments, so
-# nothing else in the gate sees them.
-env "${MUTANTS_PROFILE_ENV[@]}" TMP="$SCRATCH_NATIVE" TEMP="$SCRATCH_NATIVE" TMPDIR="$MUTANTS_SCRATCH" \
-CARGO="$OUT_DIR/bin/cargo-shim" CARGO_BUILD_JOBS="$mutants_build_jobs" \
-MUTANTS_SHIM_SCRATCH="$shim_scratch" MUTANTS_SHIM_EPOCH="$seed_epoch" \
-MUTANTS_SHIM_REAL_CARGO="$MUTANTS_SHIM_REAL_CARGO" MUTANTS_SHIM_LOG="$OUT_DIR/mtime-shim.log" \
-cargo-mutants mutants \
+mutants_lab_run "$OUT_DIR" "$MUTANTS_JOBS" \
   "${MUTANTS_FILES[@]}" \
-  --dir "$MUTANTS_STAGE/rust" \
-  --copy-target=true \
   --timeout 180 \
-  --jobs "$MUTANTS_JOBS" \
-  --output "$OUT_DIR" \
   --cargo-arg=--lib \
   -- search::
-mutants_rc=$?
+lab_rc=$?
 set -e
-
-# CI-F4 (D-F4i): a run that changed the seed is refused, and the seed goes with it.
-mutants_seed_stamp "$SEED_DIR/target" > "$OUT_DIR/seed.after" || exit $?
-if ! cmp -s "$OUT_DIR/seed.before" "$OUT_DIR/seed.after"; then
-  rm -rf "$SEED_DIR"
-  echo "FAIL: the seed changed during the run ($SEED_DIR); it is removed and the next run builds it again" >&2
-  exit 1
-fi
-echo "OK  seed unchanged"
+(( lab_rc == 0 )) || exit "$lab_rc"
+mutants_rc="$MUTANTS_LAB_RC"
 
 MUTANTS_JSON="$OUT_DIR/mutants.out/outcomes.json"
 if [[ ! -f "$MUTANTS_JSON" ]]; then
   echo "FAIL: cargo mutants produced no outcomes.json (rc=$mutants_rc)" >&2
   exit 1
 fi
-
-# CI-F4 (D-F4j', F4d): the first build of each lab says whether the seed's mtimes were hit. A miss is a line,
-# not a verdict: cargo rebuilds what is missing, and the time is what the step's ceiling watches.
-mutants_lab_builds "$MUTANTS_JSON"
 
 check_builds "$MUTANTS_JSON"
 

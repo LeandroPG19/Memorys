@@ -406,6 +406,82 @@ unused_exclusions() {
 # behind by an earlier one, and then to the same check the SIL uses: the rule
 # and its --self-test live in mutants-gate.sh, not in a copy here.
 #
+# CI-F6 (F6a, D-F6a): QG_SELECT chooses how the step reaches cargo-mutants.
+#   legacy  the call of before F6, byte for byte: `cargo mutants ... -- --lib`, the full copy of rust/ per job. It
+#           is the judge the study compares against (D-F6p), and the way back.
+#   full    the default: the same mutants and the same verdict through the lab of mutants-gate.sh (--lab-run),
+#           which builds only the lib test of each mutant from a seed of the dependencies (CI-F4).
+# A mode that selects each mutant's tests by coverage is not here: it is adopted only after a study of the
+# classes of every mutant, run against `legacy`, with 0 differences, noted in the backlog (D-F6q). Until then
+# the default stays `full`, which changes no test.
+#
+# QG_KEEP_OUT=DIR keeps the outcomes of this run in DIR/<mode>/ (green or red). It is a directory of this run's:
+# one that is not empty is exit 2 before anything is mutated, so that two runs never mix (D-F6f).
+mutate_and_judge() {
+  local out rc=0 want="${MUTANTS_JOBS:-}" mode="${QG_SELECT:-full}"
+  case "$mode" in
+    legacy | full) ;;
+    *)
+      echo "FAIL: QG_SELECT=$mode is not a mode of the mutation step (legacy or full). A mode that selects tests by coverage needs a study with 0 differences, noted in the backlog, before it is the default (D-F6q)." >&2
+      return 2
+      ;;
+  esac
+  if [[ -n "${QG_KEEP_OUT:-}" ]]; then
+    if [[ -n "$(ls -A "$QG_KEEP_OUT" 2>/dev/null || true)" ]]; then
+      echo "FAIL: QG_KEEP_OUT=$QG_KEEP_OUT is not empty; name a new directory so that runs do not mix" >&2
+      return 2
+    fi
+    mkdir -p "$QG_KEEP_OUT" || return 2
+  fi
+  echo "mode: $mode"
+  [[ -n "$want" ]] || want="$(qg_mutants_jobs)" || return $?
+  out="$(mktemp -d)"
+  if [[ "$mode" == full ]]; then
+    qg_mutate_full "$want" "$out" "${@}" || rc=1
+  else
+    qg_mutate_legacy "$want" "$out" "${@}" || rc=$?
+  fi
+  if [[ -f "$out/mutants.out/outcomes.json" ]]; then
+    "$ROOT/scripts/mutants-gate.sh" --check-builds "$out/mutants.out/outcomes.json" || rc=1
+  else
+    echo "no outcomes.json: cargo mutants built no mutant, so there is no build to judge"
+  fi
+  if [[ -n "${QG_KEEP_OUT:-}" && -d "$out/mutants.out" ]]; then
+    mkdir -p "$QG_KEEP_OUT/$mode" && cp -a "$out/mutants.out/." "$QG_KEEP_OUT/$mode/" && echo "kept: $QG_KEEP_OUT/$mode"
+  fi
+  rm -rf "$out"
+  return "$rc"
+}
+
+# qg_mutate_full WANT OUT ARGS...: cargo-mutants through the lab of mutants-gate.sh. Everything around it (the
+# disk, the scratch, the seed, the stage, the shim, the jobserver) is the lab's, and the lab's own --self-test
+# proves it; here is only what the diff judge adds: the exclusions, the timeout, and `--cargo-arg=--lib` so each
+# mutant builds the lib test and not the 116 binaries of tests/. Nothing goes after a `--`: a `-- --lib`
+# there reaches only the test phase (CI-F4, F4a). The verdict is cargo-mutants' exit: 2 (a mutant was missed)
+# and 3 (one timed out) are red; so is anything else that is not 0.
+qg_mutate_full() {
+  local want="$1" out="$2" lab_rc=0 crc
+  shift 2
+  "$ROOT/scripts/mutants-gate.sh" --lab-run "$out" "$want" -- "$@" \
+    --exclude-re "$MUTANTS_EXCLUDE_RE" --timeout 90 --gitignore=false \
+    --cargo-arg=--lib || lab_rc=$?
+  if (( lab_rc != 0 )); then
+    echo "FAIL: mutants-gate.sh --lab-run exited $lab_rc" >&2
+    return 1
+  fi
+  crc="$(cat "$out/cargo-mutants.rc" 2>/dev/null || true)"
+  case "$crc" in
+    0) return 0 ;;
+    2) echo "FAIL: cargo-mutants rc=2: at least one mutant was missed" >&2 ;;
+    3) echo "FAIL: cargo-mutants rc=3: at least one mutant timed out" >&2 ;;
+    *) echo "FAIL: cargo-mutants rc=${crc:-unknown}" >&2 ;;
+  esac
+  return 1
+}
+
+# qg_mutate_legacy WANT OUT ARGS...: the call of before F6, with the rules that were here: the disk before
+# anything is copied (mutants-gate.sh --prepare-scratch), the jobs that fit, the judge's own scratch.
+#
 # That directory is named to cargo-mutants in the spelling cygpath -m gives.
 # cargo-mutants is a Windows program under Git Bash, and MSYS rewrites an
 # argument that looks like a POSIX path when it launches one — measured on
@@ -432,9 +508,9 @@ unused_exclusions() {
 # TMP and TEMP are what cargo-mutants reads as its temp dir on Windows, TMPDIR
 # what it reads on Unix. CARGO_PROFILE_DEV_DEBUG=0 is for that one command and
 # takes a copy's target from 14.1 to 8.94 GB (the .pdb files were 54 %).
-mutate_and_judge() {
-  local out native rc=0 plan jobs scratch scratch_native want="${MUTANTS_JOBS:-}"
-  [[ -n "$want" ]] || want="$(qg_mutants_jobs)" || return $?
+qg_mutate_legacy() {
+  local want="$1" out="$2" native plan jobs scratch scratch_native rc=0
+  shift 2
   plan="$("$ROOT/scripts/mutants-gate.sh" --prepare-scratch "$want")" || return $?
   jobs="$(sed -n 's/^jobs=//p' <<<"$plan")"
   scratch="$(sed -n 's/^scratch=//p' <<<"$plan")"
@@ -443,18 +519,11 @@ mutate_and_judge() {
     return 2
   fi
   scratch_native="$(cygpath -w "$scratch" 2>/dev/null || printf '%s' "$scratch")"
-  out="$(mktemp -d)"
   native="$(cygpath -m "$out" 2>/dev/null || printf '%s' "$out")"
   (cd rust && TMP="$scratch_native" TEMP="$scratch_native" TMPDIR="$scratch" CARGO_PROFILE_DEV_DEBUG=0 \
     cargo mutants "$@" \
     --exclude-re "$MUTANTS_EXCLUDE_RE" --output "$native" \
     --timeout 90 --jobs "$jobs" --gitignore=false -- --lib) || rc=1
-  if [[ -f "$out/mutants.out/outcomes.json" ]]; then
-    "$ROOT/scripts/mutants-gate.sh" --check-builds "$out/mutants.out/outcomes.json" || rc=1
-  else
-    echo "no outcomes.json: cargo mutants built no mutant, so there is no build to judge"
-  fi
-  rm -rf "$out"
   return "$rc"
 }
 
