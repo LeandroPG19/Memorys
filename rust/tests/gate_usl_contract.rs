@@ -571,7 +571,7 @@ fn u1_recupera_los_parametros_de_una_curva_conocida() {
 fn u2_con_ruido_de_medio_por_ciento_sigue_fiable_y_la_rodilla_apenas_se_mueve() {
     let fx = Fx::new("u2");
     let ruidosa = puntos_de("debug", "DBG", CURVA_A, &NIVELES_A, 2, |i, rep, _, t| {
-        let signo = if i % 2 == 0 { 1.0 } else { -1.0 };
+        let signo = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
         let por_replica = if rep == 0 { 1.0 } else { -1.0 };
         t * (1.0 + 0.005 * signo * por_replica)
     });
@@ -655,7 +655,7 @@ fn u4_no_fiable_por_cada_criterio_con_su_motivo_y_exit_3() {
         (
             "rmse",
             puntos_de("debug", "DBG", CURVA_A, &NIVELES_A, 2, |i, _, _, t| {
-                t * (1.0 + 0.15 * if i % 2 == 0 { 1.0 } else { -1.0 })
+                t * (1.0 + 0.15 * if i.is_multiple_of(2) { 1.0 } else { -1.0 })
             }),
             "rmse_rel",
         ),
@@ -1064,8 +1064,11 @@ fn u18_un_cargo_colgado_se_corta_en_su_plazo() {
 // ---------------------------------------------------------------------------------------------
 // U12-U17: the recommendation
 
+/// The steps of one run as (id, idx, seconds).
+type PasosDeCorrida = Vec<(&'static str, u32, f64)>;
+
 /// (id, idx, seconds) of the steps of the 19th run (spec 0.1).
-fn pasos_19(b3: f64, dbg: f64) -> Vec<(&'static str, u32, f64)> {
+fn pasos_19(b3: f64, dbg: f64) -> PasosDeCorrida {
     vec![
         ("P", 10, 4.201),
         ("DBG", 20, dbg),
@@ -1082,7 +1085,7 @@ fn pasos_19(b3: f64, dbg: f64) -> Vec<(&'static str, u32, f64)> {
 /// The 19th run with the rows that do not matter to U14-U16 short (REL 30 s, DC 20 s, CV 10 s, M 20 s). With
 /// the 19th's own DC, M and REL (8 cores each) the 24 cores are the bottleneck of the whole table and no J of DBG
 /// moves the simulated clock: the scenario is about DBG against B3, so the rest of the table has to fit around them.
-fn pasos_cortos(b3: f64, dbg: f64) -> Vec<(&'static str, u32, f64)> {
+fn pasos_cortos(b3: f64, dbg: f64) -> PasosDeCorrida {
     vec![
         ("P", 10, 4.201),
         ("DBG", 20, dbg),
@@ -1148,12 +1151,7 @@ fn tabla_en_arbol(fx: &Fx, dbg_jobs: u32) -> String {
 }
 
 /// Three green serial runs: the first one cold (B3 206.174 s), the other two warm (B3 1.693 s).
-fn historial_de(
-    fx: &Fx,
-    tabla: &str,
-    dbg: f64,
-    pasos: fn(f64, f64) -> Vec<(&'static str, u32, f64)>,
-) {
+fn historial_de(fx: &Fx, tabla: &str, dbg: f64, pasos: fn(f64, f64) -> PasosDeCorrida) {
     sembrar_corrida(fx, "20261101", "run-1", tabla, &pasos(206.174, dbg));
     sembrar_corrida(fx, "20261102", "run-2", tabla, &pasos(1.693, dbg));
     sembrar_corrida(fx, "20261103", "run-3", tabla, &pasos(1.693, dbg));
@@ -1497,7 +1495,7 @@ fn u17_las_ordenes_de_cada_perfil_existen_tal_cual_en_run_all_tests() {
         assert_eq!(salida.code, Some(0), "{perfil}: {}", salida.text());
         let llamadas = fx.llamadas();
         assert!(
-            !llamadas.is_empty() && llamadas.len() % 2 == 0,
+            !llamadas.is_empty() && llamadas.len().is_multiple_of(2),
             "{perfil}: a warm-up and one point run the same orders: {} calls",
             llamadas.len()
         );
