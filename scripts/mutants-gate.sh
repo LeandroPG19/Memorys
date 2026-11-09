@@ -2768,6 +2768,161 @@ REAL
     fi
   done
 
+  # --- F6b (D-F6k, D-F6n): the shim picks the tests of the mutant it is run for, and the set guard has its mode ---
+  # The shim is the cargo that cargo-mutants calls. In a lab (a copy of the stage under the judge's scratch) that
+  # carries cargo-mutants' marker in exactly one file, it finds the mutated line by comparing that file with the
+  # stage's, looks it up in the table that quality-gate.sh built from the coverage (file, line, k, tests), and
+  # adds `-- --exact <tests>` to the test phase of that one call. In every other case the argv is the one it got
+  # and the reason is a line of its log. It never writes to stdout: cargo's stdout is parsed by cargo-mutants.
+  f6b_marker='/* ~ changed by cargo-mutants ~ */'
+  f6b_shim() { # DIR [VAR=value]... -- ARGS...: the shim as cargo-mutants runs it, with cwd DIR and the row's selection
+    local dir="$1"
+    local -a extra=()
+    shift
+    while [[ "${1:-}" != -- ]]; do extra+=("$1"); shift; done
+    shift
+    rc=0
+    (cd "$dir" && env CARGO="$tmp/f4d/wrapper" FAKE_REAL_LOG="$tmp/f4d/real.log" \
+      MUTANTS_SHIM_SCRATCH="$f4d_scr" MUTANTS_SHIM_EPOCH=1730000000.5 \
+      MUTANTS_SHIM_REAL_CARGO="$tmp/f4d/realcargo" MUTANTS_SHIM_LOG="$tmp/f4d/shim.log" \
+      MUTANTS_SHIM_ORIG="$tmp/f6b/orig" MUTANTS_SHIM_SELECT_LOG="$tmp/f6b/select.log" \
+      ${extra[@]+"${extra[@]}"} \
+      bash "$ROOT/scripts/mutants-gate.sh" --cargo-shim "$@" >"$tmp/shim.out" 2>"$tmp/shim.err") || rc=$?
+  }
+  # f6b_lab PARENT NAME LINE...: a lab named NAME under PARENT, a copy of the stage's src with cargo-mutants'
+  # marker added at each LINE of src/a.rs (none: no marker at all), and a real target/ like the seed's.
+  f6b_lab() {
+    local parent="$1" name="$2" at
+    shift 2
+    mkdir -p "$parent/$name/target/debug" "$parent/$name/src"
+    cp "$tmp/f6b/orig/src/a.rs" "$tmp/f6b/orig/src/b.rs" "$parent/$name/src/"
+    for at in "$@"; do
+      sed -i "${at}s|\$| $f6b_marker|" "$parent/$name/src/a.rs"
+    done
+  }
+  f6b_real_argv() { cut -d'|' -f1 "$tmp/f4d/real.log"; }
+  f6b_lines() { if [[ -f "$tmp/f6b/select.log" ]]; then wc -l < "$tmp/f6b/select.log"; else echo 0; fi; }
+  f6b_cargo_test=(test --verbose --package=memory-industry@0.31.0 --lib)
+
+  rm -rf "$tmp/f4d" "$tmp/f6b"
+  mkdir -p "$tmp/f4d/scr" "$tmp/f6b/orig/src" "$tmp/f6b/otro"
+  f4d_scr="$(cd "$tmp/f4d/scr" && pwd -P)"
+  f4d_real "$tmp/f4d/realcargo"
+  for f6b_i in $(seq 60); do echo "// line $f6b_i"; done > "$tmp/f6b/orig/src/a.rs"
+  for f6b_i in $(seq 60); do echo "// b line $f6b_i"; done > "$tmp/f6b/orig/src/b.rs"
+  # The table is the one quality-gate.sh writes: file, line, k, the tests. A row with k = 0 is not a selection.
+  printf 'src/a.rs\t12\t2\tt_a1 t_a2\nsrc/a.rs\t30\t0\t\nsrc/b.rs\t5\t1\tt_b\n' > "$tmp/f6b/select.tsv"
+  f6b_sel="MUTANTS_SHIM_SELECT=$tmp/f6b/select.tsv"
+
+  # F6b.5: the test phase of the mutant gets its tests, behind `--` and `--exact`, and nothing else changes.
+  f6b_lab "$f4d_scr" cargo-mutants-rust-SEL.tmp 12
+  f6b_shim "$f4d_scr/cargo-mutants-rust-SEL.tmp" "$f6b_sel" -- "${f6b_cargo_test[@]}"
+  (( rc == 7 )) || self_fail "F6b.5: the shim did not end with the real cargo's exit 7 (exit $rc): $(cat "$tmp/shim.err")"
+  [[ "$(cat "$tmp/shim.out")" == x && "$(wc -c < "$tmp/shim.out")" == 1 ]] \
+    || self_fail "F6b.5: the shim changed cargo's stdout: '$(cat "$tmp/shim.out")'"
+  [[ "$(f6b_real_argv)" == "test --verbose --package=memory-industry@0.31.0 --lib -- --exact t_a1 t_a2" ]] \
+    || self_fail "F6b.5: the real cargo did not get the argv plus '-- --exact t_a1 t_a2': $(f6b_real_argv)"
+  IFS='|' read -r seen_argv seen_cargo seen_shim < "$tmp/f4d/real.log" || true
+  [[ "$seen_shim" == 0 ]] || self_fail "F6b.5: the real cargo saw $seen_shim MUTANTS_SHIM_* variables"
+  [[ "$(cat "$tmp/f6b/select.log")" == 'subset 2 src/a.rs:12' ]] \
+    || self_fail "F6b.5: the selection log is not exactly 'subset 2 src/a.rs:12': $(cat "$tmp/f6b/select.log" 2>&1)"
+  # The build of the same lab is not filtered: a filter there would build nothing, or run what is not meant to.
+  rm -f "$tmp/f4d/real.log"
+  f6b_shim "$f4d_scr/cargo-mutants-rust-SEL.tmp" "$f6b_sel" -- test --no-run --verbose --package=memory-industry@0.31.0 --lib
+  [[ "$(f6b_real_argv)" == "test --no-run --verbose --package=memory-industry@0.31.0 --lib" && "$(f6b_lines)" == 1 ]] \
+    || self_fail "F6b.5: the build was filtered, or logged a selection: $(f6b_real_argv) / $(cat "$tmp/f6b/select.log")"
+  # The lab was normalized by the first call and the marker file is there now: the selection does not depend on it.
+  rm -f "$tmp/f4d/real.log"
+  f6b_shim "$f4d_scr/cargo-mutants-rust-SEL.tmp" "$f6b_sel" -- "${f6b_cargo_test[@]}" -- --nocapture
+  [[ "$(f6b_real_argv)" == "test --verbose --package=memory-industry@0.31.0 --lib -- --nocapture --exact t_a1 t_a2" ]] \
+    || self_fail "F6b.5: an argv that already had a -- did not get its filters behind its own arguments: $(f6b_real_argv)"
+  # Another line of the same file is another row.
+  f6b_lab "$f4d_scr" cargo-mutants-rust-SEL2.tmp 5
+  rm -f "$tmp/f4d/real.log"
+  f6b_shim "$f4d_scr/cargo-mutants-rust-SEL2.tmp" "$f6b_sel" -- "${f6b_cargo_test[@]}"
+  [[ "$(f6b_real_argv)" == "test --verbose --package=memory-industry@0.31.0 --lib" ]] \
+    && [[ "$(tail -n 1 "$tmp/f6b/select.log")" == 'full no-entry src/a.rs:5' ]] \
+    || self_fail "F6b.5/6: a line that the table has only for src/b.rs was filtered with another file's tests: $(f6b_real_argv) / $(tail -n 1 "$tmp/f6b/select.log")"
+
+  # F6b.6: with no way to tell which mutant it is, the argv goes as it came, and the log says why.
+  f6b_case() { # LABEL EXPECTED_LAST_LINE DIR [VAR=value]...: the test phase, unfiltered, and its reason in the log
+    local label="$1" want="$2" dir="$3" before after
+    shift 3
+    rm -f "$tmp/f4d/real.log"
+    before="$(f6b_lines)"
+    f6b_shim "$dir" ${@+"$@"} -- "${f6b_cargo_test[@]}"
+    after="$(f6b_lines)"
+    (( rc == 7 )) && [[ "$(cat "$tmp/shim.out")" == x ]] \
+      || self_fail "F6b.6 $label: the shim did not hand the call to cargo (exit $rc): $(cat "$tmp/shim.err")"
+    [[ "$(f6b_real_argv)" == "test --verbose --package=memory-industry@0.31.0 --lib" ]] \
+      || self_fail "F6b.6 $label: the argv was filtered: $(f6b_real_argv)"
+    if [[ -z "$want" ]]; then
+      [[ "$before" == "$after" ]] || self_fail "F6b.6 $label: the shim wrote a line to the selection log where it was not meant to: $(tail -n 1 "$tmp/f6b/select.log")"
+    else
+      [[ "$(tail -n 1 "$tmp/f6b/select.log")" == "$want" && "$after" == $((before + 1)) ]] \
+        || self_fail "F6b.6 $label: the last line of the log is '$(tail -n 1 "$tmp/f6b/select.log")', not '$want' (or it wrote $((after - before)) lines)"
+    fi
+  }
+  f6b_lab "$f4d_scr" cargo-mutants-rust-BASE.tmp
+  f6b_case baseline 'full baseline' "$f4d_scr/cargo-mutants-rust-BASE.tmp" "$f6b_sel"
+  f6b_lab "$f4d_scr" cargo-mutants-rust-TWO.tmp 12
+  sed -i "3s|\$| $f6b_marker|" "$f4d_scr/cargo-mutants-rust-TWO.tmp/src/b.rs"
+  f6b_case markers-in-2-files 'full markers-in-2-files' "$f4d_scr/cargo-mutants-rust-TWO.tmp" "$f6b_sel"
+  f6b_lab "$f4d_scr" cargo-mutants-rust-NOENTRY.tmp 59
+  f6b_case no-entry 'full no-entry src/a.rs:59' "$f4d_scr/cargo-mutants-rust-NOENTRY.tmp" "$f6b_sel"
+  f6b_lab "$f4d_scr" cargo-mutants-rust-ZERO.tmp 30
+  f6b_case k-zero 'full no-entry src/a.rs:30' "$f4d_scr/cargo-mutants-rust-ZERO.tmp" "$f6b_sel"
+  # A lab outside the judge's scratch is not a lab: it is not filtered and nothing is written.
+  f6b_lab "$tmp/f6b/otro" cargo-mutants-rust-OUT.tmp 12
+  f6b_case outside-scratch '' "$tmp/f6b/otro/cargo-mutants-rust-OUT.tmp" "$f6b_sel"
+  # Without MUTANTS_SHIM_SELECT the shim is the one of F4d: the marked lab is handed on whole and unlogged.
+  f6b_case no-select '' "$f4d_scr/cargo-mutants-rust-SEL.tmp"
+  # A table that cannot be read is not a selection either.
+  f6b_case no-table 'full no-entry src/a.rs:12' "$f4d_scr/cargo-mutants-rust-SEL.tmp" "MUTANTS_SHIM_SELECT=$tmp/f6b/not-there.tsv"
+
+  # F6b.9 (D-F6n): the set of the merged outcomes is the set --list names, in both directions, as a mode.
+  sg_outcomes() { # FILE NAME...
+    local file="$1" name
+    shift
+    printf '{"outcomes":[{"scenario":"Baseline","summary":"Success"}' > "$file"
+    for name in "$@"; do
+      printf ',{"scenario":{"Mutant":{"name":"%s"}},"summary":"CaughtMutant"}' "$name" >> "$file"
+    done
+    printf '],"caught":%d}\n' "$#" >> "$file"
+  }
+  sg_list() { # FILE NAME...
+    local file="$1" name sep=""
+    shift
+    printf '[' > "$file"
+    for name in "$@"; do
+      printf '%s{"name":"%s","file":"src/a.rs"}' "$sep" "$name" >> "$file"
+      sep=","
+    done
+    printf ']\n' >> "$file"
+  }
+  sg_run() {
+    rc=0
+    bash "$ROOT/scripts/mutants-gate.sh" --set-guard "$@" >"$tmp/sg.out" 2>"$tmp/sg.err" || rc=$?
+  }
+  mkdir -p "$tmp/sg"
+  sg_outcomes "$tmp/sg/o2.json" src/a.rs:1:1:m1 src/a.rs:2:1:m2
+  sg_list "$tmp/sg/l2.json" src/a.rs:1:1:m1 src/a.rs:2:1:m2
+  sg_list "$tmp/sg/l3.json" src/a.rs:1:1:m1 src/a.rs:2:1:m2 src/a.rs:3:1:m3
+  sg_list "$tmp/sg/l1.json" src/a.rs:1:1:m1
+  sg_run "$tmp/sg/o2.json" "$tmp/sg/l2.json"
+  (( rc == 0 )) && grep -q 'OK  mutant set: 2 mutants' "$tmp/sg.out" \
+    || self_fail "F6b.9: --set-guard over two outcomes and the same two listed was not 'OK  mutant set: 2 mutants' (exit $rc): $(cat "$tmp/sg.out" "$tmp/sg.err")"
+  sg_run "$tmp/sg/o2.json" "$tmp/sg/l3.json"
+  (( rc == 1 )) && grep -q 'mutant set differs' "$tmp/sg.err" && grep -qF 'src/a.rs:3:1:m3' "$tmp/sg.err" \
+    || self_fail "F6b.9: a listed mutant that the outcomes lack was not 'mutant set differs' naming it (exit $rc): $(cat "$tmp/sg.out" "$tmp/sg.err")"
+  sg_run "$tmp/sg/o2.json" "$tmp/sg/l1.json"
+  (( rc == 1 )) && grep -q 'mutant set differs' "$tmp/sg.err" && grep -qF 'src/a.rs:2:1:m2' "$tmp/sg.err" \
+    || self_fail "F6b.9: an outcome that --list does not name was not 'mutant set differs' naming it (exit $rc): $(cat "$tmp/sg.out" "$tmp/sg.err")"
+  sg_run "$tmp/sg/o2.json" "$tmp/sg/not-there.json"
+  (( rc != 0 )) || self_fail "F6b.9: --set-guard with a list that does not exist exited 0"
+  sg_run
+  (( rc != 0 )) || self_fail "F6b.9: --set-guard with no arguments exited 0"
+
   echo "OK  self-test: a build rustc refused with a diagnostic stays unviable; an NTSTATUS,"
   echo "    a signal, a timeout, a 101 whose build phase holds no rustc diagnostic, a missing log,"
   echo "    a build out of disk and a file whose total disagrees with its records are refused; a caught mutant"
@@ -2778,7 +2933,10 @@ REAL
   echo "    its own scratch directory: always MUTANTS_SCRATCH_DIR's subdirectory memory-industry-mutants,"
   echo "    swept only when it carries the marker, and refused if it holds the repo or HOME;"
   echo "    the default jobs come from the memory that is available (MemAvailable, else MemFree,"
-  echo "    else exit 2), not from the total, and are said out loud when the memory capped them"
+  echo "    else exit 2), not from the total, and are said out loud when the memory capped them;"
+  echo "    the shim adds '-- --exact <tests>' to the test phase of the mutant of its lab, from the table of the"
+  echo "    coverage, and hands every other call on as it came, saying why in its log; --set-guard compares the"
+  echo "    mutants measured with the ones --list names, in both directions"
   exit 0
 }
 # --- self-test end ---
