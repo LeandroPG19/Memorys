@@ -466,6 +466,34 @@ gate_target_dir_outside_the_tree() {
   export CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cargo-target/memory-industry"
 }
 
+# The judge keeps a target per row and per tree in <CARGO_TARGET_DIR>/<tree>-<12 hex>/T_x, each with a .gate-tree
+# that names its tree (gate-dag.py, target_dir). A worktree that is deleted leaves them for good: 42 GB on 9-nov
+# (CI-J13). A key is swept when it holds at least one .gate-tree and every one of them names an absolute path that
+# is gone, and a line says so with its size. Nothing else is touched: a key with no marker, a marker that names no
+# tree ("/" exists; an empty or a relative one proves nothing), another kind of name, a symlink, or anything outside
+# CARGO_TARGET_DIR. A tree on a drive that is not mounted looks gone; its target is a cache and is built again.
+gate_sweep_dead_targets() {
+  local root="${CARGO_TARGET_DIR:-}" key marker tree markers dead size
+  [[ -n "$root" && -d "$root" ]] || return 0
+  for key in "$root"/*-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]; do
+    [[ -d "$key" && ! -L "$key" ]] || continue
+    markers=0
+    dead=0
+    while IFS= read -r -d '' marker; do
+      markers=$((markers + 1))
+      tree=""
+      IFS= read -r tree <"$marker" || true
+      if [[ "$tree" == /?* && ! -e "$tree" && ! -L "$tree" ]]; then
+        dead=$((dead + 1))
+      fi
+    done < <(find "$key" -mindepth 2 -maxdepth 2 -name .gate-tree -type f -print0)
+    (( markers > 0 && dead == markers )) || continue
+    size="$(du -sh "$key" | cut -f1)"
+    rm -rf -- "$key" || { echo "note: could not remove $key" >&2; continue; }
+    echo "note: swept $key $size (its tree $tree is gone)"
+  done
+}
+
 gate_tmpdir_on_disk() {
   if [[ -n "${TMPDIR:-}" ]] && ! gate_is_ram_backed "$TMPDIR"; then
     return 0

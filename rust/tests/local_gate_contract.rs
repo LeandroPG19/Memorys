@@ -3399,14 +3399,17 @@ const JUDGE_ENVIRONMENT: [(&str, &str); 27] = [
     ("PYTHONIOENCODING", "latin-1"),
 ];
 
-/// The names the judge's scripts export that no self-test is handed, each with its reason (CI-J3).
-/// Excluded names still have to be exported, or the entry is stale.
-const NOT_HANDED_DOWN: [(&str, &str); 1] = [(
+/// The names the judge's scripts export that no self-test is handed, each with its reason, its owner and the
+/// day it expires (CI-J3, CI-J13). Excluded names still have to be exported, or the entry is stale; an entry
+/// without an owner, or past its day, is red (`the_exceptions_of_the_judge_have_an_owner_and_have_not_expired`).
+const NOT_HANDED_DOWN: [(&str, &str, &str, &str); 1] = [(
     "TMPDIR",
     "gate-lock.sh keeps the TMPDIR it is given when it is on disk, and does not check that it \
      exists: a missing one breaks every mktemp of every self-test. The judge does not own a foreign \
      TMPDIR that exists to test with, so there is no value to hand here. Open: whether the judge \
      should refuse a TMPDIR that does not exist (gate-lock.sh, gate_tmpdir_on_disk)",
+    "orquestador",
+    "2027-02-28",
 )];
 
 /// The judge's scripts that export into the environment of what they launch.
@@ -3559,7 +3562,7 @@ fn the_judges_exported_environment_list_is_complete() {
     );
 
     let handed: Vec<&str> = JUDGE_ENVIRONMENT.iter().map(|(name, _)| *name).collect();
-    let excluded: Vec<&str> = NOT_HANDED_DOWN.iter().map(|(name, _)| *name).collect();
+    let excluded: Vec<&str> = NOT_HANDED_DOWN.iter().map(|(name, ..)| *name).collect();
 
     let unlisted: Vec<&String> = exported
         .iter()
@@ -3648,7 +3651,7 @@ fn every_name_the_planner_puts_in_a_step_is_judged() {
     );
 
     let handed: Vec<&str> = JUDGE_ENVIRONMENT.iter().map(|(name, _)| *name).collect();
-    let excluded: Vec<&str> = NOT_HANDED_DOWN.iter().map(|(name, _)| *name).collect();
+    let excluded: Vec<&str> = NOT_HANDED_DOWN.iter().map(|(name, ..)| *name).collect();
     let unjudged: Vec<&String> = planner
         .iter()
         .filter(|name| !handed.contains(&name.as_str()) && !excluded.contains(&name.as_str()))
@@ -3675,11 +3678,13 @@ const MODEL_ENVIRONMENT: [&str; 7] = [
     "CUBA_POOLING",
 ];
 
-/// The scripts that set a model name outside gate_model_env, each with its reason (CI-J5). An
-/// excluded script still has to set one, or its entry is stale.
-const MODEL_NAMES_ELSEWHERE: [(&str, &str); 1] = [(
+/// The scripts that set a model name outside gate_model_env, each with its reason, its owner and the day it
+/// expires (CI-J5, CI-J13). An excluded script still has to set one, or its entry is stale.
+const MODEL_NAMES_ELSEWHERE: [(&str, &str, &str, &str); 1] = [(
     "demo.sh",
     "a presentation of the binary: it picks its own cache, and no gate runs it (record-demo-gif.sh does)",
+    "orquestador",
+    "2027-02-28",
 )];
 
 /// The model names a line of shell sets: an export, or a default `NAME="${NAME:-...}"`. A prefix
@@ -3756,7 +3761,7 @@ fn the_model_environment_is_set_in_one_place() {
                 inside.extend(names);
             } else if MODEL_NAMES_ELSEWHERE
                 .iter()
-                .any(|(file, _)| *file == name.as_str())
+                .any(|(file, ..)| *file == name.as_str())
             {
                 seen_elsewhere.push(name.clone());
             } else {
@@ -3778,7 +3783,7 @@ fn the_model_environment_is_set_in_one_place() {
         missing.is_empty(),
         "gate_model_env does not set these names: {missing:?} (CI-J5)"
     );
-    for (file, _) in MODEL_NAMES_ELSEWHERE {
+    for (file, ..) in MODEL_NAMES_ELSEWHERE {
         assert!(
             seen_elsewhere.iter().any(|seen| seen.as_str() == file),
             "scripts/{file} no longer sets a model name, so its entry in MODEL_NAMES_ELSEWHERE is \
@@ -5027,4 +5032,389 @@ fn no_judge_script_names_the_gate_audit_outside_its_comments() {
             );
         }
     }
+}
+
+// --- CI-J13 (D1): an exception of the judge has an owner and a day it expires -----------------------------
+
+/// `YYYY-MM-DD` and nothing else, so that two of them compare as text.
+fn is_iso_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(at, byte)| {
+            if at == 4 || at == 7 {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+        && (1..=12).contains(&text[5..7].parse::<u32>().unwrap_or(0))
+        && (1..=31).contains(&text[8..10].parse::<u32>().unwrap_or(0))
+}
+
+/// Whether an exception that expires on `expires` is expired on `today`: the day after its date, like
+/// advisory-exceptions.txt. Both are `YYYY-MM-DD` (`is_iso_date`). The caller hands the date in, so nothing
+/// that tests this depends on the clock.
+fn expired(expires: &str, today: &str) -> bool {
+    expires < today
+}
+
+/// What is wrong with the entries `(name, owner, expires)` of the list `list`: each problem names its entry,
+/// and for a date, the date.
+fn exception_problems(list: &str, entries: &[(&str, &str, &str)], today: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for &(name, owner, expires) in entries {
+        if owner.trim().is_empty() {
+            problems.push(format!("{list}: {name} has no owner"));
+        }
+        if !is_iso_date(expires) {
+            problems.push(format!(
+                "{list}: {name} expires on `{expires}`, which is not YYYY-MM-DD"
+            ));
+        } else if expired(expires, today) {
+            problems.push(format!(
+                "{list}: {name} expired on {expires} (today is {today})"
+            ));
+        }
+    }
+    problems
+}
+
+/// CI-J13. The day an exception expires is the last day it holds: the next one is red, across a month and a year.
+#[test]
+fn an_exception_expires_the_day_after_its_date() {
+    assert!(expired("2026-11-08", "2026-11-09"));
+    assert!(!expired("2026-11-09", "2026-11-09"));
+    assert!(!expired("2026-11-10", "2026-11-09"));
+    assert!(expired("2026-12-31", "2027-01-01"));
+    assert!(!expired("2027-01-01", "2026-12-31"));
+    assert!(is_iso_date("2026-11-09"));
+    for not_a_date in [
+        "",
+        "2026-11-9",
+        "2026-13-01",
+        "2026-00-10",
+        "2026-11-32",
+        "09/11/2026",
+        "2026-11-09x",
+        "2026_11_09",
+    ] {
+        assert!(!is_iso_date(not_a_date), "`{not_a_date}` is not YYYY-MM-DD");
+    }
+}
+
+/// CI-J13. The check of the lists is judged first, on entries that must and must not be red: an expired one, one
+/// with no owner, one with a date that is not a date, and one that is fine.
+#[test]
+fn the_check_of_the_exceptions_can_fail() {
+    let fixture = [
+        ("OLD", "dueno", "2026-11-08"),
+        ("NOBODY", "  ", "2027-01-01"),
+        ("BADDATE", "dueno", "9/11/2026"),
+        ("GOOD", "dueno", "2026-11-09"),
+    ];
+    let problems = exception_problems("FIXTURE", &fixture, "2026-11-09");
+    assert_eq!(problems.len(), 3, "{problems:#?}");
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("OLD") && p.contains("2026-11-08")),
+        "an expired entry is named with its date: {problems:#?}"
+    );
+    assert!(
+        problems.iter().any(|p| p.contains("NOBODY")),
+        "an entry with a blank owner is named: {problems:#?}"
+    );
+    assert!(
+        problems.iter().any(|p| p.contains("BADDATE")),
+        "an entry whose date is not a date is named: {problems:#?}"
+    );
+    assert!(
+        !problems.iter().any(|p| p.contains("GOOD")),
+        "an entry that expires today still holds: {problems:#?}"
+    );
+}
+
+/// CI-J13 (verificacion.md: every exception has an owner and a day it expires). The exceptions this judge keeps
+/// in its contracts, NOT_HANDED_DOWN and MODEL_NAMES_ELSEWHERE, are red when one expired by today's date or has
+/// no owner. The stale-entry checks of each list stay where they are.
+#[test]
+fn the_exceptions_of_the_judge_have_an_owner_and_have_not_expired() {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let not_handed: Vec<(&str, &str, &str)> = NOT_HANDED_DOWN
+        .iter()
+        .map(|&(name, _, owner, expires)| (name, owner, expires))
+        .collect();
+    let elsewhere: Vec<(&str, &str, &str)> = MODEL_NAMES_ELSEWHERE
+        .iter()
+        .map(|&(file, _, owner, expires)| (file, owner, expires))
+        .collect();
+    assert!(
+        !not_handed.is_empty() && !elsewhere.is_empty(),
+        "a list of exceptions read as empty: the check would be green over nothing"
+    );
+    let mut problems = exception_problems("NOT_HANDED_DOWN", &not_handed, &today);
+    problems.extend(exception_problems(
+        "MODEL_NAMES_ELSEWHERE",
+        &elsewhere,
+        &today,
+    ));
+    assert!(
+        problems.is_empty(),
+        "an exception without an owner, or past its day, is not an exception any more: renew it with a \
+         reason or remove it: {problems:#?}"
+    );
+}
+
+// --- CI-J13 (D3): the fixtures of gate-audit.sh name rows that exist ---------------------------------------
+
+/// What a line of the self-test of gate-audit.sh says of a row of the judge's table. Only the columns the
+/// line spells out are set.
+struct RowMention {
+    line: usize,
+    id: String,
+    idx: Option<String>,
+    deps: Option<String>,
+    resources: Option<String>,
+    class: Option<String>,
+}
+
+fn row_mention(line: usize, id: &str) -> RowMention {
+    RowMention {
+        line,
+        id: id.to_string(),
+        idx: None,
+        deps: None,
+        resources: None,
+        class: None,
+    }
+}
+
+/// A step id as the table writes it: `P`, `DBG`, `B3`, `E2E`.
+fn is_step_id(word: &str) -> bool {
+    let mut chars = word.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// The lines between the self-test markers of a script, the markers left out.
+fn inside_self_test(body: &str) -> Vec<&str> {
+    let mut inside = false;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if line == SELF_TEST_BEGIN {
+            inside = true;
+        } else if line == SELF_TEST_END {
+            inside = false;
+        } else if inside {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// The rows of the table that the fixtures in `lines` name, and what they say of them: the `roots`, `steps` and
+/// `overlap` heredocs of the standard table, the `au_tree` specs (`"<idx> <id> <deps> <recursos> <clase>"`),
+/// `tr_lane` calls and the arms of its `case`, the `<idx>-<id>` directories of the audit, `--step <id>`, the
+/// id the fake step is given and the `exit-<id>` file that makes it fail.
+fn fixture_mentions(lines: &[&str]) -> Vec<RowMention> {
+    let mut found = Vec::new();
+    let mut heredoc: Option<String> = None;
+    let mut joined = String::new();
+    for (at, raw) in lines.iter().copied().enumerate() {
+        let line = at + 1;
+        let text = raw.trim();
+        if let Some(tag) = &heredoc {
+            if text == tag.as_str() {
+                heredoc = None;
+                continue;
+            }
+            let words: Vec<&str> = text.split_whitespace().collect();
+            match (tag.as_str(), words.as_slice()) {
+                ("ROOTS", ["run", id, ..]) => found.push(row_mention(line, id)),
+                ("STEPS", [id, resources, ..]) => found.push(RowMention {
+                    resources: Some(resources.to_string()),
+                    ..row_mention(line, id)
+                }),
+                ("OVERLAP", [a, b]) => {
+                    found.push(row_mention(line, a));
+                    found.push(row_mention(line, b));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if let Some(rest) = text.split("<<'").nth(1) {
+            heredoc = rest.split('\'').next().map(str::to_string);
+            continue;
+        }
+        if let Some(head) = text.strip_suffix('\\') {
+            joined.push_str(head);
+            joined.push(' ');
+            continue;
+        }
+        joined.push_str(text);
+        let statement = std::mem::take(&mut joined);
+        let words: Vec<&str> = statement.split_whitespace().collect();
+        for (w, word) in words.iter().enumerate() {
+            let next = words.get(w + 1).copied().unwrap_or("");
+            let id = match *word {
+                "tr_lane" => words.get(w + 3).copied().unwrap_or(""),
+                "--step" => next,
+                other if other.trim_matches('"').ends_with("fake-step.sh") => next,
+                _ => continue,
+            };
+            if is_step_id(id) {
+                found.push(row_mention(line, id));
+            }
+        }
+        if let Some(arm) = text.split(')').next().filter(|_| text.contains(')')) {
+            if is_step_id(arm) {
+                found.push(row_mention(line, arm));
+            }
+        }
+        if let Some(from) = statement.find("au_tree \"") {
+            for spec in statement[from..].split('"').skip(1).step_by(2) {
+                let cols: Vec<&str> = spec.split_whitespace().collect();
+                if let [idx, id, deps, resources, class] = cols.as_slice() {
+                    if idx.parse::<u32>().is_ok() {
+                        found.push(RowMention {
+                            idx: Some(idx.to_string()),
+                            deps: Some(deps.to_string()),
+                            resources: Some(resources.to_string()),
+                            class: Some(class.to_string()),
+                            ..row_mention(line, id)
+                        });
+                    }
+                }
+            }
+        }
+        for token in statement.split(|c: char| c == '/' || c == '"' || c.is_whitespace()) {
+            if let Some(id) = token.strip_prefix("exit-").filter(|id| is_step_id(id)) {
+                found.push(row_mention(line, id));
+            }
+            if let Some((idx, id)) = token.split_once('-') {
+                if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) && is_step_id(id) {
+                    found.push(RowMention {
+                        idx: Some(idx.to_string()),
+                        ..row_mention(line, id)
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// What is wrong between the fixtures in `lines` and the rows of the table (`idx id deps recursos clase ...`, one
+/// `Vec` of fields per row): a row that does not exist, or a column that the fixture spells another way.
+fn fixture_problems(lines: &[&str], table: &[Vec<String>]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for mention in fixture_mentions(lines) {
+        let Some(row) = table.iter().find(|row| row[1] == mention.id) else {
+            problems.push(format!(
+                "self-test line {}: `{}` is not a row of gate-dag.txt",
+                mention.line, mention.id
+            ));
+            continue;
+        };
+        for (column, said, real) in [
+            ("idx", &mention.idx, &row[0]),
+            ("deps", &mention.deps, &row[2]),
+            ("recursos", &mention.resources, &row[3]),
+            ("clase", &mention.class, &row[4]),
+        ] {
+            if let Some(said) = said.as_ref().filter(|said| *said != real) {
+                problems.push(format!(
+                    "self-test line {}: {} says {column} `{said}`, gate-dag.txt says `{real}`",
+                    mention.line, mention.id
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// CI-J13. The extraction is judged first, on a fixture with the ways to be stale: a row that does not exist, a
+/// resource that the table spells another way, an idx that is not the row's, and a clean line to prove it does
+/// not cry wolf.
+#[test]
+fn the_check_of_the_audit_fixtures_can_fail() {
+    let table: Vec<Vec<String>> = [
+        "20 DBG P target:T_dbg,cluster:C_dbg,models normal",
+        "60 DC P target:T_docs,cluster:C_docs normal",
+    ]
+    .iter()
+    .map(|row| row.split_whitespace().map(String::from).collect())
+    .collect();
+    let fixture = [
+        "  au_std() {",
+        "    cat > \"$1/steps\" <<'STEPS'",
+        "DBG target:T_dbg,cluster:C_dbg,models merge-gate\\.sh --step DBG$",
+        "GHOST target:T_dbg merge-gate\\.sh --step GHOST$",
+        "STEPS",
+        "    cat > \"$1/overlap\" <<'OVERLAP'",
+        "DBG DC",
+        "OVERLAP",
+        "    tr_lane \"$d/tr\" 100 DC 101 beta-0123456789abcdef",
+        "    local d; d=\"$(rd)\"; au_tree \"$d\" \"20 DBG P target:T_dbg,cluster:C_dbg,models normal\" \\",
+        "      \"60 DC P target:T_dbg,cluster:C_docs normal\"",
+        "    tr_open \"$d/fx/20-DBG\" 101 w x",
+        "    tr_open \"$d/fx/50-DC\" 101 w x",
+    ];
+    let problems = fixture_problems(&fixture, &table);
+    assert_eq!(problems.len(), 3, "{problems:#?}");
+    assert!(
+        problems.iter().any(|p| p.contains("GHOST")),
+        "an id that is not a row is named: {problems:#?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("DC says recursos `target:T_dbg,cluster:C_docs`")),
+        "a stale resource is named with both spellings: {problems:#?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("DC says idx `50`") && p.contains("`60`")),
+        "a stale idx in a directory name is named: {problems:#?}"
+    );
+    let mentioned: Vec<String> = fixture_mentions(&fixture)
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert!(
+        mentioned.iter().filter(|id| id.as_str() == "DC").count() >= 4,
+        "DC is named by the overlap heredoc, tr_lane, au_tree and a directory: {mentioned:?}"
+    );
+}
+
+/// CI-J13. The ids and columns that the fixtures of `gate-audit.sh --self-test` name are the rows of
+/// `scripts/gate-dag.txt`: `DC target:T_dbg` and the D1, D2, R and E steps stayed in them after the table moved
+/// on, and the audit went on passing over a table that no longer exists.
+#[test]
+fn the_fixtures_of_the_audit_name_rows_that_exist() {
+    let body = read("scripts/gate-audit.sh").replace("\r\n", "\n");
+    let lines = inside_self_test(&body);
+    let table: Vec<Vec<String>> = dag_rows()
+        .into_iter()
+        .map(|(_, _, _, line)| line.split_whitespace().map(String::from).collect())
+        .collect();
+    let mentions = fixture_mentions(&lines);
+    let named: std::collections::BTreeSet<&str> = mentions.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        named.len() >= 5
+            && mentions.iter().any(|m| m.deps.is_some())
+            && mentions
+                .iter()
+                .any(|m| m.resources.is_some() && m.deps.is_none())
+            && mentions.iter().any(|m| m.idx.is_some() && m.deps.is_none()),
+        "the scan of the self-test of gate-audit.sh found {named:?}: it no longer reads the heredocs, the \
+         au_tree specs and the directories, so it would be green over nothing"
+    );
+    let problems = fixture_problems(&lines, &table);
+    assert!(
+        problems.is_empty(),
+        "the fixtures of gate-audit.sh --self-test are not the table of gate-dag.txt: {problems:#?}"
+    );
 }

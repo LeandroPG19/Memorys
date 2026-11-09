@@ -657,6 +657,154 @@ FAKE
   [[ "$(steps_of a1_ok)" == "cargo audit" ]] \
     || self_fail "a1_ok: a CARGO_TARGET_DIR outside rust/ was refused: $(steps_of a1_ok) / $(cat "$tmp/a1_ok.out")"
 
+  # CI-J13 (D4): the target of a tree that no longer exists is swept, and nothing else is. The judge keeps a
+  # target per row and per tree in <CARGO_TARGET_DIR>/<tree>-<12 hex of its realpath>/T_x, each with a
+  # .gate-tree that names the tree (gate-dag.py). A worktree that is deleted leaves its targets for good
+  # (42 GB on 9-nov). gate_sweep_dead_targets (gate-lock.sh) removes a key whose .gate-tree files all name an
+  # absolute path that is gone, and prints one `note: swept <dir> <size> ...` line for each. The function is
+  # run in a bash of its own that sources gate-lock.sh first (which empties some variables on load), under a
+  # deadline; each row that says "kept" has a control key in the same root that must be swept, so a sweep that
+  # never ran cannot pass it.
+  sweep_key() { # <root> <key> <tree|-> [T_x...]: one target per T_x with a file and, unless "-", its .gate-tree
+    local root="$1" key="$2" tree="$3" t
+    shift 3
+    (( $# > 0 )) || set -- T_dbg
+    for t in "$@"; do
+      mkdir -p "$root/$key/$t"
+      head -c 65536 /dev/zero >"$root/$key/$t/artifact"
+      [[ "$tree" == - ]] || printf '%s\n' "$tree" >"$root/$key/$t/.gate-tree"
+    done
+  }
+  sweep_run() { # <root|"">: rc, and what it printed in $tmp/sweep.out
+    rc=0
+    timeout 30 "$BASH" -c 'source "$1"; if [[ -n "$2" ]]; then export CARGO_TARGET_DIR="$2"; else unset CARGO_TARGET_DIR; fi; gate_sweep_dead_targets' \
+      _ "$ROOT/scripts/gate-lock.sh" "$1" >"$tmp/sweep.out" 2>&1 || rc=$?
+  }
+  sweep_kept() { # <path>...: still there, a symlink included
+    local p
+    for p in "$@"; do
+      [[ -e "$p" || -L "$p" ]] || self_fail "J13d: the sweep removed $p, which is not the target of a tree that is gone: $(cat "$tmp/sweep.out")"
+    done
+  }
+  sweep_swept() { # <dir>: gone, and said so in a line with its size
+    local line
+    [[ ! -e "$1" ]] || self_fail "J13d: $1 names a tree that is gone and was not swept: $(cat "$tmp/sweep.out")"
+    line="$(grep -F "note: swept $1 " "$tmp/sweep.out" || true)"
+    [[ -n "$line" && "$(wc -l <<<"$line")" -eq 1 ]] || self_fail "J13d: no single 'note: swept $1 ...' line: $(cat "$tmp/sweep.out")"
+    [[ "$line" =~ \ [0-9][0-9.]*[BKMGT]?\ \(its\ tree\  ]] || self_fail "J13d: the line for $1 has no size: $line"
+  }
+  sweep_alone() { # <n>: exactly that many swept lines
+    [[ "$(grep -c '^note: swept ' "$tmp/sweep.out" || true)" == "$1" ]] \
+      || self_fail "J13d: want $1 'note: swept' lines: $(cat "$tmp/sweep.out")"
+  }
+
+  # The scenario: a gone tree (two targets, and a path with a space), a live one and a key with no marker.
+  mkdir -p "$tmp/sweep/root1" "$tmp/sweep/live-tree"
+  sweep_key "$tmp/sweep/root1" gone-aaaaaaaaaaaa "$tmp/sweep/gone tree" T_dbg T_rel
+  sweep_key "$tmp/sweep/root1" live-bbbbbbbbbbbb "$tmp/sweep/live-tree"
+  sweep_key "$tmp/sweep/root1" nomark-cccccccccccc -
+  sweep_key "$tmp/sweep/root1" mixed-dddddddddddd "$tmp/sweep/gone tree" T_dbg
+  sweep_key "$tmp/sweep/root1" mixed-dddddddddddd "$tmp/sweep/live-tree" T_rel
+  sweep_run "$tmp/sweep/root1"
+  (( rc == 0 )) || self_fail "J13d: the sweep exited $rc: $(cat "$tmp/sweep.out")"
+  sweep_swept "$tmp/sweep/root1/gone-aaaaaaaaaaaa"
+  sweep_kept "$tmp/sweep/root1/live-bbbbbbbbbbbb/T_dbg/artifact" "$tmp/sweep/root1/live-bbbbbbbbbbbb/T_dbg/.gate-tree" \
+    "$tmp/sweep/root1/nomark-cccccccccccc/T_dbg/artifact" "$tmp/sweep/root1/mixed-dddddddddddd/T_dbg/artifact" \
+    "$tmp/sweep/root1/mixed-dddddddddddd/T_rel/artifact" "$tmp/sweep/live-tree"
+  sweep_alone 1
+  sweep_run "$tmp/sweep/root1"
+  (( rc == 0 )) || self_fail "J13d: the second sweep exited $rc: $(cat "$tmp/sweep.out")"
+  [[ ! -s "$tmp/sweep.out" ]] || self_fail "J13d: a sweep with nothing left to sweep printed something: $(cat "$tmp/sweep.out")"
+
+  # A marker that names nothing a tree can be: "/", an empty or blank line, an empty file, a relative path.
+  # None of them is a tree that is gone. The control key has a real dead marker.
+  mkdir -p "$tmp/sweep/root2"
+  sweep_key "$tmp/sweep/root2" slash-111111111111 /
+  sweep_key "$tmp/sweep/root2" empty-222222222222 ""
+  sweep_key "$tmp/sweep/root2" blank-333333333333 "   "
+  sweep_key "$tmp/sweep/root2" zero-444444444444 -
+  : >"$tmp/sweep/root2/zero-444444444444/T_dbg/.gate-tree"
+  sweep_key "$tmp/sweep/root2" relative-555555555555 no/such/relative/tree
+  sweep_key "$tmp/sweep/root2" control-666666666666 "$tmp/sweep/gone tree"
+  sweep_run "$tmp/sweep/root2"
+  (( rc == 0 )) || self_fail "J13d: the sweep over markers that name no tree exited $rc: $(cat "$tmp/sweep.out")"
+  sweep_swept "$tmp/sweep/root2/control-666666666666"
+  sweep_kept "$tmp/sweep/root2/slash-111111111111/T_dbg/artifact" "$tmp/sweep/root2/empty-222222222222/T_dbg/artifact" \
+    "$tmp/sweep/root2/blank-333333333333/T_dbg/artifact" "$tmp/sweep/root2/zero-444444444444/T_dbg/artifact" \
+    "$tmp/sweep/root2/relative-555555555555/T_dbg/artifact"
+  sweep_alone 1
+
+  # Only <tree>-<12 lowercase hex>, and only a directory: the names of anything else are not the judge's.
+  mkdir -p "$tmp/sweep/root3"
+  sweep_key "$tmp/sweep/root3" plain "$tmp/sweep/gone tree"
+  sweep_key "$tmp/sweep/root3" short-0123456789a "$tmp/sweep/gone tree"
+  sweep_key "$tmp/sweep/root3" long-0123456789abc "$tmp/sweep/gone tree"
+  sweep_key "$tmp/sweep/root3" upper-0123456789AB "$tmp/sweep/gone tree"
+  sweep_key "$tmp/sweep/root3" nothex-zzzzzzzzzzzz "$tmp/sweep/gone tree"
+  : >"$tmp/sweep/root3/file-777777777777"
+  sweep_key "$tmp/sweep/root3" control-888888888888 "$tmp/sweep/gone tree"
+  sweep_run "$tmp/sweep/root3"
+  (( rc == 0 )) || self_fail "J13d: the sweep over other names exited $rc: $(cat "$tmp/sweep.out")"
+  sweep_swept "$tmp/sweep/root3/control-888888888888"
+  sweep_kept "$tmp/sweep/root3/plain/T_dbg/artifact" "$tmp/sweep/root3/short-0123456789a/T_dbg/artifact" \
+    "$tmp/sweep/root3/long-0123456789abc/T_dbg/artifact" "$tmp/sweep/root3/upper-0123456789AB/T_dbg/artifact" \
+    "$tmp/sweep/root3/nothex-zzzzzzzzzzzz/T_dbg/artifact" "$tmp/sweep/root3/file-777777777777"
+  sweep_alone 1
+
+  # Nothing outside CARGO_TARGET_DIR: a neighbour of the root, and a symlink inside it to a key elsewhere, are not
+  # swept or followed. No root (unset, empty, or a directory that is not there) is not an error and creates nothing.
+  mkdir -p "$tmp/sweep/root4"
+  sweep_key "$tmp/sweep/neighbour" out-999999999999 "$tmp/sweep/gone tree"
+  sweep_key "$tmp/sweep/linked" link-aaaaaaaaaaaa "$tmp/sweep/gone tree"
+  ln -s "$tmp/sweep/linked/link-aaaaaaaaaaaa" "$tmp/sweep/root4/link-aaaaaaaaaaaa"
+  sweep_key "$tmp/sweep/root4" control-bbbbbbbbbbbb "$tmp/sweep/gone tree"
+  sweep_run "$tmp/sweep/root4"
+  (( rc == 0 )) || self_fail "J13d: the sweep next to a neighbour and a symlink exited $rc: $(cat "$tmp/sweep.out")"
+  sweep_swept "$tmp/sweep/root4/control-bbbbbbbbbbbb"
+  sweep_kept "$tmp/sweep/neighbour/out-999999999999/T_dbg/artifact" "$tmp/sweep/linked/link-aaaaaaaaaaaa/T_dbg/artifact" \
+    "$tmp/sweep/root4/link-aaaaaaaaaaaa"
+  [[ -L "$tmp/sweep/root4/link-aaaaaaaaaaaa" ]] || self_fail "J13d: the symlink in the root was replaced"
+  sweep_alone 1
+  for root_arg in "" "$tmp/sweep/not-there"; do
+    sweep_run "$root_arg"
+    (( rc == 0 )) || self_fail "J13d: a sweep with root '$root_arg' exited $rc: $(cat "$tmp/sweep.out")"
+    [[ ! -s "$tmp/sweep.out" ]] || self_fail "J13d: a sweep with root '$root_arg' printed something: $(cat "$tmp/sweep.out")"
+  done
+  [[ ! -e "$tmp/sweep/not-there" ]] || self_fail "J13d: the sweep created the root it was pointed at"
+  sweep_kept "$tmp/sweep/neighbour/out-999999999999/T_dbg/artifact"
+
+  # In the gate: after the lock and after gate_linux_env, which is what gives CARGO_TARGET_DIR its default.
+  # A gate the lock refuses sweeps nothing (a second gate has touched nothing yet).
+  fake_tree sweep_wire 'exit 0'
+  mkdir -p "$tmp/sweep_wire/home/live-tree"
+  sweep_key "$tmp/sweep_wire/target-root" gone-cccccccccccc "$tmp/sweep_wire/gone-tree"
+  sweep_key "$tmp/sweep_wire/target-root" live-dddddddddddd "$tmp/sweep_wire/home/live-tree"
+  [[ -d "$tmp/sweep_wire/target-root/gone-cccccccccccc" ]] || self_fail "J13d: the fixture of the gate has no target to sweep"
+  run_copy sweep_wire "" CARGO_TARGET_DIR="$tmp/sweep_wire/target-root"
+  (( rc == 0 )) || self_fail "J13d: a green gate over a root with a dead target exited $rc: $(cat "$tmp/sweep_wire.out")"
+  [[ ! -e "$tmp/sweep_wire/target-root/gone-cccccccccccc" ]] \
+    || self_fail "J13d: the gate did not sweep the target of a tree that is gone: $(cat "$tmp/sweep_wire.out")"
+  [[ -e "$tmp/sweep_wire/target-root/live-dddddddddddd/T_dbg/artifact" ]] || self_fail "J13d: the gate swept the target of a live tree"
+  grep -qF "note: swept $tmp/sweep_wire/target-root/gone-cccccccccccc " "$tmp/sweep_wire.out" \
+    || self_fail "J13d: the gate swept without a line saying so: $(cat "$tmp/sweep_wire.out")"
+
+  fake_tree sweep_default 'exit 0'
+  sweep_key "$tmp/sweep_default/xdg/cargo-target/memory-industry" gone-eeeeeeeeeeee "$tmp/sweep_default/gone-tree"
+  run_copy sweep_default "" XDG_CACHE_HOME="$tmp/sweep_default/xdg"
+  (( rc == 0 )) || self_fail "J13d: a green gate with the default target root exited $rc: $(cat "$tmp/sweep_default.out")"
+  [[ ! -e "$tmp/sweep_default/xdg/cargo-target/memory-industry/gone-eeeeeeeeeeee" ]] \
+    || self_fail "J13d: the gate swept before gate_linux_env gave CARGO_TARGET_DIR its default, so the root nobody names was never swept: $(cat "$tmp/sweep_default.out")"
+
+  fake_tree sweep_refused 'exit 0'
+  mkdir -p "$tmp/sweep_refused/home/.cache/cuba-gate/lock"
+  owner_record "$live" fixture-live >"$tmp/sweep_refused/home/.cache/cuba-gate/lock/owner"
+  sweep_key "$tmp/sweep_refused/target-root" gone-ffffffffffff "$tmp/sweep_refused/gone-tree"
+  run_copy sweep_refused "" CARGO_TARGET_DIR="$tmp/sweep_refused/target-root"
+  grep -q "another gate is running: pid $live" "$tmp/sweep_refused.out" \
+    || self_fail "J13d: the second gate was not refused by the live one (exit $rc): $(cat "$tmp/sweep_refused.out")"
+  [[ -e "$tmp/sweep_refused/target-root/gone-ffffffffffff/T_dbg/artifact" ]] \
+    || self_fail "J13d: a gate refused by the lock swept before it held it"
+
   # A step after the tests, with the first half past, still writes the whole
   # gate's verdict, and the file said running while the tests ran.
   fake_tree after_tests "$reads_while_running; $tests_step"
@@ -1670,6 +1818,7 @@ exit 0'
   echo "    the test times are judged last, over the gate's own log up to the npm step, and their red is the gate's"
   echo "    advisory exceptions are judged right after cargo audit, from a report made without ignores, and their red stops the gate before cargo deny;"
   echo "    a gate stopped by a signal it can catch (TERM) leaves 2 in the exit file, says so and leaves no receipt, never the 0 of its last command"
+  echo "    gate_sweep_dead_targets removes the target of a tree whose .gate-tree names a path that is gone, and no other (a live tree, a key with no marker, a marker that names no tree, another name, a symlink, a neighbour of the root), says so with the size, and the gate runs it after taking the lock and after gate_linux_env"
   exit 0
 fi
 # --- self-test end ---
@@ -1855,6 +2004,10 @@ echo ""
 # runs after the lock so that a second gate is refused first, and a refusal here
 # is this gate's verdict: exit 2, in the exit file, with the lock released.
 gate_linux_env
+
+# The targets of the trees that no longer exist, swept: after the lock (a gate that is refused has touched
+# nothing) and after gate_linux_env, which is what gives CARGO_TARGET_DIR its default (gate-lock.sh says why).
+gate_sweep_dead_targets
 
 # A cargo target inside rust/ (or a CARGO_TARGET_DIR that will be one) is copied
 # whole into every job of the mutation step, the last of this gate: it used to be

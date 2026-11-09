@@ -45,24 +45,29 @@ if [[ "${1:-}" == "--self-test" ]]; then
     awk -F'\t' -v k="$2" -v v="$3" '$k == v { n++ } END { print n + 0 }' "$1"
   }
   au_std() { # <d>: roots, steps, overlap y keys de la tabla estandar
+    # La forma de scripts/gate-dag.txt: ids, recursos y orden reales (el contrato J13 lo comprueba).
     cat > "$1/roots" <<'ROOTS'
-run D1 /r/run/tmp/D1
+run DBG /r/run/tmp/DBG
 run DC /r/run/tmp/DC
 target T_dbg /r/t/T_dbg
 target T_rel /r/t/T_rel
+target T_docs /r/t/T_docs
 cluster C_dbg /tc/dbg.Ab12
+cluster C_nli /tc/nli.Ef56
+cluster C_relh /tc/relh.Gh78
+cluster C_e2e /tc/e2e.Ij90
 cluster C_docs /tc/docs.Cd34
 ROOTS
     cat > "$1/steps" <<'STEPS'
-D1 target:T_dbg,cluster:C_dbg run-all-tests\.sh --lane D1$
-D2 target:T_dbg,cluster:C_dbg run-all-tests\.sh --lane D2$
-DC target:T_dbg,cluster:C_docs run-all-tests\.sh --lane DC$
-R target:T_rel run-all-tests\.sh --lane R$
-E target:T_rel run-all-tests\.sh --lane E$
+DBG target:T_dbg,cluster:C_dbg,models merge-gate\.sh --step DBG$
+NLI target:T_dbg,cluster:C_nli,models merge-gate\.sh --step NLI$
+DC target:T_docs,cluster:C_docs merge-gate\.sh --step DC$
+REL target:T_rel,cluster:C_relh,models merge-gate\.sh --step REL$
+E2E target:T_rel,cluster:C_e2e,models merge-gate\.sh --step E2E$
 STEPS
     cat > "$1/overlap" <<'OVERLAP'
-D1 DC
-R E
+DBG DC
+REL E2E
 OVERLAP
     cat > "$1/keys" <<'KEYS'
 alfa-0123456789abcdef alfa
@@ -100,11 +105,11 @@ KEYS
   tr_bind() { tr_put "$1" "$2" "bind(5<socket:[3]>, {sa_family=AF_INET, sin_port=htons($3), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = 0"; } # <trdir> <pid> <puerto>
   tr_bind_unix() { tr_put "$1" "$2" "bind(5<socket:[4]>, {sa_family=AF_UNIX, sun_path=\"$3\"}, 110) = 0"; }
   tr_lane() { # <trdir> <pid-bash> <paso> <pid-test> <binario>: un paso con su unidad, que ancla una conexion a su cluster
-    tr_exec "$1" "$2" /usr/bin/bash bash scripts/run-all-tests.sh --lane "$3"
+    tr_exec "$1" "$2" /usr/bin/bash bash scripts/merge-gate.sh --step "$3"
     tr_fork "$1" "$2" "$4"
     tr_exec "$1" "$4" "/r/t/T_dbg/debug/deps/$5" "$5"
     case "$3" in
-      D1) tr_unix "$1" "$4" /tc/dbg.Ab12/.s.PGSQL.5432 0 ;;
+      DBG) tr_unix "$1" "$4" /tc/dbg.Ab12/.s.PGSQL.5432 0 ;;
       DC) tr_unix "$1" "$4" /tc/docs.Cd34/.s.PGSQL.5432 0 ;;
     esac
   }
@@ -156,18 +161,18 @@ FAKE
       printf '%s %s %s %s %s 1 1 1 bash %s/scripts/fake-step.sh %s\n' "$idx" "$id" "$deps" "$rec" "$cls" "$t" "$id" >> "$t/scripts/gate-dag.txt"
     done
   }
-  au_fx13() { # <d>: trazas benignas de D1 y DC (cada una escribe solo en su raiz y ancla su cluster) para --run
+  au_fx13() { # <d>: trazas benignas de DBG y DC (cada una escribe solo en su raiz y ancla su cluster) para --run
     local d="$1" fx="$1/fx" t="$1/tree"
-    tr_exec "$fx/40-D1" 100 /usr/bin/bash bash "$t/scripts/fake-step.sh" D1
-    tr_fork "$fx/40-D1" 100 101
-    tr_exec "$fx/40-D1" 101 /r/t/T_dbg/debug/deps/alfa-0123456789abcdef alfa-0123456789abcdef
-    tr_unix "$fx/40-D1" 101 "$d/clusters/C_dbg.Ab12/.s.PGSQL.5432" 0
-    tr_open "$fx/40-D1" 101 w "$d/run/tmp/D1/a"
-    tr_exec "$fx/50-DC" 200 /usr/bin/bash bash "$t/scripts/fake-step.sh" DC
-    tr_fork "$fx/50-DC" 200 201
-    tr_exec "$fx/50-DC" 201 /r/t/T_dbg/debug/deps/beta-0123456789abcdef beta-0123456789abcdef
-    tr_unix "$fx/50-DC" 201 "$d/clusters/C_docs.Cd34/.s.PGSQL.5432" 0
-    tr_open "$fx/50-DC" 201 w "$d/run/tmp/DC/b"
+    tr_exec "$fx/20-DBG" 100 /usr/bin/bash bash "$t/scripts/fake-step.sh" DBG
+    tr_fork "$fx/20-DBG" 100 101
+    tr_exec "$fx/20-DBG" 101 /r/t/T_dbg/debug/deps/alfa-0123456789abcdef alfa-0123456789abcdef
+    tr_unix "$fx/20-DBG" 101 "$d/clusters/C_dbg.Ab12/.s.PGSQL.5432" 0
+    tr_open "$fx/20-DBG" 101 w "$d/run/tmp/DBG/a"
+    tr_exec "$fx/60-DC" 200 /usr/bin/bash bash "$t/scripts/fake-step.sh" DC
+    tr_fork "$fx/60-DC" 200 201
+    tr_exec "$fx/60-DC" 201 /r/t/T_dbg/debug/deps/beta-0123456789abcdef beta-0123456789abcdef
+    tr_unix "$fx/60-DC" 201 "$d/clusters/C_docs.Cd34/.s.PGSQL.5432" 0
+    tr_open "$fx/60-DC" 201 w "$d/run/tmp/DC/b"
   }
   au_go13() { # <d>: corre --run sobre el arbol de fixture; RC
     local d="$1"
@@ -199,7 +204,7 @@ FAKE
   row_a0b() { # --run sin GATE_AUDIT_RUN: el informe va bajo TMPDIR y HOME y XDG_CACHE_HOME quedan vacios
     local d h x t
     d="$(rd)"; h="$(mktemp -d)"; x="$(mktemp -d)"; t="$(mktemp -d)"
-    au_tree "$d" "40 D1 - target:T_dbg,cluster:C_dbg normal"
+    au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
     au_fake_strace "$d/bin"
     au_fx13 "$d"
     env -u GATE_AUDIT_RUN HOME="$h" XDG_CACHE_HOME="$x" TMPDIR="$t" PATH="$d/bin:$PATH" \
@@ -209,9 +214,9 @@ FAKE
     row_atleast A0b "informe bajo TMPDIR" "$(find "$t" -path '*/memory-industry-audit.*/audit' -type d | wc -l | tr -d ' ')" 1 || return 1
   }
 
-  row_a1() { # una unidad de D1 y otra de DC escriben la misma ruta: conflicto
+  row_a1() { # una unidad de DBG y otra de DC escriben la misma ruta: conflicto
     local d; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_lane "$d/tr" 200 DC 201 beta-0123456789abcdef
     tr_open "$d/tr" 101 w "$HOME/.cache/memory-industry/audit_key"
     tr_open "$d/tr" 201 w "$HOME/.cache/memory-industry/audit_key"
@@ -223,8 +228,8 @@ FAKE
 
   row_a1b() { # la misma ruta en pasos que no se pueden solapar no es conflicto
     local d; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
-    tr_lane "$d/tr" 300 D2 301 gamma-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 300 NLI 301 gamma-0123456789abcdef
     tr_open "$d/tr" 101 w "$HOME/.cache/x/shared"
     tr_open "$d/tr" 301 w "$HOME/.cache/x/shared"
     au_run "$d"
@@ -237,7 +242,7 @@ FAKE
     local d out smoke; d="$(rd)"; au_std "$d"
     out="$HOME/repo/rust/tests/fixtures/out.json"
     smoke="$HOME/repo/rust/eval-datasets/smoke.jsonl"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_lane "$d/tr" 200 DC 201 beta-0123456789abcdef
     tr_open "$d/tr" 101 w "$out"
     tr_open "$d/tr" 201 r "$out"
@@ -251,12 +256,12 @@ FAKE
 
   row_a2() { # raices privadas: la suya, la de otro paso, el cluster y el target compartido
     local d tr; d="$(rd)"; au_std "$d"; tr="$d/tr"
-    tr_lane "$tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$tr" 100 DBG 101 alfa-0123456789abcdef
     tr_fork "$tr" 100 111
     tr_exec "$tr" 111 /r/t/T_dbg/debug/deps/gamma-0123456789abcdef gamma-0123456789abcdef
-    tr_lane "$tr" 300 R 301 ronda-0123456789abcdef
-    tr_lane "$tr" 400 E 401 eco-0123456789abcdef
-    tr_open "$tr" 101 w "/r/run/tmp/D1/a"
+    tr_lane "$tr" 300 REL 301 ronda-0123456789abcdef
+    tr_lane "$tr" 400 E2E 401 eco-0123456789abcdef
+    tr_open "$tr" 101 w "/r/run/tmp/DBG/a"
     tr_open "$tr" 111 w "/r/run/tmp/DC/b"
     tr_open "$tr" 101 w "/tc/dbg.Ab12/x"
     tr_open "$tr" 301 w "/r/t/T_rel/tmp/shared.lock"
@@ -266,12 +271,12 @@ FAKE
     row_atleast A2 "root-intrusion" "$(au_count "$d/out" root-intrusion /r/run/tmp/DC/b)" 1 || return 1
     row_atleast A2 "cluster-write" "$(au_count "$d/out" cluster-write /tc/dbg.Ab12/x)" 1 || return 1
     row_atleast A2 "path-conflict target" "$(au_count "$d/out" path-conflict /r/t/T_rel/tmp/shared.lock)" 1 || return 1
-    row_want A2 "raiz propia sin hallazgo" "$(au_count "$d/out" '*' /r/run/tmp/D1/a)" 0 || return 1
+    row_want A2 "raiz propia sin hallazgo" "$(au_count "$d/out" '*' /r/run/tmp/DBG/a)" 0 || return 1
   }
 
   row_a3() { # el puerto del corpus vivo es rojo siempre y no se puede permitir
     local d; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_tcp "$d/tr" 101 AF_INET 5488 "-1 ECONNREFUSED (Connection refused)"
     au_run "$d"
     row_want A3 exit "$RC" 1 || return 1
@@ -283,7 +288,7 @@ FAKE
 
   row_a4() { # TCP a Postgres en el rango 5400-5599: rojo salvo que se nombre el puerto
     local d e; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_tcp "$d/tr" 101 AF_INET 5489 0
     au_run "$d"
     row_want A4 "sin --pg-tcp-allowed" "$RC" 1 || return 1
@@ -292,7 +297,7 @@ FAKE
     row_want A4 "con --pg-tcp-allowed 5489" "$RC" 0 || return 1
     row_atleast A4 "pg-connect 5489" "$(au_count "$d/out" pg-connect 5489)" 1 || return 1
     e="$(rd)"; au_std "$e"
-    tr_lane "$e/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$e/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_tcp "$e/tr" 101 AF_INET6 5490 0
     au_run "$e"
     row_want A4 "AF_INET6 al 5490" "$RC" 1 || return 1
@@ -301,7 +306,7 @@ FAKE
 
   row_a5() { # sockets de Postgres: el suyo, el de otro carril y uno de fuera
     local d; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_unix "$d/tr" 101 /tc/dbg.Ab12/.s.PGSQL.5432 0
     tr_unix "$d/tr" 101 /tc/docs.Cd34/.s.PGSQL.5432 0
     tr_unix "$d/tr" 101 /var/run/postgresql/.s.PGSQL.5432 0
@@ -313,7 +318,7 @@ FAKE
 
   row_a5b() { # sin ninguna conexion a Postgres, con clusteres declarados, no hay auditoria
     local d; d="$(rd)"; au_std "$d"
-    tr_exec "$d/tr" 100 /usr/bin/bash bash scripts/run-all-tests.sh --lane D1
+    tr_exec "$d/tr" 100 /usr/bin/bash bash scripts/merge-gate.sh --step DBG
     tr_fork "$d/tr" 100 101
     tr_exec "$d/tr" 101 /r/t/T_dbg/debug/deps/alfa-0123456789abcdef alfa-0123456789abcdef
     tr_open "$d/tr" 101 r /r/x
@@ -324,7 +329,7 @@ FAKE
 
   row_a6() { # puertos fijos: conflicto entre pasos, informativo dentro de uno, el 0 no cuenta
     local d; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_bind "$d/tr" 101 8787
     tr_bind "$d/tr" 101 0
     tr_lane "$d/tr" 200 DC 201 beta-0123456789abcdef
@@ -337,7 +342,7 @@ FAKE
 
   row_a7() { # rutas relativas (chdir, cwd heredado) y descriptores con -y
     local d e; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_put "$d/tr" 101 "chdir(\"$HOME/repo/rust\") = 0"
     tr_put "$d/tr" 101 "openat(AT_FDCWD</$HOME/repo/rust>, \"tests/fixtures/out.json\", O_WRONLY|O_CREAT, 0644) = 4</$HOME/repo/rust/tests/fixtures/out.json>"
     tr_fork "$d/tr" 101 102
@@ -345,7 +350,7 @@ FAKE
     au_run "$d"
     row_atleast A7 "home-write con la ruta absoluta" "$(au_count "$d/out" home-write "$HOME/repo/rust/tests/fixtures/out.json")" 1 || return 1
     e="$(rd)"; au_std "$e"
-    tr_lane "$e/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$e/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_put "$e/tr" 101 "chdir(\"$HOME/repo/rust\") = 0"
     tr_fork "$e/tr" 101 102
     tr_put "$e/tr" 102 "openat(3, \"out.json\", O_WRONLY|O_CREAT, 0644) = 5"
@@ -356,7 +361,7 @@ FAKE
 
   row_a7c() { # el hijo hereda la cwd del clone: su openat relativo, sin anotacion de cwd, sale de ella
     local d; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_put "$d/tr" 101 "chdir(\"$HOME/repo/rust\") = 0"
     tr_fork "$d/tr" 101 102
     tr_put "$d/tr" 102 'openat(AT_FDCWD, "tests/fixtures/out.json", O_WRONLY|O_CREAT, 0644) = 5'
@@ -367,7 +372,7 @@ FAKE
 
   row_a8() { # de quien es cada escritura: la del daemon de un test es del test; la de rustc no tiene dueno
     local d; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_fork "$d/tr" 101 102
     tr_exec "$d/tr" 102 /r/t/T_dbg/debug/memory-industry memory-industry serve
     tr_bind_unix "$d/tr" 102 "$HOME/x.sock"
@@ -395,13 +400,13 @@ FAKE
 
   row_a9() { # lo que no se entiende no se ignora: sale 2 nombrando fichero y linea
     local d e; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_put "$d/tr" 101 'openat(AT_FDCWD</x>, 0x55d0'
     au_run "$d"
     row_want A9 "linea cortada" "$RC" 2 || return 1
     row_has A9 "fichero" "$(cat "$d/err")" "t.101" || return 1
     e="$(rd)"; au_std "$e"
-    tr_lane "$e/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$e/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_put "$e/tr" 101 'openat(AT_FDCWD</x>, "/h/a", O_RDONLY <unfinished ...>'
     au_run "$e"
     row_want A9 "unfinished sin resumed" "$RC" 2 || return 1
@@ -410,7 +415,7 @@ FAKE
 
   row_a10() { # un openat de escritura que fallo no cuenta; el control de al lado, que si cuenta, prueba que la fila puede fallar
     local d; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_lane "$d/tr" 200 DC 201 beta-0123456789abcdef
     tr_put "$d/tr" 101 "openat(AT_FDCWD</r>, \"$HOME/.cache/x/out.json\", O_WRONLY|O_CREAT, 0644) = -1 ENOENT (No such file or directory)"
     tr_put "$d/tr" 201 "openat(AT_FDCWD</r>, \"$HOME/.cache/x/out.json\", O_WRONLY|O_CREAT, 0644) = -1 ENOENT (No such file or directory)"
@@ -422,14 +427,14 @@ FAKE
   }
 
   row_a11() { # la propuesta de grupos sale en el directorio del informe y el fichero versionado no cambia
-    local d t prop; d="$(rd)"; au_tree "$d" "40 D1 - target:T_dbg,cluster:C_dbg normal" "50 DC - target:T_dbg,cluster:C_docs normal"
+    local d t prop; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
     t="$d/tree"; prop="$d/run/audit/groups.proposed.txt"
     au_fake_strace "$d/bin"
     au_fx13 "$d"
-    tr_open "$d/fx/40-D1" 101 w "$HOME/.cache/x/shared"
-    tr_open "$d/fx/50-DC" 201 w "$HOME/.cache/x/shared"
-    tr_open "$d/fx/50-DC" 201 r "$t/models/emb.onnx"
-    tr_bind "$d/fx/40-D1" 101 8787
+    tr_open "$d/fx/20-DBG" 101 w "$HOME/.cache/x/shared"
+    tr_open "$d/fx/60-DC" 201 w "$HOME/.cache/x/shared"
+    tr_open "$d/fx/60-DC" 201 r "$t/models/emb.onnx"
+    tr_bind "$d/fx/20-DBG" 101 8787
     au_go13 "$d"
     row_want A11 "propuesta escrita" "$([[ -f "$prop" ]] && echo si || echo no)" si || return 1
     row_atleast A11 "grupo db" "$(awk '$2 ~ /(^|,)db(,|$)/ { n++ } END { print n + 0 }' "$prop")" 1 || return 1
@@ -441,7 +446,7 @@ FAKE
   }
 
   row_a12() { # sin strace no se audita, y se dice; con un strace que dice 5.2 tambien sale 2
-    local d rc=0; d="$(rd)"; au_tree "$d" "10 P - - normal" "40 D1 - target:T_dbg,cluster:C_dbg normal"
+    local d rc=0; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
     au_path_sin_strace "$d"
     PATH="$d/nobin" GATE_AUDIT_RUN="$d/run" FAKE_LLEGADA="$d/llegada.txt" \
       "$BASH" "$d/tree/scripts/gate-audit.sh" --run >"$d/out" 2>"$d/err" || rc=$?
@@ -458,50 +463,50 @@ FAKE
   }
 
   row_a13() { # el strace falso recibe solo los pasos de tests, en orden de idx, y el exit es el de --analyze
-    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 B1 - - normal" "40 D1 - target:T_dbg,cluster:C_dbg normal" \
-      "50 DC - target:T_dbg,cluster:C_docs normal" "75 TB - - normal"
+    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "30 B3 P target:T_rel normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" \
+      "60 DC P target:T_docs,cluster:C_docs normal"
     au_fake_strace "$d/bin"
     au_fx13 "$d"
     au_go13 "$d"
     row_want A13 exit "$RC" 0 || return 1
-    row_want A13 "orden de llegada" "$(paste -sd' ' "$d/llegada.txt")" "P B1 D1 DC TB" || return 1
+    row_want A13 "orden de llegada" "$(paste -sd' ' "$d/llegada.txt")" "P DBG B3 DC" || return 1
     row_want A13 "invocaciones de strace" "$(wc -l < "$d/strace.log" | tr -d ' ')" 2 || return 1
-    row_has A13 "D1 traced" "$(cat "$d/strace.log")" "audit/40-D1/t" || return 1
-    row_has A13 "DC traced" "$(cat "$d/strace.log")" "audit/50-DC/t" || return 1
+    row_has A13 "DBG traced" "$(cat "$d/strace.log")" "audit/20-DBG/t" || return 1
+    row_has A13 "DC traced" "$(cat "$d/strace.log")" "audit/60-DC/t" || return 1
     row_want A13 "-ff en las dos" "$(grep -c -- ' -ff ' "$d/strace.log" || true)" 2 || return 1
     row_want A13 "-y en las dos" "$(grep -c -- ' -y ' "$d/strace.log" || true)" 2 || return 1
     row_want A13 "sin -v" "$(grep -c -- ' -v ' "$d/strace.log" || true)" 0 || return 1
   }
 
   row_a13b() { # un paso que sale distinto de 0 deja la auditoria incompleta: exit 2, el resto se escribe igual
-    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "40 D1 - target:T_dbg,cluster:C_dbg normal" \
-      "50 DC - target:T_dbg,cluster:C_docs normal"
+    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" \
+      "60 DC P target:T_docs,cluster:C_docs normal"
     au_fake_strace "$d/bin"
     au_fx13 "$d"
-    printf '101\n' > "$d/tree/scripts/exit-D1"
+    printf '101\n' > "$d/tree/scripts/exit-DBG"
     au_go13 "$d"
     row_want A13b exit "$RC" 2 || return 1
-    row_has A13b "incompleta" "$(cat "$d/out" "$d/err")" "incomplete: D1 exited 101" || return 1
+    row_has A13b "incompleta" "$(cat "$d/out" "$d/err")" "incomplete: DBG exited 101" || return 1
     row_has A13b "DC corrio" "$(paste -sd' ' "$d/llegada.txt")" "DC" || return 1
     row_want A13b "report.tsv escrito" "$([[ -f "$d/run/audit/report.tsv" ]] && echo si || echo no)" si || return 1
   }
 
   row_a13c() { # trazas por encima de GATE_AUDIT_MAX_GB: exit 2 y sin truncar
-    local d rc=0; d="$(rd)"; au_tree "$d" "40 D1 - target:T_dbg,cluster:C_dbg normal"
+    local d rc=0; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
     au_fake_strace "$d/bin"
     au_fx13 "$d"
-    head -c 1048576 /dev/zero | tr '\0' x > "$d/fx/40-D1/t.999"
+    head -c 1048576 /dev/zero | tr '\0' x > "$d/fx/20-DBG/t.999"
     FAKE_STRACE_LOG="$d/strace.log" FAKE_STRACE_FX="$d/fx" FAKE_LLEGADA="$d/llegada.txt" \
       PATH="$d/bin:$PATH" GATE_AUDIT_RUN="$d/run" GATE_CLUSTER_ROOT="$d/clusters" GATE_AUDIT_MAX_GB=0 \
       "$BASH" "$d/tree/scripts/gate-audit.sh" --run >"$d/out" 2>"$d/err" || rc=$?
     row_want A13c exit "$rc" 2 || return 1
     row_has A13c "tope" "$(cat "$d/err")" "GATE_AUDIT_MAX_GB" || return 1
-    row_want A13c "trazas sin truncar" "$(wc -c < "$d/run/audit/40-D1/t.999" | tr -d ' ')" 1048576 || return 1
+    row_want A13c "trazas sin truncar" "$(wc -c < "$d/run/audit/20-DBG/t.999" | tr -d ' ')" 1048576 || return 1
   }
 
   row_a14() { # formato exacto: cinco campos por linea, ordenadas, con la clave de --keys
     local d; d="$(rd)"; au_std "$d"
-    tr_lane "$d/tr" 100 D1 101 alfa-0123456789abcdef
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_lane "$d/tr" 200 DC 201 beta-0123456789abcdef
     tr_fork "$d/tr" 100 111
     tr_exec "$d/tr" 111 /r/t/T_dbg/debug/deps/v029_bridge_against_the_real_daemon-0123456789abcdef v029_bridge_against_the_real_daemon-0123456789abcdef
@@ -930,7 +935,7 @@ ga_run() { # --run: la auditoria de verdad, en serie y con la tabla de gate-dag.
   local tree_key t c arc=0 rc traced part gen
   local -a ids=() parts=() only_ids=() words=() rows=()
   local -A deps_of=() cls_of=()
-  local -A traced_id=([D1]=1 [D2]=1 [NLI]=1 [D3]=1 [R]=1 [E]=1 [DC]=1 [CV]=1 [M]=1)
+  local -A traced_id=([DBG]=1 [NLI]=1 [REL]=1 [E2E]=1 [DC]=1 [CV]=1 [M]=1)
   while (( $# )); do
     case "$1" in
       --step) only="${2:-}"; shift 2 ;;
