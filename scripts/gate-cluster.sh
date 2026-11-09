@@ -528,15 +528,19 @@ C_EOF
   check nochmod
   [[ "$rc" == 2 && "$out" == *chmod* ]] || self_fail "A2 chmod: a chmod that fails exits $rc, not 2 naming chmod: $out"
 
-  # B4 and B5: a postgres that dies at its start is exit 2 in seconds, its log tail is printed, and the
-  # password the initdb stand-in was given is not in the output.
+  # The clock caps below sit between a row's normal time and its time with the guard broken, measured on 9-nov
+  # with the machine at load 24 and six self-tests at once: a cap is at least 3 times the normal time and at
+  # most half of the broken one. D1 times only the down of its lane, inside the shell that made it.
+  #
+  # B4 and B5: a postgres that dies at its start is exit 2 in seconds (not the 30 s of its start timeout), its
+  # log tail is printed, and the password the initdb stand-in was given is not in the output.
   fixture crash 18.6 0.8.7 "en_US.utf8" tmpfs
   printf '%s\n' die >"$tmp/crash/pgbin/mode"
-  t0="$(date +%s)"
+  t0="$(date +%s%3N)"
   lib crash crash "gate_cluster_up dbg"
-  t1="$(date +%s)"
+  t1="$(date +%s%3N)"
   [[ "$rc" == 2 ]] || self_fail "B5: a postgres that dies at its start exits $rc, not 2: $out"
-  (( t1 - t0 < 3 )) || self_fail "B5: a postgres that dies at its start took $(( t1 - t0 )) s to say so, not under 3 s"
+  (( t1 - t0 < 10000 )) || self_fail "B5: a postgres that dies at its start took $(( t1 - t0 )) ms to say so, not under 10000 ms"
   [[ "$out" == *"FATAL: fixture postgres"* ]] || self_fail "B5: the last lines of server.log are not in the output: $out"
   [[ -s "$tmp/crash.seen" ]] || self_fail "B4: the initdb stand-in was never given a password file, so the row proves nothing"
   [[ "$out" != *"$(cat "$tmp/crash.seen")"* ]] || self_fail "B4: the output carries the password of the cluster: $out"
@@ -552,23 +556,24 @@ C_EOF
   # B5 never (K9): a postgres that stays alive and never answers is exit 2 once the wall-clock timeout runs out.
   fixture stuck 18.6 0.8.7 "en_US.utf8" tmpfs
   printf '%s\n' stuck >"$tmp/stuck/pgbin/mode"
-  t0="$(date +%s)"
+  t0="$(date +%s%3N)"
   lib stuck stuck "gate_cluster_up dbg" GATE_CLUSTER_READY_TIMEOUT_S=1
-  t1="$(date +%s)"
+  t1="$(date +%s%3N)"
   [[ "$rc" == 2 ]] || self_fail "B5 never: a postgres that never answers exits $rc, not 2: $out"
-  (( t1 - t0 < 10 )) || self_fail "B5 never: a 1 s timeout took $(( t1 - t0 )) s"
+  (( t1 - t0 < 15000 )) || self_fail "B5 never: a 1 s timeout took $(( t1 - t0 )) ms, not under 15000 ms"
   [[ "$out" == *"did not answer in 1 s"* ]] || self_fail "B5 never: the FAIL line does not give the timeout: $out"
   pgrep -f "$tmp/stuck/root" >/dev/null && self_fail "B5 never: its postgres is still running after the refusal"
 
-  # B5b (K9): a pg_isready that takes 3 s a try, with a 1 s wall-clock timeout: the cluster fails in under 5 s.
+  # B5b (K9): a pg_isready that takes 3 s a try, with a 1 s wall-clock timeout: the cluster fails after the one try,
+  # not after ten (a count of tries instead of a clock would take 30 s).
   fixture slowi 18.6 0.8.7 "en_US.utf8" tmpfs
   printf '%s\n' '#!/bin/sh' 'sleep 3' 'exit 2' >"$tmp/slowi/pgbin/pg_isready"
   chmod +x "$tmp/slowi/pgbin/pg_isready"
-  t0="$(date +%s)"
+  t0="$(date +%s%3N)"
   lib slowi slowi "gate_cluster_up dbg" GATE_CLUSTER_READY_TIMEOUT_S=1
-  t1="$(date +%s)"
+  t1="$(date +%s%3N)"
   [[ "$rc" == 2 ]] || self_fail "B5b: a pg_isready that never says yes exits $rc, not 2: $out"
-  (( t1 - t0 < 5 )) || self_fail "B5b: a 1 s timeout over a 3 s pg_isready took $(( t1 - t0 )) s"
+  (( t1 - t0 < 15000 )) || self_fail "B5b: a 1 s timeout over a 3 s pg_isready took $(( t1 - t0 )) ms, not under 15000 ms"
 
   # K8: a PGPORT and a PGHOSTADDR inherited from the caller do not reach the library's calls, and the lane is
   # started on port 5432 and its URL says so.
@@ -581,16 +586,17 @@ C_EOF
   grep -qx -- "port=5432" "$tmp/k8.argv" || self_fail "K8: the postgres of the lane was not started with port=5432: $(cat "$tmp/k8.argv")"
   [[ "$(cat "$tmp/k8.url")" == *":5432/brain" ]] || self_fail "K8: the URL of the lane does not carry port 5432: $(cat "$tmp/k8.url")"
 
-  # D1 (K6, K7): gate_cluster_down ends the lane by QUIT in under 3 s, whatever the caller's exit code: its
-  # postgres is gone, its directory is gone, and its log is kept in its own directory of logs.
+  # D1 (K6, K7): gate_cluster_down ends the lane by QUIT in under 3 s (timed inside the shell that makes the lane,
+  # so the start of the shell and of the lane are not in it), whatever the caller's exit code: its postgres is
+  # gone, its directory is gone, and its log is kept in its own directory of logs.
   fixture stay 18.6 0.8.7 "en_US.utf8" tmpfs
   for code in 0 1; do
-    t0="$(date +%s%3N)"
-    lib stay$code stay "gate_cluster_up dbg >/dev/null || exit 3; gate_cluster_down dbg >/dev/null; exit $code" \
+    lib stay$code stay "gate_cluster_up dbg >/dev/null || exit 3; t0=\$(date +%s%3N); gate_cluster_down dbg >/dev/null; t1=\$(date +%s%3N); echo \"ms \$((t1 - t0))\"; exit $code" \
       GATE_CLUSTER_LOGS="$tmp/logs$code"
-    t1="$(date +%s%3N)"
     [[ "$rc" == "$code" ]] || self_fail "D1: a caller that exits $code exits $rc: $out"
-    (( t1 - t0 < 3000 )) || self_fail "D1: a lane up and down took $(( t1 - t0 )) ms (caller exit $code): the QUIT did not end the postgres"
+    ms="$(sed -n 's/^ms //p' <<<"$out")"
+    [[ "$ms" =~ ^[0-9]+$ ]] || self_fail "D1: the lane's down gave no time (caller exit $code): $out"
+    (( ms < 3000 )) || self_fail "D1: the down of a lane took $ms ms (caller exit $code), not under 3000 ms: the QUIT did not end the postgres"
     [[ -z "$(ls -A "$tmp/stay$code/root")" ]] || self_fail "D1: the lane directory is still there after its down (caller exit $code)"
     pgrep -f "$tmp/stay$code/root" >/dev/null && self_fail "D1: its postgres is still running after its down (caller exit $code)"
     grep -qx "fixture postgres: started" "$tmp/logs$code/dbg.log" 2>/dev/null \
@@ -732,7 +738,10 @@ D2EOF
   alive "$k10pid" || self_fail "K10 sweep: the sleep named by a refused directory was killed"
   kill "$k10pid" 2>/dev/null || true
 
-  # D3 (K6): a dead owner's postgres gets QUIT, and its directory goes in under 3 s; a live owner's stays.
+  # D3 (K6): a dead owner's postgres gets QUIT, and its directory goes; a live owner's stays. The QUIT is read off
+  # the exit status of the stand-in (0 when its QUIT handler ended it, 137 when the sweep waited its 10 s and
+  # killed it), not off a clock: the sweep alone takes 2 to 4 s on a loaded machine, so no cap on its time sits
+  # 3 times over that and clearly under the 10 s of the broken QUIT.
   d3="$tmp/d3"
   mkdir -p "$d3/dbg.dead02/data" "$d3/cov.live02/data"
   own 999999 deadtok "$d3/dbg.dead02/owner"
@@ -743,14 +752,13 @@ D2EOF
   "$tmp/stay/pgbin/postgres" -D "$d3/cov.live02/data" </dev/null >/dev/null 2>&1 &
   lpid=$!
   printf '%s\n%s\n' "$lpid" "$d3/cov.live02/data" >"$d3/cov.live02/data/postmaster.pid"
-  t0="$(date +%s%3N)"
   sweep "$d3" "$tmp/stay/pgbin" d3
-  t1="$(date +%s%3N)"
   for _ in $(seq 30); do alive "$dpid" || break; sleep 0.1; done
   alive "$dpid" && { kill -KILL "$dpid" 2>/dev/null; self_fail "D3: the postgres of the dead owner was still running 3 s after the sweep"; }
-  wait "$dpid" 2>/dev/null || true
+  dstatus=0
+  wait "$dpid" 2>/dev/null || dstatus=$?
   [[ "$rc" == 0 ]] || self_fail "D3: a sweep with a dead owner and a live one exits $rc, not 0: $out"
-  (( t1 - t0 < 3000 )) || self_fail "D3: the sweep took $(( t1 - t0 )) ms: the QUIT did not end the postgres of the dead owner"
+  [[ "$dstatus" == 0 ]] || self_fail "D3: the postgres of the dead owner ended with status $dstatus, not 0: the QUIT did not end it and the sweep killed it"
   [[ ! -e "$d3/dbg.dead02" ]] || self_fail "D3: the directory of the dead owner is still there"
   [[ -d "$d3/cov.live02" ]] || self_fail "D3: the directory of the live owner was removed"
   alive "$lpid" || self_fail "D3: the postgres of the live owner was killed"
