@@ -31,6 +31,10 @@
 #                                                   jobs=<n>, leaves cargo-mutants' exit in
 #                                                   OUT_DIR/cargo-mutants.rc and its output in
 #                                                   OUT_DIR/mutants.out (quality-gate.sh asks this)
+#   ./scripts/mutants-gate.sh --set-guard OUTCOMES LIST
+#                                                   the mutants an outcomes.json measured are the
+#                                                   ones LIST (a `cargo mutants --list --json`)
+#                                                   names, in both directions
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -729,16 +733,61 @@ mutants_seed_stamp() { # path, size and mtime of every file of the seed (D-F4i)
 # D-F4n..D-F4r (F4d): the cargo that cargo-mutants calls for a lab. In a lab it gives the lab's target one
 # mtime, once, so that cargo does not rebuild the 204 dependencies that fs::copy made look older than their
 # sources. Everywhere else, and in every case, it hands the same argv to the real cargo.
+#
+# CI-F6 (F6b, D-F6k): with MUTANTS_SHIM_SELECT it also picks the tests of the mutant its lab is judging, so that one
+# invocation of cargo-mutants can run each mutant with the tests that cover it. A lab is a copy of the stage that
+# cargo-mutants mutates (MUTANTS_SHIM_ORIG): the mutant is the one file that carries cargo-mutants' marker, and its
+# line is the first one where that file differs from the stage's. The table (file, line, k, tests) was made from the
+# coverage by quality-gate.sh. Only the test phase is filtered (the build has no `--exact` to take), and only when the
+# mutant is known; in every other case the argv goes as it came and the reason is a line of the selection log, which
+# is not cargo's stdout (cargo-mutants reads that).
+MUTANTS_SHIM_MARKER='/* ~ changed by cargo-mutants ~ */'
+mutants_shim_select() { # LAB ARGS...: sets MUTANTS_SHIM_EXTRA, the arguments to add behind cargo's own
+  local lab="$1" sel="${MUTANTS_SHIM_SELECT:-}" orig="${MUTANTS_SHIM_ORIG:-}" log="${MUTANTS_SHIM_SELECT_LOG:-}"
+  local arg dashed=0 rel line row k tests why
+  local -a marked=() picked=()
+  shift
+  MUTANTS_SHIM_EXTRA=()
+  [[ -n "$sel" && "${1:-}" == test ]] || return 0
+  for arg in "$@"; do
+    [[ "$arg" != --no-run ]] || return 0
+    [[ "$arg" != -- ]] || dashed=1
+  done
+  mapfile -t marked < <(grep -rlF --include='*.rs' -- "$MUTANTS_SHIM_MARKER" "$lab/src" 2>/dev/null | LC_ALL=C sort || true)
+  if (( ${#marked[@]} == 0 )); then
+    why="full baseline"
+  elif (( ${#marked[@]} > 1 )); then
+    why="full markers-in-${#marked[@]}-files"
+  else
+    rel="${marked[0]#"$lab"/}"
+    line="$(cmp "$orig/$rel" "$lab/$rel" 2>/dev/null | sed -n 's/.* line \([0-9][0-9]*\).*/\1/p' || true)"
+    row=""
+    [[ -z "$line" ]] || row="$(awk -F'\t' -v f="$rel" -v l="$line" '$1 == f && $2 == l {print; exit}' "$sel" 2>/dev/null || true)"
+    k="$(cut -f3 <<<"$row")"
+    tests="$(cut -f4 <<<"$row")"
+    if [[ -z "$row" || "$k" == 0 || -z "$tests" ]]; then
+      why="full no-entry $rel:${line:-?}"
+    else
+      read -ra picked <<<"$tests"
+      (( dashed )) || MUTANTS_SHIM_EXTRA+=(--)
+      MUTANTS_SHIM_EXTRA+=(--exact "${picked[@]}")
+      why="subset ${#picked[@]} $rel:$line"
+    fi
+  fi
+  [[ -z "$log" ]] || echo "$why" >> "$log"
+}
 mutants_cargo_shim() { # ARGS: cargo's own
-  local real="${MUTANTS_SHIM_REAL_CARGO:-}" scr="${MUTANTS_SHIM_SCRATCH:-}" epoch="${MUTANTS_SHIM_EPOCH:-}" log="${MUTANTS_SHIM_LOG:-}" lab start ms n
+  local real="${MUTANTS_SHIM_REAL_CARGO:-}" scr="${MUTANTS_SHIM_SCRATCH:-}" epoch="${MUTANTS_SHIM_EPOCH:-}" log="${MUTANTS_SHIM_LOG:-}" lab start ms n in_lab=0
   if [[ -z "$real" || ! -x "$real" ]]; then
     echo "FAIL: no cargo to hand to the shim" >&2
     exit 2
   fi
   lab="$(pwd -P)"
   if [[ -n "$scr" && "$(dirname "$lab")" == "$scr" && "$(basename "$lab")" == cargo-mutants-*.tmp \
-        && -d "$lab/target" && ! -L "$lab/target" && ! -e "$lab/target/.mi-mtime-normalized" \
-        && "$epoch" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        && -d "$lab/target" && ! -L "$lab/target" ]]; then
+    in_lab=1
+  fi
+  if (( in_lab )) && [[ ! -e "$lab/target/.mi-mtime-normalized" && "$epoch" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     start=$(date +%s%3N)
     : > "$lab/target/.mi-mtime-normalized"
     find "$lab/target" -xdev -exec touch -h -d "@$epoch" -- {} + 2>/dev/null || { echo "warning: mtime shim: normalize failed in $(basename "$lab")" >&2; [[ -z "$log" ]] || echo "normalize failed in $(basename "$lab")" >> "$log"; }
@@ -746,9 +795,11 @@ mutants_cargo_shim() { # ARGS: cargo's own
     n="$(find "$lab/target" | wc -l)"
     [[ -z "$log" ]] || echo "normalized $(basename "$lab") @$epoch $n entries $ms ms" >> "$log"
   fi
+  MUTANTS_SHIM_EXTRA=()
+  (( in_lab == 0 )) || mutants_shim_select "$lab" "$@"
   export CARGO="$real"
-  unset MUTANTS_SHIM_REAL_CARGO MUTANTS_SHIM_SCRATCH MUTANTS_SHIM_EPOCH MUTANTS_SHIM_LOG
-  exec "$real" "$@"
+  unset MUTANTS_SHIM_REAL_CARGO MUTANTS_SHIM_SCRATCH MUTANTS_SHIM_EPOCH MUTANTS_SHIM_LOG MUTANTS_SHIM_SELECT MUTANTS_SHIM_ORIG MUTANTS_SHIM_SELECT_LOG
+  exec "$real" "$@" ${MUTANTS_SHIM_EXTRA[@]+"${MUTANTS_SHIM_EXTRA[@]}"}
 }
 # D-F4j' (F4d): the first build of each lab, in the order of outcomes.json, and the shim's line. Neither is a
 # verdict: the exit is 0 always. A miss is time, not precision (D-F4j).
@@ -849,7 +900,7 @@ mutants_stage_drop() {
 mutants_lab_run() {
   OUT_DIR="$1"
   local jobs="$2" build_jobs shim_scratch seed_epoch scratch_native
-  local -a lead=()
+  local -a lead=() select_env=()
   shift 2
   mutants_seed_ensure || return $?
   mutants_stage_make || return $?
@@ -875,11 +926,17 @@ mutants_lab_run() {
   # was 8.94 GB, 37 % smaller. Prefix assignments, so nothing else in the gate sees them. --jobserver-tasks is
   # the CPUs the judge counts (D-F6c): with the jobserver cargo-mutants hands down, cargo takes its tokens and
   # ignores -j, so the CARGO_BUILD_JOBS above bounds nothing and the number of tokens is what does.
+  # CI-F6 (F6b, D-F6k): the shim selects tests only when the caller put the table in MUTANTS_SHIM_SELECT; the stage is
+  # what each lab is compared with and the log is where the shim says what it did.
+  if [[ -n "${MUTANTS_SHIM_SELECT:-}" ]]; then
+    select_env=(MUTANTS_SHIM_ORIG="$MUTANTS_STAGE/rust" MUTANTS_SHIM_SELECT_LOG="$OUT_DIR/select-shim.log")
+  fi
   MUTANTS_LAB_RC=0
   env "${MUTANTS_PROFILE_ENV[@]}" TMP="$scratch_native" TEMP="$scratch_native" TMPDIR="$MUTANTS_SCRATCH" \
   CARGO="$OUT_DIR/bin/cargo-shim" CARGO_BUILD_JOBS="$build_jobs" \
   MUTANTS_SHIM_SCRATCH="$shim_scratch" MUTANTS_SHIM_EPOCH="$seed_epoch" \
   MUTANTS_SHIM_REAL_CARGO="$MUTANTS_SHIM_REAL_CARGO" MUTANTS_SHIM_LOG="$OUT_DIR/mtime-shim.log" \
+  ${select_env[@]+"${select_env[@]}"} \
   cargo-mutants mutants ${lead[@]+"${lead[@]}"} \
     --dir "$MUTANTS_STAGE/rust" \
     --copy-target=true \
@@ -2973,6 +3030,13 @@ case "${1:-}" in
     ;;
   "--tree-guard")
     mutants_tree_guard "${2:-}" "${3:-}" || exit $?
+    exit 0
+    ;;
+  "--set-guard")
+    # CI-F6 (F6b, D-F6n): the guard of the main path, for another script: the mutants an outcomes.json measured are
+    # the ones a `cargo mutants --list --json` names.
+    [[ -f "${2:-}" && -f "${3:-}" ]] || { echo "FAIL: --set-guard needs an outcomes.json and a --list --json file (got '${2:-}' and '${3:-}')" >&2; exit 1; }
+    mutants_set_guard "$2" "$3" || exit $?
     exit 0
     ;;
   "--disk-plan")
