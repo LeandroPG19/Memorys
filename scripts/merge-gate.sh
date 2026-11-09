@@ -92,7 +92,11 @@ gate_cluster_down_all() {
   rm -f "$HOME/lanes.open"
 }
 FAKE
-    printf '#!/bin/sh\n[ "${1:-}" = --check-models ] || [ -n "${DATABASE_URL:-}" ] || { echo "FAIL: DATABASE_URL is not set, or is empty (stand-in)" >&2; exit 2; }\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
+    # CI-F3.4 (D-F34c): the E2E row has models and names no pools, so the planner wants the resource plan the binary chose in
+    # its log, as the real one writes it. The stand-in of the run-all-tests of lane E prints that line, tier full and the
+    # pools of the table (embed=4 rerank=8 nli=4), so a row that runs the planner is not red for a line only the binary writes.
+    printf '%s\n' '{"timestamp":"2026-11-06T16:10:54.000112Z","level":"INFO","fields":{"message":"resource plan","plan":"nivel=full (stand-in) hilos: embed=4 rerank=8 nli=4"}}' >"$t/scripts/plan-line.json"
+    printf '#!/bin/sh\n[ "${1:-}" = --check-models ] || [ -n "${DATABASE_URL:-}" ] || { echo "FAIL: DATABASE_URL is not set, or is empty (stand-in)" >&2; exit 2; }\ncase " $* " in *" --lane E "*) cat "$(dirname "$0")/plan-line.json" ;; esac\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
     for s in codigo-muerto crap-gate; do
       printf '#!/bin/sh\necho %s >>"$HOME/steps"\necho "${DATABASE_URL-unset}" >>"$HOME/%s.urls"\necho "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset}" >>"$HOME/%s.lanes"\nexit 0\n' "$s" "$s" "$s" >"$t/scripts/$s.sh"
     done

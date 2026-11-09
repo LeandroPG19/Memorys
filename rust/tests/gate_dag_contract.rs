@@ -1429,3 +1429,556 @@ fn a_gate_under_a_planner_step_stops_on_int_through_its_trap() {
         "a gate stopped by INT must exit 2, not {rc:?}"
     );
 }
+
+// --- CI-F3.4: the resources of a row, the memory of the models and the plan the binary chose -------------------------
+// D-F34b..F34f, D-F34o. Every step is fake, as above. The planner reads the plan from the log of the row (stdout and
+// stderr of the step are one file), the memory from GATE_PROC_MEMINFO and the cgroup tree from GATE_CGROUP_ROOT.
+
+/// The three pools of the serial judge (D-F3m, D-F34a): what the rows with models name.
+const POOLS: &str =
+    "CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8";
+
+/// The step of the row where the plan decides: a banner, what the test left in control/plan-<id>.txt (the lines the
+/// production binary writes to stderr, which the planner finds in the log of the step) and exit 0.
+/// $1 id, $2 seconds, $3 control directory.
+const PLAN_SH: &str = r#"#!/bin/sh
+id="$1"
+control="$3"
+echo "=== $id banner"
+cat "$control/plan-$id.txt" 2>/dev/null
+echo "Running unittests fake $id"
+echo "test result: ok. 1 passed; 0 failed"
+exit 0
+"#;
+
+/// A row of `table_of`: the fields of gate-dag.txt that these contracts vary, and the script that is its order.
+struct StepRow<'a> {
+    idx: u32,
+    id: &'a str,
+    deps: &'a str,
+    resources: &'a str,
+    class: &'a str,
+    secs: &'a str,
+    env: &'a str,
+    script: PathBuf,
+}
+
+impl Fixture {
+    fn row<'a>(&self, idx: u32, id: &'a str, resources: &'a str, secs: &'a str) -> StepRow<'a> {
+        StepRow {
+            idx,
+            id,
+            deps: "-",
+            resources,
+            class: "normal",
+            secs,
+            env: "",
+            script: self.script.clone(),
+        }
+    }
+
+    /// A /proc/meminfo of its own (GATE_PROC_MEMINFO, D-F34d), with the fields of the real file around the one the
+    /// planner reads.
+    fn meminfo(&self, available_kib: u64) -> PathBuf {
+        let path = self.base.join("meminfo");
+        write(
+            &path,
+            &format!(
+                "MemTotal:       49327104 kB\nMemFree:         1048576 kB\nMemAvailable:   {available_kib} kB\n\
+                 Buffers:           65536 kB\nCached:          2097152 kB\nSwapTotal:       8388608 kB\n"
+            ),
+        );
+        path
+    }
+
+    /// The `resource plan` lines the step of `id` writes into its log.
+    fn plan(&self, id: &str, text: &str) {
+        write(&self.control.join(format!("plan-{id}.txt")), text);
+    }
+
+    fn started(&self) -> Vec<PathBuf> {
+        fs::read_dir(&self.control)
+            .expect("control dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("env-"))
+            })
+            .collect()
+    }
+}
+
+/// Writes the table of `rows`, each `idx id deps resources class 1 5 secs [env] /bin/sh <script> id secs control`.
+fn table_of(fx: &mut Fixture, rows: &[StepRow]) {
+    let mut text = String::new();
+    for row in rows {
+        let mut line = vec![
+            row.idx.to_string(),
+            row.id.to_string(),
+            row.deps.to_string(),
+            row.resources.to_string(),
+            row.class.to_string(),
+            "1".to_string(),
+            "5".to_string(),
+            row.secs.to_string(),
+        ];
+        if !row.env.is_empty() {
+            line.push(row.env.to_string());
+        }
+        line.extend([
+            "/bin/sh".to_string(),
+            row.script.display().to_string(),
+            row.id.to_string(),
+            row.secs.to_string(),
+            fx.control.display().to_string(),
+        ]);
+        text.push_str(&line.join(" "));
+        text.push('\n');
+        fx.steps.push((row.idx, row.id.to_string()));
+    }
+    write(&fx.table, &text);
+    for (_, id) in &fx.steps {
+        fx.write_defaults(id);
+    }
+}
+
+fn target_root(fx: &Fixture) -> String {
+    fx.base
+        .join("target-root")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string()
+}
+
+/// Spec P1 (D-F34f): the table is judged before anything starts. Two rows in one cluster, two rows that build in one
+/// target with no order between them, a reader with no row that builds its target above it, and a resource that is
+/// none of target:, cluster:, models or reader: each is exit 2, the line names it, and no step started. The target
+/// root is set, so a table that is not judged would start its steps (and not be refused for lack of a root).
+#[test]
+fn a_table_that_breaks_a_resource_rule_is_refused_before_any_step_starts() {
+    let cases = [
+        (
+            "two rows in one cluster",
+            [
+                ("a", "-", "target:T_a,cluster:C_x"),
+                ("b", "-", "target:T_b,cluster:C_x"),
+            ],
+            "C_x",
+        ),
+        (
+            "two rows that build in one target with no order between them",
+            [("a", "-", "target:T_x"), ("b", "-", "target:T_x")],
+            "T_x",
+        ),
+        (
+            "a reader of a target no row builds above it",
+            [("p", "-", "target:T_p"), ("r", "-", "target:T_x,reader")],
+            "T_x",
+        ),
+        (
+            "a resource of a kind the planner does not know",
+            [("a", "-", "foo:bar"), ("b", "-", "-")],
+            "foo:bar",
+        ),
+    ];
+    for (defect, rows, named) in cases {
+        let mut fx = Fixture::new("f34-tabla", CPU_FOUR, MEM_OPEN);
+        let table: Vec<StepRow> = rows
+            .into_iter()
+            .zip([10, 20])
+            .map(|((id, deps, resources), idx)| StepRow {
+                deps,
+                ..fx.row(idx, id, resources, "0.1")
+            })
+            .collect();
+        table_of(&mut fx, &table);
+        let root = target_root(&fx);
+        let run = fx.run_env("0", &[("CARGO_TARGET_DIR", root.as_str())]);
+        assert_eq!(
+            run.code,
+            Some(2),
+            "{defect}: exit {:?}, want 2\n{}{}",
+            run.code,
+            run.out,
+            run.err
+        );
+        assert!(
+            run.err.contains(named),
+            "{defect}: the refusal does not name {named}: {}",
+            run.err
+        );
+        assert!(
+            fx.started().is_empty(),
+            "{defect}: a step started although the table is refused: {:?}",
+            fx.started()
+        );
+    }
+}
+
+/// The counterpart of P1: the shapes the real table has are not refused. A row that builds its target and two readers
+/// of it that wait for it, each with its own cluster, and the row of the models without a target at all.
+#[test]
+fn a_table_whose_resources_are_in_order_runs() {
+    let mut fx = Fixture::new("f34-tabla-buena", CPU_FOUR, MEM_OPEN);
+    let rows = [
+        StepRow {
+            resources: "target:T_x,cluster:C_p",
+            ..fx.row(10, "p", "", "0.1")
+        },
+        StepRow {
+            deps: "p",
+            resources: "target:T_x,cluster:C_r1,models,reader",
+            env: POOLS,
+            ..fx.row(20, "r1", "", "0.1")
+        },
+        StepRow {
+            deps: "p",
+            resources: "target:T_x,cluster:C_r2,models,reader",
+            env: POOLS,
+            ..fx.row(30, "r2", "", "0.1")
+        },
+    ];
+    table_of(&mut fx, &rows);
+    let root = target_root(&fx);
+    let run = fx.run_env("0", &[("CARGO_TARGET_DIR", root.as_str())]);
+    assert_green(&run, "a table whose resources are in order");
+}
+
+/// Spec P2 (D-F34e): as many as two rows with models alive. Three rows with models and the three pools, ready at once,
+/// with CPU and RAM to spare and a MemAvailable that is plenty: the third waits for one of the others, and says why.
+#[test]
+fn no_more_than_two_rows_with_models_are_alive_at_once() {
+    let mut fx = Fixture::new("f34-models", CPU_FOUR, MEM_OPEN);
+    let rows = ["m1", "m2", "m3"]
+        .into_iter()
+        .zip([10, 20, 30])
+        .map(|(id, idx)| StepRow {
+            env: POOLS,
+            ..fx.row(idx, id, "models", "1")
+        })
+        .collect::<Vec<_>>();
+    table_of(&mut fx, &rows);
+    let plenty = fx.meminfo(64 * 1024 * 1024);
+    let env = [("GATE_PROC_MEMINFO", plenty.to_str().expect("utf-8 path"))];
+    assert_green(&fx.run_env("0", &env), "the series that seeds the history");
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run_env("1", &env);
+    assert_green(&run, "DAG");
+    let pasos = appended(&fx.history, "pasos.jsonl", &before);
+    for record in &pasos {
+        let start = num(record, "inicio");
+        let alive = pasos
+            .iter()
+            .filter(|other| num(other, "inicio") <= start && start < num(other, "fin"))
+            .count();
+        assert!(
+            alive <= 2,
+            "three steps with models alive at t={start}: {alive} of the rows with models were running"
+        );
+    }
+    let third = by_id(&pasos, "m3");
+    assert!(
+        num(third, "espera_s") > 0.0 && third["motivo"].as_str() == Some("models"),
+        "the third row with models must wait with espera_s > 0 and motivo models: {third}"
+    );
+}
+
+/// Spec P3 (D-F34d): with another step alive, a row with models starts only if MemAvailable is at least 4096 MiB plus
+/// its own estimate. With 2 GiB it waits for the step that is alive. The control: with memory to spare, the same
+/// table starts both at once, so the wait of the first run is the memory's and nothing else's.
+#[test]
+fn a_row_with_models_waits_for_memory_when_another_step_is_alive() {
+    let mut fx = Fixture::new("f34-memoria", CPU_FOUR, MEM_OPEN);
+    let rows = [
+        fx.row(10, "A", "-", "2"),
+        StepRow {
+            env: POOLS,
+            ..fx.row(20, "B", "models", "1")
+        },
+    ];
+    table_of(&mut fx, &rows);
+    fx.anon("B", GIB);
+    let scarce = fx.meminfo(2 * 1024 * 1024);
+    let scarce_env = [("GATE_PROC_MEMINFO", scarce.to_str().expect("utf-8 path"))];
+    assert_green(
+        &fx.run_env("0", &scarce_env),
+        "the series that seeds the history",
+    );
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run_env("1", &scarce_env);
+    assert_green(&run, "DAG with 2 GiB available");
+    let pasos = appended(&fx.history, "pasos.jsonl", &before);
+    let (a, b) = (by_id(&pasos, "A"), by_id(&pasos, "B"));
+    assert!(
+        num(b, "inicio") >= num(a, "fin"),
+        "B started with MemAvailable under 4096 MiB + r: B.inicio={} A.fin={}",
+        num(b, "inicio"),
+        num(a, "fin")
+    );
+    assert!(
+        num(b, "espera_s") > 0.0 && b["motivo"].as_str() == Some("ram"),
+        "B must wait with espera_s > 0 and motivo ram: {b}"
+    );
+    let plenty = fx.meminfo(64 * 1024 * 1024);
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run_env(
+        "1",
+        &[("GATE_PROC_MEMINFO", plenty.to_str().expect("utf-8 path"))],
+    );
+    assert_green(&run, "DAG with memory to spare");
+    let pasos = appended(&fx.history, "pasos.jsonl", &before);
+    assert!(
+        overlaps(by_id(&pasos, "A"), by_id(&pasos, "B")),
+        "with memory to spare B must start beside A, or the wait above was not the memory's"
+    );
+}
+
+/// Spec P4 (D-F34d): the condition is for a row that has someone beside it. A single row with models, with 2 GiB
+/// available, runs and the planner ends, in the DAG and in the series.
+#[test]
+fn a_row_with_models_that_has_nobody_beside_it_starts_with_little_memory() {
+    let mut fx = Fixture::new("f34-sin-bloqueo", CPU_FOUR, MEM_OPEN);
+    let rows = [StepRow {
+        env: POOLS,
+        ..fx.row(10, "B", "models", "0.3")
+    }];
+    table_of(&mut fx, &rows);
+    fx.anon("B", GIB);
+    let scarce = fx.meminfo(2 * 1024 * 1024);
+    let env = [("GATE_PROC_MEMINFO", scarce.to_str().expect("utf-8 path"))];
+    for mode in ["0", "1"] {
+        let run = fx.run_env(mode, &env);
+        assert!(
+            !run.timed_out && run.code == Some(0),
+            "deadlock: GATE_DAG={mode}, a lone row with models never ran with 2 GiB available (exit {:?}, timed out {})\n{}",
+            run.code,
+            run.timed_out,
+            run.text()
+        );
+    }
+}
+
+/// The production line of the plan, as tracing writes it (the nested form of the 19th run), for a tier, a reranker on
+/// the GPU or not, and the three pools.
+fn plan_line(tier: &str, gpu: bool, embed: u32, rerank: u32, nli: u32) -> String {
+    let gpu = if gpu { " (GPU)" } else { "" };
+    format!(
+        "{{\"timestamp\":\"2026-11-06T16:10:54.000112Z\",\"level\":\"INFO\",\"fields\":{{\"message\":\"resource plan\",\
+         \"ram_total_mb\":48171,\"ram_available_mb\":27785,\"cgroup_limit_mb\":36864,\"swap_total_mb\":8192,\
+         \"cores_logical\":24,\"cores_physical\":12,\"plan\":\"nivel={tier} (embebedor + reranker + NLI) · \
+         presupuesto=27017 MiB · reserva=3320 MiB · modelos: embebedor=true reranker=true{gpu} nli=true · \
+         hilos: embed={embed} rerank={rerank} nli={nli} · tokio: workers=4 blocking=16 · pool=4 · chunk=4 · \
+         ood_fit=5000\"}}}}\n"
+    )
+}
+
+/// A table with a row of models that names the pools (4, 4 and 8) and prints nothing, and the row where the plan
+/// decides: models and no pools (E2E in the real table), whose step prints `lines`.
+fn plan_table(fx: &mut Fixture, lines: &str) {
+    let plan_script = fx.base.join("plan.sh");
+    write(&plan_script, PLAN_SH);
+    let rows = [
+        StepRow {
+            env: POOLS,
+            ..fx.row(10, "d", "models", "0.1")
+        },
+        StepRow {
+            script: plan_script,
+            ..fx.row(20, "e", "models", "0.1")
+        },
+    ];
+    table_of(fx, &rows);
+    fx.plan("e", lines);
+}
+
+/// The text of the block of `e` after its banner: from the line `=== e banner` to the verdict the planner prints.
+fn block_of_e(run: &Run) -> String {
+    let start = run
+        .out
+        .find("=== e banner")
+        .unwrap_or_else(|| panic!("no block for e in stdout:\n{}", run.text()));
+    let end = run.out[start..]
+        .find("FAIL: e exited")
+        .map_or(run.out.len(), |at| start + at);
+    run.out[start..end].to_string()
+}
+
+/// Spec P5 (D-F34b): a plan under the full tier is red, with the row's own line at the end of its block. The judge
+/// says it proves the three models, and a plan that set one aside is a judge that proves less. Both shapes of the
+/// line: the nested one tracing writes and the flat one the spec names.
+#[test]
+fn a_plan_below_the_full_tier_is_red() {
+    let flat = "{\"message\":\"resource plan\",\"plan\":\"nivel=standard (embebedor + reranker) · presupuesto=9000 MiB · \
+                modelos: embebedor=true reranker=true nli=false · hilos: embed=4 rerank=8 nli=4 · pool=4\"}\n";
+    for (shape, lines) in [
+        ("nested", plan_line("standard", false, 4, 8, 4)),
+        ("flat", flat.to_string()),
+    ] {
+        let mut fx = Fixture::new("f34-nivel", CPU_FOUR, MEM_OPEN);
+        plan_table(&mut fx, &lines);
+        let run = fx.run("0");
+        assert!(!run.timed_out, "{shape}: did not finish in 30 s");
+        assert_eq!(
+            run.code,
+            Some(1),
+            "{shape}: exit {:?}, want 1\n{}{}",
+            run.code,
+            run.out,
+            run.err
+        );
+        let block = block_of_e(&run);
+        assert!(
+            block
+                .trim_end()
+                .ends_with("FAIL: e: resource plan tier standard, the judge needs full"),
+            "{shape}: the block of e does not end in the FAIL line for the tier: {block:?}"
+        );
+    }
+}
+
+/// Spec P6 (D-F34b): the pools of the plan are the table's, except the reranker's when the plan puts it on the GPU
+/// (there the intra-op pool of the CPU does not do the work, and comparing it would turn the judge of a machine with
+/// a card red for nothing). The table's rows with models name 4, 4 and 8.
+#[test]
+fn the_threads_of_the_plan_are_the_tables_except_the_reranker_on_a_gpu() {
+    // (gpu, embed, rerank, nli, exit, the line the block carries)
+    let cases = [
+        (false, 4, 8, 4, 0, ""),
+        (
+            false,
+            4,
+            2,
+            4,
+            1,
+            "resource plan rerank=2, the rows with models set 8",
+        ),
+        (true, 4, 2, 4, 0, ""),
+        (
+            false,
+            2,
+            8,
+            4,
+            1,
+            "resource plan embed=2, the rows with models set 4",
+        ),
+    ];
+    for (n, (gpu, embed, rerank, nli, want, text)) in cases.into_iter().enumerate() {
+        let mut fx = Fixture::new("f34-hilos", CPU_FOUR, MEM_OPEN);
+        plan_table(&mut fx, &plan_line("full", gpu, embed, rerank, nli));
+        let run = fx.run("0");
+        let label = format!(
+            "case {} (gpu {gpu}, embed={embed} rerank={rerank} nli={nli})",
+            n + 1
+        );
+        assert!(!run.timed_out, "{label}: did not finish in 30 s");
+        assert_eq!(
+            run.code,
+            Some(want),
+            "{label}: exit {:?}, want {want}\n{}{}",
+            run.code,
+            run.out,
+            run.err
+        );
+        if want == 1 {
+            let block = block_of_e(&run);
+            assert!(
+                block.contains(&format!("FAIL: e: {text}")),
+                "{label}: the block does not say {text:?}: {block:?}"
+            );
+        }
+    }
+}
+
+/// Spec P7 (D-F34c): the row where the plan decides has to show it, and a plan line that is not JSON is never skipped.
+/// A plan line is one that starts with `{` and says `"message":"resource plan"`, as tracing writes it; one that is cut
+/// halfway (two writers on one stderr) is the unreadable case. A line of prose that only mentions the resource plan is
+/// not a plan line: the logs of the tests that print their assertions are full of them.
+#[test]
+fn the_row_where_the_plan_decides_has_to_show_it() {
+    let mut fx = Fixture::new("f34-ancla", CPU_FOUR, MEM_OPEN);
+    plan_table(&mut fx, "");
+    let run = fx.run("0");
+    assert!(!run.timed_out, "no line: did not finish in 30 s");
+    assert_eq!(
+        run.code,
+        Some(1),
+        "a row that shows no plan: exit {:?}, want 1\n{}{}",
+        run.code,
+        run.out,
+        run.err
+    );
+    assert!(
+        run.text().contains("no resource plan line"),
+        "the verdict does not say no resource plan line: {}",
+        run.text()
+    );
+
+    let mut fx = Fixture::new("f34-ancla-ilegible", CPU_FOUR, MEM_OPEN);
+    let whole = plan_line("full", false, 4, 8, 4);
+    let cut = &whole[..whole.find("hilos:").expect("the plan has its threads")];
+    plan_table(&mut fx, &format!("{cut}\n"));
+    let run = fx.run("0");
+    assert!(!run.timed_out, "unreadable line: did not finish in 30 s");
+    assert_eq!(
+        run.code,
+        Some(1),
+        "an unreadable plan line: exit {:?}, want 1\n{}{}",
+        run.code,
+        run.out,
+        run.err
+    );
+    assert!(
+        run.text().contains("unreadable resource plan line") && run.text().contains(cut),
+        "the verdict does not name the unreadable line: {}",
+        run.text()
+    );
+
+    let mut fx = Fixture::new("f34-ancla-prosa", CPU_FOUR, MEM_OPEN);
+    let prose =
+        "note: the resource plan above is the one the binary chose, a line that says so in prose\n";
+    plan_table(
+        &mut fx,
+        &format!("{}{prose}", plan_line("full", false, 4, 8, 4)),
+    );
+    assert_green(&fx.run("0"), "a plan line and a line of prose about it");
+}
+
+/// Spec P8 (D-F34o): while a step is exclusive no other step's cgroup has processes. A step `a` that ended and left
+/// its cgroup with `populated 1` (a daemon that outlived it; the rmdir of the planner fails in silence) is no verdict
+/// for the exclusive step after it, and with `populated 0` the same table is green. The scope is delegated, as the
+/// real one is under pesado.
+#[test]
+fn an_exclusive_step_does_not_start_beside_a_cgroup_that_still_has_processes() {
+    let mut fx = Fixture::new("f34-populated", CPU_FOUR, MEM_OPEN);
+    let rows = [
+        fx.row(10, "a", "-", "0.3"),
+        StepRow {
+            deps: "a",
+            class: "exclusive",
+            ..fx.row(20, "x", "-", "0.3")
+        },
+    ];
+    table_of(&mut fx, &rows);
+    fx.seed();
+    fx.write_step("a", "cgroup.events", "populated 1\nfrozen 0\n");
+    let run = fx.run("1");
+    assert!(!run.timed_out, "populated 1: did not finish in 30 s");
+    assert_eq!(
+        run.code,
+        Some(2),
+        "populated 1: exit {:?}, want 2\n{}{}",
+        run.code,
+        run.out,
+        run.err
+    );
+    assert!(
+        run.err
+            .contains("no verdict: x is exclusive and paso-10-a still had processes"),
+        "the verdict does not name the cgroup that still had processes: {}",
+        run.err
+    );
+    fx.write_step("a", "cgroup.events", "populated 0\nfrozen 0\n");
+    assert_green(&fx.run("1"), "populated 0");
+}

@@ -1238,6 +1238,8 @@ FAKE
     shift
     full_tree "$name"
     cp "$t/standin/memory-industry" "$t/target/release/memory-industry"
+    # CI-F3.4 (D-F34i): the record B3 leaves next to the binary, which R and E read when they run in a process of their own.
+    sha256sum "$t/target/release/memory-industry" >"$t/target/release/.gate-release.sha256"
     printf '{"content":"fake observation"}\n%.0s' 1 2 3 4 5 >"$t/rust/eval-datasets/smoke-corpus.jsonl"
     rc=0
     env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT HOME="$t/home" \
@@ -1284,6 +1286,56 @@ FAKE
   (( rc == 0 )) || self_fail "F3.3b-1: --lane E alone exits $rc, not 0: $(cat "$tmp/lane_e_alone.out")"
   [[ "$(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null || true)" == 1 ]] \
     || self_fail "F3.3b-1: --lane E alone did not provision brain_gate (CREATE DATABASE brain_gate seen $(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null || echo 0) times): $(cat "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null)"
+
+  # CI-F3.4 (D-F34i, R1): B3 leaves the sha256 of the release binary next to it (`<sha>  <path>`), and R and E, each in a
+  # process of its own, hold the binary against it. A binary rewritten after B3 is refused by E before it provisions
+  # anything, with the sha256 named and the step the record comes from.
+  full_tree r1
+  printf '{"content":"fake observation"}\n%.0s' 1 2 3 4 5 >"$tmp/r1/rust/eval-datasets/smoke-corpus.jsonl"
+  run_args r1 --lane B3
+  (( rc == 0 )) || self_fail "F3.4 R1: --lane B3 exits $rc, not 0: $(cat "$tmp/r1.out")"
+  r1_bin="$tmp/r1/target/release/memory-industry"
+  r1_record="$tmp/r1/target/release/.gate-release.sha256"
+  [[ -f "$r1_record" ]] \
+    || self_fail "F3.4 R1: B3 left no .gate-release.sha256 next to the release binary: $(ls -A "$tmp/r1/target/release")"
+  [[ "$(cut -d' ' -f1 "$r1_record")" == "$(sha256sum "$r1_bin" | cut -d' ' -f1)" ]] \
+    || self_fail "F3.4 R1: the record of B3 does not hold the sha256 of the release binary: $(cat "$r1_record")"
+  [[ "$(cut -d' ' -f3- "$r1_record")" == "$r1_bin" ]] \
+    || self_fail "F3.4 R1: the record of B3 does not name the release binary after its sha256 (<sha>  <path>): $(cat "$r1_record")"
+  run_args r1 --lane R
+  (( rc == 0 )) || self_fail "F3.4 R1: --lane R after B3, in its own process, exits $rc, not 0: $(cat "$tmp/r1.out")"
+  run_args r1 --lane E
+  (( rc == 0 )) || self_fail "F3.4 R1: --lane E after B3 and R, in its own process, exits $rc, not 0: $(cat "$tmp/r1.out")"
+  # A comment after the stand-in's last command: the sha256 changes and the binary still runs, so an E that took the binary
+  # without holding it against B3's record would end green here.
+  echo "# rewritten after B3" >>"$r1_bin"
+  run_args r1 --lane E
+  (( rc == 1 )) \
+    || self_fail "F3.4 R1: E accepted a release binary that changed after B3 (exit $rc, want 1): $(cat "$tmp/r1.out")"
+  grep -qF 'sha256 changed' "$tmp/r1.out" && grep -qF 'since B3' "$tmp/r1.out" \
+    || self_fail "F3.4 R1: E refused the changed binary without saying 'sha256 changed' and 'since B3': $(cat "$tmp/r1.out")"
+
+  # CI-F3.4 (D-F34i, R2): without B3's record R and E do not guess. The binary is on disk and nothing says it is the one B3
+  # built, so R refuses, naming what is missing.
+  full_tree r2
+  cp "$tmp/r2/standin/memory-industry" "$tmp/r2/target/release/memory-industry"
+  run_args r2 --lane R
+  (( rc == 1 )) \
+    || self_fail "F3.4 R2: R ran without B3's record (exit $rc, want 1): $(cat "$tmp/r2.out")"
+  grep -qF 'B3 left no sha256 record' "$tmp/r2.out" \
+    || self_fail "F3.4 R2: R refused without saying 'B3 left no sha256 record': $(cat "$tmp/r2.out")"
+
+  # CI-F3.4 (D-F34h, R3): E provisions brain_gate with the release binary and compiles nothing: the fake cargo logs every
+  # call, and there is none. The provision is the `doctor` the binary runs with no arguments, the one whose line the
+  # stand-in logs without --json (the placement check logs `doctor --json`).
+  release_run lane_e_nocargo --lane E
+  (( rc == 0 )) || self_fail "F3.4 R3: --lane E alone exits $rc, not 0: $(cat "$tmp/lane_e_nocargo.out")"
+  [[ ! -e "$tmp/lane_e_nocargo/home/cargo.calls" ]] \
+    || self_fail "F3.4 R3: lane E ran cargo: $(cat "$tmp/lane_e_nocargo/home/cargo.calls")"
+  [[ "$(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_e_nocargo/home/psql.calls" 2>/dev/null || true)" == 1 ]] \
+    || self_fail "F3.4 R3: --lane E alone did not provision brain_gate once: $(cat "$tmp/lane_e_nocargo/home/psql.calls" 2>/dev/null)"
+  grep -qxF "$tmp/lane_e_nocargo/target/release/memory-industry doctor" "$tmp/lane_e_nocargo/home/bin.calls" 2>/dev/null \
+    || self_fail "F3.4 R3: the provision did not call the release binary's doctor: $(cat "$tmp/lane_e_nocargo/home/bin.calls" 2>/dev/null)"
 
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
