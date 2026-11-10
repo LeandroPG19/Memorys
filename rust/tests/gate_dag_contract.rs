@@ -39,6 +39,63 @@ static SEQ: AtomicUsize = AtomicUsize::new(0);
 /// CI-K4 (D-K4n): `run_env` leaves GATE_DAG out of the environment, to see what the planner does by default.
 const UNSET: &str = "<unset>";
 
+/// What the judge exports to its lanes and to the processes under them, one name each: the same 32 as `JUDGE_ENVIRONMENT` in
+/// local_gate_contract.rs (the names `run_in_lane` of merge-gate.sh and the exports of merge-gate.sh and run-all-tests.sh
+/// hand down), which each one of them hands to a self-test as foreign. The contracts of the judge run under that
+/// environment (`lane_CT` of run-all-tests.sh runs them with `DATABASE_URL` set), so a planner started from here with what
+/// its parent has would read the judge's: `DATABASE_URL` alone (gate-dag.py, J14d) puts every DAG in series. The planner of a
+/// test sees only what the test gives it.
+const JUDGE_LANE_ENV: [&str; 32] = [
+    "DATABASE_URL",
+    "GATE_LOCK",
+    "GATE_SERVER_SYSTEM_ID",
+    "GATE_CLUSTER_ROOT",
+    "GATE_LANE",
+    "CUBA_GATE_LOCK_OWNER",
+    "CUBA_GATE_EXIT_FILE",
+    "CARGO_BUILD_JOBS",
+    "GATE_CARGO_JOBS_FROM_GATE",
+    "CARGO_TARGET_DIR",
+    "CUBA_PEER_DATABASE_URL",
+    "CUBA_BINARY_PATH",
+    "CUBA_JUDGE",
+    "ONNX_MODEL_PATH",
+    "ORT_DYLIB_PATH",
+    "CUBA_RERANKER_PATH",
+    "CUBA_NLI_PATH",
+    "CUBA_EMBEDDING_DIM",
+    "CUBA_EMBED_MODEL",
+    "CUBA_POOLING",
+    "CUBA_GATE_LANE_TOKEN",
+    "CUBA_EMBED_INTRA_THREADS",
+    "CUBA_NLI_INTRA_THREADS",
+    "CUBA_RERANK_INTRA_THREADS",
+    "MUTANTS_JOBS",
+    "CARGO_INCREMENTAL",
+    "CARGO_PROFILE_DEV_DEBUG",
+    "CARGO_PROFILE_DEV_STRIP",
+    "PYTHONUTF8",
+    "PYTHONIOENCODING",
+    "RUSTUP_TOOLCHAIN",
+    "MEMORY_INDUSTRY_REQUIRE_DATABASE_URL",
+];
+
+/// `command` without any name of JUDGE_LANE_ENV, whatever the process that runs the test has. Called by every launcher
+/// of the planner before its own variables, so what a test gives (`env`, `extra`) is applied after and stays.
+fn without_judge_env(command: &mut Command) -> &mut Command {
+    for name in JUDGE_LANE_ENV {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// `python3` for the planner, with the environment of `without_judge_env`.
+fn python3_for_the_planner() -> Command {
+    let mut command = Command::new("python3");
+    without_judge_env(&mut command);
+    command
+}
+
 const GIB: u64 = 1 << 30;
 const MEM_OPEN: &str = "max";
 /// memory.max of 14 GiB: R = 14 GiB minus the 4 GiB reserve = 10 GiB (D-J5c, D-F3p).
@@ -275,10 +332,9 @@ impl Fixture {
             command.env("GATE_DAG", gate_dag);
         }
         // CI-K4 (D-K4l): the jobs the planner counts are the ones of the machine the test describes, never the
-        // CARGO_BUILD_JOBS of whoever runs `cargo test` (pesado exports one).
-        let mut child = command
-            .env_remove("CARGO_BUILD_JOBS")
-            .env_remove("GATE_CARGO_JOBS_FROM_GATE")
+        // CARGO_BUILD_JOBS of whoever runs `cargo test` (pesado exports one); and so with every name the judge exports to
+        // its lanes (J14d: its DATABASE_URL would put the DAG a test asks for in series).
+        let mut child = without_judge_env(&mut command)
             .env("CI_TIEMPOS_DIR", &self.history)
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
@@ -1106,7 +1162,7 @@ fn the_timed_end_line_is_printed_once_before_the_first_untimed_block() {
         .join("\n")
         + "\n";
     write(&fx.table, &text);
-    let output = Command::new("python3")
+    let output = python3_for_the_planner()
         .arg("-I")
         .arg(repo_root().join("scripts/gate-dag.py"))
         .arg("run")
@@ -1163,7 +1219,7 @@ fn a_finished_block_is_written_before_the_next_step_starts() {
     let mut fx = Fixture::new("flush-bloque", CPU_FOUR, MEM_OPEN);
     fx.table(&[(10, "s10", "-", "0.1", ""), (20, "s20", "-", "4", "")]);
     let out_path = fx.base.join("salida-flush.txt");
-    let mut child = Command::new("python3")
+    let mut child = python3_for_the_planner()
         .arg("-I")
         .arg(repo_root().join("scripts/gate-dag.py"))
         .arg("run")
@@ -2172,7 +2228,7 @@ impl Fixture {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let out_path = self.base.join(format!("salida-{n}.txt"));
         let err_path = self.base.join(format!("error-{n}.txt"));
-        let child = Command::new("python3")
+        let child = python3_for_the_planner()
             .arg("-I")
             .arg(repo_root().join("scripts/gate-dag.py"))
             .arg("run")
@@ -2616,6 +2672,62 @@ fn an_external_database_url_forces_the_series() {
     assert!(
         !overlaps(by_id(&steps, "p"), by_id(&steps, "q")),
         "two rows shared the server of a DATABASE_URL: sqlx drops databases by name"
+    );
+}
+
+/// J14d under the judge (tanda 9): the contracts run in the lane CT with the lane's `DATABASE_URL`, and every other name the
+/// judge exports is there too. The planner of a test must not inherit them, or no DAG a test asks for runs as one (18 reds of
+/// the first pass of every test with the environment of each lane, all with `runs=serie (DATABASE_URL names a server of the
+/// operator)`). Both sides, with the environment of the judge put on the command the way a parent would give it:
+/// 1. every name of JUDGE_LANE_ENV given to the launcher is gone for the planner and for its steps, and the DAG runs as a DAG;
+/// 2. the same `DATABASE_URL` given as the test's own variable (`extra`, applied after) is still read, and puts it in series.
+#[test]
+fn the_planner_of_a_test_does_not_inherit_the_environment_of_the_judge() {
+    let mut fx = Fixture::new("j14d-juez", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "p", "-", "0.4", ""), (20, "q", "-", "0.4", "")]);
+    fx.seed();
+
+    let mut command = Command::new("python3");
+    command
+        .arg("-I")
+        .arg(repo_root().join("scripts/gate-dag.py"))
+        .arg("run")
+        .arg("--table")
+        .arg(&fx.table);
+    for name in JUDGE_LANE_ENV {
+        command.env(name, "postgresql://ajena:ajena@127.0.0.1:1/ajena");
+    }
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run_command(command, "1", &[]);
+    assert_green(&run, "the environment of the judge, inherited");
+    let line = plan_line_of(&run);
+    assert!(
+        line.contains(" asked=maximo runs=dag") && !line.contains("DATABASE_URL"),
+        "the planner read the DATABASE_URL of the judge instead of the test's own environment: {line}"
+    );
+    let steps = records_of(&fx, "pasos.jsonl", &before);
+    assert!(
+        overlaps(by_id(&steps, "p"), by_id(&steps, "q")),
+        "p and q did not run together, so the DAG was not a DAG: {line}"
+    );
+    for id in ["p", "q"] {
+        let seen = read(&fx.control.join(format!("env-{id}.txt")));
+        let leaked: Vec<&str> = JUDGE_LANE_ENV
+            .into_iter()
+            .filter(|name| seen.lines().any(|l| l.starts_with(&format!("{name}="))))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "step {id} got names of the judge's environment through the planner: {leaked:?}"
+        );
+    }
+
+    let run = fx.run_env("1", &[("DATABASE_URL", "postgresql://x@h/b")]);
+    assert_green(&run, "a DATABASE_URL of the test itself");
+    let line = plan_line_of(&run);
+    assert!(
+        line.contains(" asked=maximo runs=serie (DATABASE_URL names a server of the operator)"),
+        "a DATABASE_URL the test names has to be read, or the J14d contract above proves nothing: {line}"
     );
 }
 
@@ -4566,11 +4678,9 @@ struct Jobs {
 fn cargo_jobs(fx: &Fixture, host: &Machine, operator: Option<&str>) -> Jobs {
     let order = r#"source "$1" && gate_cargo_jobs && printf 'JOBS=%s RELEASE=%s\n' "$CARGO_BUILD_JOBS" "$GATE_RELEASE_JOBS""#;
     let mut command = Command::new("timeout");
-    command
+    without_judge_env(&mut command)
         .args(["20", "bash", "-c", order, "gate-lock"])
         .arg(repo_root().join("scripts").join("gate-lock.sh"))
-        .env_remove("CARGO_BUILD_JOBS")
-        .env_remove("GATE_CARGO_JOBS_FROM_GATE")
         .env("HOME", &fx.home)
         .env("TMPDIR", &fx.tmp)
         .env("GATE_CGROUP_ROOT", &fx.cgroups)
@@ -4822,7 +4932,8 @@ print("admission admitted=%d waited=%d filled=%d held=%d" % (admitted, waited, f
 /// planner module is loaded, not run: nothing here starts a step or reads the machine.
 fn property_of(body: &str) -> String {
     let fx = Fixture::new("e7a-propiedades", CPU_FOUR, MEM_OPEN);
-    let output = Command::new("timeout")
+    let mut command = Command::new("timeout");
+    let output = without_judge_env(&mut command)
         .args(["60", "python3", "-I", "-B", "-c"])
         .arg(format!("{PRELUDE_ADMISSION}{body}"))
         .arg(repo_root().join("scripts"))

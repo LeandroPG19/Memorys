@@ -56,6 +56,29 @@ use std::time::{Duration, Instant};
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
 const REPO: &str = "memory-industry";
+
+/// What `gate-dag.py` reads from the environment of its parent and the judge sets for its lanes (`os.environ` in the planner:
+/// J14d `DATABASE_URL`, D-F3k `GATE_LOCK` with `CUBA_GATE_LOCK_OWNER`, the root of the targets, the jobs of the operator and the
+/// lane token). The contracts of the judge run under them (`lane_CT`), and a planner started from here would take them: under
+/// the lock of the judge it writes lane tickets into the lock of the gate that runs the test. gate_dag_contract.rs keeps the
+/// whole list of what the judge exports (`JUDGE_LANE_ENV`); here the planner only runs in series, so what it reads is enough.
+const PLANNER_INPUTS_OF_THE_JUDGE: [&str; 7] = [
+    "DATABASE_URL",
+    "GATE_LOCK",
+    "CUBA_GATE_LOCK_OWNER",
+    "CUBA_GATE_LANE_TOKEN",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_JOBS",
+    "GATE_CARGO_JOBS_FROM_GATE",
+];
+
+/// `cmd` for a planner without the names of PLANNER_INPUTS_OF_THE_JUDGE: what a test gives it afterwards stays.
+fn without_planner_inputs(cmd: &mut Command) -> &mut Command {
+    for name in PLANNER_INPUTS_OF_THE_JUDGE {
+        cmd.env_remove(name);
+    }
+    cmd
+}
 const SHA: &str = "4f1c0a9b2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f70";
 const HUELLA: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 
@@ -839,7 +862,8 @@ fn plan(base: &Path, table: &Path, root: &Path, script_dir: &Path, extra: &[(&st
     fs::create_dir_all(&home).expect("home");
     fs::create_dir_all(&tmp).expect("tmp");
     let mut cmd = Command::new("python3");
-    cmd.arg("-I")
+    without_planner_inputs(&mut cmd)
+        .arg("-I")
         .arg(script_dir.join("gate-dag.py"))
         .arg("run")
         .arg("--table")
@@ -1711,7 +1735,8 @@ fn sin_corrida_de_historia_el_planificador_no_pasa_none() {
     let (cgroups, proc_self) = fake_cgroup(&base);
     let home = base.join("home");
     fs::create_dir_all(&home).expect("home");
-    let out = Command::new("python3")
+    let mut cmd = Command::new("python3");
+    let out = without_planner_inputs(&mut cmd)
         .arg("-I")
         .arg("-B")
         .arg("-c")
