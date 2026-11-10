@@ -3927,7 +3927,7 @@ fn the_judges_exported_environment_list_is_complete() {
 
     // CI-J9: a name the planner sets is not exported by the judge's scripts; the planner's own list is
     // where it is still named, so it is not stale while the planner names it.
-    let planner = planner_allowed_names(&read("scripts/gate-dag.py"));
+    let planner = planner_allowed_names();
     let stale: Vec<&str> = handed
         .iter()
         .chain(excluded.iter())
@@ -3962,19 +3962,26 @@ fn the_judges_exported_environment_list_is_complete() {
     );
 }
 
-/// The names of the planner's ALLOWED_ENV literal in `gate-dag.py` (CI-J9): the closed list of what a step's
-/// environment may change (D-F3j). Read from the file, so a name the planner adds is judged without this
-/// test changing.
-fn planner_allowed_names(dag: &str) -> Vec<String> {
-    let Some(start) = dag.find("ALLOWED_ENV = frozenset(") else {
-        return Vec::new();
-    };
-    let literal = &dag[start..];
-    let end = literal.find("\n)").unwrap_or(literal.len());
-    literal[..end]
-        .split('"')
-        .skip(1)
-        .step_by(2)
+/// The names a step's environment may differ in (CI-J9, D-F3j, CI-J18 D-J18c): the union of what a row may name and what the
+/// planner sets, asked of the planner itself (`gate-dag.py allowed-env`, one name per line), as gate_dag_contract.rs asks it.
+/// The list is no longer one literal in the text of gate-dag.py, so there is nothing to scan: a name the planner adds is
+/// judged without this test changing, and the scan of its text cannot go on passing over an empty list.
+fn planner_allowed_names() -> Vec<String> {
+    let out = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(repo_root().join("scripts/gate-dag.py"))
+        .arg("allowed-env")
+        .output()
+        .expect("python3 runs scripts/gate-dag.py allowed-env");
+    assert!(
+        out.status.success(),
+        "`gate-dag.py allowed-env` has to print the closed list of the step environment and exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
         .map(str::to_string)
         .collect()
 }
@@ -3983,20 +3990,13 @@ fn planner_allowed_names(dag: &str) -> Vec<String> {
 /// its own (JUDGE_ENVIRONMENT). A name the planner sets that neither list judges is red: the judge would
 /// hand a self-test the planner's value of it without anyone deciding so. The other direction is the
 /// stale check of CI-J3, which now also counts the planner's list as a place where a name is still named.
+/// CI-J18 (J18c.3): the list comes from `gate-dag.py allowed-env`, not from the text of gate-dag.py.
 #[test]
 fn every_name_the_planner_puts_in_a_step_is_judged() {
-    // The scan has to be able to fail before a clean answer from it means anything.
-    let fixture = "ALLOWED_ENV = frozenset(\n    {\n        \"AA_B\",\n        \"CC\",\n    }\n)\nOTHER = {\"ZZ\"}\n";
-    assert_eq!(
-        planner_allowed_names(fixture),
-        vec!["AA_B".to_string(), "CC".to_string()],
-        "the scan of the planner's ALLOWED_ENV must read its names and nothing after the closing paren"
-    );
-
-    let planner = planner_allowed_names(&read("scripts/gate-dag.py"));
+    let planner = planner_allowed_names();
     assert!(
         planner.len() >= 5,
-        "the planner's ALLOWED_ENV has {} names: the scan of gate-dag.py is broken",
+        "the planner's allowed-env has {} names: the list is empty or the question is not answered",
         planner.len()
     );
 
@@ -7481,7 +7481,7 @@ fn row_class(line: &str) -> String {
 
 /// D-F34p: what keeps the file `file`, named `exclusive` in scripts/gate-latency.txt, from being coherent with the
 /// judge. A src module is never exclusive (the lib runs in DBG, DC, CV and M). A test file is exclusive only if the
-/// lanes that name it with --test are those of rows of the class exclusive (or boundary), the discovery of D2 leaves it
+/// lanes that name it with --test are those of rows of the class exclusive, the discovery of D2 leaves it
 /// to them, and every test in it is #[ignore], so that the calls without --ignored of D1, DC and M only list it.
 fn exclusive_problems(file: &str, gate: &str, suite: &str, source: &str) -> Vec<String> {
     if file.starts_with("src/") {
@@ -7509,7 +7509,7 @@ fn exclusive_problems(file: &str, gate: &str, suite: &str, source: &str) -> Vec<
     }
     for lane in lanes {
         for (row, class) in rows_running(&lane) {
-            if !matches!(class.as_str(), "exclusive" | "boundary") {
+            if class != "exclusive" {
                 problems.push(format!(
                     "{file} is exclusive and runs in row {row} ({class}): lane {lane} of run-all-tests.sh runs it"
                 ));

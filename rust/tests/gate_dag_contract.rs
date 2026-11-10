@@ -940,10 +940,25 @@ fn the_planner_says_its_own_closed_list_of_step_variables() {
          nothing: {names:?}",
         names.len()
     );
-    for anchor in ["CARGO_TARGET_DIR", "TMPDIR"] {
+    for anchor in [
+        "CARGO_TARGET_DIR",
+        "TMPDIR",
+        "CUBA_GATE_LANE_TOKEN",
+        "CARGO_INCREMENTAL",
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_PROFILE_DEV_STRIP",
+    ] {
         assert!(
             names.iter().any(|name| name == anchor),
             "{anchor} is not in the list the planner printed: {names:?}"
+        );
+    }
+    // CI-J18 (D-J18c): the list is what a step may differ in, the union of what a row names and what the planner sets. No
+    // row names a database and nobody sets one since F3.2, so neither is in it: a name nobody uses is not listed.
+    for gone in ["DATABASE_URL", "GATE_SERVER_SYSTEM_ID"] {
+        assert!(
+            !names.iter().any(|name| name == gone),
+            "{gone} is in the list the planner printed, and no row names it and the planner sets none: {names:?}"
         );
     }
     let unique: HashSet<&String> = names.iter().collect();
@@ -2829,6 +2844,37 @@ fn a_comment_keeps_the_history_of_a_table_and_a_number_does_not() {
     assert!(
         overlaps(by_id(&steps, "p"), by_id(&steps, "q")),
         "with its history kept the run is a DAG"
+    );
+
+    // CI-J18 (D-J18d): the rows in another order are the same table (`parse_table` sorts them by idx), so the key is the same
+    // and the history stays. The seeded run has the key of the rows in their order of idx.
+    let reversed: String = original
+        .lines()
+        .rev()
+        .map(|row| format!("{row}\n"))
+        .collect();
+    assert_ne!(
+        reversed, original,
+        "the fixture has to have its rows in another order"
+    );
+    write(&fx.table, &reversed);
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run("1");
+    assert_green(&run, "the table with its rows in reverse order");
+    assert!(
+        !run.text().contains("note: no serial history"),
+        "the same rows in another order dropped the history: {}",
+        run.text()
+    );
+    let steps = records_of(&fx, "pasos.jsonl", &before);
+    assert_eq!(
+        by_id(&steps, "p")["tabla"],
+        key,
+        "the same rows in another order changed the key of the table"
+    );
+    assert!(
+        overlaps(by_id(&steps, "p"), by_id(&steps, "q")),
+        "with its history kept the reversed table is a DAG"
     );
 
     write(
@@ -5067,4 +5113,193 @@ print("critical path P>DBG>NLI 432.745")
 fn the_critical_path_of_the_real_table_with_the_19th_run_is_p_dbg_nli() {
     let out = property_of(BODY_CRITICAL_PATH_19);
     assert!(out.contains("critical path P>DBG>NLI 432.745"), "{out}");
+}
+
+// --- CI-J18: the table has one reader, and it refuses what it does not understand -------------------------------------
+// D-J18a: `gate-dag.py rows --table <file>` says the rows and the pairs of rows that can be alive together, and the audit
+// asks it instead of reading the table again. D-J18b: a row that is not what the grammar says is refused with the line
+// before anything starts, and a target that leaves its root writes nothing outside it.
+
+impl Fixture {
+    /// `gate-dag.py rows --table <this table>`, with the environment `run_command` gives every planner of this file.
+    fn rows(&self, extra: &[(&str, &str)]) -> Run {
+        let mut command = Command::new("python3");
+        command
+            .arg("-I")
+            .arg(repo_root().join("scripts/gate-dag.py"))
+            .arg("rows")
+            .arg("--table")
+            .arg(&self.table);
+        self.run_command(command, "0", extra)
+    }
+}
+
+/// The `FAIL:` line of the stderr of a planner: its reason, the one thing `rows` and `run` have to say alike.
+fn fail_line(run: &Run) -> String {
+    run.err
+        .lines()
+        .find(|line| line.starts_with("FAIL:"))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// CI-J18 J18a.1 (D-J18a). The table, in the order of lines 40, 10, 20, 25, 30: C waits for P and is `untimed`; A waits for
+/// P and names its jobs; X waits for A and is `exclusive`; B waits for A. `rows` says them in idx order, with the order of a
+/// row without the `NAME=value` of its environment, and then the pairs that can be alive together, `a` before `b` by idx. By
+/// hand, with the rule "neither is exclusive and neither waits for the other, directly or through others":
+///   P with A, X, B and C: every one of them waits for P, through A or directly: no pair.
+///   A with X: X is exclusive. A with B: B waits for A. A with C: C waits for P only, so they can be alive together.
+///   X with B and X with C: X is exclusive. B with C: nothing joins them.
+/// So the pairs are A-C and B-C, and `untimed` is not a reason for either to wait.
+#[test]
+fn j18a_1_rows_says_the_rows_in_idx_order_and_the_pairs_that_can_be_alive_together() {
+    let mut fx = Fixture::new("j18a1", CPU_FOUR, MEM_OPEN);
+    let rows = [
+        StepRow {
+            deps: "P",
+            class: "untimed",
+            ..fx.row(40, "C", "-", "0.1")
+        },
+        fx.row(10, "P", "-", "0.1"),
+        StepRow {
+            deps: "P",
+            env: "CARGO_BUILD_JOBS=2",
+            ..fx.row(20, "A", "-", "0.1")
+        },
+        StepRow {
+            deps: "A",
+            class: "exclusive",
+            ..fx.row(25, "X", "-", "0.1")
+        },
+        StepRow {
+            deps: "A",
+            ..fx.row(30, "B", "-", "0.1")
+        },
+    ];
+    table_of(&mut fx, &rows);
+    let run = fx.rows(&[]);
+    assert!(!run.timed_out, "`rows` did not answer in 30 s");
+    assert_eq!(
+        run.code,
+        Some(0),
+        "`gate-dag.py rows --table` has to say the table and exit 0: {}{}",
+        run.out,
+        run.err
+    );
+    let order = |id: &str| {
+        format!(
+            "/bin/sh {} {id} 0.1 {}",
+            fx.script.display(),
+            fx.control.display()
+        )
+    };
+    let mut want: Vec<String> = ["P", "A", "X", "B", "C"]
+        .into_iter()
+        .map(|id| format!("row {id} - {}", order(id)))
+        .collect();
+    want.extend(["overlap A C", "overlap B C"].map(String::from));
+    let said: Vec<&str> = run.out.lines().collect();
+    assert_eq!(
+        said, want,
+        "the rows in idx order, then the pairs that can be alive together"
+    );
+    assert!(
+        !run.out.contains("CARGO_BUILD_JOBS"),
+        "the order of a row is its argv without the NAME=value of its environment: {}",
+        run.out
+    );
+}
+
+/// CI-J18 J18a.2 (D-J18a). A table that `run` refuses, `rows` refuses with the same line: exit 2, nothing on stdout, and the
+/// `FAIL:` line of stderr is the same text. The row names a target that is not a name (`../x`); `CARGO_TARGET_DIR` is empty, so
+/// a planner that did not judge the target would be refused for another reason and the lines would differ.
+#[test]
+fn j18a_2_rows_refuses_what_run_refuses_with_the_same_line() {
+    let mut fx = Fixture::new("j18a2", CPU_FOUR, MEM_OPEN);
+    let rows = [StepRow {
+        resources: "target:../x",
+        ..fx.row(10, "s10", "-", "0.1")
+    }];
+    table_of(&mut fx, &rows);
+    let said = fx.rows(&[("CARGO_TARGET_DIR", "")]);
+    let ran = fx.run_env("0", &[("CARGO_TARGET_DIR", "")]);
+    assert!(
+        !said.timed_out && !ran.timed_out,
+        "a planner did not answer in 30 s"
+    );
+    assert_eq!(
+        (said.code, ran.code),
+        (Some(2), Some(2)),
+        "`rows` and `run` have to refuse the table with 2\nrows: {}{}\nrun: {}{}",
+        said.out,
+        said.err,
+        ran.out,
+        ran.err
+    );
+    assert!(
+        said.out.is_empty(),
+        "`rows` printed something for a table it refuses: {}",
+        said.out
+    );
+    let line = fail_line(&said);
+    assert!(
+        line.contains("../x"),
+        "`rows` has to say the FAIL line that names the target: {}",
+        said.err
+    );
+    assert_eq!(
+        line,
+        fail_line(&ran),
+        "`rows` and `run` are one reader and say the same reason"
+    );
+}
+
+/// CI-J18 J18b.2 (D-J18b). The second row names `target:../../../escape` and the root of the targets is three levels below the
+/// fixture's directory, so the path `<root>/<key>/../../../escape` ends inside the fixture (`mundo/escape`) and a planner
+/// that built it would write there. The planner refuses the table with 2, names the target, starts nothing (the first row
+/// writes its mark when it starts, and does not) and leaves no `.gate-tree` and no `escape` in the fixture.
+#[test]
+fn j18b_2_a_target_that_leaves_its_root_writes_nothing_outside_and_starts_nothing() {
+    let mut fx = Fixture::new("j18b2", CPU_FOUR, MEM_OPEN);
+    let rows = [
+        fx.row(10, "s10", "-", "0.1"),
+        StepRow {
+            deps: "s10",
+            resources: "target:../../../escape",
+            ..fx.row(20, "s20", "-", "0.1")
+        },
+    ];
+    table_of(&mut fx, &rows);
+    let root = fx.base.join("mundo/dos/target-root");
+    let run = fx.run_env(
+        "0",
+        &[("CARGO_TARGET_DIR", root.to_str().expect("utf-8 path"))],
+    );
+    assert!(!run.timed_out, "the planner did not answer in 30 s");
+    assert_eq!(
+        run.code,
+        Some(2),
+        "a target that leaves its root has to be refused with 2\n{}{}",
+        run.out,
+        run.err
+    );
+    assert!(
+        run.text().contains("../../../escape"),
+        "the refusal has to name the target: {}",
+        run.text()
+    );
+    assert!(
+        fx.started().is_empty(),
+        "a step started although the table is refused: {:?}",
+        fx.started()
+    );
+    assert!(
+        files_named(&fx.base, ".gate-tree").is_empty(),
+        "a .gate-tree was written: {:?}",
+        files_named(&fx.base, ".gate-tree")
+    );
+    assert!(
+        !fx.base.join("mundo/escape").exists(),
+        "the target `../../../escape` was made outside its root"
+    );
 }

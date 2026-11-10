@@ -230,7 +230,7 @@ FAKE
   row_a0b() { # --run sin GATE_AUDIT_RUN: el informe va bajo TMPDIR y HOME y XDG_CACHE_HOME quedan vacios (ni siquiera la raiz de target por omision se crea)
     local d h x t
     d="$(rd)"; h="$(mktemp -d)"; x="$(mktemp -d)"; t="$(mktemp -d)"
-    au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
+    au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
     env -u GATE_AUDIT_RUN -u CARGO_TARGET_DIR HOME="$h" XDG_CACHE_HOME="$x" TMPDIR="$t" PATH="$d/bin:$PATH" \
@@ -453,7 +453,7 @@ FAKE
   }
 
   row_a11() { # la propuesta de grupos sale en el directorio del informe y el fichero versionado no cambia
-    local d t prop; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    local d t prop; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
     t="$d/tree"; prop="$d/run/audit/groups.proposed.txt"
     au_fake_strace "$d/bin"
     au_fx "$d"
@@ -522,7 +522,7 @@ FAKE
   }
 
   row_a13c() { # trazas por encima de GATE_AUDIT_MAX_GB: exit 2 y sin truncar
-    local d rc=0; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
+    local d rc=0; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
     head -c 1048576 /dev/zero | tr '\0' x > "$d/fx/gate/t.999"
@@ -555,7 +555,7 @@ FAKE
   }
 
   row_a15() { # las filas llevan NAME=value delante y la orden --step: el audit las reconoce por el argv de merge-gate.sh --step <id>
-    local d line; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    local d line; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
     line="$(grep ' DBG ' "$d/tree/scripts/gate-dag.txt")"
     row_has A15 "la fila de la tabla lleva su entorno y su orden" "$line" "CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DBG" || return 1
     au_fake_strace "$d/bin"
@@ -571,7 +571,7 @@ FAKE
   }
 
   row_a16() { # la raiz de un target es <CARGO_TARGET_DIR>/<clave de arbol>/<T>, y la clave sale de gate-dag.py tree-key, la misma formula del planificador
-    local d tt key; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    local d tt key; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
     key="$(au_key "$d/tree")"
     row_want A16 "gate-dag.py tree-key" "$(python3 -I "$d/tree/scripts/gate-dag.py" tree-key "$d/tree" 2>/dev/null || true)" "$key" || return 1
     au_fake_strace "$d/bin"
@@ -586,7 +586,7 @@ FAKE
   }
 
   row_a17() { # el cluster de un carril vive en <GATE_CLUSTER_ROOT>/<carril>.XXXXXX, y el carril sale del nombre del recurso cluster:C_<carril>
-    local d; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "25 NLI DBG target:T_dbg,cluster:C_nli,models,reader exclusive" \
+    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "25 NLI DBG target:T_dbg,cluster:C_nli,models,reader exclusive" \
       "60 DC P target:T_docs normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
@@ -599,7 +599,7 @@ FAKE
   }
 
   row_a18() { # el directorio de corrida del planificador sale de la traza: la fila que escribe en el de otra es intrusion, y sin ese directorio no hay auditoria
-    local d e dag; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    local d e dag; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
     dag="$d/tmp/memory-industry-dag.Ab12Cd"
@@ -608,7 +608,7 @@ FAKE
     row_want A18 exit "$RC" 1 || return 1
     row_atleast A18 "root-intrusion en la raiz de DBG" "$(au_count "$d/out" root-intrusion "$dag/tmp/DBG/stolen")" 1 || return 1
     row_has A18 "dice de quien" "$(cat "$d/out")" "writes in the run directory of DBG" || return 1
-    e="$(rd)"; au_tree "$e" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    e="$(rd)"; au_tree "$e" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
     au_fake_strace "$e/bin"
     au_fx "$e"
     sed -i '/^mkdir(/d' "$e/fx/gate/t.120"
@@ -626,6 +626,38 @@ FAKE
     au_run "$d"
     row_want A19 "una traza de strace con el resultado alineado se lee" "$RC" 0 || return 1
     row_atleast A19 "la escritura del hijo creado por vfork" "$(au_count "$d/out" home-write "$HOME/.cache/x/padded")" 1 || return 1
+  }
+
+  row_a20() { # CI-J18 (J18a.3): una tabla que el planificador rechaza (un comentario al final de una fila) es exit 2 con el FAIL del planificador, y strace no se invoca
+    local d said; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
+    sed -i '/ DBG /s/$/ # nota/' "$d/tree/scripts/gate-dag.txt"
+    au_fake_strace "$d/bin"
+    au_fx "$d"
+    said="$(python3 -I "$d/tree/scripts/gate-dag.py" rows --table "$d/tree/scripts/gate-dag.txt" 2>&1 >/dev/null | grep '^FAIL:' || true)"
+    row_match A20 "el planificador rechaza la tabla" "$said" "FAIL: *" || return 1
+    au_go "$d"
+    row_want A20 exit "$RC" 2 || return 1
+    row_has A20 "el FAIL del planificador, tal cual" "$(cat "$d/err")" "$said" || return 1
+    row_want A20 "strace no se invoco" "$([[ -e "$d/strace.log" ]] && echo si || echo no)" no || return 1
+  }
+
+  row_a21() { # CI-J18 (J18a.4): los pasos y los solapes del audit son lo que dice `gate-dag.py rows`, no la tabla leida otra vez en bash
+    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    mv "$d/tree/scripts/gate-dag.py" "$d/tree/scripts/gate-dag-real.py"
+    cat > "$d/tree/scripts/gate-dag.py" <<'DAG'
+import os, subprocess, sys
+if sys.argv[1] == "rows":
+    print("row P - bash scripts/merge-gate.sh --step P")
+    print("row DBG target:T_dbg,cluster:C_dbg,models bash scripts/merge-gate.sh --step DBG")
+    sys.exit(0)
+real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate-dag-real.py")
+sys.exit(subprocess.run([sys.executable, "-I", real, *sys.argv[1:]]).returncode)
+DAG
+    au_fake_strace "$d/bin"
+    au_fx "$d"
+    au_go "$d"
+    row_want A21 "gen/overlap vacio: el planificador no dijo ningun solape" "$(wc -c < "$d/run/audit/gen/overlap" | tr -d ' ')" 0 || return 1
+    row_want A21 "gen/steps: las filas que dijo el planificador" "$(awk '{ print $1 }' "$d/run/audit/gen/steps" | paste -sd' ' -)" "P DBG" || return 1
   }
 
   row_a0 || exit 1
@@ -656,6 +688,8 @@ FAKE
   row_a17 || exit 1
   row_a18 || exit 1
   row_a19 || exit 1
+  row_a20 || exit 1
+  row_a21 || exit 1
   echo "OK  self-test: gate-audit"
   exit 0
 fi
@@ -969,15 +1003,6 @@ END {
 }
 AWK
 
-ga_depends() { # <a> <b>: a depende de b, directa o transitivamente (tabla de --run)
-  local d
-  for d in ${deps_of[$1]:-}; do
-    [[ "$d" == "$2" ]] && return 0
-    ga_depends "$d" "$2" && return 0
-  done
-  return 1
-}
-
 ga_analyze() { # <trazas> <roots> <steps> <overlap|""> <keys|""> <pg-tcp-allowed> <informe|"">
   local trdir="$1" roots="$2" steps="$3" overlap="$4" keys="$5" allowed="$6" report="$7"
   local -a files=()
@@ -1051,10 +1076,9 @@ ga_propose() { # <informe> <salida>: propuesta de grupos, fuera del fichero vers
     }' "$1" | LC_ALL=C sort > "$2"
 }
 
-ga_run() { # --run: la auditoria de verdad: merge-gate.sh en serie bajo strace, una vez; las filas de gate-dag.txt se reconocen en la traza (D-A7, D-A8, CI-J15a)
-  local run max used tblines incomplete="" line idx id deps rec cls order ere key lane t part arc=0 rc=0 gen dag
-  local -a ids=() parts=() words=() dags=() planner_traces=()
-  local -A deps_of=() cls_of=()
+ga_run() { # --run: la auditoria de verdad: merge-gate.sh en serie bajo strace, una vez; las filas de gate-dag.txt se reconocen en la traza (D-A7, D-A8, CI-J15a, CI-J18)
+  local run max used facts incomplete="" line kind first second order ere key lane part id arc=0 rc=0 gen dag
+  local -a ids=() parts=() dags=() planner_traces=()
   (( $# == 0 )) || ga_usage
   command -v strace >/dev/null 2>&1 || ga_fail "strace is not installed (command -v strace found nothing). The audit is never skipped: install it (sudo apt install strace) and run it again."
   local sv
@@ -1076,39 +1100,26 @@ ga_run() { # --run: la auditoria de verdad: merge-gate.sh en serie bajo strace, 
   key="$(python3 -I "$GA_ROOT/scripts/gate-dag.py" tree-key "$GA_ROOT")" || ga_fail "gate-dag.py tree-key could not name the tree $GA_ROOT"
   [[ -n "$key" ]] || ga_fail "gate-dag.py tree-key printed nothing for $GA_ROOT"
   : > "$gen/steps"; : > "$gen/roots"; : > "$gen/overlap"
-  tblines="$(grep -v -e '^#' -e '^[[:space:]]*$' "$table" | LC_ALL=C sort -k1,1n || true)"
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    read -r idx id deps rec cls _ _ _ order <<< "$line"
-    ids+=("$id"); deps_of[$id]="$deps"; cls_of[$id]="$cls"
-    # El paso es la orden sin los NAME=value de su entorno: el planificador los pone en el entorno y execve no los ve.
-    read -r -a words <<< "$order"
-    while (( ${#words[@]} > 0 )) && [[ "${words[0]}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do words=("${words[@]:1}"); done
-    (( ${#words[@]} > 0 )) || ga_fail "row $id of gate-dag.txt has no order after its NAME=value tokens"
-    ere="^$(printf '%s' "${words[*]}" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g')\$"
-    printf '%s %s %s\n' "$id" "$rec" "$ere" >> "$gen/steps"
-    IFS=',' read -r -a parts <<< "$rec"
-    for part in "${parts[@]}"; do
-      case "$part" in
-        target:*) t="${part#target:}"; printf 'target %s %s/%s/%s\n' "$t" "$CARGO_TARGET_DIR" "$key" "$t" >> "$gen/roots" ;;
-        cluster:C_*)
-          lane="${part#cluster:C_}"
-          [[ "$lane" =~ ^$GATE_LANE_RE$ ]] || ga_fail "row $id names ${part#cluster:}, and $lane is not a lane name ($GATE_LANE_RE)"
-          printf 'cluster %s %s/%s.\n' "${part#cluster:}" "$GATE_CLUSTER_ROOT" "$lane" >> "$gen/roots" ;;
-        cluster:*) ga_fail "row $id names the cluster ${part#cluster:}, which is not C_<lane>: the lane is read from its name" ;;
-      esac
-    done
-  done <<< "$tblines"
-  local i j a b
-  for ((i = 0; i < ${#ids[@]}; i++)); do
-    for ((j = i + 1; j < ${#ids[@]}; j++)); do
-      a="${ids[i]}"; b="${ids[j]}"
-      [[ "${cls_of[$a]}" == exclusive || "${cls_of[$b]}" == exclusive ]] && continue
-      ga_depends "$a" "$b" && continue
-      ga_depends "$b" "$a" && continue
-      printf '%s %s\n' "$a" "$b" >> "$gen/overlap"
-    done
-  done
+  # La tabla tiene un solo lector, el planificador (CI-J18): las filas y los solapes son lo que dice `gate-dag.py rows`. Una tabla
+  # que `run` rechazaria se rechaza aqui, con su misma linea FAIL, antes de lanzar nada.
+  facts="$(python3 -I "$GA_ROOT/scripts/gate-dag.py" rows --table "$table")" || ga_fail "gate-dag.py rows refused $table: the reason of the planner is the FAIL line above, and no row is audited against a table it does not run"
+  while read -r kind first second order; do
+    case "$kind" in
+      row)
+        # El paso es la orden sin los NAME=value de su entorno (la dice `rows` asi): el planificador los pone en el entorno y execve no los ve.
+        ids+=("$first")
+        ere="^$(printf '%s' "$order" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g')\$"
+        printf '%s %s %s\n' "$first" "$second" "$ere" >> "$gen/steps"
+        IFS=',' read -r -a parts <<< "$second"
+        for part in "${parts[@]}"; do
+          case "$part" in
+            target:*) printf 'target %s %s/%s/%s\n' "${part#target:}" "$CARGO_TARGET_DIR" "$key" "${part#target:}" >> "$gen/roots" ;;
+            cluster:*) lane="${part#cluster:C_}"; printf 'cluster %s %s/%s.\n' "${part#cluster:}" "$GATE_CLUSTER_ROOT" "$lane" >> "$gen/roots" ;;
+          esac
+        done ;;
+      overlap) printf '%s %s\n' "$first" "$second" >> "$gen/overlap" ;;
+    esac
+  done <<< "$facts"
   mkdir -p "$run/audit/gate"
   # -s 1024: strace corta los argv a 32 caracteres, y el del planificador (rutas de la tabla) y el de una fila no caben; las rutas
   # de open, mkdir y connect las imprime enteras con cualquier -s.

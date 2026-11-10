@@ -1989,14 +1989,16 @@ fn u17b_las_fichas_de_una_llamada_distinguen_lo_que_compila_de_lo_que_solo_infor
 // ---------------------------------------------------------------------------------------------
 // K9c: the key of the history of a table is the one the planner writes
 
-/// The key of the history (CI-J14k, gate-dag.py): the sha256 of the rows of the table, each with its spaces collapsed,
-/// without comments and blank lines, joined by a newline. Written here from that sentence, not read from the planner.
+/// The key of the history (CI-J14k, CI-J18 D-J18d, gate-dag.py): the sha256 of the rows of the table, each with its spaces
+/// collapsed, without comments and blank lines, ordered by bytes and joined by a newline. Written here from that sentence,
+/// not read from the planner.
 fn clave_de_tabla(texto: &str) -> String {
-    let filas: Vec<String> = texto
+    let mut filas: Vec<String> = texto
         .lines()
         .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect();
+    filas.sort();
     format!("{:x}", Sha256::digest(filas.join("\n").as_bytes()))
 }
 
@@ -2008,12 +2010,27 @@ fn u18_la_clave_de_la_tabla_es_la_que_escribe_el_planificador() {
         "4548020ba9c0a9bb9784738d8e34ca22d7ddce74c8ae586f306f1f0549bd02b6",
         "the helper that spells the key must agree with sha256 of '10 p - - normal 1 1 1 sh -c true'"
     );
+    // CI-J18 J18d.2: a known answer with two rows, written in the order 20, 10. The key is of the rows ordered by bytes, so
+    // it is the sha256 of the two normalised rows in the order 10, 20 with a line break between them and none at the end,
+    // and the table in the order 10, 20 has the same key. By hand, from the text of the table (no code of this crate):
+    //   printf '10 p - - normal 1 1 1 sh -c true\n20 q - - normal 1 1 1 sh -c true' | sha256sum
+    // The rows in the order of the lines (20, 10) give c8a7a6895dacdb0f60abc598c80e60c66f3da53ac907f504d95f16dac78d7ed7:
+    // the key that a planner that did not order them would write.
+    const DOS_FILAS: &str = "20 q - - normal 1 1 1 sh -c true\n10 p - - normal 1 1 1 sh -c true\n";
+    let conocida = "b5c741ee556ee3b324ddc2024629509bf13afd4af4025c722bb9d9acca016e9e";
+    assert_eq!(
+        clave_de_tabla(DOS_FILAS),
+        conocida,
+        "the helper orders the rows by bytes before the sha256"
+    );
+    assert_eq!(
+        clave_de_tabla("10 p - - normal 1 1 1 sh -c true\n20 q - - normal 1 1 1 sh -c true\n"),
+        conocida,
+        "the same two rows in the order 10, 20 are the same table"
+    );
     let fx = Fx::new("u18");
     let tabla = fx.base.join("tabla-del-planificador.txt");
-    write(
-        &tabla,
-        "# a comment\n\n10   p  -  -  normal 1 1 1 sh -c true\n",
-    );
+    write(&tabla, DOS_FILAS);
     let historial = fx.base.join("historial-del-planificador");
     let status = Command::new("python3")
         .arg("-I")
@@ -2052,6 +2069,11 @@ fn u18_la_clave_de_la_tabla_es_la_que_escribe_el_planificador() {
         paso["tabla"],
         json!(clave_de_tabla(&fs::read_to_string(&tabla).expect("table"))),
         "the planner writes another key than the normalised one: {paso}"
+    );
+    assert_eq!(
+        paso["tabla"],
+        json!(conocida),
+        "the planner writes another key than the known one for the rows 20, 10: {paso}"
     );
 }
 

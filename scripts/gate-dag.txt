@@ -1,7 +1,7 @@
 # scripts/gate-dag.txt: the rows of the judge, one per line (CI-F3, D-F3a, D-F3b, CI-F3.3b-2).
 # <idx> <id> <deps> <recursos> <clase> <cpu> <ram_gb> <dur_s> <orden…>
 # idx: the serial order of the judge, multiples of 10; merge-gate.sh runs the rows in it. deps: ids of this table, or '-'.
-# recursos: target:T, cluster:C, models, reader, comma separated, or '-'. clase: normal, exclusive, boundary or untimed.
+# recursos: target:T, cluster:C, models, reader, comma separated, or '-'. clase: normal, exclusive or untimed.
 # reader (CI-F3.4, D-F34g): the row builds nothing in its target, it runs the binary or the test binaries the target's
 # producer built, so it waits for that producer (a row that is not a reader, above it) and shares the target with the
 # other readers. The planner judges the table before it starts (D-F34f): one cluster per row, rows in one target ordered
@@ -32,8 +32,9 @@
 40 REL B3 target:T_rel,cluster:C_rel,models,reader normal 8 12 221 CARGO_BUILD_JOBS=2 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step REL
 50 E2E B3 target:T_rel,cluster:C_e2e,models,reader normal 8 12 113 CARGO_BUILD_JOBS=2 bash scripts/merge-gate.sh --step E2E
 # CI-K8 (D-K8c): DC compiles and lints the build without docs (`clippy --all-targets --no-default-features`, no test runs):
-# it opens no database and reads no model, so its row names a target and no cluster. dur_s is provisional (the history of DC
-# still holds the runs of when it also ran the tests, and the planner takes its median until it converges).
+# it opens no database and reads no model, so its row names a target and no cluster. dur_s is the starting duration of DC until
+# the history of this table has runs of it: the history is keyed by the rows of the table, and the planner never reads the
+# runs of another key (CI-J18, D-J18g).
 60 DC P target:T_docs normal 8 8 120 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DC
 70 CV P target:T_cov,cluster:C_cov untimed 4 4 45 CARGO_BUILD_JOBS=4 bash scripts/merge-gate.sh --step CV
 80 M P target:T_mut,cluster:C_mut untimed 8 8 136 CARGO_BUILD_JOBS=8 MUTANTS_JOBS=6 bash scripts/merge-gate.sh --step M
