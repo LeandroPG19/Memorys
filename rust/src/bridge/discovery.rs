@@ -1189,12 +1189,15 @@ mod tests {
         let tarpits = Tarpits::start_many(40).await;
         let state = id.state(8787, vec![], None);
         let net = FakeNet::new().sweep(tarpits.addrs.clone());
+        // The two timers are ten apart on purpose: only `probe_total` can end the sweep
+        // inside `identity`, so the clock tells "stopped at the budget" from "waited for each
+        // identity" by seconds, not by the load of the machine.
         let timing = Timing {
             probe_parallelism: 4,
             probe_total: ms(300),
-            identity: ms(200),
+            identity: ms(3000),
             probe_connect: ms(100),
-            discovery_total: ms(3000),
+            discovery_total: ms(5000),
             ..tiny_timing()
         };
 
@@ -1204,15 +1207,18 @@ mod tests {
 
         assert_eq!(found.verified, None, "nobody in the sweep is the host");
         assert!(
-            took < timing.probe_total + ms(500),
-            "the sweep has a total budget of {:?}; 40 silent candidates took {took:?} (an \
-             unbounded sweep would take 40/4 x 200 ms = 2 s)",
-            timing.probe_total
+            took < timing.identity,
+            "the sweep has a total budget of {:?}; 40 silent candidates took {took:?}, as long as \
+             one identity wait of {:?} (a sweep not bounded by the budget waits for every one)",
+            timing.probe_total,
+            timing.identity
         );
+        // The probes of this sweep live the whole budget (none can answer), so a 100 ms slack
+        // drops the short reachability connections without hiding a fifth probe.
         assert!(
-            tarpits.log.max_overlap(ms(15)) <= 4,
+            tarpits.log.max_overlap(ms(100)) <= 4,
             "at most probe_parallelism (4) connections may be open at once; saw {}",
-            tarpits.log.max_overlap(ms(15))
+            tarpits.log.max_overlap(ms(100))
         );
         assert_eq!(
             found.attempts.len(),
@@ -1231,8 +1237,9 @@ mod tests {
             .count();
         assert!(
             asked <= 8 && skipped >= 32 && asked + skipped == 40,
-            "in 300 ms at 4 at a time, 200 ms each, at most 8 can be asked; the rest must be \
-             reported as 'no probado (tiempo agotado)'. Asked {asked}, skipped {skipped}"
+            "in 300 ms at 4 at a time, at most 8 can be asked (here none: an identity wait \
+             lasts longer than the budget); the rest must be reported as 'no probado (tiempo \
+             agotado)'. Asked {asked}, skipped {skipped}"
         );
     }
 

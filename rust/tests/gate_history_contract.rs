@@ -1072,7 +1072,9 @@ fn h8_un_candado_tomado_no_cuelga_el_registro() {
 }
 
 /// H8 (P1), planner: the same lock does not hang `gate-dag.py run`, which writes from drain() too.
-/// With a timeout of 1 s it waits once and then skips the later writes: under 2,5 s.
+/// With a timeout of 1,5 s it waits once and then skips the later writes: under 4 s. The timeout is
+/// what the clock tells the two apart by (once is T, one per write is 4T), so it is not lowered: a
+/// shorter one would shrink the gap of 3T toward the start-up time of python under load.
 #[test]
 fn h8_un_candado_tomado_no_cuelga_el_planificador() {
     let fx = Fixture::new("h8-planificador");
@@ -1085,16 +1087,16 @@ fn h8_un_candado_tomado_no_cuelga_el_planificador() {
         &table,
         &root,
         &scripts(),
-        &[("GATE_HISTORY_LOCK_TIMEOUT_S", "1")],
+        &[("GATE_HISTORY_LOCK_TIMEOUT_S", "1.5")],
     );
     let tardo = inicio.elapsed();
     let _ = holder.kill();
     let _ = holder.wait();
     assert_eq!(p.code, Some(0), "two green steps: {}", p.err);
     assert!(
-        tardo < Duration::from_millis(2500),
-        "the planner waited {tardo:?} with the lock held and a timeout of 1 s: the timeout is spent once, \
-         so about 1.05 s; one timeout per write would be about 4.1 s (4 writes)"
+        tardo < Duration::from_secs(4),
+        "the planner waited {tardo:?} with the lock held and a timeout of 1.5 s: the timeout is spent once, \
+         so about 1.55 s; one timeout per write would be about 6.1 s (4 writes)"
     );
     assert_eq!(history_lines(&p.err), 1, "one history: line: {}", p.err);
 }

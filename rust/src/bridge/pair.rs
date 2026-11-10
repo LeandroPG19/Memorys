@@ -643,7 +643,14 @@ mod tests {
             tarpit.addr(),
             host.addr(),
         ]);
-        let timing = tiny_timing();
+        // `identity` is ten times `probe_total` so that only the sweep budget can cut the
+        // tarpit: the clock then tells "stopped at probe_total" from "waited for the
+        // candidate's own identity limit" by seconds, not by the load of the machine.
+        let timing = Timing {
+            probe_total: ms(300),
+            identity: ms(3000),
+            ..tiny_timing()
+        };
 
         let started = Instant::now();
         let state = pair(&code, None, "mi-pc", &net, &timing, &client())
@@ -660,8 +667,11 @@ mod tests {
              the code. Saw: {lines:?}"
         );
         assert!(
-            took < timing.probe_total + ms(500),
-            "a silent candidate in the sweep must not stall the pairing past probe_total; took {took:?}"
+            took < timing.identity,
+            "a silent candidate in the sweep must not stall the pairing past probe_total ({:?}); \
+             took {took:?}, as long as its own identity wait of {:?}",
+            timing.probe_total,
+            timing.identity
         );
     }
 
