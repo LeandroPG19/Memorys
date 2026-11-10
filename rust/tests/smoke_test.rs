@@ -395,11 +395,13 @@ fn every_test_that_moves_a_process_wide_variable_serialises() {
     let mut checked = 0;
     let mut reached_without_the_cuba_prefix = 0;
 
-    for entry in std::fs::read_dir(&dir)
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .expect("tests/ is readable")
         .flatten()
-    {
-        let path = entry.path();
+        .map(|entry| entry.path())
+        .collect();
+    paths.extend(group_module_paths(&dir));
+    for path in paths {
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
@@ -471,7 +473,7 @@ fn every_test_that_moves_a_process_wide_variable_serialises() {
     assert!(
         reached_without_the_cuba_prefix >= 1,
         "all {checked} file(s) in scope write a `CUBA_` name inline, which is precisely what \
-         this scan saw back when it matched `set_var(\"CUBA_` and nothing else. If no file \
+         this scan saw back when it matched `set_var(\"CUBA_\")` and nothing else. If no file \
          arrives by another route, the widening is decoration and the MEMORY_INDUSTRY_* \
          namespace is unwatched again without anyone editing a line. Two arrive that way \
          today: one writes only MEMORY_INDUSTRY_GRAPH_DB, the other sets its variables \
@@ -913,6 +915,7 @@ fn no_daemon_test_listens_on_a_port_it_wrote_down() {
             files.push(path);
         }
     }
+    files.extend(group_module_paths(&dir));
     files.sort();
 
     let mut daemons = 0;
@@ -976,5 +979,463 @@ fn no_daemon_test_listens_on_a_port_it_wrote_down() {
          receives a number: two daemons of one binary then cannot be handed the same port, \
          which is the only way a test ends up talking to the wrong daemon",
         problems.len()
+    );
+}
+
+/// A folder of `tests/` as the group checks see it: whether it is a helper (`mod.rs`), the root
+/// `tests/<name>.rs` beside it when there is one, and the `.rs` files inside.
+struct TestFolder {
+    name: String,
+    has_mod_rs: bool,
+    root: Option<String>,
+    files: Vec<String>,
+}
+
+/// A group is a folder with a root `tests/<name>.rs` and no `mod.rs`: cargo builds the root as a test
+/// binary and the root pulls the modules in with `#[path]`.
+fn is_group(folder: &TestFolder) -> bool {
+    !folder.has_mod_rs && folder.root.is_some()
+}
+
+fn rs_files_in(folder: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    files.sort();
+    files
+}
+
+fn test_folders(tests: &std::path::Path) -> Vec<TestFolder> {
+    let mut folders: Vec<TestFolder> = std::fs::read_dir(tests)
+        .expect("tests/ is readable")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .map(|path| {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            TestFolder {
+                has_mod_rs: path.join("mod.rs").is_file(),
+                root: std::fs::read_to_string(tests.join(format!("{name}.rs"))).ok(),
+                files: rs_files_in(&path)
+                    .iter()
+                    .filter_map(|file| file.file_name())
+                    .map(|file| file.to_string_lossy().into_owned())
+                    .collect(),
+                name,
+            }
+        })
+        .collect();
+    folders.sort_by(|a, b| a.name.cmp(&b.name));
+    folders
+}
+
+/// The modules of every test group, which the scans over `tests/*.rs` would otherwise never read.
+fn group_module_paths(tests: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for folder in test_folders(tests).iter().filter(|f| is_group(f)) {
+        found.extend(rs_files_in(&tests.join(&folder.name)));
+    }
+    found.sort();
+    found
+}
+
+/// The `#[path = "<folder>/<file>.rs"] mod <name>;` pairs a group root declares, as (path, name).
+fn declared_modules(root: &str) -> Vec<(String, String)> {
+    let mut declared = Vec::new();
+    let mut path: Option<String> = None;
+    for line in root.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("#[path = \"") {
+            path = rest.split('"').next().map(str::to_string);
+        } else if let Some(name) = line
+            .strip_prefix("mod ")
+            .and_then(|rest| rest.strip_suffix(';'))
+        {
+            declared.extend(path.take().map(|path| (path, name.trim().to_string())));
+        }
+    }
+    declared
+}
+
+/// What is wrong with how the folders of `tests/` and their roots agree, one sentence each. A folder
+/// with `.rs` files and neither a root nor a `mod.rs` is code nobody compiles; a root and its folder
+/// declare and hold the same set of files, in both directions; no file is declared by two roots or
+/// twice by one; and a module is named after its file, because `cargo test -- --list` prints
+/// `<module>::<test>` and the inventory of before and after is compared by that name.
+fn group_declaration_problems(folders: &[TestFolder]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut roots_of: std::collections::BTreeMap<String, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for folder in folders.iter().filter(|folder| !folder.has_mod_rs) {
+        let name = &folder.name;
+        let Some(root) = &folder.root else {
+            if !folder.files.is_empty() {
+                problems.push(format!(
+                    "tests/{name}/ holds {:?} and there is neither a tests/{name}.rs nor a \
+                     tests/{name}/mod.rs: nobody compiles those files",
+                    folder.files
+                ));
+            }
+            continue;
+        };
+        let in_folder: std::collections::BTreeSet<String> = folder
+            .files
+            .iter()
+            .map(|file| format!("{name}/{file}"))
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for (path, module) in declared_modules(root) {
+            roots_of
+                .entry(path.clone())
+                .or_default()
+                .insert(name.as_str());
+            if !in_folder.contains(&path) {
+                problems.push(format!(
+                    "tests/{name}.rs declares `{path}`, which is not in tests/{name}/"
+                ));
+            }
+            let stem = path
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(".rs");
+            if stem != module {
+                problems.push(format!(
+                    "tests/{name}.rs declares `{path}` as `mod {module}`: a module is named after \
+                     its file"
+                ));
+            }
+            if !seen.insert(path.clone()) {
+                problems.push(format!("tests/{name}.rs declares `{path}` twice"));
+            }
+        }
+        for path in &in_folder {
+            if !seen.contains(path) {
+                problems.push(format!(
+                    "tests/{path} is not declared by tests/{name}.rs, so cargo never compiles it"
+                ));
+            }
+        }
+    }
+    for (path, roots) in &roots_of {
+        if roots.len() > 1 {
+            problems.push(format!("`{path}` is declared by two roots: {roots:?}"));
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_group_declaration_check_fails_on_each_way_a_group_can_break() {
+    let root = |paths: &[(&str, &str)]| {
+        paths
+            .iter()
+            .map(|(path, name)| format!("#[path = \"{path}\"]\nmod {name};\n"))
+            .collect::<String>()
+    };
+    let folder = |name: &str, has_mod_rs: bool, body: Option<String>, files: &[&str]| TestFolder {
+        name: name.to_string(),
+        has_mod_rs,
+        root: body,
+        files: files.iter().map(|file| file.to_string()).collect(),
+    };
+    let sound = || {
+        vec![
+            folder(
+                "group_a",
+                false,
+                Some(format!(
+                    "mod helper;\n\n{}",
+                    root(&[("group_a/x.rs", "x"), ("group_a/y.rs", "y")])
+                )),
+                &["x.rs", "y.rs"],
+            ),
+            folder("helper", true, None, &["mod.rs"]),
+            folder("data", false, None, &[]),
+        ]
+    };
+    assert_eq!(
+        group_declaration_problems(&sound()),
+        Vec::<String>::new(),
+        "a root that declares exactly its folder, beside a helper and a folder with no .rs, is sound"
+    );
+
+    let mut an_undeclared_file = sound();
+    an_undeclared_file[0].files.push("z.rs".to_string());
+    let mut a_missing_file = sound();
+    a_missing_file[0].files.pop();
+    let mut an_orphan_folder = sound();
+    an_orphan_folder.push(folder("group_x", false, None, &["a.rs"]));
+    let mut a_misnamed_module = sound();
+    a_misnamed_module[0].root = Some(root(&[("group_a/x.rs", "other"), ("group_a/y.rs", "y")]));
+    let mut declared_twice = sound();
+    declared_twice[0].root = Some(root(&[
+        ("group_a/x.rs", "x"),
+        ("group_a/x.rs", "x"),
+        ("group_a/y.rs", "y"),
+    ]));
+    let mut two_roots = sound();
+    two_roots.push(folder(
+        "group_b",
+        false,
+        Some(root(&[("group_a/x.rs", "x")])),
+        &[],
+    ));
+
+    for (case, folders, expected) in [
+        (
+            "a file nobody declares",
+            an_undeclared_file,
+            "z.rs is not declared",
+        ),
+        (
+            "a declared file that is gone",
+            a_missing_file,
+            "declares `group_a/y.rs`",
+        ),
+        ("a folder with no root", an_orphan_folder, "nobody compiles"),
+        (
+            "a module named after another file",
+            a_misnamed_module,
+            "named after its file",
+        ),
+        (
+            "one file declared twice by its root",
+            declared_twice,
+            "`group_a/x.rs` twice",
+        ),
+        (
+            "one file declared by two roots",
+            two_roots,
+            "declared by two roots",
+        ),
+    ] {
+        let problems = group_declaration_problems(&folders);
+        assert!(
+            problems.iter().any(|problem| problem.contains(expected)),
+            "{case}: expected a problem that says `{expected}`, got {problems:?}"
+        );
+    }
+}
+
+#[test]
+fn every_file_of_a_test_group_is_declared_by_its_root_once() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let folders = test_folders(&dir);
+    let groups = folders.iter().filter(|folder| is_group(folder)).count();
+    let modules: usize = folders
+        .iter()
+        .filter(|folder| is_group(folder))
+        .map(|folder| folder.files.len())
+        .sum();
+    assert!(
+        groups >= 2 && modules >= 25,
+        "the scan found {groups} test group(s) with {modules} module(s) under tests/, and there are 2 \
+         with 25. A scan that found nothing proves nothing, and a group that lost its folder is a \
+         binary that runs fewer tests without a word"
+    );
+
+    let problems = group_declaration_problems(&folders);
+    assert!(
+        problems.is_empty(),
+        "cargo builds a tests/*.rs and never looks inside a folder, so a module exists only through \
+         the root that declares it with #[path]. A file the root does not declare is a test that no \
+         longer runs, and one that two roots declare runs twice. Problems:\n{}",
+        problems.join("\n")
+    );
+}
+
+/// Calls whose effect is the whole process: the next module in the same binary sees them.
+const PROCESS_STATE_CALLS: [&str; 10] = [
+    "env::set_var(",
+    "env::remove_var(",
+    "set_current_dir(",
+    "pg_advisory",
+    "tracing_subscriber",
+    "set_global_default",
+    "current_exe(",
+    "session::set(",
+    "session::clear(",
+    "enable_daemon_mode(",
+];
+
+/// A `static` holding one of these is a lock or a once-cell: state of the process, which a module
+/// would be sharing with every other module of the binary. An atomic that only numbers temporaries is not.
+const SYNC_STATICS: [&str; 5] = ["Mutex", "RwLock", "OnceLock", "OnceCell", "LazyLock"];
+
+/// The trait of process-wide state on line `index` of `lines`, if there is one. The `static` may
+/// continue on the next line; a clock assert may start up to two lines above its `.elapsed()`.
+fn process_state_on(lines: &[&str], index: usize) -> Option<String> {
+    let item = lines[index].trim_start();
+    if item.starts_with("#[ignore") {
+        return Some("`#[ignore]` (D2 runs it alone, against the shared database)".to_string());
+    }
+    if let Some(call) = PROCESS_STATE_CALLS
+        .iter()
+        .find(|call| item.contains(**call))
+    {
+        return Some(format!("`{call}`"));
+    }
+    let is_static = ["static ", "pub static ", "pub(crate) static "]
+        .iter()
+        .any(|head| item.starts_with(head));
+    if is_static {
+        let declaration = lines[index..lines.len().min(index + 2)].join(" ");
+        if let Some(kind) = SYNC_STATICS
+            .iter()
+            .find(|kind| declaration.contains(**kind))
+        {
+            return Some(format!("`static` holding a `{kind}`"));
+        }
+    }
+    let window = &lines[index.saturating_sub(2)..=index];
+    if item.contains(".elapsed()") && window.iter().any(|line| line.contains("assert")) {
+        return Some("an `assert` on `.elapsed()`".to_string());
+    }
+    None
+}
+
+/// Each line of each module (name, body) that holds process-wide state, as `<module>:<line> <what>`.
+fn grouped_state_problems(modules: &[(String, String)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, body) in modules {
+        let lines: Vec<&str> = body.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if is_comment(line) {
+                continue;
+            }
+            if let Some(what) = process_state_on(&lines, index) {
+                problems.push(format!("{name}:{} {what}", index + 1));
+            }
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_grouped_state_check_fails_on_each_trait_and_passes_what_is_not_state() {
+    for (what, body) in [
+        (
+            "env::set_var(",
+            "fn t() {\n    unsafe { std::env::set_var(\"X\", \"1\") };\n}\n",
+        ),
+        (
+            "env::remove_var(",
+            "fn t() {\n    unsafe { std::env::remove_var(\"X\") };\n}\n",
+        ),
+        (
+            "set_current_dir(",
+            "fn t() {\n    std::env::set_current_dir(\"/\").unwrap();\n}\n",
+        ),
+        (
+            "pg_advisory",
+            "const Q: &str = \"select pg_advisory_lock(1)\";\n",
+        ),
+        (
+            "tracing_subscriber",
+            "fn t() {\n    tracing_subscriber::fmt().init();\n}\n",
+        ),
+        (
+            "set_global_default",
+            "fn t() {\n    tracing::subscriber::set_global_default(s);\n}\n",
+        ),
+        (
+            "current_exe(",
+            "fn t() {\n    let me = std::env::current_exe();\n}\n",
+        ),
+        ("session::set(", "fn t() {\n    session::set(id);\n}\n"),
+        ("session::clear(", "fn t() {\n    session::clear();\n}\n"),
+        (
+            "enable_daemon_mode(",
+            "fn t() {\n    enable_daemon_mode();\n}\n",
+        ),
+        (
+            "#[ignore]",
+            "#[tokio::test]\n#[ignore = \"needs the shared database\"]\nasync fn t() {}\n",
+        ),
+        (
+            "Mutex",
+            "static G: std::sync::Mutex<()> = std::sync::Mutex::new(());\n",
+        ),
+        (
+            "OnceLock",
+            "pub static CELL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();\n",
+        ),
+        (
+            "LazyLock",
+            "static CELL: std::sync::LazyLock<\n    String,\n> = std::sync::LazyLock::new(String::new);\n",
+        ),
+        (
+            ".elapsed()",
+            "fn t() {\n    ASSERT!(t0.elapsed() < Duration::from_secs(1));\n}\n",
+        ),
+        (
+            ".elapsed()",
+            "fn t() {\n    ASSERT!(\n        t0.elapsed() < Duration::from_secs(1),\n    );\n}\n",
+        ),
+    ] {
+        // The macro is written ASSERT in the table and put back here: the latency detector of
+        // local_gate_contract.rs reads text, and a literal wall-clock assert in a string of this file
+        // would ask scripts/gate-latency.txt for a line this file has no clock to earn.
+        let body = body.replace("ASSERT", "assert");
+        let problems = grouped_state_problems(&[("group_x/m.rs".to_string(), body)]);
+        assert!(
+            problems.len() == 1
+                && problems[0].starts_with("group_x/m.rs:")
+                && problems[0].contains(what),
+            "a module with `{what}` has to be named with its line and the trait: {problems:?}"
+        );
+    }
+    let fine = "\
+//! set_var and #[ignore] in a doc comment are text\n\
+// static G: Mutex<()> = ...\n\
+static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);\n\
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!(\"./migrations\");\n\
+fn t() {\n    println!(\"{:?}\", t0.elapsed());\n    let s = \"unsafe_set_var(\";\n}\n";
+    assert_eq!(
+        grouped_state_problems(&[("group_x/ok.rs".to_string(), fine.to_string())]),
+        Vec::<String>::new(),
+        "comments, an atomic that numbers temporaries, an immutable static and an `.elapsed()` that \
+         is only printed are not process-wide state"
+    );
+}
+
+#[test]
+fn a_grouped_test_holds_no_process_wide_state() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let modules: Vec<(String, String)> = group_module_paths(&dir)
+        .iter()
+        .map(|path| {
+            let name = path
+                .strip_prefix(&dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let body = std::fs::read_to_string(path).expect("readable");
+            (name, body)
+        })
+        .collect();
+    assert!(
+        modules.len() >= 25,
+        "the scan read {} group module(s) and there are 25. A scan that read nothing proves nothing",
+        modules.len()
+    );
+
+    let problems = grouped_state_problems(&modules);
+    assert!(
+        problems.is_empty(),
+        "a test binary is one process and its tests run at the same time on threads: two modules \
+         that write the environment, take a static guard, hold an advisory lock or assert a clock \
+         trample each other, and a `ENV_GUARD` of one module orders nothing against another's. A file \
+         with one of these keeps its own binary (it used to be exempt for having one). `#[ignore]` \
+         means D2 against the shared database, where each file ran alone. Take the module out of the \
+         group and out of its root: {problems:#?}"
     );
 }

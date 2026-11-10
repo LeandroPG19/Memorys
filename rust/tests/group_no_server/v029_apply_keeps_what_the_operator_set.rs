@@ -76,6 +76,9 @@ impl Machine {
             .args(["setup", "service"])
             .args(args)
             .env_clear()
+            // After `env_clear`, or it clears itself: nothing this child starts may reach the
+            // developer's database.
+            .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
             .env("HOME", self.0.join("home"))
             .env("LOCALAPPDATA", self.local_app_data())
             .env("PATH", self.0.join("bin"))

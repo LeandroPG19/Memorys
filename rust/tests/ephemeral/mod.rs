@@ -1,7 +1,7 @@
 // The port of a test's daemon, asked of the OS and never written down. Shared by the test files
 // that declare `mod ephemeral;`. It lives in a directory so cargo does not build it as a test target
-// of its own, and it has a single public item because each includer compiles its own copy and one
-// that leaves an item unused trips dead_code under clippy `-D warnings` (the same rule as
+// of its own, and it has a single public item because each binary that declares it (a loose file,
+// or the root of a group) compiles its own copy and one that leaves an item unused trips dead_code under clippy `-D warnings` (the same rule as
 // `dead_db/mod.rs` and `common/mod.rs`).
 //
 // Why not a number in the test: the judge runs once on Windows and once on WSL, and with

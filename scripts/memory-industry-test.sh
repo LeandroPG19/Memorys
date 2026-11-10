@@ -15,7 +15,7 @@ case "$CMD" in
     ;;
   contracts)
     cd "$ROOT/rust"
-    cargo test --test local_gate_contract --test cli_contract --test doc_contract --test migrations_contract
+    cargo test --test local_gate_contract --test group_no_server
     ;;
   e2e)
     cd "$ROOT/rust"

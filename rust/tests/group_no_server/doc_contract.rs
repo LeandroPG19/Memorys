@@ -638,7 +638,9 @@ fn the_gate_writes_its_own_exit_code_where_a_reader_can_find_it() {
     }
 }
 
-const UNIT_TESTS_ON_THE_GATE_DB: &str = "DATABASE_URL=\"$GATE_DATABASE_URL\" cargo test";
+/// CI-E11 (D-E11e): the plain pass is the library and the files of tests/ that are not contracts of the judge
+/// (`PLAIN_TESTS`), counted as the section `plain`; the contracts and the doctests run in the row CT, against no database.
+const UNIT_TESTS_ON_THE_GATE_DB: &str = "DATABASE_URL=\"$GATE_DATABASE_URL\" run_counted plain 0 cargo test --lib \"${PLAIN_TESTS[@]}\"";
 
 /// A line that runs `provision_gate_db`, as opposed to the one that defines it
 /// (`provision_gate_db() {`) or a comment that names it.
@@ -1097,8 +1099,8 @@ fn every_setup_service_command_in_the_lan_guide_is_one_the_parser_accepts() {
 fn the_lan_guide_carries_the_procedure_and_a_troubleshooting_table_tied_to_the_code() {
     let raw = read(LAN_GUIDE);
     let guide = flatten(&raw);
-    let service_rs = include_str!("../src/service.rs");
-    let http_rs = include_str!("../src/http.rs");
+    let service_rs = include_str!("../../src/service.rs");
+    let http_rs = include_str!("../../src/http.rs");
 
     let procedure = [
         "--profile lan",
@@ -1585,9 +1587,9 @@ fn the_accounts_troubleshooting_table_quotes_messages_the_bridge_prints() {
     );
     let table = flatten(&rows.join("\n"));
 
-    let mod_rs = include_str!("../src/bridge/mod.rs");
-    let pair_rs = include_str!("../src/bridge/pair.rs");
-    let proxy_rs = include_str!("../src/bridge/proxy.rs");
+    let mod_rs = include_str!("../../src/bridge/mod.rs");
+    let pair_rs = include_str!("../../src/bridge/pair.rs");
+    let proxy_rs = include_str!("../../src/bridge/proxy.rs");
     let symptoms = [
         (
             "la madre cambió de huella",

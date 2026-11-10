@@ -6,7 +6,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::task::JoinHandle;
 
 pub fn handler_timeout() -> Duration {
     std::env::var("CUBA_HANDLER_TIMEOUT_SECS")
@@ -150,12 +151,134 @@ fn outbound() -> Option<&'static mpsc::UnboundedSender<Value>> {
     OUTBOUND.get()
 }
 
-fn send_outbound(msg: Value) {
-    match outbound() {
-        Some(tx) => {
-            let _ = tx.send(msg);
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Queued,
+    NoChannel,
+    Closed,
+}
+
+/// Puts `msg` on the stdio channel. A channel closed by the writer (stdin ended and the writer is draining)
+/// refuses it: the message is dropped with a warning that names it, never with a panic and never in silence.
+fn deliver(channel: Option<&mpsc::UnboundedSender<Value>>, msg: Value) -> Delivery {
+    let Some(tx) = channel else {
+        return Delivery::NoChannel;
+    };
+    match tx.send(msg) {
+        Ok(()) => Delivery::Queued,
+        Err(mpsc::error::SendError(dropped)) => {
+            let id = dropped.get("id").map(Value::to_string).unwrap_or_default();
+            let method = dropped
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            tracing::warn!(%id, method, "outbound channel closed — message dropped");
+            Delivery::Closed
         }
-        None => tracing::debug!("no stdio channel — dropping server-initiated message"),
+    }
+}
+
+fn send_outbound(msg: Value) {
+    if deliver(outbound(), msg) == Delivery::NoChannel {
+        tracing::debug!("no stdio channel — dropping server-initiated message");
+    }
+}
+
+/// How long the exit waits for a writer that is not finishing. Not a wait the exit pays: a writer that
+/// drains ends the wait by itself.
+pub(crate) const WRITER_CEILING: Duration = Duration::from_millis(500);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WriterEnd {
+    /// The channel was closed and every message that was in it is written and flushed.
+    Drained { written: u64 },
+    /// The output refused a write or a flush; `written` counts what got out before.
+    Failed { written: u64 },
+    /// The ceiling ran out first and the writer was aborted.
+    Stuck,
+}
+
+/// Writes every message of `rx` to `out`, one JSON line each. When `close` fires (or its sender is dropped) it
+/// closes the channel to new messages and keeps receiving until what is already in it is written, so the last
+/// answer of a client that closed stdin is never lost. `close` goes first in the `select!`: a message that is
+/// queued never keeps the writer from seeing it.
+pub(crate) async fn write_outbound<W>(
+    mut rx: mpsc::UnboundedReceiver<Value>,
+    mut close: oneshot::Receiver<()>,
+    mut out: W,
+) -> WriterEnd
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut written = 0u64;
+    let mut closing = false;
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = &mut close, if !closing => {
+                rx.close();
+                closing = true;
+                continue;
+            }
+            msg = rx.recv() => msg,
+        };
+        let Some(msg) = next else {
+            return WriterEnd::Drained { written };
+        };
+        let mut bytes = match serde_json::to_vec(&msg) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to serialize outbound");
+                continue;
+            }
+        };
+        bytes.push(b'\n');
+        if let Err(e) = out.write_all(&bytes).await {
+            tracing::error!(error = %e, "stdout write failed — terminating writer");
+            return WriterEnd::Failed { written };
+        }
+        if let Err(e) = out.flush().await {
+            tracing::error!(error = %e, "stdout flush failed");
+            return WriterEnd::Failed { written };
+        }
+        written += 1;
+    }
+}
+
+/// Tells the writer to close and waits for it. The wait ends when the writer does; `ceiling` is only for a writer
+/// that never does (a stdout nobody reads), which is aborted.
+pub(crate) async fn close_writer(
+    close: oneshot::Sender<()>,
+    mut writer: JoinHandle<WriterEnd>,
+    ceiling: impl std::future::Future<Output = ()>,
+) -> WriterEnd {
+    // An Err here is a writer that already ended: its JoinHandle says how.
+    let _ = close.send(());
+    tokio::select! {
+        biased;
+        joined = &mut writer => match joined {
+            Ok(end) => end,
+            Err(e) => {
+                tracing::error!(error = %e, "outbound writer task failed");
+                WriterEnd::Failed { written: 0 }
+            }
+        },
+        _ = ceiling => {
+            writer.abort();
+            WriterEnd::Stuck
+        }
+    }
+}
+
+fn report_writer_end(end: &WriterEnd) {
+    match end {
+        WriterEnd::Drained { written } => {
+            tracing::info!(outcome = "drained", written, "outbound writer closed")
+        }
+        WriterEnd::Failed { written } => {
+            tracing::warn!(outcome = "failed", written, "outbound writer closed")
+        }
+        WriterEnd::Stuck => tracing::warn!(outcome = "stuck", "outbound writer closed"),
     }
 }
 
@@ -257,9 +380,7 @@ pub fn notify_progress(token: &str, progress: f64, total: Option<f64>, message: 
         "method": "notifications/progress",
         "params": params,
     });
-    if let Some(tx) = OUTBOUND.get() {
-        let _ = tx.send(notif);
-    }
+    send_outbound(notif);
 }
 
 pub fn register_cancel_token(request_id: &Value) -> CancelRegistration {
@@ -339,32 +460,13 @@ pub async fn run_mcp() -> Result<()> {
         })
     });
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<Value>();
     OUTBOUND
         .set(out_tx)
         .map_err(|_| anyhow::anyhow!("OUTBOUND already initialized"))?;
 
-    let writer_handle = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        while let Some(msg) = out_rx.recv().await {
-            let mut bytes = match serde_json::to_vec(&msg) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to serialize outbound");
-                    continue;
-                }
-            };
-            bytes.push(b'\n');
-            if let Err(e) = stdout.write_all(&bytes).await {
-                tracing::error!(error = %e, "stdout write failed — terminating writer");
-                break;
-            }
-            if let Err(e) = stdout.flush().await {
-                tracing::error!(error = %e, "stdout flush failed");
-                break;
-            }
-        }
-    });
+    let (close_tx, close_rx) = oneshot::channel::<()>();
+    let writer_handle = tokio::spawn(write_outbound(out_rx, close_rx, tokio::io::stdout()));
 
     let stdin = tokio::io::stdin();
     let reader = BufReader::new(stdin);
@@ -478,18 +580,16 @@ pub async fn run_mcp() -> Result<()> {
     let drain = async { while in_flight.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(handler_timeout() * 2, drain).await;
 
-    if let Some(tx) = OUTBOUND.get() {
-        let _ = tx;
-    }
-
     if let Some(handle) = rem_handle {
         handle.abort();
     }
     if let Some(handle) = listen_handle {
         handle.abort();
     }
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), writer_handle).await;
-    tracing::info!("REM daemon + writer drained, shutting down");
+
+    // After the handlers: every answer is already in the channel when it closes.
+    let end = close_writer(close_tx, writer_handle, tokio::time::sleep(WRITER_CEILING)).await;
+    report_writer_end(&end);
 
     Ok(())
 }
@@ -1982,5 +2082,319 @@ pub(crate) mod tests {
             row.2, 0,
             "a cycle that never reached extraction failed nothing there"
         );
+    }
+
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context as TaskContext, Poll};
+    use tokio::io::AsyncWrite;
+    use tokio::task::JoinHandle;
+
+    // The tests below queue messages and call close_writer without yielding in between. The default
+    // #[tokio::test] is current_thread, which is what makes that order deterministic: keep it.
+
+    /// Takes at most 7 bytes per write and answers Pending (waking itself) every other poll, so that
+    /// `write_all` has to come back many times for one message.
+    #[derive(Default)]
+    struct Captura {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        polls: u32,
+    }
+
+    impl AsyncWrite for Captura {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.polls += 1;
+            if self.polls.is_multiple_of(2) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let taken = buf.len().min(7);
+            self.bytes
+                .lock()
+                .expect("capture lock")
+                .extend_from_slice(&buf[..taken]);
+            Poll::Ready(Ok(taken))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A stdout whose reader stopped reading: every write is Pending and nothing ever wakes it.
+    /// The Arc is how the test learns that the task holding it was dropped.
+    struct Atascado(#[allow(dead_code)] Arc<()>);
+
+    impl AsyncWrite for Atascado {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+            _: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A stdout whose reader closed its side.
+    struct Roto;
+
+    impl AsyncWrite for Roto {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+            _: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The guard against a hang, never the verdict: the verdict is the WriterEnd and what was written.
+    async fn within_the_guard<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), work)
+            .await
+            .unwrap_or_else(|_| panic!("{what}"))
+    }
+
+    fn start_writer<W>(
+        out: W,
+    ) -> (
+        mpsc::UnboundedSender<Value>,
+        oneshot::Sender<()>,
+        JoinHandle<WriterEnd>,
+    )
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (tx, rx) = mpsc::unbounded_channel::<Value>();
+        let (close_tx, close_rx) = oneshot::channel::<()>();
+        (
+            tx,
+            close_tx,
+            tokio::spawn(write_outbound(rx, close_rx, out)),
+        )
+    }
+
+    fn answer(id: u64) -> Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"pad": "x".repeat(512)}})
+    }
+
+    fn captured(bytes: &Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(bytes.lock().expect("capture lock").clone())
+            .expect("the writer only writes UTF-8 JSON")
+    }
+
+    #[tokio::test]
+    async fn the_writer_ends_by_itself_once_the_channel_closes_under_a_ceiling_that_never_expires()
+    {
+        let captura = Captura::default();
+        let bytes = captura.bytes.clone();
+        let (tx, close_tx, writer) = start_writer(captura);
+        for id in 1..=3 {
+            tx.send(answer(id)).expect("the channel is open");
+        }
+
+        let end = within_the_guard(
+            "close_writer did not return: the writer never saw the close",
+            close_writer(close_tx, writer, std::future::pending()),
+        )
+        .await;
+
+        assert_eq!(
+            end,
+            WriterEnd::Drained { written: 3 },
+            "a ceiling that never expires cannot be what ended the wait: if close_writer came \
+             back, the writer finished on its own, with the three messages written"
+        );
+        assert_eq!(captured(&bytes).lines().count(), 3);
+        // The static OUTBOUND keeps a sender alive for the life of the process; the test keeps
+        // its own too, so the writer cannot end because every sender was dropped.
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn the_last_answer_of_a_burst_arrives_whole() {
+        let captura = Captura::default();
+        let bytes = captura.bytes.clone();
+        let (tx, close_tx, writer) = start_writer(captura);
+        for id in 1..=1000 {
+            tx.send(answer(id)).expect("the channel is open");
+        }
+
+        let end = within_the_guard(
+            "close_writer did not return: the writer never saw the close",
+            close_writer(close_tx, writer, std::future::pending()),
+        )
+        .await;
+
+        let text = captured(&bytes);
+        assert!(
+            text.ends_with('\n'),
+            "the capture has to end on a complete line"
+        );
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every line is complete JSON"))
+            .collect();
+        let ids: Vec<u64> = lines
+            .iter()
+            .map(|line| {
+                line["id"]
+                    .as_u64()
+                    .expect("every answer has its numeric id")
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            (1..=1000).collect::<Vec<u64>>(),
+            "all 1000 answers, in the order they were queued: the last one is the one a client \
+             that closes stdin is waiting for"
+        );
+        assert_eq!(
+            lines[999]["result"]["pad"].as_str().map(str::len),
+            Some(512),
+            "the last answer is whole, not cut at the byte where the writer was stopped"
+        );
+        assert_eq!(end, WriterEnd::Drained { written: 1000 });
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_notification_queued_right_before_the_close_still_goes_out() {
+        let captura = Captura::default();
+        let bytes = captura.bytes.clone();
+        let (tx, close_tx, writer) = start_writer(captura);
+        tx.send(answer(7)).expect("the channel is open");
+        tx.send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {"progressToken": "t", "progress": 1.0}
+        }))
+        .expect("the channel is open");
+
+        let end = within_the_guard(
+            "close_writer did not return: the writer never saw the close",
+            close_writer(close_tx, writer, std::future::pending()),
+        )
+        .await;
+
+        let text = captured(&bytes);
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every line is complete JSON"))
+            .collect();
+        assert_eq!(lines.len(), 2, "both messages were queued before the close");
+        assert_eq!(lines[0]["id"], 7);
+        assert_eq!(lines[1]["method"], "notifications/progress");
+        assert_eq!(end, WriterEnd::Drained { written: 2 });
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_stuck_writer_does_not_hold_the_exit_past_the_ceiling() {
+        let probe = Arc::new(());
+        let (tx, close_tx, writer) = start_writer(Atascado(probe.clone()));
+        tx.send(answer(1)).expect("the channel is open");
+
+        let end = within_the_guard(
+            "close_writer did not return: it is waiting for a writer that cannot finish",
+            close_writer(close_tx, writer, std::future::ready(())),
+        )
+        .await;
+
+        assert_eq!(end, WriterEnd::Stuck);
+        within_the_guard(
+            "the writer task was never aborted: the stuck stdout is still held by it",
+            async {
+                while Arc::strong_count(&probe) > 1 {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await;
+        assert_eq!(Arc::strong_count(&probe), 1);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_closed_its_side_does_not_make_the_exit_wait_for_the_ceiling() {
+        let (tx, close_tx, writer) = start_writer(Roto);
+        tx.send(answer(1)).expect("the channel is open");
+        tx.send(answer(2)).expect("the channel is open");
+
+        let end = within_the_guard(
+            "close_writer did not return: a broken pipe has to end the writer, not the ceiling",
+            close_writer(close_tx, writer, std::future::pending()),
+        )
+        .await;
+
+        assert_eq!(
+            end,
+            WriterEnd::Failed { written: 0 },
+            "nothing could be written to a closed pipe, and the writer says so"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn a_message_sent_after_the_close_is_reported_and_does_not_panic() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+
+        assert_eq!(
+            deliver(Some(&tx), serde_json::json!({"id": 1})),
+            Delivery::Queued
+        );
+        assert_eq!(rx.try_recv().ok(), Some(serde_json::json!({"id": 1})));
+
+        rx.close();
+        assert_eq!(
+            deliver(
+                Some(&tx),
+                serde_json::json!({"id": 2, "method": "tools/call"})
+            ),
+            Delivery::Closed,
+            "a handler that outlives the drain writes on a closed channel: it is told, not panicked"
+        );
+        assert_eq!(
+            deliver(None, serde_json::json!({"id": 3})),
+            Delivery::NoChannel
+        );
+    }
+
+    #[test]
+    fn the_ceiling_for_a_stuck_writer_is_half_a_second() {
+        assert_eq!(WRITER_CEILING, Duration::from_millis(500));
     }
 }

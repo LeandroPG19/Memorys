@@ -1,0 +1,35 @@
+# scripts/gate-latency.txt: the files whose tests assert on a wall clock, and the class each needs in the judge (CI-F3.4).
+# <file under rust/> <exclusive|shared> <evidence> <owner> <YYYY-MM-DD> <reason...>
+# file: tests/<name>.rs or src/<path>.rs. The key is the file and not the test-times key (it changes D-A8): a module
+#   that gains an assert gets its line in the contract (local_gate_contract.rs), and nobody has to remember to measure.
+# class: exclusive runs alone, in an exclusive row of gate-dag.txt (today NLI), and every test of the file is #[ignore]
+#   and named with --test only by the lanes of such rows; shared runs beside other steps. A src module is never
+#   exclusive, because the lib runs in DBG, CV and M.
+# evidence: the ratio limit/measured with two decimals (a measure under load that the limit survives), dag-verde:<n>
+#   (green in n DAG runs that gave a verdict), or pendiente. The date is the one of the measure, or, if pendiente, the
+#   expiry, 2026-11-30 at the latest: a pending line past its date, or the DAG as the default (GATE_DAG in gate-dag.py)
+#   with a pending line, is red (D-F34n).
+# The detector (local_gate_contract.rs, D-F34l): in rust/tests/*.rs and rust/src/**/*.rs, an assert or debug_assert whose
+#   argument, with its parentheses balanced, has `<` or `>` and either `.elapsed()` or a name that the same file binds on
+#   one line with `let <name> = ... .elapsed() ...`. A timeout around a future, and an `.elapsed()` that is only printed,
+#   are not wall-clock asserts. The contract goes both ways: a file the detector finds has a line here, and a line here
+#   names a file the detector finds.
+# Rule (D-F34m): an assert that prints no measure is shared until a DAG run puts it red; after the two DAG runs of the end of
+#   F3 its evidence is dag-verde:2. A red under DAG makes the file exclusive and its row exclusive too, with the cost written
+#   down (D-F3l); if it is a src module the lot stops and goes to Leandro, because it would make DBG exclusive.
+# Only nli_entailment prints its measure, so it is the only one with a ratio: the 500 ms limit over the 1199 ms of the
+#   6-nov run under six autotests: 0.42.
+tests/nli_entailment.rs exclusive 0.42 orquestador-0.31 2026-11-06 listón 500 ms; 1199 ms por veredicto con seis autotests encima (6-nov 09:39), 37,7 ms quieta, 104,8 ms en la fila NLI sola (19.ª)
+tests/gate_dag_contract.rs shared pendiente orquestador-0.31 2026-11-30 CI-J14g: una fila sorda a TERM muere por KILL al acabar la gracia (1 s) y el planificador no la espera (tope 12 s); en CT sin medida; se mide en las corridas DAG finales
+tests/gate_history_contract.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en CT sin medida; se mide en las corridas DAG finales
+tests/gate_usl_contract.rs shared pendiente orquestador-0.31 2026-11-30 CI-F5a U18: un cargo colgado se corta en su plazo (1 s) y el barrido no lo espera (tope 30 s); en CT sin medida; se mide en las corridas DAG finales
+tests/scratch_databases_clone_one_template.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+tests/v025_a_stuck_sync_fails_instead_of_hanging.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+tests/v029_accounts_over_real_http.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+tests/v029_auto_host_beacon.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+tests/v042_health_says_what_degraded.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+src/bridge/discovery.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+src/bridge/pair.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+src/bridge/proxy.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+src/doctor.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+src/search/rerank.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales

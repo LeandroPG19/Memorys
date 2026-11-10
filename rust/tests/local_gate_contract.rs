@@ -35,7 +35,6 @@ fn merge_gate_is_the_local_judge_and_stays_strict() {
     let gate = read("scripts/merge-gate.sh");
     for needle in [
         "run-all-tests.sh",
-        "--features docs",
         "cargo deny",
         "npm/install.test.js",
         "codigo-muerto.sh",
@@ -58,6 +57,29 @@ fn merge_gate_is_the_local_judge_and_stays_strict() {
     assert!(
         !gate.contains("SKIPPED:"),
         "merge-gate.sh must not introduce soft SKIPPED lines"
+    );
+    // CI-K8 (D-K8d, D-K8i): the build without docs is only compiled and linted, in the one row that drops the feature, and
+    // the gate says so in the list of what it does not check. Read outside the self-test, which names both in its own
+    // messages.
+    let code = outside_self_test(&gate);
+    assert!(
+        code.iter()
+            .any(|(_, line)| line.contains("--no-default-features")),
+        "scripts/merge-gate.sh must keep `--no-default-features` outside its self-test: the row DC compiles and lints the \
+         build without docs"
+    );
+    let not_checked: Vec<&str> = code
+        .iter()
+        .map(|(_, line)| *line)
+        .skip_while(|line| !line.contains("WHAT THIS GATE DOES NOT CHECK"))
+        .take_while(|line| !line.contains("WHAT IT REQUIRES"))
+        .collect();
+    assert!(
+        not_checked
+            .iter()
+            .any(|line| line.contains("the build without docs")),
+        "scripts/merge-gate.sh must keep `the build without docs` in WHAT THIS GATE DOES NOT CHECK: a green run does not \
+         say that no test ran without the docs feature"
     );
 }
 
@@ -1558,8 +1580,28 @@ fn a_systemd_run_with_no_session_to_talk_to_builds_without_the_cap_and_one_with_
         "the release build has to run exactly once, outside any scope: {calls:?}\n{text}"
     );
     assert!(
-        calls[0].contains("build --release --features cuda") && calls[0].ends_with("scope=0"),
+        calls[0].starts_with("build --release ") && calls[0].ends_with("scope=0"),
         "the one cargo call was not the uncapped release build: {calls:?}\n{text}"
+    );
+    // CI-K8 (D-K8e): the release build is the set publish.yml publishes on Linux x64, read from there and not typed here.
+    let asked = features_asked_for(
+        &calls[0]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+    );
+    let published = published_features(
+        &read(".github/workflows/publish.yml"),
+        "x86_64-unknown-linux-gnu",
+    )
+    .expect("publish.yml has no matrix element with target x86_64-unknown-linux-gnu and a features: line");
+    assert!(
+        !published.is_empty(),
+        "publish.yml publishes x86_64-unknown-linux-gnu with no features: the comparison below would be vacuous"
+    );
+    assert_eq!(
+        asked, published,
+        "the uncapped release build asks for {asked:?} and publish.yml publishes {published:?}: {calls:?}\n{text}"
     );
     assert!(
         text.contains("without a memory cap"),
@@ -1797,13 +1839,88 @@ fn the_two_pass_guard_can_actually_fail() {
     );
 }
 
+/// How many handoffs came before CI-E6 and are judged by the hash of their content instead of by the cost
+/// they do not state: the ones that `scripts/handoffs-sin-coste.txt` lists. Frozen on 2026-11-10 over the handoffs of
+/// `Memorys-ci` and `Memorys-ci-integ`: only those the cost guard refuses on their merits (the ones whose spec has no
+/// table or whose evidence has no `segundos:`). The list does not grow: a new handoff meets the rule or is refused.
+const HANDOFFS_SIN_COSTE: usize = 14;
+
+/// The last day any of those exceptions may run, as `AAAA-MM-DD` (compared as text, which orders dates).
+const HANDOFFS_SIN_COSTE_EXPIRY: &str = "2026-12-31";
+
+/// What is wrong with the list of historic handoffs `body`: its data lines (not `#`, not blank) are not
+/// `expected` in number, or one expires after `HANDOFFS_SIN_COSTE_EXPIRY` (or has no third field).
+fn handoffs_without_cost_problems(body: &str, expected: usize) -> Vec<String> {
+    let data: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let mut problems = Vec::new();
+    if data.len() != expected {
+        problems.push(format!(
+            "{} lines, the contract says {expected}. A new line is a new exception: it needs its reason, \
+             its owner and its expiry, and it is the orchestrator who decides it, by editing this \
+             number. One fewer is an exception that is gone: lower the number with it",
+            data.len()
+        ));
+    }
+    for line in data {
+        match line.split_whitespace().nth(2) {
+            Some(expiry) if expiry <= HANDOFFS_SIN_COSTE_EXPIRY => {}
+            Some(expiry) => problems.push(format!(
+                "{line:?} expires after {HANDOFFS_SIN_COSTE_EXPIRY} ({expiry})"
+            )),
+            None => problems.push(format!("{line:?} has no expiry (third field)")),
+        }
+    }
+    problems
+}
+
+/// CI-E6 (D-E6f, D-E6g): the list of handoffs that the cost guard of `validar-handoff.sh` lets by is closed.
+///
+/// `.cursor/handoffs/*` is not versioned, so the only identity a historic handoff keeps is the hash of its
+/// content, and `scripts/handoffs-sin-coste.txt` is the list of those hashes. It is a production file with no
+/// region of test: `written` and `frozen` do not see it. Without this contract the green pass could add the hash
+/// of its own handoff and be let by. With it, a line more or less is an edit of a test, which `frozen` does see.
+/// The shape of each line is not repeated here: the script judges it whenever it reads the list.
+#[test]
+fn the_handoffs_without_cost_are_a_closed_list() {
+    // The check has to be able to fail before a clean answer from it means anything.
+    let honest = "# header\n\nabc one.yml 2026-12-31 owner reason\n";
+    assert!(
+        handoffs_without_cost_problems(honest, 1).is_empty(),
+        "the check refused a list with the number of lines it expects and an expiry in time"
+    );
+    assert!(
+        !handoffs_without_cost_problems(honest, 2).is_empty(),
+        "the check let one line fewer than the contract says through"
+    );
+    assert!(
+        !handoffs_without_cost_problems(honest, 0).is_empty(),
+        "the check let one line more than the contract says through"
+    );
+    let late = "abc one.yml 2027-01-31 owner reason\n";
+    assert!(
+        !handoffs_without_cost_problems(late, 1).is_empty(),
+        "the check let an exception that expires after {HANDOFFS_SIN_COSTE_EXPIRY} through"
+    );
+
+    let body = read("scripts/handoffs-sin-coste.txt").replace("\r\n", "\n");
+    let problems = handoffs_without_cost_problems(&body, HANDOFFS_SIN_COSTE);
+    assert!(
+        problems.is_empty(),
+        "scripts/handoffs-sin-coste.txt is not the closed list the contract describes: {problems:#?}"
+    );
+}
+
 const SELF_TEST_BEGIN: &str = "# --- self-test begin ---";
 const SELF_TEST_END: &str = "# --- self-test end ---";
 
 /// Every script of `scripts/` that has a `--self-test` mode, in the order
 /// `read_dir` + sort gives. Two-way on purpose: a script that gains a mode, or
 /// loses its own, is red until this list says so.
-const SCRIPTS_WITH_SELF_TEST: [&str; 13] = [
+const SCRIPTS_WITH_SELF_TEST: [&str; 14] = [
     "advisory-exceptions.sh",
     "codigo-muerto.sh",
     "crap-gate.sh",
@@ -1812,6 +1929,7 @@ const SCRIPTS_WITH_SELF_TEST: [&str; 13] = [
     "gpu-placement-check.sh",
     "merge-gate.sh",
     "mutants-gate.sh",
+    "qg-weekly-audit.sh",
     "quality-gate.sh",
     "release.sh",
     "run-all-tests.sh",
@@ -2560,15 +2678,17 @@ fn every_gate_entry_point_is_executable_in_the_index() {
 }
 
 /// The lines of `body` that point into a Windows drive as WSL mounts it
-/// (`/mnt/c/`, `/mnt/d/`, whatever the case), as `<name>:<line>: <text>`.
+/// (`/mnt/c/`, `/mnt/d/`, whatever the case), as `<name>:<line>: <text>`. The
+/// fixtures of a self-test are made-up data (CI-K9 feeds the gate a `PATH` with
+/// `/mnt/c/k9a-windows` on purpose), so only the code outside it is judged.
 fn windows_drive_refs(name: &str, body: &str) -> Vec<String> {
-    body.lines()
-        .enumerate()
+    outside_self_test(body)
+        .into_iter()
         .filter(|(_, line)| {
             let line = line.to_ascii_lowercase();
             line.contains("/mnt/c/") || line.contains("/mnt/d/")
         })
-        .map(|(n, line)| format!("{name}:{}: {}", n + 1, line.trim()))
+        .map(|(n, line)| format!("{name}:{n}: {}", line.trim()))
         .collect()
 }
 
@@ -2591,6 +2711,22 @@ fn no_gate_script_points_into_a_windows_drive() {
         3,
         "the scan must flag /mnt/c/ and /mnt/d/ in any case and nothing that only looks like \
          them. It flagged {strays:?}"
+    );
+    let with_fixtures = windows_drive_refs(
+        "fixture.sh",
+        "ls /mnt/c/stray\n# --- self-test begin ---\nPATH=/mnt/c/k9a-windows:/mnt/d/k9a/bin\n\
+         # --- self-test end ---\ncd /mnt/d/after\n",
+    );
+    assert_eq!(
+        with_fixtures,
+        vec![
+            "fixture.sh:1: ls /mnt/c/stray".to_string(),
+            "fixture.sh:5: cd /mnt/d/after".to_string()
+        ],
+        "the scan must flag a path into a Windows drive before and after the self-test, with the \
+         line it is on, and leave alone the fixtures between the markers. A scan that skipped \
+         the whole script, or none of the self-test, would be the one that passes or fails by \
+         accident"
     );
 
     let mut read_files = 0;
@@ -3132,10 +3268,49 @@ fn relative_to(root: &Path, path: &Path) -> String {
 /// two launches at the same time never share a directory.
 static SELF_TEST_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
-/// What gate-cluster.sh builds under the TMPDIR of a self-test, after the base (CI-J7): `/t` (the
-/// TMPDIR of the run), mktemp's `tmp.XXXXXXXXXX`, the root of the case `noowner` (the longest lib
-/// name that reaches gate_cluster_up), the lane `dbg.XXXXXX` and the socket file. 55 bytes.
-const SELF_TEST_SOCKET_SUFFIX: &str = "/t/tmp.XXXXXXXXXX/noowner/root/dbg.XXXXXX/.s.PGSQL.5432";
+/// The scripts of `scripts/` whose `--self-test` this process has launched (CI-K6). Each one is
+/// launched once, by `judge_env_self_test`, and every test reads that run: a second launch is a
+/// test that went back to launching a script the round already ran.
+static LAUNCHED_JUDGE_SCRIPTS: Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Panics when `script`, one of the judge's, was already launched in this process (CI-K6). The
+/// fixtures live outside `scripts/` and are launched as often as a test needs. The lock is held
+/// for the insert alone, never while a launch runs, and a poisoned one is used all the same: the
+/// set is only ever inserted into. A panic in the round that fills `judge_env_self_test` makes
+/// every reader try the round again; with this, each retry is red at once with this message, and
+/// the cause is the first red of the binary.
+fn note_launch_of_judge_script(script: &Path) {
+    if !script.starts_with(repo_root().join("scripts")) {
+        return;
+    }
+    let first = LAUNCHED_JUDGE_SCRIPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(script.to_path_buf());
+    assert!(
+        first,
+        "{} --self-test is launched a second time: read its run from judge_env_self_test",
+        script.display()
+    );
+}
+
+/// The longest socket gate-cluster.sh can build under each directory of a run, after the base
+/// (CI-J7, CI-K6). `/t`, the TMPDIR of the run: mktemp's `tmp.XXXXXXXXXX`, the root of the case
+/// `noowner` (the longest lib name that reaches gate_cluster_up), the lane `dbg.XXXXXX` and the
+/// socket file, 55 bytes. `/ct`, the GATE_CLUSTER_TMP of the run: the default root
+/// `memory-industry-gate-<uid>` with a 10-digit uid, the lane and the socket file, 60 bytes. `/aj`,
+/// the foreign directory that a foreign GATE_CLUSTER_ROOT points into: `clusters`, the lane and the
+/// socket file, 37 bytes.
+const SELF_TEST_SOCKET_SUFFIXES: [&str; 3] = [
+    "/t/tmp.XXXXXXXXXX/noowner/root/dbg.XXXXXX/.s.PGSQL.5432",
+    "/ct/memory-industry-gate-4294967295/dbg.XXXXXX/.s.PGSQL.5432",
+    "/aj/clusters/dbg.XXXXXX/.s.PGSQL.5432",
+];
+
+/// The root the foreign values of JUDGE_ENVIRONMENT that are paths start with: a place where
+/// nothing exists. A run rewrites it to its own `base/aj` (`under_the_foreign_dir`).
+const FOREIGN_ROOT: &str = "/nonexistent-ajeno";
 
 /// A unix socket path holds 107 bytes at most (sun_path), and gate-cluster.sh:155 refuses past it.
 const SOCKET_PATH_MAX: usize = 107;
@@ -3151,29 +3326,62 @@ fn self_test_parent() -> std::path::PathBuf {
     }
 }
 
+/// The cgroup tree every self-test is given (CI-K10, H1): a root with nothing in it and a "own cgroup" file with no `0::` line,
+/// so a planner that a self-test starts for real (merge-gate.sh runs gate-dag.py, and gate-dag.py delegates the scope it
+/// runs in, CI-J17) finds no scope to delegate. Without the pair it reads the real `/proc/self/cgroup` and `/sys/fs/cgroup`
+/// of whoever runs the test, makes a `juez` in that scope and moves its processes there; under the judge, the step of the
+/// outer planner is that scope and the outer planner can no longer remove it. Every launch gets it here, once, and a row
+/// that needs a cgroup (F1) sets its own pair on top. Under `base`, so it is removed with the run and is not one of the
+/// places `left_in` reads.
+fn no_cgroup_under(base: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = base.join("sin-cgroup").join("raiz");
+    let own = base.join("sin-cgroup").join("propio");
+    std::fs::create_dir_all(&root).expect("creating the empty cgroup root of the self-test");
+    std::fs::write(&own, "").expect("creating the cgroup file, with no scope, of the self-test");
+    (root, own)
+}
+
 /// Runs `script --self-test` with HOME and XDG_CACHE_HOME, each a fresh, empty directory of the
 /// run's own, and `env` set on top (CI-J3). The judge's names are removed from the inherited
-/// environment first, so a run gets exactly what `env` gives it for them. Returns the run and what
-/// it left in those two directories. This environment inherits `XDG_CACHE_HOME` from the login, and
-/// `gate_linux_env` puts its temp under it, so an empty HOME alone proves nothing. TMPDIR is
-/// removed, as an unset TMPDIR is what the script gets here, unless `own_tmpdir` gives the run an
-/// empty TMPDIR of its own, `base/t` (CI-J7). The exit code is not read by the leftovers: what the
-/// run left is the answer.
+/// environment first, so a run gets exactly what `env` gives it for them. This environment inherits
+/// `XDG_CACHE_HOME` from the login, and `gate_linux_env` puts its temp under it, so an empty HOME
+/// alone proves nothing. TMPDIR is removed, as an unset TMPDIR is what the script gets here, unless
+/// `own_tmpdir` gives the run an empty TMPDIR of its own, `base/t` (CI-J7).
+///
+/// Two more directories are the run's own (CI-K6). GATE_CLUSTER_TMP is `base/ct`, created and
+/// empty, so the default cluster root a script makes lands where it is seen (D6) and not in the
+/// `/tmp` of whoever runs next to it; gate-cluster.sh and gate-audit.sh put their own in its place,
+/// and there the self-test itself certifies D6. The values of `env` that start with `FOREIGN_ROOT`
+/// are rewritten under `base/aj`, which is not created, so a self-test that writes where it was
+/// told a foreign path (the exit file of gate-lock.sh, say) is seen and not lost to a failed
+/// `mkdir` under `/nonexistent-ajeno`.
+///
+/// Returns the run and what it left, one entry per file or directory, named by where it is:
+/// `HOME/…`, `XDG_CACHE_HOME/…`, `GATE_CLUSTER_TMP/…` (the default root itself, created empty,
+/// included) and `AJENO/…` (`AJENO/` alone when the directory exists and is empty). The exit code
+/// is not read by the leftovers: what the run left is the answer.
 ///
 /// The base is `self_test_parent()/st-<pid>-<n>`, short on purpose (CI-J7). The socket of the
-/// longest case is that base plus `SELF_TEST_SOCKET_SUFFIX`, and the arithmetic is 107 − 70 = 37:
-/// with a 7-digit pid (pid_max 4194304 here) and a 3-digit counter, the path is the parent plus 70
-/// bytes, so the parent may be at most 37 bytes. `/tmp` is 4, a margin of 33 (the socket is 74).
-/// The assert below checks the real base before any launch, so a longer parent is a red of its own
-/// that says how many bytes to cut, and not the B5 lane refused by gate-cluster's guard.
+/// longest case is that base plus the longest of `SELF_TEST_SOCKET_SUFFIXES`, and the arithmetic is
+/// 107 − 75 = 32: with a 7-digit pid (pid_max 4194304 here) and a 3-digit counter, the path is the
+/// parent plus 75 bytes, so the parent may be at most 32 bytes. `/tmp` is 4, a margin of 28 (the
+/// socket is 79). The assert below checks the real base before any launch, so a longer parent is a
+/// red of its own that says how many bytes to cut, and not the B5 lane refused by gate-cluster's
+/// guard.
 fn run_self_test(
     script: &Path,
     env: &[(&str, &str)],
     own_tmpdir: bool,
 ) -> (std::process::Output, Vec<String>) {
+    note_launch_of_judge_script(script);
     let launch = SELF_TEST_LAUNCHES.fetch_add(1, Ordering::Relaxed);
     let base = self_test_parent().join(format!("st-{}-{launch}", std::process::id()));
-    let longest = base.as_os_str().len() + SELF_TEST_SOCKET_SUFFIX.len();
+    let longest = base.as_os_str().len()
+        + SELF_TEST_SOCKET_SUFFIXES
+            .iter()
+            .map(|suffix| suffix.len())
+            .max()
+            .unwrap_or_default();
     assert!(
         longest <= SOCKET_PATH_MAX,
         "the base of this self-test is {} ({} bytes), so the longest socket gate-cluster.sh builds \
@@ -3187,9 +3395,13 @@ fn run_self_test(
     let home = base.join("home");
     let cache = base.join("xdg-cache");
     let tmp = base.join("t");
+    let cluster_tmp = base.join("ct");
+    let foreign = base.join("aj");
     std::fs::create_dir_all(&home).expect("creating the empty HOME of the self-test");
     std::fs::create_dir_all(&cache).expect("creating the empty XDG_CACHE_HOME of the self-test");
     std::fs::create_dir_all(&tmp).expect("creating the TMPDIR of the self-test");
+    std::fs::create_dir_all(&cluster_tmp).expect("creating the GATE_CLUSTER_TMP of the self-test");
+    let (cgroup_root, cgroup_own) = no_cgroup_under(&base);
     let mut command = std::process::Command::new(git_bash());
     command
         .arg(script)
@@ -3197,73 +3409,79 @@ fn run_self_test(
         .current_dir(repo_root())
         .env("HOME", &home)
         .env("XDG_CACHE_HOME", &cache)
+        .env("GATE_CLUSTER_TMP", &cluster_tmp)
+        .env("GATE_CGROUP_ROOT", &cgroup_root)
+        .env("GATE_PROC_SELF_CGROUP", &cgroup_own)
         .env_remove("TMPDIR");
     for (name, _) in JUDGE_ENVIRONMENT {
         command.env_remove(name);
     }
-    command.envs(env.iter().copied());
+    for (name, value) in env {
+        command.env(name, under_the_foreign_dir(value, &foreign));
+    }
     if own_tmpdir {
         command.env("TMPDIR", &tmp);
     }
+    let cgroup_before = own_cgroup_path();
     let output = command
         .output()
         .expect("running the self-test of a judge script");
-    let mut left: Vec<String> = entries_under(&home)
-        .into_iter()
-        .map(|entry| format!("HOME/{entry}"))
-        .collect();
-    left.extend(
-        entries_under(&cache)
-            .into_iter()
-            .map(|entry| format!("XDG_CACHE_HOME/{entry}")),
-    );
+    let cgroup_after = own_cgroup_path();
+    if cgroup_before != cgroup_after {
+        CGROUP_MOVES.lock().expect("the list of cgroup moves").push(format!(
+            "{} --self-test: the cgroup of the test went from {cgroup_before:?} to {cgroup_after:?}",
+            script.display()
+        ));
+    }
+    let mut left = left_in("HOME", &home);
+    left.extend(left_in("XDG_CACHE_HOME", &cache));
+    left.extend(left_in("GATE_CLUSTER_TMP", &cluster_tmp));
+    if foreign.exists() {
+        left.push("AJENO/".to_string());
+    }
+    left.extend(left_in("AJENO", &foreign));
     let _ = std::fs::remove_dir_all(&base);
     (output, left)
 }
 
-/// What `script --self-test` leaves in HOME and XDG_CACHE_HOME (D-J7b). See `run_self_test`.
-fn left_by_self_test(script: &Path) -> Vec<String> {
-    run_self_test(script, &[], false).1
-}
-
-/// The default cluster root of gate-cluster.sh, computed by the script itself with GATE_CLUSTER_ROOT
-/// unset (CI-F2, K11): `${GATE_CLUSTER_TMP:-/tmp}/memory-industry-gate-<uid>`. `cluster_tmp` is the
-/// GATE_CLUSTER_TMP of the computation, so the root it names is one the test owns.
-fn default_cluster_root(cluster_tmp: &Path) -> std::path::PathBuf {
-    let output = std::process::Command::new(git_bash())
-        .arg("-c")
-        .arg("source \"$1\"; printf %s \"$GATE_CLUSTER_ROOT\"")
-        .arg("default-root")
-        .arg(repo_root().join("scripts").join("gate-cluster.sh"))
-        .env_remove("GATE_CLUSTER_ROOT")
-        .env("GATE_CLUSTER_TMP", cluster_tmp)
-        .output()
-        .expect("asking gate-cluster.sh for its default cluster root");
-    assert!(
-        output.status.success(),
-        "gate-cluster.sh did not say its default cluster root: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// What differs between two listings of a directory (`entries_under`): what went, and what came.
-fn listing_changes(before: &[String], after: &[String]) -> Vec<String> {
-    before
-        .iter()
-        .filter(|entry| !after.contains(*entry))
-        .map(|entry| format!("gone: {entry}"))
-        .chain(
-            after
-                .iter()
-                .filter(|entry| !before.contains(*entry))
-                .map(|entry| format!("new: {entry}")),
-        )
+/// What is under `dir`, each entry named `label/entry` (CI-K6).
+fn left_in(label: &str, dir: &Path) -> Vec<String> {
+    entries_under(dir)
+        .into_iter()
+        .map(|entry| format!("{label}/{entry}"))
         .collect()
 }
 
+/// `value` with `FOREIGN_ROOT` rewritten to `foreign`, the directory of the run that nothing
+/// creates (CI-K6). A value that does not start with it is left as it is.
+fn under_the_foreign_dir(value: &str, foreign: &Path) -> std::ffi::OsString {
+    match value.strip_prefix(FOREIGN_ROOT) {
+        Some(rest) => {
+            let mut path = foreign.as_os_str().to_owned();
+            path.push(rest);
+            path
+        }
+        None => value.into(),
+    }
+}
+
+/// What a fixture leaves when it is launched as a self-test with `env` (CI-K6). The fixture is a
+/// script of `body` in a directory of its own outside `scripts/`, so the one-launch rule of
+/// `note_launch_of_judge_script` does not count it. It is a liar the checks below have to catch.
+fn left_by_fixture(name: &str, body: &str, env: &[(&str, &str)]) -> Vec<String> {
+    let dir = std::env::temp_dir().join(format!("selftest-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("creating the directory of the fixture");
+    let script = dir.join(format!("{name}.sh"));
+    std::fs::write(&script, format!("#!/usr/bin/env bash\n{body}\nexit 0\n"))
+        .expect("writing the fixture");
+    let left = run_self_test(&script, env, false).1;
+    let _ = std::fs::remove_dir_all(&dir);
+    left
+}
+
 /// Concurrent launches at most (CI-J7). A self-test is a bash script that starts its own processes
-/// and mostly waits on them, so the cost is wall time. Six slots serve the thirteen launches of a
+/// and mostly waits on them, so the cost is wall time. Six slots serve the fourteen launches of a
 /// round without queuing each behind the last, and cap how many of their processes run at once next
 /// to the rest of the binary's tests. Chosen here, not measured: the orchestrator measures it in
 /// the whole-judge run, and a different number is a change of this constant only.
@@ -3315,10 +3533,26 @@ struct SelfTestRun {
 }
 
 /// The one run of each script of SCRIPTS_WITH_SELF_TEST under JUDGE_ENVIRONMENT and a TMPDIR of its
-/// own (CI-J7). CI-J3 reads all of them, and the ten `*_can_actually_fail` tests read their own
-/// script's run from here, so the judge's environment is launched once per script and not once per
-/// test. Whichever asks first fills it: the result is the same either way.
+/// own (CI-J7). CI-J3 reads all of them, the ten `*_can_actually_fail` tests read their own
+/// script's run from here, and the test of the leftovers reads the eight that source gate-lock.sh,
+/// so the judge's environment is launched once per script and not once per test (CI-K6:
+/// `note_launch_of_judge_script` makes a second launch red). Whichever asks first fills it: the
+/// result is the same either way.
 static JUDGE_ENV_SELF_TESTS: OnceLock<Vec<(&'static str, SelfTestRun)>> = OnceLock::new();
+
+/// The cgroup of this process: the path of its `0::` line in `/proc/self/cgroup`, `None` where there is no cgroup v2 (CI-K10, H1).
+/// Only the path is read, and not the children of the scope: a planner that delegates the scope moves every process in it,
+/// this one included, to `<scope>/juez`, so the process that looks sees its own path change.
+fn own_cgroup_path() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| path.trim().to_string())
+}
+
+/// The launches of `run_self_test` after which this process was in another cgroup than before it, each as the script and the
+/// two paths (CI-K10, H1). `run_self_test` fills it and `the_self_tests_do_not_move_the_cgroup_of_the_test` reads it.
+static CGROUP_MOVES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The run of `name` under the judge's exported environment (CI-J7). Its output is what the test
 /// asserts on, with the same messages it had when it launched the script itself.
@@ -3337,56 +3571,47 @@ fn judge_env_self_test(name: &str) -> &'static SelfTestRun {
         .unwrap_or_else(|| panic!("{name} is not one of SCRIPTS_WITH_SELF_TEST"))
 }
 
-/// The self-tests of the judge's scripts are hermetic (D-J7b). Each script that sources
-/// `gate-lock.sh` runs its `--self-test` with an empty HOME and an empty XDG_CACHE_HOME of its
-/// own, and leaves both empty, whatever its exit code. The scripts are read from `SCRIPTS_WITH_SELF_TEST`, so a new one
-/// that sources the lock is checked without being listed here. The fixture first: a script that
-/// writes under HOME has to be caught, or the check is a paragraph.
+/// The self-tests of the judge's scripts are hermetic (D-J7b, D6). Each script that sources
+/// `gate-lock.sh` runs its `--self-test` with an empty HOME, an empty XDG_CACHE_HOME and an empty
+/// GATE_CLUSTER_TMP of its own, and with the judge's foreign paths pointing where nothing exists,
+/// and leaves all of them as it found them, whatever its exit code (CI-K6). It does not launch: it
+/// reads the run of `judge_env_self_test`, so each script runs once per round. The scripts are read
+/// from `SCRIPTS_WITH_SELF_TEST`, so a new one that sources the lock is checked without being
+/// listed here. The fixtures first, each the anchor of one place a leftover can be: a script that
+/// writes under HOME, one that makes the default cluster root (empty, as the blind spot of the old
+/// check), and one that writes the exit file it was told, which only shows under a foreign path of
+/// the run's own.
 #[test]
 fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
-    let liar_dir = std::env::temp_dir().join(format!("selftest-liar-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&liar_dir);
-    std::fs::create_dir_all(&liar_dir).expect("creating the liar fixture");
-    let liar = liar_dir.join("liar.sh");
-    std::fs::write(
-        &liar,
-        "#!/usr/bin/env bash\nmkdir -p \"$HOME/.cache/x\"\nexit 0\n",
-    )
-    .expect("writing the liar fixture");
-    let caught = left_by_self_test(&liar);
-    let _ = std::fs::remove_dir_all(&liar_dir);
+    let caught = left_by_fixture("liar", "mkdir -p \"$HOME/.cache/x\"", &[]);
     assert!(
-        !caught.is_empty(),
+        caught.iter().any(|entry| entry == "HOME/.cache/x"),
         "the check let through a script that writes ~/.cache/x under HOME during its self-test, \
-         so it cannot tell a clean self-test from a dirty one"
+         so it cannot tell a clean self-test from a dirty one: {caught:?}"
     );
 
-    // D6 (CI-F2): the same for the default cluster root, `${GATE_CLUSTER_TMP:-/tmp}/memory-industry-gate-<uid>`.
-    // Hermetic: the real root is where the judge's own lanes live (run_in_lane), so it is never listed. The
-    // fixture's liar writes into a root under a GATE_CLUSTER_TMP of its own, and the check must see that.
-    let fixture_tmp =
-        std::env::temp_dir().join(format!("selftest-root-liar-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&fixture_tmp);
-    std::fs::create_dir_all(&fixture_tmp)
-        .expect("creating the GATE_CLUSTER_TMP of the root fixture");
-    let fixture_tmp_text = fixture_tmp
-        .to_str()
-        .expect("the temp dir of the fixture is UTF-8");
-    let fixture_root = default_cluster_root(&fixture_tmp);
-    let root_liar = fixture_tmp.join("root-liar.sh");
-    std::fs::write(
-        &root_liar,
-        "#!/usr/bin/env bash\nmkdir -p \"$GATE_CLUSTER_TMP/memory-industry-gate-$(id -u)/liar\"\nexit 0\n",
-    )
-    .expect("writing the root liar fixture");
-    let fixture_before = entries_under(&fixture_root);
-    let _ = run_self_test(&root_liar, &[("GATE_CLUSTER_TMP", fixture_tmp_text)], false);
-    let fixture_changes = listing_changes(&fixture_before, &entries_under(&fixture_root));
-    let _ = std::fs::remove_dir_all(&fixture_tmp);
+    let caught = left_by_fixture(
+        "root-liar",
+        "mkdir -p \"$GATE_CLUSTER_TMP/memory-industry-gate-$(id -u)\"",
+        &[],
+    );
     assert!(
-        !fixture_changes.is_empty(),
-        "the root check let through a script that writes under the default cluster root during its \
-         self-test, so it cannot tell a clean self-test from one that left a lane behind (D6)"
+        caught.len() == 1 && caught[0].starts_with("GATE_CLUSTER_TMP/memory-industry-gate-"),
+        "the root check let through a script that makes the default cluster root, empty, during \
+         its self-test, so it cannot tell a clean self-test from one that left a lane behind \
+         (D6): {caught:?}"
+    );
+
+    let caught = left_by_fixture(
+        "exit-liar",
+        "mkdir -p \"$(dirname \"$CUBA_GATE_EXIT_FILE\")\"\necho running >\"$CUBA_GATE_EXIT_FILE\"",
+        &JUDGE_ENVIRONMENT,
+    );
+    assert!(
+        caught.iter().any(|entry| entry == "AJENO/run.exit"),
+        "the check let through a script that writes the exit file it was told under the judge's \
+         environment, so a self-test that writes there with the failure ignored is green here and \
+         red under the judge: {caught:?}"
     );
 
     let sourcing: Vec<&str> = SCRIPTS_WITH_SELF_TEST
@@ -3398,42 +3623,66 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
         !sourcing.is_empty(),
         "no script of SCRIPTS_WITH_SELF_TEST sources gate-lock.sh: the check would prove nothing"
     );
-    let cluster_tmp = self_test_parent().join(format!("ct-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&cluster_tmp);
-    std::fs::create_dir_all(&cluster_tmp).expect("creating the GATE_CLUSTER_TMP of the self-tests");
-    let cluster_tmp_text = cluster_tmp
-        .to_str()
-        .expect("the GATE_CLUSTER_TMP of the self-tests is UTF-8");
-    let root = default_cluster_root(&cluster_tmp);
-    let root_before = entries_under(&root);
-    let lefts = in_parallel(&sourcing, |name| {
-        run_self_test(
-            &repo_root().join("scripts").join(name),
-            &[("GATE_CLUSTER_TMP", cluster_tmp_text)],
-            false,
-        )
-        .1
-    });
-    let root_changes = listing_changes(&root_before, &entries_under(&root));
-    let _ = std::fs::remove_dir_all(&cluster_tmp);
     let leftovers: Vec<String> = sourcing
         .iter()
-        .zip(lefts)
+        .map(|name| (name, &judge_env_self_test(name).left))
         .filter(|(_, left)| !left.is_empty())
         .map(|(name, left)| format!("scripts/{name} --self-test left behind: {left:?}"))
         .collect();
     assert!(
         leftovers.is_empty(),
-        "a self-test of the judge wrote into the HOME or the XDG_CACHE_HOME it was given. A \
-         self-test has to leave both as it found them (D-J7b), or a judge that runs next to it \
-         loses its output: {leftovers:#?}"
+        "a self-test of the judge wrote into the HOME, the XDG_CACHE_HOME or the GATE_CLUSTER_TMP it \
+         was given, or under the foreign path it was handed (AJENO/). A self-test has to leave all \
+         of them as it found them (D-J7b, D6, CI-F2), or a judge that runs next to it loses its \
+         output or finds its lane: {leftovers:#?}"
     );
+}
+
+/// CI-K10 (H1): every self-test starts with a cgroup tree that has no scope in it. The fixture is a script that says what
+/// the pair it was given is; the tree is the one `run_self_test` makes and removes, so the fixture reports it from inside.
+#[test]
+fn a_self_test_is_given_a_cgroup_tree_with_no_scope_to_delegate() {
+    let dir = std::env::temp_dir().join(format!("selftest-cgroup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("creating the directory of the fixture");
+    let script = dir.join("cgroup.sh");
+    let body = r#"echo "root-is-dir=$([ -d "${GATE_CGROUP_ROOT:-}" ] && echo yes || echo no)"
+echo "root-entries=$(ls -A "${GATE_CGROUP_ROOT:-/nonexistent}" 2>/dev/null | wc -l)"
+echo "own-is-file=$([ -f "${GATE_PROC_SELF_CGROUP:-}" ] && echo yes || echo no)"
+echo "own-scope-lines=$(grep -c '^0::' "${GATE_PROC_SELF_CGROUP:-/nonexistent}" 2>/dev/null)""#;
+    std::fs::write(&script, format!("#!/usr/bin/env bash\n{body}\nexit 0\n"))
+        .expect("writing the fixture");
+    let output = run_self_test(&script, &[], false).0;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "root-is-dir=yes",
+            "root-entries=0",
+            "own-is-file=yes",
+            "own-scope-lines=0"
+        ],
+        "a self-test has to start with GATE_CGROUP_ROOT an empty directory and GATE_PROC_SELF_CGROUP a file with no `0::` \
+         line, or a planner it starts for real reads the cgroup of whoever runs the test and delegates it (CI-J17, CI-K10): {stdout:?}"
+    );
+}
+
+/// CI-K10 (H1): no self-test moves the cgroup of the process that runs the test. `run_self_test` reads `/proc/self/cgroup` before
+/// and after each launch and notes the ones that differ; the round of the judge's scripts is forced here first, so the run of
+/// `run-all-tests.sh`, the one that starts a planner for real, is in the list. Where the scope is delegable (under `pesado`, and
+/// under the judge, where the step that runs this test is a scope of the outer planner) a planner that reads the real cgroup
+/// moves this process into `<scope>/juez` and the path changes; where it is not, `delegate()` returns False and the path never
+/// changes, so the equality holds either way and the guard is never mute. What makes it fail without a delegable scope is
+/// `a_self_test_is_given_a_cgroup_tree_with_no_scope_to_delegate`.
+#[test]
+fn the_self_tests_do_not_move_the_cgroup_of_the_test() {
+    let _ = judge_env_self_test("run-all-tests.sh");
+    let moves = CGROUP_MOVES.lock().expect("the list of cgroup moves");
     assert!(
-        root_changes.is_empty(),
-        "a self-test of the judge changed the default cluster root {} (D6, CI-F2): {root_changes:#?}. \
-         A self-test that makes a lane has to name GATE_CLUSTER_ROOT, or the lane is left in the root \
-         of whoever runs next to it",
-        root.display()
+        moves.is_empty(),
+        "a self-test started a planner that delegated the real cgroup of this process (CI-J17, CI-K10): {moves:#?}"
     );
 }
 
@@ -3442,7 +3691,7 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
 /// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
 /// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
 /// self-test that takes it as its own fixture's identity is red under any other value.
-const JUDGE_ENVIRONMENT: [(&str, &str); 27] = [
+const JUDGE_ENVIRONMENT: [(&str, &str); 32] = [
     ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
     // CI-F3.3b-1b-i (D-F3k): merge-gate.sh exports the lock's directory so that the planner can write the
     // lane tickets under it. gate-lock.sh assigns GATE_LOCK itself, so no self-test reads what it inherits.
@@ -3481,8 +3730,22 @@ const JUDGE_ENVIRONMENT: [(&str, &str); 27] = [
     ("CUBA_NLI_INTRA_THREADS", "7"),
     ("CUBA_RERANK_INTRA_THREADS", "7"),
     ("MUTANTS_JOBS", "7"),
+    // CI-K4 (D-K4a): the planner gives the rows that compile in dev their profile (ALLOWED_ENV in gate-dag.py) and the
+    // judge does not export it. A foreign value of each, so a self-test that reads one of them fails here, and not
+    // under the planner.
+    ("CARGO_INCREMENTAL", "1"),
+    ("CARGO_PROFILE_DEV_DEBUG", "2"),
+    ("CARGO_PROFILE_DEV_STRIP", "none"),
     ("PYTHONUTF8", "0"),
     ("PYTHONIOENCODING", "latin-1"),
+    // CI-K9b: gate_linux_env exports the channel of rust-toolchain.toml for the cargo that runs outside the tree. A
+    // self-test that reads what it inherits would take this one as the channel of its fixture.
+    ("RUSTUP_TOOLCHAIN", "1.0.0-ajeno"),
+    // T-DBURL: merge-gate.sh and run-all-tests.sh export the switch (any non-empty value turns it on) so that a process the
+    // judge starts with no DATABASE_URL refuses with exit 2. It reaches the steps of the planner through the environment
+    // the planner inherits, not through ALLOWED_ENV, which only lists what a row may change. A self-test gets a foreign
+    // value of it, and neither "1" nor "0" says anything a self-test could take for its own: it must pass with the switch on.
+    ("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "ajeno"),
 ];
 
 /// The names the judge's scripts export that no self-test is handed, each with its reason, its owner and the
@@ -3608,8 +3871,9 @@ fn every_self_test_passes_under_the_judges_exported_environment() {
     );
     assert!(
         leftovers.is_empty(),
-        "a self-test run under the judge's exported environment wrote into the HOME or the \
-         XDG_CACHE_HOME it was given (CI-J3, D-J7b): {leftovers:#?}"
+        "a self-test run under the judge's exported environment wrote into the HOME, the \
+         XDG_CACHE_HOME or the GATE_CLUSTER_TMP it was given, or under a foreign path it was \
+         handed (AJENO/) (CI-J3, D-J7b, CI-K6): {leftovers:#?}"
     );
 }
 
@@ -3663,7 +3927,7 @@ fn the_judges_exported_environment_list_is_complete() {
 
     // CI-J9: a name the planner sets is not exported by the judge's scripts; the planner's own list is
     // where it is still named, so it is not stale while the planner names it.
-    let planner = planner_allowed_names(&read("scripts/gate-dag.py"));
+    let planner = planner_allowed_names();
     let stale: Vec<&str> = handed
         .iter()
         .chain(excluded.iter())
@@ -3698,19 +3962,26 @@ fn the_judges_exported_environment_list_is_complete() {
     );
 }
 
-/// The names of the planner's ALLOWED_ENV literal in `gate-dag.py` (CI-J9): the closed list of what a step's
-/// environment may change (D-F3j). Read from the file, so a name the planner adds is judged without this
-/// test changing.
-fn planner_allowed_names(dag: &str) -> Vec<String> {
-    let Some(start) = dag.find("ALLOWED_ENV = frozenset(") else {
-        return Vec::new();
-    };
-    let literal = &dag[start..];
-    let end = literal.find("\n)").unwrap_or(literal.len());
-    literal[..end]
-        .split('"')
-        .skip(1)
-        .step_by(2)
+/// The names a step's environment may differ in (CI-J9, D-F3j, CI-J18 D-J18c): the union of what a row may name and what the
+/// planner sets, asked of the planner itself (`gate-dag.py allowed-env`, one name per line), as gate_dag_contract.rs asks it.
+/// The list is no longer one literal in the text of gate-dag.py, so there is nothing to scan: a name the planner adds is
+/// judged without this test changing, and the scan of its text cannot go on passing over an empty list.
+fn planner_allowed_names() -> Vec<String> {
+    let out = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(repo_root().join("scripts/gate-dag.py"))
+        .arg("allowed-env")
+        .output()
+        .expect("python3 runs scripts/gate-dag.py allowed-env");
+    assert!(
+        out.status.success(),
+        "`gate-dag.py allowed-env` has to print the closed list of the step environment and exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
         .map(str::to_string)
         .collect()
 }
@@ -3719,20 +3990,13 @@ fn planner_allowed_names(dag: &str) -> Vec<String> {
 /// its own (JUDGE_ENVIRONMENT). A name the planner sets that neither list judges is red: the judge would
 /// hand a self-test the planner's value of it without anyone deciding so. The other direction is the
 /// stale check of CI-J3, which now also counts the planner's list as a place where a name is still named.
+/// CI-J18 (J18c.3): the list comes from `gate-dag.py allowed-env`, not from the text of gate-dag.py.
 #[test]
 fn every_name_the_planner_puts_in_a_step_is_judged() {
-    // The scan has to be able to fail before a clean answer from it means anything.
-    let fixture = "ALLOWED_ENV = frozenset(\n    {\n        \"AA_B\",\n        \"CC\",\n    }\n)\nOTHER = {\"ZZ\"}\n";
-    assert_eq!(
-        planner_allowed_names(fixture),
-        vec!["AA_B".to_string(), "CC".to_string()],
-        "the scan of the planner's ALLOWED_ENV must read its names and nothing after the closing paren"
-    );
-
-    let planner = planner_allowed_names(&read("scripts/gate-dag.py"));
+    let planner = planner_allowed_names();
     assert!(
         planner.len() >= 5,
-        "the planner's ALLOWED_ENV has {} names: the scan of gate-dag.py is broken",
+        "the planner's allowed-env has {} names: the list is empty or the question is not answered",
         planner.len()
     );
 
@@ -3751,8 +4015,8 @@ fn every_name_the_planner_puts_in_a_step_is_judged() {
 }
 
 /// CI-J5. The seven names that choose the models are set in one place, `gate_model_env` (gate-lock.sh),
-/// and both callers run it: run-all-tests.sh for the full run and merge-gate.sh before the
-/// --features docs step. A second assignment is a second source, and the docs step would test other
+/// and its one caller is run-all-tests.sh, the full run (CI-K8, D-K8d: the step of the build without docs reads no
+/// model, so merge-gate.sh stopped calling it). A second assignment is a second source, and a step would test other
 /// models than the full run.
 const MODEL_ENVIRONMENT: [&str; 7] = [
     "ONNX_MODEL_PATH",
@@ -3789,7 +4053,7 @@ fn sets_model_names(line: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// CI-J5. The model names are set once, in gate_model_env, and the two callers run it. The detector
+/// CI-J5. The model names are set once, in gate_model_env, and run-all-tests.sh runs it. The detector
 /// is judged first, on lines that must and must not count.
 #[test]
 fn the_model_environment_is_set_in_one_place() {
@@ -3877,16 +4141,24 @@ fn the_model_environment_is_set_in_one_place() {
         );
     }
 
-    for caller in ["run-all-tests.sh", "merge-gate.sh"] {
-        let body = read(&format!("scripts/{caller}")).replace("\r\n", "\n");
-        assert!(
-            outside_self_test(&body)
-                .iter()
-                .any(|(_, line)| line.trim() == "gate_model_env"),
-            "scripts/{caller} does not call gate_model_env, so it runs with models the gate did not \
-             choose (CI-J5)"
-        );
-    }
+    let suite = read("scripts/run-all-tests.sh").replace("\r\n", "\n");
+    assert!(
+        outside_self_test(&suite)
+            .iter()
+            .any(|(_, line)| line.trim() == "gate_model_env"),
+        "scripts/run-all-tests.sh does not call gate_model_env, so it runs with models the gate did not \
+         choose (CI-J5)"
+    );
+    // CI-K8 (D-K8d): no row of merge-gate.sh reads a model any more, so it does not call the function: the step of
+    // the build without docs only compiles and lints.
+    let gate = read("scripts/merge-gate.sh").replace("\r\n", "\n");
+    assert!(
+        !outside_self_test(&gate)
+            .iter()
+            .any(|(_, line)| line.trim() == "gate_model_env"),
+        "scripts/merge-gate.sh calls gate_model_env: the only step that did (the build with docs) runs no test now, and a \
+         call here is a second place that chooses the models (CI-K8)"
+    );
 }
 
 /// The section counts come from one counter, `test-times.sh --count` (D-J4c, D-J4d): the script
@@ -3945,6 +4217,7 @@ fn the_python_clients_refuse_without_database_url() {
         let out = Command::new("python3")
             .arg(repo_root().join(client))
             .env_remove("DATABASE_URL")
+            .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
             .env("CUBA_BINARY_PATH", &binary)
             .current_dir(&dir)
             .output()
@@ -4088,14 +4361,17 @@ fn every_gate_step_after_the_guard_gets_the_verified_url() {
          when the system_identifier it reads differs from the one merge-gate.sh exported"
     );
 
-    // merge-gate.sh asks again after run-all-tests.sh, before the --features docs step: the
+    // merge-gate.sh asks again after run-all-tests.sh, before the step of the build without docs (CI-K8, D-K8d): the
     // identity exported above has to be the one that answers at that point (D-J1c, A2).
     let export_at = first_line_where(&gate, |l| l.starts_with("export GATE_SERVER_SYSTEM_ID="));
-    let docs_at = first_line_where(&gate, |l| l.contains("features docs ==="));
+    let docs_at = first_line_where(&gate, |l| {
+        l.contains("no-default-features") && l.contains("===")
+    });
     let (Some(export_at), Some(docs_at)) = (export_at, docs_at) else {
         panic!(
             "merge-gate.sh must export GATE_SERVER_SYSTEM_ID (found on {export_at:?}) and print the \
-             --features docs step (found on {docs_at:?}) outside its self-test"
+             banner of the build without docs, the one with `no-default-features` (found on {docs_at:?}), \
+             outside its self-test"
         );
     };
     assert!(
@@ -4103,8 +4379,8 @@ fn every_gate_step_after_the_guard_gets_the_verified_url() {
             l.contains("gate_require_judge_server") && *n > export_at && *n < docs_at
         }),
         "merge-gate.sh does not call gate_require_judge_server between the export of \
-         GATE_SERVER_SYSTEM_ID (line {export_at}) and the --features docs step (line {docs_at}): a \
-         server that changed under run-all-tests.sh would reach the docs step unseen"
+         GATE_SERVER_SYSTEM_ID (line {export_at}) and the step of the build without docs (line \
+         {docs_at}): a server that changed under run-all-tests.sh would reach the rows after it unseen"
     );
 }
 
@@ -4160,7 +4436,15 @@ fn the_eval_reads_a_seeded_scratch_database_and_never_the_live_one() {
 /// The sections of the judge that run tests by name or with `--ignored` each have a count in
 /// `scripts/test-section-counts.txt`, written as `<section> <tests> <motive>`. Every such
 /// section is named by a `--count` call in run-all-tests.sh, and every call has its line here.
-const CI_J_COUNTED_SECTIONS: [&str; 9] = [
+/// CI-E1 (D-E1e): a section may instead state one line per test binary,
+/// `<section>/<linux|windows>/<binary> <tests> <motive>`; the section is the part before the
+/// first `/`, and a section states a total or lines per binary, never both.
+/// CI-E11 (D-E11e): the plain pass is three sections, `plain` (the library and the files of tests/ that are not
+/// contracts of the judge), `contracts` (those) and `doc`, each with one line per binary.
+const CI_J_COUNTED_SECTIONS: [&str; 12] = [
+    "plain",
+    "contracts",
+    "doc",
     "discovered-ignored",
     "lib-ignored",
     "admin-role",
@@ -4181,7 +4465,7 @@ fn every_section_with_a_count_runs_and_every_count_has_a_section() {
          nombradas, con los números del log de F0 (ci-rapido-J-F1.spec.md, D-J4b)"
     );
     let text = read(file);
-    let mut ids: Vec<String> = Vec::new();
+    let mut ids: Vec<(usize, String)> = Vec::new();
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -4201,11 +4485,56 @@ fn every_section_with_a_count_runs_and_every_count_has_a_section() {
             "{file}:{}: `{id}` has no motive; a count without one is a number nobody can judge",
             index + 1
         );
-        ids.push(id.to_string());
+        ids.push((index + 1, id.to_string()));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (n, id) in &ids {
+        assert!(
+            seen.insert(id.as_str()),
+            "{file}:{n}: `{id}` is stated twice; the counter reads the first and the second would \
+             never be judged"
+        );
+    }
+    let mut sections: Vec<String> = Vec::new();
+    for (n, id) in &ids {
+        let parts: Vec<&str> = id.split('/').collect();
+        let section = parts[0];
+        if parts.len() > 1 {
+            assert!(
+                parts.len() == 3 && ["linux", "windows"].contains(&parts[1]),
+                "{file}:{n}: `{id}` is not `<section>/<linux|windows>/<binary>`"
+            );
+            let key = parts[2];
+            let name = key
+                .strip_prefix("lib:")
+                .or_else(|| key.strip_prefix("bin:"))
+                .or_else(|| key.strip_prefix("doc:"))
+                .unwrap_or(key);
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{file}:{n}: the binary `{key}` of `{id}` is not a file name, `lib:`, `bin:` or `doc:` \
+                 and a name"
+            );
+        }
+        sections.push(section.to_string());
+    }
+    for (n, id) in &ids {
+        let per_binary = id.contains('/');
+        let section = id.split('/').next().unwrap_or("");
+        let other_form = ids.iter().any(|(_, other)| {
+            other.split('/').next() == Some(section) && other.contains('/') != per_binary
+        });
+        assert!(
+            !other_form,
+            "{file}:{n}: the section `{section}` states a total and lines per binary: one or the other"
+        );
     }
     for id in CI_J_COUNTED_SECTIONS {
         assert!(
-            ids.iter().any(|i| i.as_str() == id),
+            sections.iter().any(|i| i.as_str() == id),
             "{file} has no line for the section `{id}`"
         );
     }
@@ -4258,7 +4587,7 @@ fn every_section_with_a_count_runs_and_every_count_has_a_section() {
     let mut called = calls;
     called.sort();
     called.dedup();
-    let mut named = ids.clone();
+    let mut named = sections.clone();
     named.sort();
     named.dedup();
     assert!(
@@ -4279,6 +4608,540 @@ fn every_section_with_a_count_runs_and_every_count_has_a_section() {
              run-all-tests.sh counts it: a line for a section that is not counted proves nothing"
         );
     }
+}
+
+/// CI-E1 (D-E1b): the binaries the plain pass of the judge (`cargo test` with no filter) runs, named as
+/// `test-times.sh` names them: the file for `tests/<name>.rs`, `lib:` and `doc:` for the library, and `bin:` for
+/// each `[[bin]]` that runs its unit tests. A `[[bin]]` with `test = false` prints no header in the log, so it has no
+/// line (F5c, efccf6e: the two bins share main.rs).
+fn plain_pass_binaries() -> std::collections::BTreeSet<String> {
+    let mut keys: std::collections::BTreeSet<String> =
+        ["lib:memory_industry", "doc:memory_industry"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+    let mut bins: Vec<(String, bool)> = Vec::new();
+    let mut in_bin = false;
+    for line in read("rust/Cargo.toml").lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_bin = line == "[[bin]]";
+            if in_bin {
+                bins.push((String::new(), true));
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if let (true, Some(bin)) = (in_bin, bins.last_mut()) {
+            match (key.trim(), value.trim()) {
+                ("name", name) => bin.0 = name.trim_matches('"').replace('-', "_"),
+                ("test", "false") => bin.1 = false,
+                _ => {}
+            }
+        }
+    }
+    keys.extend(
+        bins.into_iter()
+            .filter(|(_, tested)| *tested)
+            .map(|(name, _)| format!("bin:{name}")),
+    );
+    let tests = repo_root().join("rust/tests");
+    for entry in std::fs::read_dir(&tests).unwrap_or_else(|e| panic!("{}: {e}", tests.display())) {
+        let path = entry.expect("an entry of rust/tests").path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            keys.insert(
+                path.file_stem()
+                    .expect("a file name")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    keys
+}
+
+/// What differs between the binaries that have a line and the binaries the tree has, both ways and by name.
+fn plain_line_differences(
+    declared: &std::collections::BTreeSet<String>,
+    expected: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = expected
+        .difference(declared)
+        .map(|key| format!("`{key}` is a binary of the plain pass and has no line"))
+        .collect();
+    out.extend(
+        declared
+            .difference(expected)
+            .map(|key| format!("`{key}` has a line and no such binary in the tree")),
+    );
+    out
+}
+
+/// CI-E11 (D-E11e): the names in `JUDGE_CONTRACTS=(…)` of `suite`, outside its self-test: the files of tests/ that need
+/// no server and run in the row CT, not in the plain pass of the row DBG.
+fn judge_contracts(suite: &str) -> Result<Vec<String>, String> {
+    let code: Vec<&str> = outside_self_test(suite)
+        .into_iter()
+        .map(|(_, line)| line)
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect();
+    let at = code
+        .iter()
+        .position(|line| line.trim_start().starts_with("JUDGE_CONTRACTS=("))
+        .ok_or_else(|| {
+            "run-all-tests.sh has no `JUDGE_CONTRACTS=(…)`: the files of tests/ that are contracts of the judge and run in \
+             the row CT (CI-E11, D-E11e)"
+                .to_string()
+        })?;
+    let mut names = Vec::new();
+    for line in &code[at..] {
+        names.extend(
+            line.replace("JUDGE_CONTRACTS=(", " ")
+                .replace(')', " ")
+                .split_whitespace()
+                .map(String::from),
+        );
+        if line.contains(')') {
+            break;
+        }
+    }
+    if names.is_empty() {
+        return Err("JUDGE_CONTRACTS=(…) of run-all-tests.sh names no file".to_string());
+    }
+    Ok(names)
+}
+
+type PassSections = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
+
+/// CI-E11 (D-E11e): how the binaries of the plain pass (`all`, the E1 set) are shared between the three sections:
+/// the library and the files of tests/ that are not contracts of the judge are `plain`, the contracts are `contracts`
+/// and the doctests are `doc`.
+fn sections_of_the_pass(
+    all: &std::collections::BTreeSet<String>,
+    contracts: &[String],
+) -> PassSections {
+    let doc: std::collections::BTreeSet<String> =
+        ["doc:memory_industry".to_string()].into_iter().collect();
+    let contracts: std::collections::BTreeSet<String> = contracts.iter().cloned().collect();
+    let plain = all
+        .iter()
+        .filter(|key| !contracts.contains(*key) && !doc.contains(*key))
+        .cloned()
+        .collect();
+    PassSections::from([
+        ("plain".to_string(), plain),
+        ("contracts".to_string(), contracts),
+        ("doc".to_string(), doc),
+    ])
+}
+
+/// What is wrong between the lines `declared` (section → binaries with a line) and the plain pass `all` shared out by
+/// JUDGE_CONTRACTS: a contract that is not a file of tests/, a binary with a line in two sections, and, per section, a
+/// binary with no line and a line with no binary. Each one by name.
+fn pass_line_problems(
+    declared: &PassSections,
+    all: &std::collections::BTreeSet<String>,
+    contracts: &[String],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for name in contracts {
+        if name.contains(':') || !all.contains(name) {
+            problems.push(format!(
+                "`{name}` of JUDGE_CONTRACTS is not a file of rust/tests/"
+            ));
+        }
+    }
+    let mut seen: std::collections::BTreeMap<&String, Vec<&String>> =
+        std::collections::BTreeMap::new();
+    for (section, keys) in declared {
+        for key in keys {
+            seen.entry(key).or_default().push(section);
+        }
+    }
+    for (key, sections) in seen.iter().filter(|(_, sections)| sections.len() > 1) {
+        problems.push(format!(
+            "`{key}` has a line in {} sections ({sections:?}): every binary is counted in one",
+            sections.len()
+        ));
+    }
+    let empty = std::collections::BTreeSet::new();
+    for (section, expected) in sections_of_the_pass(all, contracts) {
+        let got = declared.get(&section).unwrap_or(&empty);
+        problems.extend(
+            plain_line_differences(got, &expected)
+                .into_iter()
+                .map(|difference| format!("section {section}: {difference}")),
+        );
+    }
+    problems
+}
+
+/// CI-E11 (D-E11e, E11-3): the plain pass of CI-E1 is three sections (`plain`, `contracts` and `doc`), each with one line
+/// per binary and no total. The lines of the three are exactly the binaries of the pass, each in ONE section: `contracts`
+/// are the files of JUDGE_CONTRACTS and `doc` is the doctests of the library. A test file added with no line, a line whose
+/// file is gone, a file counted twice and a contract that is not a file are red here in milliseconds, and not at the end
+/// of a judge. The lines are not in the file until the orchestrator measures them (E1 and E11 are measured once, after
+/// E11): until then this test is red for `has no line`, by name, and nothing here invents a number.
+#[test]
+fn the_pass_is_counted_per_binary_in_plain_contracts_and_doc_and_every_binary_is_in_one() {
+    // The comparison has to be able to fail before a clean answer from it means anything.
+    let set = |keys: &[&str]| -> std::collections::BTreeSet<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    };
+    let all = set(&[
+        "lib:memory_industry",
+        "doc:memory_industry",
+        "a",
+        "c1",
+        "c2",
+    ]);
+    let contracts = ["c1".to_string(), "c2".to_string()];
+    let honest = PassSections::from([
+        ("plain".to_string(), set(&["lib:memory_industry", "a"])),
+        ("contracts".to_string(), set(&["c1", "c2"])),
+        ("doc".to_string(), set(&["doc:memory_industry"])),
+    ]);
+    assert!(
+        pass_line_problems(&honest, &all, &contracts).is_empty(),
+        "the partition that is right is refused: {:#?}",
+        pass_line_problems(&honest, &all, &contracts)
+    );
+    let mut twice = honest.clone();
+    twice
+        .get_mut("plain")
+        .expect("plain")
+        .insert("c1".to_string());
+    let mut missing = honest.clone();
+    missing
+        .get_mut("contracts")
+        .expect("contracts")
+        .remove("c2");
+    let mut ghost = honest.clone();
+    ghost
+        .get_mut("doc")
+        .expect("doc")
+        .insert("gone".to_string());
+    let problems = [&twice, &missing, &ghost].map(|d| pass_line_problems(d, &all, &contracts));
+    assert!(
+        problems[0]
+            .iter()
+            .any(|p| p.contains("`c1`") && p.contains("2 sections")),
+        "a binary with a line in plain and in contracts is not named: {:#?}",
+        problems[0]
+    );
+    assert!(
+        problems[1]
+            .iter()
+            .any(|p| p.contains("`c2`") && p.contains("no line")),
+        "a contract with no line is not named: {:#?}",
+        problems[1]
+    );
+    assert!(
+        problems[2]
+            .iter()
+            .any(|p| p.contains("`gone`") && p.contains("no such binary")),
+        "a line with no binary is not named: {:#?}",
+        problems[2]
+    );
+    let not_a_file = pass_line_problems(&honest, &all, &["c1".to_string(), "nope".to_string()]);
+    assert!(
+        not_a_file
+            .iter()
+            .any(|p| p.contains("`nope` of JUDGE_CONTRACTS is not a file")),
+        "a contract that is not a file of tests/ is not named: {not_a_file:#?}"
+    );
+
+    let all = plain_pass_binaries();
+    let contracts =
+        judge_contracts(&read("scripts/run-all-tests.sh")).unwrap_or_else(|why| panic!("{why}"));
+    let file = "scripts/test-section-counts.txt";
+    let mut linux = PassSections::new();
+    let mut windows = PassSections::new();
+    let mut lib_tests = 0u64;
+    for raw in read(file).lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let id = fields.next().unwrap_or("");
+        assert!(
+            !["plain", "contracts", "doc"].contains(&id),
+            "{file} has a total line for `{id}`: the pass states one line per binary, \
+             `<plain|contracts|doc>/linux/<binary> <tests> <motive>` (CI-E1, CI-E11)"
+        );
+        let parts: Vec<&str> = id.splitn(3, '/').collect();
+        if let [section, os, key] = parts.as_slice()
+            && ["plain", "contracts", "doc"].contains(section)
+        {
+            let target = if *os == "windows" {
+                &mut windows
+            } else {
+                &mut linux
+            };
+            target
+                .entry(section.to_string())
+                .or_default()
+                .insert(key.to_string());
+            if *os == "linux" && *section == "plain" && *key == "lib:memory_industry" {
+                lib_tests = fields.next().unwrap_or("").parse().unwrap_or(0);
+            }
+        }
+    }
+    let problems = pass_line_problems(&linux, &all, &contracts);
+    assert!(
+        problems.is_empty(),
+        "the `plain/`, `contracts/` and `doc/` lines for linux in {file} are not the binaries of the plain pass, each in \
+         one section: {problems:#?}"
+    );
+    if !windows.is_empty() {
+        let problems = pass_line_problems(&windows, &all, &contracts);
+        assert!(
+            problems.is_empty(),
+            "the lines for windows in {file} are not the binaries of the plain pass, each in one section: {problems:#?}"
+        );
+    }
+    let counted: usize = linux.values().map(|keys| keys.len()).sum();
+    assert!(
+        counted >= 100,
+        "{file} has {counted} lines for linux in plain, contracts and doc; the plain pass has a hundred binaries or \
+         more, so a file that lost most of them would otherwise pass as the tree it describes"
+    );
+    assert!(
+        lib_tests >= 1000,
+        "{file} says `plain/linux/lib:memory_industry` runs {lib_tests} tests; the library runs more than a thousand"
+    );
+}
+
+/// The code of `source` with the comments and the insides of the string and char literals blanked, the same length and
+/// the same lines: what a scan for a call has to read, because a test that writes `common::x()` inside a string (a
+/// fixture of a contract) does not call it.
+fn code_only(source: &str) -> String {
+    let b = source.as_bytes();
+    let mut out = b.to_vec();
+    let blank = |out: &mut [u8], from: usize, to: usize| {
+        for byte in &mut out[from..to.min(b.len())] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let find = |from: usize, needle: &[u8]| -> Option<usize> {
+        b.get(from..)?
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|at| from + at)
+    };
+    let mut i = 0;
+    while i < b.len() {
+        let after_ident = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                let end = find(i, b"\n").unwrap_or(b.len());
+                blank(&mut out, i, end);
+                i = end;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let end = find(i + 2, b"*/").map_or(b.len(), |at| at + 2);
+                blank(&mut out, i, end);
+                i = end;
+            }
+            b'r' if !after_ident && b[i + 1..].iter().find(|c| **c != b'#') == Some(&b'"') => {
+                let hashes = b[i + 1..].iter().take_while(|c| **c == b'#').count();
+                let mut closing = vec![b'"'];
+                closing.extend(std::iter::repeat_n(b'#', hashes));
+                let body = i + 1 + hashes + 1;
+                let end = find(body, &closing).map_or(b.len(), |at| at + closing.len());
+                blank(&mut out, body, end.saturating_sub(closing.len()).max(body));
+                i = end;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                blank(&mut out, i + 1, j);
+                i = j + 1;
+            }
+            b'\'' => {
+                let literal_len = if b.get(i + 1) == Some(&b'\\') {
+                    find(i + 3, b"'").map(|at| at + 1 - i)
+                } else {
+                    let ch = source.get(i + 1..).and_then(|rest| rest.chars().next());
+                    ch.filter(|c| b.get(i + 1 + c.len_utf8()) == Some(&b'\''))
+                        .map(|c| c.len_utf8() + 2)
+                };
+                match literal_len {
+                    Some(len) => {
+                        blank(&mut out, i + 1, i + len - 1);
+                        i += len;
+                    }
+                    None => i += 1,
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// CI-E11 (D-E11e, E11-4): what makes `source`, a file of JUDGE_CONTRACTS, need a server, each one by what it found:
+/// the `// needs-a-server:` line that ci.yml reads, a read of `DATABASE_URL` through `env::var`, and a call into `common`
+/// or to `create_pool`. The row CT opens no database: its cluster has no `brain_gate`.
+fn needs_a_server(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    if source
+        .lines()
+        .any(|line| line.starts_with("// needs-a-server:"))
+    {
+        found.push("a `// needs-a-server:` line".to_string());
+    }
+    let code = code_only(source);
+    for needle in ["common::", "create_pool", "mod common"] {
+        if code.contains(needle) {
+            found.push(format!("`{needle}` in its code"));
+        }
+    }
+    for call in ["env::var(", "env::var_os("] {
+        for (at, _) in code.match_indices(call) {
+            if source[at..].starts_with(&format!("{call}\"DATABASE_URL\")")) {
+                found.push(format!(
+                    "a read of DATABASE_URL (`{call}\"DATABASE_URL\")`)"
+                ));
+            }
+        }
+    }
+    found
+}
+
+/// The source of the contract `name` of tests/ and, if it is a group with a directory of modules next to it
+/// (`group_no_server.rs` and `group_no_server/*.rs`), the modules.
+fn contract_source(name: &str) -> String {
+    let tests = repo_root().join("rust/tests");
+    let mut text = std::fs::read_to_string(tests.join(format!("{name}.rs")))
+        .unwrap_or_else(|e| panic!("rust/tests/{name}.rs: {e}"));
+    if let Ok(entries) = std::fs::read_dir(tests.join(name)) {
+        let mut modules: Vec<_> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .collect();
+        modules.sort();
+        for module in modules {
+            text.push('\n');
+            text.push_str(&std::fs::read_to_string(&module).unwrap_or_default());
+        }
+    }
+    text
+}
+
+/// CI-E11 (D-E11e, E11-4): no contract of the judge needs a server. The scan is judged first on a source that is clean
+/// and on one for each way of needing one, and on a contract that only WRITES those words inside a string (as
+/// ci_contract.rs does in its fixtures), which is not a call.
+#[test]
+fn no_contract_of_the_judge_needs_a_server() {
+    assert!(needs_a_server("#[test]\nfn t() {}\n").is_empty());
+    let marked = needs_a_server("// needs-a-server: it makes a database\nfn t() {}\n");
+    assert!(
+        marked.iter().any(|f| f.contains("needs-a-server")),
+        "the marker that ci.yml reads is not found: {marked:?}"
+    );
+    let common = needs_a_server("mod common;\nasync fn t() { common::any_helper(\"x\").await; }\n");
+    assert!(
+        common.iter().any(|f| f.contains("common::")),
+        "a call into common is not found: {common:?}"
+    );
+    let pool = needs_a_server("fn t() { let _ = create_pool(\"x\"); }\n");
+    assert!(
+        pool.iter().any(|f| f.contains("create_pool")),
+        "a call to create_pool is not found: {pool:?}"
+    );
+    let env = needs_a_server("fn t() { let _ = std::env::var(\"DATABASE_URL\"); }\n");
+    assert!(
+        env.iter().any(|f| f.contains("DATABASE_URL")),
+        "a read of DATABASE_URL through env::var is not found: {env:?}"
+    );
+    let words_only = needs_a_server(
+        "fn t() {\n    let fixture = \"mod common;\\ncommon::x();\\nenv::var(\\\"DATABASE_URL\\\")\";\n    \
+         // create_pool and common::y() in a comment\n    let c = '\"'; let raw = r#\"create_pool(common::z)\"#;\n}\n",
+    );
+    assert!(
+        words_only.is_empty(),
+        "words inside a string, a comment, a char or a raw string are taken for a call: {words_only:?}"
+    );
+
+    let contracts =
+        judge_contracts(&read("scripts/run-all-tests.sh")).unwrap_or_else(|why| panic!("{why}"));
+    let problems: Vec<String> = contracts
+        .iter()
+        .flat_map(|name| {
+            needs_a_server(&contract_source(name))
+                .into_iter()
+                .map(move |found| format!("{name} needs a server: {found}"))
+        })
+        .collect();
+    assert!(
+        problems.is_empty(),
+        "a contract of JUDGE_CONTRACTS runs in the row CT, which has no brain_gate: {problems:#?}"
+    );
+}
+
+/// The lines of `body` outside the self-test that run `cargo test` with tests to run (not `--no-run`, not a
+/// comment, not an `echo` that names it) and do not go through `run_counted` before the `cargo`.
+fn uncounted_cargo_tests(body: &str) -> Vec<(usize, String)> {
+    outside_self_test(body)
+        .into_iter()
+        .filter(|(_, line)| {
+            let line = line.trim_start();
+            !line.starts_with('#')
+                && !line.starts_with("echo ")
+                && line.contains("cargo test")
+                && !line.contains("--no-run")
+        })
+        .filter(|(_, line)| {
+            let before_cargo = &line[..line.find("cargo test").unwrap_or(0)];
+            !before_cargo
+                .split_whitespace()
+                .any(|word| word == "run_counted")
+        })
+        .map(|(n, line)| (n, line.trim().to_string()))
+        .collect()
+}
+
+/// CI-E1 (D-E1h): the plain pass was the last `cargo test` of the judge that ran tests and was not counted. The class is
+/// closed here: every `cargo test` of run-all-tests.sh that runs tests goes through `run_counted`, so a section that
+/// loses a test is red whatever section it is.
+#[test]
+fn every_cargo_test_of_run_all_tests_that_runs_tests_is_counted() {
+    // The scan has to be able to fail before a clean answer from it means anything.
+    let fixture = [
+        "echo \"=== cargo test (unit + smoke) ===\"",
+        "DATABASE_URL=\"$GATE_DATABASE_URL\" cargo test --timings",
+        "DATABASE_URL=\"$GATE_DATABASE_URL\" run_counted plain 0 cargo test --timings",
+        "cargo test --release --no-run --lib --timings",
+        "# the debug `cargo test` above",
+        "  run_counted nli 1 cargo test --test nli_cost --timings -- --ignored",
+    ]
+    .join("\n");
+    let found = uncounted_cargo_tests(&fixture);
+    assert_eq!(
+        found,
+        vec![(
+            2,
+            "DATABASE_URL=\"$GATE_DATABASE_URL\" cargo test --timings".to_string()
+        )],
+        "the scan must flag the `cargo test` that is not counted, and only it: not the echo, the counted \
+         calls, the --no-run or the comment"
+    );
+
+    let body = read("scripts/run-all-tests.sh");
+    let found = uncounted_cargo_tests(&body);
+    assert!(
+        found.is_empty(),
+        "run-all-tests.sh runs `cargo test` without `run_counted`, so the tests it runs are not counted \
+         against scripts/test-section-counts.txt and one that stops running is silent: {found:#?}"
+    );
 }
 
 /// The product test of migrations over an existing schema is in
@@ -4796,40 +5659,192 @@ fn the_mutation_seed_lives_outside_the_swept_scratch() {
     );
 }
 
+/// The key that signs the packages of the judge's Postgres (PGDG), which the script and the doc both name.
+const PGDG_SIGNING_KEY: &str = "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8";
+
+/// The value a script assigns on a line of its own, `NAME=value` at column 0.
+fn assigned(script: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    script.lines().find_map(|line| {
+        line.strip_prefix(prefix.as_str())
+            .map(|value| value.trim().to_string())
+    })
+}
+
+/// What is wrong between the constants of the judge's Postgres in gate-cluster.sh and what docs/gate.md says (E2). The values
+/// are read from the script (CI-J15e), so this holds no copy of them; and the major is derived from the version, written once.
+fn postgres_doc_problems(cluster: &str, doc: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for name in [
+        "GATE_PG_VERSION",
+        "GATE_PGVECTOR_VERSION",
+        "GATE_PG_LOCALE",
+        "GATE_PG_TIMEZONE",
+    ] {
+        match assigned(cluster, name) {
+            None => problems.push(format!(
+                "scripts/gate-cluster.sh does not set `{name}=` on a line of its own (E2)"
+            )),
+            Some(value) if value.is_empty() => problems.push(format!(
+                "scripts/gate-cluster.sh sets {name} to nothing (E2)"
+            )),
+            Some(value) => {
+                if !doc.contains(value.as_str()) {
+                    problems.push(format!(
+                        "docs/gate.md does not say {value}, which scripts/gate-cluster.sh sets as {name} (E2)"
+                    ));
+                }
+            }
+        }
+    }
+    for text in [("scripts/gate-cluster.sh", cluster), ("docs/gate.md", doc)] {
+        if !text.1.contains(PGDG_SIGNING_KEY) {
+            problems.push(format!(
+                "{} does not say the signing key {PGDG_SIGNING_KEY} (E2)",
+                text.0
+            ));
+        }
+    }
+    let version_at = cluster
+        .lines()
+        .position(|line| line.starts_with("GATE_PG_VERSION="));
+    let major_at = cluster
+        .lines()
+        .position(|line| line == "GATE_PG_MAJOR=${GATE_PG_VERSION%%.*}");
+    match (version_at, major_at) {
+        (Some(version), Some(major)) if version < major => {}
+        _ => problems.push(
+            "scripts/gate-cluster.sh has to derive its major from its version, after it: GATE_PG_MAJOR=${GATE_PG_VERSION%%.*} (CI-J15e)"
+                .to_string(),
+        ),
+    }
+    problems
+}
+
 /// CI-F2, E2: the judge's Postgres versions, locale and zone are written once, as constants of
 /// gate-cluster.sh, and docs/gate.md and the script name the same values, the fingerprint of the
-/// signing key included. A change to one of them without the other is red here.
+/// signing key included. A change to one of them without the other is red here. CI-J15e: the values are the
+/// script's, read from it, and the major (`GATE_PG_MAJOR`) is the first number of the version, not a second constant.
 #[test]
 fn the_judge_postgres_versions_are_written_once_and_the_doc_agrees() {
     let cluster = read("scripts/gate-cluster.sh").replace("\r\n", "\n");
     let doc = read("docs/gate.md");
-    for constant in [
-        "GATE_PG_VERSION=18.6",
-        "GATE_PGVECTOR_VERSION=0.8.7",
-        "GATE_PG_LOCALE=en_US.utf8",
-        "GATE_PG_TIMEZONE=Etc/UTC",
-    ] {
-        assert!(
-            cluster.lines().any(|line| line == constant),
-            "scripts/gate-cluster.sh does not set `{constant}` (E2)"
-        );
+    let problems = postgres_doc_problems(&cluster, &doc);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// CI-J15e. The check is judged first, on a script and a doc that agree and on the three ways to stop agreeing: the script
+/// moves and the doc does not, the major is a number written by hand, and the version is no longer on a line of its own.
+#[test]
+fn the_check_of_the_judge_postgres_versions_can_fail() {
+    let cluster = format!(
+        "GATE_PG_VERSION=18.6\nGATE_PG_MAJOR=${{GATE_PG_VERSION%%.*}}\nGATE_PGVECTOR_VERSION=0.8.7\nGATE_PG_LOCALE=en_US.utf8\nGATE_PG_TIMEZONE=Etc/UTC\n# signed by {PGDG_SIGNING_KEY}\n"
+    );
+    let doc =
+        format!("PostgreSQL 18.6, pgvector 0.8.7, en_US.utf8, Etc/UTC, key {PGDG_SIGNING_KEY}");
+    let clean = postgres_doc_problems(&cluster, &doc);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let moved = postgres_doc_problems(
+        &cluster.replace("GATE_PG_VERSION=18.6", "GATE_PG_VERSION=18.7"),
+        &doc,
+    );
+    assert!(
+        moved
+            .iter()
+            .any(|p| p.contains("18.7") && p.contains("docs/gate.md")),
+        "a version that moved in the script and not in the doc is named: {moved:#?}"
+    );
+    let by_hand = postgres_doc_problems(
+        &cluster.replace("GATE_PG_MAJOR=${GATE_PG_VERSION%%.*}", "GATE_PG_MAJOR=18"),
+        &doc,
+    );
+    assert!(
+        by_hand.iter().any(|p| p.contains("GATE_PG_MAJOR")),
+        "a major written by hand is named: {by_hand:#?}"
+    );
+    let hidden = postgres_doc_problems(
+        &cluster.replace("GATE_PG_VERSION=18.6", " GATE_PG_VERSION=18.6"),
+        &doc,
+    );
+    assert!(
+        hidden.iter().any(|p| p.contains("GATE_PG_VERSION=")),
+        "a version that is not on a line of its own is named: {hidden:#?}"
+    );
+}
+
+/// CI-J15e (H9): the image of production is the judge's Postgres: `pgvector/pgvector:pg<major>` with the major of
+/// GATE_PG_VERSION, in rust/src/setup.rs (`PG_IMAGE`) and in docker-compose.yml. A major that moves in one place and not
+/// in the others has the judge testing a server that nobody runs.
+fn production_image_problems(cluster: &str, setup: &str, compose: &str) -> Vec<String> {
+    let Some(version) = assigned(cluster, "GATE_PG_VERSION") else {
+        return vec!["scripts/gate-cluster.sh sets no GATE_PG_VERSION".to_string()];
+    };
+    let major = version.split('.').next().unwrap_or_default();
+    let want = format!("pgvector/pgvector:pg{major}");
+    let mut problems = Vec::new();
+    let in_setup = setup
+        .lines()
+        .find(|line| line.contains("const PG_IMAGE"))
+        .unwrap_or_default();
+    if !in_setup.contains(&format!("\"{want}\"")) {
+        problems.push(format!(
+            "rust/src/setup.rs: PG_IMAGE is `{in_setup}` and the judge's Postgres {version} says {want}"
+        ));
     }
-    for value in [
-        "18.6",
-        "0.8.7",
-        "en_US.utf8",
-        "Etc/UTC",
-        "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8",
-    ] {
-        assert!(
-            cluster.contains(value),
-            "scripts/gate-cluster.sh does not say {value} (E2)"
-        );
-        assert!(
-            doc.contains(value),
-            "docs/gate.md does not say {value}, which scripts/gate-cluster.sh uses (E2)"
-        );
+    let in_compose = compose
+        .lines()
+        .find(|line| line.trim_start().starts_with("image:") && line.contains("pgvector"))
+        .unwrap_or_default();
+    if in_compose.trim() != format!("image: {want}") {
+        problems.push(format!(
+            "docker-compose.yml: the image is `{}` and the judge's Postgres {version} says {want}",
+            in_compose.trim()
+        ));
     }
+    problems
+}
+
+#[test]
+fn the_production_image_is_the_major_of_the_judge_postgres() {
+    let problems = production_image_problems(
+        &read("scripts/gate-cluster.sh").replace("\r\n", "\n"),
+        &read("rust/src/setup.rs"),
+        &read("docker-compose.yml"),
+    );
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn the_check_of_the_production_image_can_fail() {
+    let cluster = "GATE_PG_VERSION=18.6\n";
+    let setup = "const PG_IMAGE: &str = \"pgvector/pgvector:pg18\";\n";
+    let compose = "services:\n  db:\n    image: pgvector/pgvector:pg18\n";
+    let clean = production_image_problems(cluster, setup, compose);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let old_setup = production_image_problems(
+        cluster,
+        "const PG_IMAGE: &str = \"pgvector/pgvector:pg17\";\n",
+        compose,
+    );
+    assert!(
+        old_setup.len() == 1 && old_setup[0].contains("setup.rs"),
+        "a PG_IMAGE of another major is named: {old_setup:#?}"
+    );
+    let old_compose = production_image_problems(
+        cluster,
+        setup,
+        "services:\n  db:\n    image: pgvector/pgvector:pg17\n",
+    );
+    assert!(
+        old_compose.len() == 1 && old_compose[0].contains("docker-compose.yml"),
+        "an image of another major in the compose is named: {old_compose:#?}"
+    );
+    let moved = production_image_problems("GATE_PG_VERSION=19.1\n", setup, compose);
+    assert_eq!(
+        moved.len(),
+        2,
+        "a judge that moves to 19 leaves both files behind: {moved:#?}"
+    );
 }
 
 /// CI-F2, C4: no gate script builds a TCP URL for a lane. The one construction of a lane's URL is
@@ -5342,46 +6357,104 @@ fn dag_rows() -> Vec<(u32, String, Vec<String>, String)> {
         .collect()
 }
 
+/// CI-J15e (H10): the rows that compile are the ones the table says: those that name a target and are not readers (a
+/// reader builds nothing in it). The list is derived, so a row that is added and compiles is judged without anybody
+/// adding its id here. As (id, target).
+fn compiling_rows(table: &str) -> Vec<(String, String)> {
+    table
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .filter_map(|line| {
+            let resources = resources_of(line);
+            if resources.iter().any(|r| r.as_str() == "reader") {
+                return None;
+            }
+            let target = resources.iter().find_map(|r| r.strip_prefix("target:"))?;
+            let id = line.split_whitespace().nth(1)?;
+            Some((id.to_string(), target.to_string()))
+        })
+        .collect()
+}
+
+/// The targets that more than one compiling row holds, each with its rows: two compiling rows in one target would wait on
+/// its lock and build over each other.
+fn shared_targets(rows: &[(String, String)]) -> Vec<String> {
+    let mut by_target: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for (id, target) in rows {
+        by_target
+            .entry(target.as_str())
+            .or_default()
+            .push(id.as_str());
+    }
+    by_target
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(target, ids)| format!("{target}: {}", ids.join(", ")))
+        .collect()
+}
+
 /// CI-F3.3c (D-F3g): every row that compiles builds in a target of its own, and the rows that read the release binary
-/// read the one B3 builds. Two compiling rows in one target would wait on its lock and build over each other.
+/// read the one a row that compiles built. Two compiling rows in one target would wait on its lock and build over each
+/// other. CI-J15e: the rows that compile are read from the table, not listed here. CI-E11 (D-E11b): the row that compiles
+/// T_dbg is B1; DBG is a reader of it, like CT, D2, D3 and NLI.
 #[test]
 fn each_row_that_compiles_has_a_target_of_its_own_and_the_release_readers_share_b3s() {
-    let rows = dag_rows();
-    let target_of = |id: &str| -> String {
-        let (_, _, _, line) = rows
-            .iter()
-            .find(|(_, row, _, _)| row.as_str() == id)
-            .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"));
-        line.split_whitespace()
-            .nth(3)
-            .and_then(|recursos| recursos.split(',').find_map(|r| r.strip_prefix("target:")))
-            .unwrap_or_else(|| panic!("row {id} names no target: {line}"))
-            .to_string()
-    };
-    for (id, target) in [
-        ("DBG", "T_dbg"),
-        ("DC", "T_docs"),
-        ("CV", "T_cov"),
-        ("M", "T_mut"),
-        ("B3", "T_rel"),
-        ("REL", "T_rel"),
-        ("E2E", "T_rel"),
-    ] {
-        assert_eq!(
-            target_of(id),
-            target,
-            "row {id} must build in its own target"
+    let table = read("scripts/gate-dag.txt");
+    let compiling = compiling_rows(&table);
+    let ids: Vec<&str> = compiling.iter().map(|(id, _)| id.as_str()).collect();
+    for anchor in ["B1", "B3", "DC", "CV", "M"] {
+        assert!(
+            ids.contains(&anchor),
+            "row {anchor} builds and the table does not say so: the rows that compile are {ids:?}"
         );
     }
-    let compiling: Vec<String> = ["DBG", "DC", "CV", "M", "B3"]
-        .iter()
-        .map(|id| target_of(id))
-        .collect();
-    let unique: std::collections::BTreeSet<&String> = compiling.iter().collect();
-    assert_eq!(
-        unique.len(),
-        compiling.len(),
-        "two compiling rows share a target: {compiling:?}"
+    let shared = shared_targets(&compiling);
+    assert!(
+        shared.is_empty(),
+        "two compiling rows share a target: {shared:?}"
+    );
+    for line in table
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+    {
+        let resources = resources_of(line);
+        if !resources.iter().any(|r| r.as_str() == "reader") {
+            continue;
+        }
+        let id = line.split_whitespace().nth(1).unwrap_or_default();
+        let target = resources
+            .iter()
+            .find_map(|r| r.strip_prefix("target:"))
+            .unwrap_or_default();
+        assert!(
+            compiling.iter().any(|(_, built)| built.as_str() == target),
+            "reader {id} reads {target}, which no row that compiles builds: {line}"
+        );
+    }
+}
+
+/// CI-J15e. The derivation is judged first, on a table with the ways to be wrong: a reader is not a compiling row, and a
+/// row added that builds in a target another row builds in is named with both.
+#[test]
+fn the_check_of_the_compiling_rows_can_fail() {
+    let table = "20 DBG P target:T_dbg normal 8 8 1 bash scripts/merge-gate.sh --step DBG\n\
+                 30 B3 P target:T_rel,cluster:C_b3 normal 8 8 1 bash scripts/merge-gate.sh --step B3\n\
+                 40 REL B3 target:T_rel,reader normal 8 8 1 bash scripts/merge-gate.sh --step REL\n";
+    let clean = compiling_rows(table);
+    assert_eq!(clean.len(), 2, "a reader (REL) does not compile: {clean:?}");
+    assert!(
+        shared_targets(&clean).is_empty(),
+        "a reader of T_rel is not a second builder of it: {clean:?}"
+    );
+    let sabotaged = format!(
+        "{table}50 NEW P target:T_rel normal 8 8 1 bash scripts/merge-gate.sh --step NEW\n"
+    );
+    let shared = shared_targets(&compiling_rows(&sabotaged));
+    assert_eq!(shared.len(), 1, "{shared:?}");
+    assert!(
+        shared[0].contains("T_rel") && shared[0].contains("B3") && shared[0].contains("NEW"),
+        "the shared target is named with both rows: {shared:?}"
     );
 }
 
@@ -5649,23 +6722,33 @@ fn merge_gate_answers_the_step_mode_before_its_gate_runs() {
 }
 
 // CI-F3.3b-2 (spec F3.3b-1b, «la tabla»): the rows of the judge, with their order, their dependencies and
-// their starting durations. The order of a row is its step; the dependencies are the spec's (DBG, B3, DC, CV and M
-// wait for P; REL waits for B3; E2E waits for B3 and DBG). B1 does not enter the table.
+// their starting durations. The order of a row is its step; the dependencies are the spec's (B1, B3, DC, CV and M
+// wait for P; REL and E2E wait for B3).
+// CI-E11 (D-E11b): B1 compiles T_dbg (fmt, clippy, `cargo test --no-run`, the binary) and DBG, CT, D2, D3 and NLI are its
+// readers, each waiting for B1 and for nothing else; they run the tests of the target B1 built.
+// CI-E9 (D-E9a): E2E waited for B3 and DBG until F3, when its lane provisioned brain_gate with the debug binary of DBG;
+// since D-F34h it provisions with the release binary B3 left, so it waits for B3 only.
 // CI-F3.3c (D-F3l): NLI leaves DBG for its own row, exclusive, after DBG (it needs the target DBG built). Its clock
 // assertion (nli_entailment, < 500 ms) measured 1199 ms under contention. The dur of NLI is not measured yet.
 #[test]
-fn the_step_table_has_the_nine_rows_of_the_judge_with_their_deps_and_durations() {
+fn the_step_table_has_the_thirteen_rows_of_the_judge_with_their_deps_and_durations() {
     // The class of CV and M is `untimed` (CI-F3.3b-2): their output is past the judge's boundary line.
+    // CI-J15e (H10): the starting dur_s is not frozen here. It is the planner's first guess for a row with no history, and
+    // the numbers move with every measured run; the planner refuses a row whose dur_s is not above 0, and so does this.
     let expected = [
-        (10, "P", "-", "20", "normal"),
-        (20, "DBG", "P", "421", "normal"),
-        (25, "NLI", "DBG", "60", "exclusive"),
-        (30, "B3", "P", "150", "normal"),
-        (40, "REL", "B3", "221", "normal"),
-        (50, "E2E", "B3,DBG", "113", "normal"),
-        (60, "DC", "P", "325", "normal"),
-        (70, "CV", "P", "45", "untimed"),
-        (80, "M", "P", "136", "untimed"),
+        (10, "P", "-", "normal"),
+        (15, "B1", "P", "normal"),
+        (20, "DBG", "B1", "normal"),
+        (21, "CT", "B1", "normal"),
+        (22, "D2", "B1", "normal"),
+        (23, "D3", "B1", "normal"),
+        (25, "NLI", "B1", "exclusive"),
+        (30, "B3", "P", "normal"),
+        (40, "REL", "B3", "normal"),
+        (50, "E2E", "B3", "normal"),
+        (60, "DC", "P", "normal"),
+        (70, "CV", "P", "untimed"),
+        (80, "M", "P", "untimed"),
     ];
     let table = read("scripts/gate-dag.txt");
     let rows: Vec<Vec<&str>> = table
@@ -5680,7 +6763,7 @@ fn the_step_table_has_the_nine_rows_of_the_judge_with_their_deps_and_durations()
         rows.len(),
         expected.len()
     );
-    for (row, (idx, id, deps, dur, class)) in rows.iter().zip(expected) {
+    for (row, (idx, id, deps, class)) in rows.iter().zip(expected) {
         assert_eq!(row[0], idx.to_string(), "row {id}: its idx");
         assert_eq!(row[1], id, "row {idx}: its id");
         assert_eq!(row[2], deps, "row {id}: its deps");
@@ -5688,7 +6771,13 @@ fn the_step_table_has_the_nine_rows_of_the_judge_with_their_deps_and_durations()
             row[4], class,
             "row {id}: its class (untimed rows are past the judge's boundary)"
         );
-        assert_eq!(row[7], dur, "row {id}: its starting dur_s");
+        let dur: f64 = row[7].parse().unwrap_or_else(|_| {
+            panic!("row {id}: its starting dur_s `{}` is not a number", row[7])
+        });
+        assert!(
+            dur > 0.0,
+            "row {id}: its starting dur_s is {dur}, and it has to be above 0"
+        );
         // CI-F3.3c (D-F3j): leading NAME=value tokens are the step's environment, and the order is what follows them.
         let order: Vec<&str> = row[8..]
             .iter()
@@ -5731,17 +6820,68 @@ fn row_value(env: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+/// The hardware threads of the machine the table is written for (CI-F3.3c, D-F3m): the plan of production gives each ORT
+/// pool half of them, up to the ceiling of that pool.
+const TABLE_MACHINE_THREADS: usize = 24;
+
+/// CI-J15b (H4): the ceilings of the ORT pools, read where the plan of production holds them: the
+/// `const MAX_<POOL>_INTRA_THREADS: usize = N;` of rust/src/resources.rs, as (the variable of the pool, N).
+fn plan_pool_ceilings(resources: &str) -> Vec<(String, usize)> {
+    ["EMBED", "NLI", "RERANK"]
+        .iter()
+        .map(|pool| {
+            let prefix = format!("const MAX_{pool}_INTRA_THREADS: usize = ");
+            let value = resources
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("resources.rs has no `{prefix}N;`"))
+                .trim_end_matches(';')
+                .trim()
+                .parse::<usize>()
+                .unwrap_or_else(|_| {
+                    panic!("the ceiling of the {pool} pool in resources.rs is not a whole number")
+                });
+            (format!("CUBA_{pool}_INTRA_THREADS"), value)
+        })
+        .collect()
+}
+
+/// What is wrong between the ORT pools the rows of `table` name and the plan of production (`resources`): a row with models
+/// names each pool with min(half the table's machine, the ceiling), and E2E names none, because there the plan decides.
+fn pool_problems(table: &str, resources: &str) -> Vec<String> {
+    let ceilings = plan_pool_ceilings(resources);
+    let mut problems = Vec::new();
+    for line in table
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+    {
+        let id = line.split_whitespace().nth(1).unwrap_or_default();
+        let models = resources_of(line).iter().any(|r| r.as_str() == "models");
+        let env = row_env(line);
+        for (name, ceiling) in &ceilings {
+            let want = if models && id != "E2E" {
+                Some((TABLE_MACHINE_THREADS / 2).min(*ceiling).to_string())
+            } else {
+                None
+            };
+            let got = row_value(&env, name);
+            if got != want {
+                problems.push(format!(
+                    "row {id}: {name} is {got:?} and the plan of production gives {want:?} (half of {TABLE_MACHINE_THREADS} threads, at most the {ceiling} of resources.rs)"
+                ));
+            }
+        }
+    }
+    problems
+}
+
 /// CI-F3.3c (D-F3j, D-F3m, V6): a row that builds names its cargo jobs, and a row with models names the three ORT pools
-/// with the values the serial judge uses on this 24-thread machine (available_parallelism()/2 capped at 4, 4 and 8).
-/// E2E names none. A row's cpu is the most it asks for (its jobs or its widest pool), so the planner never admits a row
-/// that asks for more than the table says.
+/// with the values of the plan of production on this 24-thread machine (CI-J15b: read from rust/src/resources.rs, in
+/// `the_ort_pools_of_the_rows_are_the_plan_of_production`). E2E names none. A row's cpu is the most it asks for (its jobs or
+/// its widest pool), so the planner never admits a row that asks for more than the table says.
 #[test]
 fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
-    const POOLS: [(&str, &str); 3] = [
-        ("CUBA_EMBED_INTRA_THREADS", "4"),
-        ("CUBA_NLI_INTRA_THREADS", "4"),
-        ("CUBA_RERANK_INTRA_THREADS", "8"),
-    ];
+    let pools = plan_pool_ceilings(&read("rust/src/resources.rs"));
     for line in read("scripts/gate-dag.txt").lines() {
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
@@ -5758,7 +6898,6 @@ fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
         });
         let recursos: Vec<&str> = tok[3].split(',').collect();
         let builds = recursos.iter().any(|r| r.starts_with("target:"));
-        let models = recursos.contains(&"models");
         if builds {
             let n = jobs.unwrap_or_else(|| {
                 panic!("row {id} builds in a target and names no CARGO_BUILD_JOBS: {line}")
@@ -5769,18 +6908,8 @@ fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
             );
         }
         let mut widest = jobs.unwrap_or(0);
-        for (name, value) in POOLS {
-            let want = if models && id != "E2E" {
-                Some(value)
-            } else {
-                None
-            };
-            assert_eq!(
-                row_value(&env, name).as_deref(),
-                want,
-                "row {id}: {name} (models rows set the three pools, E2E sets none): {line}"
-            );
-            if let Some(v) = want {
+        for (name, _) in &pools {
+            if let Some(v) = row_value(&env, name) {
                 widest = widest.max(v.parse().expect("a pool is a whole number"));
             }
         }
@@ -5791,9 +6920,10 @@ fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
     }
 }
 
-/// CI-F3.3c (D-F3l, V9, V10) and CI-J12: the NLI clock assertion runs in a row of its own, exclusive, after DBG (it needs
-/// DBG's target built), and DBG no longer names it. Its tests open no database, but run-all-tests refuses to run without
-/// the judge's server (gate_require_judge_server), so the row runs in a cluster of its own, as the other rows that call it.
+/// CI-F3.3c (D-F3l, V9, V10) and CI-J12: the NLI clock assertion runs in a row of its own, exclusive, after B1 (it needs
+/// the target B1 built; CI-E11, D-E11b: it used to wait for DBG), and DBG no longer names it. Its tests open no database, but
+/// run-all-tests refuses to run without the judge's server (gate_require_judge_server), so the row runs in a cluster of its
+/// own, as the other rows that call it.
 #[test]
 fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_its_own_cluster() {
     let table = read("scripts/gate-dag.txt");
@@ -5807,8 +6937,8 @@ fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_its_own_cluster()
     let nli = row_of("NLI");
     let tok: Vec<&str> = nli.split_whitespace().collect();
     assert_eq!(
-        tok[2], "DBG",
-        "NLI waits for DBG, which builds its binaries: {nli}"
+        tok[2], "B1",
+        "NLI waits for B1, which builds its binaries (CI-E11): {nli}"
     );
     assert_eq!(
         tok[4], "exclusive",
@@ -5832,13 +6962,155 @@ fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_its_own_cluster()
     let dbg_body = step_body(&gate, "DBG").expect("merge-gate.sh has a step_DBG()");
     assert_eq!(
         lanes_in(&dbg_body),
-        ["CL", "D1", "D2", "D3"].map(String::from).to_vec(),
-        "step_DBG no longer runs the NLI lane: it has its own row"
+        ["D1"].map(String::from).to_vec(),
+        "step_DBG runs the plain pass only (CI-E11): the lint and the build are B1's, the contracts are CT's, the --ignored \
+         sections D2's, the LLM one D3's and NLI has its own row"
     );
+    // CI-J15e (H9): there is no `NLI) step_NLI ;;` arm any more: the dispatch is declare -F "step_$id", and the contract
+    // of the dispatch (`the_dispatch_of_a_step_is_derived_from_its_function_...`) holds that every row has its function.
+}
+
+/// CI-E11 (D-E11a, D-E11b, E11-1): the row that compiles T_dbg is B1 and not DBG: its step runs the lanes CL (fmt and
+/// clippy) and B1 (`cargo test --no-run` and the binary of the database). DBG, CT, D2, D3 and NLI are readers of that target,
+/// each waiting for B1 and for nothing else, each with a cluster of its own named after its lane, and each step runs its
+/// lane alone.
+#[test]
+fn b1_compiles_t_dbg_and_five_readers_wait_for_it_alone_each_in_a_cluster_of_its_own() {
+    let rows = dag_rows();
+    let gate = read("scripts/merge-gate.sh");
+    let compiling = compiling_rows(&read("scripts/gate-dag.txt"));
+    let of_t_dbg: Vec<&str> = compiling
+        .iter()
+        .filter(|(_, target)| target == "T_dbg")
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert_eq!(
+        of_t_dbg,
+        ["B1"],
+        "the row that compiles T_dbg is B1, not DBG: {compiling:?}"
+    );
+    let row = |id: &str| {
+        rows.iter()
+            .find(|row| row.1 == id)
+            .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"))
+    };
+    let b1 = row("B1");
+    let b1_resources = resources_of(&b1.3);
     assert!(
-        gate.lines().any(|line| line.trim() == "NLI) step_NLI ;;"),
-        "the --step dispatch names the NLI row"
+        b1.2 == ["P"]
+            && b1_resources.contains(&"target:T_dbg".to_string())
+            && b1_resources.contains(&"cluster:C_b1".to_string())
+            && !b1_resources.contains(&"reader".to_string()),
+        "B1 waits for P, builds T_dbg and is no reader, in the cluster C_b1: {}",
+        b1.3
     );
+    for (id, lane, class) in [
+        ("DBG", "dbg", "normal"),
+        ("CT", "ct", "normal"),
+        ("D2", "d2", "normal"),
+        ("D3", "d3", "normal"),
+        ("NLI", "nli", "exclusive"),
+    ] {
+        let (_, _, deps, line) = row(id);
+        let resources = resources_of(line);
+        assert_eq!(
+            deps,
+            &["B1".to_string()],
+            "{id} is a reader of T_dbg and waits for its producer B1 alone: {line}"
+        );
+        assert!(
+            resources.contains(&"target:T_dbg".to_string())
+                && resources.contains(&"reader".to_string())
+                && resources.contains(&format!("cluster:C_{lane}")),
+            "{id} reads T_dbg (reader) in the cluster C_{lane}: {line}"
+        );
+        assert_eq!(row_class(line), class, "the class of {id}: {line}");
+    }
+    for (id, lanes) in [
+        ("B1", vec!["CL", "B1"]),
+        ("DBG", vec!["D1"]),
+        ("CT", vec!["CT"]),
+        ("D2", vec!["D2"]),
+        ("D3", vec!["D3"]),
+        ("NLI", vec!["NLI"]),
+    ] {
+        let body =
+            step_body(&gate, id).unwrap_or_else(|| panic!("merge-gate.sh has no step_{id}()"));
+        assert_eq!(
+            lanes_in(&body),
+            lanes,
+            "step_{id} runs its lanes of run-all-tests.sh and nothing else"
+        );
+    }
+}
+
+/// CI-E11 (D-E11b, E11-12): a reader of T_dbg compiles nothing, so its row names ONE cargo job (a reader that claims more
+/// takes cores from a row that does compile) and the profile of the row that builds its target, token for token (the
+/// profile is in the hash of every unit: another one is a recompilation). A reader with models names the three ORT pools with
+/// the values of the other rows with models.
+#[test]
+fn the_readers_of_t_dbg_name_one_cargo_job_and_the_profile_and_the_pools_of_the_others() {
+    let rows = dag_rows();
+    let line_of = |id: &str| {
+        rows.iter()
+            .find(|row| row.1 == id)
+            .map(|row| row.3.clone())
+            .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"))
+    };
+    let producer = row_env(&line_of("B1"));
+    let profile = [
+        "CARGO_INCREMENTAL",
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_PROFILE_DEV_STRIP",
+    ];
+    let readers: Vec<&(u32, String, Vec<String>, String)> = rows
+        .iter()
+        .filter(|row| {
+            let resources = resources_of(&row.3);
+            resources.iter().any(|r| r == "reader") && resources.iter().any(|r| r == "target:T_dbg")
+        })
+        .collect();
+    assert!(
+        readers.len() >= 5,
+        "the readers of T_dbg are DBG, CT, D2, D3 and NLI: {:?}",
+        readers.iter().map(|row| row.1.as_str()).collect::<Vec<_>>()
+    );
+    let pools = [
+        "CUBA_EMBED_INTRA_THREADS",
+        "CUBA_NLI_INTRA_THREADS",
+        "CUBA_RERANK_INTRA_THREADS",
+    ];
+    let reference = row_env(&line_of("REL"));
+    for (_, id, _, line) in &readers {
+        let env = row_env(line);
+        let jobs = row_value(&env, "CARGO_BUILD_JOBS");
+        assert_eq!(
+            jobs.as_deref(),
+            Some("1"),
+            "reader {id} names CARGO_BUILD_JOBS={}, a reader compiles nothing and claims 1: {line}",
+            jobs.clone().unwrap_or_default()
+        );
+        for name in profile {
+            assert_eq!(
+                row_value(&env, name),
+                row_value(&producer, name),
+                "reader {id} does not name {name} as B1 does: {line}"
+            );
+        }
+        let models = resources_of(line).iter().any(|r| r == "models");
+        for name in pools {
+            let want = if models {
+                row_value(&reference, name)
+            } else {
+                None
+            };
+            assert_eq!(
+                row_value(&env, name),
+                want,
+                "reader {id} (models: {models}) names {name} other than the rows with models do: {line}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -6090,24 +7362,24 @@ fn fixture_mentions(lines: &[&str]) -> Vec<RowMention> {
                 found.push(row_mention(line, id));
             }
         }
-        if let Some(arm) = text.split(')').next().filter(|_| text.contains(')')) {
-            if is_step_id(arm) {
-                found.push(row_mention(line, arm));
-            }
+        if let Some(arm) = text.split(')').next().filter(|_| text.contains(')'))
+            && is_step_id(arm)
+        {
+            found.push(row_mention(line, arm));
         }
         if let Some(from) = statement.find("au_tree \"") {
             for spec in statement[from..].split('"').skip(1).step_by(2) {
                 let cols: Vec<&str> = spec.split_whitespace().collect();
-                if let [idx, id, deps, resources, class] = cols.as_slice() {
-                    if idx.parse::<u32>().is_ok() {
-                        found.push(RowMention {
-                            idx: Some(idx.to_string()),
-                            deps: Some(deps.to_string()),
-                            resources: Some(resources.to_string()),
-                            class: Some(class.to_string()),
-                            ..row_mention(line, id)
-                        });
-                    }
+                if let [idx, id, deps, resources, class] = cols.as_slice()
+                    && idx.parse::<u32>().is_ok()
+                {
+                    found.push(RowMention {
+                        idx: Some(idx.to_string()),
+                        deps: Some(deps.to_string()),
+                        resources: Some(resources.to_string()),
+                        class: Some(class.to_string()),
+                        ..row_mention(line, id)
+                    });
                 }
             }
         }
@@ -6115,13 +7387,15 @@ fn fixture_mentions(lines: &[&str]) -> Vec<RowMention> {
             if let Some(id) = token.strip_prefix("exit-").filter(|id| is_step_id(id)) {
                 found.push(row_mention(line, id));
             }
-            if let Some((idx, id)) = token.split_once('-') {
-                if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) && is_step_id(id) {
-                    found.push(RowMention {
-                        idx: Some(idx.to_string()),
-                        ..row_mention(line, id)
-                    });
-                }
+            if let Some((idx, id)) = token.split_once('-')
+                && !idx.is_empty()
+                && idx.chars().all(|c| c.is_ascii_digit())
+                && is_step_id(id)
+            {
+                found.push(RowMention {
+                    idx: Some(idx.to_string()),
+                    ..row_mention(line, id)
+                });
             }
         }
     }
@@ -6230,10 +7504,10 @@ fn the_fixtures_of_the_audit_name_rows_that_exist() {
             && mentions.iter().any(|m| m.deps.is_some())
             && mentions
                 .iter()
-                .any(|m| m.resources.is_some() && m.deps.is_none())
-            && mentions.iter().any(|m| m.idx.is_some() && m.deps.is_none()),
-        "the scan of the self-test of gate-audit.sh found {named:?}: it no longer reads the heredocs, the \
-         au_tree specs and the directories, so it would be green over nothing"
+                .any(|m| m.resources.is_some() && m.deps.is_none()),
+        "the scan of the self-test of gate-audit.sh found {named:?}: it no longer reads the heredocs and the \
+         au_tree specs, so it would be green over nothing (the audit does not write <idx>-<id> directories any more, \
+         since CI-J15a: it runs merge-gate.sh once and the planner starts the rows)"
     );
     let problems = fixture_problems(&lines, &table);
     assert!(
@@ -6526,4 +7800,2356 @@ fn main() { let mod_x = 1; let test = 2; }
         test_code_problems("src/main.rs", source),
         Vec::<String>::new()
     );
+}
+
+// --- CI-F3.4: the latency list, the resources of the rows and the release binary of the E2E ------------------------
+// D-F34g..F34p. scripts/gate-latency.txt names, one line per file under rust/, every file whose tests assert on a
+// wall clock, with the class the file needs in the judge: `exclusive` runs alone (the NLI row), `shared` can run
+// beside other steps. The detector below is the one the list is kept against, and this file is read by it too.
+
+/// The macro the detector looks for, in two pieces: a literal of it followed by an open parenthesis anywhere in this
+/// file would be a wall-clock assert of its own, and the file would need a line in the list.
+const ASSERT_MACRO: [&str; 2] = ["assert", "!"];
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `word` is in `text` as a whole word.
+fn contains_word(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + word.len()..].chars().next();
+        !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
+    })
+}
+
+/// The names a line of `text` binds with `let <name> = … .elapsed() …`, up to the first `;` of the line: the form
+/// `let per_call = t0.elapsed() / 5;` that a search of the assert alone does not see.
+fn elapsed_bindings(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in text.lines() {
+        for (at, _) in line.match_indices("let") {
+            let rest = &line[at + 3..];
+            let after_let = rest.trim_start();
+            if after_let.len() == rest.len() {
+                continue;
+            }
+            let after_mut = after_let
+                .strip_prefix("mut")
+                .filter(|more| more.starts_with(char::is_whitespace))
+                .map_or(after_let, str::trim_start);
+            let name: String = after_mut.chars().take_while(|c| is_word_char(*c)).collect();
+            if name.is_empty() {
+                continue;
+            }
+            let after_name = after_mut[name.len()..].trim_start();
+            let value = if let Some(typed) = after_name.strip_prefix(':') {
+                match typed.find('=') {
+                    Some(equals) if equals > 0 => &typed[equals + 1..],
+                    _ => continue,
+                }
+            } else if let Some(value) = after_name.strip_prefix('=') {
+                value
+            } else {
+                continue;
+            };
+            if value.split(';').next().unwrap_or("").contains(".elapsed()") {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// D-F34l: the 1-based lines of `text` where a wall-clock assert starts. A `debug_` or plain assert macro whose
+/// argument, with its parentheses balanced, has `<` or `>` and either `.elapsed()` itself or a name bound on one line
+/// to an `.elapsed()` in the same file. A timeout around a future and an `.elapsed()` that is only printed are not.
+fn clock_asserts(text: &str) -> Vec<usize> {
+    if !text.contains(".elapsed()") {
+        return Vec::new();
+    }
+    let bound = elapsed_bindings(text);
+    let needle = ASSERT_MACRO.concat();
+    let mut lines = Vec::new();
+    for (at, _) in text.match_indices(&needle) {
+        let start = if text[..at].ends_with("debug_") {
+            at - "debug_".len()
+        } else {
+            at
+        };
+        if text[..start].chars().next_back().is_some_and(is_word_char) {
+            continue;
+        }
+        let after = &text[at + needle.len()..];
+        let args = after.trim_start();
+        if !args.starts_with('(') {
+            continue;
+        }
+        let body_start = at + needle.len() + (after.len() - args.len()) + 1;
+        let rest = &text[body_start..];
+        let mut depth = 1;
+        let length = rest
+            .bytes()
+            .position(|byte| {
+                match byte {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map_or(rest.len(), |at| at + 1);
+        let body = &rest[..length];
+        let compares = body.contains('<') || body.contains('>');
+        let on_a_clock =
+            body.contains(".elapsed()") || bound.iter().any(|name| contains_word(body, name));
+        if compares && on_a_clock {
+            lines.push(text[..start].matches('\n').count() + 1);
+        }
+    }
+    lines
+}
+
+/// The Rust files of `dir`, and of the folders under it when `deep`.
+fn rust_files(dir: &Path, deep: bool) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if deep {
+                files.extend(rust_files(&path, true));
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// Every file with a wall-clock assert, as `tests/<file>.rs` or `src/<path>.rs` (relative to rust/), with its lines.
+fn files_with_clock_asserts() -> std::collections::BTreeMap<String, Vec<usize>> {
+    let rust = repo_root().join("rust");
+    let mut found = std::collections::BTreeMap::new();
+    for (folder, deep) in [("tests", true), ("src", true)] {
+        for path in rust_files(&rust.join(folder), deep) {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let lines = clock_asserts(&text);
+            if !lines.is_empty() {
+                let name = path
+                    .strip_prefix(&rust)
+                    .expect("under rust/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                found.insert(name, lines);
+            }
+        }
+    }
+    found
+}
+
+/// One line of scripts/gate-latency.txt (D-F34k): file, class, evidence, owner, date, and the reason.
+struct LatencyLine {
+    number: usize,
+    file: String,
+    class: String,
+    evidence: String,
+    owner: String,
+    date: String,
+    reason: String,
+}
+
+fn latency_lines() -> Vec<LatencyLine> {
+    read("scripts/gate-latency.txt")
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(|(index, line)| {
+            let mut fields = line.split_whitespace();
+            let mut next = |what: &str| {
+                fields
+                    .next()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "scripts/gate-latency.txt:{}: no {what}; a line is `file class evidence owner date reason`: {line}",
+                            index + 1
+                        )
+                    })
+                    .to_string()
+            };
+            let file = next("file");
+            let class = next("class");
+            let evidence = next("evidence");
+            let owner = next("owner");
+            let date = next("date");
+            let reason = fields.collect::<Vec<_>>().join(" ");
+            LatencyLine {
+                number: index + 1,
+                file,
+                class,
+                evidence,
+                owner,
+                date,
+                reason,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn the_latency_list_names_every_file_with_a_wall_clock_assert_and_only_those() {
+    let found = files_with_clock_asserts();
+    assert!(
+        !found.is_empty(),
+        "the detector found no file with a wall-clock assert under rust/tests and rust/src: it sees nothing, so a list kept against it proves nothing"
+    );
+    let listed = latency_lines();
+    for file in found.keys() {
+        assert!(
+            listed.iter().any(|line| line.file == *file),
+            "{file} has a wall-clock assert and no line in scripts/gate-latency.txt"
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for line in &listed {
+        assert!(
+            repo_root().join("rust").join(&line.file).is_file(),
+            "scripts/gate-latency.txt:{}: {} is not a file under rust/",
+            line.number,
+            line.file
+        );
+        assert!(
+            found.contains_key(&line.file),
+            "{} has no wall-clock assert, and scripts/gate-latency.txt:{} lists it",
+            line.file,
+            line.number
+        );
+        assert!(
+            seen.insert(line.file.clone()),
+            "scripts/gate-latency.txt:{}: {} is listed twice",
+            line.number,
+            line.file
+        );
+    }
+}
+
+/// D-F34l, the four forms. The macro is written ASSERT in the fixtures and put back before they are read, so this file
+/// does not hold the text the detector looks for.
+#[test]
+fn the_clock_detector_sees_the_form_with_a_variable_and_not_what_is_only_printed() {
+    let forms = [
+        (
+            "an elapsed inside the assert",
+            "ASSERT!(started.elapsed() < Duration::from_secs(3), \"slow\");",
+            true,
+        ),
+        (
+            "binding form",
+            "let took = t.elapsed();\nwork();\nASSERT!(\n    took < LIMIT,\n    \"slow\"\n);",
+            true,
+        ),
+        (
+            "a measure that is only printed",
+            "let dt = t0.elapsed();\neprintln!(\"{dt:?}\");",
+            false,
+        ),
+        (
+            "an assert on a number",
+            "assert_eq!(report.warmup_ms, 0.0);",
+            false,
+        ),
+    ];
+    for (name, text, want) in forms {
+        let detected = !clock_asserts(&text.replace("ASSERT", "assert")).is_empty();
+        assert_eq!(
+            detected,
+            want,
+            "{name} {}: the detector of D-F34l has to {} it",
+            if detected { "detected" } else { "not detected" },
+            if want { "see" } else { "leave" }
+        );
+    }
+}
+
+/// The kind of evidence a line carries (D-F34k): a ratio with two decimals, `dag-verde:<n>` with n >= 1, or pending.
+fn evidence_kind(evidence: &str) -> Option<&'static str> {
+    let digits = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_digit());
+    if evidence == "pendiente" {
+        return Some("pending");
+    }
+    if let Some(runs) = evidence.strip_prefix("dag-verde:") {
+        return (digits(runs) && runs.parse::<u32>().is_ok_and(|n| n >= 1)).then_some("dag");
+    }
+    let (whole, decimals) = evidence.split_once('.')?;
+    (digits(whole) && decimals.len() == 2 && digits(decimals)).then_some("ratio")
+}
+
+fn latency_date(line: &LatencyLine) -> chrono::NaiveDate {
+    assert!(
+        line.date.len() == 10,
+        "scripts/gate-latency.txt:{}: the date {} is not AAAA-MM-DD",
+        line.number,
+        line.date
+    );
+    chrono::NaiveDate::parse_from_str(&line.date, "%Y-%m-%d").unwrap_or_else(|e| {
+        panic!(
+            "scripts/gate-latency.txt:{}: the date {} is not AAAA-MM-DD: {e}",
+            line.number, line.date
+        )
+    })
+}
+
+/// The last day a pending line may name (D-F34k): the lot that closes F3.
+const PENDING_LAST_DAY: (i32, u32, u32) = (2026, 11, 30);
+
+#[test]
+fn every_latency_line_has_its_five_fields_and_a_pending_one_has_a_date_to_come() {
+    let today = chrono::Utc::now().date_naive();
+    let last =
+        chrono::NaiveDate::from_ymd_opt(PENDING_LAST_DAY.0, PENDING_LAST_DAY.1, PENDING_LAST_DAY.2)
+            .expect("a real day");
+    let lines = latency_lines();
+    assert!(
+        !lines.is_empty(),
+        "scripts/gate-latency.txt has no line: a list with nothing in it proves nothing"
+    );
+    for line in &lines {
+        let at = format!("scripts/gate-latency.txt:{}", line.number);
+        assert!(
+            matches!(line.class.as_str(), "exclusive" | "shared"),
+            "{at}: the class of {} is {}, not exclusive or shared",
+            line.file,
+            line.class
+        );
+        let kind = evidence_kind(&line.evidence).unwrap_or_else(|| {
+            panic!(
+                "{at}: the evidence of {} is {}: a ratio with two decimals, dag-verde:<n> with n of 1 or more, or pendiente",
+                line.file, line.evidence
+            )
+        });
+        assert!(
+            !line.owner.is_empty() && !line.reason.is_empty(),
+            "{at}: {} needs an owner and a reason",
+            line.file
+        );
+        let date = latency_date(line);
+        if kind == "pending" {
+            assert!(
+                date > today,
+                "pending line {} expired on {} ({at}; today is {today})",
+                line.file,
+                line.date
+            );
+            assert!(
+                date <= last,
+                "pending line {} is dated {} ({at}), after the {last} the lot closes",
+                line.file,
+                line.date
+            );
+        }
+    }
+}
+
+/// The ids of the `--lane` functions of run-all-tests.sh whose body names `--test <name>`.
+fn lanes_naming_test(suite: &str, name: &str) -> Vec<String> {
+    let outside: String = outside_self_test(suite)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let mut lanes = Vec::new();
+    for lane in ["CL", "B1", "D1", "CT", "D2", "D3", "NLI", "B3", "R", "E"] {
+        let named = lane_body(&outside, lane).iter().any(|line| {
+            !line.trim_start().starts_with('#')
+                && line
+                    .split("--test ")
+                    .skip(1)
+                    .any(|rest| rest.split_whitespace().next() == Some(name))
+        });
+        if named {
+            lanes.push(lane.to_string());
+        }
+    }
+    lanes
+}
+
+/// The body of `lane_<id>()` in run-all-tests.sh, as `step_body` does for merge-gate.sh.
+fn lane_body(suite: &str, id: &str) -> Vec<String> {
+    let header = format!("lane_{id}() {{");
+    let mut lines = suite.lines();
+    assert!(
+        lines.any(|line| line.trim_end() == header),
+        "run-all-tests.sh has no {header}"
+    );
+    lines
+        .take_while(|line| *line != "}")
+        .map(String::from)
+        .collect()
+}
+
+/// The names in `RUN_ELSEWHERE=(…)` of lane_D2: the files its discovery leaves for their own sections.
+fn run_elsewhere(suite: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut inside = false;
+    for line in lane_body(suite, "D2") {
+        if line.trim_start().starts_with("RUN_ELSEWHERE=(") {
+            inside = true;
+        }
+        if inside {
+            names.extend(
+                line.replace("RUN_ELSEWHERE=(", " ")
+                    .replace(')', " ")
+                    .split_whitespace()
+                    .map(String::from),
+            );
+            if line.contains(')') {
+                break;
+            }
+        }
+    }
+    names
+}
+
+fn row_class(line: &str) -> String {
+    line.split_whitespace()
+        .nth(4)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// D-F34p: what keeps the file `file`, named `exclusive` in scripts/gate-latency.txt, from being coherent with the
+/// judge. A src module is never exclusive (the lib runs in DBG, DC, CV and M). A test file is exclusive only if the
+/// lanes that name it with --test are those of rows of the class exclusive, the discovery of D2 leaves it
+/// to them, and every test in it is #[ignore], so that the calls without --ignored of D1, DC and M only list it.
+fn exclusive_problems(file: &str, gate: &str, suite: &str, source: &str) -> Vec<String> {
+    if file.starts_with("src/") {
+        return vec![format!(
+            "{file}: a src module cannot be exclusive while lib runs in DBG, DC, CV and M"
+        )];
+    }
+    let name = Path::new(file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("a file name");
+    let rows = dag_rows();
+    let rows_running = |lane: &str| -> Vec<(String, String)> {
+        rows.iter()
+            .filter(|(_, id, _, _)| {
+                step_body(gate, id).is_some_and(|body| lanes_in(&body).iter().any(|l| l == lane))
+            })
+            .map(|(_, id, _, line)| (id.clone(), row_class(line)))
+            .collect()
+    };
+    let mut problems = Vec::new();
+    let mut lanes = lanes_naming_test(suite, name);
+    if !run_elsewhere(suite).iter().any(|left| left == name) {
+        lanes.push("D2".to_string());
+    }
+    for lane in lanes {
+        for (row, class) in rows_running(&lane) {
+            if class != "exclusive" {
+                problems.push(format!(
+                    "{file} is exclusive and runs in row {row} ({class}): lane {lane} of run-all-tests.sh runs it"
+                ));
+            }
+        }
+    }
+    let tests = source
+        .lines()
+        .filter(|l| {
+            l.trim_start().starts_with("#[test]") || l.trim_start().starts_with("#[tokio::test")
+        })
+        .count();
+    let ignored = source
+        .lines()
+        .filter(|l| l.trim_start().starts_with("#[ignore"))
+        .count();
+    if tests != ignored {
+        problems.push(format!(
+            "{file} is exclusive and has {tests} tests and {ignored} #[ignore]: the calls without --ignored of D1, DC and M would run the rest beside other steps"
+        ));
+    }
+    problems
+}
+
+#[test]
+fn a_file_that_is_exclusive_in_the_latency_list_is_exclusive_in_the_judge() {
+    let gate = read("scripts/merge-gate.sh");
+    let suite = read("scripts/run-all-tests.sh");
+    let exclusive: Vec<LatencyLine> = latency_lines()
+        .into_iter()
+        .filter(|line| line.class == "exclusive")
+        .collect();
+    assert!(
+        !exclusive.is_empty(),
+        "scripts/gate-latency.txt has no exclusive file: the NLI row asserts a clock and runs alone, so there is one"
+    );
+    for line in &exclusive {
+        let source = if line.file.starts_with("src/") {
+            String::new()
+        } else {
+            read(&format!("rust/{}", line.file))
+        };
+        let problems = exclusive_problems(&line.file, &gate, &suite, &source);
+        assert!(
+            problems.is_empty(),
+            "scripts/gate-latency.txt:{}: {problems:#?}",
+            line.number
+        );
+    }
+}
+
+/// The guard of the test above can fail: a file that the discovery of D2 runs in DBG, a src module, and a file with a
+/// test that is not ignored are each refused, and the file the NLI row runs is not.
+#[test]
+fn the_exclusive_check_refuses_what_runs_beside_other_steps() {
+    let gate = read("scripts/merge-gate.sh");
+    let suite = read("scripts/run-all-tests.sh");
+    let ok = exclusive_problems(
+        "tests/nli_entailment.rs",
+        &gate,
+        &suite,
+        &read("rust/tests/nli_entailment.rs"),
+    );
+    assert!(ok.is_empty(), "the file of the NLI row is refused: {ok:#?}");
+    let in_dbg = exclusive_problems(
+        "tests/v029_accounts_over_real_http.rs",
+        &gate,
+        &suite,
+        &read("rust/tests/v029_accounts_over_real_http.rs"),
+    );
+    assert!(
+        in_dbg
+            .iter()
+            .any(|p| p.contains("is exclusive and runs in row D2 (normal)")),
+        "a file that D2 discovers in the row D2 is not refused as exclusive: {in_dbg:#?}"
+    );
+    let module = exclusive_problems("src/doctor.rs", &gate, &suite, "");
+    assert!(
+        module.iter().any(|p| p.contains("cannot be exclusive")),
+        "a src module is not refused as exclusive: {module:#?}"
+    );
+    let half = "#[tokio::test]\n#[ignore]\nasync fn a() {}\n#[tokio::test]\nasync fn b() {}\n";
+    let loose = exclusive_problems("tests/nli_entailment.rs", &gate, &suite, half);
+    assert!(
+        loose.iter().any(|p| p.contains("2 tests and 1 #[ignore]")),
+        "a file with a test that is not ignored is not refused as exclusive: {loose:#?}"
+    );
+}
+
+/// What the gate asks of the planner when nobody sets GATE_DAG, as its own self-test measured it (CI-K10, H2): the row `planner`
+/// of `merge-gate.sh --self-test` runs a copy of the gate with GATE_DAG removed from its environment, reads `asked=` in the `plan:`
+/// line the planner printed and says it in a line of its own. It is what a default put anywhere between the gate and the planner
+/// (an `export GATE_DAG=…` in merge-gate.sh or in gate-lock.sh) turns into; the literal in gate-dag.py is only one of those places.
+fn gate_dag_default() -> String {
+    let run = judge_env_self_test("merge-gate.sh");
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    let key = "gate default: GATE_DAG unset asks for ";
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(key))
+        .unwrap_or_else(|| {
+            panic!(
+                "merge-gate.sh --self-test did not say what the gate asks for when GATE_DAG is unset (exit {:?}): {}{}",
+                run.output.status.code(),
+                stdout,
+                String::from_utf8_lossy(&run.output.stderr)
+            )
+        })
+        .trim()
+        .to_string()
+}
+
+/// D-F34n: the DAG is the default only with evidence, which is no pending line in the latency list.
+fn activation_problem(default: &str, pending: usize) -> Option<String> {
+    (matches!(default, "1" | "auto" | "maximo") && pending > 0).then(|| {
+        format!(
+            "GATE_DAG defaults to {default} with {pending} pending line(s) in scripts/gate-latency.txt: the DAG is not the default before they have their evidence"
+        )
+    })
+}
+
+/// CI-K10 (H2): judged on the default the gate really has (`gate_dag_default`, read from the plan its own self-test printed), not
+/// on the literal in gate-dag.py.
+#[test]
+fn the_dag_is_not_the_default_while_a_latency_line_is_pending() {
+    let refused = activation_problem("1", 2);
+    assert!(
+        refused.is_some_and(|text| text.contains("GATE_DAG defaults to 1 with 2 pending line(s)")),
+        "a default of 1 with two pending lines is not refused"
+    );
+    assert!(
+        activation_problem("0", 2).is_none() && activation_problem("1", 0).is_none(),
+        "the guard refuses a default of 0, or a list with nothing pending"
+    );
+    let pending = latency_lines()
+        .iter()
+        .filter(|line| line.evidence == "pendiente")
+        .count();
+    let default = gate_dag_default();
+    if let Some(problem) = activation_problem(&default, pending) {
+        panic!("{problem}");
+    }
+}
+
+/// The cluster names a row declares in its resources: `cluster:C_b3` is `b3`.
+fn clusters_of(line: &str) -> Vec<String> {
+    resources_of(line)
+        .iter()
+        .filter_map(|r| r.strip_prefix("cluster:C_"))
+        .map(String::from)
+        .collect()
+}
+
+/// The resources of a row (its fourth field), without the `-` of a row that names none.
+fn resources_of(line: &str) -> Vec<String> {
+    line.split_whitespace()
+        .nth(3)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|resource| *resource != "-")
+        .map(String::from)
+        .collect()
+}
+
+/// D-F34j: a row declares a cluster exactly when its step runs a lane in one. B3 builds the release binary in a lane
+/// of its own and its row said nothing, which left the one-step-per-cluster rule with a hole.
+#[test]
+fn a_row_declares_a_cluster_exactly_when_its_step_runs_a_lane_in_one() {
+    let gate = read("scripts/merge-gate.sh");
+    for (_, id, _, line) in dag_rows() {
+        let body =
+            step_body(&gate, &id).unwrap_or_else(|| panic!("merge-gate.sh has no step_{id}()"));
+        let lanes: Vec<String> = body
+            .iter()
+            .filter(|code| !code.trim_start().starts_with('#'))
+            .filter_map(|code| code.split("run_in_lane ").nth(1))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .map(String::from)
+            .collect();
+        let clusters = clusters_of(&line);
+        for lane in &lanes {
+            assert!(
+                clusters.contains(lane),
+                "step_{id} runs run_in_lane {lane} and its row declares no cluster:C_{lane}: {line}"
+            );
+        }
+        for cluster in &clusters {
+            assert!(
+                lanes.contains(cluster),
+                "row {id} declares cluster:C_{cluster} and step_{id} runs no run_in_lane {cluster}: {line}"
+            );
+        }
+    }
+}
+
+/// D-F34f, D-F34g: the table is what the planner judges before it starts. A row names a target to build in, or reads
+/// the target another row builds (`reader`, which only reads the binary on disk and waits for its producer). Two rows
+/// in one target are ordered by their dependencies unless both read it; a row that is not a reader has a target of its
+/// own; no cluster is shared; and every resource is of a kind the planner knows. REL and E2E read T_rel, B3's; DBG, CT, D2,
+/// D3 and NLI read T_dbg, B1's (CI-E11).
+#[test]
+fn the_readers_read_the_target_of_their_producer_and_no_cluster_is_shared() {
+    let mut rows = dag_rows();
+    rows.sort_by_key(|row| row.0);
+    let target_of = |line: &str| {
+        resources_of(line)
+            .iter()
+            .find_map(|r| r.strip_prefix("target:").map(String::from))
+    };
+    let is_reader = |line: &str| resources_of(line).iter().any(|r| r == "reader");
+    for (n, (_, a, _, line_a)) in rows.iter().enumerate() {
+        let Some(target) = target_of(line_a) else {
+            continue;
+        };
+        for (_, b, _, line_b) in &rows[n + 1..] {
+            if target_of(line_b).as_deref() != Some(target.as_str()) {
+                continue;
+            }
+            let both_read = is_reader(line_a) && is_reader(line_b);
+            assert!(
+                both_read || depends_on(&rows, b, a, 0) || depends_on(&rows, a, b, 0),
+                "{a} and {b} share {target} and neither depends on the other"
+            );
+        }
+    }
+    let mut builders = std::collections::BTreeMap::new();
+    for (_, id, _, line) in rows.iter().filter(|row| !is_reader(&row.3)) {
+        if let Some(target) = target_of(line)
+            && let Some(other) = builders.insert(target.clone(), id.clone())
+        {
+            panic!(
+                "{other} and {id} both build in {target}: a row that is not a reader has a target of its own"
+            );
+        }
+    }
+    let mut readers: Vec<&str> = rows
+        .iter()
+        .filter(|(_, _, _, line)| is_reader(line))
+        .map(|(_, id, _, _)| id.as_str())
+        .collect();
+    readers.sort_unstable();
+    assert_eq!(
+        readers,
+        ["CT", "D2", "D3", "DBG", "E2E", "NLI", "REL"],
+        "the readers of the table are REL and E2E (T_rel) and DBG, CT, D2, D3 and NLI (T_dbg), and only them"
+    );
+    for (id, target) in [
+        ("REL", "T_rel"),
+        ("E2E", "T_rel"),
+        ("DBG", "T_dbg"),
+        ("CT", "T_dbg"),
+        ("D2", "T_dbg"),
+        ("D3", "T_dbg"),
+        ("NLI", "T_dbg"),
+    ] {
+        let (_, _, _, line) = rows
+            .iter()
+            .find(|row| row.1 == id)
+            .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"));
+        assert!(
+            is_reader(line) && target_of(line).as_deref() == Some(target),
+            "row {id} is a reader of {target}: it reads the binary its producer built and builds nothing: {line}"
+        );
+        assert!(
+            rows.iter().any(|(_, producer, _, other)| {
+                !is_reader(other)
+                    && target_of(other).as_deref() == Some(target)
+                    && depends_on(&rows, id, producer, 0)
+            }),
+            "reader {id} of {target} has no row that builds {target} above it"
+        );
+    }
+    let mut clusters = std::collections::BTreeMap::new();
+    for (_, id, _, line) in &rows {
+        for cluster in clusters_of(line) {
+            if let Some(other) = clusters.insert(cluster.clone(), id.clone()) {
+                panic!("rows {other} and {id} share cluster:C_{cluster}: one step per cluster");
+            }
+        }
+        for resource in resources_of(line) {
+            assert!(
+                resource == "models"
+                    || resource == "reader"
+                    || resource.starts_with("target:")
+                    || resource.starts_with("cluster:"),
+                "row {id} names the resource {resource}, which is none of target:, cluster:, models or reader"
+            );
+        }
+    }
+}
+
+/// D-F34h: the E2E lane does not compile. It provisions its database with the release binary B3 left, after checking
+/// it against B3's sha256, and the provision that used to build a debug binary (gate_bin, in the target the readers of
+/// REL hold) is not called from it. CI-E11 (D-E11f): it asks `ensure_gate_db`, which provisions only when the database is
+/// missing, and gives it the release binary.
+#[test]
+fn lane_e_provisions_with_the_release_binary_and_runs_no_cargo() {
+    let suite = read("scripts/run-all-tests.sh");
+    let body = lane_body(&suite, "E");
+    let code: Vec<&String> = body
+        .iter()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect();
+    for line in &code {
+        assert!(
+            !line.contains("cargo "),
+            "lane_E runs cargo, and the E2E reads a binary that is already built: {line}"
+        );
+        assert!(
+            !line.contains("gate_bin"),
+            "lane_E calls gate_bin, which builds a debug binary: {line}"
+        );
+    }
+    let provision = code
+        .iter()
+        .position(|line| line.contains("ensure_gate_db"))
+        .expect("lane_E provisions brain_gate when it is missing, through ensure_gate_db (CI-E11, D-E11f)");
+    assert!(
+        code[provision].contains("ensure_gate_db \"$REL_BIN\""),
+        "lane_E provisions without the release binary: {}",
+        code[provision]
+    );
+    let resolved = code
+        .iter()
+        .position(|line| line.trim_start().starts_with("REL_BIN="))
+        .expect("lane_E resolves REL_BIN");
+    assert!(
+        resolved < provision,
+        "lane_E provisions before it resolves REL_BIN"
+    );
+}
+
+/// CI-E9 (D-E9a): the row E2E waits for B3, which builds the release binary it runs, and for nothing that DBG makes: not
+/// DBG itself and not a row that waits for DBG.
+#[test]
+fn the_e2e_row_waits_for_b3_and_for_nothing_that_dbg_makes() {
+    let rows = dag_rows();
+    let e2e = rows
+        .iter()
+        .find(|row| row.1 == "E2E")
+        .expect("gate-dag.txt has no row E2E");
+    let deps: Vec<&str> = e2e.2.iter().map(String::as_str).collect();
+    assert_eq!(
+        deps,
+        ["B3"],
+        "E2E depends on {deps:?}: its lane reads the release binary B3 left and the cluster C_e2e, so it waits for B3 only"
+    );
+    assert!(
+        !depends_on(&rows, "E2E", "DBG", 0),
+        "E2E reaches DBG through its deps: it would start after the longest row of the table for nothing it reads"
+    );
+}
+
+/// The body of the shell function `name` in `code`, from its header to the closing brace in column 0.
+fn function_body(code: &str, name: &str) -> Vec<String> {
+    let header = format!("{name}() {{");
+    let mut lines = code.lines();
+    assert!(
+        lines.any(|line| line.trim_end() == header),
+        "run-all-tests.sh has no {header}"
+    );
+    lines
+        .take_while(|line| *line != "}")
+        .map(String::from)
+        .collect()
+}
+
+/// CI-E9 (D-E9a): what `lane_E` of `suite` reads that DBG makes, or lets it fall back to. "Reads" is what the lane runs or
+/// resolves: itself, `b3_record_sha` (the record B3 left) and `resolve_binary_path` (where the release binary is) may not
+/// name the debug build (`gate_bin`, any `cargo` call, the target or the cluster of DBG, a `/debug` path); and
+/// `provision_gate_db` names `gate_bin` only in its fallback for a caller that gives no binary, which `lane_E` never is:
+/// it asks for the record of B3 first, which refuses without it (exit 1, no build), and then gives the release binary.
+fn lane_e_reads_of_dbg(suite: &str) -> Vec<String> {
+    let code: String = script_code(suite)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let mut problems = Vec::new();
+    for name in ["lane_E", "b3_record_sha", "resolve_binary_path"] {
+        for line in function_body(&code, name) {
+            for needle in ["gate_bin", "cargo ", "T_dbg", "C_dbg", "dbg", "/debug"] {
+                if line.contains(needle) {
+                    problems.push(format!("{name} names `{needle}`: {}", line.trim()));
+                }
+            }
+        }
+    }
+    for line in function_body(&code, "provision_gate_db") {
+        if line.contains("gate_bin") && !line.trim_start().starts_with("[[ -n \"$bin\" ]] ||") {
+            problems.push(format!(
+                "provision_gate_db builds a binary outside the fallback for no binary: {}",
+                line.trim()
+            ));
+        }
+    }
+    let record_refuses = function_body(&code, "b3_record_sha")
+        .iter()
+        .any(|line| line.contains("B3 left no sha256 record") && line.contains("exit 1"));
+    if !record_refuses {
+        problems.push("b3_record_sha does not refuse (exit 1) when B3 left no record".to_string());
+    }
+    let lane = function_body(&code, "lane_E");
+    let record = lane.iter().position(|line| line.trim() == "b3_record_sha");
+    let provision = lane.iter().position(|line| line.contains("ensure_gate_db"));
+    match (record, provision) {
+        (None, _) => problems.push("lane_E does not ask for the record of B3".to_string()),
+        (Some(record), Some(provision)) if record > provision => {
+            problems.push("lane_E provisions before it asks for the record of B3".to_string());
+        }
+        _ => {}
+    }
+    match provision {
+        None => problems.push("lane_E does not provision brain_gate".to_string()),
+        Some(at) if !lane[at].contains("ensure_gate_db \"$REL_BIN\"") => problems.push(format!(
+            "lane_E provisions without the release binary: {}",
+            lane[at].trim()
+        )),
+        Some(_) => {}
+    }
+    problems
+}
+
+/// CI-E9 (D-E9a, S-E9-2): the E2E lane reads nothing DBG produces, so its row can start while DBG still runs. The control is
+/// the real script, clean; each sabotage is one change that makes the lane read the debug build, provision without the
+/// binary of B3, skip its record or stop refusing without it, and each one has to be named.
+#[test]
+fn lane_e_reads_nothing_that_dbg_produces_and_refuses_without_the_record_of_b3() {
+    let suite = read("scripts/run-all-tests.sh");
+    let control = lane_e_reads_of_dbg(&suite);
+    assert!(
+        control.is_empty(),
+        "lane_E reads what DBG makes, so its row cannot leave DBG: {control:#?}"
+    );
+    let (head, tail) = suite
+        .split_once("lane_E() {\n")
+        .expect("run-all-tests.sh has no lane_E() {");
+    let sabotages = [
+        (
+            "the debug binary of the target",
+            format!(
+                "{head}lane_E() {{\nDBG_BIN=\"$(gate_target_dir)/debug/memory-industry\"\n{tail}"
+            ),
+            "/debug",
+        ),
+        (
+            "a provision with no binary",
+            suite.replacen("\nensure_gate_db \"$REL_BIN\"\n", "\nensure_gate_db\n", 1),
+            "without the release binary",
+        ),
+        (
+            "no record of B3 asked for",
+            format!(
+                "{head}lane_E() {{\n{}",
+                tail.replacen("\nb3_record_sha\n", "\n", 1)
+            ),
+            "does not ask for the record",
+        ),
+        (
+            "a record that does not refuse",
+            suite.replacen(
+                "is not known to be the one it built (run --lane B3 first).\" >&2; exit 1; }",
+                "is not known to be the one it built (run --lane B3 first).\" >&2; }",
+                1,
+            ),
+            "does not refuse",
+        ),
+    ];
+    for (what, sabotaged, named) in sabotages {
+        assert_ne!(
+            sabotaged, suite,
+            "the sabotage `{what}` changed nothing in run-all-tests.sh"
+        );
+        let problems = lane_e_reads_of_dbg(&sabotaged);
+        assert!(
+            problems.iter().any(|problem| problem.contains(named)),
+            "the sabotage `{what}` is not named (want a problem with `{named}`): {problems:#?}"
+        );
+    }
+}
+
+// --- CI-J15: the hygiene of the judge's scripts ------------------------------------------------------------------
+// J15a: the audit judges the real table. J15b: the ORT pools of the table come from resources.rs. J15c: one lane grammar
+// and one mark. J15d: gate-lock.sh is loaded once. J15e: copies that are derived. Each check is judged first on a fixture
+// with the ways to be wrong (the lesson of CI-J13: a check that cannot fail is a paragraph).
+
+/// The code of a gate script: the lines outside its self-test that are not comments, as (line number, line).
+fn script_code(body: &str) -> Vec<(usize, &str)> {
+    outside_self_test(body)
+        .into_iter()
+        .filter(|(_, line)| !line.trim_start().starts_with('#'))
+        .collect()
+}
+
+/// CI-J15b (H4). The ORT pools the rows of the table name are the plan of production on the table's machine, and that plan
+/// is in rust/src/resources.rs, not in a copy of it in this file.
+#[test]
+fn the_ort_pools_of_the_rows_are_the_plan_of_production() {
+    let problems = pool_problems(
+        &read("scripts/gate-dag.txt"),
+        &read("rust/src/resources.rs"),
+    );
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// CI-J15b. The sabotage of the spec: the ceiling of the reranker at 6 in resources.rs with the table at 8 is red, one
+/// problem per row with models (DBG, D2, NLI and REL; CI-E11 gave D2 its models), and the control with the real files is clean.
+#[test]
+fn the_check_of_the_ort_pools_can_fail() {
+    let table = read("scripts/gate-dag.txt");
+    let resources = read("rust/src/resources.rs");
+    let control = pool_problems(&table, &resources);
+    assert!(control.is_empty(), "the control is not clean: {control:#?}");
+    let sabotaged = resources.replace(
+        "const MAX_RERANK_INTRA_THREADS: usize = 8;",
+        "const MAX_RERANK_INTRA_THREADS: usize = 6;",
+    );
+    assert_ne!(
+        sabotaged, resources,
+        "resources.rs no longer has `const MAX_RERANK_INTRA_THREADS: usize = 8;`: the sabotage changed nothing"
+    );
+    let problems = pool_problems(&table, &sabotaged);
+    assert_eq!(
+        problems.len(),
+        4,
+        "the rows with models (DBG, D2, NLI, REL) name a reranker of 8 and the plan says 6: {problems:#?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .all(|p| p.contains("CUBA_RERANK_INTRA_THREADS") && p.contains("Some(\"6\")")),
+        "the problem names the pool and what the plan says: {problems:#?}"
+    );
+}
+
+/// The ids of the `step_<id>() {` functions of merge-gate.sh outside its self-test: the rows it can run.
+fn step_functions(gate: &str) -> Vec<String> {
+    script_code(gate)
+        .into_iter()
+        .filter_map(|(_, line)| {
+            let id = line.strip_prefix("step_")?.strip_suffix("() {")?;
+            Some(id.to_string())
+        })
+        .collect()
+}
+
+/// CI-J15e (H9). What is wrong with the dispatch of `--step` in merge-gate.sh: it runs the function `step_$id` when
+/// `declare -F` says there is one, no `case` arm holds an id written by hand, and the functions and the rows of the table are
+/// the same ids.
+fn dispatch_problems(gate: &str, table_ids: &[String]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let code = script_code(gate);
+    if !code
+        .iter()
+        .any(|(_, line)| line.contains("declare -F \"step_$id\""))
+    {
+        problems.push(
+            "gate_step_main does not ask `declare -F \"step_$id\"` before it runs a step"
+                .to_string(),
+        );
+    }
+    for (number, line) in &code {
+        let arm = line.trim();
+        if let Some((id, rest)) = arm.split_once(") step_")
+            && is_step_id(id)
+            && rest.ends_with(" ;;")
+        {
+            problems.push(format!(
+                "merge-gate.sh:{number}: `{arm}` is a case arm with an id written by hand; the dispatch is `declare -F \"step_$id\"`"
+            ));
+        }
+    }
+    let functions = step_functions(gate);
+    for id in table_ids {
+        if !functions.contains(id) {
+            problems.push(format!(
+                "row {id} of gate-dag.txt has no step_{id}() in merge-gate.sh"
+            ));
+        }
+    }
+    for function in &functions {
+        if !table_ids.contains(function) {
+            problems.push(format!(
+                "step_{function}() of merge-gate.sh is no row of gate-dag.txt"
+            ));
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_dispatch_of_a_step_is_derived_from_its_function_and_the_table_holds_the_same_ids() {
+    let ids: Vec<String> = dag_rows().into_iter().map(|(_, id, _, _)| id).collect();
+    let problems = dispatch_problems(&read("scripts/merge-gate.sh"), &ids);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// CI-J15e. The check is judged first: an honest script is clean, a `case` with the ids by hand is named, a function that is
+/// no row and a row that has no function are named.
+#[test]
+fn the_check_of_the_dispatch_can_fail() {
+    let ids = ["P".to_string(), "DBG".to_string()];
+    let honest = "step_P() {\n  :\n}\nstep_DBG() {\n  :\n}\n  declare -F \"step_$id\" >/dev/null || exit 2\n";
+    let clean = dispatch_problems(honest, &ids);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let by_hand = "step_P() {\n}\nstep_DBG() {\n}\n  case \"$id\" in\n    P) step_P ;;\n    DBG) step_DBG ;;\n  esac\n";
+    let problems = dispatch_problems(by_hand, &ids);
+    assert!(
+        problems.iter().any(|p| p.contains("declare -F")),
+        "a dispatch with no declare -F is named: {problems:#?}"
+    );
+    assert_eq!(
+        problems.iter().filter(|p| p.contains("case arm")).count(),
+        2,
+        "the two arms written by hand are named: {problems:#?}"
+    );
+    let ghost = format!("{honest}step_ZZ() {{\n}}\n");
+    assert!(
+        dispatch_problems(&ghost, &ids)
+            .iter()
+            .any(|p| p.contains("step_ZZ() of merge-gate.sh is no row")),
+        "a function that is no row is named"
+    );
+    let missing = "step_P() {\n}\n  declare -F \"step_$id\" >/dev/null || exit 2\n";
+    assert!(
+        dispatch_problems(missing, &ids)
+            .iter()
+            .any(|p| p.contains("row DBG") && p.contains("no step_DBG()")),
+        "a row with no function is named"
+    );
+}
+
+/// CI-J15a (H1). What is wrong with gate-audit.sh outside its self-test: the key of its tree comes from the planner
+/// (`gate-dag.py tree-key`), it hashes and resolves nothing itself, it takes the target root the planner takes
+/// (CARGO_TARGET_DIR) and it launches no row of the table: merge-gate.sh runs them.
+fn audit_problems(audit: &str) -> Vec<String> {
+    let code = script_code(audit);
+    let mut problems = Vec::new();
+    if !code
+        .iter()
+        .any(|(_, line)| line.contains("gate-dag.py") && line.contains("tree-key"))
+    {
+        problems.push(
+            "gate-audit.sh does not ask `gate-dag.py tree-key` for the key of its tree: the planner holds the one formula"
+                .to_string(),
+        );
+    }
+    for (number, line) in &code {
+        for (needle, why) in [
+            (
+                "sha256sum",
+                "hashes something itself: the key of a tree is the planner's",
+            ),
+            (
+                "realpath",
+                "resolves a path itself: the key of a tree is the planner's",
+            ),
+            (
+                "GATE_TARGET_ROOT",
+                "reads GATE_TARGET_ROOT, which the planner does not: its root is CARGO_TARGET_DIR",
+            ),
+            (
+                "\"${words[@]}\"",
+                "launches a row of the table by itself: merge-gate.sh runs them, with the ticket of the planner",
+            ),
+        ] {
+            if line.contains(needle) {
+                problems.push(format!("gate-audit.sh:{number}: {why}: `{}`", line.trim()));
+            }
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_audit_takes_its_tree_key_from_the_planner_and_launches_no_row() {
+    let problems = audit_problems(&read("scripts/gate-audit.sh").replace("\r\n", "\n"));
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn the_check_of_the_audit_can_fail() {
+    let honest = "key=\"$(python3 -I \"$GA_ROOT/scripts/gate-dag.py\" tree-key \"$GA_ROOT\")\"\n";
+    let clean = audit_problems(honest);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let old = "tree_key=\"$(basename \"$GA_ROOT\")-$(realpath \"$GA_ROOT\" | sha256sum | cut -c1-12)\"\n\
+               [[ -z \"${GATE_TARGET_ROOT:-}\" ]] || :\n\
+               strace -- \"${words[@]}\"\n";
+    let problems = audit_problems(old);
+    for needle in [
+        "tree-key",
+        "sha256sum",
+        "realpath",
+        "GATE_TARGET_ROOT",
+        "words[@]",
+    ] {
+        assert!(
+            problems.iter().any(|p| p.contains(needle)),
+            "the old audit is named for {needle}: {problems:#?}"
+        );
+    }
+}
+
+/// CI-J15c (H5). The lane grammar, the mark of the judge's servers and the encoding of a socket directory as a URL host are
+/// each written once, in gate-lock.sh, and the scripts that need them use the names. `scripts` is (name, body).
+fn judge_names_problems(scripts: &[(&str, &str)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut lane_re = 0;
+    let mut mark = 0;
+    let mut encoders = 0;
+    for (name, body) in scripts {
+        for (number, line) in script_code(body) {
+            let trimmed = line.trim();
+            if trimmed == "GATE_LANE_RE='[a-z0-9][a-z0-9-]*'" {
+                lane_re += 1;
+                continue;
+            }
+            if trimmed == "GATE_SERVER_MARK=memory-industry-gate" {
+                mark += 1;
+                continue;
+            }
+            for needle in [
+                "[a-z0-9][a-z0-9-]*",
+                "cluster_name=\"memory-industry-gate",
+                "memory-industry-gate-$GATE_LANE",
+                "'^memory-industry-gate",
+            ] {
+                if line.contains(needle) {
+                    problems.push(format!(
+                        "{name}:{number}: spells `{needle}` by hand; the lane grammar and the mark are GATE_LANE_RE and GATE_SERVER_MARK of gate-lock.sh: `{trimmed}`"
+                    ));
+                }
+            }
+            if line.contains("//\\//%2F}") {
+                encoders += 1;
+            }
+        }
+    }
+    if lane_re != 1 {
+        problems.push(format!(
+            "GATE_LANE_RE='[a-z0-9][a-z0-9-]*' is assigned {lane_re} times, and it has to be once"
+        ));
+    }
+    if mark != 1 {
+        problems.push(format!(
+            "GATE_SERVER_MARK=memory-industry-gate is assigned {mark} times, and it has to be once"
+        ));
+    }
+    if encoders != 1 {
+        problems.push(format!(
+            "the encoding of a socket directory as a URL host (`${{x//\\//%2F}}`) is written {encoders} times, and it has to be once, as a function"
+        ));
+    }
+    problems
+}
+
+#[test]
+fn the_lane_grammar_the_mark_and_the_socket_encoding_are_written_once() {
+    let names = [
+        "scripts/gate-lock.sh",
+        "scripts/gate-cluster.sh",
+        "scripts/merge-gate.sh",
+        "scripts/run-all-tests.sh",
+    ];
+    let bodies: Vec<String> = names
+        .iter()
+        .map(|name| read(name).replace("\r\n", "\n"))
+        .collect();
+    let scripts: Vec<(&str, &str)> = names
+        .iter()
+        .copied()
+        .zip(bodies.iter().map(String::as_str))
+        .collect();
+    let problems = judge_names_problems(&scripts);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn the_check_of_the_judge_names_can_fail() {
+    let lock = "GATE_SERVER_MARK=memory-industry-gate\nGATE_LANE_RE='[a-z0-9][a-z0-9-]*'\nencode() { printf '%s' \"${1//\\//%2F}\"; }\n";
+    let clean = judge_names_problems(&[("gate-lock.sh", lock)]);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let cluster = "  [[ \"$lane\" =~ ^[a-z0-9][a-z0-9-]*$ ]] || exit 2\n  -c cluster_name=\"memory-industry-gate-$lane\"\n  url=\"${1//\\//%2F}\"\n";
+    let problems = judge_names_problems(&[("gate-lock.sh", lock), ("gate-cluster.sh", cluster)]);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("gate-cluster.sh:1") && p.contains("[a-z0-9][a-z0-9-]*")),
+        "a lane grammar written by hand is named: {problems:#?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("gate-cluster.sh:2") && p.contains("cluster_name")),
+        "a mark written by hand is named: {problems:#?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("socket directory") && p.contains("2 times")),
+        "a second encoding of the socket host is named: {problems:#?}"
+    );
+}
+
+/// CI-J15d (H6). What is wrong with the loading of gate-lock.sh: it has a guard that returns when it is already loaded,
+/// before it assigns the lock; gate-cluster.sh does not assign ROOT or SELF in the shell that loads it; and merge-gate.sh reads
+/// the GATE_LOCK it inherited before it sources the file that assigns its own.
+fn load_guard_problems(lock: &str, cluster: &str, gate: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let lock_code = script_code(lock);
+    let guard = lock_code
+        .iter()
+        .position(|(_, line)| line.contains("return 0"));
+    let assigned_at = lock_code
+        .iter()
+        .position(|(_, line)| line.starts_with("GATE_LOCK_HELD="));
+    match (guard, assigned_at) {
+        (Some(guard), Some(assigned_at)) if guard < assigned_at => {}
+        _ => problems.push(
+            "gate-lock.sh has no load guard (a `return 0` for a library already loaded) before it assigns GATE_LOCK_HELD: loaded twice it empties the lock its caller holds"
+                .to_string(),
+        ),
+    }
+    for (number, line) in script_code(cluster) {
+        if line.starts_with("ROOT=") || line.starts_with("SELF=") {
+            problems.push(format!(
+                "gate-cluster.sh:{number}: assigns `{line}` in the shell that loads it: a library does not take the names of its caller"
+            ));
+        }
+    }
+    let gate_code = script_code(gate);
+    let saved = gate_code
+        .iter()
+        .position(|(_, line)| line.contains("GATE_LOCK"));
+    let sourced = gate_code
+        .iter()
+        .position(|(_, line)| line.contains("source \"$ROOT/scripts/gate-lock.sh\""));
+    match (saved, sourced) {
+        (Some(saved), Some(sourced)) if saved < sourced => {}
+        _ => problems.push(
+            "merge-gate.sh has to read the GATE_LOCK it inherited before it sources gate-lock.sh, which assigns its own"
+                .to_string(),
+        ),
+    }
+    problems
+}
+
+#[test]
+fn gate_lock_is_loaded_once_and_nobody_takes_the_names_of_their_caller() {
+    let problems = load_guard_problems(
+        &read("scripts/gate-lock.sh").replace("\r\n", "\n"),
+        &read("scripts/gate-cluster.sh").replace("\r\n", "\n"),
+        &read("scripts/merge-gate.sh").replace("\r\n", "\n"),
+    );
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn the_check_of_the_load_guard_can_fail() {
+    let lock =
+        "if declare -F gate_lock_loaded >/dev/null; then\n  return 0\nfi\nGATE_LOCK_HELD=\"\"\n";
+    let cluster = "source \"$(dirname \"${BASH_SOURCE[0]}\")/gate-lock.sh\"\n";
+    let gate = "GATE_LOCK_INHERITED=\"${GATE_LOCK:-}\"\nsource \"$ROOT/scripts/gate-lock.sh\"\n";
+    let clean = load_guard_problems(lock, cluster, gate);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let unguarded = load_guard_problems(
+        "GATE_LOCK_HELD=\"\"\nf() {\n  return 0\n}\n",
+        "ROOT=\"$(pwd)\"\nSELF=\"$ROOT/x\"\n",
+        "source \"$ROOT/scripts/gate-lock.sh\"\nGATE_LOCK_INHERITED=\"${GATE_LOCK:-}\"\n",
+    );
+    assert!(
+        unguarded.iter().any(|p| p.contains("no load guard")),
+        "a library with no guard is named: {unguarded:#?}"
+    );
+    assert_eq!(
+        unguarded
+            .iter()
+            .filter(|p| p.contains("gate-cluster.sh:"))
+            .count(),
+        2,
+        "ROOT and SELF assigned by a library are named: {unguarded:#?}"
+    );
+    assert!(
+        unguarded.iter().any(|p| p.contains("inherited")),
+        "a GATE_LOCK read after the source is named: {unguarded:#?}"
+    );
+}
+
+// CI-K1: one compiler, pinned. Without `rust-toolchain.toml` every target of the judge is built
+// with whatever `stable` is that day, and the day it moves each of them is rebuilt whole while the
+// publish matrix stops using the compiler that was verified. Raising the version is one commit that
+// changes `channel`; this contract is what ties that commit to the components and targets.
+
+/// What the judge needs from the pinned toolchain beyond the compiler: `clippy` and `rustfmt` for
+/// its lint steps, `llvm-tools` for crap-gate and the `cover` mode of quality-gate.
+const TOOLCHAIN_COMPONENTS: [&str; 3] = ["clippy", "rustfmt", "llvm-tools"];
+
+/// The strings of `key = [...]` (or `key = "..."`) in a toolchain file, in order. The array may
+/// span lines; a `#` comment never counts.
+fn toml_strings(file: &str, key: &str) -> Vec<String> {
+    let lines: Vec<&str> = file
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .collect();
+    let Some(at) = lines.iter().position(|line| {
+        line.strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    }) else {
+        return Vec::new();
+    };
+    let mut value = lines[at]
+        .split_once('=')
+        .map_or(String::new(), |(_, v)| v.to_string());
+    for line in &lines[at + 1..] {
+        if value.contains(']') || !value.trim_start().starts_with('[') {
+            break;
+        }
+        value.push(' ');
+        value.push_str(line);
+    }
+    value
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn is_exact_version(channel: &str) -> bool {
+    let parts: Vec<&str> = channel.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `x86_64-unknown-linux-gnu` yes; `${{`, `"$T"`, `--target-dir` and prose no.
+fn is_target_triple(word: &str) -> bool {
+    let parts: Vec<&str> = word.split('-').collect();
+    parts.len() >= 3
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
+}
+
+/// The target triples a workflow or a script names literally: after `--target`, and as the value of
+/// a `target:` or `targets:` key. A `${{ matrix.target }}` or a shell variable names none; the
+/// matrix entries that feed it are `target:` lines of their own. maturin's `universal2-apple-darwin`
+/// (the PyPI job) is not a rustc triple: it is the two Apple ones, and it is read as both.
+fn targets_named(text: &str) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.starts_with('#')) {
+        let line = line.strip_prefix("- ").unwrap_or(line);
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let after_flag = words
+            .windows(2)
+            .filter(|pair| pair[0] == "--target")
+            .map(|pair| pair[1]);
+        let as_key = line
+            .strip_prefix("target:")
+            .or_else(|| line.strip_prefix("targets:"))
+            .into_iter()
+            .flat_map(|rest| rest.split(|c: char| c == ',' || c.is_whitespace()));
+        for word in after_flag.chain(as_key) {
+            let word = word.trim_matches(['"', '\'', ',']);
+            if word == "universal2-apple-darwin" {
+                found.insert("x86_64-apple-darwin".to_string());
+                found.insert("aarch64-apple-darwin".to_string());
+            } else if is_target_triple(word) {
+                found.insert(word.to_string());
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Every way the pinned toolchain can stop being the one the judge and the publication verified,
+/// one line each. Empty means green. `named` is what the workflows and scripts build with and
+/// `other_files` the toolchain files found anywhere else in the tree.
+fn toolchain_problems(file: &str, named: &[String], other_files: &[String]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let channel = toml_strings(file, "channel");
+    if !matches!(channel.as_slice(), [one] if is_exact_version(one)) {
+        problems.push(format!(
+            "channel must be one exact N.N.N version, found {channel:?}: `stable`, `beta` and `nightly` move under the cache"
+        ));
+    }
+    let components = toml_strings(file, "components");
+    for want in TOOLCHAIN_COMPONENTS {
+        if !components.iter().any(|c| c == want) {
+            problems.push(format!("components lacks {want}"));
+        }
+    }
+    let targets = toml_strings(file, "targets");
+    for target in named {
+        if !targets.contains(target) {
+            problems.push(format!(
+                "targets lacks {target}, which a workflow or a script builds with"
+            ));
+        }
+    }
+    for other in other_files {
+        problems.push(format!(
+            "{other} is a second toolchain file: a second compiler is a second cache"
+        ));
+    }
+    problems
+}
+
+/// Files named `rust-toolchain*` anywhere under `root` except the one at its top, relative and
+/// sorted. Build output, dependencies and git's own directory are not part of the tree.
+fn other_toolchain_files(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if kind.is_dir() {
+                let build_output = name == "target" || name.starts_with("target-");
+                if !build_output && name != ".git" && name != "node_modules" {
+                    walk(root, &path, out);
+                }
+            } else if name.starts_with("rust-toolchain") && path != root.join("rust-toolchain.toml")
+            {
+                out.push(relative_to(root, &path));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+const PINNED_TOOLCHAIN: &str = "\
+[toolchain]
+channel = \"1.99.0\"
+profile = \"minimal\"
+components = [\"clippy\", \"rustfmt\", \"llvm-tools\"]
+targets = [
+    \"x86_64-unknown-linux-gnu\",
+    \"x86_64-pc-windows-msvc\", # the judge's Windows branch
+]
+";
+
+fn the_targets_the_publication_builds() -> Vec<String> {
+    ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+        .map(String::from)
+        .to_vec()
+}
+
+#[test]
+fn toolchain_k1_the_tree_pins_one_compiler_with_what_the_judge_and_the_publication_build() {
+    let path = repo_root().join("rust-toolchain.toml");
+    let file = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "rust-toolchain.toml is missing from the repo root ({}): {e}. Without it every target is built with whatever `stable` is that day (CI-K1)",
+            path.display()
+        )
+    });
+    let publish = targets_named(&read(".github/workflows/publish.yml"));
+    assert!(
+        !publish.is_empty(),
+        "publish.yml names no target triple: the matrix moved, or targets_named reads the wrong key, and this contract would pass over nothing"
+    );
+    let mut named = std::collections::BTreeSet::from_iter(publish);
+    named.extend(targets_named(&read(".github/workflows/ci.yml")));
+    for entry in std::fs::read_dir(repo_root().join("scripts")).expect("scripts/") {
+        let path = entry.expect("entry").path();
+        let script = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ["sh", "ps1", "cmd"].contains(&ext));
+        if script {
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            named.extend(targets_named(&String::from_utf8_lossy(&bytes)));
+        }
+    }
+    let named: Vec<String> = named.into_iter().collect();
+    let others = other_toolchain_files(&repo_root());
+    assert_eq!(
+        toolchain_problems(&file, &named, &others),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn toolchain_k1_reads_the_targets_of_a_workflow_and_a_script_and_nothing_else() {
+    let workflow = "\
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: cuba-memorys-linux-x64
+          - os: macos-latest
+            target: universal2-apple-darwin
+          - os: windows-latest
+            target: x86_64
+    steps:
+      # target: riscv64gc-unknown-linux-gnu
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+        run: cargo build --release --features ${{ matrix.features }} --target ${{ matrix.target }}
+        run: cargo check --target-dir somewhere-else-entirely
+";
+    assert_eq!(
+        targets_named(workflow),
+        [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu"
+        ]
+    );
+    let script =
+        "cargo xwin build --release --target x86_64-pc-windows-msvc\nT=1 cargo b --target \"$T\"\n";
+    assert_eq!(targets_named(script), ["x86_64-pc-windows-msvc"]);
+    let literal_list =
+        "        with:\n          targets: wasm32-unknown-unknown, x86_64-unknown-linux-musl\n";
+    assert_eq!(
+        targets_named(literal_list),
+        ["wasm32-unknown-unknown", "x86_64-unknown-linux-musl"]
+    );
+    let renamed = workflow
+        .replace("target:", "tgt:")
+        .replace("--target ", "--tgt ");
+    assert_eq!(
+        targets_named(&renamed),
+        Vec::<String>::new(),
+        "a renamed key must read as nothing, which is what the presence anchor of the real tree catches"
+    );
+}
+
+#[test]
+fn toolchain_k1_the_guard_goes_red_with_each_sabotage_and_only_with_it() {
+    let named = the_targets_the_publication_builds();
+    assert_eq!(
+        toolchain_problems(PINNED_TOOLCHAIN, &named, &[]),
+        Vec::<String>::new()
+    );
+
+    for moving in ["stable", "beta", "nightly", "1.99", "1.99.0-beta.1", ""] {
+        let sabotaged = PINNED_TOOLCHAIN.replacen("1.99.0", moving, 1);
+        assert_ne!(
+            sabotaged, PINNED_TOOLCHAIN,
+            "the sabotage must change the file"
+        );
+        let problems = toolchain_problems(&sabotaged, &named, &[]);
+        assert_eq!(problems.len(), 1, "channel {moving:?}: {problems:?}");
+        assert!(
+            problems[0].starts_with("channel must be one exact N.N.N version"),
+            "{problems:?}"
+        );
+    }
+    let no_channel = PINNED_TOOLCHAIN.replacen("channel = \"1.99.0\"\n", "", 1);
+    assert_ne!(no_channel, PINNED_TOOLCHAIN);
+    assert_eq!(toolchain_problems(&no_channel, &named, &[]).len(), 1);
+
+    for component in TOOLCHAIN_COMPONENTS {
+        let sabotaged = PINNED_TOOLCHAIN.replacen(&format!("\"{component}\""), "\"rust-docs\"", 1);
+        assert_ne!(sabotaged, PINNED_TOOLCHAIN);
+        assert_eq!(
+            toolchain_problems(&sabotaged, &named, &[]),
+            [format!("components lacks {component}")]
+        );
+    }
+
+    let mut with_riscv = named.clone();
+    with_riscv.push("riscv64gc-unknown-linux-gnu".to_string());
+    let expected =
+        ["targets lacks riscv64gc-unknown-linux-gnu, which a workflow or a script builds with"];
+    assert_eq!(
+        toolchain_problems(PINNED_TOOLCHAIN, &with_riscv, &[]),
+        expected
+    );
+    let in_a_comment = format!("{PINNED_TOOLCHAIN}# targets = [\"riscv64gc-unknown-linux-gnu\"]\n");
+    assert_eq!(
+        toolchain_problems(&in_a_comment, &with_riscv, &[]),
+        expected,
+        "a commented-out target is not installed"
+    );
+    let one_line = PINNED_TOOLCHAIN.replacen(
+        "targets = [\n    \"x86_64-unknown-linux-gnu\",\n    \"x86_64-pc-windows-msvc\", # the judge's Windows branch\n]",
+        "targets = [\"x86_64-unknown-linux-gnu\"]",
+        1,
+    );
+    assert_ne!(one_line, PINNED_TOOLCHAIN);
+    assert_eq!(
+        toolchain_problems(&one_line, &named, &[]),
+        ["targets lacks x86_64-pc-windows-msvc, which a workflow or a script builds with"]
+    );
+
+    assert_eq!(
+        toolchain_problems(
+            PINNED_TOOLCHAIN,
+            &named,
+            &["rust/rust-toolchain.toml".to_string()]
+        ),
+        [
+            "rust/rust-toolchain.toml is a second toolchain file: a second compiler is a second cache"
+        ]
+    );
+}
+
+#[test]
+fn toolchain_k1_finds_a_second_toolchain_file_anywhere_but_in_build_output() {
+    let root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("k1-walk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for file in [
+        "rust-toolchain.toml",
+        "rust/rust-toolchain",
+        "a/b/rust-toolchain.toml",
+        "rust/target/rust-toolchain.toml",
+        "rust/target-sil/rust-toolchain.toml",
+        "npm/node_modules/x/rust-toolchain.toml",
+        ".git/rust-toolchain.toml",
+        "scripts/not-a-rust-toolchain.toml",
+    ] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, "[toolchain]\nchannel = \"1.99.0\"\n").expect("write");
+    }
+    let found = other_toolchain_files(&root);
+    std::fs::remove_dir_all(&root).expect("clean the scratch tree");
+    assert_eq!(found, ["a/b/rust-toolchain.toml", "rust/rust-toolchain"]);
+}
+
+// --- CI-K4: the profile of the judge in the table, and the DAG that stays off by default --------------------------------
+
+/// CI-K4 (D-K4a, D-K4b): the rows that compile in the `dev` profile (B1 and DC, and the readers of T_dbg, which name the
+/// profile of the row that builds their target: DBG, CT, D2, D3 and NLI, CI-E11; `test` inherits from `dev`, so the tokens
+/// are DEV and never TEST) carry exactly `CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0` and
+/// `CARGO_PROFILE_DEV_STRIP=symbols`, and no other row carries any `CARGO_INCREMENTAL` or `CARGO_PROFILE_*` token: the
+/// release rows (B3, REL, E2E) already build with no debuginfo and with strip, and CV and M have a seed and an
+/// instrumentation of their own that a profile of the table would move. The table is the one source: merge-gate.sh
+/// exports none of them.
+#[test]
+fn only_the_rows_that_compile_in_dev_carry_the_profile_of_the_judge() {
+    let profile = [
+        ("CARGO_INCREMENTAL", "0"),
+        ("CARGO_PROFILE_DEV_DEBUG", "0"),
+        ("CARGO_PROFILE_DEV_STRIP", "symbols"),
+    ];
+    let rows = dag_rows();
+    for id in [
+        "B1", "DBG", "CT", "D2", "D3", "NLI", "DC", "P", "B3", "REL", "E2E", "CV", "M",
+    ] {
+        assert!(
+            rows.iter().any(|row| row.1 == id),
+            "gate-dag.txt has no row {id}: the scan would pass over nothing"
+        );
+    }
+    for (_, id, _, line) in &rows {
+        let env = row_env(line);
+        let carries = matches!(
+            id.as_str(),
+            "B1" | "DBG" | "CT" | "D2" | "D3" | "NLI" | "DC"
+        );
+        for (name, value) in profile {
+            let got = row_value(&env, name);
+            if carries {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(value),
+                    "row {id} compiles in dev and has to carry {name}={value}: {line}"
+                );
+            } else {
+                assert!(
+                    got.is_none(),
+                    "row {id} does not compile in dev and names {name}: {line}"
+                );
+            }
+        }
+        for (name, _) in &env {
+            let is_profile = name == "CARGO_INCREMENTAL" || name.starts_with("CARGO_PROFILE_");
+            assert!(
+                !is_profile || profile.iter().any(|(known, _)| known == name),
+                "row {id} names {name}, which is not one of the three tokens of the profile: {line}"
+            );
+        }
+    }
+}
+
+/// CI-K4 (D-K4n, S15): the DAG is not the default in any of the forms that turn it on, `1`, `maximo` or `auto`, while a
+/// line of the latency list is pending; `0` and `serie` are the series and are never refused. The guard is first judged
+/// on those values, and then (`the_dag_is_not_the_default_while_a_latency_line_is_pending`) on the file.
+#[test]
+fn the_dag_is_not_the_default_in_any_of_its_forms_while_a_latency_line_is_pending() {
+    for default in ["1", "auto", "maximo"] {
+        let refused = activation_problem(default, 2);
+        assert!(
+            refused.as_ref().is_some_and(|text| text.contains(&format!(
+                "GATE_DAG defaults to {default} with 2 pending line(s)"
+            ))),
+            "a default of {default} with two pending lines is not refused: {refused:?}"
+        );
+        assert!(
+            activation_problem(default, 0).is_none(),
+            "a default of {default} with nothing pending is refused"
+        );
+    }
+    for default in ["0", "serie"] {
+        assert!(
+            activation_problem(default, 2).is_none(),
+            "the series is refused as a default of {default}"
+        );
+    }
+}
+
+// --- CI-K8: `docs` is the default, and the build without it is only compiled and linted -------------------------------
+// D-K8a: the default build carries `docs`, so the one round of tests runs what is published. D-K8d, D-K8g, D-K8h: the row
+// DC is the one place that drops the feature, and it runs `cargo clippy` only. D-K8e, D-K8f: the release build of the
+// gate asks for the set that publish.yml publishes on Linux x64.
+
+/// The `features:` of the matrix element of `publish.yml` whose `target:` is `target`, sorted like `features_asked_for`.
+fn published_features(workflow: &str, target: &str) -> Option<Vec<String>> {
+    let mut current_target: Option<&str> = None;
+    for line in workflow.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("- os:") {
+            current_target = None;
+        } else if let Some(name) = trimmed.strip_prefix("target:") {
+            current_target = Some(name.trim());
+        } else if let Some(list) = trimmed.strip_prefix("features:")
+            && current_target == Some(target)
+        {
+            let mut features: Vec<String> = list
+                .split(',')
+                .map(|feature| feature.trim().trim_matches('"').to_string())
+                .filter(|feature| !feature.is_empty())
+                .collect();
+            features.sort();
+            features.dedup();
+            return Some(features);
+        }
+    }
+    None
+}
+
+/// CI-K8 (D-K8f). The release build of the gate (the single `--release --no-run` call of run-all-tests.sh, whose binary the
+/// E2E and the placement check judge) asks for the features that publish.yml publishes on Linux x64. Without this the
+/// E2E could judge a binary that is not the one people install.
+#[test]
+fn the_release_build_of_the_gate_asks_for_what_publish_yml_publishes_on_linux_x64() {
+    let published = published_features(
+        &read(".github/workflows/publish.yml"),
+        "x86_64-unknown-linux-gnu",
+    )
+    .expect("publish.yml has no matrix element with target x86_64-unknown-linux-gnu and a features: line");
+    assert!(
+        !published.is_empty(),
+        "publish.yml publishes x86_64-unknown-linux-gnu with no features: the comparison below would be vacuous"
+    );
+    let suite = read("scripts/run-all-tests.sh");
+    let code: String = outside_self_test(&suite)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let no_run: Vec<Vec<String>> = cargo_invocations(&code)
+        .into_iter()
+        .filter(|args| {
+            args.iter().any(|arg| arg == "--release") && args.iter().any(|arg| arg == "--no-run")
+        })
+        .collect();
+    assert_eq!(
+        no_run.len(),
+        1,
+        "scripts/run-all-tests.sh must make exactly one `--release --no-run` cargo call outside its self-test, and it \
+         makes {}",
+        no_run.len()
+    );
+    let asked = features_asked_for(&no_run[0]);
+    assert_eq!(
+        asked,
+        published,
+        "publish.yml publishes x86_64-unknown-linux-gnu with {published:?}, and the `--release --no-run` call of \
+         scripts/run-all-tests.sh (`cargo {}`) asks for {asked:?}: the E2E would judge a binary other than the one that \
+         is published",
+        no_run[0].join(" ")
+    );
+}
+
+/// CI-K8 (D-K8f). The reading of publish.yml is judged first: the element of another target does not answer for this one,
+/// a features line outside the element is not read, and a target with no element answers nothing.
+#[test]
+fn the_check_of_the_published_features_can_fail() {
+    let workflow = "\
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: docs,cuda
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            features: docs
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: docs,cuda,directml
+";
+    assert_eq!(
+        published_features(workflow, "x86_64-unknown-linux-gnu"),
+        Some(vec!["cuda".to_string(), "docs".to_string()])
+    );
+    assert_eq!(
+        published_features(workflow, "aarch64-unknown-linux-gnu"),
+        Some(vec!["docs".to_string()]),
+        "the features of the element above are not the features of this one"
+    );
+    assert_eq!(
+        published_features(workflow, "riscv64-unknown-linux-gnu"),
+        None
+    );
+}
+
+/// The code of a script that can call cargo: outside its self-test, without whole-line comments and without the lines that
+/// only print or refuse (their words are prose, not calls).
+fn calls_cargo_code(body: &str) -> String {
+    outside_self_test(body)
+        .into_iter()
+        .map(|(_, line)| line)
+        .filter(|line| {
+            !line.trim_start().starts_with('#')
+                && !matches!(
+                    line.split_whitespace().next(),
+                    Some("echo" | "printf" | "gate_refuse")
+                )
+        })
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// CI-K8 (D-K8g). The feature is dropped in one cargo call of the scripts of the judge, the one of `step_DC`, and no call
+/// asks for `docs` alone (the default carries it). A row that lost `docs` in silence would test another binary.
+#[test]
+fn only_the_step_dc_drops_the_docs_feature_and_no_call_asks_for_docs_alone() {
+    let mut dropping: Vec<String> = Vec::new();
+    let mut alone: Vec<String> = Vec::new();
+    let mut calls = 0;
+    for script in [
+        "merge-gate.sh",
+        "run-all-tests.sh",
+        "crap-gate.sh",
+        "mutants-gate.sh",
+        "build-gpu.sh",
+    ] {
+        let code = calls_cargo_code(&read(&format!("scripts/{script}")));
+        for args in cargo_invocations(&code) {
+            calls += 1;
+            if args.iter().any(|arg| arg == "--no-default-features") {
+                dropping.push(format!("{script}: cargo {}", args.join(" ")));
+            }
+            if features_asked_for(&args) == ["docs"] {
+                alone.push(format!("{script}: cargo {}", args.join(" ")));
+            }
+        }
+    }
+    assert!(
+        calls > 20,
+        "the scan read {calls} cargo call(s) in the five scripts of the judge: it no longer matches how they are written"
+    );
+    assert_eq!(
+        dropping.len(),
+        1,
+        "--no-default-features in {} cargo calls; only step_DC may drop docs: {dropping:#?}",
+        dropping.len()
+    );
+    assert!(
+        dropping[0].starts_with("merge-gate.sh: cargo clippy "),
+        "the one call that drops docs is the clippy of step_DC in merge-gate.sh, and it is {dropping:?}"
+    );
+    let gate = read("scripts/merge-gate.sh");
+    let body = step_body(&gate, "DC").expect("merge-gate.sh has a step_DC()");
+    assert!(
+        body.iter()
+            .any(|line| line.contains("--no-default-features")),
+        "the call that drops docs is not in the body of step_DC: {dropping:?}"
+    );
+    assert!(
+        alone.is_empty(),
+        "these calls ask for `--features docs` alone, and the default build carries it already: {alone:#?}"
+    );
+}
+
+/// CI-K8 (D-K8c, D-K8h). The step DC compiles and lints the build without docs and runs no test: one cargo call, no lane,
+/// no model; its row names the target and nothing else (no cluster).
+#[test]
+fn the_dc_row_only_compiles_and_lints_the_build_without_docs() {
+    let gate = read("scripts/merge-gate.sh");
+    let outside: String = outside_self_test(&gate)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let body =
+        step_body(&outside, "DC").expect("merge-gate.sh has a step_DC() outside its self-test");
+    let code: Vec<&String> = body
+        .iter()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect();
+    for forbidden in ["cargo test", "run_in_lane", "gate_model_env"] {
+        assert!(
+            !code.iter().any(|line| line.contains(forbidden)),
+            "step_DC runs `{forbidden}`: the build without docs is only compiled and linted, so it runs no test, opens no \
+             lane and reads no model. Body: {code:#?}"
+        );
+    }
+    let calls = cargo_invocations(&calls_cargo_code(&body.join("\n")));
+    assert_eq!(
+        calls.len(),
+        1,
+        "step_DC makes {} cargo calls and has to make one, `cargo clippy --all-targets --no-default-features -- -D warnings`: {calls:?}",
+        calls.len()
+    );
+    let args = &calls[0];
+    for needed in ["clippy", "--all-targets", "--no-default-features"] {
+        assert!(
+            args.iter().any(|arg| arg == needed),
+            "the call of step_DC lacks `{needed}`: cargo {}",
+            args.join(" ")
+        );
+    }
+    assert!(
+        code.iter()
+            .any(|line| line.contains("cargo clippy") && line.contains("-- -D warnings")),
+        "the clippy of step_DC does not deny warnings (`-- -D warnings`): a warning that only exists without docs would pass. Body: {code:#?}"
+    );
+    let row = dag_rows()
+        .into_iter()
+        .find(|row| row.1 == "DC")
+        .expect("gate-dag.txt has a row DC")
+        .3;
+    assert_eq!(
+        resources_of(&row),
+        ["target:T_docs"],
+        "the row DC opens no database and reads no model: its only resource is its target. Row: {row}"
+    );
+}
+
+/// The name of the switch that makes `resolve_database_url` refuse, with exit 2, to fall back on the
+/// default database (T-DBURL). The judge exports it so that a process it starts without a
+/// `DATABASE_URL` reaches neither the developer's corpus on 127.0.0.1:5488 nor Docker.
+const REQUIRE_DATABASE_URL: &str = "MEMORY_INDUSTRY_REQUIRE_DATABASE_URL";
+
+/// What makes a line of a gate script a step: it starts the tests, the binary or one of the other
+/// gates, which is where a process without a database URL would be born.
+const GATE_STEP_MARKS: [&str; 9] = [
+    "cargo test",
+    "cargo llvm-cov",
+    "cargo mutants",
+    "scripts/run-all-tests.sh",
+    "scripts/crap-gate.sh",
+    "scripts/mutants-gate.sh",
+    "gate-dag.py",
+    "\"$bin\"",
+    "\"$CUBA_BINARY_PATH\"",
+];
+
+/// The code of `body` outside its self-test: no comments and no `echo` lines, which name steps
+/// without running them. `(line number, trimmed line)`.
+fn gate_code(body: &str) -> Vec<(usize, &str)> {
+    outside_self_test(body)
+        .into_iter()
+        .map(|(n, line)| (n, line.trim()))
+        .filter(|(_, line)| !line.starts_with('#') && !line.starts_with("echo "))
+        .collect()
+}
+
+/// The line of the first step of `body`, if it has one.
+fn first_gate_step(body: &str) -> Option<usize> {
+    gate_code(body)
+        .into_iter()
+        .find(|(_, line)| GATE_STEP_MARKS.iter().any(|mark| line.contains(mark)))
+        .map(|(n, _)| n)
+}
+
+/// What is wrong with how `body` exports the switch, as sentences; empty when it is right: one
+/// `export MEMORY_INDUSTRY_REQUIRE_DATABASE_URL=1` outside the self-test, before the first step,
+/// and nothing that unsets it.
+fn require_database_url_problems(body: &str) -> Vec<String> {
+    let code = gate_code(body);
+    let export = format!("export {REQUIRE_DATABASE_URL}=1");
+    let exports: Vec<usize> = code
+        .iter()
+        .filter(|(_, line)| *line == export)
+        .map(|(n, _)| *n)
+        .collect();
+    let mut problems = Vec::new();
+
+    match exports.as_slice() {
+        [] => problems.push(format!(
+            "no line outside the self-test exports {REQUIRE_DATABASE_URL}=1"
+        )),
+        [only] => {
+            if let Some(step) = first_gate_step(body)
+                && *only > step
+            {
+                problems.push(format!(
+                    "the export of {REQUIRE_DATABASE_URL} is on line {only}, after the first step \
+                     on line {step}: that step runs without it"
+                ));
+            }
+        }
+        many => problems.push(format!(
+            "{REQUIRE_DATABASE_URL}=1 is exported {} times (lines {many:?}); one export is the \
+             rule, so that nobody has to guess which one counts",
+            many.len()
+        )),
+    }
+    for (n, line) in &code {
+        let unsets = line.contains(REQUIRE_DATABASE_URL)
+            && (line.starts_with("unset ") || line.contains(" -u ") || line.contains("env -u"));
+        if unsets {
+            problems.push(format!(
+                "line {n} takes {REQUIRE_DATABASE_URL} away outside the self-test: a step after \
+                 it runs without the switch"
+            ));
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_switch_check_fails_on_each_way_the_judge_can_forget_to_export_it() {
+    let export = format!("export {REQUIRE_DATABASE_URL}=1");
+    let rows: [(&str, String, bool); 10] = [
+        (
+            "the export before the first step",
+            format!("{export}\ncargo test\n"),
+            false,
+        ),
+        ("no export at all", "cargo test\n".to_string(), true),
+        (
+            "the export after the first step",
+            format!("scripts/run-all-tests.sh\n{export}\n"),
+            true,
+        ),
+        (
+            "the export with an empty value",
+            format!("export {REQUIRE_DATABASE_URL}=\ncargo test\n"),
+            true,
+        ),
+        (
+            "an unset after the export",
+            format!("{export}\nunset {REQUIRE_DATABASE_URL}\ncargo test\n"),
+            true,
+        ),
+        (
+            "an env -u that starts a step without it",
+            format!("{export}\nenv -u {REQUIRE_DATABASE_URL} cargo test\n"),
+            true,
+        ),
+        (
+            "an export that lives only in the self-test",
+            format!("{SELF_TEST_BEGIN}\n{export}\n{SELF_TEST_END}\ncargo test\n"),
+            true,
+        ),
+        (
+            "two exports",
+            format!("{export}\n{export}\ncargo test\n"),
+            true,
+        ),
+        (
+            "a comment and an echo that name a step before the export",
+            format!("# cargo test comes later\necho \"cargo test\"\n{export}\ncargo test\n"),
+            false,
+        ),
+        (
+            "a step only inside the self-test before the export",
+            format!("{SELF_TEST_BEGIN}\ncargo test\n{SELF_TEST_END}\n{export}\ncargo test\n"),
+            false,
+        ),
+    ];
+
+    for (name, body, red) in rows {
+        let problems = require_database_url_problems(&body);
+        assert_eq!(
+            !problems.is_empty(),
+            red,
+            "{name}: expected {}, got {problems:?}",
+            if red { "a problem" } else { "none" }
+        );
+    }
+}
+
+/// The two scripts that start the tests of the judge. `merge-gate.sh` exports the switch beside the
+/// owner of the gate lock, before its first step; `run-all-tests.sh` beside `CUBA_JUDGE`, because it
+/// is also started alone. A script that lost the line starts its tests with no guard against the
+/// default database; no test would say so, because the ones that need it would simply not exist yet.
+#[test]
+fn both_judge_scripts_export_the_switch_before_their_first_step() {
+    for script in ["scripts/merge-gate.sh", "scripts/run-all-tests.sh"] {
+        let body = read(script).replace("\r\n", "\n");
+        assert!(
+            first_gate_step(&body).is_some(),
+            "{script} has no line the scan takes for a step, so a green answer would prove \
+             nothing: the marks are {GATE_STEP_MARKS:?}"
+        );
+        let problems = require_database_url_problems(&body);
+        assert!(
+            problems.is_empty(),
+            "{script} must export {REQUIRE_DATABASE_URL}=1 once, outside its self-test and before \
+             its first step, so that a process the judge starts with no DATABASE_URL (a Python \
+             client, a call in the test process) refuses with exit 2 instead of reaching the \
+             database the developer's own memory lives in. Problems: {problems:#?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// CI-K9a: the judge does not use the interop of Windows
+
+/// The BASH_ENV of the probe: the shell counts its commands (functions included, `set -T`), writes the PATH it has at each
+/// one over `K9_PROBE_OUT`, and exits at the `K9_PROBE_N`-th. What stays in the file is the PATH of the last command seen,
+/// at the `K9_PROBE_N`-th or when the script ended, whichever came first. A child bash skips it (`K9_PROBE_ON` is
+/// exported), so only the script that was launched is watched, and none of its self-test runs further than its first steps.
+const PATH_PROBE: &str = r#"if [[ -z "${K9_PROBE_ON:-}" ]]; then
+  export K9_PROBE_ON=1
+  k9_n=0
+  set -T
+  trap 'k9_n=$((k9_n + 1)); printf "%s" "$PATH" >"$K9_PROBE_OUT"; if ((k9_n >= K9_PROBE_N)); then exit 0; fi' DEBUG
+fi
+"#;
+
+/// The PATH `script --self-test` has once it has run `K9_PROBE_N` commands (or ended), launched with `ostype` as its
+/// OSTYPE when given and with a PATH that holds Windows directories first, in the middle and last. A loop counts each
+/// turn: the filter of a PATH of 8 entries takes about 40 commands, so the number leaves room for it. `None` if the
+/// script never ran a command.
+fn path_after_start(probe_dir: &Path, script: &str, ostype: Option<&str>) -> Option<String> {
+    let work = probe_dir.join(format!("{script}-{}", ostype.unwrap_or("own")));
+    let _ = std::fs::remove_dir_all(&work);
+    for dir in ["home", "xdg", "t", "stand"] {
+        std::fs::create_dir_all(work.join(dir)).expect("creating the directory of a probe run");
+    }
+    // quality-gate.sh refuses to start its self-test without lizard; the stand-in is only found, never run.
+    let lizard = work.join("stand").join("lizard");
+    std::fs::write(&lizard, "#!/bin/sh\nexit 0\n").expect("writing the lizard stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lizard, std::fs::Permissions::from_mode(0o755))
+            .expect("making the lizard stand-in executable");
+    }
+    let out = work.join("path.out");
+    let mut command = std::process::Command::new("timeout");
+    command
+        .args(["-k", "5", "120"])
+        .arg(git_bash())
+        .arg(repo_root().join("scripts").join(script))
+        .arg("--self-test")
+        .current_dir(repo_root())
+        .env_clear()
+        .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
+        .env(
+            "PATH",
+            format!(
+                "{}:/mnt/c/k9a-windows:/usr/bin:/mnt/d/k9a/bin:/bin:/mntools/bin:/mnt/c/k9a-last",
+                work.join("stand").display()
+            ),
+        )
+        .env("HOME", work.join("home"))
+        .env("XDG_CACHE_HOME", work.join("xdg"))
+        .env("TMPDIR", work.join("t"))
+        .env("BASH_ENV", probe_dir.join("probe.sh"))
+        .env("K9_PROBE_OUT", &out)
+        .env("K9_PROBE_N", "80")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(ostype) = ostype {
+        command.env("OSTYPE", ostype);
+    }
+    command
+        .status()
+        .expect("running a script under the PATH probe");
+    std::fs::read_to_string(&out).ok()
+}
+
+/// K9a.1 and K9a.3. On Linux a script of the judge has no entry that starts with /mnt/ on its PATH by its 80th command,
+/// wherever the entry was and whoever launched it, and keeps the others (a neighbour such as /mntools included): every
+/// command it looks for and does not find walks the whole PATH, and the one WSL adds is 68 directories of 9p, 29.5 s
+/// for `command -v cygpath` three times (9-nov-2026). Where OSTYPE says msys the PATH is the user's and is not touched.
+/// The scripts are the ones of SCRIPTS_WITH_SELF_TEST, so a new one is judged without being listed here.
+#[test]
+fn every_judge_script_drops_the_windows_entries_of_its_path_at_the_start() {
+    let probe_dir = std::env::temp_dir().join(format!("k9a-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&probe_dir);
+    std::fs::create_dir_all(&probe_dir).expect("creating the directory of the probe");
+    std::fs::write(probe_dir.join("probe.sh"), PATH_PROBE).expect("writing the probe");
+    let results: Vec<(&str, Option<&str>, Option<String>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = SCRIPTS_WITH_SELF_TEST
+            .iter()
+            .flat_map(|&name| [(name, None), (name, Some("msys"))])
+            .map(|(name, ostype)| {
+                let probe_dir = &probe_dir;
+                scope.spawn(move || (name, ostype, path_after_start(probe_dir, name, ostype)))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("a probe run panicked"))
+            .collect()
+    });
+    let _ = std::fs::remove_dir_all(&probe_dir);
+    let mut problems = Vec::new();
+    for (name, ostype, seen) in &results {
+        let Some(path) = seen else {
+            problems.push(format!(
+                "scripts/{name} (OSTYPE {ostype:?}) ran no command, so its PATH was never seen"
+            ));
+            continue;
+        };
+        let entries: Vec<&str> = path.split(':').collect();
+        if ostype.is_some() {
+            if !entries.contains(&"/mnt/c/k9a-windows") {
+                problems.push(format!(
+                    "scripts/{name} changed the PATH where OSTYPE says msys: {path}"
+                ));
+            }
+            continue;
+        }
+        if entries.iter().any(|entry| entry.starts_with("/mnt/")) {
+            problems.push(format!("scripts/{name} still has /mnt/ entries: {path}"));
+        }
+        for kept in ["/usr/bin", "/bin", "/mntools/bin"] {
+            if !entries.contains(&kept) {
+                problems.push(format!("scripts/{name} lost {kept} from its PATH: {path}"));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "the PATH of the judge's scripts (CI-K9a): {problems:#?}"
+    );
+}
+
+/// K9a.2. Outside the self-tests, a script asks `cygpath` only after it has looked at OSTYPE: the line before a use,
+/// or the three before it, say `OSTYPE`, or the use is in gate-lock.sh, which owns the functions that do. Probing for
+/// the command instead decides "Windows" by what the PATH holds, and a PATH of 68 directories of 9p made each failed
+/// probe cost seconds. (The call of a function that wraps it is not a use: only the word is.) The scan has to fail first.
+#[test]
+fn outside_the_self_tests_cygpath_is_asked_only_where_ostype_says_windows() {
+    let fixture = "if [[ \"$OSTYPE\" == msys* ]]; then\n  p=\"$(cygpath -m /)\"\nfi\necho b\necho c\necho d\nq=\"$(cygpath -u /)\"\n";
+    assert_eq!(
+        cygpath_without_ostype(fixture),
+        vec![7],
+        "the scan of cygpath uses must see line 7 and only that one"
+    );
+    let mut offenders = Vec::new();
+    let mut seen = 0;
+    for entry in std::fs::read_dir(repo_root().join("scripts")).expect("scripts/") {
+        let path = entry.expect("an entry of scripts/").path();
+        let name = path
+            .file_name()
+            .expect("a file name")
+            .to_string_lossy()
+            .into_owned();
+        if !name.ends_with(".sh") || name == "gate-lock.sh" {
+            continue;
+        }
+        seen += 1;
+        let body = read(&format!("scripts/{name}")).replace("\r\n", "\n");
+        let code: String = outside_self_test(&body)
+            .into_iter()
+            .map(|(_, line)| format!("{line}\n"))
+            .collect();
+        for line in cygpath_without_ostype(&code) {
+            offenders.push(format!(
+                "scripts/{name} (line {line} of the code outside its self-test)"
+            ));
+        }
+    }
+    assert!(
+        seen >= 10,
+        "the scan read only {seen} scripts: it is broken"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these scripts ask cygpath without having looked at OSTYPE (CI-K9a): {offenders:#?}"
+    );
+}
+
+/// The lines (1-based) of `code` that use `cygpath` with no `OSTYPE` in the three lines before them or in their own.
+/// Comments are not uses.
+fn cygpath_without_ostype(code: &str) -> Vec<usize> {
+    let lines: Vec<&str> = code.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with('#') && line.contains("cygpath"))
+        .filter(|(index, line)| {
+            let from = index.saturating_sub(3);
+            !line.contains("OSTYPE")
+                && !lines[from..*index]
+                    .iter()
+                    .any(|before| before.contains("OSTYPE"))
+        })
+        .map(|(index, _)| index + 1)
+        .collect()
 }

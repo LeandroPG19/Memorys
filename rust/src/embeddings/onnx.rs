@@ -1391,6 +1391,20 @@ mod tests {
         );
     }
 
+    /// `api-24` is a feature of `ort`, and it is what sets `ort::MINOR_VERSION`.
+    /// `ort` is declared without its default features, so the literal pins the
+    /// one that does not show up as a dependency.
+    #[test]
+    fn the_onnx_runtime_floor_is_1_24() {
+        assert_eq!(
+            ort::MINOR_VERSION,
+            24,
+            "this number comes from the `api-24` feature of `ort`; lowering it lets a runtime \
+             through that lacks functions this build calls, and raising it refuses a runtime \
+             the models already load on"
+        );
+    }
+
     /// With no runtime anywhere in the chain, loading the located runtime is
     /// an error that tells the operator how to get one — never `Ok`.
     ///

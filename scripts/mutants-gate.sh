@@ -36,6 +36,8 @@
 #                                                   ones LIST (a `cargo mutants --list --json`)
 #                                                   names, in both directions
 set -euo pipefail
+# CI-K9a: the judge does not use the interop of Windows. On Linux the PATH that WSL adds (/mnt/..., by 9p) goes before anything looks for a command: each one that is not found walks all of it. The same filter as gate_path_without_windows (gate-lock.sh), which this script cannot load first.
+if [[ "$OSTYPE" == linux* ]]; then k9_kept=""; IFS=: read -ra k9_dirs <<<"$PATH"; for k9_d in "${k9_dirs[@]}"; do [[ "$k9_d" == /mnt/* ]] || k9_kept="${k9_kept:+$k9_kept:}$k9_d"; done; PATH="$k9_kept"; unset k9_dirs k9_d k9_kept; fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 resolve_python() {
@@ -274,8 +276,8 @@ mutants_gb() { awk -v kb="$1" -v per="$MUTANTS_KB_PER_GB" 'BEGIN { printf "%.1f"
 # What cargo-mutants reads as its temp dir: TMP/TEMP on Windows, TMPDIR on Unix.
 mutants_system_temp() {
   local dir="${TMP:-${TEMP:-}}"
-  if [[ -n "$dir" ]] && command -v cygpath >/dev/null 2>&1; then
-    dir="$(cygpath -u "$dir")"
+  if [[ -n "$dir" ]] && gate_on_windows; then
+    dir="$(gate_native_path u "$dir")"
   else
     dir="${TMPDIR:-/tmp}"
   fi
@@ -290,7 +292,7 @@ MUTANTS_MARKER=.memory-industry-mutants
 
 mutants_scratch_dir() {
   local base="${MUTANTS_SCRATCH_DIR:-$(mutants_system_temp)}"
-  base="$(cygpath -u "$base" 2>/dev/null || printf '%s' "$base")"
+  base="$(gate_native_path u "$base")"
   printf '%s/memory-industry-mutants\n' "${base%/}"
 }
 
@@ -437,7 +439,7 @@ mutants_refuse_targets_in_tree() {
 mutants_refuse_target_dir_in_tree() {
   local dir="${CARGO_TARGET_DIR:-}"
   [[ -n "$dir" ]] || return 0
-  dir="$(cygpath -u "$dir" 2>/dev/null || printf '%s' "$dir")"
+  dir="$(gate_native_path u "$dir")"
   case "$dir" in
     /* | [A-Za-z]:*) ;;
     *) dir="$ROOT/rust/$dir" ;;
@@ -583,7 +585,7 @@ def load(path):
     recount = {
         "caught": sum(1 for s, _ in mutants.values() if s == "CaughtMutant"),
         "missed": sum(1 for s, _ in mutants.values() if s == "MissedMutant"),
-        "timeout": sum(1 for s, _ in mutants.values() if s == "TimeoutMutant"),
+        "timeout": sum(1 for s, _ in mutants.values() if s == "Timeout"),
         "unviable": sum(1 for s, _ in mutants.values() if s == "Unviable"),
     }
     for field, count in recount.items():
@@ -668,7 +670,7 @@ mutants_seed_inputs() { # the inputs the key is the hash of (D-F4d)
   printf 'format=%s\n' "$MUTANTS_SEED_FORMAT"
   for f in "$ROOT/rust/Cargo.lock" "$ROOT/rust/Cargo.toml" "$ROOT/rust/.cargo/config.toml" \
     "$ROOT/.cargo/config.toml" "${CARGO_HOME:-$HOME/.cargo}/config.toml" \
-    "$ROOT/rust/rust-toolchain.toml" "$ROOT/rust/rust-toolchain"; do
+    "$ROOT/rust-toolchain.toml" "$ROOT/rust/rust-toolchain.toml" "$ROOT/rust/rust-toolchain"; do
     if [[ -f "$f" ]]; then
       printf 'file %s %s\n' "${f#"$ROOT"/}" "$(sha256sum "$f" | cut -d' ' -f1)"
     else
@@ -909,7 +911,7 @@ mutants_lab_run() {
   # D-F4p: the epoch is the newest mtime of the seed (the third field of seed.before), never the start of this run.
   seed_epoch="$(awk '{print $NF}' "$OUT_DIR/seed.before" | LC_ALL=C sort -n | tail -n 1)"
   shim_scratch="$(cd "$MUTANTS_SCRATCH" && pwd -P)"
-  scratch_native="$(cygpath -w "$MUTANTS_SCRATCH" 2>/dev/null || printf '%s' "$MUTANTS_SCRATCH")"
+  scratch_native="$(gate_native_path w "$MUTANTS_SCRATCH")"
   # The build of each mutant gets its share of the cores the gate counted (CI-F1, D-F1b): max(1, floor(N / jobs)).
   build_jobs=$(( GATE_CARGO_JOBS / jobs ))
   (( build_jobs >= 1 )) || build_jobs=1
@@ -983,6 +985,8 @@ self_test() {
   hermetic="$(mktemp -d)"
   mkdir -p "$hermetic/home" "$hermetic/cache"
   export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
+  # The PATH is not filtered here: the filter at the top of the script (CI-K9a) drops the directories of Windows where
+  # OSTYPE says Linux, and where it says msys the PATH is the user's and a second filter would change it.
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp" "$hermetic"' EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
@@ -1152,13 +1156,13 @@ self_test() {
     "echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'" \
     'echo "fake 0 0 ${FAKE_DF_AVAIL_KB} 0% $last"' > "$tmp/bin/df"
   # The cargo stand-in logs its argv and environment on FAKE_CALLS (the first seven columns
-  # are the ones the rows above read). The CI-F4 rows switch on what a real run would
+  # are the ones the rows above read; the twelfth is the RUSTUP_TOOLCHAIN it saw, K9b). The CI-F4 rows switch on what a real run would
   # leave behind, through FAKE_* variables that only they set: the outcomes and the
   # baseline log of a mutation run, the --list names, the artifacts of a seed build, the
   # interrupted build, the probe of the stage's inodes and the touch of a seed file.
   cat > "$tmp/bin/cargo" <<'FAKE'
 #!/bin/bash
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$*" "${TMP:-}" "${TEMP:-}" "${TMPDIR:-}" "${CARGO_PROFILE_DEV_DEBUG:-}" "${CARGO_INCREMENTAL:-}" "${CARGO_BUILD_JOBS:-unset}" "${CARGO_TARGET_DIR:-}" "$PWD" "${CARGO:-}" "$(env | grep -c '^MUTANTS_SHIM_' || true)" >> "$FAKE_CALLS"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$*" "${TMP:-}" "${TEMP:-}" "${TMPDIR:-}" "${CARGO_PROFILE_DEV_DEBUG:-}" "${CARGO_INCREMENTAL:-}" "${CARGO_BUILD_JOBS:-unset}" "${CARGO_TARGET_DIR:-}" "$PWD" "${CARGO:-}" "$(env | grep -c '^MUTANTS_SHIM_' || true)" "${RUSTUP_TOOLCHAIN-unset}" >> "$FAKE_CALLS"
 if [[ "$*" == -V ]]; then echo "cargo ${FAKE_CARGO_VERSION:-1.99.0 (fake)}"; exit 0; fi
 if [[ " $* " == *" --list "* ]]; then
   [[ -z "${FAKE_LIST_JSON:-}" ]] || cat "$FAKE_LIST_JSON"
@@ -1340,6 +1344,7 @@ FAKE
     mkdir -p "$tmp/$1/scripts" "$tmp/$1/rust"
     cp "$ROOT/scripts/mutants-gate.sh" "$ROOT/scripts/gate-lock.sh" "$tmp/$1/scripts/"
     [[ ! -f "$ROOT/package.json" ]] || cp "$ROOT/package.json" "$tmp/$1/"
+    [[ ! -f "$ROOT/rust-toolchain.toml" ]] || cp "$ROOT/rust-toolchain.toml" "$tmp/$1/"
   }
   norm() { cygpath -m "$1" 2>/dev/null || printf '%s' "$1"; }
   home="$tmp/home"
@@ -1369,7 +1374,7 @@ FAKE
     rc=0
     env -u CARGO -u MUTANTS_SCRATCH_GB_PER_COPY -u MUTANTS_SCRATCH_DIR -u CUBA_GATE_LOCK_OWNER \
         -u CUBA_GATE_MIN_FREE_GB -u MUTANTS_JOBS -u FAKE_DF_FAIL -u CARGO_BUILD_JOBS \
-        -u CARGO_PROFILE_DEV_DEBUG -u CARGO_INCREMENTAL -u DATABASE_URL -u MUTANTS_KEEP_OUT \
+        -u CARGO_PROFILE_DEV_DEBUG -u CARGO_INCREMENTAL -u DATABASE_URL -u MUTANTS_KEEP_OUT -u RUSTUP_TOOLCHAIN \
         -u FAKE_PSQL_CLUSTER_NAME -u FAKE_PSQL_SYSID -u FAKE_PSQL_EXIT \
         "${e[@]}" ${extra[@]+"${extra[@]}"} \
         bash "$tmp/$t/scripts/mutants-gate.sh" "$@" >"$tmp/run.out" 2>"$tmp/run.err" || rc=$?
@@ -1749,7 +1754,7 @@ FAKE
   slice=user.slice/user-1000.slice
   self_scope='0::/user.slice/user-1000.slice/session-1.scope'
   cg_tree() { g5_root="$tmp/cg.$1/root"; g5_self="$tmp/cg.$1/self"; mkdir -p "$g5_root"; printf '%s\n' "$2" >"$g5_self"; }
-  cg_put() { mkdir -p "$g5_root/$1"; printf '%s\n' "$3" >"$g5_root/$1/$2"; }
+  cg_put() { [[ -d "$g5_root/$1" ]] || mkdir -p "$g5_root/$1"; printf '%s\n' "$3" >"$g5_root/$1/$2"; }
 
   # J5.1: 32 GB of cap with 20 GB in use leaves 12 GB under the cgroup, against the 40 GB
   # that MemAvailable says: the margin is the smaller, 12 GB, and 12 GB is 3 jobs, not 6.
@@ -1860,10 +1865,28 @@ FAKE
   # added under the scope, or when only the tightest level is in the tree. Three shapes of one
   # tree, one KB each, and the one the generator computed.
   p2_plan() { bash "$ROOT/scripts/mutants-gate.sh" --jobs-plan "$1" "$2" 2>/dev/null | sed -n 's/^jobs=//p' || true; }
+  # Measured 2026-11-09: these two loops start this script 600 times (360 and 240), and in series that was a third
+  # of this self-test. The cases are still drawn here, one after another from the one seed, so they are the cases
+  # they were; what is judged at the same time is each case, in a child that says its own red. par_wait waits for
+  # every child it is given and exits 1 if one of them did: a child nobody waits for is a green nobody saw.
+  # Four at a time, or the cores when that is fewer (CI-E7a, D-E7k: no two cores kept back): measured on 24 threads,
+  # the whole self-test was 57 s with 1, 38 s with 4, 38 s with 8 and 40 s with 22, and its CPU 62, 69, 86 and 138 s
+  # (the children are all fork). MUTANTS_SELF_TEST_JOBS=1 is the series, and gives the same verdict.
+  par_jobs="$(nproc 2>/dev/null || echo 1)"
+  (( par_jobs <= 4 )) || par_jobs=4
+  par_jobs="${MUTANTS_SELF_TEST_JOBS:-$par_jobs}"
+  [[ "$par_jobs" =~ ^[1-9][0-9]*$ ]] || par_jobs=1
+  par_pids=()
+  par_wait() {
+    local pid bad=0
+    for pid in "$@"; do wait "$pid" || bad=1; done
+    (( bad == 0 )) || exit 1
+  }
   RANDOM=20261106
   for ((p2_n = 0; p2_n < 120; p2_n++)); do
     p2_c=$(( RANDOM % 64 + 1 ))
     p2_kb=$(( (RANDOM * 32768 + RANDOM) % 80000001 ))
+    (
     p2_j="$(p2_plan "$p2_c" "$p2_kb")"
     [[ "$p2_j" =~ ^[1-6]$ ]] || self_fail "P2 seed 20261106, case $p2_n: --jobs-plan $p2_c $p2_kb printed '$p2_j', not a number of jobs from 1 to 6"
     p2_half=$(( p2_c / 2 )); (( p2_half >= 1 )) || p2_half=1
@@ -1874,9 +1897,15 @@ FAKE
     [[ "$p2_more" =~ ^[0-9]+$ ]] && (( p2_more >= p2_j )) || self_fail "P2 seed 20261106, case $p2_n: one more core gave '$p2_more' jobs, fewer than $p2_j"
     p2_more="$(p2_plan "$p2_c" $(( p2_kb + 4194304 )))"
     [[ "$p2_more" =~ ^[0-9]+$ ]] && (( p2_more >= p2_j )) || self_fail "P2 seed 20261106, case $p2_n: one GB more available gave '$p2_more' jobs, fewer than $p2_j"
+    ) &
+    par_pids+=("$!")
+    if (( ${#par_pids[@]} >= par_jobs )); then par_wait "${par_pids[@]}"; par_pids=(); fi
   done
+  par_wait ${par_pids[@]+"${par_pids[@]}"}
+  par_pids=()
 
   g5_meminfo p3 'MemTotal:       2000000000 kB' 'MemAvailable:   2000000000 kB'
+  p3_meminfo="$tmp/meminfo.p3"
   for ((p3_n = 0; p3_n < 60; p3_n++)); do
     p3_levels=$(( RANDOM % 4 + 1 ))
     p3_path=""; p3_lvl=(); p3_max=(); p3_cur=()
@@ -1898,35 +1927,39 @@ FAKE
       if [[ -z "$p3_want" ]] || (( p3_v < p3_want )); then p3_want=$p3_v; p3_tight=$p3_i; fi
     done
     p3_last=$(( p3_levels - 1 ))
-
-    cg_tree "p3a$p3_n" "0::/${p3_lvl[p3_last]}"
-    for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
-      cg_put "${p3_lvl[p3_i]}" memory.max "${p3_max[p3_i]}"
-      cg_put "${p3_lvl[p3_i]}" memory.current "${p3_cur[p3_i]}"
-    done
-    g5_run --available-kb "$tmp/meminfo.p3"
-    [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
-      || self_fail "P3 seed 20261106, case $p3_n: the margin of $p3_levels levels was '$(cat "$tmp/g5.out")' (exit $rc), not the minimum over them, $p3_want KB"
-
     p3_perm=()
     for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do p3_perm[p3_i]=$p3_i; done
     for ((p3_i = p3_last; p3_i > 0; p3_i--)); do
       p3_j=$(( RANDOM % (p3_i + 1) )); p3_t=${p3_perm[p3_i]}; p3_perm[p3_i]=${p3_perm[p3_j]}; p3_perm[p3_j]=$p3_t
     done
+
+    (
+    # A directory of this case's: its four trees, and the g5.out and g5.err of its runs.
+    tmp="$tmp/p3.$p3_n"
+    mkdir -p "$tmp"
+    cg_tree "p3a$p3_n" "0::/${p3_lvl[p3_last]}"
+    for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
+      cg_put "${p3_lvl[p3_i]}" memory.max "${p3_max[p3_i]}"
+      cg_put "${p3_lvl[p3_i]}" memory.current "${p3_cur[p3_i]}"
+    done
+    g5_run --available-kb "$p3_meminfo"
+    [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
+      || self_fail "P3 seed 20261106, case $p3_n: the margin of $p3_levels levels was '$(cat "$tmp/g5.out")' (exit $rc), not the minimum over them, $p3_want KB"
+
     cg_tree "p3b$p3_n" "0::/${p3_lvl[p3_last]}"
     for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
       p3_src=${p3_perm[p3_i]}
       cg_put "${p3_lvl[p3_i]}" memory.max "${p3_max[p3_src]}"
       cg_put "${p3_lvl[p3_i]}" memory.current "${p3_cur[p3_src]}"
     done
-    g5_run --available-kb "$tmp/meminfo.p3"
+    g5_run --available-kb "$p3_meminfo"
     [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
       || self_fail "P3 seed 20261106, case $p3_n: the same limits on other levels gave '$(cat "$tmp/g5.out")' (exit $rc), not $p3_want KB"
 
     cg_tree "p3c$p3_n" "0::/${p3_lvl[p3_tight]}"
     cg_put "${p3_lvl[p3_tight]}" memory.max "${p3_max[p3_tight]}"
     cg_put "${p3_lvl[p3_tight]}" memory.current "${p3_cur[p3_tight]}"
-    g5_run --available-kb "$tmp/meminfo.p3"
+    g5_run --available-kb "$p3_meminfo"
     [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
       || self_fail "P3 seed 20261106, case $p3_n: the tightest level alone gave '$(cat "$tmp/g5.out")' (exit $rc), not $p3_want KB"
 
@@ -1937,10 +1970,15 @@ FAKE
     done
     cg_put "${p3_lvl[p3_last]}/extra" memory.max max
     cg_put "${p3_lvl[p3_last]}/extra" memory.current 1
-    g5_run --available-kb "$tmp/meminfo.p3"
+    g5_run --available-kb "$p3_meminfo"
     [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
       || self_fail "P3 seed 20261106, case $p3_n: a level with max under the scope gave '$(cat "$tmp/g5.out")' (exit $rc), not $p3_want KB"
+    ) &
+    par_pids+=("$!")
+    if (( ${#par_pids[@]} >= par_jobs )); then par_wait "${par_pids[@]}"; par_pids=(); fi
   done
+  par_wait ${par_pids[@]+"${par_pids[@]}"}
+  par_pids=()
   unset g5_root g5_self
 
   # --- J1.9 (D-J1d): the mutation step, with a DATABASE_URL, asks that server who it is
@@ -2157,6 +2195,29 @@ PY
     self_fail "F4a.2: a different cargo path in argv[0] was taken for a different test (exit $rc): $(cat "$tmp/cmp.out" "$tmp/cmp.err")"
   fi
 
+  # F6c (the equivalence study of quality-gate.sh reads its classes with this comparator). cargo-mutants 27.1.0
+  # serializes the class of a mutant whose test timed out as "Timeout" (outcome.rs: Success, CaughtMutant,
+  # MissedMutant, Unviable, Failure, Timeout), and the comparator counted "TimeoutMutant", a name the tool never
+  # writes: a real timeout was in no total of its own. No fixture of F4 above holds a timeout; this is the first,
+  # written the way cargo-mutants writes it. mkout counts the old name for its own totals, so the total that
+  # cargo-mutants declares is spelled out, as in the row of a total that does not add up.
+  cmp_case tmo_ref Success "$(rec CaughtMutant "$N_MMR" "$T_REF"; rec Timeout "$N_RRF" "$T_REF"; rec Unviable "$N_CACHE" -; rec MissedMutant "$N_MISS" "$T_REF"; rec declare timeout 1)"
+  cmp_run "$cmp_dir/tmo_ref/outcomes.json" "$cmp_dir/tmo_ref/outcomes.json"
+  if (( rc != 0 )) || ! grep -qF 'OK  classes: 4/4 identical' "$tmp/cmp.out"; then
+    self_fail "F6c: a file with one \"Timeout\" record under timeout=1, compared with itself, was not 'OK  classes: 4/4 identical' (exit $rc; a timeout that the comparator does not count): $(cat "$tmp/cmp.out" "$tmp/cmp.err")"
+  fi
+  # The other direction: a "Timeout" record under a total of timeout=0 does not add up.
+  cmp_case tmo_undeclared Success "$(rec CaughtMutant "$N_MMR" "$T_REF"; rec Timeout "$N_RRF" "$T_REF"; rec Unviable "$N_CACHE" -; rec MissedMutant "$N_MISS" "$T_REF")"
+  cmp_run "$cmp_dir/ref/outcomes.json" "$cmp_dir/tmo_undeclared/outcomes.json"
+  if (( rc != 1 )) || ! grep -qF 'carries no per-mutant outcomes that add up to its totals: timeout is 0 and its records hold 1' "$tmp/cmp.err"; then
+    self_fail "F6c: a \"Timeout\" record under a total of timeout=0 was not refused with 'timeout is 0 and its records hold 1' (exit $rc): $(cat "$tmp/cmp.err")"
+  fi
+  # A timeout that turns caught is one difference, the class: the totals of both files add up, so nothing else.
+  cmp_run "$cmp_dir/tmo_ref/outcomes.json" "$cmp_dir/ref/outcomes.json"
+  if (( rc != 1 )) || ! grep -qF "class changed for $N_RRF: Timeout -> CaughtMutant" "$tmp/cmp.err" || [[ "$(grep -c '^FAIL' "$tmp/cmp.err")" != 1 ]]; then
+    self_fail "F6c: a Timeout that turns CaughtMutant was not exactly one FAIL, 'class changed for $N_RRF: Timeout -> CaughtMutant' (exit $rc): $(cat "$tmp/cmp.err")"
+  fi
+
   # F4b. The dependencies are built once per content (D-F4c..j). Every row here runs the
   # main path with a fake cargo: the seed is built, the stage copied, the guards judged.
   F4B_T="$T_REF"
@@ -2249,6 +2310,40 @@ PY
   k3="$last_key"
   f4b_run seedtree FAKE_RUSTC_VERSION='1.100.0 (fake)'
   f4b_new_key 'rustc -vV' "$k3"
+
+  # K9b.1 (CI-K9): the seed is built in a directory outside the tree, where rustup does not see rust-toolchain.toml and
+  # takes `stable`. The judge hands cargo the channel of the file of the root, exported (the double of cargo is a child: a
+  # variable that is set and not exported does not reach it). Without the file, nothing is exported and the run says so.
+  fresh
+  mk_crate_tree seedtree
+  printf '[toolchain]\nchannel = "1.98.1"\n' > "$tmp/seedtree/rust-toolchain.toml"
+  f4b_run seedtree
+  (( rc == 0 )) || self_fail "K9b.1: the run with a rust-toolchain.toml did not pass (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  build_line="$(grep -m1 '^test --no-run --lib ' "$tmp/cargo.calls" || true)"
+  [[ "$(printf '%s' "$build_line" | awk -F'\t' '{print $12}')" == 1.98.1 ]] \
+    || self_fail "K9b.1: the cargo that built the seed saw RUSTUP_TOOLCHAIN='$(printf '%s' "$build_line" | awk -F'\t' '{print $12}')', not the channel of the file of the root (1.98.1)"
+  fresh
+  mk_crate_tree seedtree
+  rm -f "$tmp/seedtree/rust-toolchain.toml"
+  f4b_run seedtree
+  (( rc == 0 )) || self_fail "K9b.1: the run without a rust-toolchain.toml did not pass (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  build_line="$(grep -m1 '^test --no-run --lib ' "$tmp/cargo.calls" || true)"
+  [[ "$(printf '%s' "$build_line" | awk -F'\t' '{print $12}')" == unset ]] \
+    || self_fail "K9b.1: without the file the cargo of the seed saw RUSTUP_TOOLCHAIN='$(printf '%s' "$build_line" | awk -F'\t' '{print $12}')'"
+  any_said 'rust-toolchain.toml' \
+    || self_fail "K9b.1: without the file the run did not say that no toolchain is pinned: $(cat "$tmp/run.out" "$tmp/run.err")"
+
+  # K9b.2: the seed key has the file of the root: another channel in it is another key. The channel alone is the
+  # difference here, so a key that listed only the files of rust/ would stay the same and the run would build nothing.
+  fresh
+  mk_crate_tree seedtree
+  printf '[toolchain]\nchannel = "1.98.1"\n' > "$tmp/seedtree/rust-toolchain.toml"
+  f4b_run seedtree
+  (( rc == 0 )) || self_fail "K9b.2: the first seed did not build (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
+  k0="$(built_key)"
+  printf '[toolchain]\nchannel = "1.98.2"\n' > "$tmp/seedtree/rust-toolchain.toml"
+  f4b_run seedtree
+  f4b_new_key 'rust-toolchain.toml of the root' "$k0"
 
   # F4b.3: the mutants get a stage of the tree with a copy of the seed, and the stage is removed.
   fresh
@@ -2684,11 +2779,15 @@ REAL
   # The tools of /usr/bin and /bin, each one linked, but the rustup proxies: /usr/bin/cargo and rustc are
   # links to rustup here, so no PATH that names /usr/bin can be without cargo.
   mkdir -p "$tmp/f4d/nocargo"
+  # One ln for all of them (measured 2026-11-09: one ln each was 1638 processes, 4 s): the first of each name, as before.
+  local -A f4d_seen=()
+  f4d_links=()
   for tool in /usr/bin/* /bin/*; do
     name="${tool##*/}"
     case "$name" in cargo|cargo-*|rustc|rustup|rust-*) continue ;; esac
-    if [[ -x "$tool" && ! -e "$tmp/f4d/nocargo/$name" ]]; then ln -s "$tool" "$tmp/f4d/nocargo/$name"; fi
+    if [[ -x "$tool" && -z "${f4d_seen[$name]:-}" ]]; then f4d_seen[$name]=1; f4d_links+=("$tool"); fi
   done
+  ln -s -t "$tmp/f4d/nocargo" -- "${f4d_links[@]}"
   node_bin="$(command -v node || true)"
   [[ -z "$node_bin" ]] || ln -sf "$node_bin" "$tmp/f4d/nocargo/node"
   printf '#!/bin/bash\nexec "$(dirname "$0")/cargo" "$@"\n' > "$tmp/f4d/nocargo/cargo-mutants"

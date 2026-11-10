@@ -733,6 +733,20 @@ mod profile_tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::assertions_on_constants,
+        reason = "the feature is fixed at compile time and this test is the alarm of a build without `docs`"
+    )]
+    fn the_default_build_carries_the_docs_feature() {
+        assert!(
+            cfg!(feature = "docs"),
+            "the default build has no `docs` feature: `cargo test` is the only round of tests, \
+             and without `docs` the 10 tests of `net` and `handlers::docs` would not run \
+             anywhere. `default = [\"docs\"]` in Cargo.toml is what the release publishes"
+        );
+    }
+
+    #[test]
     fn every_profiled_tool_actually_exists() {
         let names: Vec<&str> = tool_definitions()
             .iter()

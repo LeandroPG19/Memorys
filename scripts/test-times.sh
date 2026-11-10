@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# CI-K9a: the judge does not use the interop of Windows. On Linux the PATH that WSL adds (/mnt/..., by 9p) goes before anything looks for a command: each one that is not found walks all of it. The same filter as gate_path_without_windows (gate-lock.sh), which this script cannot load first.
+if [[ "$OSTYPE" == linux* ]]; then k9_kept=""; IFS=: read -ra k9_dirs <<<"$PATH"; for k9_d in "${k9_dirs[@]}"; do [[ "$k9_d" == /mnt/* ]] || k9_kept="${k9_kept:+$k9_kept:}$k9_d"; done; PATH="$k9_kept"; unset k9_dirs k9_d k9_kept; fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SELF="$ROOT/scripts/test-times.sh"
@@ -434,6 +436,39 @@ if [[ "${1:-}" == "--self-test" ]]; then
   rc=0
   bash "$SELF" --count "$tmp/U2.log" >"$tmp/U2.count.out" 2>&1 || rc=$?
   want_rc "U2.count" 2
+
+  # K4h (CI-K4, D-K4h): `cargo test --timings` prints `Timing report saved to <path>` on stderr, and the log of a
+  # section (run_counted merges stderr into it) and the log of a row of the planner hold it. It is no header, no
+  # result and no boundary: --count and --judge give the same answer with that line before the first header,
+  # between two blocks, at the boundary and after it as they give without it. The same log path is used for both
+  # runs, so what the judge prints about the file is the same too.
+  k4_line='   Timing report saved to /t/cargo-timings/cargo-timing-20261109T120000Z.html'
+  c1 linux windows >"$tmp/K4.txt"
+  simple_log linux slow=40.00 lib:memory_industry=21.51 >"$tmp/K4.log"
+  tt K4clean linux "$tmp/K4.log" "$tmp/K4.txt"
+  want_rc K4clean 0
+  clean_rc=$rc
+  bash "$SELF" --count "$tmp/K4.log" >"$tmp/K4count.clean" 2>&1 || self_fail "K4h: --count could not read the log with no timing line: $(cat "$tmp/K4count.clean")"
+  {
+    emit linux "$k4_line"
+    bin_block linux slow 40.00
+    emit linux "$k4_line"
+    bin_block linux lib:memory_industry 21.51
+    emit linux "$k4_line"
+    emit linux "$BOUND"
+    emit linux "$k4_line"
+  } >"$tmp/K4.log"
+  grep -c 'Timing report saved to' "$tmp/K4.log" | grep -qx 4 \
+    || self_fail "K4h: the log of the row does not hold the four timing lines it is built with"
+  tt K4timed linux "$tmp/K4.log" "$tmp/K4.txt"
+  (( rc == clean_rc )) || self_fail "K4h: the judge exited $rc with the timing lines and $clean_rc without them: $(cat "$tmp/K4timed.out")"
+  cmp -s "$tmp/K4clean.out" "$tmp/K4timed.out" \
+    || self_fail "K4h: the judge says something else with the timing lines in the log: $(diff "$tmp/K4clean.out" "$tmp/K4timed.out" || true)"
+  bash "$SELF" --count "$tmp/K4.log" >"$tmp/K4count.timed" 2>&1 || self_fail "K4h: --count could not read the log with the timing lines: $(cat "$tmp/K4count.timed")"
+  [[ "$(cat "$tmp/K4count.timed")" == "$(printf '%s\n' 'slow 1' 'lib:memory_industry 1')" ]] \
+    || self_fail "K4h: --count says '$(cat "$tmp/K4count.timed")' for the log with the timing lines, not the 1 test of slow and of lib:memory_industry"
+  cmp -s "$tmp/K4count.clean" "$tmp/K4count.timed" \
+    || self_fail "K4h: --count counts other binaries or tests with the timing lines in the log"
 
   echo "OK  self-test: test-times sums each binary's finished-in over both cargo shapes up to the boundary, prints the 10 slowest, and is red for a ceiling passed, the default passed, a floor undercut, a dead or expired line and a malformed one, all in one run; a log it cannot read is exit 2"
   exit 0

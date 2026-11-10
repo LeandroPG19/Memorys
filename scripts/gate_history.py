@@ -2,8 +2,10 @@
 """History of the local judge's runs (CI-F3, F3.1): the only writer of the JSONL history.
 
 Root: `${CI_TIEMPOS_DIR:-$HOME/.cache/ci-tiempos}/memory-industry/`, created when missing. One
-folder per UTC day holds `corridas.jsonl`, `pasos.jsonl`, `unidades.jsonl`, `indice.jsonl` and
-`flaky.jsonl`. Writes go under flock on `.candado` in the root. Every record has `repo`.
+folder per UTC day holds `corridas.jsonl`, `pasos.jsonl`, `unidades.jsonl`, `indice.jsonl`, `flaky.jsonl`
+and `usl.jsonl` (the points of the USL sweep of gate_usl.py, CI-F5a). The reports of `cargo --timings` that a
+row saved go to `<day>/timings/<run>/<idx>-<id>/` (CI-K4, D-K4h). Writes go under flock on `.candado` in
+the root. Every record has `repo`.
 
 It never changes a verdict. The library calls and `registrar` turn any failure into one
 `history: ...` line on stderr per process and exit 0; a history that cannot be written, a lock
@@ -12,7 +14,14 @@ an illegible manifest is exit 2. What was not measured is written as null, never
 is diagnosis only.
 
 Library use (the planner and the contract tests): run_start, step_start, step_end, units,
-run_end, lower_bounds, leer_jsonl. CLI (the serial writer): `registrar`, a JSON manifest on stdin.
+run_end, lower_bounds, camino_critico, leer_jsonl, usl_point, keep_timings, solape_s, serie_final. `anon_max` of a step is its anonymous memory plus the pages its
+tmpfs holds (`shmem`): what is charged to the scope and cannot be reclaimed without swap. CLI (the serial writer): `registrar`, a JSON manifest on stdin.
+
+CI-E4: a step and a run also carry `nucleos` (CPU seconds over the seconds of the step, over the T of the run) and
+`sin_medida`, `{field: reason}` for every null of a field the planner measures (cpu_s, nucleos, mem_peak and anon_max of a step; those and
+mem_muestra, serie_final_s and serie_cola_s of a run). The reason is the one the caller gave; this module derives only the one of
+`nucleos` (the one of `cpu_s`, or a duration of 0 s) and never invents another. `serie_final` is the one function of the
+seconds a run spent with one row alive and another ready, or with one row alive at the end.
 """
 
 from __future__ import annotations
@@ -20,8 +29,11 @@ from __future__ import annotations
 import fcntl
 import functools
 import hashlib
+import itertools
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -40,6 +52,10 @@ FLAKE_DAYS = 7
 LOCK_TIMEOUT_S = 2.0
 TEST_TIMES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-times.sh")
 COTAS = ("camino", "cpu", "ram", "paso")
+# CI-K4 (D-K4j): the reports of `--timings` are kept for 30 UTC days; the day folders and their jsonl files never go.
+TIMINGS_DIAS = 30
+# CI-K4 (D-K4h): what cargo writes on stderr when it saves a report, the only place that says which report a call made.
+INFORME_RE = re.compile(r"^\s*Timing report saved to (.+?)\s*$")
 
 _avisado = False
 _candado_roto = False
@@ -140,6 +156,24 @@ def _columna(registros: list[dict[str, Any]], campo: str) -> list[Any] | None:
     return _todos_medidos([r.get(campo) for r in registros])
 
 
+def _con_nucleos(
+    cpu_s: float | None, duracion: float | None, que: str, sin_medida: dict[str, str] | None
+) -> tuple[float | None, dict[str, str]]:
+    """D-E4b: the cores a CPU total and a duration give, and the `sin_medida` that goes with them. A null takes the reason
+    the caller gave for `cpu_s`, or says that `que` took 0 s; with no reason given and none of ours, it has none."""
+    motivos = dict(sin_medida or {})
+    if cpu_s is None:
+        if "cpu_s" in motivos:
+            motivos.setdefault("nucleos", motivos["cpu_s"])
+        return None, motivos
+    if duracion is None:
+        return None, motivos
+    if duracion <= 0:
+        motivos.setdefault("nucleos", f"{que} took 0 s")
+        return None, motivos
+    return _r(cpu_s / duracion), motivos
+
+
 def leer_jsonl(path: str) -> list[dict[str, Any]]:
     """Every JSON object of a JSONL file. A line that is not UTF-8 or not JSON is skipped: an old
     history never stops a run."""
@@ -178,6 +212,17 @@ def _tomar(candado: TextIO) -> bool:
             time.sleep(0.02)
 
 
+def _salto_pendiente(path: str) -> str:
+    """A newline when the file ends in a line cut halfway (a process killed in the middle of a write), so the next record
+    does not glue itself to it and get lost with it. Nothing for a file that is absent, empty or ends in a newline."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(-1, os.SEEK_END)
+            return "" if fh.read(1) == b"\n" else "\n"
+    except OSError:
+        return ""
+
+
 def _escribir(nombre: str, registro: dict[str, Any]) -> None:
     """Once the lock timed out in this process, the later writes skip it without waiting: the
     timeout is spent once, and the one warning already said what happened."""
@@ -194,8 +239,9 @@ def _escribir(nombre: str, registro: dict[str, Any]) -> None:
                 _candado_roto = True
                 _aviso(f"{nombre} not written: {candado_path} is held by another process for more than {_plazo_candado()} s; the later writes of this process skip it")
                 return
-            with open(os.path.join(carpeta, nombre), "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+            destino = os.path.join(carpeta, nombre)
+            with open(destino, "a", encoding="utf-8") as fh:
+                fh.write(_salto_pendiente(destino) + json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
     except OSError as err:
         _aviso(f"{nombre} not written under {carpeta} ({err})")
 
@@ -234,10 +280,14 @@ def _paso(
     anon_max: int | None,
     oom_kill: int | None,
     psi: dict[str, float | None] | None,
+    timings: dict[str, Any] | None = None,
+    solape_s: float | None = None,
+    sin_medida: dict[str, str] | None = None,
 ) -> None:
     """A step's line. A time nobody gave is null: the registrar never invents one."""
     corrida.cpus.append(cpu_s)
     seg = None if ini is None or end is None else end - ini
+    nucleos, motivos = _con_nucleos(cpu_s, seg, "the step", sin_medida)
     _escribir(
         "pasos.jsonl",
         {
@@ -255,10 +305,14 @@ def _paso(
             "espera_s": _r(espera_s),
             "motivo": motivo,
             "cpu_s": _r(cpu_s),
+            "nucleos": nucleos,
             "mem_peak": mem_peak,
             "anon_max": anon_max,
             "oom_kill": oom_kill,
             "psi": psi,
+            "timings": timings,
+            "solape_s": _r(solape_s),
+            "sin_medida": motivos,
         },
     )
 
@@ -279,8 +333,12 @@ def step_end(
     anon_max: int | None = None,
     oom_kill: int | None = None,
     psi: dict[str, float | None] | None = None,
+    timings: dict[str, Any] | None = None,
+    solape_s: float | None = None,
+    sin_medida: dict[str, str] | None = None,
 ) -> None:
-    """The library's own step: a missing inicio or fin is the module clock's."""
+    """The library's own step: a missing inicio or fin is the module clock's. `sin_medida` is the reason of each null the caller
+    knows (D-E4h)."""
     _paso(
         corrida,
         paso,
@@ -295,7 +353,118 @@ def step_end(
         anon_max,
         oom_kill,
         psi,
+        timings,
+        solape_s,
+        sin_medida,
     )
+
+
+def _informes_nombrados(log_path: str) -> list[str]:
+    """The paths `Timing report saved to <path>` names in the log of a row, in order and with repeats."""
+    nombrados: list[str] = []
+    with open(log_path, encoding="utf-8", errors="replace") as fh:
+        for linea in fh:
+            coincide = INFORME_RE.match(linea)
+            if coincide:
+                nombrados.append(coincide.group(1))
+    return nombrados
+
+
+def _podar_informes(raiz: str) -> None:
+    """D-K4j: the timings/ of the day folders older than TIMINGS_DIAS UTC days go; the folder and its jsonl stay. A name
+    that is not a day is not touched, and a folder that cannot be read is not a failure of the run."""
+    hoy = datetime.now(timezone.utc).date()
+    try:
+        carpetas = os.listdir(raiz)
+    except OSError:
+        return
+    for carpeta in carpetas:
+        try:
+            dia = datetime.strptime(carpeta, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if (hoy - dia).days > TIMINGS_DIAS:
+            shutil.rmtree(os.path.join(raiz, carpeta, "timings"), ignore_errors=True)
+
+
+@_sin_veredicto
+def keep_timings(corrida: Corrida, paso: Paso, log_path: str) -> dict[str, Any] | None:
+    """D-K4h: the reports the log of a row names go from where cargo left them to
+    `<root>/<day>/timings/<run>/<idx>-<id>/`, moved and not copied, and the answer is what was kept:
+    `{dir, n, bytes, perdidos, faltan}`, with `dir` relative to the root of the history, `perdidos` the times a path is
+    named again and `faltan` the paths that are not there. The log is the only source: a report it does not name (the
+    one of another call, `cargo-timing.html`) stays where it is. None when the log names none; and None, with the one
+    `history:` line, when the history cannot take them (they stay in the target). Keeping also prunes the retention."""
+    nombrados = _informes_nombrados(log_path)
+    if not nombrados:
+        return None
+    unicos = list(dict.fromkeys(nombrados))
+    existentes = [ruta for ruta in unicos if os.path.isfile(ruta)]
+    raiz = history_root()
+    relativo = "/".join((datetime.now(timezone.utc).strftime("%Y%m%d"), "timings", corrida.run, f"{paso.idx}-{paso.id}"))
+    peso = 0
+    if existentes:
+        destino = os.path.join(raiz, *relativo.split("/"))
+        os.makedirs(destino, exist_ok=True)
+        for ruta in existentes:
+            peso += os.path.getsize(ruta)
+            shutil.move(ruta, os.path.join(destino, os.path.basename(ruta)))
+    _podar_informes(raiz)
+    return {
+        "dir": relativo if existentes else None,
+        "n": len(existentes),
+        "bytes": peso,
+        "perdidos": len(nombrados) - len(unicos),
+        "faltan": len(unicos) - len(existentes),
+    }
+
+
+def solape_s(intervalos: list[tuple[float, float]], i: int) -> float:
+    """D-K4r: the seconds of the interval `i` in which at least one other interval of `intervalos` is alive: the union of
+    the others over `i`, and not the sum of their intersections. Two intervals that touch do not overlap."""
+    inicio, fin = intervalos[i]
+    otros = sorted(
+        (max(a, inicio), min(b, fin))
+        for j, (a, b) in enumerate(intervalos)
+        if j != i and a < fin and b > inicio
+    )
+    total = 0.0
+    hasta = inicio
+    for a, b in otros:
+        if b > hasta:
+            total += b - max(a, hasta)
+            hasta = b
+    return total
+
+
+def _vivos(intervalos: list[tuple[float, float, float]], t: float) -> int:
+    return sum(1 for _, inicio, fin in intervalos if inicio <= t < fin)
+
+
+def _listo_sin_empezar(intervalos: list[tuple[float, float, float]], t: float) -> bool:
+    return any(listo <= t < inicio for listo, inicio, _ in intervalos)
+
+
+def serie_final(intervalos: list[tuple[float, float, float]]) -> tuple[float, float] | None:
+    """D-E4k, D-E4l: `(serie_final_s, serie_cola_s)` of a run from the `(listo, inicio, fin)` of each row that started. In a
+    stretch where exactly one row is alive, the seconds count as the wait if another row is ready (its dependencies are
+    green, it has not started) and as the tail if no row starts after them; the first is `serie_final_s` with the second.
+    One row alive while the others are blocked by their dependencies is the critical path, and does not count; nor does a
+    stretch with nobody alive. A row ends where the next stretch begins, so two that touch are not alive together. None
+    when no row started: a 0 is a run with everything in parallel."""
+    if not intervalos:
+        return None
+    ultimo_inicio = max(inicio for _, inicio, _ in intervalos)
+    puntos = sorted(set(itertools.chain.from_iterable(intervalos)))
+    espera = cola = 0.0
+    for desde, hasta in zip(puntos, puntos[1:]):
+        if _vivos(intervalos, desde) != 1:
+            continue
+        if _listo_sin_empezar(intervalos, desde):
+            espera += hasta - desde
+        elif ultimo_inicio <= desde:
+            cola += hasta - desde
+    return round(espera + cola, 3), round(cola, 3)
 
 
 def _test_times_units(log_path: str) -> str | None:
@@ -450,9 +619,15 @@ def _cerrar(
     load: float | None = None,
     hilos: int | None = None,
     oom_kill: int | None = None,
+    plan: dict[str, Any] | None = None,
+    mem_muestra: dict[str, Any] | None = None,
+    serie_final_s: float | None = None,
+    serie_cola_s: float | None = None,
+    sin_medida: dict[str, str] | None = None,
 ) -> None:
     cpus = _todos_medidos(corrida.cpus)
     cpu_total = None if cpus is None else sum(cpus)
+    nucleos, motivos = _con_nucleos(cpu_total, total, "the run", sin_medida)
     registro = {
         "repo": REPO,
         "modo": corrida.modo,
@@ -465,6 +640,7 @@ def _cerrar(
         "T": _r(total),
         "seg": _r(total),
         "cpu_s": _r(cpu_total),
+        "nucleos": nucleos,
         "LB_ref": _r(LB_ref),
         "LB_run": _r(LB_run),
         "brecha_ref": _brecha(total, LB_ref),
@@ -476,6 +652,11 @@ def _cerrar(
         "load": _r(load, 2),
         "hilos": hilos,
         "oom_kill": oom_kill,
+        "plan": plan,
+        "mem_muestra": mem_muestra,
+        "serie_final_s": _r(serie_final_s),
+        "serie_cola_s": _r(serie_cola_s),
+        "sin_medida": motivos,
         "fecha": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     _escribir("corridas.jsonl", registro)
@@ -497,8 +678,15 @@ def run_end(
     load: float | None = None,
     hilos: int | None = None,
     oom_kill: int | None = None,
+    plan: dict[str, Any] | None = None,
+    mem_muestra: dict[str, Any] | None = None,
+    serie_final_s: float | None = None,
+    serie_cola_s: float | None = None,
+    sin_medida: dict[str, str] | None = None,
 ) -> None:
-    """The library's own run end: a missing T is the module clock's. What nobody measured is None."""
+    """The library's own run end: a missing T is the module clock's. What nobody measured is None. `plan` is what the
+    planner measured of the machine and decided (D-K4q); `mem_muestra`, the two `serie_*` and `sin_medida` are the planner's
+    (CI-E4), as given."""
     _cerrar(
         corrida,
         rc,
@@ -512,22 +700,53 @@ def run_end(
         load=load,
         hilos=hilos,
         oom_kill=oom_kill,
+        plan=plan,
+        mem_muestra=mem_muestra,
+        serie_final_s=serie_final_s,
+        serie_cola_s=serie_cola_s,
+        sin_medida=sin_medida,
     )
 
 
-def _camino(
-    paso_id: str,
-    seg: dict[str, float],
-    deps: dict[str, list[str]],
-    memo: dict[str, float],
-    pila: tuple[str, ...] = (),
-) -> float:
-    if paso_id in pila:
-        raise ValueError("ciclo en las dependencias: " + " -> ".join(pila + (paso_id,)))
-    if paso_id not in memo:
-        previos = [_camino(d, seg, deps, memo, pila + (paso_id,)) for d in deps.get(paso_id, []) if d in seg]
-        memo[paso_id] = seg[paso_id] + max(previos, default=0.0)
-    return memo[paso_id]
+@_sin_veredicto
+def usl_point(registro: dict[str, Any]) -> None:
+    """One point of a USL sweep (CI-F5a, D-F5l) into `usl.jsonl`, with `repo`, under the same lock. Like every
+    writer here it never raises: a point that cannot be written is the one `history:` warning."""
+    _escribir("usl.jsonl", {"repo": REPO, **registro})
+
+
+def camino_critico(seg: dict[str, float], deps: dict[str, list[str]]) -> tuple[float, list[str]]:
+    """The longest chain of dependencies, by the durations in `seg`: its length (the term `camino` of the bound) and the
+    chain itself, from its first step to its last. The one function of the critical path: the planner prints the chain
+    and the history gives the number from it. A dependency with no duration is skipped. A tie goes to the first step of
+    `seg` for the end of the chain and to the first of `deps[id]` for each step before it. A cycle raises ValueError
+    naming it."""
+    memo: dict[str, tuple[float, str | None]] = {}
+
+    def hasta(paso_id: str, pila: tuple[str, ...] = ()) -> tuple[float, str | None]:
+        if paso_id in pila:
+            raise ValueError("ciclo en las dependencias: " + " -> ".join(pila + (paso_id,)))
+        if paso_id not in memo:
+            previo: str | None = None
+            mejor = 0.0
+            for d in deps.get(paso_id, []):
+                if d in seg:
+                    largo = hasta(d, pila + (paso_id,))[0]
+                    if previo is None or largo > mejor:
+                        previo, mejor = d, largo
+            memo[paso_id] = (seg[paso_id] + mejor, previo)
+        return memo[paso_id]
+
+    if not seg:
+        return 0.0, []
+    fin = max(seg, key=lambda i: hasta(i)[0])
+    cadena: list[str] = []
+    paso: str | None = fin
+    while paso is not None:
+        cadena.append(paso)
+        paso = memo[paso][1]
+    cadena.reverse()
+    return memo[fin][0], cadena
 
 
 def _cota_cpu(records: list[dict[str, Any]], table: dict[str, Any]) -> float | None:
@@ -563,8 +782,7 @@ def lower_bounds(records: list[dict[str, Any]], table: dict[str, Any]) -> dict[s
     seg = {r["id"]: float(r["seg"]) for r in records if r.get("seg") is not None}
     cotas: dict[str, float | None] = dict.fromkeys(COTAS)
     if _columna(records, "seg") is not None:
-        memo: dict[str, float] = {}
-        cotas["camino"] = max(_camino(i, seg, table["deps"], memo) for i in seg)
+        cotas["camino"] = camino_critico(seg, table["deps"])[0]
         cotas["paso"] = max(seg.values())
     cotas["cpu"] = _cota_cpu(records, table)
     cotas["ram"] = _cota_ram(records, seg, table)
@@ -600,6 +818,8 @@ def registrar(manifiesto: dict[str, Any]) -> None:
             p.get("anon_max"),
             p.get("oom_kill"),
             p.get("psi"),
+            p.get("timings"),
+            p.get("solape_s"),
         )
         pasos[p["id"]] = paso
     for u in manifiesto.get("unidades", []):
@@ -625,6 +845,7 @@ def registrar(manifiesto: dict[str, Any]) -> None:
         load=manifiesto.get("load"),
         hilos=manifiesto.get("hilos"),
         oom_kill=manifiesto.get("oom_kill"),
+        plan=manifiesto.get("plan"),
     )
 
 

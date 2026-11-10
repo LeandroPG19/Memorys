@@ -1,7 +1,5 @@
 // needs-a-server: creates and drops its own database where DATABASE_URL points
-mod empty_db;
-
-use empty_db::in_an_empty_database;
+use crate::empty_db::in_an_empty_database;
 use sqlx::{Executor, PgPool};
 
 #[tokio::test]

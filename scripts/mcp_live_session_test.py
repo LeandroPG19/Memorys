@@ -103,11 +103,16 @@ TOOL_CALLS: List[Tuple[str, str, Dict[str, Any]]] = [
 
 SKIP_LIVE: set[str] = set()  # soft-skips forbidden; every live tool must run
 
+WRITER_CLOSED = "outbound writer closed"
+BURST = 20
+
 class McpSession:
     def __init__(self) -> None:
         env = os.environ.copy()
         env["DATABASE_URL"] = DATABASE_URL
         env["CUBA_JUDGE"] = os.environ.get("CUBA_JUDGE", "heuristic")
+        # The event that proves the writer drained is logged at info: pin it, whatever RUST_LOG the operator exports.
+        env["RUST_LOG"] = "memory_industry=info"
         self.proc = subprocess.Popen(
             [str(BINARY)],
             stdin=subprocess.PIPE,
@@ -119,6 +124,10 @@ class McpSession:
         )
         self._responses: List[Dict[str, Any]] = []
         self._stderr_lines: List[str] = []
+        # The writer-closed event, seen on any line: the 200 lines kept above are for the error message, not for this.
+        self.writer_closed: Optional[Dict[str, Any]] = None
+        self._exit_code: Optional[int] = None
+        self._closed = False
         self._lock = threading.Lock()
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
@@ -143,9 +152,23 @@ class McpSession:
     def _read_stderr(self) -> None:
         assert self.proc.stderr is not None
         for line in self.proc.stderr:
+            event = self._writer_closed_in(line) if WRITER_CLOSED in line else None
             with self._lock:
+                if event is not None:
+                    self.writer_closed = event
                 if len(self._stderr_lines) < 200:
                     self._stderr_lines.append(line.rstrip())
+
+    @staticmethod
+    def _writer_closed_in(line: str) -> Optional[Dict[str, Any]]:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        fields = event.get("fields") if isinstance(event, dict) else None
+        if isinstance(fields, dict) and fields.get("message") == WRITER_CLOSED:
+            return fields
+        return None
 
     def request(
         self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 30.0
@@ -181,13 +204,37 @@ class McpSession:
         self.proc.stdin.write(json.dumps(payload) + "\n")
         self.proc.stdin.flush()
 
-    def close(self) -> None:
+    def send_burst(self, count: int) -> List[str]:
+        """Writes `count` tools/list requests back to back without reading any answer; returns their ids."""
+        assert self.proc.stdin is not None
+        ids = [f"burst-{n}" for n in range(1, count + 1)]
+        for req_id in ids:
+            payload = {"jsonrpc": "2.0", "id": req_id, "method": "tools/list"}
+            self.proc.stdin.write(json.dumps(payload) + "\n")
+        self.proc.stdin.flush()
+        return ids
+
+    def close(self) -> Optional[int]:
+        """Closes stdin and waits up to 10 s for the exit: its code, or None if it had to be killed. Idempotent."""
+        if self._closed:
+            return self._exit_code
+        self._closed = True
         if self.proc.stdin:
             self.proc.stdin.close()
         try:
-            self.proc.wait(timeout=10)
+            self._exit_code = self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+            self.proc.wait()
+            return None
+        # Everything the process wrote before it exited is in the pipes: read it to EOF before anyone counts it.
+        self._reader.join(timeout=10)
+        self._err_reader.join(timeout=10)
+        return self._exit_code
+
+    def answered_ids(self) -> set:
+        with self._lock:
+            return {str(msg.get("id")) for msg in self._responses}
 
 def parse_tool_result(response: Dict[str, Any]) -> Tuple[bool, str]:
     if "error" in response:
@@ -402,6 +449,33 @@ def main() -> int:
         else:
             failed.append(f"cuba_eco/positive: no observation_id ({detail})")
             print(f"FAIL cuba_eco/positive: no observation_id ({detail})")
+
+        # The last thing a client does is close stdin with requests still being answered: every one of them has to
+        # come back, the process has to leave by itself, and its writer has to say it drained.
+        burst_ids = session.send_burst(BURST)
+        exit_code = session.close()
+        missing = [i for i in burst_ids if i not in session.answered_ids()]
+        if missing:
+            failed.append(f"burst: stdout ended without the answers to {missing}")
+            print(f"FAIL burst: no answer to {len(missing)} of {BURST}: {missing}")
+        else:
+            passed += 1
+            print(f"PASS burst: {BURST} answers to {BURST} requests, read up to EOF")
+        if exit_code != 0:
+            failed.append(f"burst: the process did not exit 0 by itself within 10 s (exit={exit_code})")
+            print(f"FAIL burst: exit={exit_code}")
+        else:
+            passed += 1
+            print("PASS burst: exit 0 after stdin closed")
+        closed = session.writer_closed
+        outcome = "missing" if closed is None else str(closed.get("outcome"))
+        written = 0 if closed is None else closed.get("written")
+        if outcome != "drained" or not isinstance(written, int) or written < BURST:
+            failed.append(f"burst: the writer did not drain: {outcome} (written={written})")
+            print(f"FAIL burst: the writer did not drain: {outcome} (written={written})")
+        else:
+            passed += 1
+            print(f"PASS burst: writer drained ({written} messages written)")
 
     finally:
         session.close()

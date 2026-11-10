@@ -65,16 +65,15 @@ async fn test_v09_all() {
         "Smol is a smaller async runtime focused on simplicity",
         "Rust does not have green threads in stdlib",
     ] {
-        memory_industry::handlers::dispatch(
+        let added = memory_industry::handlers::dispatch(
             &pool,
             "cuba_cronica",
             json!({"action": "add", "entity_name": entity_a, "content": content, "observation_type": "fact"}),
         )
         .await
         .expect("cronica add");
+        assert_embedding_written_before_the_answer(&added, content);
     }
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     println!("  [2/8] PR #6: BM25 hybrid as third RRF signal");
     let with_bm25 = memory_industry::handlers::dispatch(
@@ -240,15 +239,19 @@ async fn test_v09_all() {
         .await
         .expect("cronica add under a custom model tag");
 
-        let payload: serde_json::Value =
-            serde_json::from_str(&extract_text(&added)).expect("cronica add returns JSON");
+        let payload = assert_embedding_written_before_the_answer(&added, "the tagged observation");
         let obs_id: Uuid = payload["id"]
             .as_str()
             .expect("a fresh observation gets an id (not deduplicated/reinforced)")
             .parse()
             .expect("that id is a uuid");
 
-        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        assert_eq!(
+            memory_industry::tasks::drain(std::time::Duration::from_secs(10)).await,
+            0,
+            "a background task was still running after 10 s: whatever it writes, the row below \
+             is read before it is done"
+        );
 
         let row: (Option<String>, bool) = sqlx::query_as(
             "SELECT embedding_model, embedding IS NOT NULL FROM brain_observations WHERE id = $1",
@@ -261,7 +264,15 @@ async fn test_v09_all() {
         unsafe { std::env::remove_var("CUBA_EMBED_MODEL") };
 
         let (stored_tag, has_vector) = row;
-        if has_vector {
+        // The branch is decided by the model, not by what the row happens to hold: choosing it by the
+        // row let a vector that never got written fall into the "no model" branch and pass.
+        if memory_industry::embeddings::onnx::is_model_loaded() {
+            assert!(
+                has_vector,
+                "the model is loaded and add answered `ready`, so the row has to carry its vector \
+                 by the time the answer is back: the embedding is written through, not in the \
+                 background"
+            );
             assert_eq!(
                 stored_tag.as_deref(),
                 Some(tag.as_str()),
@@ -272,9 +283,9 @@ async fn test_v09_all() {
             println!("  ✓ the stored tag follows CUBA_EMBED_MODEL, not a constant");
         } else {
             assert!(
-                stored_tag.is_none(),
-                "no vector was written, so no model tag may be claimed — a label without a \
-                 vector is a lie about work that never happened"
+                !has_vector && stored_tag.is_none(),
+                "no model is loaded, so there is no vector and no model tag may be claimed — a \
+                 label without a vector is a lie about work that never happened"
             );
             println!("  ✓ no ONNX model loaded: no vector, and no tag claiming one (correct)");
         }
@@ -299,6 +310,31 @@ async fn test_v09_all() {
         .ok();
 
     println!("\n  ✅ v0.9.0 integration tests OK (8/8 phases verified)");
+}
+
+/// `cuba_cronica add` embeds the observation before it answers (write-through, with a 2 s cap), and says so in
+/// `embedding`: nothing is left to sleep for. A near-duplicate is reinforced or refused and writes no row, so it
+/// has no `id` and nothing to embed. Returns the parsed answer.
+fn assert_embedding_written_before_the_answer(
+    added: &serde_json::Value,
+    what: &str,
+) -> serde_json::Value {
+    let payload: serde_json::Value =
+        serde_json::from_str(&extract_text(added)).expect("cronica add returns JSON");
+    if payload.get("id").is_some() {
+        let expected = if memory_industry::embeddings::onnx::is_model_loaded() {
+            "ready"
+        } else {
+            "pending"
+        };
+        assert_eq!(
+            payload["embedding"].as_str(),
+            Some(expected),
+            "{what}: the answer to add says whether the vector is already written, and here it \
+             has to be `{expected}` (is_model_loaded() decides). Got: {payload}"
+        );
+    }
+    payload
 }
 
 fn extract_text(value: &serde_json::Value) -> String {

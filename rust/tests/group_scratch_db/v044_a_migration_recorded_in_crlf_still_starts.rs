@@ -14,9 +14,7 @@
 // database, and two databases of one server migrating at once can collide on
 // the server-wide role that migration 0041 touches.
 
-mod empty_db;
-
-use empty_db::in_an_empty_database;
+use crate::empty_db::in_an_empty_database;
 use sha2::{Digest, Sha384};
 use sqlx::PgPool;
 

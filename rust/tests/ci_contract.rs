@@ -31,6 +31,34 @@ fn test_file_stems() -> Vec<String> {
     names
 }
 
+/// What a test binary's first line speaks for: its root file and, when the root is a group
+/// (`tests/<root>.rs` with the modules in `tests/<root>/`), the modules the root declares. The marker
+/// and the second-node variable live in the modules, the first line lives in the root.
+fn with_modules(root: &str, modules: &[String]) -> String {
+    modules
+        .iter()
+        .fold(root.to_string(), |body, module| format!("{body}\n{module}"))
+}
+
+fn root_and_modules(dir: &Path, stem: &str) -> String {
+    let read = |path: &Path| {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    };
+    let mut module_paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join(stem))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    module_paths.sort();
+    let modules: Vec<String> = module_paths
+        .iter()
+        .map(|path| read(path.as_path()))
+        .collect();
+    with_modules(&read(&dir.join(format!("{stem}.rs"))), &modules)
+}
+
 fn bash_array(yaml: &str, name: &str) -> Vec<String> {
     let marker = format!("{name}=(");
     let start = yaml
@@ -335,19 +363,13 @@ fn no_test_file_is_named_with_a_bare_dash_dash_test_outside_the_role0_step() {
 #[test]
 fn tests_that_need_a_second_node_get_one_from_the_workflow() {
     let yaml = ci_yaml();
-    let needing: Vec<String> =
-        std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"))
-            .expect("tests/ is readable")
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
-            .filter(|e| e.file_name() != std::ffi::OsStr::new("ci_contract.rs"))
-            .filter(|e| {
-                std::fs::read_to_string(e.path())
-                    .unwrap_or_default()
-                    .contains("CUBA_PEER_DATABASE_URL")
-            })
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let needing: Vec<String> = test_file_stems()
+        .into_iter()
+        .filter(|stem| stem != "ci_contract")
+        .filter(|stem| root_and_modules(&dir, stem).contains("CUBA_PEER_DATABASE_URL"))
+        .map(|stem| format!("{stem}.rs"))
+        .collect();
 
     assert!(
         !needing.is_empty(),
@@ -390,7 +412,8 @@ const NEEDS_A_SERVER: &str = "// needs-a-server:";
 /// without a helper, is the one shape this does not see.
 const USES_A_SERVER: [&str; 2] = ["in_a_scratch_database(", "in_an_empty_database("];
 
-/// The files whose first line and whose body disagree, each with what is
+/// The files whose first line and whose body disagree (the body of a group is its root plus
+/// its modules, `root_and_modules`), each with what is
 /// wrong: a server used without the marker, which the check job would run and
 /// fail; the marker on a file that uses none, which the check job would drop
 /// for nothing; or the marker with no reason after it.
@@ -425,7 +448,10 @@ fn the_server_marker_check_fails_on_each_way_a_file_can_disagree() {
                   common::in_a_scratch_database(\"x\", |url| async move { drop(url) }).await;\n}\n";
     let empty = "mod empty_db;\n\n#[tokio::test]\nasync fn t() {\n    \
                  empty_db::in_an_empty_database(\"x\", |url| async move { drop(url) }).await;\n}\n";
-    let rows: [(&str, String, bool); 9] = [
+    let module_using_a_server = "use crate::common::in_a_scratch_database;\n\n#[tokio::test]\nasync fn t() {\n    \
+                                 in_a_scratch_database(\"x\", |url| async move { drop(url) }).await;\n}\n"
+        .to_string();
+    let rows: [(&str, String, bool); 12] = [
         (
             "marked_and_using",
             format!("{NEEDS_A_SERVER} creates its own database\n{server}"),
@@ -459,6 +485,30 @@ fn the_server_marker_check_fails_on_each_way_a_file_can_disagree() {
             format!("//! a file\n{NEEDS_A_SERVER} too late for ci.yml to read\n{server}"),
             true,
         ),
+        (
+            "group_unmarked_with_a_module_using_a_server",
+            with_modules(
+                "mod common;\n",
+                std::slice::from_ref(&module_using_a_server),
+            ),
+            true,
+        ),
+        (
+            "group_marked_with_a_module_using_a_server",
+            with_modules(
+                &format!("{NEEDS_A_SERVER} its modules create their own database\nmod common;\n"),
+                std::slice::from_ref(&module_using_a_server),
+            ),
+            false,
+        ),
+        (
+            "group_marked_and_no_module_uses_a_server",
+            with_modules(
+                &format!("{NEEDS_A_SERVER} says so\n"),
+                &["#[test]\nfn plain() {}\n".to_string()],
+            ),
+            true,
+        ),
     ];
 
     for (name, body, flagged) in rows {
@@ -479,9 +529,7 @@ fn a_test_file_that_needs_a_server_says_so_where_ci_reads_it() {
         .into_iter()
         .filter(|stem| stem != "ci_contract")
         .map(|stem| {
-            let path = dir.join(format!("{stem}.rs"));
-            let body = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let body = root_and_modules(&dir, &stem);
             (stem, body)
         })
         .collect();
@@ -513,5 +561,257 @@ fn a_test_file_that_needs_a_server_says_so_where_ci_reads_it() {
         !yaml.contains("NEEDS_A_SERVER=("),
         "ci.yml still carries the list of globs. Two ways to leave a file out of the check job \
          is one of them drifting from the other"
+    );
+}
+
+const SELF_TEST_BEGIN: &str = "# --- self-test begin ---";
+const SELF_TEST_END: &str = "# --- self-test end ---";
+
+/// The names a script or workflow hands to cargo as `--test <name>`, outside the comments and the
+/// self-test region (whose fixtures name fake binaries on purpose). Only an identifier counts: a
+/// `--test ]]` in a bash condition or a `--test,` in a message is not a target.
+fn dash_dash_test_targets(text: &str) -> Vec<String> {
+    let mut in_self_test = false;
+    let mut live = String::new();
+    for line in text.lines() {
+        match line.trim_end() {
+            SELF_TEST_BEGIN => in_self_test = true,
+            SELF_TEST_END => in_self_test = false,
+            _ if in_self_test || line.trim_start().starts_with('#') => {}
+            _ => {
+                live.push_str(line);
+                live.push('\n');
+            }
+        }
+    }
+    literal_test_names(&live)
+        .into_iter()
+        .map(|name| {
+            name.chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Each `--test <name>` of `text` that has no `rust/tests/<name>.rs`, as `<file>: --test <name>`.
+fn test_targets_that_do_not_exist(file: &str, text: &str, stems: &HashSet<String>) -> Vec<String> {
+    dash_dash_test_targets(text)
+        .into_iter()
+        .filter(|name| !stems.contains(name))
+        .map(|name| format!("{file}: --test {name}"))
+        .collect()
+}
+
+#[test]
+fn the_dash_dash_test_scan_reads_live_lines_only_and_flags_a_vanished_binary() {
+    let stems: HashSet<String> = ["group_no_server".to_string()].into_iter().collect();
+    let script = "cargo test --test group_no_server --test cli_contract\n\
+                  # cargo test --test only_in_a_comment\n\
+                  [[ \"$arg\" == --test ]] && cargo test --test \"$name\"\n\
+                  # --- self-test begin ---\n\
+                  cargo test --test a_fixture_binary\n\
+                  # --- self-test end ---\n\
+                  cargo test --test after_the_region \\\n";
+    assert_eq!(
+        dash_dash_test_targets(script),
+        ["group_no_server", "cli_contract", "after_the_region"],
+        "the scan has to see the live lines and skip the comment, the self-test region, a bash \
+         condition and a quoted variable"
+    );
+    assert_eq!(
+        test_targets_that_do_not_exist("scripts/x.sh", script, &stems),
+        [
+            "scripts/x.sh: --test cli_contract",
+            "scripts/x.sh: --test after_the_region"
+        ],
+        "a name with no rust/tests/<name>.rs is reported with the file that carries it"
+    );
+}
+
+/// A binary that moved into a test group (or was deleted) keeps its name in whatever still runs it, and
+/// cargo says `no test target named` only when that line runs. `scripts/memory-industry-test.sh contracts`
+/// is run by nobody in the judge, so nothing else would notice.
+#[test]
+fn every_dash_dash_test_in_the_scripts_names_a_test_target() {
+    let root = repo_root();
+    let stems: HashSet<String> = test_file_stems().into_iter().collect();
+    let mut carriers: Vec<std::path::PathBuf> = Vec::new();
+    let sources: [(&str, &[&str]); 2] = [
+        ("scripts", &["sh"]),
+        (".github/workflows", &["yml", "yaml"]),
+    ];
+    for (folder, extensions) in sources {
+        let dir = root.join(folder);
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        carriers.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| extensions.contains(&ext))
+        }));
+    }
+    carriers.sort();
+
+    let mut named = HashSet::new();
+    let mut missing = Vec::new();
+    for path in &carriers {
+        let text =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let file = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        named.extend(dash_dash_test_targets(&text));
+        missing.extend(test_targets_that_do_not_exist(&file, &text, &stems));
+    }
+
+    assert!(
+        named.len() >= 8,
+        "the scan found {} distinct `--test <name>` in scripts/*.sh and the workflows, and there are \
+         ten or more. A scan that found almost nothing proves nothing",
+        named.len()
+    );
+    assert!(
+        missing.is_empty(),
+        "these lines hand cargo a `--test` for a binary that is not a rust/tests/<name>.rs: {missing:?}. \
+         A test file that moved into a group (tests/group_*.rs) or was deleted leaves its name behind in \
+         whatever still runs it, and the line breaks only when somebody runs it. Name the group root, or \
+         drop the flag"
+    );
+}
+
+/// Packages this build must not compile. The first three only enter through
+/// the downloader of `ort-sys`: it builds `ureq`, `native-tls` and OpenSSL for
+/// its build script when `ort` keeps its default `download-binaries` feature,
+/// and under `load-dynamic` that script returns before it downloads anything.
+/// The fourth is the package of an advisory the project no longer excepts.
+const FORBIDDEN_IN_LOCK: [(&str, &str); 4] = [
+    (
+        "openssl-sys",
+        "OpenSSL linked for the downloader of ort-sys (`native-tls`)",
+    ),
+    (
+        "openssl-src",
+        "a vendored OpenSSL compiled from C for the downloader of ort-sys (`tls-native-vendored`)",
+    ),
+    (
+        "ureq",
+        "the HTTP client of the downloader of ort-sys (`download-binaries`, with any TLS feature)",
+    ),
+    (
+        "number_prefix",
+        "RUSTSEC-2025-0119, unmaintained: only tokenizers' progressbar brought it, through \
+         indicatif; cargo audit only warns on it, so this is the only check that sees it come back",
+    ),
+];
+
+fn package_names(lock: &str) -> Vec<String> {
+    lock.split("[[package]]")
+        .skip(1)
+        .filter_map(|block| {
+            block.lines().find_map(|line| {
+                line.strip_prefix("name = \"")
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+        })
+        .collect()
+}
+
+fn forbidden_in_lock(lock: &str) -> Vec<String> {
+    package_names(lock)
+        .into_iter()
+        .filter(|name| {
+            FORBIDDEN_IN_LOCK
+                .iter()
+                .any(|(forbidden, _)| name.as_str() == *forbidden)
+        })
+        .collect()
+}
+
+#[test]
+fn the_lock_carries_no_openssl_and_no_ort_downloader() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
+    let lock = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let names = package_names(&lock);
+    assert!(
+        names.len() >= 300 && names.iter().any(|name| name == "ort-sys"),
+        "{} lists {} packages and {} of them is `ort-sys`; the guard below reads package names \
+         out of that file, and an empty or unreadable lock would pass it for any tree",
+        path.display(),
+        names.len(),
+        if names.iter().any(|name| name == "ort-sys") {
+            "one"
+        } else {
+            "none"
+        }
+    );
+
+    let found = forbidden_in_lock(&lock);
+    let report: Vec<String> = FORBIDDEN_IN_LOCK
+        .iter()
+        .filter(|(forbidden, _)| found.iter().any(|name| name == forbidden))
+        .map(|(forbidden, meaning)| format!("  {forbidden}: {meaning}"))
+        .collect();
+    assert!(
+        report.is_empty(),
+        "Cargo.lock carries packages this build must not compile:\n{}\nThe OpenSSL ones and \
+         `ureq` come back when `ort` is declared without `default-features = false`, or with \
+         `download-binaries` or a `tls-*` feature: the build script returns before it downloads \
+         anything under `load-dynamic`, so they cost a clean build minutes (OpenSSL is compiled \
+         from C) and buy nothing, on the five platforms of the release matrix. `number_prefix` \
+         comes back when `tokenizers` is declared with its default features",
+        report.join("\n")
+    );
+}
+
+#[test]
+fn the_lock_guard_names_each_forbidden_package() {
+    let lock = |names: &[&str]| -> String {
+        names
+            .iter()
+            .map(|name| format!("[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\n\n"))
+            .collect()
+    };
+
+    assert_eq!(
+        forbidden_in_lock("[[package]]\nname = \"openssl-src\""),
+        vec!["openssl-src"],
+        "a lock with a vendored OpenSSL has to be named"
+    );
+    assert_eq!(
+        forbidden_in_lock("[[package]]\nname = \"ureq\""),
+        vec!["ureq"],
+        "a lock with the downloader's HTTP client has to be named, TLS feature or not"
+    );
+    assert_eq!(
+        forbidden_in_lock("[[package]]\nname = \"number_prefix\""),
+        vec!["number_prefix"],
+        "a lock with the package of RUSTSEC-2025-0119 has to be named, whoever brings it"
+    );
+    assert_eq!(
+        forbidden_in_lock(&lock(&["ort-sys", "openssl-sys", "ureq", "serde"])),
+        vec!["openssl-sys", "ureq"],
+        "every forbidden package is named, in lock order, and the others are left alone"
+    );
+    assert_eq!(
+        forbidden_in_lock(&lock(&["ort-sys"])),
+        Vec::<String>::new(),
+        "a lock with only `ort-sys` is clean"
+    );
+    assert_eq!(
+        forbidden_in_lock(&lock(&["openssl-probe", "openssl-macros", "ureq-proto"])),
+        Vec::<String>::new(),
+        "a name that merely starts like a forbidden one is not it"
+    );
+    assert_eq!(
+        forbidden_in_lock(
+            "[[package]]\nname = \"native-tls\"\ndependencies = [\n \"openssl-sys\",\n \"ureq\",\n]\n"
+        ),
+        Vec::<String>::new(),
+        "the guard reads the `name =` of each package, not the dependency lists"
     );
 }

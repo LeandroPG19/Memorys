@@ -6,8 +6,8 @@
 # receipt, last, is what merge-gate.sh leaves and scripts/release.sh reads.
 #
 # It lived inside run-all-tests.sh until merge-gate.sh needed it too. That
-# script calls run-all-tests.sh and then keeps going — clippy and tests under
-# --features docs, deny, audit, codigo-muerto, crap-gate, mutants-gate — and
+# script calls run-all-tests.sh and then keeps going — clippy of the build without
+# docs, deny, audit, codigo-muerto, crap-gate, mutants-gate — and
 # all of that ran after the lock was already released. A second gate started
 # in that window compiled into the same target directory and queued on the
 # same cargo lock as the first, which is the collision the lock exists for.
@@ -49,10 +49,52 @@
 # terminal is seen. A record from another host or another MSYS installation
 # cannot be looked up from here, and is refused with the path to remove by hand
 # rather than guessed at.
+# CI-J15d (H6): this file is loaded once per shell. gate-cluster.sh sources it too, and a second load would empty the
+# lock its caller already holds (GATE_LOCK, GATE_LOCK_HELD and GATE_OWNER). The guard is a function and not a variable so
+# that a variable of the environment cannot say "already loaded" to a shell that has nothing.
+if declare -F gate_lock_is_loaded >/dev/null; then
+  return 0
+fi
+gate_lock_is_loaded() { :; }
+
+# CI-K9a: the judge does not use the interop of Windows. WSL puts the PATH of Windows on the PATH of Linux (68 directories of
+# 9p on 2026-11-09), and a command that is not found walks all of it: `command -v cygpath` three times took 29.5 s, 0.05 s
+# without those entries, and the self-test of gate-cluster.sh spent 147 of its 189 s in 32 calls of gate_where. On Linux
+# nothing that starts with /mnt/ stays on PATH. PATH is already exported, so assigning it is enough (and an `export PATH` here
+# would make JUDGE_ENVIRONMENT hand the self-tests a foreign PATH they cannot run with). The scripts that cannot load this file
+# before they start carry the same filter as their second line of code.
+gate_path_without_windows() {
+  [[ "$OSTYPE" == linux* ]] || return 0
+  local dirs dir kept=""
+  IFS=: read -ra dirs <<<"$PATH"
+  for dir in "${dirs[@]}"; do
+    [[ "$dir" == /mnt/* ]] || kept="${kept:+$kept:}$dir"
+  done
+  PATH="$kept"
+}
+gate_path_without_windows
+
+# Whether this shell is Git Bash or Cygwin, decided by what the shell says it is and not by what is on PATH.
+gate_on_windows() { [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; }
+
+# gate_native_path MODE PATH: the path as cygpath -MODE (u, m or w) writes it on Windows, as it came anywhere else.
+gate_native_path() {
+  if gate_on_windows; then
+    cygpath "-$1" "$2" 2>/dev/null || printf '%s\n' "$2"
+  else
+    printf '%s\n' "$2"
+  fi
+}
 # shellcheck disable=SC2034 # read by the scripts that source this one
 GATE_LOCK="$HOME/.cache/cuba-gate/lock"
 GATE_LOCK_HELD=""
 GATE_OWNER=""
+# CI-J15c (H5): the mark of the judge's servers (cluster_name), the grammar of the name of a lane and the encoding of a socket
+# directory as the host of a URL are written here once. gate-cluster.sh makes the lanes with them and the guard of the
+# judge's server below judges with them, so a lane that can be made is a lane that can be judged.
+GATE_SERVER_MARK=memory-industry-gate
+GATE_LANE_RE='[a-z0-9][a-z0-9-]*'
+gate_encode_host() { printf '%s' "${1//\//%2F}"; }
 # The live corpus port (D-A11): the one place the port is spelled as code. The scripts
 # that must refuse it read this name, not the number.
 # shellcheck disable=SC2034 # read by the scripts that source this one
@@ -71,7 +113,7 @@ proc_start() {
 
 gate_where() {
   local root
-  root="$(cygpath -m / 2>/dev/null || echo /)"
+  root="$(gate_native_path m /)"
   printf '%s:%s\n' "$HOSTNAME" "${root// /_}"
 }
 
@@ -524,8 +566,24 @@ gate_require_node() {
     || gate_refuse "node $version is older than engines.node >=$need in package.json. nvm use $need, or put a newer node first on PATH."
 }
 
+# CI-K9b: the compiler the judge pins is the one rust-toolchain.toml of the root names. Whatever cargo it starts outside the
+# tree (the seed of the mutants, the labs, in ~/.cache or the scratch) does not see that file, and rustup takes `stable`:
+# the day `stable` moves, every mutant builds its dependencies with another compiler. The channel is read here and handed
+# down; without a file, or without a channel in it, nothing is exported and it says so.
+gate_pin_toolchain() {
+  local file="$GATE_REPO_ROOT/rust-toolchain.toml" channel
+  channel="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$file" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$channel" ]]; then
+    echo "note: $file is missing or names no channel, so RUSTUP_TOOLCHAIN is not set and a cargo outside the tree takes the default toolchain of rustup" >&2
+    return 0
+  fi
+  export RUSTUP_TOOLCHAIN="$channel"
+}
+
 gate_linux_env() {
+  gate_path_without_windows
   [[ "$(uname -s)" == Linux ]] || return 0
+  gate_pin_toolchain
   gate_target_dir_outside_the_tree
   gate_tmpdir_on_disk
   gate_require_node
@@ -585,6 +643,13 @@ gate_model_env() {
 # is about the server DATABASE_URL names and about nothing else. Sets
 # GATE_JUDGE_SYSID to the system_identifier it read.
 GATE_JUDGE_SYSID=""
+# The variables a libpq client reads from the environment (gate-cluster.sh, K8). Every call to the judge's Postgres drops
+# them first, so a PGHOSTADDR or a PGREQUIREPEER of the caller cannot send a lane's identity query to another host or
+# refuse its peer. gate-cluster.sh sources this file, and the lane library uses the same list.
+# shellcheck disable=SC2034 # read by the scripts that source this one
+GATE_PG_ENV_UNSET=(-u PGHOST -u PGHOSTADDR -u PGPORT -u PGSERVICE -u PGSERVICEFILE -u PGPASSFILE
+  -u PGSSLMODE -u PGSSLCERT -u PGSSLKEY -u PGSSLROOTCERT -u PGOPTIONS -u PGDATABASE -u PGUSER
+  -u PGPASSWORD -u PGREQUIREPEER -u PGCONNECT_TIMEOUT)
 
 gate_url_port() {
   local rest="${1#*://}" authority hostport
@@ -609,7 +674,7 @@ gate_require_given_database_url() {
 
 gate_require_judge_server() {
   local url="${1:-}" port identity cn sysid
-  local identity_re='^[^|]*[|][0-9]+$' mark_re='^memory-industry-gate(-[A-Za-z0-9]+)?$'
+  local identity_re='^[^|]*[|][0-9]+$' mark_re="^$GATE_SERVER_MARK(-$GATE_LANE_RE)?\$"
   gate_require_given_database_url "$url"
   command -v psql >/dev/null 2>&1 \
     || gate_refuse "psql is not on PATH, so the judge cannot read which server DATABASE_URL names (cluster_name and system_identifier). Install the PostgreSQL client tools."
@@ -630,7 +695,7 @@ gate_require_judge_server() {
     pw="${userinfo#*:}"
     pw="$(printf '%b' "${pw//%/\\x}")"
   fi
-  identity="$(PGPASSWORD="$pw" PGOPTIONS='-c default_transaction_read_only=on' psql -X -At -F '|' -d "$dsn" \
+  identity="$(env "${GATE_PG_ENV_UNSET[@]}" PGCONNECT_TIMEOUT=10 PGPASSWORD="$pw" PGOPTIONS='-c default_transaction_read_only=on' psql -X -At -F '|' -d "$dsn" \
     -c "select current_setting('cluster_name'), system_identifier from pg_control_system()" 2>/dev/null)" || identity=""
   identity="${identity%$'\r'}"
   [[ "$identity" =~ $identity_re ]] \
@@ -647,9 +712,9 @@ gate_require_judge_server() {
   # D-F2i: a lane (GATE_LANE set) is judged by its own name and by its own socket under this root. Its
   # cluster_name is memory-industry-gate-<lane> and nothing else, and its URL is never TCP.
   if [[ -n "${GATE_LANE:-}" ]]; then
-    [[ "$cn" == "memory-industry-gate-$GATE_LANE" ]] \
-      || gate_refuse "lane $GATE_LANE is served by '$cn' (system_identifier $sysid), not by memory-industry-gate-$GATE_LANE: lanes do not cross (D-F2i)."
-    [[ -n "${GATE_CLUSTER_ROOT:-}" && "${url#*@}" == "${GATE_CLUSTER_ROOT//\//%2F}%2F"* ]] \
+    [[ "$cn" == "$GATE_SERVER_MARK-$GATE_LANE" ]] \
+      || gate_refuse "lane $GATE_LANE is served by '$cn' (system_identifier $sysid), not by $GATE_SERVER_MARK-$GATE_LANE: lanes do not cross (D-F2i)."
+    [[ -n "${GATE_CLUSTER_ROOT:-}" && "${url#*@}" == "$(gate_encode_host "$GATE_CLUSTER_ROOT")%2F"* ]] \
       || gate_refuse "lane $GATE_LANE has a URL that is not a socket under ${GATE_CLUSTER_ROOT:-no root} (D-F2i): a lane is never TCP."
     GATE_JUDGE_SYSID="$sysid"
     local sockdir="${url#*@}"
@@ -760,40 +825,93 @@ gate_cgroup_read() {
   done
 }
 
-# --- the cargo jobs of a gate run (CI-F1, D-F1a/b, F-c) ----------------------
-# N is the number of CPUs the gate may hand cargo: the cgroup's (gate_cgroup_read) under
-# nproc's, so a judge in a scope of 8 CPUs on a 24-core machine asks for 8 jobs, not 24.
-# The release build takes min(N, floor(margin GB / 4)), at least 1, with the margin the
-# cgroup leaves (MemAvailable where it sets no memory limit): the 4 GB per job build-gpu.sh
-# used to cap with. The release margin is the cgroup's and not MemAvailable's because
-# pesado's MemoryMax is what kills the build, and that is the limit that holds here.
+# --- the RAM and the cargo jobs of a gate run (CI-F1, D-F1a/b, F-c; CI-K4, D-K4k, D-K4l, D-K4o) -------------
+# gate_free_ram_kb sets GATE_FREE_RAM_KB: the RAM the gate can count on, in KB, the lower of MemAvailable
+# (GATE_PROC_MEMINFO when a fixture names a file, as gate-dag.py reads it) and the memory the cgroup chain leaves
+# (GATE_CG_MEM_KB, so it follows gate_cgroup_read). No MemAvailable is status 1 and the reason in GATE_FREE_RAM_WHY:
+# the callers say it and go on in series, they do not stop.
+gate_free_ram_kb() {
+  local meminfo="${GATE_PROC_MEMINFO:-/proc/meminfo}" available
+  GATE_FREE_RAM_KB=""
+  GATE_FREE_RAM_WHY=""
+  available="$(awk '$1 == "MemAvailable:" { print $2; exit }' "$meminfo" 2>/dev/null || true)"
+  if [[ ! "$available" =~ ^[0-9]+$ ]]; then
+    GATE_FREE_RAM_WHY="no MemAvailable in $meminfo"
+    return 1
+  fi
+  GATE_FREE_RAM_KB="$available"
+  if [[ -n "${GATE_CG_MEM_KB:-}" ]] && (( GATE_CG_MEM_KB < GATE_FREE_RAM_KB )); then
+    GATE_FREE_RAM_KB="$GATE_CG_MEM_KB"
+  fi
+}
+
+# The jobs cargo gets are min(nproc, the CPUs of the cgroup, free RAM / 2 GiB), at least 1 (CI-E7a, D-E7a): the judge that
+# holds the turn uses the whole machine, with no core kept back, and 2 GiB a job is what a rustc of this crate holds. The
+# cgroup (gate_cgroup_read) is the tightest of the chain, so a judge in a scope of 8 CPUs on a 24-core machine asks for 8
+# jobs, not 24.
+# The release build takes min(N, floor(margin GB / 4)), at least 1, with the margin the cgroup leaves
+# (MemAvailable where it sets no memory limit): the 4 GB per job build-gpu.sh used to cap with. The release margin is the
+# cgroup's and not MemAvailable's because pesado's MemoryMax is what kills the build, and that is the limit that holds here.
 # A CARGO_BUILD_JOBS the operator set is kept and said; one this gate exported (the
 # GATE_CARGO_JOBS_FROM_GATE marker, which the children inherit) is not named as the operator's.
-# Sets GATE_CARGO_JOBS and GATE_RELEASE_JOBS. Must be called directly, not in a subshell:
-# the refusals are exits of this shell.
+# A measure that cannot be read (a cgroup file that is no number, nproc that is no number, no MemAvailable) is not a
+# refusal: one job, in series, said in the line with what could not be read (D-K4o). The limit that was not read could be
+# the MemoryMax of pesado, so the number that cannot kill the run is 1, and the operator can name another by hand.
+# Sets GATE_CARGO_JOBS and GATE_RELEASE_JOBS, GATE_NPROC (what nproc said) and GATE_RESOURCE_WHY when a measure failed.
+# Must be called directly, not
+# in a subshell: it exports.
 gate_cargo_jobs() {
-  local cores cg margin_kb margin_gb
-  GATE_CG_HINT="Set CARGO_BUILD_JOBS=<n> by hand."
-  gate_cgroup_read
-  cores="$(nproc)"
-  [[ "$cores" =~ ^[0-9]+$ ]] \
-    || gate_refuse "nproc printed '$cores', which is not a number of CPUs, so the cargo jobs cannot be counted. Set CARGO_BUILD_JOBS=<n> by hand."
+  local cores cg margin_kb margin_gb read_out why="" jobs tenths
+  GATE_CG_HINT=""
+  GATE_CG_MEM_KB=""
+  GATE_CG_CPUS=""
+  # In a subshell: the refusals of gate_cgroup_read are exits of the shell that calls it. Its hint (set the jobs by
+  # hand) is left out: what the line says already is that the jobs are 1, and the operator knows the way to name others.
+  if read_out="$( (gate_cgroup_read && printf 'OK|%s|%s' "$GATE_CG_MEM_KB" "$GATE_CG_CPUS") 2>&1 )"; then
+    IFS='|' read -r _ GATE_CG_MEM_KB GATE_CG_CPUS <<<"$read_out"
+  else
+    why="${read_out#FAIL: }"
+    why="${why%.}"
+  fi
+  cores="$(nproc 2>/dev/null || true)"
+  if [[ -z "$why" && ! "$cores" =~ ^[0-9]+$ ]]; then
+    why="nproc printed '$cores', which is not a number of CPUs"
+  fi
+  if [[ -z "$why" ]]; then
+    gate_free_ram_kb || why="$GATE_FREE_RAM_WHY"
+  fi
+  GATE_RESOURCE_WHY="$why"
+  GATE_NPROC="$cores"
   cg="$GATE_CG_CPUS"
-  GATE_CARGO_JOBS="$cores"
-  if [[ -n "$cg" ]] && (( cg < GATE_CARGO_JOBS )); then GATE_CARGO_JOBS="$cg"; fi
+  if [[ -n "$why" ]]; then
+    jobs=1
+  else
+    jobs="$cores"
+    if [[ -n "$cg" ]] && (( cg < jobs )); then jobs="$cg"; fi
+    if (( GATE_FREE_RAM_KB / 2097152 < jobs )); then jobs=$(( GATE_FREE_RAM_KB / 2097152 )); fi
+    (( jobs >= 1 )) || jobs=1
+  fi
+  GATE_CARGO_JOBS="$jobs"
   if [[ -n "${CARGO_BUILD_JOBS:-}" && "$CARGO_BUILD_JOBS" != "${GATE_CARGO_JOBS_FROM_GATE:-}" ]]; then
     echo "cargo jobs=$CARGO_BUILD_JOBS (CARGO_BUILD_JOBS set by the operator; nproc=$cores, cgroup cpu=${cg:-none})"
   elif [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
-    export CARGO_BUILD_JOBS="$GATE_CARGO_JOBS" GATE_CARGO_JOBS_FROM_GATE="$GATE_CARGO_JOBS"
-    echo "cargo jobs=$GATE_CARGO_JOBS (nproc=$cores, cgroup cpu=${cg:-none})"
+    export CARGO_BUILD_JOBS="$jobs" GATE_CARGO_JOBS_FROM_GATE="$jobs"
+    if [[ -n "$why" ]]; then
+      echo "cargo jobs=1 (resource measure failed: $why; series with one job)"
+    else
+      tenths=$(( GATE_FREE_RAM_KB * 10 / 1048576 ))
+      echo "cargo jobs=$jobs (nproc=$cores, cgroup cpu=${cg:-none}, ram free=$(( tenths / 10 )).$(( tenths % 10 )) GiB)"
+    fi
   fi
   GATE_CARGO_JOBS="$CARGO_BUILD_JOBS"
   margin_kb="${GATE_CG_MEM_KB:-}"
   if [[ -z "$margin_kb" ]]; then
-    margin_kb="$(awk '$1 == "MemAvailable:" { print $2; exit }' /proc/meminfo 2>/dev/null || true)"
+    margin_kb="$(awk '$1 == "MemAvailable:" { print $2; exit }' "${GATE_PROC_MEMINFO:-/proc/meminfo}" 2>/dev/null || true)"
   fi
   GATE_RELEASE_JOBS="$GATE_CARGO_JOBS"
-  if [[ "$margin_kb" =~ ^[0-9]+$ ]]; then
+  if [[ -n "$why" ]]; then
+    GATE_RELEASE_JOBS=1
+  elif [[ "$margin_kb" =~ ^[0-9]+$ ]]; then
     margin_gb=$(( margin_kb / 1048576 ))
     if (( margin_gb / 4 < GATE_RELEASE_JOBS )); then GATE_RELEASE_JOBS=$(( margin_gb / 4 )); fi
   fi

@@ -32,6 +32,8 @@ ENV = {
     # it again. Pointing at a directory with no model.onnx resolves the status to
     # the identity fallback without reading a byte.
     "CUBA_RERANKER_PATH": str(Path(__file__).resolve().parent),
+    # The event that proves the writer drained is logged at info: pin it, whatever RUST_LOG the operator exports.
+    "RUST_LOG": "memory_industry=info",
 }
 
 # One subprocess per call, and each one loads the models from scratch. Measured on
@@ -46,6 +48,37 @@ tests_run = 0
 tests_passed = 0
 tests_failed = 0
 failed_tests = []
+
+
+WRITER_CLOSED = "outbound writer closed"
+
+
+def writer_close_problem(stderr: str) -> Optional[str]:
+    """
+    None when stderr carries exactly one `outbound writer closed` event that says the writer drained
+    the one answer a call writes; otherwise what it carried instead. The server logs that event after
+    it stopped waiting for its writer, so a server that exits without it, or on a ceiling, is the
+    server that may lose the last answer.
+    """
+    events = []
+    for line in stderr.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        fields = event.get("fields") if isinstance(event, dict) else None
+        if isinstance(fields, dict) and fields.get("message") == WRITER_CLOSED:
+            events.append(fields)
+    if not events:
+        return "missing"
+    if len(events) != 1:
+        return f"{len(events)} events"
+    fields = events[0]
+    if fields.get("outcome") != "drained":
+        return str(fields.get("outcome"))
+    if fields.get("written") != 1:
+        return f"drained, but written={fields.get('written')} for one request"
+    return None
 
 
 def invoke_mcp(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -72,6 +105,12 @@ def invoke_mcp(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             print(
                 f"  [ERROR] MCP invocation failed (exit={result.returncode}): {stderr_preview}"
             )
+            return None
+
+        problem = writer_close_problem(result.stderr or "")
+        if problem is not None:
+            tail = "\n".join((result.stderr or "").splitlines()[-8:])
+            print(f"  [ERROR] the writer did not drain: {problem}\n{tail}")
             return None
 
         if not result.stdout:

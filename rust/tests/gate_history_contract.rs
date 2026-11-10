@@ -22,6 +22,9 @@
 //! - `run_end(corrida, rc, *, T=None, LB_ref=None, LB_run=None, C=None, R=None)`: writes
 //!   `corridas.jsonl` and the same line in `indice.jsonl`. `cpu_s` of the run is the sum of its
 //!   steps' `cpu_s`, or `null` if any of them is `null`.
+//! - CI-E4: `serie_final(intervalos)` over `(listo, inicio, fin)`; `step_end(..., sin_medida=None)` adds `nucleos` and
+//!   `sin_medida` to the step; `run_end(..., mem_muestra=None, serie_final_s=None, serie_cola_s=None, sin_medida=None)`
+//!   adds `nucleos`, those three and `sin_medida` to the run (the spec is the block of CI-E4 at the end of this file).
 //! - `lower_bounds(records, table) -> {"LB": float, "cota": str}`, with
 //!   `table = {"C": int, "R": bytes, "deps": {id: [ids]}}` and the step records of one run.
 //!   `LB = max(camino critico, sum(cpu_s)/C, sum(anon_max*seg)/R, max seg)`; `cota` names the
@@ -53,6 +56,29 @@ use std::time::{Duration, Instant};
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
 const REPO: &str = "memory-industry";
+
+/// What `gate-dag.py` reads from the environment of its parent and the judge sets for its lanes (`os.environ` in the planner:
+/// J14d `DATABASE_URL`, D-F3k `GATE_LOCK` with `CUBA_GATE_LOCK_OWNER`, the root of the targets, the jobs of the operator and the
+/// lane token). The contracts of the judge run under them (`lane_CT`), and a planner started from here would take them: under
+/// the lock of the judge it writes lane tickets into the lock of the gate that runs the test. gate_dag_contract.rs keeps the
+/// whole list of what the judge exports (`JUDGE_LANE_ENV`); here the planner only runs in series, so what it reads is enough.
+const PLANNER_INPUTS_OF_THE_JUDGE: [&str; 7] = [
+    "DATABASE_URL",
+    "GATE_LOCK",
+    "CUBA_GATE_LOCK_OWNER",
+    "CUBA_GATE_LANE_TOKEN",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_JOBS",
+    "GATE_CARGO_JOBS_FROM_GATE",
+];
+
+/// `cmd` for a planner without the names of PLANNER_INPUTS_OF_THE_JUDGE: what a test gives it afterwards stays.
+fn without_planner_inputs(cmd: &mut Command) -> &mut Command {
+    for name in PLANNER_INPUTS_OF_THE_JUDGE {
+        cmd.env_remove(name);
+    }
+    cmd
+}
 const SHA: &str = "4f1c0a9b2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f70";
 const HUELLA: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 
@@ -836,7 +862,8 @@ fn plan(base: &Path, table: &Path, root: &Path, script_dir: &Path, extra: &[(&st
     fs::create_dir_all(&home).expect("home");
     fs::create_dir_all(&tmp).expect("tmp");
     let mut cmd = Command::new("python3");
-    cmd.arg("-I")
+    without_planner_inputs(&mut cmd)
+        .arg("-I")
         .arg(script_dir.join("gate-dag.py"))
         .arg("run")
         .arg("--table")
@@ -1708,7 +1735,8 @@ fn sin_corrida_de_historia_el_planificador_no_pasa_none() {
     let (cgroups, proc_self) = fake_cgroup(&base);
     let home = base.join("home");
     fs::create_dir_all(&home).expect("home");
-    let out = Command::new("python3")
+    let mut cmd = Command::new("python3");
+    let out = without_planner_inputs(&mut cmd)
         .arg("-I")
         .arg("-B")
         .arg("-c")
@@ -1749,3 +1777,1338 @@ gate_dag = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate_dag)
 sys.exit(gate_dag.main(["run", "--table", sys.argv[2]]))
 "#;
+
+// --- CI-J14: the history keeps a half line apart, one function for the critical path, and the properties of the
+// planner. The properties run in process (`python3 -I -B -c`, like the rest of this file), with `random` seeded with a
+// fixed number and no sleeps: they take milliseconds, and the same run is the same run on every machine.
+
+/// J14f: a history that ends in a line cut halfway, with no `\n`, gets a `\n` before the next record, so the record
+/// that follows is read whole and the cut line is only itself. argv: none. Prints the path of the file it wrote.
+const BODY_LINEA_A_MEDIAS: &str = r#"
+import datetime
+day = os.path.join(gh.history_root(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d"))
+os.makedirs(day, exist_ok=True)
+with open(os.path.join(day, "pasos.jsonl"), "w", encoding="utf-8") as fh:
+    fh.write('{"a":1')
+corrida = gh.run_start(modo="serie", sha=None, huella=None, tabla="tabla-j14f")
+for idx, nombre in [(10, "fmt"), (20, "tests")]:
+    paso = gh.step_start(corrida, idx, nombre)
+    gh.step_end(corrida, paso, 0, inicio=0.0, fin=0.1)
+"#;
+
+/// J14f: the file is the three lines it should be: the cut one, and the two records, each whole.
+#[test]
+fn j14f_una_linea_a_medias_no_se_come_el_registro_siguiente() {
+    let fx = Fixture::new("j14f");
+    let out = py(&fx, BODY_LINEA_A_MEDIAS, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "two steps after a line cut halfway");
+    let files = files_named(&fx.root, "pasos.jsonl");
+    assert_eq!(files.len(), 1, "one day, one pasos.jsonl: {files:?}");
+    let body = fs::read_to_string(&files[0]).expect("pasos.jsonl");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "the cut line and the two records are three lines; the first record was glued to the cut one: {body:?}"
+    );
+    assert_eq!(
+        lines[0], "{\"a\":1",
+        "the cut line is kept as it was: {body:?}"
+    );
+    for (line, id) in lines[1..].iter().zip(["fmt", "tests"]) {
+        let record: Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("the record of {id} is not read whole ({e}): {line:?}"));
+        assert_eq!(record["id"].as_str(), Some(id), "{record}");
+    }
+    assert!(
+        body.ends_with('\n') && !body.contains("\n\n"),
+        "a history that ended in a newline gets no blank line: {body:?}"
+    );
+}
+
+/// J14j: the critical path is one function, in the history module (the low level), and it returns `(length, chain)`:
+/// the length the bound `LB` is made of and the chain the planner prints. Ties go to the first in the order of `seg`
+/// (the end of the chain) and to the first of the list `deps` (each step before it). A dependency that has no record
+/// is skipped. argv: none.
+const BODY_CAMINO_CRITICO: &str = r#"
+casos = [
+    ({"a": 1.0, "b": 1.0, "c": 1.5}, {"a": [], "b": ["a"], "c": []}),
+    ({"a": 1.0, "b": 1.0, "c": 2.0}, {"c": ["a", "b"]}),
+    ({"a": 1.0, "b": 2.0}, {"b": ["falta"]}),
+    ({"a": 1.0, "b": 1.0}, {}),
+]
+print(json.dumps([list(gh.camino_critico(seg, deps)) for seg, deps in casos]))
+"#;
+
+/// J14j: a dependency cycle is a ValueError that names it, as `lower_bounds` does today. argv: none.
+const BODY_CAMINO_CICLO: &str = r#"
+try:
+    gh.camino_critico({"a": 1.0, "b": 1.0}, {"a": ["b"], "b": ["a"]})
+except ValueError as err:
+    print("ValueError", err)
+"#;
+
+#[test]
+fn j14j_el_camino_critico_es_una_funcion_que_da_la_longitud_y_la_cadena() {
+    let fx = Fixture::new("j14j");
+    let out = py(&fx, BODY_CAMINO_CRITICO, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "gate_history.camino_critico");
+    let v: Value = serde_json::from_str(text(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("camino_critico did not print JSON: {e}: {}", show(&out)));
+    assert_eq!(
+        v,
+        json!([
+            [2.0, ["a", "b"]],
+            [3.0, ["a", "c"]],
+            [2.0, ["b"]],
+            [1.0, ["a"]]
+        ]),
+        "length and chain of the four cases (the chain from its first step to its last)"
+    );
+    let out = py(&fx, BODY_CAMINO_CICLO, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "a cycle in camino_critico");
+    assert!(
+        text(&out.stdout).starts_with("ValueError") && text(&out.stdout).contains("ciclo"),
+        "a cycle is a ValueError that names it: {}",
+        show(&out)
+    );
+}
+
+/// The two modules and a seeded generator, for the properties. argv: none.
+const PRELUDIO_PROPIEDADES: &str = r#"
+import importlib.util, random, tempfile, time
+spec = importlib.util.spec_from_file_location("gate_dag", os.path.join(sys.argv[1], "gate-dag.py"))
+dag = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dag)
+GIB = 1 << 30
+rng = random.Random(20261109)
+
+def random_dag(n, pesos):
+    ids = [f"s{i}" for i in range(n)]
+    deps = {sid: (rng.sample(ids[:i], rng.randint(0, min(i, 3))) if i else []) for i, sid in enumerate(ids)}
+    seg = {sid: float(rng.choice(pesos)) for sid in ids}
+    return ids, deps, seg
+
+def longest(ids, deps, seg):
+    best = {}
+    for sid in ids:
+        best[sid] = seg[sid] + max((best[d] for d in deps[sid]), default=0.0)
+    return max(best.values())
+"#;
+
+/// J14m P1: for any DAG, the bound LB and the length of the chain the planner prints are the same number, and the
+/// chain is a path of the graph. The oracle is a dynamic program written here; the planner's text is parsed.
+const BODY_P1: &str = r#"
+def run_p1():
+    trials = 0
+    for pesos in ([0.5, 1.0, 2.5, 4.0], [1, 2, 3]):
+        for n in range(1, 11):
+            for _ in range(30):
+                ids, deps, seg = random_dag(n, pesos)
+                want = longest(ids, deps, seg)
+                records = [{"id": s, "seg": seg[s], "cpu_s": None, "anon_max": None} for s in ids]
+                lb = gh.lower_bounds(records, {"C": 4, "R": 10 * GIB, "deps": deps})
+                assert abs(lb["LB"] - want) < 1e-9, f"LB {lb} is not the longest path {want}: {deps} {seg}"
+                steps = [dag.Step(10 * (i + 1), s, deps[s], [], "normal", 1.0, 1.0, seg[s], {}, ["true"]) for i, s in enumerate(ids)]
+                planner = dag.Planner.__new__(dag.Planner)
+                planner.steps = steps
+                planner.cpu = 4
+                planner.ram = 10 * GIB
+                value, texto = planner.bound(seg, {}, {})
+                assert abs(value - want) < 1e-9, f"the planner's LB {value} is not {want}"
+                assert texto.startswith("critical path: "), f"no chain in {texto!r}"
+                chain = texto[len("critical path: "):].split(" -> ")
+                assert all(s in seg for s in chain), f"a step that is not in the table: {chain}"
+                assert all(a in deps[b] for a, b in zip(chain, chain[1:])), f"{chain} is not a path of {deps}"
+                assert not deps[chain[0]], f"the chain starts at {chain[0]}, which has dependencies: {deps}"
+                length = sum(seg[s] for s in chain)
+                assert abs(length - lb["LB"]) < 1e-9, f"the chain {chain} is {length} long and LB is {lb['LB']}: two functions"
+                trials += 1
+    return trials
+
+print("p1 trials=%d" % run_p1())
+"#;
+
+/// J14m P2: LB is a lower bound of a greedy scheduler that respects the dependencies, the cores and the memory
+/// (T >= LB); raising a `seg` or a `cpu_s`, or adding a dependency, never lowers it; raising C or R never raises it.
+const BODY_P2: &str = r#"
+C = 4
+R = 16 * GIB
+
+def instance(n):
+    ids, deps, seg = random_dag(n, [1, 2, 3, 5, 8])
+    cores = {s: float(rng.choice([1, 2, 4])) for s in ids}
+    mem = {s: rng.choice([1, 2, 4, 8]) * GIB for s in ids}
+    return ids, deps, seg, {s: cores[s] * seg[s] for s in ids}, mem
+
+def bound(ids, deps, seg, cpu_s, mem, cap=C, ram=R):
+    records = [{"id": s, "seg": seg[s], "cpu_s": cpu_s[s], "anon_max": mem[s]} for s in ids]
+    return gh.lower_bounds(records, {"C": cap, "R": ram, "deps": deps})["LB"]
+
+def greedy(ids, deps, seg, cpu_s, mem):
+    t = 0.0
+    done = set()
+    running = {}
+    pending = list(ids)
+    while pending or running:
+        moved = True
+        while moved:
+            moved = False
+            for s in list(pending):
+                cores = cpu_s[s] / seg[s]
+                if all(d in done for d in deps[s]) \
+                        and sum(cpu_s[r] / seg[r] for r in running) + cores <= C + 1e-12 \
+                        and sum(mem[r] for r in running) + mem[s] <= R:
+                    running[s] = t + seg[s]
+                    pending.remove(s)
+                    moved = True
+        assert running, f"the greedy scheduler is stuck with {pending} pending"
+        t = min(running.values())
+        for s in [r for r, end in running.items() if end <= t + 1e-12]:
+            del running[s]
+            done.add(s)
+    return t
+
+def run_p2():
+    trials = 0
+    for _ in range(300):
+        ids, deps, seg, cpu_s, mem = instance(rng.randint(1, 9))
+        lb = bound(ids, deps, seg, cpu_s, mem)
+        total = greedy(ids, deps, seg, cpu_s, mem)
+        assert total >= lb - 1e-9, f"a greedy schedule of {total} s is under the bound {lb}: {deps} {seg} {cpu_s} {mem}"
+        s = rng.choice(ids)
+        longer = dict(seg, **{s: seg[s] + rng.choice([1, 3])})
+        assert bound(ids, deps, longer, cpu_s, mem) >= lb - 1e-9, f"a longer {s} lowered the bound"
+        busier = dict(cpu_s, **{s: cpu_s[s] + rng.choice([1.0, 7.0])})
+        assert bound(ids, deps, seg, busier, mem) >= lb - 1e-9, f"more cpu_s in {s} lowered the bound"
+        heavier = dict(mem, **{s: mem[s] + rng.choice([1, 4]) * GIB})
+        assert bound(ids, deps, seg, cpu_s, heavier) >= lb - 1e-9, f"more memory in {s} lowered the bound"
+        pairs = [(a, b) for i, b in enumerate(ids) for a in ids[:i] if a not in deps[b]]
+        if pairs:
+            a, b = rng.choice(pairs)
+            linked = dict(deps, **{b: deps[b] + [a]})
+            assert bound(ids, linked, seg, cpu_s, mem) >= lb - 1e-9, f"a new dependency {a} -> {b} lowered the bound"
+        assert bound(ids, deps, seg, cpu_s, mem, cap=C + rng.choice([1, 4])) <= lb + 1e-9, "more cores raised the bound"
+        assert bound(ids, deps, seg, cpu_s, mem, ram=R + rng.choice([1, 8]) * GIB) <= lb + 1e-9, "more memory raised the bound"
+        trials += 1
+    return trials
+
+print("p2 trials=%d" % run_p2())
+"#;
+
+/// J14m P3: admission and verdict of the planner with no processes (the start of a step is a stand-in that marks it as
+/// running; a finish goes through the real `finish`). On random tables: the planner is never stuck; an exclusive step
+/// runs alone; with two or more alive the cores add up to no more than C and the memory to no more than R; no step
+/// starts before its dependencies exited 0; in series at most one is alive; the verdict is the red of the lowest idx,
+/// and every step before it exited 0.
+const BODY_P3: &str = r#"
+CORES = 8
+RAM_GIB = 24
+
+def random_steps(n):
+    steps = []
+    for i in range(n):
+        previous = [s.id for s in steps]
+        deps = rng.sample(previous, rng.randint(0, min(len(previous), 2))) if previous else []
+        clase = "exclusive" if rng.random() < 0.15 else "normal"
+        cpu = round(rng.uniform(0.5, CORES * 1.25), 2)
+        ram_gb = round(rng.uniform(0.5, RAM_GIB * 0.7), 2)
+        steps.append(dag.Step(10 * (i + 1), f"s{i}", deps, [], clase, cpu, ram_gb, 1.0, {}, ["true"]))
+    return steps
+
+def make_planner(steps, solo):
+    p = dag.Planner.__new__(dag.Planner)
+    p.steps = steps
+    p.by_id = {s.id: s for s in steps}
+    p.dag = True
+    p.solo = solo
+    p.rank = {s.id: rng.random() for s in steps}
+    p.t0 = time.monotonic()
+    p.delegado = False
+    p.scope = None
+    p.cpu_cap = CORES
+    p.ram = RAM_GIB * GIB
+    p.red = None
+    p.no_verdict = None
+    p.corrida = None
+
+    def start(step):
+        for d in step.deps:
+            assert p.by_id[d].state == "done" and p.by_id[d].rc == 0, f"{step.id} started before {d} exited 0"
+        step.state = "running"
+        step.t_start = p.now()
+
+    p.start = start
+    p.kill = lambda step: setattr(step, "parado", True)
+    return p
+
+def check_alive(p):
+    alive = p.running()
+    if any(s.clase == "exclusive" for s in alive):
+        assert len(alive) == 1, f"an exclusive step shares the machine with {[s.id for s in alive]}"
+    if p.solo:
+        assert len(alive) <= 1, f"in series, {[s.id for s in alive]} are alive"
+    if len(alive) >= 2:
+        assert sum(s.c for s in alive) <= p.cpu_cap + 1e-9, f"{[s.id for s in alive]} ask for more cores than {p.cpu_cap}"
+        assert sum(max(s.anon_now or 0, s.r) for s in alive) <= p.ram, f"{[s.id for s in alive]} ask for more memory than R"
+
+def run_p3():
+    trials = 0
+    for _ in range(300):
+        steps = random_steps(rng.randint(1, 10))
+        p = make_planner(steps, rng.random() < 0.3)
+        rcs = {s.id: rng.choice([0, 0, 0, 0, 0, 1, 2]) for s in steps}
+        guard = 0
+        while p.unfinished():
+            guard += 1
+            assert guard < 200, "the planner does not end"
+            p.admit()
+            assert not p.no_verdict, p.no_verdict
+            alive = p.running()
+            assert alive, f"stuck: nothing runs and these are left: {[(s.id, s.state) for s in steps]}"
+            check_alive(p)
+            step = rng.choice(alive)
+            p.finish(step, -9 if step.parado else rcs[step.id])
+        failed = [s for s in steps if s.state == "done" and not s.parado and s.rc != 0]
+        if failed:
+            lowest = min(failed, key=lambda s: s.idx)
+            assert p.red is lowest, f"the red is {p.red and p.red.id}, the lowest idx that failed is {lowest.id}"
+            for s in steps:
+                if s.idx < lowest.idx:
+                    assert s.state == "done" and s.rc == 0 and not s.parado, f"{s.id} is before the red {lowest.id} and did not exit 0"
+        else:
+            assert p.red is None, f"no step failed and the red is {p.red.id}"
+        trials += 1
+    return trials
+
+print("p3 trials=%d" % run_p3())
+"#;
+
+/// J14m P4, widened by CI-J18 (J18e.P4): `parse_table` over the real table with random mutations (a token changed to nan,
+/// inf, a negative, a 0, an overflow or text, or to one of the words the grammar of D-J18b and D-J18c refuses; a token or a
+/// row dropped, repeated or swapped) answers with a list of steps or a Refusal, never with another exception, the same
+/// answer for the rows in another order (both refused, or the same steps), and every step it accepts has numbers that are
+/// finite and above 0 and says what the grammar says: names of `[A-Za-z0-9_]+`, clusters of `C_[a-z0-9]+`, an idx of
+/// `[1-9][0-9]*`, an environment inside `dag.ROW_ENV` with no empty value and numbers above 0 in its `*_JOBS` and
+/// `*_THREADS`, and no word of its order that starts with the comment mark. The seed is the one of J18 (20261110).
+const BODY_P4: &str = r#"
+import math, re
+HASH = chr(35)
+rng = random.Random(20261110)
+real = open(os.path.join(sys.argv[1], "gate-dag.txt"), encoding="utf-8").read().splitlines()
+rows = [line for line in real if line.strip() and not line.startswith(HASH)]
+assert len(rows) >= 9, f"the real table has {len(rows)} rows"
+work = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+TOKENS = ["nan", "inf", "-inf", "-1", "0", "1e999", "abc", "", "1,2", "-", "target:", "cluster:x", "models", "reader",
+          "normal", "exclusive", "boundary", "untimed", "BOGUS", "FOO=bar", "CARGO_TARGET_DIR=/x", "99999999999999999999",
+          "1e-9", "0.0", "-0",
+          "target:/etc", "target:../x", "target:a/b", "cluster:C_a/../b", "cluster:C_Dbg", "a/b", "-10", "1_0", "010",
+          "CARGO_BUILD_JOBS=ocho", "CARGO_BUILD_JOBS=", "CARGO_BUILD_JOBS=0", "CUBA_NLI_INTRA_THREADS=x",
+          "MUTANTS_JOBS=-1", "CARGO_INCREMENTAL=", HASH, HASH + "x", HASH + "nota", "TMPDIR=x",
+          "CUBA_GATE_LANE_TOKEN=x", "DATABASE_URL=x", "GATE_SERVER_SYSTEM_ID=x"]
+
+def mutate(lines):
+    lines = list(lines)
+    for _ in range(rng.randint(1, 3)):
+        op = rng.choice(["token", "delete", "dup", "swap", "drop", "append"])
+        i = rng.randrange(len(lines))
+        tok = lines[i].split()
+        if op == "token" and tok:
+            tok[rng.randrange(len(tok))] = rng.choice(TOKENS)
+            lines[i] = " ".join(tok)
+        elif op == "delete" and tok:
+            del tok[rng.randrange(len(tok))]
+            lines[i] = " ".join(tok)
+        elif op == "dup":
+            lines.insert(i, lines[i])
+        elif op == "swap":
+            j = rng.randrange(len(lines))
+            lines[i], lines[j] = lines[j], lines[i]
+        elif op == "drop" and len(lines) > 1:
+            del lines[i]
+        else:
+            lines[i] += " " + rng.choice(TOKENS)
+    return lines
+
+def parse(lines, name):
+    path = os.path.join(work, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return dag.parse_table(path)
+
+def attempt(lines, name):
+    """The steps `parse_table` gives for these lines, or None for a Refusal; any other exception is the failure."""
+    try:
+        return parse(lines, name)
+    except dag.Refusal:
+        return None
+    except Exception as err:
+        raise AssertionError(f"parse_table raised {type(err).__name__}: {err} for {lines}")
+
+def listing(steps):
+    return None if steps is None else [
+        (s.idx, s.id, s.deps, s.recursos, s.clase, s.cpu_tab, s.ram_tab, s.dur_tab, sorted(s.env.items()), s.argv)
+        for s in steps]
+
+GRAMMAR_ID = re.compile(r"[A-Za-z0-9_]+")
+GRAMMAR_CLUSTER = re.compile(r"C_[a-z0-9]+")
+GRAMMAR_NUMBER = re.compile(r"[1-9][0-9]*")
+
+def check_grammar(steps, lines):
+    for s in steps:
+        assert GRAMMAR_ID.fullmatch(s.id), f"the id {s.id!r} was accepted: {lines}"
+        assert s.idx > 0, f"{s.id} was accepted with idx {s.idx}: {lines}"
+        for resource in s.recursos:
+            kind, _, name = resource.partition(":")
+            assert kind != "target" or GRAMMAR_ID.fullmatch(name), f"{s.id} was accepted with {resource}: {lines}"
+            assert kind != "cluster" or GRAMMAR_CLUSTER.fullmatch(name), f"{s.id} was accepted with {resource}: {lines}"
+        for name, value in s.env.items():
+            assert name in dag.ROW_ENV, f"{s.id} was accepted with {name}, which a row may not name: {lines}"
+            assert value != "", f"{s.id} was accepted with {name} empty: {lines}"
+            if name.endswith("_JOBS") or name.endswith("_THREADS"):
+                assert GRAMMAR_NUMBER.fullmatch(value), f"{s.id} was accepted with {name}={value!r}: {lines}"
+        assert not any(word.startswith(HASH) for word in s.argv), f"{s.id} was accepted with a # in its order: {lines}"
+        for name, value in (("cpu", s.cpu_tab), ("ram_gb", s.ram_tab), ("dur_s", s.dur_tab)):
+            assert math.isfinite(value) and value > 0, f"{s.id} was accepted with {name}={value}: {lines}"
+    for line in lines:
+        words = line.split()
+        if words and not words[0].startswith(HASH):
+            assert GRAMMAR_NUMBER.fullmatch(words[0]), f"an idx spelled {words[0]!r} was accepted: {lines}"
+
+assert len(parse(rows, "real.txt")) == len(rows), "the real table does not parse"
+accepted = refused = 0
+for n in range(600):
+    lines = mutate(rows)
+    shuffled = list(lines)
+    rng.shuffle(shuffled)
+    steps = attempt(lines, f"m{n}.txt")
+    assert listing(steps) == listing(attempt(shuffled, f"s{n}.txt")), \
+        f"the rows in another order give another answer: {lines} / {shuffled}"
+    if steps is None:
+        refused += 1
+        continue
+    accepted += 1
+    check_grammar(steps, lines)
+assert accepted > 0 and refused > 0, f"the mutations were all accepted or all refused ({accepted}/{refused})"
+print("p4 trials=600 accepted=%d refused=%d" % (accepted, refused))
+"#;
+
+/// The properties run as one process each, with the prelude of the generator.
+fn propiedad(nombre: &str, cuerpo: &str, intentos: &str) {
+    let fx = Fixture::new(nombre);
+    let codigo = format!("{PRELUDIO_PROPIEDADES}{cuerpo}");
+    let out = py(&fx, &codigo, &[], Some(fx.root.as_path()));
+    assert_ok(&out, nombre);
+    assert!(
+        text(&out.stdout).contains(intentos),
+        "{nombre} did not say it ran its trials ({intentos}): {}",
+        show(&out)
+    );
+}
+
+#[test]
+fn j14m_p1_el_lb_y_la_cadena_impresa_son_la_misma_cuenta() {
+    propiedad("j14m-p1", BODY_P1, "p1 trials=600");
+}
+
+#[test]
+fn j14m_p2_el_lb_es_una_cota_inferior_y_monotona() {
+    propiedad("j14m-p2", BODY_P2, "p2 trials=300");
+}
+
+#[test]
+fn j14m_p3_la_admision_y_el_veredicto_cumplen_sus_invariantes() {
+    propiedad("j14m-p3", BODY_P3, "p3 trials=300");
+}
+
+#[test]
+fn j14m_p4_la_tabla_da_una_lista_o_una_negativa_y_nunca_otra_excepcion() {
+    propiedad("j14m-p4", BODY_P4, "p4 trials=600");
+}
+
+// --- CI-K4: the reports of `cargo --timings`, the overlap of the rows and the plan of the machine ---------------------
+// D-K4h (keep_timings moves the reports a row's log names, from its target to the day's folder of the history), D-K4j
+// (the folders of days older than 30 UTC days lose their timings/ and nothing else), D-K4q (`plan` in the run's line),
+// D-K4r (`solape_s`). The API these tests fix for pass 2:
+// - `keep_timings(corrida, paso, log_path) -> dict | None`: reads the lines `Timing report saved to <path>` of the log of
+//   the row and moves each report that exists to `<root>/<AAAAMMDD>/timings/<run>/<idx>-<id>/`. It returns
+//   `{dir, n, bytes, perdidos, faltan}` (`dir` relative to the root of the history; `perdidos` the times a path is named
+//   again, `faltan` the paths that are not there) or None: when the log names none, and when the history cannot take
+//   them (then one `history:` line, and the reports stay where they were). It also prunes the retention.
+// - `solape_s(intervalos, i)`: seconds of the interval `i` in which another interval of `intervalos` is alive.
+// - `step_end(..., timings=None, solape_s=None)` and `run_end(..., plan=None)` write those fields, null when not given.
+
+/// Four reports in `<objetivo>/cargo-timings` (4, 6, 2 and 2 bytes) and the function that keeps what a log names.
+/// argv: the directory of the target. `guardar(lineas)` writes the log, keeps, and returns what the day was before and
+/// after the call (a run that crosses midnight UTC names either) and what `keep_timings` returned.
+const K4_PRE: &str = r#"
+from datetime import datetime, timedelta, timezone
+objetivo = sys.argv[2]
+informes = objetivo + "/cargo-timings"
+os.makedirs(informes, exist_ok=True)
+for nombre, cuerpo in [("cargo-timing-20261109T120000Z.html", b"AAAA"), ("cargo-timing-20261109T120001Z.html", b"BBBBBB"),
+                       ("cargo-timing-20261109T120002Z.html", b"CC"), ("cargo-timing.html", b"DD")]:
+    with open(informes + "/" + nombre, "wb") as fh:
+        fh.write(cuerpo)
+def nombrado(nombre):
+    return "   Timing report saved to " + informes + "/" + nombre
+def dia():
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+def guardar(lineas):
+    log = objetivo + "/fila.log"
+    with open(log, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lineas) + "\n")
+    corrida = gh.run_start(modo="serie", sha=None, huella=None, tabla="t", run="run-k4")
+    paso = gh.step_start(corrida, 10, "DBG")
+    antes = dia()
+    res = gh.keep_timings(corrida, paso, log)
+    return {"res": res, "antes": antes, "despues": dia()}
+"#;
+
+const K4_NOMBRES: [&str; 4] = [
+    "cargo-timing-20261109T120000Z.html",
+    "cargo-timing-20261109T120001Z.html",
+    "cargo-timing-20261109T120002Z.html",
+    "cargo-timing.html",
+];
+
+const BODY_K4_GUARDAR: &str = r#"
+print(json.dumps(guardar(["   Compiling x v0.1.0", nombrado("cargo-timing-20261109T120000Z.html"),
+                          nombrado("cargo-timing-20261109T120001Z.html"), "    Finished `dev` profile"])))
+"#;
+
+const BODY_K4_CUENTA: &str = r#"
+print(json.dumps(guardar([nombrado("cargo-timing-20261109T120000Z.html"), nombrado("cargo-timing-20261109T120000Z.html"),
+                          nombrado("cargo-timing-20269999T000000Z.html")])))
+"#;
+
+const BODY_K4_NADA: &str = r#"
+print(json.dumps(guardar(["   Compiling x v0.1.0", "    Finished `dev` profile"])))
+"#;
+
+/// Folders of days 31, 30 and 29 days ago, and one that is no day, each with a timings/ and a pasos.jsonl; then a row
+/// that keeps a report today. The names of the folders come back with the answer.
+const BODY_K4_RETENCION: &str = r#"
+raiz = os.path.join(os.environ["CI_TIEMPOS_DIR"], "memory-industry")
+def sembrar(nombre):
+    carpeta = os.path.join(raiz, nombre)
+    os.makedirs(carpeta + "/timings/run-vieja/10-a", exist_ok=True)
+    with open(carpeta + "/timings/run-vieja/10-a/cargo-timing-vieja.html", "w") as fh:
+        fh.write("v")
+    with open(carpeta + "/pasos.jsonl", "w") as fh:
+        fh.write('{"id": "a"}\n')
+    return nombre
+hoy = datetime.now(timezone.utc)
+dias = {str(n): sembrar((hoy - timedelta(days=n)).strftime("%Y%m%d")) for n in (31, 30, 29)}
+dias["ninguno"] = sembrar("no-es-un-dia")
+resultado = guardar([nombrado("cargo-timing-20261109T120000Z.html")])
+resultado["dias"] = dias
+print(json.dumps(resultado))
+"#;
+
+/// The answer of a K4 body: the JSON line it printed.
+fn k4_answer(out: &Output) -> Value {
+    serde_json::from_str(text(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("the body printed no JSON: {e}\n{}", show(out)))
+}
+
+/// A target directory of the fixture for the K4 bodies, and where the reports are in it.
+fn k4_target(fx: &Fixture) -> PathBuf {
+    let dir = fx.base.join("objetivo");
+    fs::create_dir_all(&dir).expect("target dir");
+    dir
+}
+
+/// Spec K4-A, D-K4h: `keep_timings` moves what the log names, with the exact count and the exact weight, to the folder
+/// of the day, the run and the row, and `dir` is relative to the root of the history. What the log does not name stays.
+#[test]
+fn keep_timings_mueve_los_informes_que_nombra_el_log_y_cuenta_exacto() {
+    let fx = Fixture::new("k4-guardar");
+    let target = k4_target(&fx);
+    let out = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_GUARDAR}"),
+        &[path_str(&target)],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&out, "keep_timings of a log that names two reports");
+    let answer = k4_answer(&out);
+    let res = &answer["res"];
+    let dir = res["dir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("keep_timings gave no dir: {answer}\n{}", show(&out)));
+    let parts: Vec<&str> = dir.split('/').collect();
+    assert_eq!(parts.len(), 4, "<day>/timings/<run>/<idx>-<id>: {dir}");
+    assert!(
+        [&answer["antes"], &answer["despues"]]
+            .iter()
+            .any(|day| day.as_str() == Some(parts[0])),
+        "the day folder is the UTC day of the call: {dir} / {answer}"
+    );
+    assert_eq!(&parts[1..], ["timings", "run-k4", "10-DBG"], "{dir}");
+    assert_eq!(res["n"], json!(2), "{answer}");
+    assert_eq!(res["bytes"], json!(10), "{answer}");
+    assert_eq!(res["perdidos"], json!(0), "{answer}");
+    assert_eq!(res["faltan"], json!(0), "{answer}");
+    let kept = fx.root.join(REPO).join(dir);
+    for (name, body) in [(K4_NOMBRES[0], "AAAA"), (K4_NOMBRES[1], "BBBBBB")] {
+        assert_eq!(
+            fs::read_to_string(kept.join(name)).unwrap_or_default(),
+            body,
+            "{name} is not in {}",
+            kept.display()
+        );
+        assert!(
+            !target.join("cargo-timings").join(name).exists(),
+            "{name} was copied and not moved"
+        );
+    }
+    for stays in [K4_NOMBRES[2], K4_NOMBRES[3]] {
+        assert!(
+            target.join("cargo-timings").join(stays).exists(),
+            "{stays} is not named by the log and left the target"
+        );
+    }
+    assert_eq!(history_lines(&text(&out.stderr)), 0, "{}", show(&out));
+}
+
+/// Spec K4-A, D-K4h: a report named twice counts once and is a `perdido`; a path named that is not there is a `falta`.
+#[test]
+fn keep_timings_cuenta_lo_perdido_y_lo_que_falta() {
+    let fx = Fixture::new("k4-cuenta");
+    let target = k4_target(&fx);
+    let out = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_CUENTA}"),
+        &[path_str(&target)],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(
+        &out,
+        "keep_timings of a log with a repeated and a missing report",
+    );
+    let answer = k4_answer(&out);
+    let res = &answer["res"];
+    assert_eq!(res["n"], json!(1), "{res}");
+    assert_eq!(res["bytes"], json!(4), "{res}");
+    assert_eq!(res["perdidos"], json!(1), "{res}");
+    assert_eq!(res["faltan"], json!(1), "{res}");
+}
+
+/// Spec K4-A, D-K4h: a log that names no report gives None, moves nothing and says nothing.
+#[test]
+fn keep_timings_de_un_log_sin_informes_es_none_y_no_mueve_nada() {
+    let fx = Fixture::new("k4-nada");
+    let target = k4_target(&fx);
+    let out = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_NADA}"),
+        &[path_str(&target)],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&out, "keep_timings of a log with no report");
+    let answer = k4_answer(&out);
+    assert!(
+        answer.get("res").is_some_and(Value::is_null),
+        "no report named, so None: {answer}"
+    );
+    for name in K4_NOMBRES {
+        assert!(
+            target.join("cargo-timings").join(name).exists(),
+            "{name} left the target although the log named none"
+        );
+    }
+    assert!(
+        files_named(&fx.root, "cargo-timing-20261109T120000Z.html").is_empty(),
+        "a report reached the history"
+    );
+    assert_eq!(history_lines(&text(&out.stderr)), 0, "{}", show(&out));
+}
+
+/// Spec K4-A, D-K4h: a history that cannot be written is None, one `history:` line and the reports where they were.
+/// The control is the same call with a history that can be written, which moves them.
+#[test]
+fn keep_timings_con_un_historial_que_no_se_escribe_es_none_avisa_y_deja_los_informes() {
+    let fx = Fixture::new("k4-sin-escritura");
+    let target = k4_target(&fx);
+    let control = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_GUARDAR}"),
+        &[path_str(&target)],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&control, "control");
+    assert!(
+        !target.join("cargo-timings").join(K4_NOMBRES[0]).exists(),
+        "control: with a history that can be written the report moves"
+    );
+    let fx = Fixture::new("k4-sin-escritura-roto");
+    let target = k4_target(&fx);
+    let blocker = fx.base.join("no-es-un-directorio");
+    write(&blocker, "x");
+    let broken = blocker.join("historial");
+    let out = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_GUARDAR}"),
+        &[path_str(&target)],
+        Some(broken.as_path()),
+    );
+    assert_ok(&out, "keep_timings over a history that cannot be written");
+    assert!(
+        k4_answer(&out).get("res").is_some_and(Value::is_null),
+        "a history that cannot take the reports gives None: {}",
+        show(&out)
+    );
+    assert_eq!(
+        history_lines(&text(&out.stderr)),
+        1,
+        "one `history:` line: {}",
+        show(&out)
+    );
+    for name in K4_NOMBRES {
+        assert!(
+            target.join("cargo-timings").join(name).exists(),
+            "{name} left the target although the history could not take it"
+        );
+    }
+}
+
+/// Spec K4-A, D-K4j: when it keeps reports, `keep_timings` removes the timings/ of the day folders older than 30 UTC
+/// days (the one of 31 days), and only that: the one of exactly 30 days and the one of 29 stay whole, the `pasos.jsonl`
+/// of the old one stays as it was, and a folder that is no day is not touched.
+#[test]
+fn keep_timings_poda_los_timings_de_mas_de_30_dias_y_nada_mas() {
+    let fx = Fixture::new("k4-retencion");
+    let target = k4_target(&fx);
+    let out = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_RETENCION}"),
+        &[path_str(&target)],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&out, "keep_timings with old day folders");
+    let answer = k4_answer(&out);
+    let root = fx.root.join(REPO);
+    let day = |key: &str| root.join(answer["dias"][key].as_str().expect("a seeded folder"));
+    let old = day("31");
+    assert!(
+        !old.join("timings").exists(),
+        "the timings/ of a folder of 31 days is still there: {}",
+        show(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(old.join("pasos.jsonl")).unwrap_or_default(),
+        "{\"id\": \"a\"}\n",
+        "the pasos.jsonl of the old folder changed: the history is never pruned, only its reports"
+    );
+    for (key, why) in [
+        ("30", "30 days is not more than 30"),
+        ("29", "29 days"),
+        ("ninguno", "a folder that is no day"),
+    ] {
+        assert!(
+            day(key)
+                .join("timings/run-vieja/10-a/cargo-timing-vieja.html")
+                .is_file(),
+            "the timings/ of the folder of {why} was removed"
+        );
+    }
+    assert!(
+        answer["res"]["dir"].is_string(),
+        "the reports of today were kept: {answer}"
+    );
+}
+
+/// Spec K4-B, D-K4r, by hand: the seconds of the interval `i` in which another is alive, the union and not the sum.
+/// [(0,10),(2,4),(3,6)] is 4, 2 and 3; two intervals that touch do not overlap.
+#[test]
+fn solape_s_da_los_ejemplos_a_mano() {
+    let fx = Fixture::new("k4-solape-mano");
+    let out = py(
+        &fx,
+        r#"
+casos = [[(0, 10), (2, 4), (3, 6)], [(0, 5), (5, 9)], [(0, 5), (0, 5)], [(1, 2)]]
+print(json.dumps([[gh.solape_s(c, i) for i in range(len(c))] for c in casos]))
+"#,
+        &[],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&out, "solape_s over the examples");
+    let got: Vec<Vec<f64>> = serde_json::from_str(text(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", show(&out)));
+    assert_eq!(
+        got,
+        vec![
+            vec![4.0, 2.0, 3.0],
+            vec![0.0, 0.0],
+            vec![5.0, 5.0],
+            vec![0.0]
+        ]
+    );
+}
+
+/// Spec K4-B, D-K4r: for every combination of three integer intervals with 0 <= start < end <= 6, `solape_s` is what
+/// counting the unit cells of an interval that another one covers gives. The expectation is the count, not the formula.
+#[test]
+fn solape_s_coincide_con_contar_las_celdas_que_otro_cubre() {
+    let fx = Fixture::new("k4-solape-celdas");
+    let out = py(
+        &fx,
+        r#"
+import itertools
+intervalos = [(a, b) for a in range(7) for b in range(a + 1, 7)]
+print(json.dumps([[gh.solape_s(list(c), i) for i in range(3)] for c in itertools.product(intervalos, repeat=3)]))
+"#,
+        &[],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&out, "solape_s over every combination");
+    let shown = show(&out);
+    let got: Vec<Vec<f64>> = serde_json::from_str(text(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", &shown[..shown.len().min(300)]));
+    let intervals: Vec<(u32, u32)> = (0..7)
+        .flat_map(|a| (a + 1..7).map(move |b| (a, b)))
+        .collect();
+    let mut n = 0;
+    for a in &intervals {
+        for b in &intervals {
+            for c in &intervals {
+                let all = [*a, *b, *c];
+                for (i, own) in all.iter().enumerate() {
+                    let covered = (own.0..own.1)
+                        .filter(|cell| {
+                            all.iter()
+                                .enumerate()
+                                .any(|(j, other)| j != i && other.0 <= *cell && *cell < other.1)
+                        })
+                        .count() as f64;
+                    assert_eq!(
+                        got[n][i], covered,
+                        "solape_s({all:?}, {i}) is {} and the cells say {covered}",
+                        got[n][i]
+                    );
+                }
+                n += 1;
+            }
+        }
+    }
+    assert_eq!(got.len(), n, "the enumerations do not have the same size");
+}
+
+/// Spec K4-A, K4-B: `step_end` takes `timings` and `solape_s`, and `run_end` takes `plan`; the records carry them as
+/// given, and as null (a key, not a gap) when nobody gave them. The plan is also in the index.
+#[test]
+fn step_end_acepta_timings_y_solape_s_y_run_end_acepta_el_plan() {
+    let fx = Fixture::new("k4-campos");
+    let out = py(
+        &fx,
+        r#"
+corrida = gh.run_start(modo="serie", sha=None, huella=None, tabla="t", run="r1")
+p1 = gh.step_start(corrida, 10, "a")
+gh.step_end(corrida, p1, rc=0, timings={"dir": "20261109/timings/r1/10-a", "n": 2, "bytes": 10, "perdidos": 0, "faltan": 0}, solape_s=1.5)
+p2 = gh.step_start(corrida, 20, "b")
+gh.step_end(corrida, p2, rc=0)
+gh.run_end(corrida, rc=0, plan={"nproc": 24, "jobs": 15, "carriles": 2, "fallo": None})
+otra = gh.run_start(modo="serie", sha=None, huella=None, tabla="t", run="r2")
+gh.run_end(otra, rc=0)
+"#,
+        &[],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(
+        &out,
+        "step_end with timings and solape_s, run_end with a plan",
+    );
+    assert_eq!(history_lines(&text(&out.stderr)), 0, "{}", show(&out));
+    let steps = records(&fx.root, "pasos.jsonl");
+    assert_eq!(
+        steps[0]["timings"],
+        json!({"dir": "20261109/timings/r1/10-a", "n": 2, "bytes": 10, "perdidos": 0, "faltan": 0}),
+        "{}",
+        steps[0]
+    );
+    assert_eq!(steps[0]["solape_s"], json!(1.5), "{}", steps[0]);
+    for campo in ["timings", "solape_s"] {
+        assert!(
+            steps[1].get(campo).is_some_and(Value::is_null),
+            "{campo} has to be a key of the record and null when nobody gave it: {}",
+            steps[1]
+        );
+    }
+    let plan = json!({"nproc": 24, "jobs": 15, "carriles": 2, "fallo": null});
+    for name in ["corridas.jsonl", "indice.jsonl"] {
+        let lines = records(&fx.root, name);
+        let first = lines.iter().find(|l| l["run"] == json!("r1"));
+        let second = lines.iter().find(|l| l["run"] == json!("r2"));
+        assert_eq!(first.map(|l| &l["plan"]), Some(&plan), "{name}: {lines:?}");
+        assert!(
+            second.is_some_and(|l| l.get("plan").is_some_and(Value::is_null)),
+            "a run that gave no plan has `plan` as a key and null in {name}: {lines:?}"
+        );
+    }
+}
+
+// --- CI-E4: the seconds in series and the cores of a step and of a run ----------------------------------------------
+// D-E4b, D-E4h, D-E4k, D-E4l. The API these tests fix for pass 2:
+// - `serie_final(intervalos) -> (serie_final_s, serie_cola_s) | None`, over tuples `(listo, inicio, fin)`: the seconds in
+//   which exactly one row is alive and another is ready to start (the wait) or no row will start after it (the tail).
+// - `step_end(..., sin_medida=None)`: the record adds `nucleos` (cpu_s over fin - inicio, null when cpu_s is null or the
+//   step took 0 s) and `sin_medida` ({} by default). A null `nucleos` takes the reason the caller gave for `cpu_s`, or
+//   "the step took 0 s"; a reason nobody gave is not invented.
+// - `run_end(..., mem_muestra=None, serie_final_s=None, serie_cola_s=None, sin_medida=None)`: the record (and the index)
+//   adds `nucleos` (the sum of the cpu_s of the steps over T), the three values as given and `sin_medida`.
+
+/// The nine rows of the 19th run of the history (pasos.jsonl of 8-nov-2026, `listo = inicio - espera_s`): P, DBG, NLI,
+/// B3, REL, E2E, DC, CV and M, as `(listo, inicio, fin)`. Worked out in the spec of CI-E4 (section 0.3): the wait is
+/// 1006.421 s and the tail 146.363 s, so 1152.784 s of the 1157.205 s of the run.
+const E4_RUN19: &str = "[(0.054, 0.057, 4.257), (4.259, 4.262, 395.298), (395.358, 395.363, 432.871), \
+     (4.259, 432.875, 434.568), (434.568, 434.571, 537.101), (434.568, 537.104, 717.785), \
+     (4.258, 717.788, 942.179), (4.259, 942.254, 1010.836), (4.258, 1010.840, 1157.203)]";
+
+/// Spec H-E4-1: `serie_final` on the examples worked out by hand (the comments say which seconds count) and on the 19th run.
+const BODY_E4_SERIE_MANO: &str = r#"
+casos = [
+    [(0, 0, 10), (0, 0, 4), (4, 6, 8)],
+    [(0, 0, 5), (5, 5, 8), (0, 0, 2)],
+    [(0, 0, 3), (0, 3, 5)],
+    [(0, 0, 2), (2.5, 3, 4)],
+    [(0, 0, 5), (0, 0, 5)],
+    [(0, 0, 7)],
+    [],
+    @RUN19@,
+]
+print(json.dumps([gh.serie_final(c) for c in casos]))
+"#;
+
+/// Spec H-E4-1. By hand, second by second:
+/// 1. [4,6) one alive with the third ready = 2; [8,10) the first alone and nobody starts after = 2: (4, 2).
+/// 2. [2,5) one alive and the second blocked by its dependencies does not count; [5,8) the tail = 3: (3, 3).
+/// 3. [0,3) the first alone with the second ready = 3; [3,5) the tail = 2: (5, 2).
+/// 4. [0,2) the first alone, the second not ready yet: nothing; [2,3) nobody alive; [3,4) the tail = 1: (1, 1).
+/// 5. two alive all the time: (0, 0).  6. one row alone: it is the tail: (7, 7).  7. no row: None.
+#[test]
+fn serie_final_da_los_ejemplos_a_mano_y_la_corrida_19_e4() {
+    let fx = Fixture::new("e4-serie-mano");
+    let body = BODY_E4_SERIE_MANO.replace("@RUN19@", E4_RUN19);
+    let out = py(&fx, &body, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "serie_final over the examples");
+    let got: Vec<Value> = serde_json::from_str(text(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", show(&out)));
+    let want = [
+        json!([4.0, 2.0]),
+        json!([3.0, 3.0]),
+        json!([5.0, 2.0]),
+        json!([1.0, 1.0]),
+        json!([0.0, 0.0]),
+        json!([7.0, 7.0]),
+        Value::Null,
+    ];
+    assert_eq!(got.len(), 8, "{got:?}");
+    assert_eq!(&got[..7], &want[..], "the seven worked examples: {got:?}");
+    let (total, tail) = (got[7][0].as_f64(), got[7][1].as_f64());
+    assert!(
+        total.is_some_and(|s| (s - 1152.784).abs() <= 0.001),
+        "the 19th run is 1152.784 s in series: {:?}",
+        got[7]
+    );
+    assert!(
+        tail.is_some_and(|s| (s - 146.363).abs() <= 0.001),
+        "the tail of the 19th run is 146.363 s: {:?}",
+        got[7]
+    );
+}
+
+/// Spec H-E4-2: 500 random runs of one to six rows with integer times 0 <= listo <= inicio < fin <= 20. The oracle is
+/// in the body: it counts each cell [k, k+1) with the definition (one alive and another ready: the wait; one alive and
+/// no start after it: the tail) and `serie_final` has to give that sum exactly, within the bounds of any run.
+const BODY_E4_SERIE_CELDAS: &str = r#"
+import random
+rng = random.Random(20261110)
+casos = 0
+for _ in range(500):
+    filas = []
+    for _ in range(rng.randint(1, 6)):
+        listo = rng.randint(0, 19)
+        inicio = rng.randint(listo, 19)
+        filas.append((listo, inicio, rng.randint(inicio + 1, 20)))
+    espera = cola = 0
+    for k in range(20):
+        vivos = [f for f in filas if f[1] <= k < f[2]]
+        esperando = [f for f in filas if f[0] <= k < f[1]]
+        despues = [f for f in filas if f[1] > k]
+        if len(vivos) == 1 and esperando:
+            espera += 1
+        elif len(vivos) == 1 and not despues:
+            cola += 1
+    total, la_cola = gh.serie_final(filas)
+    assert total == espera + cola, f"serie_final of {filas} is {total} and the cells say {espera + cola}"
+    assert la_cola == cola, f"the tail of {filas} is {la_cola} and the cells say {cola}"
+    assert 0 <= la_cola <= total <= max(f[2] for f in filas) - min(f[1] for f in filas), f"{filas}: {total} {la_cola}"
+    casos += 1
+print("e4 casos=%d" % casos)
+"#;
+
+#[test]
+fn serie_final_coincide_con_contar_las_celdas_e4() {
+    let fx = Fixture::new("e4-serie-celdas");
+    let out = py(&fx, BODY_E4_SERIE_CELDAS, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "serie_final over 500 random runs");
+    assert!(
+        text(&out.stdout).contains("e4 casos=500"),
+        "the property did not say it ran its 500 cases: {}",
+        show(&out)
+    );
+}
+
+/// Spec H-E4-3: four steps. `a` has cpu_s 1.5 over 3 s of its own, with a second of wait that does not divide (0.5 and not
+/// 0.375); `b` has no cpu_s and the reason the planner gave; `c` took 0 s; `d` is a call of the old shape (no reason).
+const BODY_E4_NUCLEOS_PASO: &str = r#"
+corrida = gh.run_start(modo="serie", sha=None, huella=None, tabla="t", run="r-e4-3")
+a = gh.step_start(corrida, 10, "a")
+gh.step_end(corrida, a, rc=0, inicio=2.0, fin=5.0, espera_s=1.0, cpu_s=1.5)
+b = gh.step_start(corrida, 20, "b")
+gh.step_end(corrida, b, rc=0, inicio=2.0, fin=5.0, espera_s=1.0, cpu_s=None, sin_medida={"cpu_s": "r"})
+c = gh.step_start(corrida, 30, "c")
+gh.step_end(corrida, c, rc=0, inicio=3.0, fin=3.0, cpu_s=1.0)
+d = gh.step_start(corrida, 40, "d")
+gh.step_end(corrida, d, rc=0, cpu_s=None)
+"#;
+
+#[test]
+fn los_nucleos_de_un_paso_son_cpu_entre_seg_y_null_con_su_motivo_e4() {
+    let fx = Fixture::new("e4-nucleos-paso");
+    let out = py(&fx, BODY_E4_NUCLEOS_PASO, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "step_end with cores and reasons");
+    assert_eq!(history_lines(&text(&out.stderr)), 0, "{}", show(&out));
+    let steps = records(&fx.root, "pasos.jsonl");
+    assert_eq!(steps.len(), 4, "{steps:?}");
+    assert_eq!(steps[0]["nucleos"], json!(0.5), "{}", steps[0]);
+    assert_eq!(steps[0]["sin_medida"], json!({}), "{}", steps[0]);
+    assert!(
+        steps[1]["cpu_s"].is_null() && steps[1]["nucleos"].is_null(),
+        "{}",
+        steps[1]
+    );
+    assert_eq!(
+        steps[1]["sin_medida"],
+        json!({"cpu_s": "r", "nucleos": "r"}),
+        "a null of cores takes the reason of the cpu_s that was not measured: {}",
+        steps[1]
+    );
+    assert!(steps[2]["nucleos"].is_null(), "{}", steps[2]);
+    assert!(
+        steps[2]["sin_medida"]["nucleos"]
+            .as_str()
+            .is_some_and(|why| why.contains("0 s")),
+        "a step of 0 s gives no cores and says why: {}",
+        steps[2]
+    );
+    assert_eq!(steps[2]["cpu_s"], json!(1.0), "{}", steps[2]);
+    assert!(steps[3]["nucleos"].is_null(), "{}", steps[3]);
+    assert_eq!(
+        steps[3]["sin_medida"],
+        json!({}),
+        "a call with no `sin_medida` writes its line with an empty one, and invents no reason: {}",
+        steps[3]
+    );
+}
+
+/// Spec H-E4-4: three runs. r1: three steps of 1.5 CPU-seconds, T = 9 s and every new argument. r2: the second step is
+/// not measured, with its reason. r3: a run of the old shape.
+const BODY_E4_NUCLEOS_CORRIDA: &str = r#"
+def corrida_de(run, cpus, **extra):
+    corrida = gh.run_start(modo="serie", sha=None, huella=None, tabla="t", run=run)
+    for idx, (nombre, cpu, motivos) in enumerate(cpus, 1):
+        paso = gh.step_start(corrida, 10 * idx, nombre)
+        gh.step_end(corrida, paso, rc=0, inicio=0.0, fin=1.0, cpu_s=cpu, sin_medida=motivos)
+    gh.run_end(corrida, rc=0, **extra)
+
+corrida_de("r1", [("a", 1.5, None), ("b", 1.5, None), ("c", 1.5, None)], T=9.0,
+           mem_muestra={"t": 1.5, "current": 7, "anon": 4, "file": 2, "shmem": 1, "kernel": 1, "muestras": 5},
+           serie_final_s=4.0, serie_cola_s=2.0, sin_medida={"mem_peak": "m"})
+corrida_de("r2", [("a", 1.5, None), ("b", None, {"cpu_s": "step b: x"})], T=9.0, sin_medida={"cpu_s": "step b: x"})
+corrida_de("r3", [("a", 1.5, None)], T=3.0)
+"#;
+
+#[test]
+fn los_nucleos_y_los_campos_nuevos_de_la_corrida_e4() {
+    let fx = Fixture::new("e4-nucleos-corrida");
+    let out = py(&fx, BODY_E4_NUCLEOS_CORRIDA, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "run_end with cores and the new fields");
+    assert_eq!(history_lines(&text(&out.stderr)), 0, "{}", show(&out));
+    let muestra = json!({"t": 1.5, "current": 7, "anon": 4, "file": 2, "shmem": 1, "kernel": 1, "muestras": 5});
+    for name in ["corridas.jsonl", "indice.jsonl"] {
+        let lines = records(&fx.root, name);
+        let run = |id: &str| -> &Value {
+            lines
+                .iter()
+                .find(|l| l["run"] == json!(id))
+                .unwrap_or_else(|| panic!("{name} has no run {id}: {lines:?}"))
+        };
+        let (r1, r2, r3) = (run("r1"), run("r2"), run("r3"));
+        assert_eq!(r1["cpu_s"], json!(4.5), "{name}: {r1}");
+        assert_eq!(
+            r1["nucleos"],
+            json!(0.5),
+            "{name}: the cores of a run are its CPU over its T (9 s), not over the seconds its steps add up to: {r1}"
+        );
+        assert_eq!(r1["mem_muestra"], muestra, "{name}: {r1}");
+        assert_eq!(r1["serie_final_s"], json!(4.0), "{name}: {r1}");
+        assert_eq!(r1["serie_cola_s"], json!(2.0), "{name}: {r1}");
+        assert_eq!(r1["sin_medida"], json!({"mem_peak": "m"}), "{name}: {r1}");
+        assert!(
+            r2["cpu_s"].is_null() && r2["nucleos"].is_null(),
+            "{name}: {r2}"
+        );
+        assert_eq!(
+            r2["sin_medida"],
+            json!({"cpu_s": "step b: x", "nucleos": "step b: x"}),
+            "{name}: the cores of a run that is missing a step take the reason of its cpu_s: {r2}"
+        );
+        assert_eq!(r3["nucleos"], json!(0.5), "{name}: {r3}");
+        for campo in ["mem_muestra", "serie_final_s", "serie_cola_s"] {
+            assert!(
+                r3.get(campo).is_some_and(Value::is_null),
+                "{name}: a run of the old shape has `{campo}` as a key and null: {r3}"
+            );
+        }
+        assert_eq!(r3["sin_medida"], json!({}), "{name}: {r3}");
+    }
+}
+
+// --- CI-J18: the grammar of a row, the target that stays under its root and the key that ignores the form ---------------
+// The properties of the revision of 10-nov, J18b/J18c/J18e. They run in process like those of J14m (`propiedad`), with their
+// own seed, 20261110, and no sleeps. The scripts dir is `sys.argv[1]` and the prelude has loaded `gate-dag.py` as `dag`.
+
+/// J18b.1 and J18c.1 (D-J18b, D-J18c): the real table with one row changed by each defect is a Refusal that names the line
+/// of the row (`table line N:`) and the thing that is wrong, and the real table as it is reads whole. The same process
+/// then puts each name the planner sets, and each base, in front of the order of a row: a row may not name any of them.
+/// Each case is (what it is, the row, the word to change, what it becomes, what the message has to name); an empty word to
+/// change appends. No case is read from the planner: they are the cells of the Gherkin.
+const BODY_J18_GRAMATICA: &str = r#"
+HASH = chr(35)
+real = open(os.path.join(sys.argv[1], "gate-dag.txt"), encoding="utf-8").read().split("\n")
+work = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+rows = [n for n, line in enumerate(real) if line.strip() and not line.lstrip().startswith(HASH)]
+
+def parse(lines):
+    path = os.path.join(work, "case.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    return dag.parse_table(path)
+
+def row_of(step_id):
+    return next(n for n in rows if real[n].split()[1] == step_id)
+
+def word_of(step_id, prefix):
+    found = [w for w in real[row_of(step_id)].split() if w.startswith(prefix)]
+    assert found, f"{step_id} has no word that starts with {prefix!r}: the row has no such cell any more"
+    return found[0]
+
+def change(step_id, old, new):
+    # old is the column to change (an int: 0 idx, 1 id, 3 resources, 4 class), a word of the row, or empty to append.
+    n = row_of(step_id)
+    words = real[n].split()
+    if isinstance(old, int):
+        words[old] = new
+    elif old:
+        assert old in words, f"{step_id} has no word {old!r}: the fixture of the test is stale"
+        words[words.index(old)] = new
+    else:
+        words.append(new)
+    lines = list(real)
+    lines[n] = " ".join(words)
+    return n + 1, lines
+
+def refused(label, number, lines, named):
+    try:
+        parse(lines)
+    except dag.Refusal as err:
+        said = str(err)
+    except Exception as err:
+        raise AssertionError(f"{label}: {type(err).__name__}: {err}")
+    else:
+        raise AssertionError(f"{label}: the table was accepted")
+    assert f"table line {number}:" in said, f"{label}: the refusal does not name the line {number}: {said}"
+    assert named in said, f"{label}: the refusal does not name {named!r}: {said}"
+
+assert len(parse(real)) == len(rows), "the real table is not read whole"
+# The cells a case changes are read from the row of the real table, not written here: the resources of the row (column 3)
+# keep every entry but the one a case replaces, and an env word is the one the row names.
+RESOURCES = real[row_of("DBG")].split()[3]
+assert "target:" in RESOURCES and "cluster:" in RESOURCES, f"DBG names no target and cluster: {RESOURCES!r}"
+
+def resources_with(prefix, entry):
+    parts = RESOURCES.split(",")
+    assert any(p.startswith(prefix) for p in parts), f"the resources {RESOURCES!r} have no {prefix!r}"
+    return ",".join(entry if p.startswith(prefix) else p for p in parts)
+
+CASES = [
+    ("target:/etc", "DBG", 3, resources_with("target:", "target:/etc"), "/etc"),
+    ("target:../../../x", "DBG", 3, resources_with("target:", "target:../../../x"), "../../../x"),
+    ("target:a/b", "DBG", 3, resources_with("target:", "target:a/b"), "a/b"),
+    ("cluster:x", "DBG", 3, resources_with("cluster:", "cluster:x"), "cluster:x"),
+    ("cluster:C_a/../b", "DBG", 3, resources_with("cluster:", "cluster:C_a/../b"), "C_a/../b"),
+    ("cluster:C_Dbg", "DBG", 3, resources_with("cluster:", "cluster:C_Dbg"), "C_Dbg"),
+    ("the id a/b", "DBG", 1, "a/b", "a/b"),
+    ("idx -10", "DBG", 0, "-10", "-10"),
+    ("idx 0", "DBG", 0, "0", "0"),
+    ("idx 1_0", "DBG", 0, "1_0", "1_0"),
+    ("idx 010", "DBG", 0, "010", "010"),
+    ("CARGO_BUILD_JOBS=ocho", "DBG", word_of("DBG", "CARGO_BUILD_JOBS="), "CARGO_BUILD_JOBS=ocho", "CARGO_BUILD_JOBS"),
+    ("CARGO_BUILD_JOBS=0", "DBG", word_of("DBG", "CARGO_BUILD_JOBS="), "CARGO_BUILD_JOBS=0", "CARGO_BUILD_JOBS"),
+    ("CARGO_BUILD_JOBS empty", "DBG", word_of("DBG", "CARGO_BUILD_JOBS="), "CARGO_BUILD_JOBS=", "CARGO_BUILD_JOBS"),
+    ("MUTANTS_JOBS=-1", "M", word_of("M", "MUTANTS_JOBS="), "MUTANTS_JOBS=-1", "MUTANTS_JOBS"),
+    ("CUBA_NLI_INTRA_THREADS=x", "DBG", word_of("DBG", "CUBA_NLI_INTRA_THREADS="), "CUBA_NLI_INTRA_THREADS=x", "CUBA_NLI_INTRA_THREADS"),
+    ("CARGO_INCREMENTAL empty", "DBG", word_of("DBG", "CARGO_INCREMENTAL="), "CARGO_INCREMENTAL=", "CARGO_INCREMENTAL"),
+    ("a comment at the end of the row", "DBG", "", HASH + " nota", HASH),
+    ("the word " + HASH + "x in the order", "DBG", "bash", "bash " + HASH + "x", HASH + "x"),
+    ("the class boundary", "DBG", 4, "boundary", "normal, exclusive or untimed"),
+]
+for label, step_id, old, new, named in CASES:
+    number, lines = change(step_id, old, new)
+    refused(label, number, lines, named)
+
+VARIABLES = ["TMPDIR", "CARGO_TARGET_DIR", "CUBA_GATE_LANE_TOKEN", "DATABASE_URL", "GATE_SERVER_SYSTEM_ID"]
+for name in VARIABLES:
+    number, lines = change("P", "bash", name + "=x bash")
+    refused(name + " before the order of a row", number, lines, name)
+assert len(parse(real)) == len(rows), "the real table is not read whole after the cases"
+print("j18 grammar cases=%d vars=%d" % (len(CASES), len(VARIABLES)))
+"#;
+
+/// J18e.P2 (D-J18b): `target_dir` over 500 names from the seed 20261110, with letters, digits, `_`, `.`, `/`, `..`, `-`,
+/// `~`, `$`, `é`, `\`, a space, a NUL, the empty name and one of 300 characters, and a root of the fixture three levels deep
+/// (so a `..` or an absolute name lands inside the fixture and is seen). Every name it accepts is `[A-Za-z0-9_]+`, its parent
+/// is exactly `<root>/<key of the tree>` and its `.gate-tree` names the tree; every such name of up to 255 characters is
+/// accepted; anything else is a Refusal and never another exception; and nothing is made in the fixture outside
+/// `<root>/<key>`. The names do not come from the planner.
+const BODY_J18_P2: &str = r#"
+import re
+rng = random.Random(20261110)
+base = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+root = os.path.join(base, "a", "b", "raiz")
+os.makedirs(root)
+os.environ["CARGO_TARGET_DIR"] = root
+tree = os.path.realpath(dag.repo_root())
+key = dag.tree_key(tree)
+under = os.path.join(root, key)
+SAFE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+PIECES = list("abcXYZ019_") + [".", "/", "..", "-", "~", "$", "é", "\\", " ", "\x00", "", "../.."]
+names = ["..", ".", "../x", "../../../x_escape", "a/b", "/etc", "", "é", "x" * 300, "a" * 255, "a" * 256, "T_dbg", "T dbg",
+         "T\x00x", "-", "~", "$HOME", "a\\b", "T_dbg/../../x"]
+while len(names) < 500:
+    if rng.random() < 0.4:
+        names.append("".join(rng.choice(SAFE) for _ in range(rng.randint(1, 40))))
+    else:
+        names.append("".join(rng.choice(PIECES) for _ in range(rng.randint(1, 6))))
+accepted = refused = 0
+for name in names:
+    fits = re.fullmatch(r"[A-Za-z0-9_]+", name) is not None
+    try:
+        path = dag.target_dir(name)
+    except dag.Refusal:
+        refused += 1
+        assert not (fits and len(name) <= 255), f"{name!r} is a name and was refused"
+        continue
+    except Exception as err:
+        raise AssertionError(f"target_dir({name!r}) raised {type(err).__name__}: {err}")
+    accepted += 1
+    assert fits, f"{name!r} is not a name and target_dir accepted it: {path}"
+    assert os.path.dirname(path) == under, f"{name!r} is under {os.path.dirname(path)}, not under {under}"
+    assert open(os.path.join(path, ".gate-tree"), encoding="utf-8").read().strip() == tree, f"{name!r}: .gate-tree"
+allowed = {os.path.join(base, "a"), os.path.join(base, "a", "b"), root, under}
+found = [os.path.join(where, entry) for where, dirs, files in os.walk(base) for entry in dirs + files]
+outside = [p for p in found if p not in allowed and not p.startswith(under + os.sep)]
+assert not outside, f"made outside <root>/<key>: {outside}"
+assert accepted >= 50 and refused >= 50, f"{accepted} accepted and {refused} refused: the names do not exercise both sides"
+print("j18 p2 names=%d accepted=%d refused=%d" % (len(names), accepted, refused))
+"#;
+
+/// J18e.P3 (D-J18d): `table_key_of` over 400 variants of the real table from the seed 20261110, and a sweep of every word.
+/// A variant that adds comments (also indented), blank lines, runs of spaces or tabs, CRLF or CR, or puts the rows in
+/// another order has the key of the real table; a variant that changes a word of a row, drops a row or repeats one has
+/// another. The sweep changes each word of each row of the real table in turn: the key sees all of them, so a key made of the
+/// start of each row would not pass. The key of the real table is also worked here from its definition (the sha256 of its
+/// normalised rows ordered by bytes and joined by a line break), so the answer is not only the planner's agreeing with itself.
+const BODY_J18_P3: &str = r#"
+import hashlib
+HASH = chr(35)
+rng = random.Random(20261110)
+real = open(os.path.join(sys.argv[1], "gate-dag.txt"), "rb").read()
+rows = [line for line in real.decode("utf-8").split("\n") if line.strip() and not line.lstrip().startswith(HASH)]
+assert len(rows) >= 9, f"the real table has {len(rows)} rows"
+key = dag.table_key_of(real)
+by_hand = hashlib.sha256("\n".join(sorted(" ".join(row.split()) for row in rows)).encode("utf-8")).hexdigest()
+assert key == by_hand, f"the key of the real table is {key}, and its definition gives {by_hand}"
+SPACES = [" ", "  ", "\t", " \t "]
+EOLS = ["\n", "\r\n", "\r"]
+COMMENTS = [HASH + " a comment", "   " + HASH + " indented", "\t" + HASH, "", "  ", "\t"]
+
+def same_form():
+    order = list(rows)
+    rng.shuffle(order)
+    out = []
+    for row in order:
+        out.extend(rng.choice(COMMENTS) for _ in range(rng.randint(0, 2)))
+        words = row.split()
+        out.append(rng.choice(["", " ", "\t"]) + "".join(w + rng.choice(SPACES) for w in words[:-1]) + words[-1]
+                   + rng.choice(["", " ", "\t"]))
+    body = "".join(line + rng.choice(EOLS) for line in out)
+    return body.rstrip("\r\n").encode("utf-8") if rng.random() < 0.3 else body.encode("utf-8")
+
+def other_word():
+    lines = list(rows)
+    op = rng.choice(["word", "word", "word", "drop", "repeat"])
+    i = rng.randrange(len(lines))
+    if op == "word":
+        words = lines[i].split()
+        j = rng.randrange(len(words))
+        new = rng.choice(["x", "9", "Z" + words[j], words[j] + "q", "normal", "target:T_x", "-"])
+        words[j] = new if new != words[j] else words[j] + "!"
+        lines[i] = " ".join(words)
+    elif op == "drop":
+        del lines[i]
+    else:
+        lines.insert(i, lines[i])
+    rng.shuffle(lines)
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+same = other = 0
+for n in range(400):
+    if n % 2 == 0:
+        assert dag.table_key_of(same_form()) == key, "a form that is not a word changed the key"
+        same += 1
+    else:
+        assert dag.table_key_of(other_word()) != key, "a table with another word, another count of rows has the same key"
+        other += 1
+swept = 0
+for i, row in enumerate(rows):
+    words = row.split()
+    for j in range(len(words)):
+        changed = list(rows)
+        changed[i] = " ".join(words[:j] + [words[j] + "!"] + words[j + 1:])
+        assert dag.table_key_of(("\n".join(changed) + "\n").encode("utf-8")) != key, f"word {j} of the row {words[1]} is not in the key"
+        swept += 1
+print("j18 p3 variants=400 same=%d different=%d swept=%d" % (same, other, swept))
+"#;
+
+#[test]
+fn j18b_1_a_row_that_is_not_the_grammar_is_refused_with_its_line_and_no_row_names_what_the_planner_sets()
+ {
+    propiedad("j18b-1", BODY_J18_GRAMATICA, "j18 grammar cases=20 vars=5");
+}
+
+#[test]
+fn j18e_p2_target_dir_stays_under_the_root_and_the_key_of_the_tree_for_every_name() {
+    propiedad("j18e-p2", BODY_J18_P2, "j18 p2 names=500");
+}
+
+#[test]
+fn j18e_p3_the_key_of_a_table_ignores_the_form_and_sees_every_word() {
+    propiedad(
+        "j18e-p3",
+        BODY_J18_P3,
+        "j18 p3 variants=400 same=200 different=200",
+    );
+}

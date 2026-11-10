@@ -3,9 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# CI-J15d (H6): gate-lock.sh assigns GATE_LOCK its own default when it is loaded, so the lock that a step inherited from the
+# gate is read before the load. --step refuses a lock that is not the one its own HOME names.
+GATE_LOCK_INHERITED="${GATE_LOCK:-}"
 
 # One gate at a time, for the whole of this one: run-all-tests.sh is only its
-# first half, and everything after it (clippy and tests under --features docs,
+# first half, and everything after it (clippy of the build without docs,
 # deny, audit, codigo-muerto, crap-gate, mutants-gate) builds in the same target
 # directory under the same cargo lock. Taken before anything else happens, so
 # a second gate is refused before it has checked, backed up or built anything.
@@ -51,6 +54,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
   live=$!
   trap 'kill "$live" 2>/dev/null || true; rm -rf "$tmp" "$hermetic"' EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
+  # What the planner prints between the OK of the judge's server and the banner of its first block: the plan
+  # of the machine (CI-K4), the note that the scope is not delegated (CI-E4; the stand-in cgroup tree of the
+  # self-tests has no `0::` line, so it is always printed) and the row it starts (CI-F3.3b-2). Any other line
+  # there is still a failure.
+  planner_lines='^(plan: |note: the scope is not delegated |dag: P env:)'
 
   # fake_tree NAME RUN_ALL_TESTS_BODY
   fake_tree() {
@@ -91,8 +99,22 @@ gate_cluster_down_all() {
   echo down-all >>"$HOME/steps"
   rm -f "$HOME/lanes.open"
 }
+# CI-J14h: what the gate's exit asks of the library when it takes down the directories a row left. As the real ones
+# answer it (gate-cluster.sh, K1, K2): a pid that is alive and is not the postgres of the directory gets no signal and
+# the directory stays; no stand-in is the postgres of anything.
+gate_pid_alive() { [[ "${1:-}" =~ ^[0-9]+$ ]] && kill -0 "$1" 2>/dev/null; }
+gate_identity_refusal() { printf 'exe is not %s/postgres (stand-in)' "$GATE_PG_BINDIR"; }
+gate_stop_pid() {
+  gate_pid_alive "$1" || return 0
+  echo "note: pid $1 is not the postgres of $2 ($(gate_identity_refusal "$1" "$2")): no signal is sent" >&2
+  return 1
+}
 FAKE
-    printf '#!/bin/sh\n[ "${1:-}" = --check-models ] || [ -n "${DATABASE_URL:-}" ] || { echo "FAIL: DATABASE_URL is not set, or is empty (stand-in)" >&2; exit 2; }\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
+    # CI-F3.4 (D-F34c): the E2E row has models and names no pools, so the planner wants the resource plan the binary chose in
+    # its log, as the real one writes it. The stand-in of the run-all-tests of lane E prints that line, tier full and the
+    # pools of the table (embed=4 rerank=8 nli=4), so a row that runs the planner is not red for a line only the binary writes.
+    printf '%s\n' '{"timestamp":"2026-11-06T16:10:54.000112Z","level":"INFO","fields":{"message":"resource plan","plan":"nivel=full (stand-in) hilos: embed=4 rerank=8 nli=4"}}' >"$t/scripts/plan-line.json"
+    printf '#!/bin/sh\n[ "${1:-}" = --check-models ] || [ -n "${DATABASE_URL:-}" ] || { echo "FAIL: DATABASE_URL is not set, or is empty (stand-in)" >&2; exit 2; }\ncase " $* " in *" --lane E "*) cat "$(dirname "$0")/plan-line.json" ;; esac\n%s\n' "$2" >"$t/scripts/run-all-tests.sh"
     for s in codigo-muerto crap-gate; do
       printf '#!/bin/sh\necho %s >>"$HOME/steps"\necho "${DATABASE_URL-unset}" >>"$HOME/%s.urls"\necho "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset}" >>"$HOME/%s.lanes"\nexit 0\n' "$s" "$s" "$s" >"$t/scripts/$s.sh"
     done
@@ -153,6 +175,10 @@ FAKE
       'for a in "$@"; do printf "%s\n" "$a"; done >>"$HOME/psql.args"' \
       'printf "PGOPTIONS=%s\n" "${PGOPTIONS-}" >>"$HOME/psql.env"' \
       'printf "PGPASSWORD=%s\n" "${PGPASSWORD-}" >>"$HOME/psql.env"' \
+      'printf "PGCONNECT_TIMEOUT=%s\n" "${PGCONNECT_TIMEOUT-unset}" >>"$HOME/psql.env"' \
+      'printf "PGHOSTADDR=%s\n" "${PGHOSTADDR-unset}" >>"$HOME/psql.env"' \
+      'printf "PGREQUIREPEER=%s\n" "${PGREQUIREPEER-unset}" >>"$HOME/psql.env"' \
+      'if [ -n "${PGHOSTADDR:-}" ] || [ -n "${PGREQUIREPEER:-}" ]; then echo "psql: connection to server failed: libpq read PGHOSTADDR or PGREQUIREPEER from the environment, and the socket the URL names is not what it asked for (stand-in)" >&2; exit 2; fi' \
       'if [ -n "${FAKE_PSQL_EXIT:-}" ]; then echo "${FAKE_PSQL_STDERR:-psql: fake failure}" >&2; exit "$FAKE_PSQL_EXIT"; fi' \
       'lane="$(printf "%s" "$*" | sed -n "s/.*%2F\([a-z][a-z0-9-]*\)\.[A-Za-z0-9]\{6\}:5432.*/\1/p")"' \
       'if [ -n "$lane" ] && [ -z "${FAKE_PSQL_CLUSTER_NAME+x}" ]; then name="memory-industry-gate-$lane"; else name="${FAKE_PSQL_CLUSTER_NAME-memory-industry-gate}"; fi' \
@@ -175,6 +201,8 @@ FAKE
     printf '%s\n' '#!/bin/sh' 'echo initdb >>"$HOME/initdb.calls"' 'exit 1' >"$t/pgbin/initdb"
     chmod +x "$t/pgbin/initdb"
     printf '{"engines":{"node":">=18"}}\n' >"$t/package.json"
+    # CI-K9b: and rust-toolchain.toml says which compiler it pins, or the gate says it is not pinned.
+    printf '[toolchain]\nchannel = "1.98.1"\n' >"$t/rust-toolchain.toml"
     # cargo fails the one subcommand named in FAIL_AT, and not its --version
     # probe, so the gate gets past "is cargo-deny installed" to the check. Each
     # call leaves its arguments in $HOME/steps, which is how a row reads the
@@ -272,6 +300,17 @@ FAKE
   git config --global init.defaultBranch main
   git config --global core.autocrlf false
   judge_test_url='postgresql://gate:pw0@127.0.0.1:5489/brain'
+  # No wait without a deadline: a gate or a step that waits for something that never comes (a stand-in that reads its stdin,
+  # a lane that does not answer) is red at the deadline of its row and says which one, not a self-test that never ends.
+  # `timeout` is looked up here, in the PATH of the self-test, and not in the PATH the row is given.
+  row_s="${GATE_SELFTEST_ROW_S:-240}"
+  row_bound=(timeout -k 5 "$row_s")
+  # CI-J17: the copy runs the planner (gate-dag.py) for real, and a planner delegates the cgroup it runs in: one that reads the
+  # real /proc/self/cgroup and /sys/fs/cgroup from inside the judge's own scope creates a `juez` inside it and moves the
+  # judge's processes. A row gets a cgroup tree of its own with no `0::` line, so the planner has no scope to delegate and
+  # the gate counts no limit; a row that needs a cgroup (F1) passes its own GATE_CGROUP_ROOT and GATE_PROC_SELF_CGROUP.
+  mkdir -p "$tmp/sin-cgroup/raiz"
+  : >"$tmp/sin-cgroup/propio"
   run_copy() { run_copy_as "$judge_test_url" "$@"; }
   run_copy_as() {
     local base="$1" name="$2" fail_at="${3:-}"
@@ -281,9 +320,12 @@ FAKE
     rc=0
     # CI-F3.3c (the judge's names): a row takes the target root of the gate from its own HOME, not from the judge's
     # CARGO_TARGET_DIR, which is a foreign directory no user can make. A row that needs one passes it in "$@".
-    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS -u CARGO_TARGET_DIR HOME="$tmp/$name/home" \
-        PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" ${start[@]+"${start[@]}"} "$@" \
-        "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 || rc=$?; } 2>/dev/null
+    # CI-K10 (H2): GATE_DAG is not inherited either, so a row that does not set it shows what the gate asks for by default.
+    { "${row_bound[@]}" env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS -u CARGO_TARGET_DIR -u GATE_DAG HOME="$tmp/$name/home" \
+        PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" ${start[@]+"${start[@]}"} \
+        GATE_CGROUP_ROOT="$tmp/sin-cgroup/raiz" GATE_PROC_SELF_CGROUP="$tmp/sin-cgroup/propio" "$@" \
+        "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 </dev/null || rc=$?; } 2>/dev/null
+    (( rc != 124 )) || self_fail "$name: the gate was still running after $row_s s, so it is waiting for something that does not come: $(tail -n 5 "$tmp/$name.out" 2>/dev/null)"
   }
   exit_file() { cat "$tmp/$1/home/.cache/cuba-gate/run.exit" 2>/dev/null || true; }
   # git_tree NAME RUN_ALL_TESTS_BODY: a fake_tree committed whole, its home
@@ -814,7 +856,7 @@ FAKE
     || self_fail "after_tests: while the tests ran, the exit file did not say so: $(grep 'run.exit reads' "$tmp/after_tests.out")"
 
   # The time of every test binary is judged last, after mutants-gate.sh, over the
-  # gate's own log up to the line printed after the --features docs step (G7, D-F2c):
+  # gate's own log up to the line printed after the step DC (G7, D-F2c):
   # a time red is drift and not broken behaviour, so the same run still gives the verdicts of codigo-muerto,
   # crap-gate and the mutation. What it says is the gate's verdict: a 1 or a 2
   # from it is the exit of the gate, in the exit file, with no receipt.
@@ -822,7 +864,7 @@ FAKE
   run_copy times_last
   (( rc == 0 )) || self_fail "times_last: a gate whose every step passed exited $rc: $(cat "$tmp/times_last.out")"
   [[ "$(exit_file times_last)" == 0 ]] || self_fail "times_last: the exit file says '$(exit_file times_last)', not 0"
-  docs_at="$(step_at times_last '^cargo test --features docs$')"
+  docs_at="$(step_at times_last '^cargo clippy --all-targets --no-default-features --timings -- -D warnings$')"
   muerto_at="$(step_at times_last '^codigo-muerto$')"
   crap_at="$(step_at times_last '^crap-gate$')"
   mutants_at="$(step_at times_last '^mutants-gate$')"
@@ -830,10 +872,10 @@ FAKE
   [[ -n "$docs_at" && -n "$muerto_at" && -n "$crap_at" && -n "$mutants_at" && -n "$times_at" ]] \
     || self_fail "times_last: a step is missing from the order (docs '$docs_at', codigo-muerto '$muerto_at', crap-gate '$crap_at', mutants-gate '$mutants_at', test-times '$times_at'): $(steps_of times_last)"
   (( muerto_at < docs_at && docs_at < crap_at && crap_at < mutants_at && mutants_at < times_at )) \
-    || self_fail "times_last: the order is not codigo-muerto (before the first cargo call that compiles), cargo test --features docs, crap-gate, mutants-gate, test-times: $(steps_of times_last)"
+    || self_fail "times_last: the order is not codigo-muerto (before the first cargo call that compiles), cargo clippy --all-targets --no-default-features (the build without docs), crap-gate, mutants-gate, test-times: $(steps_of times_last)"
   grep -qxF "test-times --judge $tmp/times_last/home/.cache/cuba-gate/merge-gate.log --until === end of timed steps ===" "$tmp/times_last/home/steps" \
     || self_fail "times_last: test-times was not called as --judge <the gate's own log> --until '=== end of timed steps ===': $(steps_of times_last)"
-  for line in '=== cargo clippy/test --features docs ===' '=== end of timed steps ==='; do
+  for line in '=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ===' '=== end of timed steps ==='; do
     tr -d '\r' <"$tmp/times_last/home/times.seen" 2>/dev/null | grep -qxF "$line" \
       || self_fail "times_last: the log test-times was handed did not hold '$line' yet, so it judged a log cut before the boundary: $(cat "$tmp/times_last/home/times.seen" 2>/dev/null || true)"
   done
@@ -928,10 +970,11 @@ FAKE
     [[ "${lines[at+1]:-}" == "OK  judge server :$port (cluster_name=memory-industry-gate, system_identifier=7701731310526959658)" ]] \
       || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the OK of the judge server on :$port"
     # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
+    # CI-K4 (D-K4q): and, before the first block, the plan of the machine it measured (`plan: ...`).
     planner_gap=0
-    [[ "${lines[at+2]:-}" =~ ^dag:\ P\ env: ]] && planner_gap=1
+    while [[ "${lines[at+2+planner_gap]:-}" =~ $planner_lines ]]; do planner_gap=$(( planner_gap + 1 )); done
     [[ "${lines[at+2+planner_gap]:-}" == "=== cargo audit ===" ]] \
-      || self_fail "$name: the line after the judge's OK is '${lines[at+2]:-}', not the banner of cargo audit, the first step after the readiness check"
+      || self_fail "$name: the line after the judge's OK (and the planner's lines) is '${lines[at+2+planner_gap]:-}', not the banner of cargo audit, the first step after the readiness check"
     if grep -qxF "$answer" "$tmp/$name.out"; then
       self_fail "$name: pg_isready's own answer is a line of the output: $(cat "$tmp/$name.out")"
     fi
@@ -969,10 +1012,15 @@ FAKE
     at="$(grep -nxF -- "$want" "$tmp/$name.out" | head -1 | cut -d: -f1)"
     [[ -n "$at" ]] || self_fail "$name: no line '$want': $(cat "$tmp/$name.out")"
     # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
-    next="$(sed -n "$((at+1))p" "$tmp/$name.out")"
-    [[ "$next" =~ ^dag:\ P\ env: ]] && next="$(sed -n "$((at+2))p" "$tmp/$name.out")"
+    # CI-K4 (D-K4q): and, before the first block, the plan of the machine it measured (`plan: ...`).
+    skip=1
+    next="$(sed -n "$((at+skip))p" "$tmp/$name.out")"
+    while [[ "$next" =~ $planner_lines ]]; do
+      skip=$(( skip + 1 ))
+      next="$(sed -n "$((at+skip))p" "$tmp/$name.out")"
+    done
     [[ "$next" == "=== cargo audit ===" ]] \
-      || self_fail "$name: the line after the judge's OK (and the planner's line for P) is not the banner of cargo audit: $(cat "$tmp/$name.out")"
+      || self_fail "$name: the line after the judge's OK (and the planner's lines for P) is not the banner of cargo audit: $(cat "$tmp/$name.out")"
     grep -qxF 'PGOPTIONS=-c default_transaction_read_only=on' "$tmp/$name/home/psql.env" 2>/dev/null \
       || self_fail "$name: the identity query did not run read-only: $(cat "$tmp/$name/home/psql.env" 2>/dev/null || true)"
     # A F2b: the password goes to libpq in PGPASSWORD, for that one call, and never in the argv of psql
@@ -1043,12 +1091,25 @@ FAKE
   fake_tree c1 "$lane_body"
   run_copy_as unset c1 ""
   (( rc == 0 )) || self_fail "C1: the gate without DATABASE_URL on Linux exited $rc: $(cat "$tmp/c1.out")"
-  # CI-F3.3b-1 (D-F3b, spec §4 F3.3b): the chains of the step table, in idx order, one process and one
-  # cluster each: dbg (CL..D3), b3 (B3), rel (R), e2e (E). Then the --features docs step as before.
+  # CI-F3.3b-1 (D-F3b, spec §4 F3.3b) and CI-E11 (E11-10, D-E11b): the chains of the step table, in idx order, one process
+  # and one cluster each: b1 (CL, B1: the lint and the build of T_dbg), then its readers dbg (D1), ct (CT), d2 (D2), d3 (D3)
+  # and nli (NLI), b3 (B3), rel (R), e2e (E). Then the build without docs (CI-K8): it opens no cluster.
   lane_order='run-all-tests --check-models
+up b1
+run-all-tests --lane CL --lane B1
+down b1
 up dbg
-run-all-tests --lane CL --lane D1 --lane D2 --lane D3
+run-all-tests --lane D1
 down dbg
+up ct
+run-all-tests --lane CT
+down ct
+up d2
+run-all-tests --lane D2
+down d2
+up d3
+run-all-tests --lane D3
+down d3
 up nli
 run-all-tests --lane NLI
 down nli
@@ -1061,18 +1122,24 @@ down rel
 up e2e
 run-all-tests --lane E
 down e2e
-up docs
-cargo clippy --all-targets --features docs -- -D warnings
-cargo test --features docs
-down docs
+cargo clippy --all-targets --no-default-features --timings -- -D warnings
 up cov
 crap-gate
 down cov
 up mut
 mutants-gate
 down mut'
-  [[ "$(grep -E '^(up |down |run-all-tests|crap-gate|mutants-gate|cargo .*--features docs)' "$tmp/c1/home/steps")" == "$lane_order" ]] \
+  [[ "$(grep -E '^(up |down |run-all-tests|crap-gate|mutants-gate|cargo .*--no-default-features)' "$tmp/c1/home/steps")" == "$lane_order" ]] \
     || self_fail "C1: the lanes and the steps are not in the order of D-F2c (up, its step, down, per lane): $(cat "$tmp/c1/home/steps")"
+  # CI-K4 (D-K4g): the call of DC compiles and carries --timings before its `--` (the order above pins it to the
+  # letter); a call that compiles nothing (fmt, audit, deny) carries none.
+  for k4_sub in fmt audit deny; do
+    grep -q "^cargo $k4_sub" "$tmp/c1/home/steps" \
+      || self_fail "K4: the steps of C1 hold no cargo $k4_sub call, so the rule is not read over it: $(cat "$tmp/c1/home/steps")"
+  done
+  if grep -E '^cargo (fmt|audit|deny)' "$tmp/c1/home/steps" | grep -q -- '--timings'; then
+    self_fail "K4: a cargo call that compiles nothing was given --timings: $(grep -E '^cargo (fmt|audit|deny)' "$tmp/c1/home/steps")"
+  fi
   grep -qxE 'dbg postgresql://cuba:fakepw@[^ ]*%2Fdbg\.fk0000:5432/brain 7701731310526959658' "$tmp/c1/home/run-all.lanes" \
     || self_fail "C1: the full run did not see the URL and GATE_SERVER_SYSTEM_ID of its lane dbg: $(cat "$tmp/c1/home/run-all.lanes" 2>/dev/null)"
   # CI-F3.3b-1: the e2e chain has a cluster of its own, and it sees its URL and its identity, not the dbg one.
@@ -1085,10 +1152,14 @@ down mut'
   # The environment of the gate itself carries no lane's URL when it reaches the last step (test-times).
   [[ -e "$tmp/c1/home/test-times.url" && ( "$(cat "$tmp/c1/home/test-times.url")" == unset || -z "$(cat "$tmp/c1/home/test-times.url")" ) ]] \
     || self_fail "C1: a lane's DATABASE_URL reached test-times, which runs after the lanes: $(cat "$tmp/c1/home/test-times.url")"
-  docs_lines="$(grep -c -- '--features docs' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
-  docs_ok="$(grep -cE '^docs postgresql://cuba:fakepw@[^ ]*%2Fdocs\.fk0000:5432/brain 7701731310526959658 (clippy|test) .*--features docs' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
-  (( docs_lines >= 2 && docs_lines == docs_ok )) \
-    || self_fail "C1: the docs steps did not all see the URL and GATE_LANE of lane docs: $(cat "$tmp/c1/home/cargo.lanes")"
+  # CI-K8 (D-K8d): the build without docs reads no database, so its call sees the URL and the GATE_LANE of no lane, and
+  # no call of the gate asks for the docs feature alone any more.
+  docs_lines="$(grep -c -- '--no-default-features' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
+  docs_ok="$(grep -cE '^unset (unset)? unset clippy .*--no-default-features' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
+  (( docs_lines == 1 && docs_lines == docs_ok )) \
+    || self_fail "C1: the call of the build without docs saw the URL or the GATE_LANE of a lane (it opens no cluster): $(cat "$tmp/c1/home/cargo.lanes")"
+  grep -q -- '--features docs' "$tmp/c1/home/cargo.lanes" \
+    && self_fail "C1: a cargo call asks for --features docs alone, and the default build is the one that carries it: $(cat "$tmp/c1/home/cargo.lanes")"
   # F2b-fix (D-F2i): the step of a lane is judged by gate_require_judge_server, which refuses a lane's
   # URL unless GATE_CLUSTER_ROOT names the root of the clusters. The root is the gate's own shell variable
   # (not exported, as in the judge), so it reaches a step only if run_in_lane hands it over. The crap-gate
@@ -1101,19 +1172,19 @@ down mut'
   (( rc == 0 )) || self_fail "F2b-fix: the gate without DATABASE_URL on Linux exited $rc: $(cat "$tmp/f2bfix.out")"
   grep -qxF "$f2bfix_root" "$tmp/f2bfix/home/crap-gate.roots" 2>/dev/null \
     || self_fail "F2b-fix: the step of lane cov did not see GATE_CLUSTER_ROOT=$f2bfix_root: a lane's step is refused without it (D-F2i), and run_in_lane must hand it over with the lane's URL. It got: $(cat "$tmp/f2bfix/home/crap-gate.roots" 2>/dev/null)"
-  # CI-J5: the --features docs step reads the models the full run reads. The HOME of this row has the
-  # embedder where the binary keeps it, and the stand-in cargo of each docs call records the two
-  # variables it was given: ONNX_MODEL_PATH and CUBA_EMBEDDING_DIM.
+  # CI-J5, CI-K8 (D-K8d): the models are set by run-all-tests.sh alone (gate_model_env), and the build without docs reads
+  # none. The HOME of this row has the embedder where the binary keeps it, and the stand-in cargo of each call records the
+  # two variables it was given: ONNX_MODEL_PATH and CUBA_EMBEDDING_DIM. The call of DC sees neither.
   fake_tree j5 "$lane_body"
   mkdir -p "$tmp/j5/home/.cache/memory-industry/models"
   : >"$tmp/j5/home/.cache/memory-industry/models/model_quantized.onnx"
   run_copy_as unset j5 ""
   (( rc == 0 )) || self_fail "J5: the gate with the embedder under its HOME exited $rc: $(cat "$tmp/j5.out")"
-  j5_docs="$(grep -c -- '--features docs' "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
-  j5_docs_ok="$(awk -v p="$tmp/j5/home/.cache/memory-industry/models" '/--features docs/ && $1 == p && $2 == "384"' \
+  j5_docs="$(grep -c -- '--no-default-features' "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
+  j5_docs_ok="$(awk '/--no-default-features/ && $1 == "unset" && $2 == "unset"' \
     "$tmp/j5/home/cargo.models" 2>/dev/null | wc -l | tr -d ' ')"
-  (( j5_docs >= 2 && j5_docs == j5_docs_ok )) \
-    || self_fail "J5: the --features docs step did not get ONNX_MODEL_PATH=<HOME>/.cache/memory-industry/models and CUBA_EMBEDDING_DIM=384 as the full run does; it got: $(cat "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
+  (( j5_docs == 1 && j5_docs == j5_docs_ok )) \
+    || self_fail "J5: the build without docs was given ONNX_MODEL_PATH or CUBA_EMBEDDING_DIM, and it reads no model; it got: $(cat "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
   # C5: a DATABASE_URL the operator gives still governs, as it does today: no lane is made, every step
   # gets that URL, and the gate says the lanes share that server.
   ext='postgresql://gate:pw0@127.0.0.1:5489/brain'
@@ -1132,8 +1203,8 @@ down mut'
   run_copy_as unset d1 ""
   (( rc == 1 )) || self_fail "D1: the gate whose run-all-tests failed exited $rc, not 1: $(cat "$tmp/d1.out")"
   [[ "$(exit_file d1)" == 1 ]] || self_fail "D1: the exit file says '$(exit_file d1)', not 1"
-  grep -qx 'down dbg' "$tmp/d1/home/steps" || self_fail "D1: lane dbg was not taken down after its failed step: $(cat "$tmp/d1/home/steps")"
-  grep -qx 'up docs' "$tmp/d1/home/steps" && self_fail "D1: the docs lane was made after the failed run-all-tests: $(cat "$tmp/d1/home/steps")"
+  grep -qx 'down b1' "$tmp/d1/home/steps" || self_fail "D1: lane b1 was not taken down after its failed step: $(cat "$tmp/d1/home/steps")"
+  grep -q -- '--no-default-features' "$tmp/d1/home/steps" && self_fail "D1: the build without docs ran after the failed run-all-tests: $(cat "$tmp/d1/home/steps")"
   # D2: a gate stopped by TERM, HUP or INT, during its first lane, takes that lane down (down-all) and
   # leaves 2 in its exit file.
   # CI-F3.3b-2: the signal names the gate by its lock record (the steps run one level deeper, under the planner).
@@ -1337,10 +1408,11 @@ down mut'
     [[ "${lines[at]}" == "OK  Postgres :$port (container $container)" ]] \
       || self_fail "$name: the line said '${lines[at]}', not the port and the container that answered"
     # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
+    # CI-K4 (D-K4q): and, before the first block, the plan of the machine it measured (`plan: ...`).
     planner_gap=0
-    [[ "${lines[at+1]:-}" =~ ^dag:\ P\ env: ]] && planner_gap=1
+    while [[ "${lines[at+1+planner_gap]:-}" =~ $planner_lines ]]; do planner_gap=$(( planner_gap + 1 )); done
     [[ "${lines[at+1+planner_gap]:-}" == "=== cargo audit ===" ]] \
-      || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the banner of cargo audit"
+      || self_fail "$name: the line after the OK line (and the planner's lines) is '${lines[at+1+planner_gap]:-}', not the banner of cargo audit"
     if [[ -n "$password" ]] && grep -qF "$password" "$tmp/$name.out"; then
       self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
     fi
@@ -1440,7 +1512,7 @@ down mut'
     || self_fail "j15: run-all-tests did not get the system_identifier the guard read: '$(cat "$tmp/j15/home/rat.sysid" 2>/dev/null || true)'"
 
   # J1.6 (A2, D-J1c): a server whose system_identifier changes under the run is refused before
-  # the --features docs step, which reads the database after run-all-tests.sh. The stand-in
+  # the build without docs (CI-K8, D-K8d), which asks the identity again after run-all-tests.sh. The stand-in
   # answers the identity the guard read until run-all-tests.sh has run, and then another one.
   j2_url='postgresql://gate:pw0@127.0.0.1:5489/brain'
   fake_tree j2doc 'echo run-all-tests >>"$HOME/steps"; touch "$HOME/sysid.flip"'
@@ -1450,8 +1522,8 @@ down mut'
   run_copy_as "$j2_url" j2doc ""
   (( rc == 2 )) || self_fail "J1.6: a gate whose server changed system_identifier under run-all-tests exited $rc, not 2: $(cat "$tmp/j2doc.out")"
   grep -qF 'system_identifier' "$tmp/j2doc.out" || self_fail "J1.6: the refusal does not name system_identifier: $(cat "$tmp/j2doc.out")"
-  if grep -qF '=== cargo clippy/test --features docs ===' "$tmp/j2doc.out"; then
-    self_fail "J1.6: the --features docs step ran after the server changed: $(cat "$tmp/j2doc.out")"
+  if grep -qF '=== cargo clippy --all-targets --no-default-features' "$tmp/j2doc.out"; then
+    self_fail "J1.6: the build without docs ran after the server changed: $(cat "$tmp/j2doc.out")"
   fi
 
   # gate_linux_env (gate-lock.sh): what a gate run on Linux hands to cargo, to the
@@ -1462,6 +1534,7 @@ down mut'
   mkdir -p "$tmp/env/scripts" "$tmp/env/bin" "$tmp/env/bare" "$tmp/env/home"
   cp "$ROOT/scripts/gate-lock.sh" "$tmp/env/scripts/"
   printf '{"engines":{"node":">=18"}}\n' >"$tmp/env/package.json"
+  printf '[toolchain]\nchannel = "1.98.1"\n' >"$tmp/env/rust-toolchain.toml"
   printf '#!/bin/sh\necho "${FAKE_UNAME:-Linux}"\n' >"$tmp/env/bin/uname"
   printf '#!/bin/sh\necho "${FAKE_FS:-ext2/ext3}"\n' >"$tmp/env/bin/stat"
   printf '#!/bin/sh\necho "${FAKE_NODE:-v20.0.0}"\n' >"$tmp/env/bin/node"
@@ -1486,7 +1559,7 @@ down mut'
     shift
     rc=0
     env -i HOME="$tmp/env/home" PATH="$tmp/env/bin:/usr/bin:/bin" "$@" "$BASH" -c \
-      'source "$1" && gate_linux_env && printf "CARGO_TARGET_DIR=%s\nTMPDIR=%s\n" "${CARGO_TARGET_DIR-unset}" "${TMPDIR-unset}"' \
+      'source "$1" && gate_linux_env && rt=unset && { [[ -z "${RUSTUP_TOOLCHAIN+x}" ]] || case "$(export -p)" in *"declare -x RUSTUP_TOOLCHAIN="*) rt="$RUSTUP_TOOLCHAIN" ;; *) rt=not-exported ;; esac; } && printf "CARGO_TARGET_DIR=%s\nTMPDIR=%s\nPATH=%s\nRUSTUP_TOOLCHAIN=%s\n" "${CARGO_TARGET_DIR-unset}" "${TMPDIR-unset}" "$PATH" "$rt"' \
       _ "$tmp/env/scripts/gate-lock.sh" >"$tmp/$n.out" 2>&1 || rc=$?
   }
   env_var() { sed -n "s/^$2=//p" "$tmp/$1.out"; }
@@ -1543,6 +1616,58 @@ down mut'
   [[ "$(env_var not_linux CARGO_TARGET_DIR)" == unset && "$(env_var not_linux TMPDIR)" == unset ]] \
     || self_fail "gate_linux_env set variables on a machine that is not Linux: $(cat "$tmp/not_linux.out")"
 
+  # K9a.1 (CI-K9): the judge does not use the interop of Windows, and the PATH that WSL adds (68 directories of 9p on
+  # 2026-11-09) made every command that is not found cost seconds: `command -v cygpath` three times took 29.5 s. On Linux
+  # nothing that starts with /mnt/ stays on PATH, whatever its place; the others keep their order, a neighbour such as
+  # /mntools included. Where the shell says it is Windows (OSTYPE) the PATH is the user's own and is not touched.
+  env_run path_mnt PATH="$tmp/env/bin:/mnt/c/k9a-windows:/usr/bin:/mnt/d/k9a/bin:/mntools/bin:/bin:/mnt/c/last"
+  (( rc == 0 )) || self_fail "K9a.1: gate_linux_env exited $rc with /mnt/ entries on PATH: $(cat "$tmp/path_mnt.out")"
+  [[ "$(env_var path_mnt PATH)" == "$tmp/env/bin:/usr/bin:/mntools/bin:/bin" ]] \
+    || self_fail "K9a.1: with /mnt/ entries on PATH it was left as '$(env_var path_mnt PATH)', not '$tmp/env/bin:/usr/bin:/mntools/bin:/bin'"
+  env_run path_msys OSTYPE=msys PATH="$tmp/env/bin:/mnt/c/k9a-windows:/usr/bin:/bin"
+  [[ "$(env_var path_msys PATH)" == "$tmp/env/bin:/mnt/c/k9a-windows:/usr/bin:/bin" ]] \
+    || self_fail "K9a.3: where OSTYPE says msys the PATH was changed to '$(env_var path_msys PATH)'"
+
+  # K9a.2 and K9a.3: gate_where asks cygpath only where the shell says Windows. The stand-in notes each call it gets.
+  mkdir -p "$tmp/env/cyg"
+  printf '#!/bin/sh\necho called >>"%s"\necho C:/k9a-root\n' "$tmp/env/cyg.calls" >"$tmp/env/cyg/cygpath"
+  chmod +x "$tmp/env/cyg/cygpath"
+  where_run() { # NAME [VAR=value ...]: gate_where in a fresh bash, cygpath first on PATH
+    local n="$1"
+    shift
+    rm -f "$tmp/env/cyg.calls"
+    rc=0
+    env -i HOME="$tmp/env/home" PATH="$tmp/env/cyg:/usr/bin:/bin" "$@" "$BASH" -c 'source "$1" && gate_where' \
+      _ "$tmp/env/scripts/gate-lock.sh" >"$tmp/$n.out" 2>&1 || rc=$?
+  }
+  where_run where_linux
+  [[ ! -s "$tmp/env/cyg.calls" ]] \
+    || self_fail "K9a.2: on Linux gate_where asked cygpath $(wc -l <"$tmp/env/cyg.calls") time(s)"
+  [[ "$(cat "$tmp/where_linux.out")" == "$HOSTNAME:/" ]] \
+    || self_fail "K9a.2: on Linux gate_where said '$(cat "$tmp/where_linux.out")', not '$HOSTNAME:/'"
+  where_run where_msys OSTYPE=msys
+  [[ -s "$tmp/env/cyg.calls" && "$(cat "$tmp/where_msys.out")" == "$HOSTNAME:C:/k9a-root" ]] \
+    || self_fail "K9a.3: where OSTYPE says msys gate_where did not use cygpath: '$(cat "$tmp/where_msys.out")'"
+
+  # K9b (CI-K9): the judge pins the compiler for whatever cargo it starts outside the tree (the seed of the mutants, the
+  # labs: rustup does not see rust-toolchain.toml from there and takes `stable`). The channel is read from the file of the
+  # root. Without the file, or without a channel in it, nothing is exported and it says so; a value from outside gives way.
+  [[ "$(env_var target_default RUSTUP_TOOLCHAIN)" == 1.98.1 ]] \
+    || self_fail "K9b: gate_linux_env left RUSTUP_TOOLCHAIN '$(env_var target_default RUSTUP_TOOLCHAIN)', not the channel of rust-toolchain.toml (1.98.1)"
+  env_run pin_foreign RUSTUP_TOOLCHAIN=stable
+  [[ "$(env_var pin_foreign RUSTUP_TOOLCHAIN)" == 1.98.1 ]] \
+    || self_fail "K9b: a RUSTUP_TOOLCHAIN from outside ('stable') was kept as '$(env_var pin_foreign RUSTUP_TOOLCHAIN)', not the pinned 1.98.1"
+  mv "$tmp/env/rust-toolchain.toml" "$tmp/env/rust-toolchain.toml.away"
+  env_run pin_missing
+  mv "$tmp/env/rust-toolchain.toml.away" "$tmp/env/rust-toolchain.toml"
+  (( rc == 0 )) || self_fail "K9b: gate_linux_env exited $rc without rust-toolchain.toml: $(cat "$tmp/pin_missing.out")"
+  [[ "$(env_var pin_missing RUSTUP_TOOLCHAIN)" == unset ]] \
+    || self_fail "K9b: without rust-toolchain.toml RUSTUP_TOOLCHAIN was '$(env_var pin_missing RUSTUP_TOOLCHAIN)'"
+  grep -q 'rust-toolchain.toml' "$tmp/pin_missing.out" \
+    || self_fail "K9b: without rust-toolchain.toml the gate did not say so: $(cat "$tmp/pin_missing.out")"
+  [[ "$(env_var not_linux RUSTUP_TOOLCHAIN)" == unset ]] \
+    || self_fail "K9b: gate_linux_env pinned a toolchain on a machine that is not Linux"
+
   # --- CI-F1 rows (spec §4, F1 and F2): the cores the gate counts, the order of the cheap
   # steps, and the boundary test-times judges. cg_tree NAME CPU_MAX builds a cgroup v2 scope
   # by hand: its cpu.max, and the `0::` line /proc/self/cgroup would give. The rows read it
@@ -1556,12 +1681,16 @@ down mut'
 
   # F1.1 (D-F1a): the gate counts its cores once, before its first cargo call: the cgroup's
   # CPUs under nproc's (8 under 24 here), exports CARGO_BUILD_JOBS with them and says so.
+  # CI-K4 (D-K4k, D-K4l), CI-E7a (D-E7a): the jobs are min(nproc, the CPUs of the cgroup, free RAM / 2 GiB), and the line
+  # names the three measures. The RAM of this machine is the self-test's (100 GiB in a /proc/meminfo of its own), so the 8 does
+  # not depend on how much memory whoever runs it has free.
+  printf 'MemTotal:       134217728 kB\nMemFree:        104857600 kB\nMemAvailable:   104857600 kB\n' >"$tmp/meminfo-100g"
   cg_tree f1jobs "800000 100000"
   fake_tree f1jobs "$reads_while_running"
-  run_copy f1jobs "" GATE_CGROUP_ROOT="$tmp/cg/f1jobs/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1jobs/self"
+  run_copy f1jobs "" GATE_CGROUP_ROOT="$tmp/cg/f1jobs/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1jobs/self" GATE_PROC_MEMINFO="$tmp/meminfo-100g"
   (( rc == 0 )) || self_fail "F1.1: a gate whose every step passed exited $rc: $(cat "$tmp/f1jobs.out")"
-  grep -qE '^cargo jobs=8 \(nproc=24, cgroup cpu=8' "$tmp/f1jobs.out" \
-    || self_fail "F1.1: the gate did not print 'cargo jobs=8 (nproc=24, cgroup cpu=8' for 24 cores under an 8-CPU cgroup: $(grep 'cargo jobs' "$tmp/f1jobs.out" || echo 'no such line')"
+  grep -qxF 'cargo jobs=8 (nproc=24, cgroup cpu=8, ram free=100.0 GiB)' "$tmp/f1jobs.out" \
+    || self_fail "F1.1: the gate did not print 'cargo jobs=8 (nproc=24, cgroup cpu=8, ram free=100.0 GiB)' for 24 cores under an 8-CPU cgroup with 100 GiB free: $(grep 'cargo jobs' "$tmp/f1jobs.out" || echo 'no such line')"
   jobs_at="$(grep -n '^cargo jobs=' "$tmp/f1jobs.out" | head -1 | cut -d: -f1)"
   audit_at="$(grep -nxF '=== cargo audit ===' "$tmp/f1jobs.out" | head -1 | cut -d: -f1)"
   [[ -n "$jobs_at" && -n "$audit_at" ]] && (( jobs_at < audit_at )) \
@@ -1589,9 +1718,41 @@ down mut'
   fi
   grep -q '^5 ' "$tmp/f1operator/home/cargo.jobs" \
     || self_fail "F1.2: no cargo call kept the CARGO_BUILD_JOBS=5 the operator set (a row that names none must keep it): $(cat "$tmp/f1operator/home/cargo.jobs")"
-  if grep -qvE '^(5|8|12|4|2) ' "$tmp/f1operator/home/cargo.jobs"; then
-    self_fail "F1.2: a cargo call saw neither the operator's 5 nor the jobs its row names in gate-dag.txt: $(cat "$tmp/f1operator/home/cargo.jobs")"
+  table_jobs="$(grep -o 'CARGO_BUILD_JOBS=[0-9]*' "$tmp/f1operator/scripts/gate-dag.txt" | cut -d= -f2 | sort -un | paste -sd'|' -)"
+  [[ -n "$table_jobs" ]] \
+    || self_fail "F1.2: no row of gate-dag.txt names a CARGO_BUILD_JOBS, so the jobs of the rows cannot be read from it"
+  if grep -qvE "^(5|$table_jobs) " "$tmp/f1operator/home/cargo.jobs"; then
+    self_fail "F1.2: a cargo call saw neither the operator's 5 nor the jobs its row names in gate-dag.txt ($table_jobs): $(cat "$tmp/f1operator/home/cargo.jobs")"
   fi
+  # CI-J15e (H10): the jobs of the rows are the table's and not a list copied here. A table whose DC row names 6, a number
+  # the list used to lack, gives the cargo call of DC its 6, and the numbers read from that table hold it.
+  # CI-K4 (D-K4n): the number of a row is its ceiling and not its share: in series a row takes min(its number, the jobs
+  # of the machine), and the operator's CARGO_BUILD_JOBS are the jobs of the machine. So this row sees its 6 only when
+  # the operator names more than 6 (12 here), and with the operator's 5 it would see 5.
+  cg_tree f1table "800000 100000"
+  fake_tree f1table "$reads_while_running"
+  sed -i 's/CARGO_BUILD_JOBS=8 bash scripts\/merge-gate.sh --step DC$/CARGO_BUILD_JOBS=6 bash scripts\/merge-gate.sh --step DC/' "$tmp/f1table/scripts/gate-dag.txt"
+  grep -q 'CARGO_BUILD_JOBS=6 bash scripts/merge-gate.sh --step DC$' "$tmp/f1table/scripts/gate-dag.txt" \
+    || self_fail "F1.2 table: the copy of the table did not take 6 jobs for DC: the DC row no longer ends in 'CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DC'"
+  run_copy f1table "" CARGO_BUILD_JOBS=12 GATE_CGROUP_ROOT="$tmp/cg/f1table/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1table/self"
+  (( rc == 0 )) || self_fail "F1.2 table: a gate whose DC row names 6 jobs exited $rc: $(cat "$tmp/f1table.out")"
+  grep -q '^6 ' "$tmp/f1table/home/cargo.jobs" \
+    || self_fail "F1.2 table: no cargo call saw the 6 jobs the DC row of the table names: $(cat "$tmp/f1table/home/cargo.jobs")"
+  table_jobs="$(grep -o 'CARGO_BUILD_JOBS=[0-9]*' "$tmp/f1table/scripts/gate-dag.txt" | cut -d= -f2 | sort -un | paste -sd'|' -)"
+  if grep -qvE "^(12|$table_jobs) " "$tmp/f1table/home/cargo.jobs"; then
+    self_fail "F1.2 table: a cargo call saw neither the operator's 12 nor the jobs the table names ($table_jobs): $(cat "$tmp/f1table/home/cargo.jobs")"
+  fi
+  # CI-K4 (D-K4n): the same table with the operator's 5 gives the DC row 5, not its 6: the operator's jobs are the ceiling.
+  cg_tree f1ceil "800000 100000"
+  fake_tree f1ceil "$reads_while_running"
+  sed -i 's/CARGO_BUILD_JOBS=8 bash scripts\/merge-gate.sh --step DC$/CARGO_BUILD_JOBS=6 bash scripts\/merge-gate.sh --step DC/' "$tmp/f1ceil/scripts/gate-dag.txt"
+  run_copy f1ceil "" CARGO_BUILD_JOBS=5 GATE_CGROUP_ROOT="$tmp/cg/f1ceil/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1ceil/self"
+  (( rc == 0 )) || self_fail "F1.2 ceiling: a gate whose DC row names 6 jobs under an operator of 5 exited $rc: $(cat "$tmp/f1ceil.out")"
+  if grep -q '^6 ' "$tmp/f1ceil/home/cargo.jobs"; then
+    self_fail "F1.2 ceiling: a cargo call saw the 6 jobs of the DC row although the operator's 5 are the jobs of the machine: $(cat "$tmp/f1ceil/home/cargo.jobs")"
+  fi
+  grep -q '^5 ' "$tmp/f1ceil/home/cargo.jobs" \
+    || self_fail "F1.2 ceiling: no cargo call saw the 5 jobs that bound the row of DC: $(cat "$tmp/f1ceil/home/cargo.jobs")"
 
   # F2: the run-all-tests stand-in of the rows below answers --check-models (its verdict is
   # FAKE_CHECK_MODELS_EXIT) and records a full run as one step. Anything else is a full run.
@@ -1633,19 +1794,19 @@ exit 0'
   f2_cheap_red f2node "" FAKE_NODE_EXIT=1
   f2_cheap_red f2models "" FAKE_CHECK_MODELS_EXIT=1
 
-  # F2.3 (D-F2c): test-times stops at a line of its own, printed after the --features docs
-  # step, and not at the npm banner, which now runs before the first build.
+  # F2.3 (D-F2c): test-times stops at a line of its own, printed after the step of the build
+  # without docs, and not at the npm banner, which now runs before the first build.
   fake_tree f2until "$run_all_steps"
   run_copy f2until ""
   (( rc == 0 )) || self_fail "F2.3: a gate whose every step passed exited $rc: $(cat "$tmp/f2until.out")"
   until_arg="$(sed -n 's/^test-times .*--until //p' "$tmp/f2until/home/steps" | tail -1)"
   [[ "$until_arg" == '=== end of timed steps ===' ]] \
-    || self_fail "F2.3: test-times was told to stop at '$until_arg', not at the line the gate prints after the --features docs step ('=== end of timed steps ===')"
+    || self_fail "F2.3: test-times was told to stop at '$until_arg', not at the line the gate prints after the step of the build without docs ('=== end of timed steps ===')"
   seen="$tmp/f2until/home/times.seen"
-  docs_at="$(grep -nxF '=== cargo clippy/test --features docs ===' "$seen" | head -1 | cut -d: -f1)"
+  docs_at="$(grep -nxF '=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ===' "$seen" | head -1 | cut -d: -f1)"
   bound_at="$(grep -nxF -- "$until_arg" "$seen" | head -1 | cut -d: -f1)"
   [[ -n "$docs_at" && -n "$bound_at" ]] && (( bound_at > docs_at )) \
-    || self_fail "F2.3: the boundary '$until_arg' is not a line of the log after the --features docs step (docs at '${docs_at:-none}', boundary at '${bound_at:-none}')"
+    || self_fail "F2.3: the boundary '$until_arg' is not a line of the log after the step of the build without docs (docs at '${docs_at:-none}', boundary at '${bound_at:-none}')"
 
   # CI-F3.3b-2 (D-F3b, spec F3.3b-1b): the steps of the judge are the rows of scripts/gate-dag.txt, run by the
   # planner (gate-dag.py) after the preamble and before the boundary line. Each row is `merge-gate.sh --step <id>`,
@@ -1653,12 +1814,19 @@ exit 0'
   fake_tree planner "$run_all_steps"
   run_copy planner ""
   (( rc == 0 )) || self_fail "planner: a gate whose every step passed exited $rc: $(cat "$tmp/planner.out")"
+  # CI-K10 (H2): what the gate asks of the planner when nobody sets GATE_DAG is read from the `plan:` line this run printed, not from
+  # the default written in gate-dag.py: a default set anywhere before the planner starts (an `export GATE_DAG="${GATE_DAG:-auto}"` in this script)
+  # is the default of the gate all the same. The contract (local_gate_contract.rs) reads the line below from this self-test.
+  plan_asked="$(sed -n 's/^plan: .* asked=\([a-z]*\) runs=.*/\1/p' "$tmp/planner.out" | head -n 1)"
+  [[ -n "$plan_asked" ]] || self_fail "planner: the gate printed no plan line with what it asked for: $(cat "$tmp/planner.out")"
+  echo "gate default: GATE_DAG unset asks for $plan_asked"
   dag_order="$(sed -n 's/^dag: \([A-Za-z0-9]*\) env:.*/\1/p' "$tmp/planner.out" | tr '\n' ' ')"
-  [[ "$dag_order" == "P DBG NLI B3 REL E2E DC CV M " ]] \
+  [[ "$dag_order" == "P B1 DBG CT D2 D3 NLI B3 REL E2E DC CV M " ]] \
     || self_fail "planner: the planner did not start the rows of gate-dag.txt in idx order (it started: '$dag_order')"
-  # The boundary line is printed by the planner before the first untimed row (CV), after the block of docs and before
-  # the block of crap-gate: the judge of the test times reads up to it, so CV and M are not judged (CI-F3.3b-2).
-  dc_at="$(grep -nxF '=== cargo clippy/test --features docs ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
+  # The boundary line is printed by the planner before the first untimed row (CV), after the block of DC (the build
+  # without docs) and before the block of crap-gate: the judge of the test times reads up to it, so CV and M are not
+  # judged (CI-F3.3b-2).
+  dc_at="$(grep -nxF '=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
   bound_at="$(grep -nxF '=== end of timed steps ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
   crap_at="$(grep -nxF '=== crap-gate (coverage floor) ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
   mut_at="$(grep -nxF '=== mutants-gate ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
@@ -1680,7 +1848,27 @@ exit 0'
     || self_fail "planner red: the planner does not name the red row CV: $(cat "$tmp/planner_red.out")"
   [[ "$(exit_file planner_red)" == 1 ]] \
     || self_fail "planner red: the exit file says '$(exit_file planner_red)', not 1"
-  # CI-F3.3b-2 (spec F3.3b-1b-iii): the rows that are not timed are CV and M, the rows after the docs step. The judge of
+  # E11-11 (CI-E11, D-E11b): a reader of T_dbg that is red is the red of the judge, with its row. The stand-in of run-all-tests
+  # exits 1 on `--lane CT`: the gate exits 1, names CT, prints no MERGE GATE PASSED and leaves no verdict green, and the rows
+  # after CT in the serial order (D2, D3, NLI, B3, REL, E2E, DC, CV, M) do not start; B1 and DBG, which come first, did.
+  ct_body='case "${1:-}" in --check-models) echo "run-all-tests --check-models" >>"$HOME/steps"; exit 0 ;; esac
+echo "run-all-tests${*:+ $*}" >>"$HOME/steps"
+case " $* " in *" --lane CT "*) exit 1 ;; esac
+exit 0'
+  fake_tree ctred "$ct_body"
+  run_copy_as "$judge_test_url" ctred ""
+  (( rc == 1 )) || self_fail "E11-11: the lane CT exited 1 and the gate exited $rc, not 1: $(cat "$tmp/ctred.out")"
+  grep -qF 'FAIL: CT exited 1' "$tmp/ctred.out" \
+    || self_fail "E11-11: the gate does not name the red row CT: $(cat "$tmp/ctred.out")"
+  grep -q 'MERGE GATE PASSED' "$tmp/ctred.out" \
+    && self_fail "E11-11: row CT failed and the judge said PASSED: $(cat "$tmp/ctred.out")"
+  [[ "$(exit_file ctred)" == 1 ]] || self_fail "E11-11: the exit file says '$(exit_file ctred)', not 1"
+  grep -qxF 'run-all-tests --lane D1' "$tmp/ctred/home/steps" \
+    || self_fail "E11-11: the rows before CT did not run (no 'run-all-tests --lane D1'): $(steps_of ctred)"
+  if grep -qE '^(up (d2|d3|nli|b3|rel|e2e)|run-all-tests --lane (D2|D3|NLI|B3|R|E)$|crap-gate|mutants-gate|cargo clippy .*--no-default-features)' "$tmp/ctred/home/steps"; then
+    self_fail "E11-11: a row after the red CT started: $(steps_of ctred)"
+  fi
+  # CI-F3.3b-2 (spec F3.3b-1b-iii): the rows that are not timed are CV and M, the rows after DC. The judge of
   # the test times reads this gate's log only up to the boundary line the planner prints before the first of them, so a
   # crap-gate whose output carries a timed `finished in` line does not change the judgement, and the boundary is not the
   # end of the planner (that would judge CV and M too).
@@ -1694,16 +1882,16 @@ exit 0'
   until_arg="$(sed -n 's/^test-times .*--until //p' "$tmp/untimed/home/steps" | tail -1)"
   [[ "$until_arg" == '=== end of timed steps ===' ]] \
     || self_fail "untimed: the judge of the test times was told to stop at '$until_arg', not at the boundary line of the planner"
-  grep -qxF '=== cargo clippy/test --features docs ===' "$judged" \
-    || self_fail "untimed: the judge does not hold the docs block, the last timed row: $(cat "$judged" 2>/dev/null)"
+  grep -qxF '=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ===' "$judged" \
+    || self_fail "untimed: the judge does not hold the block of DC, the last timed row: $(cat "$judged" 2>/dev/null)"
   grep -qF 'finished in 99.00s' "$judged" \
     && self_fail "untimed: the output of an untimed row (crap-gate, a finished-in line) reached the judge of the test times"
   # The step mode is not a gate: it takes no lock and writes no verdict, and it runs only with the ticket the planner
   # hands it (D-F3k). Without one it exits 2 before any step, and says what it needs.
   fake_tree step_alone "$run_all_steps"
   step_rc=0
-  env -i PATH="$tmp/step_alone/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_alone/home" \
-    "$BASH" "$tmp/step_alone/scripts/merge-gate.sh" --step DBG >"$tmp/step_alone.out" 2>&1 || step_rc=$?
+  "${row_bound[@]}" env -i PATH="$tmp/step_alone/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_alone/home" \
+    "$BASH" "$tmp/step_alone/scripts/merge-gate.sh" --step DBG >"$tmp/step_alone.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 2 )) || self_fail "--step without a ticket exited $step_rc, not 2: $(cat "$tmp/step_alone.out")"
   grep -qF -- '--step' "$tmp/step_alone.out" \
     || self_fail "--step without a ticket does not say what it needs: $(cat "$tmp/step_alone.out")"
@@ -1722,11 +1910,11 @@ exit 0'
   printf '%s' tok-planted >"$step_lock/lanes/20-DBG"
   step_owner_before="$(cat "$step_lock/owner")"
   step_rc=0
-  env -i PATH="$tmp/step_ok/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_ok/home" GATE_LOCK="$step_lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_ok/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_ok/home" GATE_LOCK="$step_lock" \
     CUBA_GATE_LOCK_OWNER="$step_owner_before" CUBA_GATE_LANE_TOKEN=tok-planted \
-    "$BASH" "$tmp/step_ok/scripts/merge-gate.sh" --step DBG >"$tmp/step_ok.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_ok/scripts/merge-gate.sh" --step DBG >"$tmp/step_ok.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 0 )) || self_fail "--step with its ticket exited $step_rc, not 0: $(cat "$tmp/step_ok.out")"
-  [[ "$(grep -E '^(up |down |run-all-tests)' "$tmp/step_ok/home/steps")" == "$(printf '%s\n' 'up dbg' 'run-all-tests --lane CL --lane D1 --lane D2 --lane D3 token=tok-planted' 'down dbg')" ]] \
+  [[ "$(grep -E '^(up |down |run-all-tests)' "$tmp/step_ok/home/steps")" == "$(printf '%s\n' 'up dbg' 'run-all-tests --lane D1 token=tok-planted' 'down dbg')" ]] \
     || self_fail "--step with its ticket did not run the lane of DBG with the token in its environment: $(steps_of step_ok)"
   [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-planted ]] \
     || self_fail "--step spent the ticket its lane has to spend"
@@ -1744,9 +1932,9 @@ exit 0'
   printf '%s' tok-owner >"$step_lock/lanes/20-DBG"
   step_owner_record="$(cat "$step_lock/owner")"
   step_rc=0
-  env -i PATH="$tmp/step_owner/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_owner/home" GATE_LOCK="$step_lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_owner/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_owner/home" GATE_LOCK="$step_lock" \
     CUBA_GATE_LOCK_OWNER="$step_owner_record" CUBA_GATE_LANE_TOKEN=tok-owner \
-    "$BASH" "$tmp/step_owner/scripts/merge-gate.sh" --step DBG >"$tmp/step_owner.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_owner/scripts/merge-gate.sh" --step DBG >"$tmp/step_owner.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 0 )) || self_fail "--step with its ticket and no GATE_OWNER exited $step_rc, not 0: $(cat "$tmp/step_owner.out")"
   [[ "$(cat "$tmp/step_owner/home/lane.owners" 2>/dev/null)" == "dbg $step_owner_record" ]] \
     || self_fail "--step made its lane under '$(cat "$tmp/step_owner/home/lane.owners" 2>/dev/null)', not under the owner of the lock ('dbg $step_owner_record'): $(cat "$tmp/step_owner.out")"
@@ -1757,9 +1945,9 @@ exit 0'
   owner_record 2147483646 dead-owner >"$step_lock/owner"
   printf '%s' tok-dead >"$step_lock/lanes/20-DBG"
   step_rc=0
-  env -i PATH="$tmp/step_dead/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_dead/home" GATE_LOCK="$step_lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_dead/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_dead/home" GATE_LOCK="$step_lock" \
     CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-dead \
-    "$BASH" "$tmp/step_dead/scripts/merge-gate.sh" --step DBG >"$tmp/step_dead.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_dead/scripts/merge-gate.sh" --step DBG >"$tmp/step_dead.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 2 )) || self_fail "--step with the owner of a gate that is not running exited $step_rc, not 2: $(cat "$tmp/step_dead.out")"
   [[ -z "$(steps_of step_dead)" && ! -e "$tmp/step_dead/home/lane.owners" ]] \
     || self_fail "--step with the owner of a gate that is not running made a lane or ran a step: $(steps_of step_dead)"
@@ -1772,9 +1960,9 @@ exit 0'
   owner_record "$$" fixture-owner >"$step_lock/owner"
   printf '%s' tok-judge >"$step_lock/lanes/20-DBG"
   step_rc=0
-  env -i PATH="$tmp/step_judge/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_judge/home" GATE_LOCK="$step_lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_judge/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_judge/home" GATE_LOCK="$step_lock" \
     CUBA_GATE_LOCK_OWNER=ajeno-0000 CUBA_GATE_LANE_TOKEN=tok-judge \
-    "$BASH" "$tmp/step_judge/scripts/merge-gate.sh" --step DBG >"$tmp/step_judge.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_judge/scripts/merge-gate.sh" --step DBG >"$tmp/step_judge.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 2 )) || self_fail "--step with the judge's owner exited $step_rc, not 2: $(cat "$tmp/step_judge.out")"
   [[ -z "$(steps_of step_judge)" ]] || self_fail "--step with the judge's owner ran a step: $(steps_of step_judge)"
   [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-judge ]] || self_fail "--step with the judge's owner spent the ticket"
@@ -1785,14 +1973,123 @@ exit 0'
   owner_record "$$" fixture-owner >"$step_lock/owner"
   printf '%s' tok-planted >"$step_lock/lanes/20-DBG"
   step_rc=0
-  env -i PATH="$tmp/step_foreign/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_foreign/home" GATE_LOCK="$step_lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_foreign/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_foreign/home" GATE_LOCK="$step_lock" \
     CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-other \
-    "$BASH" "$tmp/step_foreign/scripts/merge-gate.sh" --step DBG >"$tmp/step_foreign.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_foreign/scripts/merge-gate.sh" --step DBG >"$tmp/step_foreign.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 2 )) || self_fail "--step with a foreign ticket exited $step_rc, not 2: $(cat "$tmp/step_foreign.out")"
   grep -qF 'lane token refused' "$tmp/step_foreign.out" \
     || self_fail "--step with a foreign ticket does not say it was refused: $(cat "$tmp/step_foreign.out")"
   [[ -z "$(steps_of step_foreign)" ]] || self_fail "--step with a foreign ticket ran a step: $(steps_of step_foreign)"
   [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-planted ]] || self_fail "--step with a foreign ticket spent the planner's ticket"
+
+  # CI-J15e (H9): the dispatch of a row is its function step_<id>: a new row is its function and its line of the table, and no
+  # case holds the ids written by hand. The tree gets a step_Q the real script does not have and `--step Q`, with its ticket,
+  # runs it. An id that is no function is refused with 2 and named, and an id with shell in it runs nothing.
+  fake_tree step_new "$step_run_all"
+  awk '/^if \[\[ "\$\{1:-\}" == --step \]\]; then$/ { print "step_Q() { echo \"q-ran\" >>\"$HOME/steps\"; }" } { print }' \
+    "$tmp/step_new/scripts/merge-gate.sh" >"$tmp/step_new/scripts/merge-gate.new"
+  mv "$tmp/step_new/scripts/merge-gate.new" "$tmp/step_new/scripts/merge-gate.sh"
+  grep -qxF 'step_Q() { echo "q-ran" >>"$HOME/steps"; }' "$tmp/step_new/scripts/merge-gate.sh" \
+    || self_fail "J15e dispatch: the fixture got no step_Q: the dispatch line of merge-gate.sh is not the one the row looks for"
+  step_lock="$tmp/step_new/home/.cache/cuba-gate/lock"
+  mkdir -p "$step_lock/lanes"
+  owner_record "$$" fixture-owner >"$step_lock/owner"
+  printf '%s' tok-new >"$step_lock/lanes/20-DBG"
+  step_new_run() { # <id>: step_rc and $tmp/step_new.out
+    step_rc=0
+    "${row_bound[@]}" env -i PATH="$tmp/step_new/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_new/home" GATE_LOCK="$step_lock" \
+      CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-new \
+      "$BASH" "$tmp/step_new/scripts/merge-gate.sh" --step "$1" >"$tmp/step_new.out" 2>&1 </dev/null || step_rc=$?
+  }
+  step_new_run Q
+  (( step_rc == 0 )) || self_fail "J15e dispatch: --step Q, a function step_Q with no case arm, exited $step_rc, not 0: $(cat "$tmp/step_new.out")"
+  [[ "$(grep -cx 'q-ran' "$tmp/step_new/home/steps")" == 1 ]] \
+    || self_fail "J15e dispatch: --step Q did not run step_Q once: $(steps_of step_new)"
+  for bad_id in ZZZ 'Q;touch "$HOME/pwn"' '../x'; do
+    : >"$tmp/step_new/home/steps"
+    step_new_run "$bad_id"
+    (( step_rc == 2 )) || self_fail "J15e dispatch: --step '$bad_id' exited $step_rc, not 2: $(cat "$tmp/step_new.out")"
+    [[ -z "$(steps_of step_new)" && ! -e "$tmp/step_new/home/pwn" ]] \
+      || self_fail "J15e dispatch: --step '$bad_id' ran something: $(steps_of step_new)"
+  done
+  step_new_run ZZZ
+  grep -qF 'ZZZ' "$tmp/step_new.out" || self_fail "J15e dispatch: the refusal of --step ZZZ does not name it: $(cat "$tmp/step_new.out")"
+
+  # CI-J15d (H6): the lock a step inherits is the gate's. GATE_LOCK of the environment is read before gate-lock.sh is loaded,
+  # because the load assigns the default of the HOME, and a step whose inherited lock is not the one its HOME names is refused
+  # with 2 naming GATE_LOCK, before any lane, with the ticket unspent. Here the HOME's own lock holds a valid owner and
+  # ticket, so a step that read the default instead of what it inherited would run.
+  fake_tree step_lock "$step_run_all"
+  step_lock="$tmp/step_lock/home/.cache/cuba-gate/lock"
+  mkdir -p "$step_lock/lanes" "$tmp/step_lock/elsewhere/lock"
+  owner_record "$$" fixture-owner >"$step_lock/owner"
+  printf '%s' tok-lock >"$step_lock/lanes/20-DBG"
+  step_rc=0
+  "${row_bound[@]}" env -i PATH="$tmp/step_lock/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_lock/home" GATE_LOCK="$tmp/step_lock/elsewhere/lock" \
+    CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-lock \
+    "$BASH" "$tmp/step_lock/scripts/merge-gate.sh" --step DBG >"$tmp/step_lock.out" 2>&1 </dev/null || step_rc=$?
+  (( step_rc == 2 )) || self_fail "J15d: --step with an inherited GATE_LOCK that is not its HOME's exited $step_rc, not 2: $(cat "$tmp/step_lock.out")"
+  grep -qF 'GATE_LOCK' "$tmp/step_lock.out" \
+    || self_fail "J15d: the refusal of a different GATE_LOCK does not name it: $(cat "$tmp/step_lock.out")"
+  [[ -z "$(steps_of step_lock)" && ! -e "$tmp/step_lock/home/lane.owners" ]] \
+    || self_fail "J15d: --step with another GATE_LOCK made a lane or ran a step: $(steps_of step_lock)"
+  [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-lock ]] || self_fail "J15d: --step with another GATE_LOCK spent the ticket"
+
+  # CI-J14h: a row that dies by KILL runs no trap, so the cluster it made stays under the root with this gate's owner on
+  # it. The gate's exit, once it has collected the planner, takes down the directories of the root whose owner is its own
+  # (the identity check of the library decides what is a postgres of theirs) and no other. The row makes three: this
+  # gate's (it goes), one of another owner (it stays) and one of this gate's whose postmaster.pid names a live process
+  # that is not its postgres (it stays, and the process is not signalled). The row kills the step's own shell, as the
+  # kernel kills a step under OOM, so the planner says no verdict and the gate leaves through its exit trap.
+  j14h_body='case "${1:-}" in --check-models) exit 0 ;; esac
+root="$HOME/cluster-root"
+mkdir -p "$root/dbg.own111" "$root/dbg.alien1" "$root/dbg.live11/data"
+printf "%s pidns=1\n" "$CUBA_GATE_LOCK_OWNER" >"$root/dbg.own111/owner"
+printf "%s pidns=1\n" "pid=1 start=1 where=elsewhere since=x token=alien" >"$root/dbg.alien1/owner"
+printf "%s pidns=1\n" "$CUBA_GATE_LOCK_OWNER" >"$root/dbg.live11/owner"
+echo LIVEPID >"$root/dbg.live11/data/postmaster.pid"
+echo made >"$HOME/j14h.made"
+kill -9 "$PPID"
+exit 1'
+  fake_tree j14h "${j14h_body//LIVEPID/$live}"
+  run_copy_as unset j14h ""
+  (( rc != 0 )) || self_fail "J14h: a gate whose step was killed exited 0: $(cat "$tmp/j14h.out")"
+  j14h_root="$tmp/j14h/home/cluster-root"
+  [[ -f "$tmp/j14h/home/j14h.made" ]] \
+    || self_fail "J14h: the step did not make its directories before it died, so the row proves nothing: $(cat "$tmp/j14h.out")"
+  [[ ! -e "$j14h_root/dbg.own111" ]] \
+    || self_fail "J14h: the cluster this gate's row left under its root is still there after the gate's exit: $(cat "$tmp/j14h.out")"
+  [[ -f "$j14h_root/dbg.alien1/owner" ]] \
+    || self_fail "J14h: the exit took down the cluster of another owner: it did not look at whose it was"
+  [[ -d "$j14h_root/dbg.live11" ]] \
+    || self_fail "J14h: the exit took down a directory whose postmaster.pid is a live process that is not its postgres: the identity check was not asked"
+  kill -0 "$live" 2>/dev/null \
+    || self_fail "J14h: the exit signalled a process that is not the postgres of the directory that names it"
+  grep -qF "note: pid $live is not the postgres of $j14h_root/dbg.live11" "$tmp/j14h.out" \
+    || self_fail "J14h: the exit left the directory of a live pid that is not its postgres without saying why: $(cat "$tmp/j14h.out")"
+
+  # CI-J14i: libpq reads PGHOSTADDR and PGREQUIREPEER from the environment, and with them it asks another host, or
+  # refuses the peer, instead of the socket of the lane's URL. The identity query of the judge's server drops the PG*
+  # variables of its caller, as every call of the lane library does (GATE_PG_ENV_UNSET), and sets its own deadline: the
+  # stand-in psql refuses as libpq would when it finds either of them, and records the three it was handed.
+  fake_tree j14i_psql "$lane_body"
+  run_copy_as unset j14i_psql "" PGHOSTADDR=127.0.0.1 PGREQUIREPEER=x
+  (( rc == 0 )) || self_fail "J14i: a gate with PGHOSTADDR and PGREQUIREPEER in its environment exited $rc, not 0: the identity query of the lane read them: $(cat "$tmp/j14i_psql.out")"
+  [[ -s "$tmp/j14i_psql/home/psql.env" ]] || self_fail "J14i: no identity query was made, so the row proves nothing"
+  for j14i_line in PGHOSTADDR=unset PGREQUIREPEER=unset PGCONNECT_TIMEOUT=10; do
+    grep -qxF "$j14i_line" "$tmp/j14i_psql/home/psql.env" \
+      || self_fail "J14i: the identity query was not handed $j14i_line: $(cat "$tmp/j14i_psql/home/psql.env")"
+  done
+  grep -vxF -e PGHOSTADDR=unset -e PGREQUIREPEER=unset -e PGCONNECT_TIMEOUT=10 "$tmp/j14i_psql/home/psql.env" \
+    | grep -qE '^(PGHOSTADDR|PGREQUIREPEER|PGCONNECT_TIMEOUT)=' \
+    && self_fail "J14i: an identity query saw one of the three with another value: $(cat "$tmp/j14i_psql/home/psql.env")"
+  # The identity query of a gate that was given the server (DATABASE_URL) is made the same way.
+  fake_tree j14i_ext "$lane_body"
+  run_copy_as "$ext" j14i_ext "" FAKE_PG_ANSWER='127.0.0.1:5489 - accepting connections' FAKE_PSQL_CLUSTER_NAME=memory-industry-gate \
+    PGHOSTADDR=127.0.0.1 PGREQUIREPEER=x
+  (( rc == 0 )) || self_fail "J14i: a gate with an external DATABASE_URL and PGHOSTADDR in its environment exited $rc, not 0: $(cat "$tmp/j14i_ext.out")"
+  grep -qxF PGCONNECT_TIMEOUT=10 "$tmp/j14i_ext/home/psql.env" \
+    || self_fail "J14i: the identity query of the external server has no deadline of its own: $(cat "$tmp/j14i_ext/home/psql.env")"
 
   echo "OK  self-test: the exit file says running while a gate runs and holds the whole"
   echo "    gate's verdict at the end, a step after the tests included; a gate killed"
@@ -1818,6 +2115,8 @@ exit 0'
   echo "    the test times are judged last, over the gate's own log up to the npm step, and their red is the gate's"
   echo "    advisory exceptions are judged right after cargo audit, from a report made without ignores, and their red stops the gate before cargo deny;"
   echo "    a gate stopped by a signal it can catch (TERM) leaves 2 in the exit file, says so and leaves no receipt, never the 0 of its last command"
+  echo "    the gate's exit takes down, after it has collected the planner, the clusters its rows left under the root with its own owner on them, never the ones of another owner or the ones whose pid is not their postgres (J14h);"
+  echo "    the identity query of the judge's server drops the PGHOSTADDR and PGREQUIREPEER of its caller and has a deadline of its own (J14i);"
   echo "    gate_sweep_dead_targets removes the target of a tree whose .gate-tree names a path that is gone, and no other (a live tree, a key with no marker, a marker that names no tree, another name, a symlink, a neighbour of the root), says so with the size, and the gate runs it after taking the lock and after gate_linux_env"
   exit 0
 fi
@@ -1881,6 +2180,27 @@ write_receipt() {
 # the verdict is the file, and the process just has not passed.
 GATE_REACHED_END=""
 GATE_PLANNER=""
+
+# CI-J14h: the clusters this gate's rows left under the root. A row killed by KILL (the kernel, or the planner after its
+# grace) runs no trap, and its cluster stays in tmpfs with this gate's owner on it. Taken down once the planner is
+# collected, so no row is still making one: the directories of the root whose owner starts with this gate's, as
+# gate_cluster_down does it, and the identity check of the library (gate_stop_pid, gate_identity_refusal) before any
+# signal. A directory whose postmaster.pid names a live process that is not its postgres stays, with the library's note.
+gate_cluster_down_owned() {
+  local dir owner pid
+  [[ -n "$GATE_OWNER" ]] || return 0
+  for dir in "$GATE_CLUSTER_ROOT"/*/; do
+    dir="${dir%/}"
+    [[ -d "$dir" && "${dir##*/}" =~ ^$GATE_LANE_RE\.[A-Za-z0-9]{6}$ && -f "$dir/owner" ]] || continue
+    owner="$(<"$dir/owner")"
+    [[ "$owner" == "$GATE_OWNER"* ]] || continue
+    pid="$(head -n 1 "$dir/data/postmaster.pid" 2>/dev/null || true)"
+    gate_stop_pid "$pid" "$dir" || continue
+    rm -rf -- "$dir"
+    echo "note: took down the cluster a row of this gate left under its root: $dir"
+  done
+}
+
 on_exit() {
   local code=$? tenths=0 stopped=0
   gate_cluster_down_all
@@ -1888,6 +2208,7 @@ on_exit() {
     kill -TERM "$GATE_PLANNER" 2>/dev/null || true
     wait "$GATE_PLANNER" 2>/dev/null || true
   fi
+  gate_cluster_down_owned
   if (( code == 0 )) && [[ -z "$GATE_REACHED_END" ]]; then
     code=2
     stopped=1
@@ -1918,6 +2239,11 @@ trap 'exit 2' INT
 export CUBA_GATE_LOCK_OWNER="$GATE_OWNER"
 # CI-F3.3b-1b-i: the planner writes its lane tickets under this lock's directory (gate-dag.py).
 export GATE_LOCK
+# No process of this judge may fall back on the developer's own database (127.0.0.1:5488) or create a
+# PostgreSQL container: without a DATABASE_URL it refuses with exit 2. Every step that has a database
+# is handed its URL; this is for the one that loses it. Before the first step, which is the refuse-
+# targets check below, and not beside `export DATABASE_URL`, which comes after it.
+export MEMORY_INDUSTRY_REQUIRE_DATABASE_URL=1
 
 # Whatever this commit's earlier receipt said, this run is its verdict now: a
 # red run on it takes it away, and a green one writes it again. A dirty start
@@ -1973,6 +2299,10 @@ echo "  · retrieval quality     the eval step is a smoke run. It proves the"
 echo "                          harness executes; it asserts no nDCG threshold."
 echo "  · other platforms       this judge runs on the merge machine (typically"
 echo "                          Linux x64). Cross-targets are not exercised here."
+echo "  · the build without docs --no-default-features is only compiled and"
+echo "                           linted (clippy -D warnings, row DC): no test runs"
+echo "                           without the docs feature, the default and what is"
+echo "                           published, with which every test runs once."
 echo ""
 echo "WHAT IT REQUIRES (missing = FAIL, never SKIPPED):"
 echo "  · ONNX embed + ORT      ~/.cache/memory-industry/models + onnxruntime"
@@ -2131,7 +2461,8 @@ export GATE_SERVER_SYSTEM_ID="$GATE_JUDGE_SYSID"
 fi
 
 # CI-F3.3b-2 (D-F3b, spec F3.3b-1b): the rows of scripts/gate-dag.txt run here, one `merge-gate.sh --step <id>` each,
-# in the planner's order: GATE_DAG=0 is the series in idx order, GATE_DAG=1 the DAG. Its verdict is this gate's: a red row
+# in the planner's order: GATE_DAG=0 (or serie) is the series in idx order, GATE_DAG=1 (or maximo) the DAG, GATE_DAG=auto the DAG
+# with as many rows alive as the machine has lanes (CI-K4). Its verdict is this gate's: a red row
 # stops the gate with its own code, and the rows after it do not start.
 # The line where the timed steps end (D-F2c, spec F3.3b-1b-iii): test-times.sh judges the log up to it. The planner
 # prints it before the first untimed row (CV, class untimed in gate-dag.txt), so the output of CV and M is not judged.
@@ -2190,9 +2521,11 @@ run_in_lane() {
 # --- the rows of the judge (CI-F3.3b-2) ---------------------------------------------------------
 # The planner starts each row as `merge-gate.sh --step <id>`, a process of its own that reads this file from the top.
 # The flow above is gate_main, which only the else branch of the dispatch at the end calls, so the rows are defined
-# here, after it, and before the dispatch. Each row is one process and one cluster (D-F3b): DBG (CL..D3) shares one
-# throwaway database; B3 builds the release binary; REL and E2E find that binary on disk again (lane_R and lane_E in
-# run-all-tests.sh), so no variable crosses processes.
+# here, after it, and before the dispatch. Each row is one process and one cluster (D-F3b). CI-E11 (D-E11b): B1 lints and
+# compiles T_dbg (CL, B1) and its readers run what it built, each in a cluster of its own: DBG the plain pass (D1, which makes
+# its throwaway database), CT the contracts and the doctests (no database), D2 and D3 the --ignored sections (each makes
+# its database if it is missing) and NLI. B3 builds the release binary; REL and E2E find that binary on disk again (lane_R and
+# lane_E in run-all-tests.sh), so no variable crosses processes.
 step_P() {
 # The advisories are judged before the 20-minute test run: a judge idle for days
 # found its new advisory half an hour in, when 3 s would have said it. cargo audit
@@ -2227,7 +2560,7 @@ fi
 # printed when the judge cannot read the report.
 echo "=== advisory exceptions (scripts/advisory-exceptions.txt) ==="
 adv_dir="$(mktemp -d)"
-adv_lock="$(cygpath -m "$ROOT/rust/Cargo.lock" 2>/dev/null || printf '%s' "$ROOT/rust/Cargo.lock")"
+adv_lock="$(gate_native_path m "$ROOT/rust/Cargo.lock")"
 (cd "$adv_dir" && timeout 120 cargo audit --json --no-fetch -f "$adv_lock" >audit.json 2>audit.err) || true
 adv_rc=0
 "$ROOT/scripts/advisory-exceptions.sh" --judge "$adv_dir/audit.json" || adv_rc=$?
@@ -2264,8 +2597,20 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 # outside this repo, makes it. The judge never touches the live server.
 }
 
+step_B1() {
+  run_in_lane b1 "$ROOT/scripts/run-all-tests.sh" --lane CL --lane B1
+}
 step_DBG() {
-  run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane D3
+  run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane D1
+}
+step_CT() {
+  run_in_lane ct "$ROOT/scripts/run-all-tests.sh" --lane CT
+}
+step_D2() {
+  run_in_lane d2 "$ROOT/scripts/run-all-tests.sh" --lane D2
+}
+step_D3() {
+  run_in_lane d3 "$ROOT/scripts/run-all-tests.sh" --lane D3
 }
 # CI-F3.3c (D-F3l): the NLI assertion (nli_entailment, < 500 ms) runs alone. CI-J12: run-all-tests refuses to run without
 # the judge's server, so NLI runs in a cluster of its own, as the rows that call it do. Its tests open no database.
@@ -2282,14 +2627,15 @@ step_E2E() {
   run_in_lane e2e "$ROOT/scripts/run-all-tests.sh" --lane E
 }
 step_DC() {
-  # The identity is asked again before the --features docs step, which reads the database after run-all-tests.sh:
-  # a server that changed under the run is refused here (D-J1c, A2). A lane is judged when it is made, so only the
-  # server of the operator is asked again.
+  # The identity is asked again after the rows of tests and before CV, which reads the database of the operator: a server
+  # that changed under the run is refused here (D-J1c, A2). A lane is judged when it is made, so only the server of the
+  # operator is asked again.
   [[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
-  # The models of the --features docs step are the ones of the full run (CI-J5): the same function sets them.
-  gate_model_env
-  echo "=== cargo clippy/test --features docs ==="
-  run_in_lane docs "$BASH" -c 'cd "$1" && cargo clippy --all-targets --features docs -- -D warnings && cargo test --features docs' gate "$ROOT/rust"
+  # CI-K8 (D-K8d): the default build carries docs, and the rows that run tests ran them with it. The build without docs is compiled and
+  # linted here and runs no test, so no lane is made and no model is read. clippy -D warnings and not cargo check: it costs
+  # the same, and a warning that exists only without docs (a variable that only a cfg(docs) block uses) is red.
+  echo "=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ==="
+  (cd "$ROOT/rust" && cargo clippy --all-targets --no-default-features --timings -- -D warnings)
 }
 step_CV() {
   echo "=== crap-gate (coverage floor) ==="
@@ -2304,8 +2650,10 @@ step_M() {
 # takes no lock and writes no verdict: its ticket is checked here, and the lane it starts is the one that spends it.
 gate_step_main() {
   local id="$1"
-  [[ -n "${CUBA_GATE_LANE_TOKEN:-}" && -n "${CUBA_GATE_LOCK_OWNER:-}" && -n "${GATE_LOCK:-}" ]] \
+  [[ -n "${CUBA_GATE_LANE_TOKEN:-}" && -n "${CUBA_GATE_LOCK_OWNER:-}" && -n "$GATE_LOCK_INHERITED" ]] \
     || gate_refuse "--step runs one row of scripts/gate-dag.txt, which the planner (gate-dag.py) starts with its lane ticket. Run scripts/merge-gate.sh for the whole gate."
+  [[ "$GATE_LOCK_INHERITED" == "$GATE_LOCK" ]] \
+    || gate_refuse "--step: the GATE_LOCK it inherited ($GATE_LOCK_INHERITED) is not the lock its own HOME names ($GATE_LOCK), so the ticket it holds is not of this gate's lock"
   lane_token_check "$GATE_LOCK" "$CUBA_GATE_LOCK_OWNER" || exit 2
   # CI-F3.3c: GATE_OWNER is a shell variable that acquire_gate_lock sets in gate_main, and a step is a process of its
   # own, so it starts empty. Its value is the record the lock holds now, which lane_token_check has just checked against
@@ -2319,18 +2667,11 @@ gate_step_main() {
   fi
   trap 'gate_cluster_down_all' EXIT
   trap 'exit 2' INT
-  case "$id" in
-    P) step_P ;;
-    DBG) step_DBG ;;
-    NLI) step_NLI ;;
-    B3) step_B3 ;;
-    REL) step_REL ;;
-    E2E) step_E2E ;;
-    DC) step_DC ;;
-    CV) step_CV ;;
-    M) step_M ;;
-    *) gate_refuse "--step: $id is no row of scripts/gate-dag.txt" ;;
-  esac
+  # CI-J15e (H9): the row is the function step_<id>, so a new row is its function and its line of the table, and no list of ids
+  # is kept here. The name is asked of declare -F before it is called: an id that is no function never reaches the call.
+  declare -F "step_$id" >/dev/null \
+    || gate_refuse "--step: $id is no row of scripts/gate-dag.txt: merge-gate.sh has no function step_$id"
+  "step_$id"
 }
 
 # The dispatch: one row of the table, or the whole gate. Bash reads this file from the top, and the rows and gate_main

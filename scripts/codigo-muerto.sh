@@ -13,6 +13,8 @@
 # names it, and a name in the CI workflow's MODEL_OR_CLI_ONLY is excluded there
 # on the promise that the local gate covers it. Nothing checked either promise.
 set -euo pipefail
+# CI-K9a: the judge does not use the interop of Windows. On Linux the PATH that WSL adds (/mnt/..., by 9p) goes before anything looks for a command: each one that is not found walks all of it. The same filter as gate_path_without_windows (gate-lock.sh), which this script cannot load first.
+if [[ "$OSTYPE" == linux* ]]; then k9_kept=""; IFS=: read -ra k9_dirs <<<"$PATH"; for k9_d in "${k9_dirs[@]}"; do [[ "$k9_d" == /mnt/* ]] || k9_kept="${k9_kept:+$k9_kept:}$k9_d"; done; PATH="$k9_kept"; unset k9_dirs k9_d k9_kept; fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUST_DIR="$ROOT/rust"
@@ -95,7 +97,11 @@ server_only_files() {
 # marker is rust/tests/ci_contract.rs's to judge, not this script's.
 check_server_only_tests_run_locally() {
   local ci="$1" gate="$2" tests="$3" today="$4" uncovered=0 file reason expired
-  local plain='^DATABASE_URL="\$GATE_DATABASE_URL" cargo test$'
+  # CI-K4: every cargo call of the judge carries --timings, a report flag; the plain cargo test is still the plain one.
+  # CI-E1: it is the section `plain` of run_counted, which counts its tests against scripts/test-section-counts.txt.
+  # CI-E11 (D-E11e): it is the library and PLAIN_TESTS, every file of tests/ that is not a contract of the judge; a plain pass
+  # that names no PLAIN_TESTS runs none of the marked files.
+  local plain='^DATABASE_URL="\$GATE_DATABASE_URL" (run_counted plain 0 )?cargo test( --lib "\$\{PLAIN_TESTS\[@\]\}")?( --timings)?$'
   while read -r file; do
     [[ -z "$file" ]] && continue
     reason="$(head -n 1 "$file" | tr -d '\r')"
@@ -104,7 +110,7 @@ check_server_only_tests_run_locally() {
       echo "FAIL: $file opens with '$SERVER_MARKER' and no reason after it" >&2
       uncovered=$((uncovered + 1))
     fi
-    if ! grep -q "$plain" "$gate"; then
+    if ! grep -Eq "$plain" "$gate"; then
       echo "FAIL: ci.yml keeps $file out of the check job because run-all-tests.sh runs it in" >&2
       echo "      its plain cargo test against GATE_DATABASE_URL, and that line is gone" >&2
       uncovered=$((uncovered + 1))
@@ -163,6 +169,23 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" cargo test --lib' > "$tmp/gate4.sh"
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate4.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
   [[ "$got" == "2" ]] || { echo "FAIL self-test: the two marked files with no plain cargo test left to run them were not both caught, or the one marked below the first line was (got $got)" >&2; exit 1; }
+  # CI-K4 put --timings on every cargo call of the judge: it is a report flag, so the plain cargo test is still plain.
+  printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" cargo test --timings' > "$tmp/gate5.sh"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate5.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "0" ]] || { echo "FAIL self-test: the plain cargo test with the --timings report flag of CI-K4 was not taken as the run of the marked files (got $got)" >&2; exit 1; }
+  # CI-E1 (D-E1a) counted the plain pass: the line goes through run_counted, and it is still the run of the marked files.
+  printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --timings' > "$tmp/gate6.sh"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate6.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "0" ]] || { echo "FAIL self-test: the plain cargo test counted by run_counted (CI-E1) was not taken as the run of the marked files (got $got)" >&2; exit 1; }
+  # CI-E11 (D-E11e) took the contracts and the doctests out of the plain pass: it is the library and PLAIN_TESTS, the files of
+  # tests/ that are not contracts of the judge, and it is still the run of the marked files, which are never contracts.
+  printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --lib "${PLAIN_TESTS[@]}" --timings' > "$tmp/gate7.sh"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate7.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "0" ]] || { echo "FAIL self-test: the plain pass of CI-E11 (the library and PLAIN_TESTS) was not taken as the run of the marked files (got $got)" >&2; exit 1; }
+  # A selection of the plain pass that names no PLAIN_TESTS runs none of the marked files, and is still caught.
+  printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --lib --timings' > "$tmp/gate8.sh"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate8.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "2" ]] || { echo "FAIL self-test: a plain pass that is the library alone, with no PLAIN_TESTS, was taken as the run of the marked files (got $got)" >&2; exit 1; }
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-23 2>/dev/null | tail -1)"
   [[ "$got" == "1" ]] || { echo "FAIL self-test: a CI exclusion past its date was not caught (got $got)" >&2; exit 1; }
   printf '%s\n' '// needs-a-server:   ' 'mod common;' > "$tmp/tests/unexplained.rs"
