@@ -6420,24 +6420,24 @@ fn fixture_mentions(lines: &[&str]) -> Vec<RowMention> {
                 found.push(row_mention(line, id));
             }
         }
-        if let Some(arm) = text.split(')').next().filter(|_| text.contains(')')) {
-            if is_step_id(arm) {
-                found.push(row_mention(line, arm));
-            }
+        if let Some(arm) = text.split(')').next().filter(|_| text.contains(')'))
+            && is_step_id(arm)
+        {
+            found.push(row_mention(line, arm));
         }
         if let Some(from) = statement.find("au_tree \"") {
             for spec in statement[from..].split('"').skip(1).step_by(2) {
                 let cols: Vec<&str> = spec.split_whitespace().collect();
-                if let [idx, id, deps, resources, class] = cols.as_slice() {
-                    if idx.parse::<u32>().is_ok() {
-                        found.push(RowMention {
-                            idx: Some(idx.to_string()),
-                            deps: Some(deps.to_string()),
-                            resources: Some(resources.to_string()),
-                            class: Some(class.to_string()),
-                            ..row_mention(line, id)
-                        });
-                    }
+                if let [idx, id, deps, resources, class] = cols.as_slice()
+                    && idx.parse::<u32>().is_ok()
+                {
+                    found.push(RowMention {
+                        idx: Some(idx.to_string()),
+                        deps: Some(deps.to_string()),
+                        resources: Some(resources.to_string()),
+                        class: Some(class.to_string()),
+                        ..row_mention(line, id)
+                    });
                 }
             }
         }
@@ -6445,13 +6445,15 @@ fn fixture_mentions(lines: &[&str]) -> Vec<RowMention> {
             if let Some(id) = token.strip_prefix("exit-").filter(|id| is_step_id(id)) {
                 found.push(row_mention(line, id));
             }
-            if let Some((idx, id)) = token.split_once('-') {
-                if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) && is_step_id(id) {
-                    found.push(RowMention {
-                        idx: Some(idx.to_string()),
-                        ..row_mention(line, id)
-                    });
-                }
+            if let Some((idx, id)) = token.split_once('-')
+                && !idx.is_empty()
+                && idx.chars().all(|c| c.is_ascii_digit())
+                && is_step_id(id)
+            {
+                found.push(RowMention {
+                    idx: Some(idx.to_string()),
+                    ..row_mention(line, id)
+                });
             }
         }
     }

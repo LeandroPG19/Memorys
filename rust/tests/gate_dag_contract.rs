@@ -4002,8 +4002,8 @@ struct Jobs {
 }
 
 /// `source gate-lock.sh; gate_cargo_jobs` under a `timeout` of 20 s, with the fixture's cgroup tree, `nproc` and
-/// MemAvailable of `machine`, and the CARGO_BUILD_JOBS of the operator only if `operator` names one.
-fn cargo_jobs(fx: &Fixture, machine: &Machine, operator: Option<&str>) -> Jobs {
+/// MemAvailable of `host`, and the CARGO_BUILD_JOBS of the operator only if `operator` names one.
+fn cargo_jobs(fx: &Fixture, host: &Machine, operator: Option<&str>) -> Jobs {
     let order = r#"source "$1" && gate_cargo_jobs && printf 'JOBS=%s RELEASE=%s\n' "$CARGO_BUILD_JOBS" "$GATE_RELEASE_JOBS""#;
     let mut command = Command::new("timeout");
     command

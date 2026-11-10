@@ -733,6 +733,10 @@ mod profile_tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::assertions_on_constants,
+        reason = "the feature is fixed at compile time and this test is the alarm of a build without `docs`"
+    )]
     fn the_default_build_carries_the_docs_feature() {
         assert!(
             cfg!(feature = "docs"),
