@@ -46,6 +46,26 @@
 #   - son dos patrones que crecen con cada forma nueva, frente a una regla.
 # Un marcador mal puesto es rojo sea cual sea `tests` (marcas_sh), porque una
 # region adivinada no vale para decidir written ni frozen.
+#
+# CI-E6, el coste de lo que se entrega. Tampoco hay campo nuevo (E6a): el
+# especificador dice nivel, segundos, carril y porque del nivel caro de cada
+# escenario en una TABLA de su spec (son N filas, y no caben en una clave de una
+# linea), y el implementador dice los segundos que midio y el carril en dos lineas
+# sangradas de `evidence: |`, que ya es la linea de la orden que pega el
+# orquestador. Un repo que juzga solo seis claves no gana una septima; gana lo que
+# `evidence` ya llevaba. Se juzga despues de written y frozen (E6h), asi que los
+# rojos de siempre no cambian de mensaje ni de orden.
+#
+# `.cursor/handoffs/*` no se versiona, y un handoff no tiene fecha ni su mtime
+# sobrevive a una copia: la unica identidad que conserva un historico es su
+# CONTENIDO. Por eso los anteriores a CI-E6 se eximen por el sha256 de su
+# contenido (sin CR) en scripts/handoffs-sin-coste.txt (E6f). Por fecha no se
+# puede; con un marcador de formato, omitirlo seria la salida (la misma fuga que
+# `tests`); por nombre, reescribir un historico pasaria; con el hash, editarlo lo
+# vuelve nuevo. La lista es cerrada (un contrato de local_gate_contract.rs fija
+# cuantas lineas tiene) y cada linea caduca: toda excepcion lleva motivo, dueño
+# y fecha. Que una linea «ya no se usa» no se puede comprobar, porque los
+# handoffs no se versionan.
 set -euo pipefail
 # CI-K9a: the judge does not use the interop of Windows. On Linux the PATH that WSL adds (/mnt/..., by 9p) goes before anything looks for a command: each one that is not found walks all of it. The same filter as gate_path_without_windows (gate-lock.sh), which this script cannot load first.
 if [[ "$OSTYPE" == linux* ]]; then k9_kept=""; IFS=: read -ra k9_dirs <<<"$PATH"; for k9_d in "${k9_dirs[@]}"; do [[ "$k9_d" == /mnt/* ]] || k9_kept="${k9_kept:+$k9_kept:}$k9_d"; done; PATH="$k9_kept"; unset k9_dirs k9_d k9_kept; fi
@@ -67,6 +87,22 @@ se juzga entonces solo sobre los ficheros bajo ellas.
 Region de test: un `#[cfg(test)]` de un .rs, un .rs entero bajo tests/, o en un
 .sh lo que hay entre las lineas `# --- self-test begin ---` y
 `# --- self-test end ---` (columna 0).
+
+Coste (CI-E6), sin campo nuevo:
+  Del especificador al implementador (cualquier type): `task` o `evidence` nombra
+  su `.cursor/handoffs/<nombre>.spec.md`, junto al .yml, y esa spec trae una tabla
+  con esta cabecera y una fila por cada `Escenario:` de sus bloques gherkin:
+    | Escenario | Nivel | Segundos | Carril | Por qué no el barato |
+    |---|---|---|---|---|
+  Nivel: pura|guion|servicio|e2e. Segundos: un numero (. o ,). Carril: una fila
+  de scripts/gate-dag.txt. Con un nivel que no es `pura`, la ultima celda dice por
+  que el barato no lo demuestra.
+  Del implementador con git_handoff y commit: `evidence: |` lleva, cada una en su
+  linea sangrada, una `segundos: <S> s; <orden acotada>[; <su ultima linea>]` por
+  orden que corrio los tests nuevos (con el `finished in Xs` de cargo, X es S) y,
+  si la tajada toca scripts/, `carril: <id>; comparte: <recursos o nada>`.
+  Los anteriores a CI-E6 estan en scripts/handoffs-sin-coste.txt, por el sha256 de
+  su contenido, con caducidad, dueño y motivo.
 TXT
 }
 
@@ -239,6 +275,315 @@ lista_paths() { # <fichero.yml>
   ' "$1"
 }
 
+# ----------------------------------------------------- el coste (CI-E6)
+
+recorta() { # <texto> -> sin los espacios de los bordes
+  local x="$1"
+  x="${x#"${x%%[![:space:]]*}"}"
+  printf '%s' "${x%"${x##*[![:space:]]}"}"
+}
+
+# Las lineas de un `evidence: |`, sin su sangria. Una `evidence:` de una linea no
+# tiene bloque, y lo que lleve no cuenta: ni segundos ni carril.
+evidencia() { # <fichero.yml>
+  awk '
+    { sub(/\r$/, "") }
+    dentro && ($0 ~ /^[[:space:]]+[^[:space:]]/ || $0 ~ /^[[:space:]]*$/) {
+      sub(/^[[:space:]]+/, ""); print; next
+    }
+    { dentro = 0 }
+    /^evidence:[[:space:]]*[|>][-+]?[[:space:]]*$/ { dentro = 1 }
+  ' "$1"
+}
+
+filas_dag() { # los ids de las filas de scripts/gate-dag.txt de ESTE arbol, uno por linea
+  [[ -f "$ROOT/scripts/gate-dag.txt" ]] || return 0
+  awk '{ sub(/\r$/, "") } /^[[:space:]]*(#|$)/ { next } { print $2 }' "$ROOT/scripts/gate-dag.txt"
+}
+
+# Imprime lo que esta mal de un carril, o nada si es una fila de la tabla.
+carril_problema() { # <id> <ids, uno por linea>
+  local fila filas=""
+  while IFS= read -r fila; do
+    [[ -n "$fila" ]] || continue
+    if [[ "$fila" == "$1" ]]; then return 0; fi
+    filas="${filas:+$filas }$fila"
+  done <<<"$2"
+  echo "$1 no es una fila de scripts/gate-dag.txt (filas: ${filas:-ninguna, el fichero no existe o esta vacio})"
+}
+
+# Imprime lo que esta mal de un `segundos:`, o nada. `<S> s; <orden acotada>[; <su ultima linea>]`
+segundos_problema() { # <lo que sigue a `segundos:`>
+  local valor="$1" medido orden cola="" dicho
+  medido="$(recorta "${valor%%;*}")"
+  [[ "$valor" != *";"* ]] || cola="${valor#*;}"
+  orden="$(recorta "${cola%%;*}")"
+  if [[ ! "$medido" =~ ^([0-9]+([.,][0-9]+)?)[[:space:]]*s$ || -z "$orden" ]]; then
+    echo "segundos invalido: se esperaba 'segundos: <S> s; <orden acotada>[; <su ultima linea>]' con S un numero, y llego 'segundos:$valor'"
+    return 0
+  fi
+  medido="${BASH_REMATCH[1]}"
+  if [[ "$cola" =~ finished\ in\ ([0-9]+([.,][0-9]+)?)s ]]; then
+    dicho="${BASH_REMATCH[1]}"
+    awk -v a="${medido/,/.}" -v b="${dicho/,/.}" 'BEGIN { exit !(a + 0 == b + 0) }' ||
+      echo "segundos no cuadra: la linea dice $medido s y su 'finished in' dice ${dicho}s. El numero sale de la linea medida, no de memoria."
+  fi
+}
+
+toca_el_juez() { # <commit> [ruta...] -> los ficheros de scripts/ cambiados o sin versionar, dentro de la tajada
+  local commit="$1" f
+  shift
+  # Todo lo que hay bajo scripts/, sea .sh, .py o .txt: un paso del juez es una fila
+  # de gate-dag.txt y lo que comparte vive ahi. `ficheros_candidatos` solo ve .rs y
+  # .sh, y no sirve para esto.
+  {
+    git -C "$ROOT" diff --name-only "$commit" -- scripts 2>/dev/null
+    git -C "$ROOT" ls-files --others --exclude-standard -- scripts 2>/dev/null
+  } | sort -u | while IFS= read -r f; do
+    if [[ -n "$f" ]] && en_la_tajada "$f" "$@"; then
+      printf '%s\n' "$f"
+    fi
+  done
+}
+
+# El traspaso del implementador: sus segundos y, si toca el juez, su carril.
+coste_traspaso() { # <fichero.yml> <commit> [ruta...] -> 0 si esta, 1 si falta o esta mal (lo explica)
+  local path="$1" commit="$2" linea mal=0 valor problema id resto ids
+  local -a lineas segundos=() carriles=() tocados
+  shift 2
+  mapfile -t lineas < <(evidencia "$path")
+  for linea in "${lineas[@]}"; do
+    case "$linea" in
+      segundos:*) segundos+=("${linea#segundos:}") ;;
+      carril:*) carriles+=("${linea#carril:}") ;;
+    esac
+  done
+
+  if (( ${#segundos[@]} == 0 )); then
+    echo "FALTA segundos: un traspaso del implementador con commit lleva, dentro de 'evidence: |' y en su propia linea sangrada,"
+    echo "  segundos: <S> s; <orden acotada que corrio los tests nuevos>[; <su ultima linea>]"
+    echo "En una 'evidence:' de una sola linea no cuenta, y en columna 0 seria una clave mas."
+    mal=1
+  fi
+  for valor in "${segundos[@]}"; do
+    problema="$(segundos_problema "$valor")"
+    if [[ -n "$problema" ]]; then echo "$problema"; mal=1; fi
+  done
+
+  mapfile -t tocados < <(toca_el_juez "$commit" "$@")
+  if (( ${#tocados[@]} > 0 )); then
+    ids="$(filas_dag)"
+    if (( ${#carriles[@]} == 0 )); then
+      echo "FALTA carril: la tajada toca ${tocados[*]} y entonces 'evidence: |' lleva, en su propia linea sangrada,"
+      echo "  carril: <id de una fila de scripts/gate-dag.txt>; comparte: <recursos de esa fila, o nada>"
+      mal=1
+    fi
+    for valor in "${carriles[@]}"; do
+      if [[ "$valor" =~ ^[[:space:]]*([^[:space:];]+)[[:space:]]*\;[[:space:]]*comparte:[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]]; then
+        id="${BASH_REMATCH[1]}"
+        problema="$(carril_problema "$id" "$ids")"
+        if [[ -n "$problema" ]]; then echo "carril invalido: $problema"; mal=1; fi
+      else
+        resto="$(recorta "$valor")"
+        echo "carril invalido: 'carril:$valor' no dice su '; comparte: <recursos>' (o 'comparte: nada'): $resto"
+        mal=1
+      fi
+    done
+  fi
+  return "$mal"
+}
+
+specs_nombradas() { # <task> <evidence> <fichero.yml> -> los nombres de .cursor/handoffs/*.spec.md que nombran
+  { printf '%s\n%s\n' "$1" "$2"; evidencia "$3"; } |
+    { grep -Eo '\.cursor/handoffs/[A-Za-z0-9._-]+\.spec\.md' || true; } | sed 's|.*/||' | sort -u
+}
+
+cabecera_coste='| Escenario | Nivel | Segundos | Carril | Por qué no el barato |'
+
+# Lo que lee de una spec, un registro por linea y separados por \037 (un blanco
+# no, que colapsa los campos vacios): H cabecera de la tabla, E escenario de un
+# bloque gherkin, R fila de cinco celdas, M fila que no las tiene.
+registros_de_spec() { # <spec.md> <cabecera>
+  # shellcheck disable=SC2016  # the backticks are the fence of the block, for awk to read
+  awk -v cerca='```' -v cab="$2" '
+    function celdas(l,    t, i) {
+      t = l; sub(/^[[:space:]]*\|/, "", t); sub(/\|[[:space:]]*$/, "", t)
+      n = split(t, c, "|")
+      for (i = 1; i <= n; i++) { sub(/^[[:space:]]+/, "", c[i]); sub(/[[:space:]]+$/, "", c[i]) }
+      return n
+    }
+    { sub(/\r$/, ""); l = $0; sub(/^[[:space:]]+/, "", l) }
+    l == cerca "gherkin" { gh = 1; next }
+    gh && l == cerca { gh = 0; next }
+    gh {
+      if (match($0, /^[[:space:]]*(Escenario|Esquema del escenario):[[:space:]]*/)) {
+        nom = substr($0, RLENGTH + 1); sub(/[[:space:]]+$/, "", nom); print "E\037" nom
+      }
+      next
+    }
+    estado > 0 && l !~ /^\|/ { estado = 0 }
+    l ~ /^\|/ {
+      k = celdas($0)
+      if (estado == 0) {
+        if (k == 5 && c[1] == "Escenario" && c[2] == "Nivel" && c[3] == "Segundos" && c[4] == "Carril" && c[5] == "Por qué no el barato") {
+          print "H"; estado = 1
+        }
+      } else if (estado == 1) {
+        estado = (l ~ /^\|[-: |]+$/) ? 2 : 0
+      } else if (k == 5) {
+        print "R\037" c[1] "\037" c[2] "\037" c[3] "\037" c[4] "\037" c[5]
+      } else {
+        print "M\037" l
+      }
+    }
+  ' "$1"
+}
+
+# Imprime lo que esta mal de la spec y devuelve 1 si algo lo esta.
+spec_problemas() { # <spec.md> <nombre>
+  local spec="$1" nombre="$2" ids tipo c1 c2 c3 c4 c5 mal=0 problema
+  local hay_cabecera=0 n_esc=0 n_fil=0 k
+  local -a orden_esc=() orden_fil=()
+  local -A esc=() fil=()
+  ids="$(filas_dag)"
+  while IFS=$'\037' read -r tipo c1 c2 c3 c4 c5; do
+    case "$tipo" in
+      H) hay_cabecera=1 ;;
+      E)
+        n_esc=$(( n_esc + 1 ))
+        [[ -n "${esc[$c1]:-}" ]] || orden_esc+=("$c1")
+        esc[$c1]=$(( ${esc[$c1]:-0} + 1 ))
+        ;;
+      M)
+        echo "$nombre: fila de la tabla de coste sin sus cinco celdas: $c1"
+        mal=1
+        ;;
+      R)
+        n_fil=$(( n_fil + 1 ))
+        [[ -n "${fil[$c1]:-}" ]] || orden_fil+=("$c1")
+        fil[$c1]=$(( ${fil[$c1]:-0} + 1 ))
+        case "$c2" in
+          pura | guion | servicio | e2e) ;;
+          *) echo "$nombre: nivel invalido '$c2' en la fila '$c1' (pura|guion|servicio|e2e)"; mal=1 ;;
+        esac
+        if [[ ! "$c3" =~ ^[0-9]+([.,][0-9]+)?$ ]]; then
+          echo "$nombre: segundos invalido '$c3' en la fila '$c1' (un numero, con . o , decimal)"
+          mal=1
+        fi
+        problema="$(carril_problema "$c4" "$ids")"
+        if [[ -n "$problema" ]]; then echo "$nombre: carril invalido en la fila '$c1': $problema"; mal=1; fi
+        case "$c2" in
+          guion | servicio | e2e)
+            if [[ -z "$c5" || "$c5" == "-" || "$c5" == "—" ]]; then
+              echo "$nombre: la fila '$c1' es de nivel $c2 y no dice por qué el barato no lo demuestra"
+              mal=1
+            fi
+            ;;
+        esac
+        ;;
+    esac
+  done < <(registros_de_spec "$spec" "$cabecera_coste")
+
+  if (( hay_cabecera == 0 )); then
+    echo "$nombre: no tiene tabla de coste. Copia esta cabecera y pon una fila por escenario:"
+    echo "$cabecera_coste"
+    echo "|---|---|---|---|---|"
+    return 1
+  fi
+  if (( n_esc == 0 && n_fil == 0 )); then
+    echo "$nombre: sin escenarios (ni un 'Escenario:' en un bloque gherkin ni una fila en la tabla de coste)"
+    return 1
+  fi
+  for k in "${orden_esc[@]}"; do
+    if (( ${fil[$k]:-0} < ${esc[$k]} )); then echo "$nombre: escenario sin fila de coste: $k"; mal=1; fi
+  done
+  for k in "${orden_fil[@]}"; do
+    if (( ${esc[$k]:-0} < ${fil[$k]} )); then echo "$nombre: fila de coste sin escenario: $k"; mal=1; fi
+  done
+  return "$mal"
+}
+
+# La spec hermana del handoff: se resuelve JUNTO al .yml juzgado y no bajo ROOT,
+# porque las specs se escriben en un arbol y el guardia puede ser el de otro.
+coste_spec() { # <fichero.yml> <task> <evidence> -> 0 si cada spec nombrada trae su tabla al dia
+  local path="$1" dir nombres nombre mal=0
+  dir="$(dirname "$path")"
+  nombres="$(specs_nombradas "$2" "$3" "$path")"
+  if [[ -z "$nombres" ]]; then
+    echo "FALTA spec: un traspaso del especificador al implementador nombra, en 'task' o en 'evidence', su spec: .cursor/handoffs/<nombre>.spec.md"
+    return 1
+  fi
+  while IFS= read -r nombre; do
+    if [[ ! -f "$dir/$nombre" ]]; then
+      echo "$nombre no existe junto al handoff ($dir): se nombra y no esta"
+      mal=1
+    else
+      spec_problemas "$dir/$nombre" "$nombre" || mal=1
+    fi
+  done <<<"$nombres"
+  return "$mal"
+}
+
+# Los historicos anteriores a CI-E6, por el hash de su contenido sin CR. Devuelve 0
+# si este esta listado y vigente, 1 si no esta, 2 si la lista esta mal formada o su
+# excepcion caduco (y lo dice). La lista se lee entera siempre: un fallo en una
+# linea que no es la que casa tambien deja rojo.
+exento_por_lista() { # <fichero.yml>
+  local lista="$ROOT/scripts/handoffs-sin-coste.txt" hash hoy n=0 linea h nombre caduca motivo mal=0
+  local casa="" casa_caduca="" casa_n=""
+  [[ -f "$lista" ]] || return 1
+  command -v sha256sum >/dev/null 2>&1 || { echo "falta sha256sum: no se puede juzgar scripts/handoffs-sin-coste.txt"; return 2; }
+  hash="$(sed 's/\r$//' "$1" | sha256sum | cut -d' ' -f1)"
+  hoy="$(date +%F)"
+  while IFS= read -r linea || [[ -n "$linea" ]]; do
+    n=$(( n + 1 ))
+    linea="${linea%$'\r'}"
+    if [[ -z "$(recorta "$linea")" || "$linea" =~ ^[[:space:]]*# ]]; then continue; fi
+    read -r h nombre caduca _ motivo <<<"$linea"
+    if [[ ! "$h" =~ ^[0-9a-f]{64}$ || ! "$caduca" =~ ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$ || -z "$motivo" ]]; then
+      echo "scripts/handoffs-sin-coste.txt:$n: linea malformada: se esperaba '<sha256 de 64 hex> <nombre> <AAAA-MM-DD> <dueño> <motivo>'"
+      mal=1
+    elif [[ "$h" == "$hash" ]]; then
+      casa="$nombre"; casa_caduca="$caduca"; casa_n="$n"
+    fi
+  done < "$lista"
+  (( mal == 0 )) || return 2
+  [[ -n "$casa" ]] || return 1
+  if [[ "$casa_caduca" < "$hoy" ]]; then
+    echo "la excepción de $(basename "$1") caducó el $casa_caduca (scripts/handoffs-sin-coste.txt:$casa_n): ya no exime, y el traspaso se juzga por su coste."
+    return 2
+  fi
+  echo "exento del coste hasta $casa_caduca: $(basename "$1") es anterior a CI-E6 (scripts/handoffs-sin-coste.txt:$casa_n)"
+  return 0
+}
+
+# Dos traspasos se juzgan por su coste: del especificador al implementador (su spec,
+# de cualquier type) y del implementador con git_handoff y commit (sus segundos y,
+# si toca el juez, su carril). La nota del implementador, el mejorador, el
+# endurecedor y el especificador hacia otro rol no entregan tests que medir.
+juzgar_coste() { # <fichero.yml> <from> <to> <type> <commit> <task> <evidence> [ruta...]
+  local path="$1" from="$2" to="$3" tipo="$4" commit="$5" task="$6" evidence="$7" alcance="" salida rc=0 exencion ex=0
+  shift 7
+  if [[ "$from" == "especificador" && "$to" == "implementador" ]]; then
+    alcance=spec
+  elif [[ "$from" == "implementador" && "$tipo" == "git_handoff" && "$commit" != "none" ]]; then
+    alcance=traspaso
+  fi
+  [[ -n "$alcance" ]] || return 0
+  if [[ "$alcance" == "spec" ]]; then
+    salida="$(coste_spec "$path" "$task" "$evidence")" || rc=$?
+  else
+    salida="$(coste_traspaso "$path" "$commit" "$@")" || rc=$?
+  fi
+  (( rc != 0 )) || return 0
+  exencion="$(exento_por_lista "$path")" || ex=$?
+  case "$ex" in
+    0) printf '%s\n' "$exencion"; return 0 ;;
+    1) printf '%s\n' "$salida"; return 1 ;;
+    *) printf '%s\n%s\n' "$exencion" "$salida"; return 1 ;;
+  esac
+}
+
 # -------------------------------------------------------------- el veredicto
 
 juzgar() { # <fichero.yml>
@@ -360,6 +705,11 @@ juzgar() { # <fichero.yml>
         ;;
     esac
   fi
+
+  # Despues de todo lo de arriba, written y frozen incluidos (D-E6h): los rojos y
+  # los mensajes de siempre no cambian, y el coste se juzga sobre un traspaso que ya
+  # es honesto en lo demas.
+  juzgar_coste "$path" "$from" "$to" "$tipo" "$commit" "$task" "$evidence" "${paths[@]}" || return 1
 
   echo "OK $path $from->$to"
   return 0
