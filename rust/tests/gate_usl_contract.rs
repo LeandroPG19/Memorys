@@ -1,5 +1,6 @@
 //! Contract for `scripts/gate_usl.py`, the USL calibration tool of the local judge (CI-F5a), and for
-//! `usl_point` in `scripts/gate_history.py`. Spec: `.cursor/handoffs/ci-rapido-F5.spec.md`, F5a (U1-U17).
+//! `usl_point` in `scripts/gate_history.py`. Spec: `.cursor/handoffs/ci-rapido-F5.spec.md`, F5a (U1-U17), and
+//! `.cursor/handoffs/ci-rapido-E7.spec.md`, E7a-2 (the simulation counts as the planner: E7a.P1, P5, 7-10).
 //!
 //! The tool never runs the judge: `barrido` compiles under a fake `cargo` put first in the `PATH`,
 //! `ajustar` and `recomendar` read JSONL fixtures. Every scenario builds its world in a temporary
@@ -14,8 +15,10 @@
 //!   position inside the replica), then `barrido <id>: <n> puntos, <k> cargados, <m> rojos`. A warm-up
 //!   of the whole profile at the highest J comes first and writes nothing. Exit 2: unknown profile,
 //!   no `CARGO_TARGET_DIR`, machine busy (`some avg10` of `GATE_USL_PSI` above 15 %), a red or timed
-//!   out warm-up (`GATE_USL_PLAZO_S`, 1800 s per cargo order by default), a `huella` that moved or a
-//!   `scripts/gate-dag.txt` that cannot be read. Every cargo call of a sweep carries the profile tokens
+//!   out warm-up (`GATE_USL_PLAZO_S`, 1800 s per cargo order by default), a `huella` that moved, a
+//!   `scripts/gate-dag.txt` that cannot be read, or a grid of fewer than five levels (E7a-2: without `--j` the grid
+//!   is the fractions of the profile over J_m, the jobs of the machine as `gate-dag.py: measure_machine` counts them,
+//!   and nothing is compiled when it has fewer than five levels). Every cargo call of a sweep carries the profile tokens
 //!   (`CARGO_PROFILE_*`) of the row of its profile in that table (CI-K4): the profile is in the hash of
 //!   every unit, so a sweep without them measures another build and leaves a second set of artifacts in
 //!   the target of the judge. There is no `bin` profile: after CI-F3.4 the E2E row compiles nothing.
@@ -24,8 +27,13 @@
 //! - `recomendar [--tabla T] [--json]`: exit 0 when it recommended (even "se conserva"), 3 when an
 //!   adjustment or a cold run is missing (`faltan`), 2 when the table or the history cannot be read
 //!   or the history has no `R`. JSON: L, filas{id: d, L_j, h, h_L, estado}, juez_cuda, faltan,
-//!   calibradas{fila: perfil, J_actual, J_propuesto, propone, ganancia_s, J_hist, runs, d_hist,
-//!   d_por_J}, T_sim_actual, T_sim_propuesto, cpu_cap{C, N_estrella, propuesto}, diff, se_conserva, notas.
+//!   calibradas{fila: perfil, J_actual, J_propuesto, J_efectivo, propone, ganancia_s, J_hist, runs, d_hist,
+//!   d_por_J}, T_sim_actual, T_sim_propuesto, cpu_cap{C, N_estrella, propuesto}, diff, se_conserva, notas, and
+//!   (E7a-2) `supone` (the string "dag") and `J_maquina` (the `plan.jobs` of the last green serial run, or C without a plan).
+//! - Library: `simular(filas, cpu_cap, ram, jobs_cap, arranques=None)`: the clock of the DAG by list scheduling with
+//!   the admission, the order and the jobs of `gate-dag.py` (`admission`, `ranks`, `row_jobs`). A row is a dict with
+//!   id, idx, deps, clase, recursos, d, c, r (bytes) and jobs (the CARGO_BUILD_JOBS it names, 0 for none); when
+//!   `arranques` is a list, each start is appended to it as `(instant, id)`.
 //! - Library: `rodilla(lam, sigma, kappa, J_min, J_max, C)`; `gate_history.usl_point(registro)`.
 //!
 //! Sabotage -> assertion (each one is a change in production code that turns the named test red):
@@ -42,6 +50,11 @@
 //! - `J_hist` read from today's table -> U16; a command of a profile that drifted from `run-all-tests.sh`, or that moved to the lane of another row -> U17;
 //!   a flag added to a cargo call of a lane (`--no-default-features`), or a call that compiles in the lanes and no profile names -> U17.
 //! - a wait without a deadline -> U18.
+//! - `simular` with an admission of its own that forgets the models, or the jobs -> E7a.P1 and E7a.9; its rows by `idx` and
+//!   not by `(-rank, idx)` -> E7a.P1; `holguras` that leaves out the own duration of a row in `sale` -> E7a.P5.
+//! - the curve with the J of today's table and not the one each run received -> E7a.7; a candidate of the recommendation above
+//!   J_m, or a J_efectivo that is not `row_jobs(J, J_m)`, or no `supone:` line -> E7a.8; a fixed grid -> E7a.10; a sweep that
+//!   compiles with fewer than five levels -> E7a.10.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1243,13 +1256,28 @@ fn pasos_cortos(b3: f64, dbg: f64) -> PasosDeCorrida {
 }
 
 fn sembrar_corrida(fx: &Fx, dia: &str, run: &str, tabla: &str, pasos: &[(&str, u32, f64)]) {
+    sembrar_corrida_con_plan(fx, dia, run, tabla, pasos, None);
+}
+
+/// A green serial run whose `plan` (D-K4q) says the jobs the machine gave it; `None` is a run with no plan.
+fn sembrar_corrida_con_plan(
+    fx: &Fx,
+    dia: &str,
+    run: &str,
+    tabla: &str,
+    pasos: &[(&str, u32, f64)],
+    jobs: Option<u32>,
+) {
     let carpeta = fx.hist.join("memory-industry").join(dia);
     fs::create_dir_all(&carpeta).expect("day folder");
     let total: f64 = pasos.iter().map(|p| p.2).sum();
-    let corrida = json!({
+    let mut corrida = json!({
         "repo": "memory-industry", "modo": "serie", "tabla": tabla, "run": run, "rc": 0,
         "T": total, "seg": total, "C": C_NUCLEOS, "R": R_BYTES, "fecha": "2026-11-08T12:00:00+00:00"
     });
+    if let Some(jobs) = jobs {
+        corrida["plan"] = json!({ "nproc": C_NUCLEOS, "jobs": jobs });
+    }
     anadir(&carpeta.join("corridas.jsonl"), &[corrida]);
     let lineas: Vec<Value> = pasos
         .iter()
@@ -2061,4 +2089,469 @@ fn u19_recomendar_encuentra_las_corridas_aunque_la_tabla_cambie_de_comentarios_y
         "a table git knows was reported as unknown\n{}",
         salida.text()
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// E7a-2: the simulation counts as the planner (D-E7f, D-E7g, D-E7h, D-E7i, D-E7j)
+
+/// Python for the properties (the pattern of `PRELUDIO_PROPIEDADES` in gate_history_contract.rs: a fixed seed of the
+/// standard library, no dependency): the rows of a random DAG, the planner's steps they stand for, and a driver of
+/// reference that is the loop of events written out here, by hand, over `dag.ranks` and `dag.admission` (the planner's
+/// own functions: what the property compares is the loop around them, which is what `simular` is).
+const PRELUDIO_DAG_AL_AZAR: &str = r#"
+import random
+d = g.gate_dag()
+GIB = 1 << 30
+
+
+def pasos_de(filas):
+    pasos = []
+    for f in filas:
+        env = {"CARGO_BUILD_JOBS": str(f["jobs"])} if f["jobs"] else {}
+        p = d.Step(f["idx"], f["id"], list(f["deps"]), list(f["recursos"]), f["clase"], f["c"], 0, f["d"], env, [])
+        p.c, p.r = f["c"], f["r"]
+        pasos.append(p)
+    return pasos
+
+
+def dag_al_azar(rng):
+    filas = []
+    for i in range(rng.randint(2, 8)):
+        anteriores = [f["id"] for f in filas]
+        filas.append({
+            "id": "F%d" % i, "idx": 10 * (i + 1),
+            "deps": rng.sample(anteriores, rng.randint(0, min(2, len(anteriores)))),
+            "recursos": ["models"] if rng.random() < 0.4 else [],
+            "clase": "exclusive" if rng.random() < 0.1 else "normal",
+            "d": rng.randint(1, 60), "c": rng.randint(1, 12), "r": rng.randint(1, 8) * GIB,
+            "jobs": rng.choice([0, 0, 1, 2, 4, 8, 12, 16]),
+        })
+    return filas, rng.randint(4, 24), rng.randint(4, 40) * GIB, rng.randint(1, 24)
+
+
+def conductor(filas, cpu_cap, ram, jobs_cap, motivos):
+    pasos = {p.id: p for p in pasos_de(filas)}
+    dur = {f["id"]: f["d"] for f in filas}
+    rango = d.ranks(list(pasos.values()), dur)[0]
+    sin_hacer, corre, hechos = set(pasos), {}, set()
+    ahora, arranques = 0, []
+    while True:
+        listos = [pasos[i] for i in sin_hacer if all(x in hechos for x in pasos[i].deps)]
+        listos.sort(key=lambda p: (-rango[p.id], p.idx))
+        for p in listos:
+            vivas = [pasos[i] for i in corre]
+            hay_antes = any(pasos[i].idx < p.idx for i in sin_hacer if i != p.id)
+            motivo = d.admission(p, vivas, hay_antes, cpu_cap, ram, jobs_cap, ram - sum(v.r for v in vivas))
+            if motivo is None:
+                arranques.append((ahora, p.id))
+                corre[p.id] = ahora + dur[p.id]
+                sin_hacer.discard(p.id)
+            else:
+                motivos[motivo] = motivos.get(motivo, 0) + 1
+        if not corre:
+            break
+        ahora = min(corre.values())
+        for i in [i for i, t in corre.items() if t == ahora]:
+            hechos.add(i)
+            del corre[i]
+    return arranques, ahora
+"#;
+
+const CUERPO_P1: &str = r#"
+rng = random.Random(20261110)
+fallos, motivos, completos = [], {}, 0
+for caso in range(500):
+    filas, cpu_cap, ram, jobs_cap = dag_al_azar(rng)
+    esperado = conductor(filas, cpu_cap, ram, jobs_cap, motivos)
+    arranques = []
+    reloj = g.simular(filas, cpu_cap, ram, jobs_cap, arranques)
+    completos += len(esperado[0]) == len(filas)
+    if arranques != esperado[0] or reloj != esperado[1]:
+        fallos.append(caso)
+print(json.dumps({"casos": 500, "completos": completos, "fallos": fallos[:5], "motivos": motivos}))
+"#;
+
+const CUERPO_P5: &str = r#"
+import gate_history
+rng = random.Random(20261110)
+malos = []
+for caso in range(1000):
+    filas = dag_al_azar(rng)[0]
+    dur = {f["id"]: f["d"] for f in filas}
+    deps = {f["id"]: f["deps"] for f in filas}
+    de_holguras = g.holguras(filas, dur)["L"]
+    de_ranks = max(d.ranks(pasos_de(filas), dur)[0].values())
+    de_historial = gate_history.camino_critico(dur, deps)[0]
+    if not (de_holguras == de_ranks == de_historial):
+        malos.append([caso, de_holguras, de_ranks, de_historial])
+print(json.dumps({"casos": 1000, "malos": malos[:5]}))
+"#;
+
+/// The rows of the fixture's table (the figures of the real one: cpu, ram and jobs of every row) with the durations of the
+/// 19th run, simulated with C = 24, R = 28 GiB and J_m = 24; the starts are read back to count what is alive at each one.
+const CUERPO_TABLA_19: &str = r#"
+import os
+dur = {"P": 4.201, "DBG": 391.036, "NLI": 37.508, "B3": 206.174, "REL": 102.530, "E2E": 180.680,
+       "DC": 224.391, "CV": 68.583, "M": 146.363}
+pasos = {p.id: p for p in d.parse_table(os.path.join(sys.argv[1], "gate-dag.txt"))}
+filas = [{"id": p.id, "idx": p.idx, "deps": p.deps, "recursos": p.recursos, "clase": p.clase, "d": dur[p.id],
+          "c": p.cpu_tab, "r": p.ram_tab * GIB, "jobs": d.named_jobs(p)} for p in pasos.values()]
+arranques = []
+reloj = g.simular(filas, 24, 28 * GIB, 24, arranques)
+max_modelos = max_jobs = 0
+for i, (t, _) in enumerate(arranques):
+    vivas = [x for t0, x in arranques[: i + 1] if t0 + dur[x] > t + 1e-9]
+    max_modelos = max(max_modelos, sum("models" in pasos[x].recursos for x in vivas))
+    if len(vivas) > 1:
+        max_jobs = max(max_jobs, sum(d.row_jobs(n, 24) for n in (d.named_jobs(pasos[x]) for x in vivas) if n))
+print(json.dumps({"arranques": arranques, "T": reloj, "max_modelos": max_modelos, "max_jobs": max_jobs}))
+"#;
+
+#[test]
+fn e7a_p1_simular_arranca_las_filas_en_el_orden_y_con_la_admision_del_planificador() {
+    let fx = Fx::new("e7a-p1");
+    let salida = biblioteca(&fx, &format!("{PRELUDIO_DAG_AL_AZAR}{CUERPO_P1}"));
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    let v = salida.json();
+    assert_eq!(v["casos"], json!(500));
+    assert_eq!(
+        v["fallos"],
+        json!([]),
+        "the starts of `simular` (instant, id) and its clock are those of the driver of reference\n{}",
+        salida.text()
+    );
+    assert_eq!(
+        v["completos"],
+        json!(500),
+        "anchor: in every case the driver starts every row, or the comparison is of two half runs"
+    );
+    // Anchor of presence: the 500 cases do wait for each reason of the admission, so a `simular` that forgets one of
+    // them (the models, the jobs, the exclusive row) has a case that tells it apart.
+    for motivo in ["exclusive", "models", "cpu", "jobs", "ram"] {
+        assert!(
+            v["motivos"][motivo].as_u64().unwrap_or(0) > 0,
+            "no case waited for {motivo}: {}",
+            v["motivos"]
+        );
+    }
+}
+
+#[test]
+fn e7a_p5_el_camino_critico_es_uno_en_holguras_en_ranks_y_en_el_historial() {
+    let fx = Fx::new("e7a-p5");
+    let salida = biblioteca(&fx, &format!("{PRELUDIO_DAG_AL_AZAR}{CUERPO_P5}"));
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    let v = salida.json();
+    assert_eq!(v["casos"], json!(1000));
+    assert_eq!(
+        v["malos"],
+        json!([]),
+        "[case, L of holguras, longest rank of dag.ranks, camino_critico] of the first cases that differ\n{}",
+        salida.text()
+    );
+}
+
+#[test]
+fn e7a9_simular_respeta_los_modelos_y_los_jobs_como_el_planificador() {
+    // The table of the fixture (the cpu, ram and jobs of the judge's rows), the durations of the 19th run, C = 24,
+    // R = 28 GiB, J_m = 24. Worked by hand, with the ranks (rank = d + the largest rank of a successor: M 146.363,
+    // CV 68.583, DC 224.391, E2E 180.680, REL 102.530, NLI 37.508, B3 206.174 + 180.680 = 386.854, DBG 391.036 + 180.680 =
+    // 571.716, P 4.201 + 571.716 = 575.917) and the admission of the planner:
+    //   t = 0        P starts.
+    //   t = 4.201    ready by rank: DBG, B3, DC, M, CV. DBG starts (nobody alive). B3: cpu 8 + 12 = 20 <= 24, jobs 8 + 12 = 20 <= 24,
+    //                ram 8 + 16 = 24 <= 28 GiB: starts. DC and M: cpu 20 + 8 = 28 > 24: wait. CV: cpu 20 + 4 = 24, jobs 24 and
+    //                ram 24 + 4 = 28 GiB, all three at the limit and none over it: starts (it ends at 72.784).
+    //   t = 210.375  B3 ends (4.201 + 206.174). Ready by rank: DC, M, REL. DC: cpu 8 + 8 = 16: starts. M: cpu 24, jobs 24, ram
+    //                24 GiB: starts. REL (models; one alive, DBG): mem_free = 28 - 24 = 4 GiB < 4 GiB + 12 GiB: waits for RAM.
+    //   t = 356.738  M ends. REL: mem_free = 28 - (8 + 8) = 12 GiB < 16 GiB: waits. (Without the floor it would start here.)
+    //   t = 395.237  DBG ends (4.201 + 391.036). Ready: E2E, REL, NLI. E2E (models, none alive): mem_free = 28 - 8 = 20 >= 16,
+    //                cpu 16, jobs 8 + 2, ram 8 + 12 = 20: starts. REL: mem_free = 28 - 20 = 8 < 16: waits. NLI is exclusive: waits.
+    //   t = 434.766  DC ends (210.375 + 224.391). REL: models alive 1 (E2E), mem_free = 28 - 12 = 16, not below 16: starts.
+    //                (it ends at 537.296; NLI still waits: E2E is alive).
+    //   t = 575.917  E2E ends (395.237 + 180.680). Nobody is alive and no row of lower idx is pending: NLI starts.
+    //   T_sim = 575.917 + 37.508 = 613.425.
+    // The old simulation, with no models and no jobs, started REL at 356.738 and gave 652.954.
+    let fx = Fx::new("e7a9");
+    let salida = biblioteca(&fx, &format!("{PRELUDIO_DAG_AL_AZAR}{CUERPO_TABLA_19}"));
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    let v = salida.json();
+    let esperados = [
+        ("P", 0.0),
+        ("DBG", 4.201),
+        ("B3", 4.201),
+        ("CV", 4.201),
+        ("DC", 210.375),
+        ("M", 210.375),
+        ("E2E", 395.237),
+        ("REL", 434.766),
+        ("NLI", 575.917),
+    ];
+    let arranques = v["arranques"].as_array().expect("the starts");
+    let ids: Vec<&str> = arranques
+        .iter()
+        .map(|a| a[1].as_str().expect("id"))
+        .collect();
+    let esperados_ids: Vec<&str> = esperados.iter().map(|e| e.0).collect();
+    assert_eq!(
+        ids,
+        esperados_ids,
+        "the order of the starts\n{}",
+        salida.text()
+    );
+    for (arranque, (id, t)) in arranques.iter().zip(esperados) {
+        cerca(num(&arranque[0]), t, 1e-6, &format!("the start of {id}"));
+    }
+    cerca(num(&v["T"]), 613.425, 1e-6, "T_sim");
+    assert!(
+        v["max_modelos"].as_u64().expect("max_modelos") <= 2,
+        "never more than two rows with models alive: {}",
+        v["max_modelos"]
+    );
+    assert!(
+        v["max_jobs"].as_u64().expect("max_jobs") <= 24,
+        "the jobs of the live rows never pass J = 24: {}",
+        v["max_jobs"]
+    );
+}
+
+#[test]
+fn e7a7_la_curva_usa_el_j_que_la_fila_recibio_en_cada_corrida() {
+    // Three cold runs of the table (DBG names 8): the first got 4 jobs from its machine, the other two 24. What each one gave
+    // the row is row_jobs(8, plan.jobs): 4 and 8, not 8 three times.
+    let fx = Fx::new("e7a7");
+    let tabla = tabla_en_arbol(&fx, 8);
+    for (dia, run, jobs) in [
+        ("20261101", "run-1", Some(4)),
+        ("20261102", "run-2", Some(24)),
+        ("20261103", "run-3", Some(24)),
+    ] {
+        let pasos = pasos_cortos(206.174, 391.036);
+        sembrar_corrida_con_plan(&fx, dia, run, &tabla, &pasos, jobs);
+    }
+    barridos_buenos(&fx);
+    let (salida, v) = recomendar(&fx);
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    let dbg = &v["calibradas"]["DBG"];
+    assert_eq!(dbg["J_hist"], json!([4, 8]), "{}", salida.text());
+    assert_eq!(
+        dbg["runs"],
+        json!(["run-1", "run-2", "run-3"]),
+        "{}",
+        salida.text()
+    );
+
+    // A cold run with no plan: the J of the table, and a note that says so.
+    let sin = Fx::new("e7a7-sin-plan");
+    let tabla = tabla_en_arbol(&sin, 8);
+    for (dia, run, jobs) in [
+        ("20261101", "run-1", None),
+        ("20261102", "run-2", Some(24)),
+        ("20261103", "run-3", Some(24)),
+    ] {
+        let pasos = pasos_cortos(206.174, 391.036);
+        sembrar_corrida_con_plan(&sin, dia, run, &tabla, &pasos, jobs);
+    }
+    barridos_buenos(&sin);
+    let (salida, v) = recomendar(&sin);
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    assert_eq!(
+        v["calibradas"]["DBG"]["J_hist"],
+        json!([8]),
+        "{}",
+        salida.text()
+    );
+    assert!(
+        salida.err.contains("run-1 has no plan") && salida.err.contains("J of the table (8)"),
+        "a note says that the J of the table was used for the run with no plan\n{}",
+        salida.text()
+    );
+}
+
+#[test]
+fn e7a8_recomendar_no_propone_mas_jobs_de_los_que_tiene_la_maquina_y_dice_lo_que_supone() {
+    // The last run was given 12 jobs by its machine (C is still 24), and the sweep's knee is at 20: no candidate above 12.
+    let fx = Fx::new("e7a8");
+    let tabla = tabla_en_arbol(&fx, 8);
+    for (dia, run, jobs) in [
+        ("20261101", "run-1", 24),
+        ("20261102", "run-2", 24),
+        ("20261103", "run-3", 12),
+    ] {
+        let pasos = pasos_cortos(206.174, 391.036);
+        sembrar_corrida_con_plan(&fx, dia, run, &tabla, &pasos, Some(jobs));
+    }
+    barridos_buenos(&fx);
+    let (salida, v) = recomendar(&fx);
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    assert_eq!(v["supone"], json!("dag"), "{}", salida.text());
+    assert_eq!(v["J_maquina"], json!(12), "{}", salida.text());
+    let dbg = &v["calibradas"]["DBG"];
+    let candidatos: Vec<u64> = dbg["d_por_J"]
+        .as_object()
+        .expect("d_por_J")
+        .keys()
+        .map(|j| j.parse().expect("a J"))
+        .collect();
+    assert!(
+        candidatos.contains(&12) && candidatos.iter().all(|&j| j <= 12),
+        "the candidates stop at the J of the machine: {candidatos:?}\n{}",
+        salida.text()
+    );
+    let propuesto = dbg["J_propuesto"].as_u64().expect("J_propuesto");
+    assert_eq!(
+        dbg["J_efectivo"],
+        json!(propuesto.min(12)),
+        "{}",
+        salida.text()
+    );
+    let texto = fx.run(&["recomendar"]);
+    let linea = texto
+        .out
+        .lines()
+        .find(|l| l.starts_with("supone:"))
+        .unwrap_or_else(|| panic!("no line that starts with `supone:`\n{}", texto.text()));
+    assert!(
+        linea.starts_with("supone: DAG con la admisión del planificador") && linea.contains("J=12"),
+        "{linea}"
+    );
+    for protegida in ["se conserva", "+++", "T_sim", "juez-cuda"] {
+        assert!(
+            !linea.contains(protegida),
+            "campana-final.sh greps `{protegida}`: the new line must not match it: {linea}"
+        );
+    }
+
+    // A table that asks for more than the machine gives (DBG at 16, the machine 12): it is the 12 that counts.
+    let alta = Fx::new("e7a8-alta");
+    let tabla = tabla_en_arbol(&alta, 16);
+    for (dia, run, jobs) in [
+        ("20261101", "run-1", 24),
+        ("20261102", "run-2", 24),
+        ("20261103", "run-3", 12),
+    ] {
+        let pasos = pasos_cortos(206.174, 391.036);
+        sembrar_corrida_con_plan(&alta, dia, run, &tabla, &pasos, Some(jobs));
+    }
+    barridos_buenos(&alta);
+    let (salida, v) = recomendar(&alta);
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    let dbg = &v["calibradas"]["DBG"];
+    assert_eq!(dbg["J_actual"], json!(16), "{}", salida.text());
+    let candidatos: Vec<u64> = dbg["d_por_J"]
+        .as_object()
+        .expect("d_por_J")
+        .keys()
+        .map(|j| j.parse().expect("a J"))
+        .collect();
+    assert!(
+        candidatos.iter().all(|&j| j <= 12),
+        "a row at 16 of a machine of 12 is a candidate at 12, not at 16: {candidatos:?}\n{}",
+        salida.text()
+    );
+    let propuesto = dbg["J_propuesto"].as_u64().expect("J_propuesto");
+    assert_eq!(
+        dbg["J_efectivo"],
+        json!(propuesto.min(12)),
+        "{}",
+        salida.text()
+    );
+
+    // The last run has no plan: the machine is C, and a note says it.
+    let sin = Fx::new("e7a8-sin-plan");
+    let tabla = tabla_en_arbol(&sin, 8);
+    for (dia, run, jobs) in [
+        ("20261101", "run-1", Some(12)),
+        ("20261102", "run-2", Some(12)),
+        ("20261103", "run-3", None),
+    ] {
+        let pasos = pasos_cortos(206.174, 391.036);
+        sembrar_corrida_con_plan(&sin, dia, run, &tabla, &pasos, jobs);
+    }
+    barridos_buenos(&sin);
+    let (salida, v) = recomendar(&sin);
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    assert_eq!(v["J_maquina"], json!(C_NUCLEOS), "{}", salida.text());
+    assert!(
+        salida.err.contains("has no plan") && salida.err.contains("J_m is C (24)"),
+        "{}",
+        salida.text()
+    );
+}
+
+#[test]
+fn e7a10_la_rejilla_del_barrido_sale_de_la_maquina() {
+    // J_m is what the operator names in CARGO_BUILD_JOBS (gate-lock.sh counts it as the machine's), so the test does not
+    // read the PC it runs on. The grid is J_m times a fraction, rounded half up, from 1 up, with no repeats.
+    let casos: [(u32, &str, &[u64]); 5] = [
+        (24, "debug", &[2, 4, 8, 12, 16, 24]),
+        (24, "release", &[4, 6, 8, 12, 16]),
+        (12, "debug", &[1, 2, 4, 6, 8, 12]),
+        (12, "release", &[2, 3, 4, 6, 8]),
+        (8, "debug", &[1, 3, 4, 5, 8]),
+    ];
+    for (jobs, perfil, rejilla) in casos {
+        let fx = Fx::new(&format!("e7a10-{perfil}-{jobs}"));
+        let jm = jobs.to_string();
+        let salida = fx.run_env(
+            &["barrido", "--perfil", perfil, "--reps", "1"],
+            &[
+                ("CARGO_BUILD_JOBS", Some(jm.as_str())),
+                ("USL_FAKE_SLEEP", Some("0")),
+            ],
+        );
+        assert_eq!(
+            salida.code,
+            Some(0),
+            "J_m = {jobs}, {perfil}: {}",
+            salida.text()
+        );
+        let mut medidos: Vec<u64> = fx
+            .usl()
+            .iter()
+            .map(|l| l["J"].as_u64().expect("J"))
+            .collect();
+        medidos.sort_unstable();
+        medidos.dedup();
+        assert_eq!(medidos, rejilla, "the grid of {perfil} at J_m = {jobs}");
+    }
+
+    // A grid of four levels (J_m = 4, debug: 1, 2, 3, 4) is not a sweep that can be trusted: out with 2 before cargo.
+    let fx = Fx::new("e7a10-corta");
+    let salida = fx.run_env(
+        &["barrido", "--perfil", "debug", "--reps", "1"],
+        &[
+            ("CARGO_BUILD_JOBS", Some("4")),
+            ("USL_FAKE_SLEEP", Some("0")),
+        ],
+    );
+    assert_eq!(salida.code, Some(2), "{}", salida.text());
+    assert!(
+        salida.text().contains("J_m=4") && salida.text().contains("4 levels"),
+        "the message names J_m and the levels: {}",
+        salida.text()
+    );
+    assert!(
+        fx.llamadas().is_empty(),
+        "no cargo for a grid that is too short"
+    );
+    assert!(fx.usl().is_empty(), "no point either");
+
+    // --j mandates, whatever the machine.
+    let fx = Fx::new("e7a10-j");
+    let salida = fx.run_env(
+        &["barrido", "--perfil", "debug", "--j", "3,5", "--reps", "1"],
+        &[
+            ("CARGO_BUILD_JOBS", Some("4")),
+            ("USL_FAKE_SLEEP", Some("0")),
+        ],
+    );
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    let mut medidos: Vec<u64> = fx
+        .usl()
+        .iter()
+        .map(|l| l["J"].as_u64().expect("J"))
+        .collect();
+    medidos.sort_unstable();
+    medidos.dedup();
+    assert_eq!(medidos, [3, 5], "--j 3,5 measures 3 and 5 whatever J_m is");
 }
