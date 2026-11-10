@@ -3691,7 +3691,7 @@ fn the_self_tests_do_not_move_the_cgroup_of_the_test() {
 /// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
 /// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
 /// self-test that takes it as its own fixture's identity is red under any other value.
-const JUDGE_ENVIRONMENT: [(&str, &str); 32] = [
+const JUDGE_ENVIRONMENT: [(&str, &str); 33] = [
     ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
     // CI-F3.3b-1b-i (D-F3k): merge-gate.sh exports the lock's directory so that the planner can write the
     // lane tickets under it. gate-lock.sh assigns GATE_LOCK itself, so no self-test reads what it inherits.
@@ -3730,6 +3730,9 @@ const JUDGE_ENVIRONMENT: [(&str, &str); 32] = [
     ("CUBA_NLI_INTRA_THREADS", "7"),
     ("CUBA_RERANK_INTRA_THREADS", "7"),
     ("MUTANTS_JOBS", "7"),
+    // CI-E14 (D-E14b): the row D3 names the handler timeout of its LLM tests (ALLOWED_ENV in gate-dag.py) and the judge does
+    // not export it. A foreign value, so a self-test that reads it fails here and not under the planner.
+    ("CUBA_HANDLER_TIMEOUT_SECS", "7"),
     // CI-K4 (D-K4a): the planner gives the rows that compile in dev their profile (ALLOWED_ENV in gate-dag.py) and the
     // judge does not export it. A foreign value of each, so a self-test that reads one of them fails here, and not
     // under the planner.
@@ -6918,6 +6921,104 @@ fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
             "row {id}: cpu {cpu} is less than the widest thing it asks for ({widest}): {line}"
         );
     }
+}
+
+/// The whole line of the row `id` of the table.
+fn row_line(id: &str) -> String {
+    dag_rows()
+        .into_iter()
+        .find(|row| row.1 == id)
+        .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"))
+        .3
+}
+
+/// CI-E14 (D-E14a). Once P is green the planner can start B3 (the critical path, P -> B3 -> E2E), M and B1 together, and
+/// what admits them is the sum of the CARGO_BUILD_JOBS the rows name against the threads of the machine. With M at 8 the three
+/// added up to 28 over 24: B1 waited for M by `jobs` (wait=180 s in the DAG run of 10-nov, 431.3 s) while the machine ran at
+/// 8.5 cores. With M at 4 they add up to 24, B1 starts with them, and the same simulation on the durations of that run gives
+/// 367.9 s. M is not on the critical path (about 170 s of slack) and what it compiles is one crate per mutant (its seed is
+/// hit, `lab builds: hit in 6 of 6 labs`), so its cargo jobs are not what its clock is made of. Its cpu column is the most
+/// it asks for, which the header of the table says is the largest of its jobs and its pools: here MUTANTS_JOBS=6.
+#[test]
+fn the_rows_that_start_together_after_p_name_jobs_that_fit_the_machine_of_the_table() {
+    let jobs = |id: &str| -> usize {
+        row_value(&row_env(&row_line(id)), "CARGO_BUILD_JOBS")
+            .unwrap_or_else(|| panic!("row {id} names no CARGO_BUILD_JOBS"))
+            .parse()
+            .unwrap_or_else(|_| panic!("row {id}: CARGO_BUILD_JOBS is not a number"))
+    };
+    let together = jobs("B3") + jobs("B1") + jobs("M");
+    assert!(
+        together <= TABLE_MACHINE_THREADS,
+        "B3 ({}), B1 ({}) and M ({}) start together once P is green and name {together} jobs over the {TABLE_MACHINE_THREADS} \
+         threads of the table: the last one waits by `jobs` until another ends (CI-E14, D-E14a)",
+        jobs("B3"),
+        jobs("B1"),
+        jobs("M")
+    );
+    assert_eq!(
+        jobs("M"),
+        4,
+        "M names the jobs that let B1 start beside B3 (CI-E14, D-E14a)"
+    );
+    let mutants: usize = row_value(&row_env(&row_line("M")), "MUTANTS_JOBS")
+        .expect("M names its mutation jobs")
+        .parse()
+        .expect("MUTANTS_JOBS is a whole number");
+    let cpu: usize = row_line("M")
+        .split_whitespace()
+        .nth(5)
+        .expect("the cpu column of M")
+        .parse()
+        .expect("the cpu column of a row is a whole number");
+    assert_eq!(
+        cpu,
+        jobs("M").max(mutants),
+        "M's cpu is the most it asks for: its cargo jobs or its mutation jobs, whichever is wider (CI-E14, D-E14a)"
+    );
+}
+
+/// The ratio of the handler timeout that the extraction of `cuba_ingesta` gets as its budget, read where the product holds
+/// it: the `const EXTRACTION_BUDGET_RATIO: f32 = N;` of rust/src/handlers/ingesta.rs.
+fn extraction_budget_ratio(ingesta: &str) -> f64 {
+    let prefix = "const EXTRACTION_BUDGET_RATIO: f32 = ";
+    ingesta
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("ingesta.rs has no `{prefix}N;`"))
+        .trim_end_matches(';')
+        .trim()
+        .parse()
+        .expect("the extraction budget ratio is a number")
+}
+
+/// The slowest answer of the real CLI that `auto_extract_falls_back_to_the_local_cli_when_the_client_has_no_sampling` got in
+/// 17 runs (7.5 to 18.3 s): the one that failed on 10-nov was cut by the 18 s budget (60 % of the 30 s handler timeout).
+const SLOWEST_EXTRACTION_S: f64 = 18.3;
+
+/// CI-E14 (D-E14b, a decision of Leandro of 10-nov-2026). The test of the generative LLM calls the real CLI of Claude
+/// through `cuba_ingesta`, whose extraction budget is 60 % of CUBA_HANDLER_TIMEOUT_SECS (30 by default, so 18 s) and answers
+/// `out_of_budget` past it. Only the row D3 that runs it names the timeout, and with 60 the budget is 36 s, twice what the
+/// slowest of 17 runs took: production keeps its 30 and no other row, test or lane changes the sense of a deadline.
+#[test]
+fn only_d3_stretches_the_handler_timeout_that_its_extraction_budget_is_made_of() {
+    let naming: Vec<(String, String)> = dag_rows()
+        .iter()
+        .filter_map(|row| {
+            row_value(&row_env(&row.3), "CUBA_HANDLER_TIMEOUT_SECS").map(|v| (row.1.clone(), v))
+        })
+        .collect();
+    assert_eq!(
+        naming,
+        [("D3".to_string(), "60".to_string())],
+        "the rows that name CUBA_HANDLER_TIMEOUT_SECS are D3 and only D3, with 60 (CI-E14, D-E14b)"
+    );
+    let budget = 60.0 * extraction_budget_ratio(&read("rust/src/handlers/ingesta.rs"));
+    assert!(
+        budget >= 1.5 * SLOWEST_EXTRACTION_S,
+        "D3 gives the extraction {budget} s, under 1.5 x the slowest real answer ({SLOWEST_EXTRACTION_S} s): the test would \
+         fail again with `out_of_budget` on a slow CLI"
+    );
 }
 
 /// CI-F3.3c (D-F3l, V9, V10) and CI-J12: the NLI clock assertion runs in a row of its own, exclusive, after B1 (it needs

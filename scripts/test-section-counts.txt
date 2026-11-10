@@ -127,7 +127,7 @@ contracts/linux/gate_dag_contract 89 pasada llana del 10-nov sobre b51e027 (87: 
 contracts/linux/gate_history_contract 54 pasada llana del 10-nov sobre b51e027
 contracts/linux/gate_usl_contract 32 pasada llana del 10-nov sobre b51e027
 contracts/linux/group_no_server 101 pasada llana del 10-nov sobre b51e027
-contracts/linux/local_gate_contract 141 pasada llana del 10-nov sobre b51e027 (2 fallados: pasados + fallados)
+contracts/linux/local_gate_contract 143 pasada llana del 10-nov sobre b51e027 (2 fallados: pasados + fallados) y CI-E14 +2 tests (the_rows_that_start_together_after_p_name_jobs_that_fit_the_machine_of_the_table, only_d3_stretches_the_handler_timeout_that_its_extraction_budget_is_made_of)
 contracts/linux/packaging_contract 10 pasada llana del 10-nov sobre b51e027
 contracts/linux/v047_without_a_database_url_the_judge_reaches_no_default 5 pasada llana del 10-nov sobre b51e027
 doc/linux/doc:memory_industry 0 pasada llana del 10-nov sobre b51e027
