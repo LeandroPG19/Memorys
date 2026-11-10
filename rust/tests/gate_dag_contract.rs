@@ -4176,7 +4176,8 @@ fn a_row_that_names_its_jobs_gets_the_lower_of_them_and_the_jobs_of_the_machine_
 
 /// Spec K4-B, D-K4n, D-F3x, E7a.6 (D-E7c): 0 and serie are the series, 1, maximo and auto are the DAG, and the plan says
 /// what was asked and has no lanes. Anything else is exit 2 with `GATE_DAG is`, and no row starts. Without GATE_DAG the
-/// default is the series (the default is `serie`, not `auto`: the DAG is activated in a commit of its own).
+/// default is `auto`, the DAG (CI-E24: it became the default once the latency list had no pending line); `0` and `serie`
+/// still force the series.
 #[test]
 fn gate_dag_takes_serie_auto_maximo_and_their_numbers_and_nothing_else() {
     let mut fx = Fixture::new("k4-valores", CPU_FOUR, MEM_OPEN);
@@ -4188,7 +4189,7 @@ fn gate_dag_takes_serie_auto_maximo_and_their_numbers_and_nothing_else() {
         ("1", "maximo", "dag"),
         ("maximo", "maximo", "dag"),
         ("auto", "auto", "dag"),
-        (UNSET, "serie", "serie"),
+        (UNSET, "auto", "dag"),
     ] {
         let run = fx.run(value);
         assert_green(&run, value);
@@ -4218,6 +4219,39 @@ fn gate_dag_takes_serie_auto_maximo_and_their_numbers_and_nothing_else() {
             fx.started()
         );
     }
+}
+
+/// CI-E24: the planner that nobody told what to do is an `auto`, and it falls to the series for the same reasons as an `auto`
+/// that was written: a table with no serial history, a scope that is not delegated and a DATABASE_URL of the operator. The
+/// plan says `asked=auto` and why it runs in series.
+#[test]
+fn a_planner_with_no_gate_dag_falls_to_the_series_for_the_reasons_of_an_auto() {
+    let mut fx = Fixture::new("e24-omision", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "s10", "-", "0.2", ""), (20, "s20", "-", "0.2", "")]);
+    let first = fx.run(UNSET);
+    assert_green(&first, "no GATE_DAG, no history");
+    assert!(
+        plan_line_of(&first).contains(" asked=auto runs=serie (no serial history for this table)"),
+        "{}",
+        first.out
+    );
+    fx.undelegate();
+    let loose = fx.run(UNSET);
+    assert_green(&loose, "no GATE_DAG, a scope that is not delegated");
+    assert!(
+        plan_line_of(&loose).contains(" asked=auto runs=serie (the scope is not delegated)"),
+        "{}",
+        loose.out
+    );
+    write(&fx.scope().join("cgroup.subtree_control"), "");
+    let shared = fx.run_env(UNSET, &[("DATABASE_URL", "postgresql://x@h/b")]);
+    assert_green(&shared, "no GATE_DAG, a DATABASE_URL of the operator");
+    assert!(
+        plan_line_of(&shared)
+            .contains(" asked=auto runs=serie (DATABASE_URL names a server of the operator)"),
+        "{}",
+        shared.out
+    );
 }
 
 /// Spec K4-B, E7a-V (the verdict does not depend on the machine): a table with a red in the row of idx 30, between greens,

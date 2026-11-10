@@ -56,9 +56,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
   # What the planner prints between the OK of the judge's server and the banner of its first block: the plan
   # of the machine (CI-K4), the note that the scope is not delegated (CI-E4; the stand-in cgroup tree of the
-  # self-tests has no `0::` line, so it is always printed) and the row it starts (CI-F3.3b-2). Any other line
-  # there is still a failure.
-  planner_lines='^(plan: |note: the scope is not delegated |dag: P env:)'
+  # self-tests has no `0::` line, so it is always printed), the note that a DATABASE_URL of the operator puts the
+  # DAG in series (CI-E24: the DAG is the default, so the rows that name a server get it) and the row it starts
+  # (CI-F3.3b-2). Any other line there is still a failure.
+  planner_lines='^(plan: |note: the scope is not delegated |note: DATABASE_URL names a server this judge did not make, so every row shares it |dag: P env:)'
 
   # fake_tree NAME RUN_ALL_TESTS_BODY
   fake_tree() {

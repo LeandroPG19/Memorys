@@ -8494,6 +8494,18 @@ fn the_dag_is_not_the_default_while_a_latency_line_is_pending() {
     }
 }
 
+/// CI-E24: the gate asks the planner for a DAG when nobody sets GATE_DAG, judged on what its own self-test measured
+/// (`gate_dag_default`) and not on the literal in gate-dag.py. The guard above is what makes that default honest: with a
+/// pending line in the latency list the same default is red.
+#[test]
+fn the_gate_asks_for_the_dag_when_nobody_sets_gate_dag() {
+    let default = gate_dag_default();
+    assert!(
+        matches!(default.as_str(), "auto" | "maximo"),
+        "the gate asks the planner for {default} when GATE_DAG is unset: the DAG is the default (GATE_DAG=0 or serie forces the series)"
+    );
+}
+
 /// The cluster names a row declares in its resources: `cluster:C_b3` is `b3`.
 fn clusters_of(line: &str) -> Vec<String> {
     resources_of(line)

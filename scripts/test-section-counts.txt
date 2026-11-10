@@ -123,11 +123,11 @@ plain/linux/v046_migrations_apply_over_an_existing_schema 1 pasada llana del 10-
 plain/linux/v08_project_scoping 0 pasada llana del 10-nov sobre b51e027
 plain/linux/v09_integration 0 pasada llana del 10-nov sobre b51e027
 contracts/linux/ci_contract 14 pasada llana del 10-nov sobre b51e027
-contracts/linux/gate_dag_contract 94 pasada llana del 10-nov sobre b51e027 (87: pasados + 18 fallados) y tanda 9 +1 test (the_planner_of_a_test_does_not_inherit_the_environment_of_the_judge) y CI-E13 +1 test (the_pools_of_the_plan_follow_the_cpus_the_plan_saw) y CI-E15 +5 tests (the_note_of_an_orphan_names_the_processes_that_were_in_the_cgroup, a_green_run_deletes_its_run_directory, a_red_run_keeps_its_run_directory_and_names_it, a_run_with_no_verdict_keeps_the_tmpdir_of_the_row_it_could_not_judge, a_planner_deletes_the_run_directories_of_more_than_seven_days_whose_planner_is_gone)
+contracts/linux/gate_dag_contract 95 pasada llana del 10-nov sobre b51e027 (87: pasados + 18 fallados) y tanda 9 +1 test (the_planner_of_a_test_does_not_inherit_the_environment_of_the_judge) y CI-E13 +1 test (the_pools_of_the_plan_follow_the_cpus_the_plan_saw) y CI-E15 +5 tests (the_note_of_an_orphan_names_the_processes_that_were_in_the_cgroup, a_green_run_deletes_its_run_directory, a_red_run_keeps_its_run_directory_and_names_it, a_run_with_no_verdict_keeps_the_tmpdir_of_the_row_it_could_not_judge, a_planner_deletes_the_run_directories_of_more_than_seven_days_whose_planner_is_gone) y CI-E24 +1 test (a_planner_with_no_gate_dag_falls_to_the_series_for_the_reasons_of_an_auto)
 contracts/linux/gate_history_contract 54 pasada llana del 10-nov sobre b51e027
 contracts/linux/gate_usl_contract 32 pasada llana del 10-nov sobre b51e027
 contracts/linux/group_no_server 101 pasada llana del 10-nov sobre b51e027
-contracts/linux/local_gate_contract 143 pasada llana del 10-nov sobre b51e027 (2 fallados: pasados + fallados) y CI-E14 +2 tests (the_rows_that_start_together_after_p_name_jobs_that_fit_the_machine_of_the_table, only_d3_stretches_the_handler_timeout_that_its_extraction_budget_is_made_of)
+contracts/linux/local_gate_contract 144 pasada llana del 10-nov sobre b51e027 (2 fallados: pasados + fallados) y CI-E14 +2 tests (the_rows_that_start_together_after_p_name_jobs_that_fit_the_machine_of_the_table, only_d3_stretches_the_handler_timeout_that_its_extraction_budget_is_made_of) y CI-E24 +1 test (the_gate_asks_for_the_dag_when_nobody_sets_gate_dag)
 contracts/linux/packaging_contract 10 pasada llana del 10-nov sobre b51e027
 contracts/linux/v047_without_a_database_url_the_judge_reaches_no_default 5 pasada llana del 10-nov sobre b51e027
 doc/linux/doc:memory_industry 0 pasada llana del 10-nov sobre b51e027
