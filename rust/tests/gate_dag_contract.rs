@@ -4475,3 +4475,161 @@ fn two_planners_one_inside_the_other_leave_no_juez_inside_a_juez() {
         run.err
     );
 }
+
+// --- CI-E9 (D-E9a): E2E waits for B3 and not for DBG --------------------------------------------------------------------
+
+/// The step of the rows of CI-E9: it marks that it started (`started-<id>`). DBG does not end until E2E has started or
+/// `dbg-ticks` x 0.1 s pass, and leaves `dbg-saw` = yes or no. $1 id, $3 control.
+const E9_PASO_SH: &str = r#"#!/bin/sh
+id="$1"
+control="$3"
+echo "=== $id banner"
+: > "$control/started-$id"
+if [ "$id" = DBG ]; then
+    limit=$(cat "$control/dbg-ticks" 2>/dev/null || echo 0)
+    i=0
+    while [ ! -e "$control/started-E2E" ] && [ "$i" -lt "$limit" ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if [ -e "$control/started-E2E" ]; then echo yes > "$control/dbg-saw"; else echo no > "$control/dbg-saw"; fi
+fi
+echo "Running unittests fake $id"
+echo "test result: ok. 1 passed; 0 failed"
+"#;
+
+/// The rows P, DBG, B3 and E2E of the real table, in miniature. Only the dependencies can hold a row back: the history has
+/// almost no CPU (100 us a step), and DBG is the longest row in it (the series that seeds it makes DBG wait 0.3 s, since E2E
+/// starts after it there), so the planner starts DBG before B3 and E2E, as the real table's critical path does.
+/// `e2e_deps` is what E2E waits for; `dbg_ticks` is how many tenths of a second DBG waits for E2E to start in the DAG run.
+fn e9_fixture(name: &str, e2e_deps: &str, dbg_ticks: &str) -> Fixture {
+    let mut fx = Fixture::new(name, CPU_FOUR, MEM_OPEN);
+    let script = fx.base.join("paso-e9.sh");
+    write(&script, E9_PASO_SH);
+    let rows: Vec<StepRow> = [
+        (10, "P", "-"),
+        (20, "DBG", "P"),
+        (30, "B3", "P"),
+        (50, "E2E", e2e_deps),
+    ]
+    .into_iter()
+    .map(|(idx, id, deps)| StepRow {
+        deps,
+        script: script.clone(),
+        ..fx.row(idx, id, "-", "0.1")
+    })
+    .collect();
+    table_of(&mut fx, &rows);
+    for id in ["P", "DBG", "B3", "E2E"] {
+        fx.usage(id, 100);
+    }
+    write(&fx.control.join("dbg-ticks"), "3");
+    fx.seed();
+    for id in ["P", "DBG", "B3", "E2E"] {
+        let _ = fs::remove_file(fx.control.join(format!("started-{id}")));
+    }
+    let _ = fs::remove_file(fx.control.join("dbg-saw"));
+    write(&fx.control.join("dbg-ticks"), dbg_ticks);
+    fx
+}
+
+/// The records of a DAG run of `fx` (the one it has history for), green, and whether DBG saw E2E start before it ended.
+fn e9_dag_run(fx: &Fixture) -> (Vec<Value>, String) {
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run("1");
+    assert_green(&run, "DAG with room for DBG and E2E beside each other");
+    let saw = read(&fx.control.join("dbg-saw")).trim().to_string();
+    (appended(&fx.history, "pasos.jsonl", &before), saw)
+}
+
+/// CI-E9 (D-E9a, S-E9-3). With E2E waiting for B3 only, DBG does not end until E2E has started (a barrier of files, with 20 s
+/// to wait that run out only if E2E cannot start), so it ends having seen E2E and the instants the planner records say E2E
+/// started after B3 ended and before DBG ended: an order of events, with no duration in it. The control, with the old
+/// dependency (B3 and DBG), gives DBG 1 s: E2E cannot start while DBG lives, so DBG does not see it and E2E starts after DBG
+/// ended. The control is what shows that the first half could fail.
+#[test]
+fn e2e_starts_when_b3_ends_while_dbg_still_runs_and_after_dbg_with_the_old_dependency() {
+    let ((pasos, saw), (viejo, viejo_saw)) = std::thread::scope(|scope| {
+        let solo_b3 = scope.spawn(|| e9_dag_run(&e9_fixture("e9-solo-b3", "B3", "200")));
+        let viejo = scope.spawn(|| e9_dag_run(&e9_fixture("e9-b3-y-dbg", "B3,DBG", "10")));
+        (
+            solo_b3.join().expect("the fixture with B3 only"),
+            viejo.join().expect("the fixture with B3,DBG"),
+        )
+    });
+    let (dbg, b3, e2e) = (
+        by_id(&pasos, "DBG"),
+        by_id(&pasos, "B3"),
+        by_id(&pasos, "E2E"),
+    );
+    assert_eq!(
+        saw,
+        "yes",
+        "DBG waited 20 s and E2E did not start: it depends on B3 only and B3 ended at {}",
+        num(b3, "fin")
+    );
+    assert!(
+        num(dbg, "inicio") < num(e2e, "inicio") && num(e2e, "inicio") >= num(b3, "fin"),
+        "the order of events is DBG starts, B3 ends, E2E starts: DBG.inicio={} B3.fin={} E2E.inicio={}",
+        num(dbg, "inicio"),
+        num(b3, "fin"),
+        num(e2e, "inicio")
+    );
+    assert!(
+        num(e2e, "inicio") < num(dbg, "fin"),
+        "E2E started after DBG ended, and DBG saw it: E2E.inicio={} DBG.fin={}",
+        num(e2e, "inicio"),
+        num(dbg, "fin")
+    );
+
+    let (dbg, e2e) = (by_id(&viejo, "DBG"), by_id(&viejo, "E2E"));
+    assert_eq!(
+        viejo_saw, "no",
+        "control: with B3,DBG, DBG saw E2E start while it lived"
+    );
+    assert!(
+        num(e2e, "inicio") >= num(dbg, "fin"),
+        "control: with B3,DBG, E2E started before DBG ended: E2E.inicio={} DBG.fin={}",
+        num(e2e, "inicio"),
+        num(dbg, "fin")
+    );
+}
+
+/// The critical path of the real table with the durations of the 19th run (8-nov-2026, 220355b), the `seg` of its rows in
+/// `ci-tiempos/memory-industry/20261108/pasos.jsonl`: P 4.201, DBG 391.036, NLI 37.508, B3 1.693 (a warm build), REL 102.530,
+/// E2E 180.680, DC 224.391, CV 68.583, M 146.363. By hand, the chains of the table now:
+///   P -> DBG -> NLI  = 4.201 + 391.036 + 37.508  = 432.745
+///   P -> B3 -> E2E   = 4.201 +   1.693 + 180.680 = 186.574   (391.055 with the cold B3 of 206.174 that gate_usl_contract uses)
+///   P -> B3 -> REL   = 4.201 +   1.693 + 102.530 = 108.424
+///   P -> DC          = 4.201 + 224.391           = 228.592
+/// and the one it had with E2E behind DBG: P -> DBG -> E2E = 4.201 + 391.036 + 180.680 = 575.917 (the `LB_run` that run saved).
+/// So the path is P, DBG, NLI and its length is 432.745; DBG's own rank is DBG + NLI = 428.544, and E2E is a sink (180.680).
+const BODY_CRITICAL_PATH_19: &str = r#"
+steps = dag.parse_table(os.path.join(sys.argv[1], "gate-dag.txt"))
+
+def critical(b3):
+    dur = {"P": 4.201, "DBG": 391.036, "NLI": 37.508, "B3": b3, "REL": 102.530, "E2E": 180.680,
+           "DC": 224.391, "CV": 68.583, "M": 146.363}
+    rank, nxt = dag.ranks(steps, dur)
+    cur = max(steps, key=lambda s: rank[s.id])
+    length, path = rank[cur.id], []
+    while cur:
+        path.append(cur.id)
+        cur = nxt[cur.id]
+    return path, length, rank
+
+for b3 in (1.693, 206.174):
+    path, length, rank = critical(b3)
+    assert path == ["P", "DBG", "NLI"], f"the critical path with B3 {b3} is {path}, not P, DBG, NLI"
+    assert abs(length - 432.745) < 1e-6, f"its length with B3 {b3} is {length}, not 4.201 + 391.036 + 37.508 = 432.745"
+    assert abs(rank["DBG"] - 428.544) < 1e-6, f"DBG ranks {rank['DBG']}, not 391.036 + 37.508: something waits behind it"
+    assert abs(rank["E2E"] - 180.680) < 1e-6, f"E2E ranks {rank['E2E']}, not its own 180.680: something waits behind it"
+print("critical path P>DBG>NLI 432.745")
+"#;
+
+/// CI-E9 (D-E9a, S-E9-1): in the real table the critical path is P, DBG, NLI, and E2E is no longer behind DBG.
+#[test]
+fn the_critical_path_of_the_real_table_with_the_19th_run_is_p_dbg_nli() {
+    let out = property_of(BODY_CRITICAL_PATH_19);
+    assert!(out.contains("critical path P>DBG>NLI 432.745"), "{out}");
+}

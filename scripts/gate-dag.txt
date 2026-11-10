@@ -30,7 +30,7 @@
 25 NLI DBG target:T_dbg,cluster:C_nli,models,reader exclusive 8 8 60 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step NLI
 30 B3 P target:T_rel,cluster:C_b3 normal 12 16 150 CARGO_BUILD_JOBS=12 bash scripts/merge-gate.sh --step B3
 40 REL B3 target:T_rel,cluster:C_rel,models,reader normal 8 12 221 CARGO_BUILD_JOBS=2 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step REL
-50 E2E B3,DBG target:T_rel,cluster:C_e2e,models,reader normal 8 12 113 CARGO_BUILD_JOBS=2 bash scripts/merge-gate.sh --step E2E
+50 E2E B3 target:T_rel,cluster:C_e2e,models,reader normal 8 12 113 CARGO_BUILD_JOBS=2 bash scripts/merge-gate.sh --step E2E
 # CI-K8 (D-K8c): DC compiles and lints the build without docs (`clippy --all-targets --no-default-features`, no test runs):
 # it opens no database and reads no model, so its row names a target and no cluster. dur_s is provisional (the history of DC
 # still holds the runs of when it also ran the tests, and the planner takes its median until it converges).
