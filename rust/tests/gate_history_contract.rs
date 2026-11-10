@@ -22,6 +22,9 @@
 //! - `run_end(corrida, rc, *, T=None, LB_ref=None, LB_run=None, C=None, R=None)`: writes
 //!   `corridas.jsonl` and the same line in `indice.jsonl`. `cpu_s` of the run is the sum of its
 //!   steps' `cpu_s`, or `null` if any of them is `null`.
+//! - CI-E4: `serie_final(intervalos)` over `(listo, inicio, fin)`; `step_end(..., sin_medida=None)` adds `nucleos` and
+//!   `sin_medida` to the step; `run_end(..., mem_muestra=None, serie_final_s=None, serie_cola_s=None, sin_medida=None)`
+//!   adds `nucleos`, those three and `sin_medida` to the run (the spec is the block of CI-E4 at the end of this file).
 //! - `lower_bounds(records, table) -> {"LB": float, "cota": str}`, with
 //!   `table = {"C": int, "R": bytes, "deps": {id: [ids]}}` and the step records of one run.
 //!   `LB = max(camino critico, sum(cpu_s)/C, sum(anon_max*seg)/R, max seg)`; `cota` names the
@@ -2569,5 +2572,233 @@ gh.run_end(otra, rc=0)
             second.is_some_and(|l| l.get("plan").is_some_and(Value::is_null)),
             "a run that gave no plan has `plan` as a key and null in {name}: {lines:?}"
         );
+    }
+}
+
+// --- CI-E4: the seconds in series and the cores of a step and of a run ----------------------------------------------
+// D-E4b, D-E4h, D-E4k, D-E4l. The API these tests fix for pass 2:
+// - `serie_final(intervalos) -> (serie_final_s, serie_cola_s) | None`, over tuples `(listo, inicio, fin)`: the seconds in
+//   which exactly one row is alive and another is ready to start (the wait) or no row will start after it (the tail).
+// - `step_end(..., sin_medida=None)`: the record adds `nucleos` (cpu_s over fin - inicio, null when cpu_s is null or the
+//   step took 0 s) and `sin_medida` ({} by default). A null `nucleos` takes the reason the caller gave for `cpu_s`, or
+//   "the step took 0 s"; a reason nobody gave is not invented.
+// - `run_end(..., mem_muestra=None, serie_final_s=None, serie_cola_s=None, sin_medida=None)`: the record (and the index)
+//   adds `nucleos` (the sum of the cpu_s of the steps over T), the three values as given and `sin_medida`.
+
+/// The nine rows of the 19th run of the history (pasos.jsonl of 8-nov-2026, `listo = inicio - espera_s`): P, DBG, NLI,
+/// B3, REL, E2E, DC, CV and M, as `(listo, inicio, fin)`. Worked out in the spec of CI-E4 (section 0.3): the wait is
+/// 1006.421 s and the tail 146.363 s, so 1152.784 s of the 1157.205 s of the run.
+const E4_RUN19: &str = "[(0.054, 0.057, 4.257), (4.259, 4.262, 395.298), (395.358, 395.363, 432.871), \
+     (4.259, 432.875, 434.568), (434.568, 434.571, 537.101), (434.568, 537.104, 717.785), \
+     (4.258, 717.788, 942.179), (4.259, 942.254, 1010.836), (4.258, 1010.840, 1157.203)]";
+
+/// Spec H-E4-1: `serie_final` on the examples worked out by hand (the comments say which seconds count) and on the 19th run.
+const BODY_E4_SERIE_MANO: &str = r#"
+casos = [
+    [(0, 0, 10), (0, 0, 4), (4, 6, 8)],
+    [(0, 0, 5), (5, 5, 8), (0, 0, 2)],
+    [(0, 0, 3), (0, 3, 5)],
+    [(0, 0, 2), (2.5, 3, 4)],
+    [(0, 0, 5), (0, 0, 5)],
+    [(0, 0, 7)],
+    [],
+    @RUN19@,
+]
+print(json.dumps([gh.serie_final(c) for c in casos]))
+"#;
+
+/// Spec H-E4-1. By hand, second by second:
+/// 1. [4,6) one alive with the third ready = 2; [8,10) the first alone and nobody starts after = 2: (4, 2).
+/// 2. [2,5) one alive and the second blocked by its dependencies does not count; [5,8) the tail = 3: (3, 3).
+/// 3. [0,3) the first alone with the second ready = 3; [3,5) the tail = 2: (5, 2).
+/// 4. [0,2) the first alone, the second not ready yet: nothing; [2,3) nobody alive; [3,4) the tail = 1: (1, 1).
+/// 5. two alive all the time: (0, 0).  6. one row alone: it is the tail: (7, 7).  7. no row: None.
+#[test]
+fn serie_final_da_los_ejemplos_a_mano_y_la_corrida_19_e4() {
+    let fx = Fixture::new("e4-serie-mano");
+    let body = BODY_E4_SERIE_MANO.replace("@RUN19@", E4_RUN19);
+    let out = py(&fx, &body, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "serie_final over the examples");
+    let got: Vec<Value> = serde_json::from_str(text(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", show(&out)));
+    let want = [
+        json!([4.0, 2.0]),
+        json!([3.0, 3.0]),
+        json!([5.0, 2.0]),
+        json!([1.0, 1.0]),
+        json!([0.0, 0.0]),
+        json!([7.0, 7.0]),
+        Value::Null,
+    ];
+    assert_eq!(got.len(), 8, "{got:?}");
+    assert_eq!(&got[..7], &want[..], "the seven worked examples: {got:?}");
+    let (total, tail) = (got[7][0].as_f64(), got[7][1].as_f64());
+    assert!(
+        total.is_some_and(|s| (s - 1152.784).abs() <= 0.001),
+        "the 19th run is 1152.784 s in series: {:?}",
+        got[7]
+    );
+    assert!(
+        tail.is_some_and(|s| (s - 146.363).abs() <= 0.001),
+        "the tail of the 19th run is 146.363 s: {:?}",
+        got[7]
+    );
+}
+
+/// Spec H-E4-2: 500 random runs of one to six rows with integer times 0 <= listo <= inicio < fin <= 20. The oracle is
+/// in the body: it counts each cell [k, k+1) with the definition (one alive and another ready: the wait; one alive and
+/// no start after it: the tail) and `serie_final` has to give that sum exactly, within the bounds of any run.
+const BODY_E4_SERIE_CELDAS: &str = r#"
+import random
+rng = random.Random(20261110)
+casos = 0
+for _ in range(500):
+    filas = []
+    for _ in range(rng.randint(1, 6)):
+        listo = rng.randint(0, 19)
+        inicio = rng.randint(listo, 19)
+        filas.append((listo, inicio, rng.randint(inicio + 1, 20)))
+    espera = cola = 0
+    for k in range(20):
+        vivos = [f for f in filas if f[1] <= k < f[2]]
+        esperando = [f for f in filas if f[0] <= k < f[1]]
+        despues = [f for f in filas if f[1] > k]
+        if len(vivos) == 1 and esperando:
+            espera += 1
+        elif len(vivos) == 1 and not despues:
+            cola += 1
+    total, la_cola = gh.serie_final(filas)
+    assert total == espera + cola, f"serie_final of {filas} is {total} and the cells say {espera + cola}"
+    assert la_cola == cola, f"the tail of {filas} is {la_cola} and the cells say {cola}"
+    assert 0 <= la_cola <= total <= max(f[2] for f in filas) - min(f[1] for f in filas), f"{filas}: {total} {la_cola}"
+    casos += 1
+print("e4 casos=%d" % casos)
+"#;
+
+#[test]
+fn serie_final_coincide_con_contar_las_celdas_e4() {
+    let fx = Fixture::new("e4-serie-celdas");
+    let out = py(&fx, BODY_E4_SERIE_CELDAS, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "serie_final over 500 random runs");
+    assert!(
+        text(&out.stdout).contains("e4 casos=500"),
+        "the property did not say it ran its 500 cases: {}",
+        show(&out)
+    );
+}
+
+/// Spec H-E4-3: four steps. `a` has cpu_s 1.5 over 3 s of its own, with a second of wait that does not divide (0.5 and not
+/// 0.375); `b` has no cpu_s and the reason the planner gave; `c` took 0 s; `d` is a call of the old shape (no reason).
+const BODY_E4_NUCLEOS_PASO: &str = r#"
+corrida = gh.run_start(modo="serie", sha=None, huella=None, tabla="t", run="r-e4-3")
+a = gh.step_start(corrida, 10, "a")
+gh.step_end(corrida, a, rc=0, inicio=2.0, fin=5.0, espera_s=1.0, cpu_s=1.5)
+b = gh.step_start(corrida, 20, "b")
+gh.step_end(corrida, b, rc=0, inicio=2.0, fin=5.0, espera_s=1.0, cpu_s=None, sin_medida={"cpu_s": "r"})
+c = gh.step_start(corrida, 30, "c")
+gh.step_end(corrida, c, rc=0, inicio=3.0, fin=3.0, cpu_s=1.0)
+d = gh.step_start(corrida, 40, "d")
+gh.step_end(corrida, d, rc=0, cpu_s=None)
+"#;
+
+#[test]
+fn los_nucleos_de_un_paso_son_cpu_entre_seg_y_null_con_su_motivo_e4() {
+    let fx = Fixture::new("e4-nucleos-paso");
+    let out = py(&fx, BODY_E4_NUCLEOS_PASO, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "step_end with cores and reasons");
+    assert_eq!(history_lines(&text(&out.stderr)), 0, "{}", show(&out));
+    let steps = records(&fx.root, "pasos.jsonl");
+    assert_eq!(steps.len(), 4, "{steps:?}");
+    assert_eq!(steps[0]["nucleos"], json!(0.5), "{}", steps[0]);
+    assert_eq!(steps[0]["sin_medida"], json!({}), "{}", steps[0]);
+    assert!(
+        steps[1]["cpu_s"].is_null() && steps[1]["nucleos"].is_null(),
+        "{}",
+        steps[1]
+    );
+    assert_eq!(
+        steps[1]["sin_medida"],
+        json!({"cpu_s": "r", "nucleos": "r"}),
+        "a null of cores takes the reason of the cpu_s that was not measured: {}",
+        steps[1]
+    );
+    assert!(steps[2]["nucleos"].is_null(), "{}", steps[2]);
+    assert!(
+        steps[2]["sin_medida"]["nucleos"]
+            .as_str()
+            .is_some_and(|why| why.contains("0 s")),
+        "a step of 0 s gives no cores and says why: {}",
+        steps[2]
+    );
+    assert_eq!(steps[2]["cpu_s"], json!(1.0), "{}", steps[2]);
+    assert!(steps[3]["nucleos"].is_null(), "{}", steps[3]);
+    assert_eq!(
+        steps[3]["sin_medida"],
+        json!({}),
+        "a call with no `sin_medida` writes its line with an empty one, and invents no reason: {}",
+        steps[3]
+    );
+}
+
+/// Spec H-E4-4: three runs. r1: three steps of 1.5 CPU-seconds, T = 9 s and every new argument. r2: the second step is
+/// not measured, with its reason. r3: a run of the old shape.
+const BODY_E4_NUCLEOS_CORRIDA: &str = r#"
+def corrida_de(run, cpus, **extra):
+    corrida = gh.run_start(modo="serie", sha=None, huella=None, tabla="t", run=run)
+    for idx, (nombre, cpu, motivos) in enumerate(cpus, 1):
+        paso = gh.step_start(corrida, 10 * idx, nombre)
+        gh.step_end(corrida, paso, rc=0, inicio=0.0, fin=1.0, cpu_s=cpu, sin_medida=motivos)
+    gh.run_end(corrida, rc=0, **extra)
+
+corrida_de("r1", [("a", 1.5, None), ("b", 1.5, None), ("c", 1.5, None)], T=9.0,
+           mem_muestra={"t": 1.5, "current": 7, "anon": 4, "file": 2, "shmem": 1, "kernel": 1, "muestras": 5},
+           serie_final_s=4.0, serie_cola_s=2.0, sin_medida={"mem_peak": "m"})
+corrida_de("r2", [("a", 1.5, None), ("b", None, {"cpu_s": "step b: x"})], T=9.0, sin_medida={"cpu_s": "step b: x"})
+corrida_de("r3", [("a", 1.5, None)], T=3.0)
+"#;
+
+#[test]
+fn los_nucleos_y_los_campos_nuevos_de_la_corrida_e4() {
+    let fx = Fixture::new("e4-nucleos-corrida");
+    let out = py(&fx, BODY_E4_NUCLEOS_CORRIDA, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "run_end with cores and the new fields");
+    assert_eq!(history_lines(&text(&out.stderr)), 0, "{}", show(&out));
+    let muestra = json!({"t": 1.5, "current": 7, "anon": 4, "file": 2, "shmem": 1, "kernel": 1, "muestras": 5});
+    for name in ["corridas.jsonl", "indice.jsonl"] {
+        let lines = records(&fx.root, name);
+        let run = |id: &str| -> &Value {
+            lines
+                .iter()
+                .find(|l| l["run"] == json!(id))
+                .unwrap_or_else(|| panic!("{name} has no run {id}: {lines:?}"))
+        };
+        let (r1, r2, r3) = (run("r1"), run("r2"), run("r3"));
+        assert_eq!(r1["cpu_s"], json!(4.5), "{name}: {r1}");
+        assert_eq!(
+            r1["nucleos"],
+            json!(0.5),
+            "{name}: the cores of a run are its CPU over its T (9 s), not over the seconds its steps add up to: {r1}"
+        );
+        assert_eq!(r1["mem_muestra"], muestra, "{name}: {r1}");
+        assert_eq!(r1["serie_final_s"], json!(4.0), "{name}: {r1}");
+        assert_eq!(r1["serie_cola_s"], json!(2.0), "{name}: {r1}");
+        assert_eq!(r1["sin_medida"], json!({"mem_peak": "m"}), "{name}: {r1}");
+        assert!(
+            r2["cpu_s"].is_null() && r2["nucleos"].is_null(),
+            "{name}: {r2}"
+        );
+        assert_eq!(
+            r2["sin_medida"],
+            json!({"cpu_s": "step b: x", "nucleos": "step b: x"}),
+            "{name}: the cores of a run that is missing a step take the reason of its cpu_s: {r2}"
+        );
+        assert_eq!(r3["nucleos"], json!(0.5), "{name}: {r3}");
+        for campo in ["mem_muestra", "serie_final_s", "serie_cola_s"] {
+            assert!(
+                r3.get(campo).is_some_and(Value::is_null),
+                "{name}: a run of the old shape has `{campo}` as a key and null: {r3}"
+            );
+        }
+        assert_eq!(r3["sin_medida"], json!({}), "{name}: {r3}");
     }
 }
