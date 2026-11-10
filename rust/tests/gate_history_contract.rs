@@ -2875,10 +2875,18 @@ def parse(lines):
 def row_of(step_id):
     return next(n for n in rows if real[n].split()[1] == step_id)
 
+def word_of(step_id, prefix):
+    found = [w for w in real[row_of(step_id)].split() if w.startswith(prefix)]
+    assert found, f"{step_id} has no word that starts with {prefix!r}: the row has no such cell any more"
+    return found[0]
+
 def change(step_id, old, new):
+    # old is the column to change (an int: 0 idx, 1 id, 3 resources, 4 class), a word of the row, or empty to append.
     n = row_of(step_id)
     words = real[n].split()
-    if old:
+    if isinstance(old, int):
+        words[old] = new
+    elif old:
         assert old in words, f"{step_id} has no word {old!r}: the fixture of the test is stale"
         words[words.index(old)] = new
     else:
@@ -2900,28 +2908,37 @@ def refused(label, number, lines, named):
     assert named in said, f"{label}: the refusal does not name {named!r}: {said}"
 
 assert len(parse(real)) == len(rows), "the real table is not read whole"
-DBG_TARGETS = "target:T_dbg,cluster:C_dbg,models"
+# The cells a case changes are read from the row of the real table, not written here: the resources of the row (column 3)
+# keep every entry but the one a case replaces, and an env word is the one the row names.
+RESOURCES = real[row_of("DBG")].split()[3]
+assert "target:" in RESOURCES and "cluster:" in RESOURCES, f"DBG names no target and cluster: {RESOURCES!r}"
+
+def resources_with(prefix, entry):
+    parts = RESOURCES.split(",")
+    assert any(p.startswith(prefix) for p in parts), f"the resources {RESOURCES!r} have no {prefix!r}"
+    return ",".join(entry if p.startswith(prefix) else p for p in parts)
+
 CASES = [
-    ("target:/etc", "DBG", DBG_TARGETS, "target:/etc,cluster:C_dbg,models", "/etc"),
-    ("target:../../../x", "DBG", DBG_TARGETS, "target:../../../x,cluster:C_dbg,models", "../../../x"),
-    ("target:a/b", "DBG", DBG_TARGETS, "target:a/b,cluster:C_dbg,models", "a/b"),
-    ("cluster:x", "DBG", DBG_TARGETS, "target:T_dbg,cluster:x,models", "cluster:x"),
-    ("cluster:C_a/../b", "DBG", DBG_TARGETS, "target:T_dbg,cluster:C_a/../b,models", "C_a/../b"),
-    ("cluster:C_Dbg", "DBG", DBG_TARGETS, "target:T_dbg,cluster:C_Dbg,models", "C_Dbg"),
-    ("the id a/b", "DBG", "DBG", "a/b", "a/b"),
-    ("idx -10", "DBG", "20", "-10", "-10"),
-    ("idx 0", "DBG", "20", "0", "0"),
-    ("idx 1_0", "DBG", "20", "1_0", "1_0"),
-    ("idx 010", "DBG", "20", "010", "010"),
-    ("CARGO_BUILD_JOBS=ocho", "DBG", "CARGO_BUILD_JOBS=8", "CARGO_BUILD_JOBS=ocho", "CARGO_BUILD_JOBS"),
-    ("CARGO_BUILD_JOBS=0", "DBG", "CARGO_BUILD_JOBS=8", "CARGO_BUILD_JOBS=0", "CARGO_BUILD_JOBS"),
-    ("CARGO_BUILD_JOBS empty", "DBG", "CARGO_BUILD_JOBS=8", "CARGO_BUILD_JOBS=", "CARGO_BUILD_JOBS"),
-    ("MUTANTS_JOBS=-1", "M", "MUTANTS_JOBS=6", "MUTANTS_JOBS=-1", "MUTANTS_JOBS"),
-    ("CUBA_NLI_INTRA_THREADS=x", "DBG", "CUBA_NLI_INTRA_THREADS=4", "CUBA_NLI_INTRA_THREADS=x", "CUBA_NLI_INTRA_THREADS"),
-    ("CARGO_INCREMENTAL empty", "DBG", "CARGO_INCREMENTAL=0", "CARGO_INCREMENTAL=", "CARGO_INCREMENTAL"),
+    ("target:/etc", "DBG", 3, resources_with("target:", "target:/etc"), "/etc"),
+    ("target:../../../x", "DBG", 3, resources_with("target:", "target:../../../x"), "../../../x"),
+    ("target:a/b", "DBG", 3, resources_with("target:", "target:a/b"), "a/b"),
+    ("cluster:x", "DBG", 3, resources_with("cluster:", "cluster:x"), "cluster:x"),
+    ("cluster:C_a/../b", "DBG", 3, resources_with("cluster:", "cluster:C_a/../b"), "C_a/../b"),
+    ("cluster:C_Dbg", "DBG", 3, resources_with("cluster:", "cluster:C_Dbg"), "C_Dbg"),
+    ("the id a/b", "DBG", 1, "a/b", "a/b"),
+    ("idx -10", "DBG", 0, "-10", "-10"),
+    ("idx 0", "DBG", 0, "0", "0"),
+    ("idx 1_0", "DBG", 0, "1_0", "1_0"),
+    ("idx 010", "DBG", 0, "010", "010"),
+    ("CARGO_BUILD_JOBS=ocho", "DBG", word_of("DBG", "CARGO_BUILD_JOBS="), "CARGO_BUILD_JOBS=ocho", "CARGO_BUILD_JOBS"),
+    ("CARGO_BUILD_JOBS=0", "DBG", word_of("DBG", "CARGO_BUILD_JOBS="), "CARGO_BUILD_JOBS=0", "CARGO_BUILD_JOBS"),
+    ("CARGO_BUILD_JOBS empty", "DBG", word_of("DBG", "CARGO_BUILD_JOBS="), "CARGO_BUILD_JOBS=", "CARGO_BUILD_JOBS"),
+    ("MUTANTS_JOBS=-1", "M", word_of("M", "MUTANTS_JOBS="), "MUTANTS_JOBS=-1", "MUTANTS_JOBS"),
+    ("CUBA_NLI_INTRA_THREADS=x", "DBG", word_of("DBG", "CUBA_NLI_INTRA_THREADS="), "CUBA_NLI_INTRA_THREADS=x", "CUBA_NLI_INTRA_THREADS"),
+    ("CARGO_INCREMENTAL empty", "DBG", word_of("DBG", "CARGO_INCREMENTAL="), "CARGO_INCREMENTAL=", "CARGO_INCREMENTAL"),
     ("a comment at the end of the row", "DBG", "", HASH + " nota", HASH),
     ("the word " + HASH + "x in the order", "DBG", "bash", "bash " + HASH + "x", HASH + "x"),
-    ("the class boundary", "DBG", "normal", "boundary", "normal, exclusive or untimed"),
+    ("the class boundary", "DBG", 4, "boundary", "normal, exclusive or untimed"),
 ]
 for label, step_id, old, new, named in CASES:
     number, lines = change(step_id, old, new)

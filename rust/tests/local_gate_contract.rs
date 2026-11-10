@@ -5047,9 +5047,7 @@ fn no_contract_of_the_judge_needs_a_server() {
         marked.iter().any(|f| f.contains("needs-a-server")),
         "the marker that ci.yml reads is not found: {marked:?}"
     );
-    let common = needs_a_server(
-        "mod common;\nasync fn t() { common::in_a_scratch_database(\"x\").await; }\n",
-    );
+    let common = needs_a_server("mod common;\nasync fn t() { common::any_helper(\"x\").await; }\n");
     assert!(
         common.iter().any(|f| f.contains("common::")),
         "a call into common is not found: {common:?}"

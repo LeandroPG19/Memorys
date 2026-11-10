@@ -52,10 +52,13 @@
 # v029_accounts_over_real_http (4.66-5.03 s) and v045_a_merge_reaches_the_database (1.48-1.58 s): 1.3 x the slowest is under
 # the default of 10 s, so by the rule they have no line; the default still catches the 33 s and the 635 s they once guarded.
 # linux v046_migrations_apply_over_an_existing_schema needs none: its 12.94 s in the 19th run were 4.70 s here and 8.24 s of
-# the docs pass that no longer exists. linux v017_rerank_gpu and nli_cost are NOT touched: the backlog (ci-rapido.md, 8-nov
-# 15:47) decided that no ceiling moves on one run and that nli_cost is reproduced apart first; they wait for the final runs.
+# the docs pass that no longer exists. linux nli_cost is NOT touched: the backlog (ci-rapido.md, 8-nov
+# 15:47) decided that no ceiling moves on one run and that nli_cost is reproduced apart first; it waits for the final runs.
+# (linux v017_rerank_gpu was not touched here either; CI-E8 sets it below, with the one run that the backlog allows while the final runs are pending.)
 # The windows lines are not touched either: this host does not measure them, and they still describe two passes (the sums
 # of two passes put the floor of windows local_gate_contract and v029_bridge_against_the_real_daemon on the edge of one pass).
+
+# CI-E8 (10-nov, orquestador-0.31), from medir-e8.sh of 2026-11-10 (one run per binary, linux): linux v029_bridge_against_the_real_daemon LOSES its line (45 286). With the models of the judge exported the binary takes 5.16 s (9 tests); 1.5 x 5.16 = 7.74 s is not above the default of 10 s, so by the rule it has none. It took 277.20 s because it ran 28 + 32 x n s of warm-up batches of the reranker that no test of the binary uses (CI-E8 stopped them). linux v017_rerank_gpu is re-set to 31/96 from 63.61 s (129.30 s before), its line says how. The windows lines of both binaries are NOT touched (this host does not measure them): the windows line of the bridge, 52/399, stays far above what the binary takes now and would not catch a regression there until it is measured and re-set.
 
 windows v029_bridge_against_the_real_daemon 52 399 orquestador-0.31 2026-11-30 a real daemon and the bridge against it, run by the plain cargo test and again by --features docs; 105.9-306.2 s in five runs, the widest spread of the judge and not explained yet
 windows local_gate_contract 58 217 orquestador-0.31 2026-11-30 every gate script's --self-test, each a throwaway gate tree of stand-ins, run twice; Git Bash forks slowly (16 s on linux); 116.5-166.5 s
@@ -68,8 +71,7 @@ windows v045_a_merge_reaches_the_database 2 11 orquestador-0.31 2026-11-30 5.9-8
 windows v017_rerank_gpu 2 11 orquestador-0.31 2026-11-30 the real reranker on the GPU in release; 5.8-8.2 s (213 s on the CPU of the linux judge)
 windows v029_accounts_redeem 2 11 orquestador-0.31 2026-11-30 5.6-8.0 s, too close to the default to live under it
 
-linux v029_bridge_against_the_real_daemon 45 286 orquestador-0.31 2026-11-30 a real daemon and the bridge against it; CI-K8: one pass, 90.32-219.39 s over the eight passes of the four complete runs alone under pesado of 7-nov (073815, 082500, 091943, 113706), k = 1.3; the widest spread of the judge and not explained yet; pending: to be set again by the first complete one-pass judge run
-linux v017_rerank_gpu 106 327 orquestador-0.31 2026-11-30 the reranker on the CPU: the ONNX runtime in WSL is the CPU one (doctor, 2026-10-14); 212.9-217.4 s. The GPU runtime in WSL brings it down, and this line with it
+linux v017_rerank_gpu 31 96 orquestador-0.31 2026-11-30 the reranker on the CPU (the ONNX runtime in WSL is the CPU one, doctor, 2026-10-14); CI-E8: the order test no longer launches a second batch of 50. One run, 63.61 s on 2026-11-10 (medir-e8.sh, 8 threads, the machine shared with another job; 129.30 s before): k = 1.5, floor = floor(0.5 x 63.61), ceiling = ceil(1.5 x 63.61); pending: to be set again by the final runs of the judge
 linux lib:memory_industry 13 35 orquestador-0.31 2026-11-30 the unit tests, run plain, --ignored and gpu:: in release (CI-K8: one pass, docs is a default feature); 26.44-26.77 s in the plain pass of the four complete runs alone under pesado of 7-nov (073815, 082500, 091943, 113706), k = 1.3; pending: to be set again by the first complete one-pass judge run
 linux v017_relation_scan 4 25 orquestador-0.31 2026-11-30 asks the generative LLM over the network; four complete runs of the judge, alone under pesado: 19.18 s (20261107-073815), 9.45 s (20261107-082500), 11.24 s (20261107-091943), 8.47 s (20261107-113706)
 linux v016_extract_without_sampling 5 26 orquestador-0.31 2026-11-30 asks the generative LLM over the network; 11.6-16.8 s

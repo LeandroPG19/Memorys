@@ -901,6 +901,7 @@ fn a_step_environment_differs_only_by_the_closed_list() {
                 "HOME",
                 "XDG_CACHE_HOME",
                 "TMPDIR",
+                "GATE_PROC_MEMINFO",
                 "GATE_CGROUP_ROOT",
                 "GATE_PROC_SELF_CGROUP",
                 "PWD",
