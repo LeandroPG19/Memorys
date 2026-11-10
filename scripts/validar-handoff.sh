@@ -468,13 +468,21 @@ esac
 SH
 
   printf '%s\n' '#!/usr/bin/env bash' 'echo plano' > "$d/scripts/plano.sh"
+
+  # CI-E6 (D-E6i): the judge of the cost reads the rows of scripts/gate-dag.txt of
+  # the tree it judges, so the fixture has a table of two rows, in the base: a
+  # carril is a row of it, and a file that is not .rs or .sh (the table is neither)
+  # is how a slice touches the judge without any region of test moving.
+  printf '%s\n' '# fixture del self-test: las filas de scripts/gate-dag.txt' \
+    '10 P - - normal 1 1 1 true' \
+    '20 DBG P target:T_dbg normal 1 1 1 true' > "$d/scripts/gate-dag.txt"
   sed -i -e "s/^@@INI@@\$/$st_ini/" -e "s/^@@FIN@@\$/$st_fin/" \
     "$d/scripts/juez.sh" "$d/scripts/juez-fn.sh"
 
   # Rutas explicitas: `git add -A` arrastra CRLF fantasma y ficheros ajenos, y
   # en este repo lo bloquea la guardia de comandos.
   git -C "$d" add rust/src/cosa.rs rust/tests/contrato.rs scripts/validar-handoff.sh \
-    scripts/juez.sh scripts/juez-fn.sh scripts/plano.sh >/dev/null 2>&1
+    scripts/juez.sh scripts/juez-fn.sh scripts/plano.sh scripts/gate-dag.txt >/dev/null 2>&1
   git -C "$d" commit -q -m "base" >/dev/null 2>&1
 
   # El arbol se convierte a CRLF DESPUES del commit, que es como pasa de verdad:
@@ -503,11 +511,66 @@ mk_handoff() { # <dir> <nombre> <commit> <tests|-> [rol-from]
     echo "type: git_handoff"
     echo 'task: "fixture del self-test"'
     echo "commit: $commit"
-    echo 'evidence: "fixture del self-test"'
+    echo 'evidence: |'
+    echo '  fixture del self-test'
+    echo '  segundos: 0.01 s; bash scripts/validar-handoff.sh --self-test'
+    echo '  carril: DBG; comparte: target:T_dbg'
     [[ "$t" == "-" ]] || echo "tests: $t"
   } > "$d/.cursor/handoffs/$nombre.yml"
   printf '%s\n' "$d/.cursor/handoffs/$nombre.yml"
 }
+
+# CI-E6: un .yml con todos sus campos a la vista, para los casos del coste. El
+# evidence va tal cual despues de la clave: `"texto"` en una linea, o lo que
+# imprime ev_bloque.
+mk_yml() { # <ruta.yml> <from> <to> <type> <commit> <task> <evidence> [tests]
+  {
+    echo "from: $2"
+    echo "to: $3"
+    echo "type: $4"
+    echo "task: \"$6\""
+    echo "commit: $5"
+    echo "evidence: $7"
+    [[ -z "${8:-}" ]] || echo "tests: $8"
+  } > "$1"
+}
+
+ev_bloque() { # <linea>... -> el valor de un `evidence: |` con cada linea sangrada
+  local l
+  printf '%s\n' '|'
+  for l in "$@"; do printf '  %s\n' "$l"; done
+}
+
+# Una spec de fixture (§3 del CI-E6): dos escenarios, A y B, y la tabla de coste
+# con una fila por cada uno. Cada parametro es lo que un caso rompe.
+mk_spec() { # <ruta.spec.md> [fila de A] [fila de B] [escenario de mas]
+  local fila_a="${2:-| A | pura | 0,01 | DBG | — |}"
+  local fila_b="${3:-| B | guion | 0.06 | DBG | la guarda solo existe en bash |}"
+  {
+    echo '# spec de fixture'
+    echo
+    echo '```gherkin'
+    echo 'Característica: fixture'
+    echo
+    echo '  Escenario: A'
+    echo '    Dado algo'
+    echo
+    echo '  Esquema del escenario: B'
+    echo '    Dado <x>'
+    echo '    Ejemplos:'
+    echo '      | x |'
+    echo '      | 1 |'
+    [[ -z "${4:-}" ]] || printf '%s\n' "$4"
+    echo '```'
+    echo
+    echo '| Escenario | Nivel | Segundos | Carril | Por qué no el barato |'
+    echo '|---|---|---|---|---|'
+    printf '%s\n' "$fila_a" "$fila_b"
+  } > "$1"
+}
+
+# El sha256 de un handoff como lo calcula el guardia: sin los CR.
+st_hash() { sed 's/\r$//' "$1" | sha256sum | cut -d' ' -f1; }
 
 must_fail() { # <que> <dir> <yml>
   local que="$1" dir="$2" yml="$3" out rc=0
@@ -549,6 +612,29 @@ must_fail_saying() { # <que> <aguja> <dir> <yml>
     printf '%s\n' "$out" | sed 's/^/      /' >&2
     return 1
   fi
+  echo "  rojo, como debe: $que"
+  printf '%s\n' "$out" | sed 's/^/      /'
+  return 0
+}
+
+# Lo mismo con varias agujas: un rechazo del coste tiene que nombrar la causa y
+# lo que se le pide al que entrega, y una sola aguja no ata las dos cosas.
+must_fail_saying_all() { # <que> <dir> <yml> <aguja>...
+  local que="$1" dir="$2" yml="$3" out rc=0 aguja
+  shift 3
+  out="$(bash "$dir/scripts/validar-handoff.sh" "$yml" 2>&1)" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL self-test: $que — el guardia lo acepto." >&2
+    printf '%s\n' "$out" | sed 's/^/      /' >&2
+    return 1
+  fi
+  for aguja in "$@"; do
+    if [[ "$out" != *"$aguja"* ]]; then
+      echo "FAIL self-test: $que — rechazo sin decir '$aguja':" >&2
+      printf '%s\n' "$out" | sed 's/^/      /' >&2
+      return 1
+    fi
+  done
   echo "  rojo, como debe: $que"
   printf '%s\n' "$out" | sed 's/^/      /'
   return 0
@@ -758,6 +844,114 @@ self_test() {
   yml="$(mk_handoff "$d" v14 "$base" written)"
   printf '%s\n' 'paths:' '  - scripts/juez-fn.sh' '  - rust/tests/contrato.rs' >> "$yml"
   must_fail "V14: el brazo del case fuera de toda region, aunque un test se movio" "$d" "$yml" || bad=1
+
+  # -- CI-E6: el coste del traspaso y de la spec ------------------------------
+  # Un solo repo para toda la seccion, restaurado entre grupos desde copias como la
+  # de `sh`. Cada fila arranca de un traspaso honesto y rompe UNA cosa, para que
+  # el rojo sea de esa y de ninguna otra. Va antes de V15.
+  d="$st_tmp/e6"; base="$(mk_repo "$d" false)"
+  mkdir -p "$st_tmp/pristino-e6" "$st_tmp/otro-arbol/.cursor/handoffs"
+  cp "$d/scripts/juez.sh" "$d/scripts/gate-dag.txt" "$d/rust/src/cosa.rs" "$st_tmp/pristino-e6/"
+  local seg='segundos: 0.84 s; cargo test --workspace --test local_gate_contract e6_; test result: ok. 3 passed; 0 failed; finished in 0.84s'
+  local carril='carril: DBG; comparte: target:T_dbg'
+  local h="$d/.cursor/handoffs"
+
+  # Implementador, tocando un script del juez fuera de su region.
+  sed -i 's/\* 2 ))/* 20 ))/' "$d/scripts/juez.sh"
+  mk_yml "$h/c1.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque "$seg" "$carril")" frozen
+  must_pass "E6: un traspaso honesto del implementador que toca el juez, con segundos y carril" "$d" "$h/c1.yml" || bad=1
+  mk_yml "$h/c2.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque "$carril")" frozen
+  must_fail_saying_all "E6: sin linea segundos" "$d" "$h/c2.yml" "FALTA segundos" || bad=1
+  mk_yml "$h/c3.yml" implementador mejorador git_handoff "$base" "fixture" '"segundos: 0.84 s; cargo test --test x"' frozen
+  must_fail_saying_all "E6: segundos dentro de un evidence de una linea no cuenta" "$d" "$h/c3.yml" \
+    "FALTA segundos" "evidence: |" || bad=1
+  mk_yml "$h/c4.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque 'segundos: rapido s; cargo test --test x' "$carril")" frozen
+  must_fail_saying_all "E6: segundos sin numero" "$d" "$h/c4.yml" "segundos invalido" || bad=1
+  mk_yml "$h/c5.yml" implementador mejorador git_handoff "$base" "fixture" \
+    "$(ev_bloque 'segundos: 0.5 s; cargo test --test x; test result: ok. 1 passed; finished in 0.84s' "$carril")" frozen
+  must_fail_saying_all "E6: segundos que no cuadra con su finished in" "$d" "$h/c5.yml" "no cuadra" "0.5" "0.84" || bad=1
+  mk_yml "$h/c6.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque "$seg" 'carril: XYZ; comparte: nada')" frozen
+  must_fail_saying_all "E6: un carril que no es una fila de gate-dag.txt" "$d" "$h/c6.yml" \
+    "XYZ no es una fila de scripts/gate-dag.txt" "P DBG" || bad=1
+  mk_yml "$h/c7.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque "$seg" 'carril: DBG')" frozen
+  must_fail_saying_all "E6: un carril sin comparte" "$d" "$h/c7.yml" "comparte" || bad=1
+
+  # Implementador que solo toca la tabla del juez: no es .rs ni .sh, y ningun
+  # test se mueve. Con la lista de candidatos de written/frozen esto pasaria.
+  cp "$st_tmp/pristino-e6/juez.sh" "$d/scripts/juez.sh"
+  echo '30 X P - normal 1 1 1 true' >> "$d/scripts/gate-dag.txt"
+  mk_yml "$h/c8.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque "$seg")" frozen
+  must_fail_saying_all "E6: tocar scripts/ sin carril" "$d" "$h/c8.yml" "FALTA carril" "scripts/gate-dag.txt" || bad=1
+
+  # Implementador que no toca scripts/: sin carril esta bien.
+  cp "$st_tmp/pristino-e6/gate-dag.txt" "$d/scripts/gate-dag.txt"
+  sed -i 's/^    41$/    42/' "$d/rust/src/cosa.rs"
+  mk_yml "$h/c9.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque "$seg")" frozen
+  must_pass "E6: un traspaso que no toca scripts/ no necesita carril" "$d" "$h/c9.yml" || bad=1
+
+  # Fuera del alcance: una nota del implementador y el traspaso del mejorador.
+  mk_yml "$h/c10.yml" implementador mejorador note "$base" "fixture" '"un test parece incorrecto"' frozen
+  must_pass "E6: una nota del implementador no se juzga por coste" "$d" "$h/c10.yml" || bad=1
+  mk_yml "$h/c11.yml" mejorador arquitecto git_handoff "$base" "fixture" '"sin segundos"' frozen
+  must_pass "E6: el traspaso del mejorador no se juzga por coste" "$d" "$h/c11.yml" || bad=1
+
+  # La spec. El .yml honesto y su spec van FUERA de ROOT/.cursor/handoffs: se
+  # resuelve junto al .yml juzgado, no bajo la raiz del guardia.
+  local o="$st_tmp/otro-arbol/.cursor/handoffs"
+  mk_yml "$o/fuera.yml" especificador implementador git_handoff none \
+    "CI-E6 fixture. Spec: .cursor/handoffs/fuera.spec.md" '"none (solo lectura)"'
+  mk_spec "$o/fuera.spec.md"
+  must_pass "E6: una spec honesta, junto a su .yml y fuera de la raiz del guardia" "$d" "$o/fuera.yml" || bad=1
+  mk_yml "$h/s1.yml" especificador implementador note none "fixture sin spec" '"none (solo lectura)"'
+  must_fail_saying_all "E6: un traspaso del especificador sin spec" "$d" "$h/s1.yml" "FALTA spec" || bad=1
+  mk_yml "$h/s2.yml" especificador implementador git_handoff none \
+    "fixture. Spec: .cursor/handoffs/otra.spec.md" '"none (solo lectura)"'
+  must_fail_saying_all "E6: una spec nombrada que no existe junto al handoff" "$d" "$h/s2.yml" "otra.spec.md" "no existe" || bad=1
+  mk_yml "$h/e6.yml" especificador implementador git_handoff none \
+    "fixture. Spec: .cursor/handoffs/e6.spec.md" '"none (solo lectura)"'
+  mk_spec "$h/e6.spec.md"
+  sed -i '/^| Escenario /,$d' "$h/e6.spec.md"
+  must_fail_saying_all "E6: una spec sin tabla de coste" "$d" "$h/e6.yml" \
+    "tabla de coste" "| Escenario | Nivel | Segundos | Carril | Por qué no el barato |" || bad=1
+  mk_spec "$h/e6.spec.md" "" "" "  Escenario: C"
+  must_fail_saying_all "E6: un escenario sin fila" "$d" "$h/e6.yml" "escenario sin fila de coste: C" || bad=1
+  mk_spec "$h/e6.spec.md"
+  echo '| D | pura | 0,01 | DBG | — |' >> "$h/e6.spec.md"
+  must_fail_saying_all "E6: una fila sin escenario" "$d" "$h/e6.yml" "fila de coste sin escenario: D" || bad=1
+  mk_spec "$h/e6.spec.md" '| A | unitario | 0,01 | DBG | — |'
+  must_fail_saying_all "E6: un nivel fuera de la lista" "$d" "$h/e6.yml" "nivel invalido" "pura|guion|servicio|e2e" || bad=1
+  mk_spec "$h/e6.spec.md" "" '| B | guion | 0.06 | DBG | — |'
+  must_fail_saying_all "E6: el nivel caro sin su porqué" "$d" "$h/e6.yml" "'B'" "por qué el barato no lo demuestra" || bad=1
+  mk_spec "$h/e6.spec.md" '| A | pura | poco | DBG | — |'
+  must_fail_saying_all "E6: segundos invalidos en una fila" "$d" "$h/e6.yml" "segundos invalido" "'A'" || bad=1
+  mk_spec "$h/e6.spec.md" '| A | pura | 0,01 | XYZ | — |'
+  must_fail_saying_all "E6: un carril invalido en una fila" "$d" "$h/e6.yml" "XYZ no es una fila de scripts/gate-dag.txt" || bad=1
+  mk_spec "$h/e6.spec.md"
+  # shellcheck disable=SC2016  # the backticks are the fence of the block, for sed to read
+  sed -i -e '/^[`]\{3\}gherkin$/,/^[`]\{3\}$/d' -e '/^| [AB] |/d' "$h/e6.spec.md"
+  must_fail_saying_all "E6: una spec sin escenarios" "$d" "$h/e6.yml" "sin escenarios" || bad=1
+
+  # Los historicos: una lista cerrada por el hash de su contenido sin CR.
+  local lista="$d/scripts/handoffs-sin-coste.txt" cab='# fixture: sha256 nombre caducidad dueño motivo'
+  mk_yml "$h/h1.yml" implementador mejorador git_handoff "$base" "historico" '"sin segundos"' frozen
+  printf '%s\n' "$cab" "$(st_hash "$h/h1.yml") h1.yml 9999-12-31 orquestador anterior a CI-E6" > "$lista"
+  must_pass "E6: un traspaso historico del implementador, listado, pasa sin coste" "$d" "$h/h1.yml" || bad=1
+  mk_yml "$h/h2.yml" especificador implementador git_handoff none "historico sin spec" '"none"'
+  printf '%s\n' "$cab" "$(st_hash "$h/h2.yml") h2.yml 9999-12-31 orquestador anterior a CI-E6" > "$lista"
+  must_pass "E6: un traspaso historico del especificador, listado, pasa sin spec" "$d" "$h/h2.yml" || bad=1
+  sed 's/$/\r/' "$h/h1.yml" > "$h/h3.yml"
+  printf '%s\n' "$cab" "$(st_hash "$h/h1.yml") h3.yml 9999-12-31 orquestador anterior a CI-E6" > "$lista"
+  must_pass "E6: el mismo historico en CRLF, listado por su hash LF" "$d" "$h/h3.yml" || bad=1
+  sed -i 's/historico/historica/' "$h/h1.yml"
+  printf '%s\n' "$cab" "$(st_hash "$h/h3.yml") h1.yml 9999-12-31 orquestador anterior a CI-E6" > "$lista"
+  must_fail_saying_all "E6: un historico editado deja de ser historico" "$d" "$h/h1.yml" "FALTA segundos" || bad=1
+  mk_yml "$h/h1.yml" implementador mejorador git_handoff "$base" "historico" '"sin segundos"' frozen
+  printf '%s\n' "$cab" "$(st_hash "$h/h1.yml") h1.yml 2000-01-01 orquestador anterior a CI-E6" > "$lista"
+  must_fail_saying_all "E6: una excepcion caducada no exime" "$d" "$h/h1.yml" "caducó el 2000-01-01" || bad=1
+  printf '%s\n' "$cab" "$(st_hash "$h/h1.yml") h1.yml 9999-12-31 orquestador anterior a CI-E6" \
+    "$(printf '%064d' 7) otro.yml 9999-12-31" > "$lista"
+  must_fail_saying_all "E6: una linea malformada de la lista, despues de la que casa" "$d" "$h/h1.yml" \
+    "handoffs-sin-coste.txt:3:" "malformada" || bad=1
 
   # V15: el mismo V1 en el arbol CRLF. Va aqui y no junto a frozen-crlf-ok para
   # que la primera fila roja de un guardia viejo sea V1; el repo crlf sigue ahi,
