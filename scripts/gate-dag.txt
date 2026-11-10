@@ -20,8 +20,10 @@
 # CARGO_BUILD_JOBS, so a step asks for its own share of the cores and not nproc. A row with models names the three ORT
 # pools with the values of the plan of production on this machine (4, 4, 8; CI-F3.4, D-F34a: the plan gives the reranker
 # 8, and the 2 of rerank.rs is only what a binary without a plan asks for when it wants the GPU); E2E names none, because
-# there the plan decides, and the planner holds it against these (D-F34b). The cpu column is the most the row asks for: its
-# jobs or its widest pool, since the phases of a row do not run at once. NLI is exclusive: it asserts a clock
+# there the plan decides, and the planner holds the pools of that plan (the `resource plan` line of the log of the row) against
+# half of the `cores_logical` that same line says, at least 1 and at most the number these rows name (D-F34b; CI-E13, D-E13a:
+# the verdict does not follow the CPU cap of its turn). The cpu column is the most the row asks for: its
+# jobs or its widest pool (for M, the larger of its cargo jobs and its MUTANTS_JOBS), since the phases of a row do not run at once. NLI is exclusive: it asserts a clock
 # (nli_entailment, < 500 ms). Its tests open no database, but run-all-tests needs the judge's server (CI-J12), so it names a cluster.
 # CI-K4 (D-K4a, D-K4b, D-K4c, D-K4d, D-K4e, D-K4f): the rows that compile in the dev profile (B1, DC; `test` inherits from
 # `dev`, so the tokens are DEV and never TEST) build with no incremental state, no debuginfo and with their symbols stripped:
@@ -39,7 +41,11 @@
 20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal 8 8 170 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step DBG
 21 CT B1 target:T_dbg,cluster:C_ct,reader normal 4 4 90 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 bash scripts/merge-gate.sh --step CT
 22 D2 B1 target:T_dbg,cluster:C_d2,models,reader normal 8 8 115 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step D2
-23 D3 B1 target:T_dbg,cluster:C_d3,reader normal 1 2 95 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 bash scripts/merge-gate.sh --step D3
+# CI-E14 (D-E14b, 10-nov-2026, a decision of Leandro): D3 names CUBA_HANDLER_TIMEOUT_SECS=60. Its test of the real CLI of Claude
+# (v016_extract_without_sampling) gets 60 % of that timeout as the budget of the extraction (rust/src/handlers/ingesta.rs) and
+# fails with `out_of_budget` past it: 18 s with the default of 30. In 17 runs it took 7.5 to 18.3 s and one failed. With 60 the
+# budget is 36 s, in this row only: production keeps its 30.
+23 D3 B1 target:T_dbg,cluster:C_d3,reader normal 1 2 95 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 CUBA_HANDLER_TIMEOUT_SECS=60 bash scripts/merge-gate.sh --step D3
 25 NLI B1 target:T_dbg,cluster:C_nli,models,reader exclusive 8 8 60 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step NLI
 30 B3 P target:T_rel,cluster:C_b3 normal 12 16 150 CARGO_BUILD_JOBS=12 bash scripts/merge-gate.sh --step B3
 40 REL B3 target:T_rel,cluster:C_rel,models,reader normal 8 12 221 CARGO_BUILD_JOBS=2 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step REL
@@ -50,4 +56,9 @@
 # runs of another key (CI-J18, D-J18g).
 60 DC P target:T_docs normal 8 8 120 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DC
 70 CV P target:T_cov,cluster:C_cov untimed 4 4 45 CARGO_BUILD_JOBS=4 bash scripts/merge-gate.sh --step CV
-80 M P target:T_mut,cluster:C_mut untimed 8 8 136 CARGO_BUILD_JOBS=8 MUTANTS_JOBS=6 bash scripts/merge-gate.sh --step M
+# CI-E14 (D-E14a, 10-nov-2026): M names 4 cargo jobs, not 8, and its cpu is its largest request, the 6 of MUTANTS_JOBS. In the DAG
+# run of 10-nov (juez-B2-dag.log) B3 (12) and M (8) started and B1 (8) waited by `jobs` (12 + 8 + 8 = 28 > 24): `B1 wait=180` s with
+# the machine at 8.5 cores of 24. With M at 4 the three add up to 24, B1 starts at t=4 and the simulation of that run gives
+# T = 367.9 s, not 431.1 s. M is off the critical path (P -> B3 -> E2E, 350 s) and its 6 labs ran at 1.04 cores each: one crate
+# per mutant, so the jobserver tokens it hands them (mutants-gate.sh --jobserver-tasks) were hardly used.
+80 M P target:T_mut,cluster:C_mut untimed 6 8 136 CARGO_BUILD_JOBS=4 MUTANTS_JOBS=6 bash scripts/merge-gate.sh --step M
