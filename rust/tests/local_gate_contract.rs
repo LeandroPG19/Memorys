@@ -3160,10 +3160,22 @@ fn note_launch_of_judge_script(script: &Path) {
     );
 }
 
-/// What gate-cluster.sh builds under the TMPDIR of a self-test, after the base (CI-J7): `/t` (the
-/// TMPDIR of the run), mktemp's `tmp.XXXXXXXXXX`, the root of the case `noowner` (the longest lib
-/// name that reaches gate_cluster_up), the lane `dbg.XXXXXX` and the socket file. 55 bytes.
-const SELF_TEST_SOCKET_SUFFIX: &str = "/t/tmp.XXXXXXXXXX/noowner/root/dbg.XXXXXX/.s.PGSQL.5432";
+/// The longest socket gate-cluster.sh can build under each directory of a run, after the base
+/// (CI-J7, CI-K6). `/t`, the TMPDIR of the run: mktemp's `tmp.XXXXXXXXXX`, the root of the case
+/// `noowner` (the longest lib name that reaches gate_cluster_up), the lane `dbg.XXXXXX` and the
+/// socket file, 55 bytes. `/ct`, the GATE_CLUSTER_TMP of the run: the default root
+/// `memory-industry-gate-<uid>` with a 10-digit uid, the lane and the socket file, 60 bytes. `/aj`,
+/// the foreign directory that a foreign GATE_CLUSTER_ROOT points into: `clusters`, the lane and the
+/// socket file, 37 bytes.
+const SELF_TEST_SOCKET_SUFFIXES: [&str; 3] = [
+    "/t/tmp.XXXXXXXXXX/noowner/root/dbg.XXXXXX/.s.PGSQL.5432",
+    "/ct/memory-industry-gate-4294967295/dbg.XXXXXX/.s.PGSQL.5432",
+    "/aj/clusters/dbg.XXXXXX/.s.PGSQL.5432",
+];
+
+/// The root the foreign values of JUDGE_ENVIRONMENT that are paths start with: a place where
+/// nothing exists. A run rewrites it to its own `base/aj` (`under_the_foreign_dir`).
+const FOREIGN_ROOT: &str = "/nonexistent-ajeno";
 
 /// A unix socket path holds 107 bytes at most (sun_path), and gate-cluster.sh:155 refuses past it.
 const SOCKET_PATH_MAX: usize = 107;
@@ -3181,19 +3193,31 @@ fn self_test_parent() -> std::path::PathBuf {
 
 /// Runs `script --self-test` with HOME and XDG_CACHE_HOME, each a fresh, empty directory of the
 /// run's own, and `env` set on top (CI-J3). The judge's names are removed from the inherited
-/// environment first, so a run gets exactly what `env` gives it for them. Returns the run and what
-/// it left in those two directories. This environment inherits `XDG_CACHE_HOME` from the login, and
-/// `gate_linux_env` puts its temp under it, so an empty HOME alone proves nothing. TMPDIR is
-/// removed, as an unset TMPDIR is what the script gets here, unless `own_tmpdir` gives the run an
-/// empty TMPDIR of its own, `base/t` (CI-J7). The exit code is not read by the leftovers: what the
-/// run left is the answer.
+/// environment first, so a run gets exactly what `env` gives it for them. This environment inherits
+/// `XDG_CACHE_HOME` from the login, and `gate_linux_env` puts its temp under it, so an empty HOME
+/// alone proves nothing. TMPDIR is removed, as an unset TMPDIR is what the script gets here, unless
+/// `own_tmpdir` gives the run an empty TMPDIR of its own, `base/t` (CI-J7).
+///
+/// Two more directories are the run's own (CI-K6). GATE_CLUSTER_TMP is `base/ct`, created and
+/// empty, so the default cluster root a script makes lands where it is seen (D6) and not in the
+/// `/tmp` of whoever runs next to it; gate-cluster.sh and gate-audit.sh put their own in its place,
+/// and there the self-test itself certifies D6. The values of `env` that start with `FOREIGN_ROOT`
+/// are rewritten under `base/aj`, which is not created, so a self-test that writes where it was
+/// told a foreign path (the exit file of gate-lock.sh, say) is seen and not lost to a failed
+/// `mkdir` under `/nonexistent-ajeno`.
+///
+/// Returns the run and what it left, one entry per file or directory, named by where it is:
+/// `HOME/…`, `XDG_CACHE_HOME/…`, `GATE_CLUSTER_TMP/…` (the default root itself, created empty,
+/// included) and `AJENO/…` (`AJENO/` alone when the directory exists and is empty). The exit code
+/// is not read by the leftovers: what the run left is the answer.
 ///
 /// The base is `self_test_parent()/st-<pid>-<n>`, short on purpose (CI-J7). The socket of the
-/// longest case is that base plus `SELF_TEST_SOCKET_SUFFIX`, and the arithmetic is 107 − 70 = 37:
-/// with a 7-digit pid (pid_max 4194304 here) and a 3-digit counter, the path is the parent plus 70
-/// bytes, so the parent may be at most 37 bytes. `/tmp` is 4, a margin of 33 (the socket is 74).
-/// The assert below checks the real base before any launch, so a longer parent is a red of its own
-/// that says how many bytes to cut, and not the B5 lane refused by gate-cluster's guard.
+/// longest case is that base plus the longest of `SELF_TEST_SOCKET_SUFFIXES`, and the arithmetic is
+/// 107 − 75 = 32: with a 7-digit pid (pid_max 4194304 here) and a 3-digit counter, the path is the
+/// parent plus 75 bytes, so the parent may be at most 32 bytes. `/tmp` is 4, a margin of 28 (the
+/// socket is 79). The assert below checks the real base before any launch, so a longer parent is a
+/// red of its own that says how many bytes to cut, and not the B5 lane refused by gate-cluster's
+/// guard.
 fn run_self_test(
     script: &Path,
     env: &[(&str, &str)],
@@ -3202,7 +3226,12 @@ fn run_self_test(
     note_launch_of_judge_script(script);
     let launch = SELF_TEST_LAUNCHES.fetch_add(1, Ordering::Relaxed);
     let base = self_test_parent().join(format!("st-{}-{launch}", std::process::id()));
-    let longest = base.as_os_str().len() + SELF_TEST_SOCKET_SUFFIX.len();
+    let longest = base.as_os_str().len()
+        + SELF_TEST_SOCKET_SUFFIXES
+            .iter()
+            .map(|suffix| suffix.len())
+            .max()
+            .unwrap_or_default();
     assert!(
         longest <= SOCKET_PATH_MAX,
         "the base of this self-test is {} ({} bytes), so the longest socket gate-cluster.sh builds \
@@ -3216,9 +3245,12 @@ fn run_self_test(
     let home = base.join("home");
     let cache = base.join("xdg-cache");
     let tmp = base.join("t");
+    let cluster_tmp = base.join("ct");
+    let foreign = base.join("aj");
     std::fs::create_dir_all(&home).expect("creating the empty HOME of the self-test");
     std::fs::create_dir_all(&cache).expect("creating the empty XDG_CACHE_HOME of the self-test");
     std::fs::create_dir_all(&tmp).expect("creating the TMPDIR of the self-test");
+    std::fs::create_dir_all(&cluster_tmp).expect("creating the GATE_CLUSTER_TMP of the self-test");
     let mut command = std::process::Command::new(git_bash());
     command
         .arg(script)
@@ -3226,69 +3258,65 @@ fn run_self_test(
         .current_dir(repo_root())
         .env("HOME", &home)
         .env("XDG_CACHE_HOME", &cache)
+        .env("GATE_CLUSTER_TMP", &cluster_tmp)
         .env_remove("TMPDIR");
     for (name, _) in JUDGE_ENVIRONMENT {
         command.env_remove(name);
     }
-    command.envs(env.iter().copied());
+    for (name, value) in env {
+        command.env(name, under_the_foreign_dir(value, &foreign));
+    }
     if own_tmpdir {
         command.env("TMPDIR", &tmp);
     }
     let output = command
         .output()
         .expect("running the self-test of a judge script");
-    let mut left: Vec<String> = entries_under(&home)
-        .into_iter()
-        .map(|entry| format!("HOME/{entry}"))
-        .collect();
-    left.extend(
-        entries_under(&cache)
-            .into_iter()
-            .map(|entry| format!("XDG_CACHE_HOME/{entry}")),
-    );
+    let mut left = left_in("HOME", &home);
+    left.extend(left_in("XDG_CACHE_HOME", &cache));
+    left.extend(left_in("GATE_CLUSTER_TMP", &cluster_tmp));
+    if foreign.exists() {
+        left.push("AJENO/".to_string());
+    }
+    left.extend(left_in("AJENO", &foreign));
     let _ = std::fs::remove_dir_all(&base);
     (output, left)
 }
 
-/// What `script --self-test` leaves in HOME and XDG_CACHE_HOME (D-J7b). See `run_self_test`.
-fn left_by_self_test(script: &Path) -> Vec<String> {
-    run_self_test(script, &[], false).1
-}
-
-/// The default cluster root of gate-cluster.sh, computed by the script itself with GATE_CLUSTER_ROOT
-/// unset (CI-F2, K11): `${GATE_CLUSTER_TMP:-/tmp}/memory-industry-gate-<uid>`. `cluster_tmp` is the
-/// GATE_CLUSTER_TMP of the computation, so the root it names is one the test owns.
-fn default_cluster_root(cluster_tmp: &Path) -> std::path::PathBuf {
-    let output = std::process::Command::new(git_bash())
-        .arg("-c")
-        .arg("source \"$1\"; printf %s \"$GATE_CLUSTER_ROOT\"")
-        .arg("default-root")
-        .arg(repo_root().join("scripts").join("gate-cluster.sh"))
-        .env_remove("GATE_CLUSTER_ROOT")
-        .env("GATE_CLUSTER_TMP", cluster_tmp)
-        .output()
-        .expect("asking gate-cluster.sh for its default cluster root");
-    assert!(
-        output.status.success(),
-        "gate-cluster.sh did not say its default cluster root: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// What differs between two listings of a directory (`entries_under`): what went, and what came.
-fn listing_changes(before: &[String], after: &[String]) -> Vec<String> {
-    before
-        .iter()
-        .filter(|entry| !after.contains(*entry))
-        .map(|entry| format!("gone: {entry}"))
-        .chain(
-            after
-                .iter()
-                .filter(|entry| !before.contains(*entry))
-                .map(|entry| format!("new: {entry}")),
-        )
+/// What is under `dir`, each entry named `label/entry` (CI-K6).
+fn left_in(label: &str, dir: &Path) -> Vec<String> {
+    entries_under(dir)
+        .into_iter()
+        .map(|entry| format!("{label}/{entry}"))
         .collect()
+}
+
+/// `value` with `FOREIGN_ROOT` rewritten to `foreign`, the directory of the run that nothing
+/// creates (CI-K6). A value that does not start with it is left as it is.
+fn under_the_foreign_dir(value: &str, foreign: &Path) -> std::ffi::OsString {
+    match value.strip_prefix(FOREIGN_ROOT) {
+        Some(rest) => {
+            let mut path = foreign.as_os_str().to_owned();
+            path.push(rest);
+            path
+        }
+        None => value.into(),
+    }
+}
+
+/// What a fixture leaves when it is launched as a self-test with `env` (CI-K6). The fixture is a
+/// script of `body` in a directory of its own outside `scripts/`, so the one-launch rule of
+/// `note_launch_of_judge_script` does not count it. It is a liar the checks below have to catch.
+fn left_by_fixture(name: &str, body: &str, env: &[(&str, &str)]) -> Vec<String> {
+    let dir = std::env::temp_dir().join(format!("selftest-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("creating the directory of the fixture");
+    let script = dir.join(format!("{name}.sh"));
+    std::fs::write(&script, format!("#!/usr/bin/env bash\n{body}\nexit 0\n"))
+        .expect("writing the fixture");
+    let left = run_self_test(&script, env, false).1;
+    let _ = std::fs::remove_dir_all(&dir);
+    left
 }
 
 /// Concurrent launches at most (CI-J7). A self-test is a bash script that starts its own processes
@@ -3344,9 +3372,11 @@ struct SelfTestRun {
 }
 
 /// The one run of each script of SCRIPTS_WITH_SELF_TEST under JUDGE_ENVIRONMENT and a TMPDIR of its
-/// own (CI-J7). CI-J3 reads all of them, and the ten `*_can_actually_fail` tests read their own
-/// script's run from here, so the judge's environment is launched once per script and not once per
-/// test. Whichever asks first fills it: the result is the same either way.
+/// own (CI-J7). CI-J3 reads all of them, the ten `*_can_actually_fail` tests read their own
+/// script's run from here, and the test of the leftovers reads the eight that source gate-lock.sh,
+/// so the judge's environment is launched once per script and not once per test (CI-K6:
+/// `note_launch_of_judge_script` makes a second launch red). Whichever asks first fills it: the
+/// result is the same either way.
 static JUDGE_ENV_SELF_TESTS: OnceLock<Vec<(&'static str, SelfTestRun)>> = OnceLock::new();
 
 /// The run of `name` under the judge's exported environment (CI-J7). Its output is what the test
@@ -3366,56 +3396,47 @@ fn judge_env_self_test(name: &str) -> &'static SelfTestRun {
         .unwrap_or_else(|| panic!("{name} is not one of SCRIPTS_WITH_SELF_TEST"))
 }
 
-/// The self-tests of the judge's scripts are hermetic (D-J7b). Each script that sources
-/// `gate-lock.sh` runs its `--self-test` with an empty HOME and an empty XDG_CACHE_HOME of its
-/// own, and leaves both empty, whatever its exit code. The scripts are read from `SCRIPTS_WITH_SELF_TEST`, so a new one
-/// that sources the lock is checked without being listed here. The fixture first: a script that
-/// writes under HOME has to be caught, or the check is a paragraph.
+/// The self-tests of the judge's scripts are hermetic (D-J7b, D6). Each script that sources
+/// `gate-lock.sh` runs its `--self-test` with an empty HOME, an empty XDG_CACHE_HOME and an empty
+/// GATE_CLUSTER_TMP of its own, and with the judge's foreign paths pointing where nothing exists,
+/// and leaves all of them as it found them, whatever its exit code (CI-K6). It does not launch: it
+/// reads the run of `judge_env_self_test`, so each script runs once per round. The scripts are read
+/// from `SCRIPTS_WITH_SELF_TEST`, so a new one that sources the lock is checked without being
+/// listed here. The fixtures first, each the anchor of one place a leftover can be: a script that
+/// writes under HOME, one that makes the default cluster root (empty, as the blind spot of the old
+/// check), and one that writes the exit file it was told, which only shows under a foreign path of
+/// the run's own.
 #[test]
 fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
-    let liar_dir = std::env::temp_dir().join(format!("selftest-liar-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&liar_dir);
-    std::fs::create_dir_all(&liar_dir).expect("creating the liar fixture");
-    let liar = liar_dir.join("liar.sh");
-    std::fs::write(
-        &liar,
-        "#!/usr/bin/env bash\nmkdir -p \"$HOME/.cache/x\"\nexit 0\n",
-    )
-    .expect("writing the liar fixture");
-    let caught = left_by_self_test(&liar);
-    let _ = std::fs::remove_dir_all(&liar_dir);
+    let caught = left_by_fixture("liar", "mkdir -p \"$HOME/.cache/x\"", &[]);
     assert!(
-        !caught.is_empty(),
+        caught.iter().any(|entry| entry == "HOME/.cache/x"),
         "the check let through a script that writes ~/.cache/x under HOME during its self-test, \
-         so it cannot tell a clean self-test from a dirty one"
+         so it cannot tell a clean self-test from a dirty one: {caught:?}"
     );
 
-    // D6 (CI-F2): the same for the default cluster root, `${GATE_CLUSTER_TMP:-/tmp}/memory-industry-gate-<uid>`.
-    // Hermetic: the real root is where the judge's own lanes live (run_in_lane), so it is never listed. The
-    // fixture's liar writes into a root under a GATE_CLUSTER_TMP of its own, and the check must see that.
-    let fixture_tmp =
-        std::env::temp_dir().join(format!("selftest-root-liar-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&fixture_tmp);
-    std::fs::create_dir_all(&fixture_tmp)
-        .expect("creating the GATE_CLUSTER_TMP of the root fixture");
-    let fixture_tmp_text = fixture_tmp
-        .to_str()
-        .expect("the temp dir of the fixture is UTF-8");
-    let fixture_root = default_cluster_root(&fixture_tmp);
-    let root_liar = fixture_tmp.join("root-liar.sh");
-    std::fs::write(
-        &root_liar,
-        "#!/usr/bin/env bash\nmkdir -p \"$GATE_CLUSTER_TMP/memory-industry-gate-$(id -u)/liar\"\nexit 0\n",
-    )
-    .expect("writing the root liar fixture");
-    let fixture_before = entries_under(&fixture_root);
-    let _ = run_self_test(&root_liar, &[("GATE_CLUSTER_TMP", fixture_tmp_text)], false);
-    let fixture_changes = listing_changes(&fixture_before, &entries_under(&fixture_root));
-    let _ = std::fs::remove_dir_all(&fixture_tmp);
+    let caught = left_by_fixture(
+        "root-liar",
+        "mkdir -p \"$GATE_CLUSTER_TMP/memory-industry-gate-$(id -u)\"",
+        &[],
+    );
     assert!(
-        !fixture_changes.is_empty(),
-        "the root check let through a script that writes under the default cluster root during its \
-         self-test, so it cannot tell a clean self-test from one that left a lane behind (D6)"
+        caught.len() == 1 && caught[0].starts_with("GATE_CLUSTER_TMP/memory-industry-gate-"),
+        "the root check let through a script that makes the default cluster root, empty, during \
+         its self-test, so it cannot tell a clean self-test from one that left a lane behind \
+         (D6): {caught:?}"
+    );
+
+    let caught = left_by_fixture(
+        "exit-liar",
+        "mkdir -p \"$(dirname \"$CUBA_GATE_EXIT_FILE\")\"\necho running >\"$CUBA_GATE_EXIT_FILE\"",
+        &JUDGE_ENVIRONMENT,
+    );
+    assert!(
+        caught.iter().any(|entry| entry == "AJENO/run.exit"),
+        "the check let through a script that writes the exit file it was told under the judge's \
+         environment, so a self-test that writes there with the failure ignored is green here and \
+         red under the judge: {caught:?}"
     );
 
     let sourcing: Vec<&str> = SCRIPTS_WITH_SELF_TEST
@@ -3427,42 +3448,18 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
         !sourcing.is_empty(),
         "no script of SCRIPTS_WITH_SELF_TEST sources gate-lock.sh: the check would prove nothing"
     );
-    let cluster_tmp = self_test_parent().join(format!("ct-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&cluster_tmp);
-    std::fs::create_dir_all(&cluster_tmp).expect("creating the GATE_CLUSTER_TMP of the self-tests");
-    let cluster_tmp_text = cluster_tmp
-        .to_str()
-        .expect("the GATE_CLUSTER_TMP of the self-tests is UTF-8");
-    let root = default_cluster_root(&cluster_tmp);
-    let root_before = entries_under(&root);
-    let lefts = in_parallel(&sourcing, |name| {
-        run_self_test(
-            &repo_root().join("scripts").join(name),
-            &[("GATE_CLUSTER_TMP", cluster_tmp_text)],
-            false,
-        )
-        .1
-    });
-    let root_changes = listing_changes(&root_before, &entries_under(&root));
-    let _ = std::fs::remove_dir_all(&cluster_tmp);
     let leftovers: Vec<String> = sourcing
         .iter()
-        .zip(lefts)
+        .map(|name| (name, &judge_env_self_test(name).left))
         .filter(|(_, left)| !left.is_empty())
         .map(|(name, left)| format!("scripts/{name} --self-test left behind: {left:?}"))
         .collect();
     assert!(
         leftovers.is_empty(),
-        "a self-test of the judge wrote into the HOME or the XDG_CACHE_HOME it was given. A \
-         self-test has to leave both as it found them (D-J7b), or a judge that runs next to it \
-         loses its output: {leftovers:#?}"
-    );
-    assert!(
-        root_changes.is_empty(),
-        "a self-test of the judge changed the default cluster root {} (D6, CI-F2): {root_changes:#?}. \
-         A self-test that makes a lane has to name GATE_CLUSTER_ROOT, or the lane is left in the root \
-         of whoever runs next to it",
-        root.display()
+        "a self-test of the judge wrote into the HOME, the XDG_CACHE_HOME or the GATE_CLUSTER_TMP it \
+         was given, or under the foreign path it was handed (AJENO/). A self-test has to leave all \
+         of them as it found them (D-J7b, D6, CI-F2), or a judge that runs next to it loses its \
+         output or finds its lane: {leftovers:#?}"
     );
 }
 
@@ -3637,8 +3634,9 @@ fn every_self_test_passes_under_the_judges_exported_environment() {
     );
     assert!(
         leftovers.is_empty(),
-        "a self-test run under the judge's exported environment wrote into the HOME or the \
-         XDG_CACHE_HOME it was given (CI-J3, D-J7b): {leftovers:#?}"
+        "a self-test run under the judge's exported environment wrote into the HOME, the \
+         XDG_CACHE_HOME or the GATE_CLUSTER_TMP it was given, or under a foreign path it was \
+         handed (AJENO/) (CI-J3, D-J7b, CI-K6): {leftovers:#?}"
     );
 }
 
