@@ -2267,8 +2267,8 @@ if [[ -n "${DATABASE_URL:-}" ]]; then
   echo "note: DATABASE_URL names a server this judge did not make, so every step shares that server and no lane is made (D-F2k)"
 fi
 
-# CARGO_BUILD_JOBS for every cargo call of this run, counted once (CI-F1, D-F1a): the CPUs
-# of the cgroup this gate runs in, under nproc's. Before the banner, because the banner
+# CARGO_BUILD_JOBS for every cargo call of this run, counted once (CI-F1, D-F1a; CI-E7a-1):
+# max(1, min(nproc, the CPUs of the cgroup this gate runs in, the free RAM / 2 GiB)). Before the banner, because the banner
 # and the OK lines of the judge server are read as one block (the first cargo call is
 # still after all of them).
 gate_cargo_jobs
@@ -2461,9 +2461,10 @@ export GATE_SERVER_SYSTEM_ID="$GATE_JUDGE_SYSID"
 fi
 
 # CI-F3.3b-2 (D-F3b, spec F3.3b-1b): the rows of scripts/gate-dag.txt run here, one `merge-gate.sh --step <id>` each,
-# in the planner's order: GATE_DAG=0 (or serie) is the series in idx order, GATE_DAG=1 (or maximo) the DAG, GATE_DAG=auto the DAG
-# with as many rows alive as the machine has lanes (CI-K4). Its verdict is this gate's: a red row
-# stops the gate with its own code, and the rows after it do not start.
+# in the planner's order: GATE_DAG=0 (or serie) is the series in idx order; GATE_DAG=1, maximo and auto (CI-E7a-1) are one
+# DAG, whose rows start when scripts/gate-dag.py `admission` lets them: the CPU, the RAM, the models and the jobs of the
+# rows alive (the jobs they name in CARGO_BUILD_JOBS, row_jobs, add up to no more than the machine's) have room for them.
+# Its verdict is this gate's: a red row stops the gate with its own code, and the rows after it do not start.
 # The line where the timed steps end (D-F2c, spec F3.3b-1b-iii): test-times.sh judges the log up to it. The planner
 # prints it before the first untimed row (CV, class untimed in gate-dag.txt), so the output of CV and M is not judged.
 TIMED_STEPS_END='=== end of timed steps ==='

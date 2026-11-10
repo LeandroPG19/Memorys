@@ -2498,7 +2498,8 @@ REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
 [[ -f "$REL_BIN" ]] || { echo "FAIL: no release binary at $REL_BIN: the B3 lane builds it (run --lane B3 first)." >&2; exit 1; }
 b3_record_sha
 # CI-F3.3b-1: the e2e chain runs in a process of its own, with a cluster that has no brain_gate: E makes
-# it with the same provision D1 uses, and only when it is missing (D1 and E in one call share it): ensure_gate_db (CI-E11, D-E11f).
+# it with provision_gate_db, through ensure_gate_db (CI-E11, D-E11f), and only when it is missing: D2 and D3 do the same with
+# the debug binary B1 left, E with the release binary of B3, and in one process (no --lane) the first to need it makes it.
 # CI-F3.4 (D-F34h): E compiles nothing. The provision runs the release binary B3 left, already held against its record.
 ensure_gate_db "$REL_BIN"
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
