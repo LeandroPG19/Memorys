@@ -3131,6 +3131,38 @@ mod tests {
         );
         assert_eq!(reason, None);
     }
+
+    #[test]
+    fn the_production_wait_for_the_sync_lock_is_ten_seconds_and_is_written_in_milliseconds() {
+        assert_eq!(
+            SYNC_LOCK_WAIT,
+            std::time::Duration::from_secs(10),
+            "the wait a real sync gives the lock is the one thing the injected-wait test in \
+             v025 does not exercise: this is where it is pinned"
+        );
+        assert_eq!(
+            lock_timeout_sql(SYNC_LOCK_WAIT).expect("ten seconds is a valid wait"),
+            "SET LOCAL lock_timeout = '10000ms'"
+        );
+        assert_eq!(
+            lock_timeout_sql(std::time::Duration::from_secs(1)).expect("a second is a valid wait"),
+            "SET LOCAL lock_timeout = '1000ms'"
+        );
+    }
+
+    #[test]
+    fn a_wait_under_a_millisecond_is_refused_because_postgres_reads_zero_as_wait_forever() {
+        let why = lock_timeout_sql(std::time::Duration::ZERO)
+            .expect_err("a zero wait must not be accepted")
+            .to_string();
+        assert!(
+            why.contains("wait forever"),
+            "lock_timeout = 0 in Postgres means wait forever, which is the hang this lock \
+             exists to prevent; the refusal has to say so. Got: {why}"
+        );
+        lock_timeout_sql(std::time::Duration::from_micros(999))
+            .expect_err("999 microseconds rounds down to 0 ms, which is the same hang");
+    }
 }
 
 #[cfg(test)]
