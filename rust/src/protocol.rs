@@ -6,7 +6,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::task::JoinHandle;
 
 pub fn handler_timeout() -> Duration {
     std::env::var("CUBA_HANDLER_TIMEOUT_SECS")
@@ -150,12 +151,134 @@ fn outbound() -> Option<&'static mpsc::UnboundedSender<Value>> {
     OUTBOUND.get()
 }
 
-fn send_outbound(msg: Value) {
-    match outbound() {
-        Some(tx) => {
-            let _ = tx.send(msg);
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Queued,
+    NoChannel,
+    Closed,
+}
+
+/// Puts `msg` on the stdio channel. A channel closed by the writer (stdin ended and the writer is draining)
+/// refuses it: the message is dropped with a warning that names it, never with a panic and never in silence.
+fn deliver(channel: Option<&mpsc::UnboundedSender<Value>>, msg: Value) -> Delivery {
+    let Some(tx) = channel else {
+        return Delivery::NoChannel;
+    };
+    match tx.send(msg) {
+        Ok(()) => Delivery::Queued,
+        Err(mpsc::error::SendError(dropped)) => {
+            let id = dropped.get("id").map(Value::to_string).unwrap_or_default();
+            let method = dropped
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            tracing::warn!(%id, method, "outbound channel closed — message dropped");
+            Delivery::Closed
         }
-        None => tracing::debug!("no stdio channel — dropping server-initiated message"),
+    }
+}
+
+fn send_outbound(msg: Value) {
+    if deliver(outbound(), msg) == Delivery::NoChannel {
+        tracing::debug!("no stdio channel — dropping server-initiated message");
+    }
+}
+
+/// How long the exit waits for a writer that is not finishing. Not a wait the exit pays: a writer that
+/// drains ends the wait by itself.
+pub(crate) const WRITER_CEILING: Duration = Duration::from_millis(500);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WriterEnd {
+    /// The channel was closed and every message that was in it is written and flushed.
+    Drained { written: u64 },
+    /// The output refused a write or a flush; `written` counts what got out before.
+    Failed { written: u64 },
+    /// The ceiling ran out first and the writer was aborted.
+    Stuck,
+}
+
+/// Writes every message of `rx` to `out`, one JSON line each. When `close` fires (or its sender is dropped) it
+/// closes the channel to new messages and keeps receiving until what is already in it is written, so the last
+/// answer of a client that closed stdin is never lost. `close` goes first in the `select!`: a message that is
+/// queued never keeps the writer from seeing it.
+pub(crate) async fn write_outbound<W>(
+    mut rx: mpsc::UnboundedReceiver<Value>,
+    mut close: oneshot::Receiver<()>,
+    mut out: W,
+) -> WriterEnd
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut written = 0u64;
+    let mut closing = false;
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = &mut close, if !closing => {
+                rx.close();
+                closing = true;
+                continue;
+            }
+            msg = rx.recv() => msg,
+        };
+        let Some(msg) = next else {
+            return WriterEnd::Drained { written };
+        };
+        let mut bytes = match serde_json::to_vec(&msg) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to serialize outbound");
+                continue;
+            }
+        };
+        bytes.push(b'\n');
+        if let Err(e) = out.write_all(&bytes).await {
+            tracing::error!(error = %e, "stdout write failed — terminating writer");
+            return WriterEnd::Failed { written };
+        }
+        if let Err(e) = out.flush().await {
+            tracing::error!(error = %e, "stdout flush failed");
+            return WriterEnd::Failed { written };
+        }
+        written += 1;
+    }
+}
+
+/// Tells the writer to close and waits for it. The wait ends when the writer does; `ceiling` is only for a writer
+/// that never does (a stdout nobody reads), which is aborted.
+pub(crate) async fn close_writer(
+    close: oneshot::Sender<()>,
+    mut writer: JoinHandle<WriterEnd>,
+    ceiling: impl std::future::Future<Output = ()>,
+) -> WriterEnd {
+    // An Err here is a writer that already ended: its JoinHandle says how.
+    let _ = close.send(());
+    tokio::select! {
+        biased;
+        joined = &mut writer => match joined {
+            Ok(end) => end,
+            Err(e) => {
+                tracing::error!(error = %e, "outbound writer task failed");
+                WriterEnd::Failed { written: 0 }
+            }
+        },
+        _ = ceiling => {
+            writer.abort();
+            WriterEnd::Stuck
+        }
+    }
+}
+
+fn report_writer_end(end: &WriterEnd) {
+    match end {
+        WriterEnd::Drained { written } => {
+            tracing::info!(outcome = "drained", written, "outbound writer closed")
+        }
+        WriterEnd::Failed { written } => {
+            tracing::warn!(outcome = "failed", written, "outbound writer closed")
+        }
+        WriterEnd::Stuck => tracing::warn!(outcome = "stuck", "outbound writer closed"),
     }
 }
 
@@ -257,9 +380,7 @@ pub fn notify_progress(token: &str, progress: f64, total: Option<f64>, message: 
         "method": "notifications/progress",
         "params": params,
     });
-    if let Some(tx) = OUTBOUND.get() {
-        let _ = tx.send(notif);
-    }
+    send_outbound(notif);
 }
 
 pub fn register_cancel_token(request_id: &Value) -> CancelRegistration {
@@ -339,32 +460,13 @@ pub async fn run_mcp() -> Result<()> {
         })
     });
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<Value>();
     OUTBOUND
         .set(out_tx)
         .map_err(|_| anyhow::anyhow!("OUTBOUND already initialized"))?;
 
-    let writer_handle = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        while let Some(msg) = out_rx.recv().await {
-            let mut bytes = match serde_json::to_vec(&msg) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to serialize outbound");
-                    continue;
-                }
-            };
-            bytes.push(b'\n');
-            if let Err(e) = stdout.write_all(&bytes).await {
-                tracing::error!(error = %e, "stdout write failed — terminating writer");
-                break;
-            }
-            if let Err(e) = stdout.flush().await {
-                tracing::error!(error = %e, "stdout flush failed");
-                break;
-            }
-        }
-    });
+    let (close_tx, close_rx) = oneshot::channel::<()>();
+    let writer_handle = tokio::spawn(write_outbound(out_rx, close_rx, tokio::io::stdout()));
 
     let stdin = tokio::io::stdin();
     let reader = BufReader::new(stdin);
@@ -478,18 +580,16 @@ pub async fn run_mcp() -> Result<()> {
     let drain = async { while in_flight.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(handler_timeout() * 2, drain).await;
 
-    if let Some(tx) = OUTBOUND.get() {
-        let _ = tx;
-    }
-
     if let Some(handle) = rem_handle {
         handle.abort();
     }
     if let Some(handle) = listen_handle {
         handle.abort();
     }
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), writer_handle).await;
-    tracing::info!("REM daemon + writer drained, shutting down");
+
+    // After the handlers: every answer is already in the channel when it closes.
+    let end = close_writer(close_tx, writer_handle, tokio::time::sleep(WRITER_CEILING)).await;
+    report_writer_end(&end);
 
     Ok(())
 }

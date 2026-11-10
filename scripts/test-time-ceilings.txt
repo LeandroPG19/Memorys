@@ -64,7 +64,6 @@ windows v017_relation_scan 4 36 orquestador-0.31 2026-11-30 asks the generative 
 windows v029_accounts_over_real_http 9 27 orquestador-0.31 2026-11-30 real HTTP daemons over scratch databases migrated one at a time (fcebc6c); 19.5-20.5 s, 1180 s before 0.30: this line keeps it from coming back
 windows v016_extract_without_sampling 4 18 orquestador-0.31 2026-11-30 asks the generative LLM over the network; 9.3-13.2 s
 windows v029_auto_host_over_real_http 6 17 orquestador-0.31 2026-11-30 12.2-12.3 s here and 3.1 s on linux; the windows difference is not explained yet
-windows v025_a_stuck_sync_fails_instead_of_hanging 5 14 orquestador-0.31 2026-11-30 waits for a stuck sync to give up, which is what it proves; 10.2-10.5 s on both hosts
 windows v045_a_merge_reaches_the_database 2 11 orquestador-0.31 2026-11-30 5.9-8.2 s, too close to the default to live under it
 windows v017_rerank_gpu 2 11 orquestador-0.31 2026-11-30 the real reranker on the GPU in release; 5.8-8.2 s (213 s on the CPU of the linux judge)
 windows v029_accounts_redeem 2 11 orquestador-0.31 2026-11-30 5.6-8.0 s, too close to the default to live under it
@@ -76,4 +75,4 @@ linux v017_relation_scan 4 25 orquestador-0.31 2026-11-30 asks the generative LL
 linux v016_extract_without_sampling 5 26 orquestador-0.31 2026-11-30 asks the generative LLM over the network; 11.6-16.8 s
 linux local_gate_contract 34 103 orquestador-0.31 2026-11-30 the --self-test of the gate scripts under the judge's exported environment, one OnceLock run per script and six launches at a time (CI-J7); CI-K8: one pass, 131 tests in 68.17 s on 2026-11-10 (verif-unica-20261110-083518, one run, k = 1.5; floor = floor(0.5 x 68.17), ceiling = ceil(1.5 x 68.17)); pending: to be set again by the first complete one-pass judge run
 linux gate_dag_contract 5 16 orquestador-0.31 2026-11-30 gate_dag_contract; CI-K8: one pass, 74 tests in 10.25 s on 2026-11-10 (verif-unica-20261110-083518, one run, k = 1.5; floor = floor(0.5 x 10.25), ceiling = ceil(1.5 x 10.25)); it had 7/23 from 7.57 s a round with fewer tests; pending: to be set again by the first complete one-pass judge run
-linux v025_a_stuck_sync_fails_instead_of_hanging 5 16 orquestador-0.31 2026-11-30 waits for a stuck sync to give up, which is what it proves; 10.2 s
+# CI-E10 (10-nov, orquestador-0.31): v025_a_stuck_sync_fails_instead_of_hanging loses its two lines, linux (5 16) and windows (5 14). It no longer sits out the production wait of 10 s (10.19 s in the 8-nov log): the wait is a parameter of take_sync_lock and the test gives it 1 s, so the binary takes ~1.2 s, under the floor of 5 and, at 1.3 x, under the default of 10 s. Number measured after the change: pending, from medir-e10.sh phase b (rewrite this line with it).
