@@ -13,6 +13,14 @@ table or with a DATABASE_URL in the environment runs in series, and is recorded 
 planner: TERM and HUP stop it, and its exit stops every step and every `paso-*` cgroup of the scope (J14b).
 The planner measures the machine before it starts (cores, RAM free, disk, battery) and prints its plan in one line,
 `plan: ...` (CI-K4, D-K4q); a measure that cannot be read is a series with one job and the line says what (D-K4o).
+CI-E4: each step and the run leave their CPU, their mean cores (CPU over seconds) and the seconds spent in series
+(gate_history.serie_final) in the history, and the run its peak: `memory.peak` of the scope through a descriptor of its own,
+zeroed when the planner starts and read when it closes, and the memory.stat of the highest `memory.current` it sampled (at
+the start, every tick, at the end of each step and at the close). What cannot be known is said here and not guessed: of what
+the peak was made at the instant of the peak (the kernel keeps the mark of the total, not its parts), what happened between two
+samples, whether `memory.stat` and `memory.current` were read at one instant, and the cache that another job loaded first, which
+is charged to that job and not to this scope. A scope that is not delegated is not measured and not written: every number of
+it is null, with the reason in `sin_medida`, and a `note: not measured (...)` line per reason.
 
 Not in the planner: the removal of old run directories (D-F3i) and the per-binary launcher (D-F3u).
 `exclusive` and `boundary` run alone, after every lower idx: the conservative form of D-F3l, and with a
@@ -265,6 +273,7 @@ class Step:
         self.psi: dict[str, float | None] | None = None
         self.paso: gate_history.Paso | None = None
         self.solape_s: float | None = None
+        self.sin_medida: dict[str, str] = {}
 
 
 def parse_env(rest: list[str], step_id: str) -> tuple[dict[str, str], list[str]]:
@@ -540,25 +549,91 @@ def move_pid(destination: str, pid: int) -> None:
 DELEGATED = "juez"
 
 
-def delegate(scope: str | None) -> bool:
-    """Moves the planner and its scope's processes to scope/juez, then enables controllers. A scope that is already a `juez`
-    is another planner's: it has processes of its own, so the kernel does not let it enable controllers for children, and a
-    second `juez` inside it would go one level down for each planner that starts there (CI-J17). That planner is not delegated:
-    it runs in series, and the planner outside keeps its DAG."""
-    if scope is None or os.path.basename(scope) == DELEGATED:
-        return False
-    if not os.access(os.path.join(scope, "cgroup.subtree_control"), os.W_OK):
-        return False
+def delegate(scope: str | None) -> str | None:
+    """Moves the planner and its scope's processes to scope/juez, then enables controllers. None when it delegated, and the
+    reason when it did not (D-E4c). A scope that is already a `juez` is another planner's: it has processes of its own, so the
+    kernel does not let it enable controllers for children, and a second `juez` inside it would go one level down for each
+    planner that starts there (CI-J17). That planner is not delegated: it runs in series, and the planner outside keeps its DAG."""
+    if scope is None:
+        return "there is no `0::` line in /proc/self/cgroup"
+    if os.path.basename(scope) == DELEGATED:
+        return f"{scope} is a `{DELEGATED}` of another planner (CI-J17)"
+    control = os.path.join(scope, "cgroup.subtree_control")
+    if not os.access(control, os.W_OK):
+        return f"{control} cannot be written"
     juez = os.path.join(scope, DELEGATED)
     try:
         os.makedirs(juez, exist_ok=True)
         for pid in sorted(read_pids(scope) | {os.getpid()}):
             move_pid(juez, pid)
-        with open(os.path.join(scope, "cgroup.subtree_control"), "w", encoding="utf-8") as fh:
+        with open(control, "w", encoding="utf-8") as fh:
             fh.write("+cpu +memory +pids")
+    except OSError as err:
+        return f"the processes of {scope} could not be moved or its controllers enabled ({err})"
+    return None
+
+
+SAMPLE_FIELDS = ("anon", "file", "shmem", "kernel")
+
+
+def open_peak(scope: str) -> tuple[int | None, str | None]:
+    """D-E4d: a descriptor of its own on `<scope>/memory.peak`, with the mark set to zero (writing to it resets it for that
+    descriptor and for no other). The descriptor, or why there is none: a peak read by path would be the one since the scope
+    was born, the preamble of the judge included, and that is not this run's."""
+    path = os.path.join(scope, "memory.peak")
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError as err:
+        return None, f"{path} cannot be reset ({err})"
+    try:
+        os.write(fd, b"reset\n")
+    except OSError as err:
+        os.close(fd)
+        return None, f"{path} cannot be reset ({err})"
+    return fd, None
+
+
+def read_peak(fd: int) -> int | None:
+    """The mark of a descriptor `open_peak` returned; None when it cannot be read."""
+    try:
+        text = os.pread(fd, 64, 0).decode("ascii", errors="replace").strip()
     except OSError:
-        return False
-    return True
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def scope_sample(scope: str) -> dict[str, int] | None:
+    """D-E4e: `memory.current` and the four fields of `memory.stat` that split it, or None when one is missing."""
+    current = read_int(os.path.join(scope, "memory.current"))
+    stat = read_kv(os.path.join(scope, "memory.stat"))
+    if current is None or stat is None or any(name not in stat for name in SAMPLE_FIELDS):
+        return None
+    return {"current": current, **{name: stat[name] for name in SAMPLE_FIELDS}}
+
+
+def read_step(cg: str) -> tuple[float | None, int | None, dict[str, str]]:
+    """D-E4g: the CPU seconds and the peak of a step's own cgroup, and the reason of each one that cannot be read."""
+    why: dict[str, str] = {}
+    cpu_path = os.path.join(cg, "cpu.stat")
+    cpu = read_kv(cpu_path)
+    cpu_s = cpu["usage_usec"] / 1e6 if cpu and "usage_usec" in cpu else None
+    if cpu_s is None:
+        why["cpu_s"] = f"{cpu_path} cannot be read" if cpu is None else f"{cpu_path} has no usage_usec"
+    peak_path = os.path.join(cg, "memory.peak")
+    peak = read_int(peak_path)
+    if peak is None:
+        why["mem_peak"] = f"{peak_path} cannot be read"
+    return cpu_s, peak, why
+
+
+def num(value: float | None, spec: str) -> str:
+    """A measured number in `spec`; `n/a` when it was not measured (a measured 0 is `0.00`, and fmt() says n/a to it)."""
+    return "n/a" if value is None else format(value, spec)
+
+
+def gib(value: float | None) -> str:
+    """Bytes as GiB with two decimals; `n/a` for bytes that were not measured."""
+    return num(None if value is None else value / GIB, ".2f")
 
 
 class Measure:
@@ -791,6 +866,13 @@ class Planner:
     # D-E7e: what the jobs of the rows alive may add up to. A class default, so that a planner made without __init__ (the
     # property tests of the admission) has one.
     jobs_cap: int = 1
+    # CI-E4: class defaults too, so that such a planner measures nothing in the scope and writes nothing in it.
+    delegate_why: str | None = None
+    peak_fd: int | None = None
+    peak_why: str | None = None
+    peak_run: int | None = None
+    mem_best: dict[str, Any] | None = None
+    mem_n: int = 0
 
     def __init__(self, steps: list[Step], asked: str, tabla: str, timed_end: str | None = None) -> None:
         self.steps = steps
@@ -806,7 +888,9 @@ class Planner:
         self.run_id = os.path.basename(self.run_dir)
         self.hist_steps, self.hist_runs = load_history(tabla)
         self.scope = scope_dir()
-        self.delegado = delegate(self.scope)
+        self.delegate_why = delegate(self.scope)
+        self.delegado = self.delegate_why is None
+        self.open_memory()
         # CI-J14d: a DATABASE_URL of the operator is one server for every row, and sqlx drops databases by name.
         self.shared_server = bool(os.environ.get("DATABASE_URL"))
         # CI-K4 (D-K4o): a measure that could not be read puts the planner in series, with one job, and the plan says what.
@@ -902,9 +986,12 @@ class Planner:
             self.estimate(step)
         return ranks(self.steps, {s.id: s.dur for s in self.steps})
 
+    def undelegated_reason(self) -> str:
+        return f"not delegated ({self.delegate_why or 'no reason given'})"
+
     def notes(self) -> None:
-        if self.dag and not self.delegado:
-            print("note: the scope is not delegated: nothing is measured or killed per step, so the planner runs in series")
+        if not self.delegado:
+            print(f"note: the scope is not delegated ({self.delegate_why}): nothing is measured or killed per step, so the planner runs in series")
         elif self.dag and not self.hist_runs:
             print(f"note: no serial history for this table ({self.tabla[:12]}): the planner runs in series")
         if self.dag and self.shared_server:
@@ -1072,6 +1159,34 @@ class Planner:
             step.anon_now = value
             step.anon_max = max(step.anon_max or 0, value)
 
+    def open_memory(self) -> None:
+        """D-E4d, D-E4j: only a scope this planner delegated is written (the descriptor of its peak, zeroed) and read."""
+        if self.delegado and self.scope:
+            self.peak_fd, self.peak_why = open_peak(self.scope)
+            self.sample_scope()
+
+    def sample_scope(self) -> None:
+        """D-E4e: keeps the sample of the highest `memory.current` (the first one on a tie) and counts the valid ones."""
+        if not (self.delegado and self.scope):
+            return
+        sample = scope_sample(self.scope)
+        if sample is None:
+            return
+        self.mem_n += 1
+        if self.mem_best is None or sample["current"] > self.mem_best["current"]:
+            self.mem_best = {"t": self.now(), **sample}
+
+    def seal_memory(self) -> None:
+        """D-E4d: the last sample, the peak through the descriptor of its own, and the descriptor closed."""
+        self.sample_scope()
+        if self.peak_fd is None:
+            return
+        self.peak_run = read_peak(self.peak_fd)
+        if self.peak_run is None:
+            self.peak_why = f"{self.scope}/memory.peak cannot be read through its descriptor"
+        os.close(self.peak_fd)
+        self.peak_fd = None
+
     def sample(self) -> None:
         now = self.now()
         if now - self.last_sample < TICK_S:
@@ -1079,6 +1194,7 @@ class Planner:
         self.last_sample = now
         for step in self.running():
             self.sample_step(step)
+        self.sample_scope()
 
     def wait_event(self) -> None:
         select.select([self.wake_r], [], [], TICK_S)
@@ -1101,6 +1217,7 @@ class Planner:
         step.t_end = self.now()
         step.state = "done"
         self.measure(step)
+        self.sample_scope()
         if rc == 0 and not step.parado:
             step.rc = rc = self.plan_rc(step)
         self.record_step(step)
@@ -1139,14 +1256,19 @@ class Planner:
         return f"no verdict: {step.id} ended by signal {-rc} that the planner did not send; the judge exits 2"
 
     def measure(self, step: Step) -> None:
+        """What the step's own cgroup says, read before it is removed (D-E4g), and the reason of each number it cannot give (D-E4h)."""
         if not step.cg:
+            why = self.undelegated_reason()
+            step.sin_medida = {"cpu_s": why, "nucleos": why, "mem_peak": why, "anon_max": why}
             return
-        cpu = read_kv(os.path.join(step.cg, "cpu.stat"))
-        step.cpu_s = cpu["usage_usec"] / 1e6 if cpu and "usage_usec" in cpu else None
-        step.mem_peak = read_int(os.path.join(step.cg, "memory.peak"))
+        step.cpu_s, step.mem_peak, step.sin_medida = read_step(step.cg)
         events = read_kv(os.path.join(step.cg, "memory.events"))
         step.oom_kill = events.get("oom_kill") if events else None
         self.sample_step(step)
+        if step.anon_max is None:
+            step.sin_medida["anon_max"] = f"{step.cg}/memory.stat cannot be read or has no anon"
+        if "cpu_s" in step.sin_medida:
+            step.sin_medida["nucleos"] = step.sin_medida["cpu_s"]
         step.psi = {
             name: psi_some_avg10(os.path.join(step.cg, f"{name}.pressure"))
             for name in ("cpu", "memory", "io")
@@ -1208,6 +1330,7 @@ class Planner:
             psi=step.psi,
             timings=timings,
             solape_s=step.solape_s,
+            sin_medida=step.sin_medida,
         )
 
     # verdict
@@ -1358,6 +1481,7 @@ class Planner:
             pass
 
     def close(self) -> int:
+        self.seal_memory()
         if self.no_verdict:
             self.leave_logs()
             sys.stderr.write(self.no_verdict + "\n")
@@ -1434,26 +1558,105 @@ class Planner:
             f"T/LB_run={ratio(total, self.lb_run)}; steps={len(self.steps)}; C={self.cpu}; "
             f"R={self.ram / GIB:.2f} GiB; mode={self.modo}"
         )
+        print(self.resources_line(total))
         for step in self.ran_steps():
             print(self.step_line(step))
+
+    def run_cpu(self) -> float | None:
+        """D-E4b: the CPU seconds of the run are the sum of its steps'; null while one of them is null."""
+        cpus = [s.cpu_s for s in self.ran_steps()]
+        return sum(cpus) if cpus and all(c is not None for c in cpus) else None
+
+    def serie_of_run(self) -> tuple[float, float] | None:
+        """D-E4k: gate_history.serie_final over the (ready, start, end) of the rows that ran."""
+        rows = [(s.t_ready, s.t_start, s.t_end) for s in self.ran_steps()]
+        return gate_history.serie_final([r for r in rows if None not in r])
+
+    def memory_words(self) -> str:
+        """D-E4m: the peak and the sample of the highest `memory.current`, in GiB; `cache` is the `file` of the sample less
+        the `shmem` it includes, the part of the page cache that can be reclaimed."""
+        sample = self.mem_best or {}
+        cache = gib(sample["file"] - sample["shmem"]) if sample else "n/a"
+        return (
+            f"mem_peak={gib(self.peak_run)} at_t={num(sample.get('t'), '.2f')} current={gib(sample.get('current'))} "
+            f"anon={gib(sample.get('anon'))} shmem={gib(sample.get('shmem'))} cache={cache} kernel={gib(sample.get('kernel'))} "
+            f"samples={self.mem_n}"
+        )
+
+    def resources_line(self, total: float) -> str:
+        """D-E4m: the numbers of the run that the history keeps, in one line; `n/a` is a number that was not measured."""
+        cpu = self.run_cpu()
+        final, tail = self.serie_of_run() or (None, None)
+        cores = None if cpu is None else cpu / total
+        share = None if final is None else final / total
+        return (
+            f"dag: resources: cpu_s={num(cpu, '.2f')} cores={num(cores, '.2f')} {self.memory_words()} "
+            f"serie_final={num(final, '.2f')} tail={num(tail, '.2f')} serie_share={num(share, '.3f')}"
+        )
 
     @staticmethod
     def step_line(step: Step) -> str:
         """D-K4r: the numbers of one row, as the history keeps them."""
+        seg = step.t_end - step.t_start
         peak = "n/a" if step.mem_peak is None else f"{step.mem_peak / GIB:.2f}"
         cpu = "n/a" if step.cpu_s is None else f"{step.cpu_s:.2f}"
+        cores = num(None if step.cpu_s is None or seg <= 0 else step.cpu_s / seg, ".2f")
         return (
-            f"dag: step {step.id} seg={step.t_end - step.t_start:.2f} wait={step.t_start - step.t_ready:.2f} "
-            f"overlap={step.solape_s or 0.0:.2f} mem_peak={peak} cpu_s={cpu}"
+            f"dag: step {step.id} seg={seg:.2f} wait={step.t_start - step.t_ready:.2f} "
+            f"overlap={step.solape_s or 0.0:.2f} mem_peak={peak} cpu_s={cpu} cores={cores}"
         )
 
     def ran_steps(self) -> list[Step]:
         return [s for s in self.steps if s.rc is not None]
 
+    def mem_record(self) -> dict[str, Any] | None:
+        """D-E4e: `mem_muestra` of the run: the highest sample with its time on the clock of the run and how many were taken."""
+        best = self.mem_best
+        return None if best is None else {**best, "t": round(best["t"], 3), "muestras": self.mem_n}
+
+    def unmeasured_cpu(self) -> dict[str, str]:
+        """D-E4h: why the CPU of the run is null: the reason of each step that was not measured, or that no step ran."""
+        why = [f"step {s.id}: {s.sin_medida.get('cpu_s', 'not measured')}" for s in self.ran_steps() if s.cpu_s is None]
+        if why or not self.ran_steps():
+            return dict.fromkeys(("cpu_s", "nucleos"), "; ".join(why) or "no step ran")
+        return {}
+
+    def unmeasured_memory(self) -> dict[str, str]:
+        """D-E4h: why the peak and the sample of the run are null, when the scope is the planner's."""
+        why: dict[str, str] = {}
+        if self.peak_run is None:
+            why["mem_peak"] = self.peak_why or f"{self.scope}/memory.peak was not read"
+        if self.mem_best is None:
+            why["mem_muestra"] = f"no valid sample of {self.scope}/memory.current and memory.stat (anon, file, shmem, kernel)"
+        return why
+
+    def unmeasured_run(self, serie: tuple[float, float] | None) -> dict[str, str]:
+        """D-E4h: `sin_medida` of the run: a reason for each null of the fields the planner measures, and for no other."""
+        if self.delegado:
+            why = {**self.unmeasured_cpu(), **self.unmeasured_memory()}
+        else:
+            why = dict.fromkeys(("cpu_s", "nucleos", "mem_peak", "mem_muestra"), self.undelegated_reason())
+        if serie is None:
+            why.update(dict.fromkeys(("serie_final_s", "serie_cola_s"), "no step ran"))
+        return why
+
+    def print_unmeasured(self, why: dict[str, str]) -> None:
+        """D-E4h, D-E4i: one `note: not measured (<fields>): <reason>` line per distinct reason, in every mode."""
+        fields_of: dict[str, list[str]] = {}
+        for reasons in [*(s.sin_medida for s in self.ran_steps()), why]:
+            for field, reason in reasons.items():
+                names = fields_of.setdefault(reason, [])
+                if field not in names:
+                    names.append(field)
+        for reason, names in fields_of.items():
+            print(f"note: not measured ({', '.join(names)}): {reason}")
+
     def annotate_run(self, code: int) -> None:
+        serie = self.serie_of_run()
+        why = self.unmeasured_run(serie)
+        self.print_unmeasured(why)
         if self.corrida is None:
             return
-        picos = [s.mem_peak for s in self.ran_steps()]
         oom = [s.oom_kill for s in self.ran_steps()]
         gate_history.run_end(
             self.corrida,
@@ -1463,12 +1666,16 @@ class Planner:
             LB_run=self.lb_run,
             C=self.cpu,
             R=self.ram,
-            mem_peak=max(picos) if picos and all(p is not None for p in picos) else None,
+            mem_peak=self.peak_run,
             psi=system_psi(),
             load=loadavg(),
             hilos=self.cpu,
             oom_kill=sum(oom) if oom and all(o is not None for o in oom) else None,
             plan=self.plan,
+            mem_muestra=self.mem_record(),
+            serie_final_s=None if serie is None else serie[0],
+            serie_cola_s=None if serie is None else serie[1],
+            sin_medida=why,
         )
 
 
