@@ -3758,7 +3758,8 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           # read in rust/tests/ and asserts the observable the mutant changes.
           #
           # Needs a database, which --lib has no pool for (precedent: the db.rs groups above). Judged by
-          # rust/tests/v029_accounts_storage.rs. That file creates and drops its own database and carries
+          # rust/tests/group_scratch_db/v029_accounts_storage.rs (a module of the group_scratch_db binary).
+          # That file creates and drops its own database and carries
           # no #[ignore], so the plain DATABASE_URL cargo test of run-all-tests.sh runs it. `cargo mutants
           # -- --lib` never builds a file under rust/tests/, so each of these would still come back MISSED
           # under --lib: the kill happens in the SIL, out of the mutation's sight.
@@ -3834,7 +3835,7 @@ if [[ ${#rs[@]} -gt 0 ]]; then
           #
           # A tenth group: the bridge CLI survivors of 0.29 (src/bridge/mod.rs), the four functions that
           # the `bridge` subcommands call, and the comparison in cli_doctor that decides its exit code.
-          # Each one is judged by rust/tests/v029_bridge_cli.rs: it starts the real binary with HOME in a
+          # Each one is judged by rust/tests/group_no_server/v029_bridge_cli.rs: it starts the real binary with HOME in a
           # scratch directory, carries no #[ignore] and no needs-a-server line, and needs no database, so
           # the plain `DATABASE_URL=... cargo test` of the SIL (scripts/run-all-tests.sh) builds and runs
           # it. `cargo mutants -- --lib` never builds a file under rust/tests/, and the unit tests of
