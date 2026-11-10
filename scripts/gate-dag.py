@@ -539,11 +539,19 @@ def move_pid(destination: str, pid: int) -> None:
         pass
 
 
+DELEGATED = "juez"
+
+
 def delegate(scope: str | None) -> bool:
-    """Moves the planner and its scope's processes to scope/juez, then enables controllers."""
-    if scope is None or not os.access(os.path.join(scope, "cgroup.subtree_control"), os.W_OK):
+    """Moves the planner and its scope's processes to scope/juez, then enables controllers. A scope that is already a `juez`
+    is another planner's: it has processes of its own, so the kernel does not let it enable controllers for children, and a
+    second `juez` inside it would go one level down for each planner that starts there (CI-J17). That planner is not delegated:
+    it runs in series, with no cap per lane, and the planner outside keeps its lanes."""
+    if scope is None or os.path.basename(scope) == DELEGATED:
         return False
-    juez = os.path.join(scope, "juez")
+    if not os.access(os.path.join(scope, "cgroup.subtree_control"), os.W_OK):
+        return False
+    juez = os.path.join(scope, DELEGATED)
     try:
         os.makedirs(juez, exist_ok=True)
         for pid in sorted(read_pids(scope) | {os.getpid()}):
