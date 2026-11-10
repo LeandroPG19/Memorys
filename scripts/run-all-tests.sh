@@ -208,6 +208,100 @@ source "$ROOT/scripts/gate-lock.sh"
 source "$ROOT/scripts/gate-cluster.sh"
 GATE_OWNED_DBS=()
 
+# --- the test counts (CI-J, D-J4b; CI-E1) -------------------------------------
+# A section that runs a different number of tests than its line in
+# scripts/test-section-counts.txt is red, in either direction: a test that stops
+# being run is the same silence as one that is skipped. The count is passed + failed
+# over the `test result:` lines of that section's cargo call. A section states either
+# one total, `<section> <tests> <motive>`, or one line per test binary,
+# `<section>/<linux|windows>/<binary> <tests> <motive>` (CI-E1: the plain pass), never both.
+# The judgement is one function, section_count_verdict, which run_counted calls for every
+# section and `--check-counts` calls over a log that was saved.
+SECTION_COUNTS="$ROOT/scripts/test-section-counts.txt"
+# The sections this gate ran and judged, in order (CI-J2, A7): run_counted appends each one. It is
+# the only list of sections: check_section_lines compares the count file with it, both ways.
+RAN_SECTIONS=""
+
+# section_count_verdict SECTION COUNTS: COUNTS is what `test-times.sh --count` printed (`<binary> <tests>` per
+# line). Prints the OK line and returns 0, or prints every FAIL line to stderr and returns 1: every difference at once,
+# so one run says all of them. A section with no line at all is not judged here: check_section_lines says it.
+section_count_verdict() {
+  local section="$1" counts="$2" os=linux ran bins zero expected shape totals binaries
+  gate_on_windows && os=windows
+  if [[ -r "$SECTION_COUNTS" ]]; then
+    shape="$(awk '!/^[[:space:]]*#/ && NF > 0 && index($1, "/") && !(NF >= 3 && $2 ~ /^[0-9]+$/ \
+        && $1 ~ "^[a-z][a-z0-9-]*/(linux|windows)/(lib:|bin:|doc:)?[A-Za-z0-9_-]+$") \
+        { printf "FAIL: scripts/test-section-counts.txt:%d: %c%s%c is not %c<section>/<linux|windows>/<binary> <tests> <motive>%c\n", NR, 39, $0, 39, 39, 39 }' "$SECTION_COUNTS")"
+    if [[ -n "$shape" ]]; then
+      printf '%s\n' "$shape" >&2
+      return 1
+    fi
+    totals="$(awk -v s="$section" '!/^[[:space:]]*#/ && NF >= 2 && $1 == s { n++ } END { print n + 0 }' "$SECTION_COUNTS")"
+    binaries="$(awk -v s="$section" '!/^[[:space:]]*#/ && NF >= 3 && index($1, s "/") == 1 { n++ } END { print n + 0 }' "$SECTION_COUNTS")"
+  else
+    totals=0
+    binaries=0
+  fi
+  if (( totals > 0 && binaries > 0 )); then
+    echo "FAIL: section $section has a total line and lines per binary in scripts/test-section-counts.txt: one or the other" >&2
+    return 1
+  fi
+  if (( binaries > 0 )); then
+    awk -v s="$section" -v os="$os" '
+      function err(msg) { print "FAIL: section " s " on " os ": " msg > "/dev/stderr"; bad++ }
+      BEGIN { prefix = s "/" os "/" }
+      NR == FNR { ran[$1] = $2; order[++n] = $1; ranned += $2; next }
+      !/^[[:space:]]*#/ && NF >= 3 && index($1, prefix) == 1 {
+        key = substr($1, length(prefix) + 1); want[key] = $2; wanted[++m] = key; lines += $2
+      }
+      END {
+        if (m == 0) {
+          print "FAIL: section " s " has lines per binary and none for " os ": the first judge on " os " sets them from its log" > "/dev/stderr"
+          exit 1
+        }
+        for (i = 1; i <= n; i++) {
+          k = order[i]
+          if (!(k in want)) err(k " ran " ran[k] " tests and has no line")
+          else if (want[k] != ran[k]) err(sprintf("%s: expected %d, ran %d (%+d)", k, want[k], ran[k], ran[k] - want[k]))
+        }
+        for (j = 1; j <= m; j++) if (!(wanted[j] in ran)) err(wanted[j] " has a line (" want[wanted[j]] ") and did not run")
+        if (bad > 0) {
+          err(bad " binaries differ from scripts/test-section-counts.txt (lines " lines ", ran " ranned "). Change a line only by what the diff of this change adds or removes in that binary; a difference the diff does not explain is a test lost or gained, not a new number.")
+          exit 1
+        }
+        print "OK  section " s ": " ranned " tests in " n " test binaries, each against its line for " os
+      }' <(printf '%s\n' "$counts") "$SECTION_COUNTS"
+    return
+  fi
+  read -r ran bins zero <<<"$(awk '{ ran += $2; bins++; if ($2 == 0) zero++ }
+    END { printf "%d %d %d\n", ran + 0, bins + 0, zero + 0 }' <<<"$counts")"
+  expected=""
+  (( totals == 0 )) || expected="$(awk -v s="$section" '!/^[[:space:]]*#/ && NF >= 2 && $1 == s { print $2; exit }' "$SECTION_COUNTS")"
+  if [[ -n "$expected" && ! "$expected" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: scripts/test-section-counts.txt says '$expected' for section $section, which is not a number." >&2
+    return 1
+  fi
+  if [[ -n "$expected" && "$expected" != "$ran" ]]; then
+    echo "FAIL: section $section: expected $expected, ran $ran tests ($bins test binaries). scripts/test-section-counts.txt says $expected: change that line only with the log that proves the new number." >&2
+    return 1
+  fi
+  echo "OK  section $section: $ran tests in $bins test binaries"
+}
+
+# --check-counts SECTION LOG judges a cargo log that was saved against the lines of the section, with the function the
+# judge itself uses. It opens no database, takes no lock and runs no cargo: 0 green, 1 red, 2 when it cannot read.
+# Only the lines of this host's system are judged (gate_on_windows), whichever system wrote them.
+if [[ "${1:-}" == "--check-counts" ]]; then
+  [[ $# -eq 3 ]] || { echo "FAIL: --check-counts takes a section and a cargo log: --check-counts SECTION LOG" >&2; exit 2; }
+  [[ -f "$3" ]] || { echo "FAIL: --check-counts: no log at $3" >&2; exit 2; }
+  counts="$("$ROOT/scripts/test-times.sh" --count "$3")" \
+    || { echo "FAIL: --check-counts: test-times.sh --count could not read $3 (see above)." >&2; exit 2; }
+  grep -Eq "^${2}[[:space:]/]" "$SECTION_COUNTS" 2>/dev/null \
+    || { echo "FAIL: scripts/test-section-counts.txt has no line for the section $2." >&2; exit 1; }
+  section_count_verdict "$2" "$counts" || exit 1
+  exit 0
+fi
+
 # The admin connection and psql_url are defined further down; these three only
 # run after them. They are the whole of what the ownership rule says to the
 # server, which is also what lets the self-test put a catalog in their place.
@@ -1452,6 +1546,122 @@ FAKE
   grep -qE '^60 gemini -p ' "$tmp/j14i_gemini_ok/home/timeout.args" 2>/dev/null \
     || self_fail "J14i: gemini -p is not run under timeout 60: $(cat "$tmp/j14i_gemini_ok/home/timeout.args" 2>/dev/null)"
 
+  # CI-E1 (D-E1a, D-E1b, D-E1e, D-E1f): the plain pass is the section `plain`, counted per binary in both directions.
+  # The two lane rows run `--lane D1` in a tree whose counts file has no `plain` total and says
+  # `plain/<os>/fixture N e1`; the fake cargo prints the binary `fixture` with 3 tests, so N=3 is green and N=4 is -1.
+  # The rows of `--check-counts SECTION LOG` judge a cargo log written here, in the form of Linux, with the same
+  # function run_counted uses: nothing here compiles, and the tree they run in is a tree of this self-test (a script
+  # that does not know the mode starts the whole fake judge there, and the row is red).
+  e1_counts() {
+    local name="$1"
+    shift
+    { awk '$1 != "plain"' "$calib_file"; printf '%s\n' "$@"; } >"$tmp/$name/scripts/test-section-counts.txt"
+  }
+  full_tree e1ok
+  e1_os=linux
+  # The line is written with the system in a variable on purpose: a chain of lanes calls a line an orphan when its name is
+  # nowhere in this script, and this very file is a script that would say it, so the literal must not be written out.
+  e1_counts e1ok "plain/$e1_os/fixture 3 e1"
+  run_args e1ok --lane D1
+  (( rc == 0 )) || self_fail "E1: --lane D1 with a line of 3 for the 3 tests it runs exited $rc, not 0: $(cat "$tmp/e1ok.out")"
+  grep -qF 'OK  section plain: 3 tests in 1 test binaries' "$tmp/e1ok.out" \
+    || self_fail "E1: the plain pass is not counted by run_counted (no 'OK  section plain: 3 tests in 1 test binaries'): $(cat "$tmp/e1ok.out")"
+  { [[ "$(grep -c '^test' "$tmp/e1ok/home/cargo.calls" 2>/dev/null || true)" == 1 ]] \
+    && grep -qx 'test --timings' "$tmp/e1ok/home/cargo.calls"; } \
+    || self_fail "E1: the plain pass did not run cargo test once, as 'test --timings': $(cat "$tmp/e1ok/home/cargo.calls" 2>/dev/null)"
+  full_tree e1off
+  e1_counts e1off "plain/$e1_os/fixture 4 e1"
+  run_args e1off --lane D1
+  (( rc == 1 )) || self_fail "E1: a line of 4 against 3 tests run exited $rc, not 1: $(cat "$tmp/e1off.out")"
+  grep -qF 'section plain on linux: fixture: expected 4, ran 3 (-1)' "$tmp/e1off.out" \
+    || self_fail "E1: the binary that differs is not named with both numbers and the difference: $(cat "$tmp/e1off.out")"
+
+  # e1_log FILE KEY=TESTS...: a cargo log in the form of Linux, one block per binary. KEY is the judge's name for it:
+  # a file of tests/, or lib:, bin: and doc: with the crate.
+  e1_log() {
+    local file="$1" spec key n header
+    shift
+    : >"$file"
+    for spec in "$@"; do
+      key="${spec%=*}"
+      n="${spec##*=}"
+      case "$key" in
+        lib:*) header="     Running unittests src/lib.rs (target/debug/deps/${key#lib:}-0123456789abcdef)" ;;
+        bin:*) header="     Running unittests src/main.rs (target/debug/deps/${key#bin:}-fedcba9876543210)" ;;
+        doc:*) header="   Doc-tests ${key#doc:}" ;;
+        *) header="     Running tests/$key.rs (target/debug/deps/$key-0123456789abcdef)" ;;
+      esac
+      printf '%s\n\nrunning %s tests\ntest result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n' \
+        "$header" "$n" "$n" >>"$file"
+    done
+  }
+  # e1_mode: --check-counts plain over the log of the tree e1c, with its counts file as the row left it; the system
+  # is Linux unless E1_OS says another: bash takes OSTYPE from the environment, which is how a row says msys.
+  e1_mode() {
+    OSTYPE="${E1_OS:-linux-gnu}" run_args e1c --check-counts plain "$tmp/e1c/plain.log"
+  }
+  full_tree e1c
+  e1_log "$tmp/e1c/plain.log" lib:memory_industry=5 bin:memory_industry=0 doc:memory_industry=0 grupo=4 sube=3 vacio=0 nuevo=3
+  # The lines and the log of the scenario "todas las diferencias": 5 binaries differ and both sides sum 15.
+  printf '%s\n' \
+    'plain/linux/lib:memory_industry 5 x' 'plain/linux/bin:memory_industry 0 x' 'plain/linux/doc:memory_industry 0 x' \
+    'plain/linux/grupo 5 x' 'plain/linux/sube 2 x' 'plain/linux/vacio 2 x' 'plain/linux/fantasma 1 x' \
+    >"$tmp/e1c/scripts/test-section-counts.txt"
+  e1_mode
+  (( rc == 1 )) || self_fail "E1: lines and log that differ in five binaries exited $rc, not 1: $(cat "$tmp/e1c.out")"
+  for want in 'grupo: expected 5, ran 4 (-1)' 'sube: expected 2, ran 3 (+1)' 'vacio: expected 2, ran 0 (-2)' \
+    'nuevo ran 3 tests and has no line' 'fantasma has a line (1) and did not run' '5 binaries differ'; do
+    grep -qF "$want" "$tmp/e1c.out" \
+      || self_fail "E1: the comparison per binary does not say '$want', and it says every difference at once and in both directions (the sums of the two sides are 15 and 15, so a total would not see it): $(cat "$tmp/e1c.out")"
+  done
+  [[ ! -e "$tmp/e1c/home/cargo.calls" ]] || self_fail "E1: --check-counts ran cargo: $(cat "$tmp/e1c/home/cargo.calls")"
+
+  # The lines that match the log are green, zero tests and all. The windows lines are there and are not read on Linux.
+  printf '%s\n' \
+    'plain/linux/lib:memory_industry 5 x' 'plain/linux/bin:memory_industry 0 x' 'plain/linux/doc:memory_industry 0 x' \
+    'plain/linux/grupo 4 x' 'plain/linux/sube 3 x' 'plain/linux/vacio 0 x' 'plain/linux/nuevo 3 x' \
+    'plain/windows/lib:memory_industry 5 x' 'plain/windows/bin:memory_industry 0 x' 'plain/windows/doc:memory_industry 0 x' \
+    'plain/windows/grupo 3 x' 'plain/windows/sube 3 x' 'plain/windows/vacio 0 x' 'plain/windows/nuevo 3 x' \
+    >"$tmp/e1c/scripts/test-section-counts.txt"
+  e1_mode
+  (( rc == 0 )) || self_fail "E1: lines that equal the log, zero-test binaries included, exited $rc, not 0 (the windows lines are not for Linux): $(cat "$tmp/e1c.out")"
+  grep -qF 'OK  section plain: 15 tests in 7 test binaries, each against its line for linux' "$tmp/e1c.out" \
+    || self_fail "E1: the green verdict is not 'OK  section plain: 15 tests in 7 test binaries, each against its line for linux': $(cat "$tmp/e1c.out")"
+  # The same counts file on Windows: the windows lines are the ones read, and grupo ran 4 against its 3.
+  E1_OS=msys e1_mode
+  (( rc == 1 )) || self_fail "E1: on Windows, the line of grupo (3) against 4 tests run exited $rc, not 1: $(cat "$tmp/e1c.out")"
+  grep -qF 'section plain on windows: grupo: expected 3, ran 4 (+1)' "$tmp/e1c.out" \
+    || self_fail "E1: on Windows the verdict is not about the windows lines, 'section plain on windows: grupo: expected 3, ran 4 (+1)': $(cat "$tmp/e1c.out")"
+  # With no windows lines at all there is nothing to judge a Windows host by, and that is red.
+  printf '%s\n' \
+    'plain/linux/lib:memory_industry 5 x' 'plain/linux/bin:memory_industry 0 x' 'plain/linux/doc:memory_industry 0 x' \
+    'plain/linux/grupo 4 x' 'plain/linux/sube 3 x' 'plain/linux/vacio 0 x' 'plain/linux/nuevo 3 x' \
+    >"$tmp/e1c/scripts/test-section-counts.txt"
+  E1_OS=msys e1_mode
+  (( rc == 1 )) || self_fail "E1: on Windows with lines for linux only exited $rc, not 1: $(cat "$tmp/e1c.out")"
+  grep -qF 'has lines per binary and none for windows' "$tmp/e1c.out" \
+    || self_fail "E1: no windows lines is red without saying 'has lines per binary and none for windows': $(cat "$tmp/e1c.out")"
+  # A section is a total or lines per binary, not both.
+  printf '%s\n' 'plain 15 total' >>"$tmp/e1c/scripts/test-section-counts.txt"
+  e1_mode
+  (( rc == 1 )) || self_fail "E1: a total and lines per binary for one section exited $rc, not 1: $(cat "$tmp/e1c.out")"
+  grep -qF 'a total line and lines per binary' "$tmp/e1c.out" \
+    || self_fail "E1: the two forms of one section are red without saying 'a total line and lines per binary': $(cat "$tmp/e1c.out")"
+  # A line of the per-binary form that is not of the form is red, with its number and its text.
+  printf '%s\n' \
+    'plain/linux/lib:memory_industry 5 x' 'plain/linux/bin:memory_industry 0 x' 'plain/linux/doc:memory_industry 0 x' \
+    'plain/linux/grupo 4 x' 'plain/linux/sube 3 x' 'plain/linux/vacio 0 x' 'plain/linux/nuevo 3 x' \
+    'plain/macos/grupo 4 x' 'plain/linux/sube tres x' \
+    >"$tmp/e1c/scripts/test-section-counts.txt"
+  e1_mode
+  (( rc == 1 )) || self_fail "E1: two malformed lines of the per-binary form exited $rc, not 1: $(cat "$tmp/e1c.out")"
+  { grep -qF "test-section-counts.txt:8: 'plain/macos/grupo 4 x'" "$tmp/e1c.out" \
+    && grep -qF "test-section-counts.txt:9: 'plain/linux/sube tres x'" "$tmp/e1c.out"; } \
+    || self_fail "E1: the two malformed lines are not named with their number and their text (8 and 9): $(cat "$tmp/e1c.out")"
+  # A log that is not there cannot be read: 2, not the verdict of a count of nothing.
+  run_args e1c --check-counts plain "$tmp/e1c/no-such.log"
+  (( rc == 2 )) || self_fail "E1: --check-counts over a log that is not there exited $rc, not 2: $(cat "$tmp/e1c.out")"
+
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
   echo "    else; the run-all-tests.sh merge-gate launches works under its lock and"
@@ -1581,22 +1791,12 @@ if [[ "$(free_gb)" -lt "$MIN_FREE_GB" ]]; then
   exit 1
 fi
 
-# --- the test counts (CI-J, D-J4b) -------------------------------------------
-# A section that runs a different number of tests than its line in
-# scripts/test-section-counts.txt is red, in either direction: a test that stops
-# being run is the same silence as one that is skipped. The count is passed + failed
-# over the `test result:` lines of that section's cargo call. A named section (one
-# that names its --test binaries) must also run every binary at least one test.
-SECTION_COUNTS="$ROOT/scripts/test-section-counts.txt"
-# The sections this gate ran and judged, in order (CI-J2, A7): run_counted appends each one. It is
-# the only list of sections: check_section_lines compares the count file with it, both ways.
-RAN_SECTIONS=""
-
+# --- the test counts (CI-J, D-J4b): the judgement is section_count_verdict, above --------
 # run_counted SECTION NAMED <command>: runs the call with its output shown and kept,
 # judges the count, and exits with the call's own code when the call failed. The count
 # is test-times.sh --count's, the one parse of a cargo log the judge has (D-J4d).
 run_counted() {
-  local section="$1" named="$2" log counts rc=0 want=0 arg expected ran bins zero
+  local section="$1" named="$2" log counts verdict rc=0 want=0 arg bins zero
   shift 2
   for arg in "$@"; do
     [[ "$arg" == --test ]] && want=$((want + 1))
@@ -1613,29 +1813,21 @@ run_counted() {
     exit 1
   fi
   rm -f "$log"
-  read -r ran bins zero <<<"$(awk '{ ran += $2; bins++; if ($2 == 0) zero++ }
-    END { printf "%d %d %d\n", ran + 0, bins + 0, zero + 0 }' <<<"$counts")"
-  expected="$(awk -v s="$section" '!/^[[:space:]]*#/ && NF >= 2 && $1 == s { print $2; exit }' "$SECTION_COUNTS" 2>/dev/null || true)"
-  if [[ -n "$expected" && ! "$expected" =~ ^[0-9]+$ ]]; then
-    echo "FAIL: scripts/test-section-counts.txt says '$expected' for section $section, which is not a number." >&2
-    exit 1
-  fi
-  if [[ -n "$expected" && "$expected" != "$ran" ]]; then
-    echo "FAIL: section $section: expected $expected, ran $ran tests ($bins test binaries). scripts/test-section-counts.txt says $expected: change that line only with the log that proves the new number." >&2
-    exit 1
-  fi
+  verdict="$(section_count_verdict "$section" "$counts")" || exit 1
+  read -r bins zero <<<"$(awk '{ bins++; if ($2 == 0) zero++ } END { printf "%d %d\n", bins + 0, zero + 0 }' <<<"$counts")"
   if [[ "$named" == 1 ]] && { (( bins != want )) || (( zero > 0 )); }; then
     echo "FAIL: section $section: $bins test binaries reported for $want named --test, $zero of them ran 0 tests. Each named binary has to run at least one test." >&2
     exit 1
   fi
   RAN_SECTIONS+=" $section"
-  echo "OK  section $section: $ran tests in $bins test binaries"
+  echo "$verdict"
 }
 
 # Every section that runs tests has its line, and every line is a section that runs.
 check_section_lines() {
   local listed name missing="" orphan=""
-  listed="$(awk '!/^[[:space:]]*#/ && NF >= 2 { print $1 }' "$SECTION_COUNTS" 2>/dev/null || true)"
+  # A line `<section>/<os>/<binary>` belongs to its section, once however many binaries it states (CI-E1).
+  listed="$(awk '!/^[[:space:]]*#/ && NF >= 2 { sub(/\/.*/, "", $1); if (!seen[$1]++) print $1 }' "$SECTION_COUNTS" 2>/dev/null || true)"
   for name in $RAN_SECTIONS; do
     grep -qxF "$name" <<<"$listed" || missing+=" $name"
   done
@@ -1865,7 +2057,7 @@ echo "=== throwaway database for every mutating step ==="
 provision_gate_db
 
 echo "=== cargo test (unit + smoke) ==="
-DATABASE_URL="$GATE_DATABASE_URL" cargo test --timings
+DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --timings
 }
 
 lane_D2() {

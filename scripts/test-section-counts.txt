@@ -2,6 +2,18 @@
 # <tests> = Σ(passed + failed) de las líneas `test result:` de la llamada cargo de esa sección.
 # Fuente: log de F0, corrida 2 (~/.cache/memory-industry-gate/f0/20261106-084921-c1/log-con-hora.txt),
 # contado con `scripts/test-times.sh --count` sobre el segmento de cada sección.
+#
+# CI-E1: el pase llano (`cargo test` sin filtro, sección `plain`) no declara un total sino UNA LÍNEA POR BINARIO:
+#   plain/<linux|windows>/<binario> <tests> <motivo>
+# <binario> es la clave de `test-times.sh --count`: el nombre del fichero para tests/<x>.rs, y `lib:`, `bin:` o `doc:` más
+# el crate para lo demás. Una sección declara un total o líneas por binario, nunca las dos cosas. Cada juez lee solo las
+# líneas de su sistema (`windows` si $OSTYPE es msys o cygwin, `linux` en otro caso); sin líneas de su sistema es rojo.
+# Se comprueba en los dos sentidos: un binario que corre y no tiene línea, una línea cuyo binario no corrió, y un número
+# distinto, salen todos a la vez y por su nombre. Una línea nueva por cada fichero de rust/tests/*.rs nuevo.
+# Una línea cambia en el MISMO commit que los tests de ese binario y por lo que el diff de ese commit añade o quita en él
+# (motivo: `<tajada> <±Δ> <tests>`). Nunca se copia el número de un rojo: una diferencia que el diff no explica es un test
+# perdido o de más. La base inicial se midió sobre un log del juez; se vuelve a comprobar sin correr nada con
+#   bash scripts/run-all-tests.sh --check-counts plain <log de cargo del pase llano>
 discovered-ignored 106 cargo test --test <todos los tests/*.rs salvo RUN_ELSEWHERE> -- --ignored (F0 corrida 2)
 lib-ignored 18 cargo test --lib -- --ignored (F0 corrida 2)
 admin-role 3 v020_audit_update_applies + v020_role_separation con CUBA_APP_ROLE=0 (F0 corrida 2)
