@@ -73,7 +73,7 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
     echo "         The binary still runs on CPU; it just carries the provider."
 fi
 
-echo "building release + cuda (MemoryMax=$MEM_MAX, jobs=$JOBS)"
+echo "building release + docs,cuda, the set published on Linux x64 (MemoryMax=$MEM_MAX, jobs=$JOBS)"
 
 # `command -v` finds the binary, not a session to talk to. In a container
 # without systemd as PID 1, or a WSL2 without systemd=true, systemd-run is
@@ -84,10 +84,10 @@ if command -v systemd-run >/dev/null 2>&1 \
     && systemd-run --user --scope -q true >/dev/null 2>&1; then
     systemd-run --user --scope -q \
         -p MemoryMax="$MEM_MAX" -p CPUQuota="$CPU_QUOTA" \
-        nice -n 15 cargo build --release --features cuda -j "$JOBS"
+        nice -n 15 cargo build --release --features docs,cuda -j "$JOBS"
 else
     echo "note: systemd-run cannot start a user scope here (not installed, or no user session), building without a memory cap"
-    nice -n 15 cargo build --release --features cuda -j "$JOBS"
+    nice -n 15 cargo build --release --features docs,cuda -j "$JOBS"
 fi
 
 # cargo writes here when Cursor/sandbox sets CARGO_TARGET_DIR. A hardcoded

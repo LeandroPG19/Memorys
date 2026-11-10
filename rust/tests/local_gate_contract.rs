@@ -35,7 +35,6 @@ fn merge_gate_is_the_local_judge_and_stays_strict() {
     let gate = read("scripts/merge-gate.sh");
     for needle in [
         "run-all-tests.sh",
-        "--features docs",
         "cargo deny",
         "npm/install.test.js",
         "codigo-muerto.sh",
@@ -58,6 +57,29 @@ fn merge_gate_is_the_local_judge_and_stays_strict() {
     assert!(
         !gate.contains("SKIPPED:"),
         "merge-gate.sh must not introduce soft SKIPPED lines"
+    );
+    // CI-K8 (D-K8d, D-K8i): the build without docs is only compiled and linted, in the one row that drops the feature, and
+    // the gate says so in the list of what it does not check. Read outside the self-test, which names both in its own
+    // messages.
+    let code = outside_self_test(&gate);
+    assert!(
+        code.iter()
+            .any(|(_, line)| line.contains("--no-default-features")),
+        "scripts/merge-gate.sh must keep `--no-default-features` outside its self-test: the row DC compiles and lints the \
+         build without docs"
+    );
+    let not_checked: Vec<&str> = code
+        .iter()
+        .map(|(_, line)| *line)
+        .skip_while(|line| !line.contains("WHAT THIS GATE DOES NOT CHECK"))
+        .take_while(|line| !line.contains("WHAT IT REQUIRES"))
+        .collect();
+    assert!(
+        not_checked
+            .iter()
+            .any(|line| line.contains("the build without docs")),
+        "scripts/merge-gate.sh must keep `the build without docs` in WHAT THIS GATE DOES NOT CHECK: a green run does not \
+         say that no test ran without the docs feature"
     );
 }
 
@@ -3784,8 +3806,8 @@ fn every_name_the_planner_puts_in_a_step_is_judged() {
 }
 
 /// CI-J5. The seven names that choose the models are set in one place, `gate_model_env` (gate-lock.sh),
-/// and both callers run it: run-all-tests.sh for the full run and merge-gate.sh before the
-/// --features docs step. A second assignment is a second source, and the docs step would test other
+/// and its one caller is run-all-tests.sh, the full run (CI-K8, D-K8d: the step of the build without docs reads no
+/// model, so merge-gate.sh stopped calling it). A second assignment is a second source, and a step would test other
 /// models than the full run.
 const MODEL_ENVIRONMENT: [&str; 7] = [
     "ONNX_MODEL_PATH",
@@ -3822,7 +3844,7 @@ fn sets_model_names(line: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// CI-J5. The model names are set once, in gate_model_env, and the two callers run it. The detector
+/// CI-J5. The model names are set once, in gate_model_env, and run-all-tests.sh runs it. The detector
 /// is judged first, on lines that must and must not count.
 #[test]
 fn the_model_environment_is_set_in_one_place() {
@@ -3910,16 +3932,24 @@ fn the_model_environment_is_set_in_one_place() {
         );
     }
 
-    for caller in ["run-all-tests.sh", "merge-gate.sh"] {
-        let body = read(&format!("scripts/{caller}")).replace("\r\n", "\n");
-        assert!(
-            outside_self_test(&body)
-                .iter()
-                .any(|(_, line)| line.trim() == "gate_model_env"),
-            "scripts/{caller} does not call gate_model_env, so it runs with models the gate did not \
-             choose (CI-J5)"
-        );
-    }
+    let suite = read("scripts/run-all-tests.sh").replace("\r\n", "\n");
+    assert!(
+        outside_self_test(&suite)
+            .iter()
+            .any(|(_, line)| line.trim() == "gate_model_env"),
+        "scripts/run-all-tests.sh does not call gate_model_env, so it runs with models the gate did not \
+         choose (CI-J5)"
+    );
+    // CI-K8 (D-K8d): no row of merge-gate.sh reads a model any more, so it does not call the function: the step of
+    // the build without docs only compiles and lints.
+    let gate = read("scripts/merge-gate.sh").replace("\r\n", "\n");
+    assert!(
+        !outside_self_test(&gate)
+            .iter()
+            .any(|(_, line)| line.trim() == "gate_model_env"),
+        "scripts/merge-gate.sh calls gate_model_env: the only step that did (the build with docs) runs no test now, and a \
+         call here is a second place that chooses the models (CI-K8)"
+    );
 }
 
 /// The section counts come from one counter, `test-times.sh --count` (D-J4c, D-J4d): the script
@@ -4121,14 +4151,17 @@ fn every_gate_step_after_the_guard_gets_the_verified_url() {
          when the system_identifier it reads differs from the one merge-gate.sh exported"
     );
 
-    // merge-gate.sh asks again after run-all-tests.sh, before the --features docs step: the
+    // merge-gate.sh asks again after run-all-tests.sh, before the step of the build without docs (CI-K8, D-K8d): the
     // identity exported above has to be the one that answers at that point (D-J1c, A2).
     let export_at = first_line_where(&gate, |l| l.starts_with("export GATE_SERVER_SYSTEM_ID="));
-    let docs_at = first_line_where(&gate, |l| l.contains("features docs ==="));
+    let docs_at = first_line_where(&gate, |l| {
+        l.contains("no-default-features") && l.contains("===")
+    });
     let (Some(export_at), Some(docs_at)) = (export_at, docs_at) else {
         panic!(
             "merge-gate.sh must export GATE_SERVER_SYSTEM_ID (found on {export_at:?}) and print the \
-             --features docs step (found on {docs_at:?}) outside its self-test"
+             banner of the build without docs, the one with `no-default-features` (found on {docs_at:?}), \
+             outside its self-test"
         );
     };
     assert!(
@@ -4136,8 +4169,8 @@ fn every_gate_step_after_the_guard_gets_the_verified_url() {
             l.contains("gate_require_judge_server") && *n > export_at && *n < docs_at
         }),
         "merge-gate.sh does not call gate_require_judge_server between the export of \
-         GATE_SERVER_SYSTEM_ID (line {export_at}) and the --features docs step (line {docs_at}): a \
-         server that changed under run-all-tests.sh would reach the docs step unseen"
+         GATE_SERVER_SYSTEM_ID (line {export_at}) and the step of the build without docs (line \
+         {docs_at}): a server that changed under run-all-tests.sh would reach the rows after it unseen"
     );
 }
 
@@ -8403,4 +8436,231 @@ fn the_dag_is_not_the_default_in_any_of_its_forms_while_a_latency_line_is_pendin
             "the series is refused as a default of {default}"
         );
     }
+}
+
+// --- CI-K8: `docs` is the default, and the build without it is only compiled and linted -------------------------------
+// D-K8a: the default build carries `docs`, so the one round of tests runs what is published. D-K8d, D-K8g, D-K8h: the row
+// DC is the one place that drops the feature, and it runs `cargo clippy` only. D-K8e, D-K8f: the release build of the
+// gate asks for the set that publish.yml publishes on Linux x64.
+
+/// The `features:` of the matrix element of `publish.yml` whose `target:` is `target`, sorted like `features_asked_for`.
+fn published_features(workflow: &str, target: &str) -> Option<Vec<String>> {
+    let mut current_target: Option<&str> = None;
+    for line in workflow.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("- os:") {
+            current_target = None;
+        } else if let Some(name) = trimmed.strip_prefix("target:") {
+            current_target = Some(name.trim());
+        } else if let Some(list) = trimmed.strip_prefix("features:")
+            && current_target == Some(target)
+        {
+            let mut features: Vec<String> = list
+                .split(',')
+                .map(|feature| feature.trim().trim_matches('"').to_string())
+                .filter(|feature| !feature.is_empty())
+                .collect();
+            features.sort();
+            features.dedup();
+            return Some(features);
+        }
+    }
+    None
+}
+
+/// CI-K8 (D-K8f). The release build of the gate (the single `--release --no-run` call of run-all-tests.sh, whose binary the
+/// E2E and the placement check judge) asks for the features that publish.yml publishes on Linux x64. Without this the
+/// E2E could judge a binary that is not the one people install.
+#[test]
+fn the_release_build_of_the_gate_asks_for_what_publish_yml_publishes_on_linux_x64() {
+    let published = published_features(
+        &read(".github/workflows/publish.yml"),
+        "x86_64-unknown-linux-gnu",
+    )
+    .expect("publish.yml has no matrix element with target x86_64-unknown-linux-gnu and a features: line");
+    assert!(
+        !published.is_empty(),
+        "publish.yml publishes x86_64-unknown-linux-gnu with no features: the comparison below would be vacuous"
+    );
+    let suite = read("scripts/run-all-tests.sh");
+    let code: String = outside_self_test(&suite)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let no_run: Vec<Vec<String>> = cargo_invocations(&code)
+        .into_iter()
+        .filter(|args| {
+            args.iter().any(|arg| arg == "--release") && args.iter().any(|arg| arg == "--no-run")
+        })
+        .collect();
+    assert_eq!(
+        no_run.len(),
+        1,
+        "scripts/run-all-tests.sh must make exactly one `--release --no-run` cargo call outside its self-test, and it \
+         makes {}",
+        no_run.len()
+    );
+    let asked = features_asked_for(&no_run[0]);
+    assert_eq!(
+        asked,
+        published,
+        "publish.yml publishes x86_64-unknown-linux-gnu with {published:?}, and the `--release --no-run` call of \
+         scripts/run-all-tests.sh (`cargo {}`) asks for {asked:?}: the E2E would judge a binary other than the one that \
+         is published",
+        no_run[0].join(" ")
+    );
+}
+
+/// CI-K8 (D-K8f). The reading of publish.yml is judged first: the element of another target does not answer for this one,
+/// a features line outside the element is not read, and a target with no element answers nothing.
+#[test]
+fn the_check_of_the_published_features_can_fail() {
+    let workflow = "\
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: docs,cuda
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            features: docs
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: docs,cuda,directml
+";
+    assert_eq!(
+        published_features(workflow, "x86_64-unknown-linux-gnu"),
+        Some(vec!["cuda".to_string(), "docs".to_string()])
+    );
+    assert_eq!(
+        published_features(workflow, "aarch64-unknown-linux-gnu"),
+        Some(vec!["docs".to_string()]),
+        "the features of the element above are not the features of this one"
+    );
+    assert_eq!(
+        published_features(workflow, "riscv64-unknown-linux-gnu"),
+        None
+    );
+}
+
+/// The code of a script that can call cargo: outside its self-test, without whole-line comments and without the lines that
+/// only print or refuse (their words are prose, not calls).
+fn calls_cargo_code(body: &str) -> String {
+    outside_self_test(body)
+        .into_iter()
+        .map(|(_, line)| line)
+        .filter(|line| {
+            !line.trim_start().starts_with('#')
+                && !matches!(
+                    line.split_whitespace().next(),
+                    Some("echo" | "printf" | "gate_refuse")
+                )
+        })
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// CI-K8 (D-K8g). The feature is dropped in one cargo call of the scripts of the judge, the one of `step_DC`, and no call
+/// asks for `docs` alone (the default carries it). A row that lost `docs` in silence would test another binary.
+#[test]
+fn only_the_step_dc_drops_the_docs_feature_and_no_call_asks_for_docs_alone() {
+    let mut dropping: Vec<String> = Vec::new();
+    let mut alone: Vec<String> = Vec::new();
+    let mut calls = 0;
+    for script in [
+        "merge-gate.sh",
+        "run-all-tests.sh",
+        "crap-gate.sh",
+        "mutants-gate.sh",
+        "build-gpu.sh",
+    ] {
+        let code = calls_cargo_code(&read(&format!("scripts/{script}")));
+        for args in cargo_invocations(&code) {
+            calls += 1;
+            if args.iter().any(|arg| arg == "--no-default-features") {
+                dropping.push(format!("{script}: cargo {}", args.join(" ")));
+            }
+            if features_asked_for(&args) == ["docs"] {
+                alone.push(format!("{script}: cargo {}", args.join(" ")));
+            }
+        }
+    }
+    assert!(
+        calls > 20,
+        "the scan read {calls} cargo call(s) in the five scripts of the judge: it no longer matches how they are written"
+    );
+    assert_eq!(
+        dropping.len(),
+        1,
+        "--no-default-features in {} cargo calls; only step_DC may drop docs: {dropping:#?}",
+        dropping.len()
+    );
+    assert!(
+        dropping[0].starts_with("merge-gate.sh: cargo clippy "),
+        "the one call that drops docs is the clippy of step_DC in merge-gate.sh, and it is {dropping:?}"
+    );
+    let gate = read("scripts/merge-gate.sh");
+    let body = step_body(&gate, "DC").expect("merge-gate.sh has a step_DC()");
+    assert!(
+        body.iter()
+            .any(|line| line.contains("--no-default-features")),
+        "the call that drops docs is not in the body of step_DC: {dropping:?}"
+    );
+    assert!(
+        alone.is_empty(),
+        "these calls ask for `--features docs` alone, and the default build carries it already: {alone:#?}"
+    );
+}
+
+/// CI-K8 (D-K8c, D-K8h). The step DC compiles and lints the build without docs and runs no test: one cargo call, no lane,
+/// no model; its row names the target and nothing else (no cluster).
+#[test]
+fn the_dc_row_only_compiles_and_lints_the_build_without_docs() {
+    let gate = read("scripts/merge-gate.sh");
+    let outside: String = outside_self_test(&gate)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let body =
+        step_body(&outside, "DC").expect("merge-gate.sh has a step_DC() outside its self-test");
+    let code: Vec<&String> = body
+        .iter()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect();
+    for forbidden in ["cargo test", "run_in_lane", "gate_model_env"] {
+        assert!(
+            !code.iter().any(|line| line.contains(forbidden)),
+            "step_DC runs `{forbidden}`: the build without docs is only compiled and linted, so it runs no test, opens no \
+             lane and reads no model. Body: {code:#?}"
+        );
+    }
+    let calls = cargo_invocations(&calls_cargo_code(&body.join("\n")));
+    assert_eq!(
+        calls.len(),
+        1,
+        "step_DC makes {} cargo calls and has to make one, `cargo clippy --all-targets --no-default-features -- -D warnings`: {calls:?}",
+        calls.len()
+    );
+    let args = &calls[0];
+    for needed in ["clippy", "--all-targets", "--no-default-features"] {
+        assert!(
+            args.iter().any(|arg| arg == needed),
+            "the call of step_DC lacks `{needed}`: cargo {}",
+            args.join(" ")
+        );
+    }
+    assert!(
+        code.iter()
+            .any(|line| line.contains("cargo clippy") && line.contains("-- -D warnings")),
+        "the clippy of step_DC does not deny warnings (`-- -D warnings`): a warning that only exists without docs would pass. Body: {code:#?}"
+    );
+    let row = dag_rows()
+        .into_iter()
+        .find(|row| row.1 == "DC")
+        .expect("gate-dag.txt has a row DC")
+        .3;
+    assert_eq!(
+        resources_of(&row),
+        ["target:T_docs"],
+        "the row DC opens no database and reads no model: its only resource is its target. Row: {row}"
+    );
 }

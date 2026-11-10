@@ -4,7 +4,7 @@
 #   that gains an assert gets its line in the contract (local_gate_contract.rs), and nobody has to remember to measure.
 # class: exclusive runs alone, in an exclusive row of gate-dag.txt (today NLI), and every test of the file is #[ignore]
 #   and named with --test only by the lanes of such rows; shared runs beside other steps. A src module is never
-#   exclusive, because the lib runs in DBG, DC, CV and M.
+#   exclusive, because the lib runs in DBG, CV and M.
 # evidence: the ratio limit/measured with two decimals (a measure under load that the limit survives), dag-verde:<n>
 #   (green in n DAG runs that gave a verdict), or pendiente. The date is the one of the measure, or, if pendiente, the
 #   expiry, 2026-11-30 at the latest: a pending line past its date, or the DAG as the default (GATE_DAG in gate-dag.py)

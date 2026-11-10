@@ -8,7 +8,7 @@ cd "$ROOT"
 GATE_LOCK_INHERITED="${GATE_LOCK:-}"
 
 # One gate at a time, for the whole of this one: run-all-tests.sh is only its
-# first half, and everything after it (clippy and tests under --features docs,
+# first half, and everything after it (clippy of the build without docs,
 # deny, audit, codigo-muerto, crap-gate, mutants-gate) builds in the same target
 # directory under the same cargo lock. Taken before anything else happens, so
 # a second gate is refused before it has checked, backed up or built anything.
@@ -835,7 +835,7 @@ FAKE
     || self_fail "after_tests: while the tests ran, the exit file did not say so: $(grep 'run.exit reads' "$tmp/after_tests.out")"
 
   # The time of every test binary is judged last, after mutants-gate.sh, over the
-  # gate's own log up to the line printed after the --features docs step (G7, D-F2c):
+  # gate's own log up to the line printed after the step DC (G7, D-F2c):
   # a time red is drift and not broken behaviour, so the same run still gives the verdicts of codigo-muerto,
   # crap-gate and the mutation. What it says is the gate's verdict: a 1 or a 2
   # from it is the exit of the gate, in the exit file, with no receipt.
@@ -843,7 +843,7 @@ FAKE
   run_copy times_last
   (( rc == 0 )) || self_fail "times_last: a gate whose every step passed exited $rc: $(cat "$tmp/times_last.out")"
   [[ "$(exit_file times_last)" == 0 ]] || self_fail "times_last: the exit file says '$(exit_file times_last)', not 0"
-  docs_at="$(step_at times_last '^cargo test --features docs --timings$')"
+  docs_at="$(step_at times_last '^cargo clippy --all-targets --no-default-features --timings -- -D warnings$')"
   muerto_at="$(step_at times_last '^codigo-muerto$')"
   crap_at="$(step_at times_last '^crap-gate$')"
   mutants_at="$(step_at times_last '^mutants-gate$')"
@@ -851,10 +851,10 @@ FAKE
   [[ -n "$docs_at" && -n "$muerto_at" && -n "$crap_at" && -n "$mutants_at" && -n "$times_at" ]] \
     || self_fail "times_last: a step is missing from the order (docs '$docs_at', codigo-muerto '$muerto_at', crap-gate '$crap_at', mutants-gate '$mutants_at', test-times '$times_at'): $(steps_of times_last)"
   (( muerto_at < docs_at && docs_at < crap_at && crap_at < mutants_at && mutants_at < times_at )) \
-    || self_fail "times_last: the order is not codigo-muerto (before the first cargo call that compiles), cargo test --features docs, crap-gate, mutants-gate, test-times: $(steps_of times_last)"
+    || self_fail "times_last: the order is not codigo-muerto (before the first cargo call that compiles), cargo clippy --all-targets --no-default-features (the build without docs), crap-gate, mutants-gate, test-times: $(steps_of times_last)"
   grep -qxF "test-times --judge $tmp/times_last/home/.cache/cuba-gate/merge-gate.log --until === end of timed steps ===" "$tmp/times_last/home/steps" \
     || self_fail "times_last: test-times was not called as --judge <the gate's own log> --until '=== end of timed steps ===': $(steps_of times_last)"
-  for line in '=== cargo clippy/test --features docs ===' '=== end of timed steps ==='; do
+  for line in '=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ===' '=== end of timed steps ==='; do
     tr -d '\r' <"$tmp/times_last/home/times.seen" 2>/dev/null | grep -qxF "$line" \
       || self_fail "times_last: the log test-times was handed did not hold '$line' yet, so it judged a log cut before the boundary: $(cat "$tmp/times_last/home/times.seen" 2>/dev/null || true)"
   done
@@ -1071,7 +1071,7 @@ FAKE
   run_copy_as unset c1 ""
   (( rc == 0 )) || self_fail "C1: the gate without DATABASE_URL on Linux exited $rc: $(cat "$tmp/c1.out")"
   # CI-F3.3b-1 (D-F3b, spec §4 F3.3b): the chains of the step table, in idx order, one process and one
-  # cluster each: dbg (CL..D3), b3 (B3), rel (R), e2e (E). Then the --features docs step as before.
+  # cluster each: dbg (CL..D3), b3 (B3), rel (R), e2e (E). Then the build without docs (CI-K8): it opens no cluster.
   lane_order='run-all-tests --check-models
 up dbg
 run-all-tests --lane CL --lane D1 --lane D2 --lane D3
@@ -1088,19 +1088,16 @@ down rel
 up e2e
 run-all-tests --lane E
 down e2e
-up docs
-cargo clippy --all-targets --features docs --timings -- -D warnings
-cargo test --features docs --timings
-down docs
+cargo clippy --all-targets --no-default-features --timings -- -D warnings
 up cov
 crap-gate
 down cov
 up mut
 mutants-gate
 down mut'
-  [[ "$(grep -E '^(up |down |run-all-tests|crap-gate|mutants-gate|cargo .*--features docs)' "$tmp/c1/home/steps")" == "$lane_order" ]] \
+  [[ "$(grep -E '^(up |down |run-all-tests|crap-gate|mutants-gate|cargo .*--no-default-features)' "$tmp/c1/home/steps")" == "$lane_order" ]] \
     || self_fail "C1: the lanes and the steps are not in the order of D-F2c (up, its step, down, per lane): $(cat "$tmp/c1/home/steps")"
-  # CI-K4 (D-K4g): the two calls of DC compile and carry --timings before their `--` (the order above pins them to the
+  # CI-K4 (D-K4g): the call of DC compiles and carries --timings before its `--` (the order above pins it to the
   # letter); a call that compiles nothing (fmt, audit, deny) carries none.
   for k4_sub in fmt audit deny; do
     grep -q "^cargo $k4_sub" "$tmp/c1/home/steps" \
@@ -1121,10 +1118,14 @@ down mut'
   # The environment of the gate itself carries no lane's URL when it reaches the last step (test-times).
   [[ -e "$tmp/c1/home/test-times.url" && ( "$(cat "$tmp/c1/home/test-times.url")" == unset || -z "$(cat "$tmp/c1/home/test-times.url")" ) ]] \
     || self_fail "C1: a lane's DATABASE_URL reached test-times, which runs after the lanes: $(cat "$tmp/c1/home/test-times.url")"
-  docs_lines="$(grep -c -- '--features docs' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
-  docs_ok="$(grep -cE '^docs postgresql://cuba:fakepw@[^ ]*%2Fdocs\.fk0000:5432/brain 7701731310526959658 (clippy|test) .*--features docs' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
-  (( docs_lines >= 2 && docs_lines == docs_ok )) \
-    || self_fail "C1: the docs steps did not all see the URL and GATE_LANE of lane docs: $(cat "$tmp/c1/home/cargo.lanes")"
+  # CI-K8 (D-K8d): the build without docs reads no database, so its call sees the URL and the GATE_LANE of no lane, and
+  # no call of the gate asks for the docs feature alone any more.
+  docs_lines="$(grep -c -- '--no-default-features' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
+  docs_ok="$(grep -cE '^unset (unset)? unset clippy .*--no-default-features' "$tmp/c1/home/cargo.lanes" 2>/dev/null || true)"
+  (( docs_lines == 1 && docs_lines == docs_ok )) \
+    || self_fail "C1: the call of the build without docs saw the URL or the GATE_LANE of a lane (it opens no cluster): $(cat "$tmp/c1/home/cargo.lanes")"
+  grep -q -- '--features docs' "$tmp/c1/home/cargo.lanes" \
+    && self_fail "C1: a cargo call asks for --features docs alone, and the default build is the one that carries it: $(cat "$tmp/c1/home/cargo.lanes")"
   # F2b-fix (D-F2i): the step of a lane is judged by gate_require_judge_server, which refuses a lane's
   # URL unless GATE_CLUSTER_ROOT names the root of the clusters. The root is the gate's own shell variable
   # (not exported, as in the judge), so it reaches a step only if run_in_lane hands it over. The crap-gate
@@ -1137,19 +1138,19 @@ down mut'
   (( rc == 0 )) || self_fail "F2b-fix: the gate without DATABASE_URL on Linux exited $rc: $(cat "$tmp/f2bfix.out")"
   grep -qxF "$f2bfix_root" "$tmp/f2bfix/home/crap-gate.roots" 2>/dev/null \
     || self_fail "F2b-fix: the step of lane cov did not see GATE_CLUSTER_ROOT=$f2bfix_root: a lane's step is refused without it (D-F2i), and run_in_lane must hand it over with the lane's URL. It got: $(cat "$tmp/f2bfix/home/crap-gate.roots" 2>/dev/null)"
-  # CI-J5: the --features docs step reads the models the full run reads. The HOME of this row has the
-  # embedder where the binary keeps it, and the stand-in cargo of each docs call records the two
-  # variables it was given: ONNX_MODEL_PATH and CUBA_EMBEDDING_DIM.
+  # CI-J5, CI-K8 (D-K8d): the models are set by run-all-tests.sh alone (gate_model_env), and the build without docs reads
+  # none. The HOME of this row has the embedder where the binary keeps it, and the stand-in cargo of each call records the
+  # two variables it was given: ONNX_MODEL_PATH and CUBA_EMBEDDING_DIM. The call of DC sees neither.
   fake_tree j5 "$lane_body"
   mkdir -p "$tmp/j5/home/.cache/memory-industry/models"
   : >"$tmp/j5/home/.cache/memory-industry/models/model_quantized.onnx"
   run_copy_as unset j5 ""
   (( rc == 0 )) || self_fail "J5: the gate with the embedder under its HOME exited $rc: $(cat "$tmp/j5.out")"
-  j5_docs="$(grep -c -- '--features docs' "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
-  j5_docs_ok="$(awk -v p="$tmp/j5/home/.cache/memory-industry/models" '/--features docs/ && $1 == p && $2 == "384"' \
+  j5_docs="$(grep -c -- '--no-default-features' "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
+  j5_docs_ok="$(awk '/--no-default-features/ && $1 == "unset" && $2 == "unset"' \
     "$tmp/j5/home/cargo.models" 2>/dev/null | wc -l | tr -d ' ')"
-  (( j5_docs >= 2 && j5_docs == j5_docs_ok )) \
-    || self_fail "J5: the --features docs step did not get ONNX_MODEL_PATH=<HOME>/.cache/memory-industry/models and CUBA_EMBEDDING_DIM=384 as the full run does; it got: $(cat "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
+  (( j5_docs == 1 && j5_docs == j5_docs_ok )) \
+    || self_fail "J5: the build without docs was given ONNX_MODEL_PATH or CUBA_EMBEDDING_DIM, and it reads no model; it got: $(cat "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
   # C5: a DATABASE_URL the operator gives still governs, as it does today: no lane is made, every step
   # gets that URL, and the gate says the lanes share that server.
   ext='postgresql://gate:pw0@127.0.0.1:5489/brain'
@@ -1169,7 +1170,7 @@ down mut'
   (( rc == 1 )) || self_fail "D1: the gate whose run-all-tests failed exited $rc, not 1: $(cat "$tmp/d1.out")"
   [[ "$(exit_file d1)" == 1 ]] || self_fail "D1: the exit file says '$(exit_file d1)', not 1"
   grep -qx 'down dbg' "$tmp/d1/home/steps" || self_fail "D1: lane dbg was not taken down after its failed step: $(cat "$tmp/d1/home/steps")"
-  grep -qx 'up docs' "$tmp/d1/home/steps" && self_fail "D1: the docs lane was made after the failed run-all-tests: $(cat "$tmp/d1/home/steps")"
+  grep -q -- '--no-default-features' "$tmp/d1/home/steps" && self_fail "D1: the build without docs ran after the failed run-all-tests: $(cat "$tmp/d1/home/steps")"
   # D2: a gate stopped by TERM, HUP or INT, during its first lane, takes that lane down (down-all) and
   # leaves 2 in its exit file.
   # CI-F3.3b-2: the signal names the gate by its lock record (the steps run one level deeper, under the planner).
@@ -1477,7 +1478,7 @@ down mut'
     || self_fail "j15: run-all-tests did not get the system_identifier the guard read: '$(cat "$tmp/j15/home/rat.sysid" 2>/dev/null || true)'"
 
   # J1.6 (A2, D-J1c): a server whose system_identifier changes under the run is refused before
-  # the --features docs step, which reads the database after run-all-tests.sh. The stand-in
+  # the build without docs (CI-K8, D-K8d), which asks the identity again after run-all-tests.sh. The stand-in
   # answers the identity the guard read until run-all-tests.sh has run, and then another one.
   j2_url='postgresql://gate:pw0@127.0.0.1:5489/brain'
   fake_tree j2doc 'echo run-all-tests >>"$HOME/steps"; touch "$HOME/sysid.flip"'
@@ -1487,8 +1488,8 @@ down mut'
   run_copy_as "$j2_url" j2doc ""
   (( rc == 2 )) || self_fail "J1.6: a gate whose server changed system_identifier under run-all-tests exited $rc, not 2: $(cat "$tmp/j2doc.out")"
   grep -qF 'system_identifier' "$tmp/j2doc.out" || self_fail "J1.6: the refusal does not name system_identifier: $(cat "$tmp/j2doc.out")"
-  if grep -qF '=== cargo clippy/test --features docs ===' "$tmp/j2doc.out"; then
-    self_fail "J1.6: the --features docs step ran after the server changed: $(cat "$tmp/j2doc.out")"
+  if grep -qF '=== cargo clippy --all-targets --no-default-features' "$tmp/j2doc.out"; then
+    self_fail "J1.6: the build without docs ran after the server changed: $(cat "$tmp/j2doc.out")"
   fi
 
   # gate_linux_env (gate-lock.sh): what a gate run on Linux hands to cargo, to the
@@ -1706,19 +1707,19 @@ exit 0'
   f2_cheap_red f2node "" FAKE_NODE_EXIT=1
   f2_cheap_red f2models "" FAKE_CHECK_MODELS_EXIT=1
 
-  # F2.3 (D-F2c): test-times stops at a line of its own, printed after the --features docs
-  # step, and not at the npm banner, which now runs before the first build.
+  # F2.3 (D-F2c): test-times stops at a line of its own, printed after the step of the build
+  # without docs, and not at the npm banner, which now runs before the first build.
   fake_tree f2until "$run_all_steps"
   run_copy f2until ""
   (( rc == 0 )) || self_fail "F2.3: a gate whose every step passed exited $rc: $(cat "$tmp/f2until.out")"
   until_arg="$(sed -n 's/^test-times .*--until //p' "$tmp/f2until/home/steps" | tail -1)"
   [[ "$until_arg" == '=== end of timed steps ===' ]] \
-    || self_fail "F2.3: test-times was told to stop at '$until_arg', not at the line the gate prints after the --features docs step ('=== end of timed steps ===')"
+    || self_fail "F2.3: test-times was told to stop at '$until_arg', not at the line the gate prints after the step of the build without docs ('=== end of timed steps ===')"
   seen="$tmp/f2until/home/times.seen"
-  docs_at="$(grep -nxF '=== cargo clippy/test --features docs ===' "$seen" | head -1 | cut -d: -f1)"
+  docs_at="$(grep -nxF '=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ===' "$seen" | head -1 | cut -d: -f1)"
   bound_at="$(grep -nxF -- "$until_arg" "$seen" | head -1 | cut -d: -f1)"
   [[ -n "$docs_at" && -n "$bound_at" ]] && (( bound_at > docs_at )) \
-    || self_fail "F2.3: the boundary '$until_arg' is not a line of the log after the --features docs step (docs at '${docs_at:-none}', boundary at '${bound_at:-none}')"
+    || self_fail "F2.3: the boundary '$until_arg' is not a line of the log after the step of the build without docs (docs at '${docs_at:-none}', boundary at '${bound_at:-none}')"
 
   # CI-F3.3b-2 (D-F3b, spec F3.3b-1b): the steps of the judge are the rows of scripts/gate-dag.txt, run by the
   # planner (gate-dag.py) after the preamble and before the boundary line. Each row is `merge-gate.sh --step <id>`,
@@ -1729,9 +1730,10 @@ exit 0'
   dag_order="$(sed -n 's/^dag: \([A-Za-z0-9]*\) env:.*/\1/p' "$tmp/planner.out" | tr '\n' ' ')"
   [[ "$dag_order" == "P DBG NLI B3 REL E2E DC CV M " ]] \
     || self_fail "planner: the planner did not start the rows of gate-dag.txt in idx order (it started: '$dag_order')"
-  # The boundary line is printed by the planner before the first untimed row (CV), after the block of docs and before
-  # the block of crap-gate: the judge of the test times reads up to it, so CV and M are not judged (CI-F3.3b-2).
-  dc_at="$(grep -nxF '=== cargo clippy/test --features docs ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
+  # The boundary line is printed by the planner before the first untimed row (CV), after the block of DC (the build
+  # without docs) and before the block of crap-gate: the judge of the test times reads up to it, so CV and M are not
+  # judged (CI-F3.3b-2).
+  dc_at="$(grep -nxF '=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
   bound_at="$(grep -nxF '=== end of timed steps ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
   crap_at="$(grep -nxF '=== crap-gate (coverage floor) ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
   mut_at="$(grep -nxF '=== mutants-gate ===' "$tmp/planner.out" | head -1 | cut -d: -f1)"
@@ -1753,7 +1755,7 @@ exit 0'
     || self_fail "planner red: the planner does not name the red row CV: $(cat "$tmp/planner_red.out")"
   [[ "$(exit_file planner_red)" == 1 ]] \
     || self_fail "planner red: the exit file says '$(exit_file planner_red)', not 1"
-  # CI-F3.3b-2 (spec F3.3b-1b-iii): the rows that are not timed are CV and M, the rows after the docs step. The judge of
+  # CI-F3.3b-2 (spec F3.3b-1b-iii): the rows that are not timed are CV and M, the rows after DC. The judge of
   # the test times reads this gate's log only up to the boundary line the planner prints before the first of them, so a
   # crap-gate whose output carries a timed `finished in` line does not change the judgement, and the boundary is not the
   # end of the planner (that would judge CV and M too).
@@ -1767,8 +1769,8 @@ exit 0'
   until_arg="$(sed -n 's/^test-times .*--until //p' "$tmp/untimed/home/steps" | tail -1)"
   [[ "$until_arg" == '=== end of timed steps ===' ]] \
     || self_fail "untimed: the judge of the test times was told to stop at '$until_arg', not at the boundary line of the planner"
-  grep -qxF '=== cargo clippy/test --features docs ===' "$judged" \
-    || self_fail "untimed: the judge does not hold the docs block, the last timed row: $(cat "$judged" 2>/dev/null)"
+  grep -qxF '=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ===' "$judged" \
+    || self_fail "untimed: the judge does not hold the block of DC, the last timed row: $(cat "$judged" 2>/dev/null)"
   grep -qF 'finished in 99.00s' "$judged" \
     && self_fail "untimed: the output of an untimed row (crap-gate, a finished-in line) reached the judge of the test times"
   # The step mode is not a gate: it takes no lock and writes no verdict, and it runs only with the ticket the planner
@@ -2179,6 +2181,10 @@ echo "  · retrieval quality     the eval step is a smoke run. It proves the"
 echo "                          harness executes; it asserts no nDCG threshold."
 echo "  · other platforms       this judge runs on the merge machine (typically"
 echo "                          Linux x64). Cross-targets are not exercised here."
+echo "  · the build without docs --no-default-features is only compiled and"
+echo "                           linted (clippy -D warnings, row DC): no test runs"
+echo "                           without the docs feature, the default and what is"
+echo "                           published, with which every test runs once."
 echo ""
 echo "WHAT IT REQUIRES (missing = FAIL, never SKIPPED):"
 echo "  · ONNX embed + ORT      ~/.cache/memory-industry/models + onnxruntime"
@@ -2489,14 +2495,15 @@ step_E2E() {
   run_in_lane e2e "$ROOT/scripts/run-all-tests.sh" --lane E
 }
 step_DC() {
-  # The identity is asked again before the --features docs step, which reads the database after run-all-tests.sh:
-  # a server that changed under the run is refused here (D-J1c, A2). A lane is judged when it is made, so only the
-  # server of the operator is asked again.
+  # The identity is asked again after the rows of tests and before CV, which reads the database of the operator: a server
+  # that changed under the run is refused here (D-J1c, A2). A lane is judged when it is made, so only the server of the
+  # operator is asked again.
   [[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
-  # The models of the --features docs step are the ones of the full run (CI-J5): the same function sets them.
-  gate_model_env
-  echo "=== cargo clippy/test --features docs ==="
-  run_in_lane docs "$BASH" -c 'cd "$1" && cargo clippy --all-targets --features docs --timings -- -D warnings && cargo test --features docs --timings' gate "$ROOT/rust"
+  # CI-K8 (D-K8d): the default build carries docs, and DBG ran its tests with it. The build without docs is compiled and
+  # linted here and runs no test, so no lane is made and no model is read. clippy -D warnings and not cargo check: it costs
+  # the same, and a warning that exists only without docs (a variable that only a cfg(docs) block uses) is red.
+  echo "=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ==="
+  (cd "$ROOT/rust" && cargo clippy --all-targets --no-default-features --timings -- -D warnings)
 }
 step_CV() {
   echo "=== crap-gate (coverage floor) ==="

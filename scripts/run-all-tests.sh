@@ -93,7 +93,7 @@ if [[ "${1:-}" == "--print-paths" ]]; then
   exit 0
 fi
 
-# B3g (CI-F1, D-F3b): judges the JSON of `cargo build --release --features cuda --bins
+# B3g (CI-F1, D-F3b): judges the JSON of `cargo build --release --features docs,cuda --bins
 # --message-format=json`. Every compiler-artifact has to say fresh: a unit that compiled
 # again is a binary the --no-run build did not leave. Only reads the file.
 check_fresh() {
@@ -1884,7 +1884,9 @@ require_generative_llm "tests that need a generative LLM (extract / relation-sca
              -- --ignored --nocapture
 }
 
-# The release build carries --features cuda. Without it, gpu::wants_gpu() returns false
+# The release build carries --features docs,cuda, the set that publish.yml publishes on Linux x64 (CI-K8, D-K8e, D-K8f:
+# written out, so the build does not depend on what the default is, and a contract holds it equal to the published one).
+# Without cuda, gpu::wants_gpu() returns false
 # unconditionally, CUBA_RERANK_DEVICE=gpu goes inert, and the reranker runs on CPU at
 # 20.669s per query against 0.356s — 58x, measured in d7922fa. The E2E allows 15s per call,
 # so every one of its 40 calls times out and the gate can never pass on a machine that has
@@ -1926,14 +1928,14 @@ b3_record_sha() {
 lane_B3() {
 echo "=== release build (one cargo call with --no-run, the feature set production runs) ==="
 export CARGO_BUILD_JOBS="$GATE_RELEASE_JOBS"
-cargo test --release --features cuda --no-run --lib --test v017_rerank_gpu --timings
+cargo test --release --features docs,cuda --no-run --lib --test v017_rerank_gpu --timings
 REL_BIN="$(resolve_binary_path)"
 [[ -f "$REL_BIN" ]] || { echo "FAIL: the release build left no binary at $REL_BIN." >&2; exit 1; }
 REL_SHA="$(release_sha "$REL_BIN")"
 
 echo "=== B3g (every unit of the bins is fresh after the --no-run build) ==="
 b3g_json="$(mktemp)"
-cargo build --release --features cuda --bins --message-format=json --timings >"$b3g_json" \
+cargo build --release --features docs,cuda --bins --message-format=json --timings >"$b3g_json" \
   || { rm -f "$b3g_json"; echo "FAIL: the release build of the bins failed (B3g)." >&2; exit 1; }
 check_fresh "$b3g_json" || { rm -f "$b3g_json"; exit 1; }
 rm -f "$b3g_json"
@@ -1942,7 +1944,7 @@ sha_unchanged "after B3g"
 printf '%s  %s\n' "$REL_SHA" "$REL_BIN" >"$(dirname "$REL_BIN")/.gate-release.sha256"
 }
 
-# --features cuda here too. The feature set is part of what cargo fingerprints,
+# --features docs,cuda here too. The feature set is part of what cargo fingerprints,
 # so a second release call asking for a different one rebuilds this same target
 # directory and relinks the binary the E2E and the placement check below read.
 # It fires at COMPILE time, not at run time, which is what makes it invisible:
@@ -1976,7 +1978,7 @@ REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
 [[ -f "$REL_BIN" ]] || { echo "FAIL: no release binary at $REL_BIN: the B3 lane builds it (run --lane B3 first)." >&2; exit 1; }
 b3_record_sha
 echo "=== reranker placement contracts (GPU feature live, no model needed) ==="
-run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu --timings -- --nocapture
+run_counted reranker-placement 1 cargo test --release --features docs,cuda --test v017_rerank_gpu --timings -- --nocapture
 
 # The library half of the same hole. The cfg! that actually decides placement is
 # in gpu::wants_gpu, which returns false before reading the device variable when
@@ -1990,11 +1992,11 @@ run_counted reranker-placement 1 cargo test --release --features cuda --test v01
 # unit itself. In debug it would be a third feature set (debug bare, release
 # cuda, debug cuda) and a full rebuild of everything under it.
 echo "=== placement table under the feature that changes it ==="
-run_counted placement-table 0 cargo test --release --features cuda --lib gpu:: --timings -- --nocapture
+run_counted placement-table 0 cargo test --release --features docs,cuda --lib gpu:: --timings -- --nocapture
 
 require_present "reranker tests (release: 387s in debug, seconds here)" \
   "$CUBA_RERANKER_PATH/model.onnx" \
-  run_counted reranker-model 1 cargo test --release --features cuda --test v017_rerank_gpu --timings -- --ignored --nocapture
+  run_counted reranker-model 1 cargo test --release --features docs,cuda --test v017_rerank_gpu --timings -- --ignored --nocapture
 
 check_section_lines
 
@@ -2023,7 +2025,7 @@ export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 "$PY" tests/e2e_all_tools.py
 
-# The gate has always built with --features cuda (build-gpu.sh, above) and then
+# The gate has always built with --features cuda (docs,cuda since CI-K8; build-gpu.sh, above) and then
 # asserted nothing about where the work landed. A CUDA build that degrades to
 # the CPU answers every call correctly and only costs 58x, so nothing about a
 # green run distinguishes it from one on a card.
@@ -2036,8 +2038,8 @@ export PYTHONIOENCODING=utf-8
 echo "=== GPU placement (doctor --json must agree with this machine) ==="
 if [[ ! -f "$CUBA_BINARY_PATH" ]]; then
   echo "FAIL: no binary at $CUBA_BINARY_PATH, so there is nothing to ask about placement." >&2
-  echo "      This step reads the release build this run just made (--features cuda)" >&2
-  echo "      (--features cuda). Judging any other binary would report on a build that" >&2
+  echo "      This step reads the release build this run just made (--features docs,cuda)" >&2
+  echo "      (the cuda feature). Judging any other binary would report on a build that" >&2
   echo "      never had GPU support compiled in and call the answer honest." >&2
   exit 1
 fi
