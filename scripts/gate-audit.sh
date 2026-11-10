@@ -1003,15 +1003,6 @@ END {
 }
 AWK
 
-ga_depends() { # <a> <b>: a depende de b, directa o transitivamente (tabla de --run)
-  local d
-  for d in ${deps_of[$1]:-}; do
-    [[ "$d" == "$2" ]] && return 0
-    ga_depends "$d" "$2" && return 0
-  done
-  return 1
-}
-
 ga_analyze() { # <trazas> <roots> <steps> <overlap|""> <keys|""> <pg-tcp-allowed> <informe|"">
   local trdir="$1" roots="$2" steps="$3" overlap="$4" keys="$5" allowed="$6" report="$7"
   local -a files=()
@@ -1085,10 +1076,9 @@ ga_propose() { # <informe> <salida>: propuesta de grupos, fuera del fichero vers
     }' "$1" | LC_ALL=C sort > "$2"
 }
 
-ga_run() { # --run: la auditoria de verdad: merge-gate.sh en serie bajo strace, una vez; las filas de gate-dag.txt se reconocen en la traza (D-A7, D-A8, CI-J15a)
-  local run max used tblines incomplete="" line idx id deps rec cls order ere key lane t part arc=0 rc=0 gen dag
-  local -a ids=() parts=() words=() dags=() planner_traces=()
-  local -A deps_of=() cls_of=()
+ga_run() { # --run: la auditoria de verdad: merge-gate.sh en serie bajo strace, una vez; las filas de gate-dag.txt se reconocen en la traza (D-A7, D-A8, CI-J15a, CI-J18)
+  local run max used facts incomplete="" line kind first second order ere key lane part id arc=0 rc=0 gen dag
+  local -a ids=() parts=() dags=() planner_traces=()
   (( $# == 0 )) || ga_usage
   command -v strace >/dev/null 2>&1 || ga_fail "strace is not installed (command -v strace found nothing). The audit is never skipped: install it (sudo apt install strace) and run it again."
   local sv
@@ -1110,39 +1100,26 @@ ga_run() { # --run: la auditoria de verdad: merge-gate.sh en serie bajo strace, 
   key="$(python3 -I "$GA_ROOT/scripts/gate-dag.py" tree-key "$GA_ROOT")" || ga_fail "gate-dag.py tree-key could not name the tree $GA_ROOT"
   [[ -n "$key" ]] || ga_fail "gate-dag.py tree-key printed nothing for $GA_ROOT"
   : > "$gen/steps"; : > "$gen/roots"; : > "$gen/overlap"
-  tblines="$(grep -v -e '^#' -e '^[[:space:]]*$' "$table" | LC_ALL=C sort -k1,1n || true)"
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    read -r idx id deps rec cls _ _ _ order <<< "$line"
-    ids+=("$id"); deps_of[$id]="$deps"; cls_of[$id]="$cls"
-    # El paso es la orden sin los NAME=value de su entorno: el planificador los pone en el entorno y execve no los ve.
-    read -r -a words <<< "$order"
-    while (( ${#words[@]} > 0 )) && [[ "${words[0]}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do words=("${words[@]:1}"); done
-    (( ${#words[@]} > 0 )) || ga_fail "row $id of gate-dag.txt has no order after its NAME=value tokens"
-    ere="^$(printf '%s' "${words[*]}" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g')\$"
-    printf '%s %s %s\n' "$id" "$rec" "$ere" >> "$gen/steps"
-    IFS=',' read -r -a parts <<< "$rec"
-    for part in "${parts[@]}"; do
-      case "$part" in
-        target:*) t="${part#target:}"; printf 'target %s %s/%s/%s\n' "$t" "$CARGO_TARGET_DIR" "$key" "$t" >> "$gen/roots" ;;
-        cluster:C_*)
-          lane="${part#cluster:C_}"
-          [[ "$lane" =~ ^$GATE_LANE_RE$ ]] || ga_fail "row $id names ${part#cluster:}, and $lane is not a lane name ($GATE_LANE_RE)"
-          printf 'cluster %s %s/%s.\n' "${part#cluster:}" "$GATE_CLUSTER_ROOT" "$lane" >> "$gen/roots" ;;
-        cluster:*) ga_fail "row $id names the cluster ${part#cluster:}, which is not C_<lane>: the lane is read from its name" ;;
-      esac
-    done
-  done <<< "$tblines"
-  local i j a b
-  for ((i = 0; i < ${#ids[@]}; i++)); do
-    for ((j = i + 1; j < ${#ids[@]}; j++)); do
-      a="${ids[i]}"; b="${ids[j]}"
-      [[ "${cls_of[$a]}" == exclusive || "${cls_of[$b]}" == exclusive ]] && continue
-      ga_depends "$a" "$b" && continue
-      ga_depends "$b" "$a" && continue
-      printf '%s %s\n' "$a" "$b" >> "$gen/overlap"
-    done
-  done
+  # La tabla tiene un solo lector, el planificador (CI-J18): las filas y los solapes son lo que dice `gate-dag.py rows`. Una tabla
+  # que `run` rechazaria se rechaza aqui, con su misma linea FAIL, antes de lanzar nada.
+  facts="$(python3 -I "$GA_ROOT/scripts/gate-dag.py" rows --table "$table")" || ga_fail "gate-dag.py rows refused $table: the reason of the planner is the FAIL line above, and no row is audited against a table it does not run"
+  while read -r kind first second order; do
+    case "$kind" in
+      row)
+        # El paso es la orden sin los NAME=value de su entorno (la dice `rows` asi): el planificador los pone en el entorno y execve no los ve.
+        ids+=("$first")
+        ere="^$(printf '%s' "$order" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g')\$"
+        printf '%s %s %s\n' "$first" "$second" "$ere" >> "$gen/steps"
+        IFS=',' read -r -a parts <<< "$second"
+        for part in "${parts[@]}"; do
+          case "$part" in
+            target:*) printf 'target %s %s/%s/%s\n' "${part#target:}" "$CARGO_TARGET_DIR" "$key" "${part#target:}" >> "$gen/roots" ;;
+            cluster:*) lane="${part#cluster:C_}"; printf 'cluster %s %s/%s.\n' "${part#cluster:}" "$GATE_CLUSTER_ROOT" "$lane" >> "$gen/roots" ;;
+          esac
+        done ;;
+      overlap) printf '%s %s\n' "$first" "$second" >> "$gen/overlap" ;;
+    esac
+  done <<< "$facts"
   mkdir -p "$run/audit/gate"
   # -s 1024: strace corta los argv a 32 caracteres, y el del planificador (rutas de la tabla) y el de una fila no caben; las rutas
   # de open, mkdir y connect las imprime enteras con cualquier -s.

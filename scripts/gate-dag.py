@@ -23,7 +23,7 @@ is charged to that job and not to this scope. A scope that is not delegated is n
 it is null, with the reason in `sin_medida`, and a `note: not measured (...)` line per reason.
 
 Not in the planner: the removal of old run directories (D-F3i) and the per-binary launcher (D-F3u).
-`exclusive` and `boundary` run alone, after every lower idx: the conservative form of D-F3l, and with a
+`exclusive` runs alone, after every lower idx: the conservative form of D-F3l, and with a
 delegated scope no other step's cgroup may still have processes when one starts or ends (D-F34o). The
 resource column (CI-F3.3c, D-F3g, CI-F3.4): `target:<T>` is where the step builds, under
 CARGO_TARGET_DIR/<tree key>/<T>, and a target that another tree marked is refused before the step starts;
@@ -34,6 +34,13 @@ reader with its builder above it, and no resource of another kind. At most two r
 at once, and with another step alive one is admitted only with 4096 MiB of MemAvailable plus its own
 estimate (D-F34d, D-F34e). A row with models that ends green is judged against the resource plan the
 binary wrote in its log (D-F34b, D-F34c).
+CI-J18: the table has one reader, this one. `rows --table <file>` says what `run` would run, in idx order: a line
+`row <id> <recursos, or -> <order without its NAME=value>` per row, and a line `overlap <a> <b>` per pair that can be alive
+together (neither is `exclusive` and neither waits for the other, directly or through others), `a` before `b` by idx; a table
+that `run` refuses is exit 2, the same `FAIL:` line and nothing on stdout. gate-audit.sh asks it and does not read the table
+again. The grammar of a row is checked before anything starts (D-J18b): an id or a target of `[A-Za-z0-9_]+`, a cluster of
+`C_[a-z0-9]+` (so that the lane of a cluster is its name), an idx of `[1-9][0-9]*`, a `*_JOBS` or `*_THREADS` that is a
+whole number above 0, no value that is empty and no word that starts with `#` (a comment goes in its own line).
 """
 
 from __future__ import annotations
@@ -90,26 +97,29 @@ PLAN_TIER_RE = re.compile(r"nivel=(\S+)")
 PLAN_GPU_RE = re.compile(r"reranker=\S+ \(GPU\)")
 MEM_AVAILABLE_RE = re.compile(r"^MemAvailable:\s+(\d+) kB", re.MULTILINE)
 # CI-F3.3b-2 (spec F3.3b-1b-iii): `untimed` schedules as `normal`; its block is past the judge's boundary line.
-CLASSES = frozenset({"normal", "exclusive", "boundary", "untimed"})
-EXCLUSIVE = frozenset({"exclusive", "boundary"})
-ALLOWED_ENV = frozenset(
+CLASSES = frozenset({"normal", "exclusive", "untimed"})
+# CI-J18 (D-J18c): what a row may name, and what only the planner sets in a step. A step may differ from the planner's own
+# environment in the union (`allowed-env` says it, and the contracts of J9, J13 and K4 read it there).
+ROW_ENV = frozenset(
     {
-        "CARGO_TARGET_DIR",
         "CARGO_BUILD_JOBS",
         "CARGO_INCREMENTAL",
         "CARGO_PROFILE_DEV_DEBUG",
         "CARGO_PROFILE_DEV_STRIP",
-        "TMPDIR",
-        "DATABASE_URL",
-        "GATE_SERVER_SYSTEM_ID",
         "CUBA_EMBED_INTRA_THREADS",
         "CUBA_NLI_INTRA_THREADS",
         "CUBA_RERANK_INTRA_THREADS",
         "MUTANTS_JOBS",
-        "CUBA_GATE_LANE_TOKEN",
     }
 )
+PLANNER_ENV = frozenset({"TMPDIR", "CARGO_TARGET_DIR", "CUBA_GATE_LANE_TOKEN"})
+ALLOWED_ENV = ROW_ENV | PLANNER_ENV
 NAME_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+# CI-J18 (D-J18b): the id and the target of a row end up in paths (`run_dir/tmp/<id>`, `<root>/<key>/<target>`, the log and the
+# cgroup of the step), the cluster names its lane, and an idx has one spelling. `fullmatch`: no `$` that lets a newline through.
+NAME_OF_ID_RE = re.compile(r"[A-Za-z0-9_]+")
+CLUSTER_NAME_RE = re.compile(r"C_[a-z0-9]+")
+WHOLE_NUMBER_RE = re.compile(r"[1-9][0-9]*")
 # CI-K4 (D-K4n): the values of GATE_DAG and what each one asks for (`auto` and `maximo` are one DAG since CI-E7a, D-E7c).
 ASKED = {"0": "serie", "serie": "serie", "auto": "auto", "1": "maximo", "maximo": "maximo"}
 
@@ -177,11 +187,12 @@ def p95(values: Iterable[float]) -> float:
 
 def table_key_of(content: bytes) -> str:
     """The key of the history (J14k) of a table given as bytes: the sha256 of its rows, each with its spaces collapsed, with
-    no comment and no blank line. A comment does not drop the history; a number of a row does. gate_usl.py keys the tables
-    of git with this same function (K9c): there is no second way to spell the key."""
+    no comment and no blank line, ordered by bytes (J18, D-J18d: `parse_table` orders them by idx, so two orders of the same
+    rows are one table). A comment does not drop the history; a number of a row does. gate_usl.py keys the tables of git with
+    this same function (K9c): there is no second way to spell the key."""
     text = content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     rows = [" ".join(line.split()) for line in text.split("\n") if line.strip() and not line.lstrip().startswith("#")]
-    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+    return hashlib.sha256("\n".join(sorted(rows)).encode("utf-8")).hexdigest()
 
 
 def table_key(path: str) -> str:
@@ -240,6 +251,7 @@ class Step:
         dur: float,
         env: dict[str, str],
         argv: list[str],
+        line: int = 0,
     ) -> None:
         self.idx = idx
         self.id = step_id
@@ -251,6 +263,7 @@ class Step:
         self.dur_tab = dur
         self.env = env
         self.argv = argv
+        self.line = line
         self.state = "pending"
         self.proc: subprocess.Popen[bytes] | None = None
         self.log: str | None = None
@@ -276,15 +289,19 @@ class Step:
         self.sin_medida: dict[str, str] = {}
 
 
-def parse_env(rest: list[str], step_id: str) -> tuple[dict[str, str], list[str]]:
+def parse_env(rest: list[str], step_id: str, number: int) -> tuple[dict[str, str], list[str]]:
     env: dict[str, str] = {}
     while rest:
         match = NAME_RE.match(rest[0])
         if not match:
             break
         name, value = match.groups()
-        if name not in ALLOWED_ENV:
-            die(f"{name} is not in the closed list of the step environment (D-F3j): step {step_id} not started")
+        if name not in ROW_ENV:
+            die(f"table line {number}: {name} is not one a row may name (D-F3j, D-J18c): step {step_id} not started")
+        if not value:
+            die(f"table line {number}: {name} of {step_id} has no value (D-J18b)")
+        if name.endswith(("_JOBS", "_THREADS")) and not WHOLE_NUMBER_RE.fullmatch(value):
+            die(f"table line {number}: {name}={value!r} of {step_id} is not a whole number above 0 (D-J18b)")
         env[name] = value
         rest = rest[1:]
     if not rest:
@@ -302,7 +319,10 @@ def tree_key(tree: str) -> str:
 def target_dir(name: str) -> str:
     """CI-F3.3c (D-F3g): the target of a resource is <CARGO_TARGET_DIR>/<tree key>/<name>. The tree key is the name of
     the tree's directory and 12 hex of the sha256 of its realpath, so two trees under one root never share a target.
-    The directory names its tree in .gate-tree, and one that names another tree is refused before cargo runs."""
+    The directory names its tree in .gate-tree, and one that names another tree is refused before cargo runs. The name is
+    checked before the disk is touched (J18, D-J18b): it is `[A-Za-z0-9_]+`, so it cannot leave <root>/<tree key>."""
+    if not NAME_OF_ID_RE.fullmatch(name):
+        die(f"target {name!r} is not [A-Za-z0-9_]+: a target is a directory under <CARGO_TARGET_DIR>/<tree key> (D-J18b)")
     root = os.environ.get("CARGO_TARGET_DIR", "")
     if not root:
         die(f"target {name}: CARGO_TARGET_DIR is not set, so there is no root to put the target under (D-F3g)")
@@ -325,8 +345,15 @@ def target_dir(name: str) -> str:
 
 def parse_row(line: str, number: int) -> Step:
     tok = line.split()
+    for word in tok:
+        if word.startswith("#"):
+            die(f"table line {number}: the word {word!r} starts with # (D-J18b): a comment goes in a line of its own")
     if len(tok) < 9:
         die(f"table line {number}: needs idx id deps recursos clase cpu ram_gb dur_s and an order")
+    if not WHOLE_NUMBER_RE.fullmatch(tok[0]):
+        die(f"table line {number}: idx {tok[0]!r} is not [1-9][0-9]* (D-J18b)")
+    if not NAME_OF_ID_RE.fullmatch(tok[1]):
+        die(f"table line {number}: step id {tok[1]!r} is not [A-Za-z0-9_]+ (D-J18b)")
     try:
         idx, cpu, ram_gb, dur = int(tok[0]), float(tok[5]), float(tok[6]), float(tok[7])
     except ValueError:
@@ -335,13 +362,13 @@ def parse_row(line: str, number: int) -> Step:
         if not (math.isfinite(value) and value > 0):
             die(f"table line {number}: {column} of {tok[1]} has to be a finite number above 0, not {value!r}")
     if tok[4] not in CLASSES:
-        die(f"table line {number}: class {tok[4]} is not normal, exclusive or boundary")
+        die(f"table line {number}: class {tok[4]} is not normal, exclusive or untimed")
     deps = [] if tok[2] == "-" else tok[2].split(",")
     recursos = [] if tok[3] == "-" else tok[3].split(",")
     if sum(r.startswith("target:") for r in recursos) > 1:
         die(f"table line {number}: a row names one target, and {tok[1]} names more (D-F3g)")
-    env, argv = parse_env(tok[8:], tok[1])
-    return Step(idx, tok[1], deps, recursos, tok[4], cpu, ram_gb, dur, env, argv)
+    env, argv = parse_env(tok[8:], tok[1], number)
+    return Step(idx, tok[1], deps, recursos, tok[4], cpu, ram_gb, dur, env, argv, number)
 
 
 def unique_steps(steps: list[Step]) -> dict[str, Step]:
@@ -375,7 +402,8 @@ def target_of(step: Step) -> str | None:
 
 
 def check_resource_kinds(steps: list[Step]) -> None:
-    """D-F34f: a resource is target:<T>, cluster:<C>, models or reader, and one cluster is one row's."""
+    """D-F34f: a resource is target:<T>, cluster:<C>, models or reader, and one cluster is one row's. D-J18b: <T> is
+    `[A-Za-z0-9_]+` and <C> is `C_[a-z0-9]+`, so a target stays under its root and a cluster is its lane."""
     clusters: dict[str, str] = {}
     for step in steps:
         for resource in step.recursos:
@@ -383,7 +411,10 @@ def check_resource_kinds(steps: list[Step]) -> None:
             if resource in ("models", "reader"):
                 continue
             if kind not in ("target", "cluster") or not name:
-                die(f"step {step.id} names the resource {resource}, which is none of target:<T>, cluster:<C>, models or reader (D-F34f)")
+                die(f"table line {step.line}: step {step.id} names the resource {resource}, which is none of target:<T>, cluster:<C>, models or reader (D-F34f)")
+            shape = NAME_OF_ID_RE if kind == "target" else CLUSTER_NAME_RE
+            if not shape.fullmatch(name):
+                die(f"table line {step.line}: step {step.id} names {resource}, and {name!r} is not {shape.pattern} (D-J18b)")
             if kind == "cluster":
                 if name in clusters:
                     die(f"steps {clusters[name]} and {step.id} both name cluster:{name}: one step per cluster (D-F34f)")
@@ -460,6 +491,27 @@ def parse_table(path: str) -> list[Step]:
                 steps.append(parse_row(line, number))
     validate_table(steps)
     return sorted(steps, key=lambda s: s.idx)
+
+
+def overlapping(steps: list[Step]) -> list[tuple[str, str]]:
+    """CI-J18 (D-J18a): the pairs of rows that can be alive together, `steps` in idx order and the first of each pair the
+    lower idx: neither is `exclusive` and neither is an ancestor of the other, directly or through others. `untimed` and
+    `reader` are no reason to wait for each other."""
+    by_id = {s.id: s for s in steps}
+    above = {s.id: ancestors(s, by_id) for s in steps}
+    return [
+        (first.id, second.id)
+        for n, first in enumerate(steps)
+        for second in steps[n + 1 :]
+        if "exclusive" not in (first.clase, second.clase) and first.id not in above[second.id] and second.id not in above[first.id]
+    ]
+
+
+def rows_text(steps: list[Step]) -> str:
+    """What `rows` says (D-J18a): `row <id> <recursos as written, or -> <order without its NAME=value>` per row in idx order,
+    then `overlap <a> <b>` per pair of `overlapping`."""
+    rows = [f"row {s.id} {','.join(s.recursos) or '-'} {' '.join(s.argv)}\n" for s in steps]
+    return "".join(rows + [f"overlap {a} {b}\n" for a, b in overlapping(steps)])
 
 
 # --- the memory of the machine and the plan of the binary --------------------------
@@ -796,9 +848,9 @@ def named_jobs(step: Step) -> int:
 
 def exclusive_wait(step: Step, alive: list[Step], earlier_pending: bool) -> bool:
     """D-F3l: an exclusive row starts alone and after every lower idx; nothing starts beside it."""
-    if step.clase in EXCLUSIVE:
+    if step.clase == "exclusive":
         return bool(alive) or bool(earlier_pending)
-    return any(o.clase in EXCLUSIVE for o in alive)
+    return any(o.clase == "exclusive" for o in alive)
 
 
 def admission(
@@ -1052,7 +1104,7 @@ class Planner:
         """D-F34o: an exclusive step starts and ends with no other step's cgroup holding processes. A step that left
         its cgroup populated (a daemon outlived it; the rmdir of the planner fails in silence) gives no verdict. Only
         in a delegated scope: without one the planner runs in series and the exclusivity holds by construction."""
-        if step.clase not in EXCLUSIVE or not self.delegado or not self.scope:
+        if step.clase != "exclusive" or not self.delegado or not self.scope:
             return False
         own = f"paso-{step.idx}-{step.id}"
         for path in sorted(glob.glob(os.path.join(glob.escape(self.scope), "paso-*"))):
@@ -1096,8 +1148,6 @@ class Planner:
             env["CARGO_BUILD_JOBS"] = str(row_jobs(named_jobs(step), self.jobs_cap))
         targets = [r[len("target:"):] for r in step.recursos if r.startswith("target:")]
         if targets:
-            if "CARGO_TARGET_DIR" in step.env:
-                die(f"step {step.id} names CARGO_TARGET_DIR and a target: the target sets it (D-F3g)")
             env["CARGO_TARGET_DIR"] = target_dir(targets[0])
         env.pop("CUBA_GATE_LANE_TOKEN", None)
         if token is not None:
@@ -1758,6 +1808,8 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="run a step table: GATE_DAG=0 or serie, or 1, maximo or auto")
     run.add_argument("--table", required=True)
     run.add_argument("--timed-end", default=None, help="the line printed before the first untimed block (CI-F3.3b-2)")
+    rows = commands.add_parser("rows", help="say the rows of a step table and the pairs that can be alive together (CI-J18)")
+    rows.add_argument("--table", required=True)
     commands.add_parser("allowed-env", help="print the closed list of a step's environment, one name per line (CI-J13)")
     key = commands.add_parser("tree-key", help="print the key of a tree in the judge's targets, <name>-<12 hex> of its realpath (CI-J15a)")
     key.add_argument("tree")
@@ -1772,6 +1824,9 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(f"{tree_key(os.path.realpath(args.tree))}\n")
         return 0
     try:
+        if args.command == "rows":
+            sys.stdout.write(rows_text(parse_table(args.table)))
+            return 0
         return run_table(args.table, args.timed_end)
     except Refusal as err:
         sys.stderr.write(f"FAIL: {err}\n")
