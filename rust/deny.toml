@@ -47,12 +47,13 @@ yanked = "deny"
 # A mirror of scripts/advisory-exceptions.txt, which holds each advisory's owner,
 # expiry and reason; merge-gate.sh is red when this list differs from it by one ID
 # either way. cargo deny by hand says advisory-not-detected for some of them: it
-# resolves features (sqlx-mysql is never built) and, with unmaintained = "workspace",
+# resolves features (sqlx-mysql and sqlx-sqlite are never built) and, with unmaintained = "workspace",
 # does not report unmaintained crates deep in the tree. cargo audit reads Cargo.lock
 # and does see them, and cargo audit is the judge.
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
     { id = "RUSTSEC-2024-0436", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
+    { id = "RUSTSEC-2026-0459", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
 ]
 
 [bans]
