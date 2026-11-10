@@ -515,3 +515,137 @@ fn a_test_file_that_needs_a_server_says_so_where_ci_reads_it() {
          is one of them drifting from the other"
     );
 }
+
+/// Packages this build must not compile. The first three only enter through
+/// the downloader of `ort-sys`: it builds `ureq`, `native-tls` and OpenSSL for
+/// its build script when `ort` keeps its default `download-binaries` feature,
+/// and under `load-dynamic` that script returns before it downloads anything.
+/// The fourth is the package of an advisory the project no longer excepts.
+const FORBIDDEN_IN_LOCK: [(&str, &str); 4] = [
+    (
+        "openssl-sys",
+        "OpenSSL linked for the downloader of ort-sys (`native-tls`)",
+    ),
+    (
+        "openssl-src",
+        "a vendored OpenSSL compiled from C for the downloader of ort-sys (`tls-native-vendored`)",
+    ),
+    (
+        "ureq",
+        "the HTTP client of the downloader of ort-sys (`download-binaries`, with any TLS feature)",
+    ),
+    (
+        "number_prefix",
+        "RUSTSEC-2025-0119, unmaintained: only tokenizers' progressbar brought it, through \
+         indicatif; cargo audit only warns on it, so this is the only check that sees it come back",
+    ),
+];
+
+fn package_names(lock: &str) -> Vec<String> {
+    lock.split("[[package]]")
+        .skip(1)
+        .filter_map(|block| {
+            block.lines().find_map(|line| {
+                line.strip_prefix("name = \"")
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+        })
+        .collect()
+}
+
+fn forbidden_in_lock(lock: &str) -> Vec<String> {
+    package_names(lock)
+        .into_iter()
+        .filter(|name| {
+            FORBIDDEN_IN_LOCK
+                .iter()
+                .any(|(forbidden, _)| name.as_str() == *forbidden)
+        })
+        .collect()
+}
+
+#[test]
+fn the_lock_carries_no_openssl_and_no_ort_downloader() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
+    let lock = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let names = package_names(&lock);
+    assert!(
+        names.len() >= 300 && names.iter().any(|name| name == "ort-sys"),
+        "{} lists {} packages and {} of them is `ort-sys`; the guard below reads package names \
+         out of that file, and an empty or unreadable lock would pass it for any tree",
+        path.display(),
+        names.len(),
+        if names.iter().any(|name| name == "ort-sys") {
+            "one"
+        } else {
+            "none"
+        }
+    );
+
+    let found = forbidden_in_lock(&lock);
+    let report: Vec<String> = FORBIDDEN_IN_LOCK
+        .iter()
+        .filter(|(forbidden, _)| found.iter().any(|name| name == forbidden))
+        .map(|(forbidden, meaning)| format!("  {forbidden}: {meaning}"))
+        .collect();
+    assert!(
+        report.is_empty(),
+        "Cargo.lock carries packages this build must not compile:\n{}\nThe OpenSSL ones and \
+         `ureq` come back when `ort` is declared without `default-features = false`, or with \
+         `download-binaries` or a `tls-*` feature: the build script returns before it downloads \
+         anything under `load-dynamic`, so they cost a clean build minutes (OpenSSL is compiled \
+         from C) and buy nothing, on the five platforms of the release matrix. `number_prefix` \
+         comes back when `tokenizers` is declared with its default features",
+        report.join("\n")
+    );
+}
+
+#[test]
+fn the_lock_guard_names_each_forbidden_package() {
+    let lock = |names: &[&str]| -> String {
+        names
+            .iter()
+            .map(|name| format!("[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\n\n"))
+            .collect()
+    };
+
+    assert_eq!(
+        forbidden_in_lock("[[package]]\nname = \"openssl-src\""),
+        vec!["openssl-src"],
+        "a lock with a vendored OpenSSL has to be named"
+    );
+    assert_eq!(
+        forbidden_in_lock("[[package]]\nname = \"ureq\""),
+        vec!["ureq"],
+        "a lock with the downloader's HTTP client has to be named, TLS feature or not"
+    );
+    assert_eq!(
+        forbidden_in_lock("[[package]]\nname = \"number_prefix\""),
+        vec!["number_prefix"],
+        "a lock with the package of RUSTSEC-2025-0119 has to be named, whoever brings it"
+    );
+    assert_eq!(
+        forbidden_in_lock(&lock(&["ort-sys", "openssl-sys", "ureq", "serde"])),
+        vec!["openssl-sys", "ureq"],
+        "every forbidden package is named, in lock order, and the others are left alone"
+    );
+    assert_eq!(
+        forbidden_in_lock(&lock(&["ort-sys"])),
+        Vec::<String>::new(),
+        "a lock with only `ort-sys` is clean"
+    );
+    assert_eq!(
+        forbidden_in_lock(&lock(&["openssl-probe", "openssl-macros", "ureq-proto"])),
+        Vec::<String>::new(),
+        "a name that merely starts like a forbidden one is not it"
+    );
+    assert_eq!(
+        forbidden_in_lock(
+            "[[package]]\nname = \"native-tls\"\ndependencies = [\n \"openssl-sys\",\n \"ureq\",\n]\n"
+        ),
+        Vec::<String>::new(),
+        "the guard reads the `name =` of each package, not the dependency lists"
+    );
+}
