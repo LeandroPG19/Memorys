@@ -1,0 +1,14 @@
+# CI-K1: one compiler for the judge, the publication and every developer. Raising it is one
+# commit that changes `channel` (and rebuilds once); tests/local_gate_contract.rs ties the
+# components and targets below to what the scripts and workflows build with.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["clippy", "rustfmt", "llvm-tools"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
