@@ -315,7 +315,8 @@ FAKE
     rc=0
     # CI-F3.3c (the judge's names): a row takes the target root of the gate from its own HOME, not from the judge's
     # CARGO_TARGET_DIR, which is a foreign directory no user can make. A row that needs one passes it in "$@".
-    { "${row_bound[@]}" env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS -u CARGO_TARGET_DIR HOME="$tmp/$name/home" \
+    # CI-K10 (H2): GATE_DAG is not inherited either, so a row that does not set it shows what the gate asks for by default.
+    { "${row_bound[@]}" env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS -u CARGO_TARGET_DIR -u GATE_DAG HOME="$tmp/$name/home" \
         PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" ${start[@]+"${start[@]}"} \
         GATE_CGROUP_ROOT="$tmp/sin-cgroup/raiz" GATE_PROC_SELF_CGROUP="$tmp/sin-cgroup/propio" "$@" \
         "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 </dev/null || rc=$?; } 2>/dev/null
@@ -1795,6 +1796,12 @@ exit 0'
   fake_tree planner "$run_all_steps"
   run_copy planner ""
   (( rc == 0 )) || self_fail "planner: a gate whose every step passed exited $rc: $(cat "$tmp/planner.out")"
+  # CI-K10 (H2): what the gate asks of the planner when nobody sets GATE_DAG is read from the `plan:` line this run printed, not from
+  # the default written in gate-dag.py: a default set anywhere before the planner starts (an `export GATE_DAG="${GATE_DAG:-auto}"` in this script)
+  # is the default of the gate all the same. The contract (local_gate_contract.rs) reads the line below from this self-test.
+  plan_asked="$(sed -n 's/^plan: .* asked=\([a-z]*\) runs=.*/\1/p' "$tmp/planner.out" | head -n 1)"
+  [[ -n "$plan_asked" ]] || self_fail "planner: the gate printed no plan line with what it asked for: $(cat "$tmp/planner.out")"
+  echo "gate default: GATE_DAG unset asks for $plan_asked"
   dag_order="$(sed -n 's/^dag: \([A-Za-z0-9]*\) env:.*/\1/p' "$tmp/planner.out" | tr '\n' ' ')"
   [[ "$dag_order" == "P DBG NLI B3 REL E2E DC CV M " ]] \
     || self_fail "planner: the planner did not start the rows of gate-dag.txt in idx order (it started: '$dag_order')"

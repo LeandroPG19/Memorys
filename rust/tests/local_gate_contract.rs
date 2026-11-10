@@ -3251,6 +3251,21 @@ fn self_test_parent() -> std::path::PathBuf {
     }
 }
 
+/// The cgroup tree every self-test is given (CI-K10, H1): a root with nothing in it and a "own cgroup" file with no `0::` line,
+/// so a planner that a self-test starts for real (merge-gate.sh runs gate-dag.py, and gate-dag.py delegates the scope it
+/// runs in, CI-J17) finds no scope to delegate. Without the pair it reads the real `/proc/self/cgroup` and `/sys/fs/cgroup`
+/// of whoever runs the test, makes a `juez` in that scope and moves its processes there; under the judge, the step of the
+/// outer planner is that scope and the outer planner can no longer remove it. Every launch gets it here, once, and a row
+/// that needs a cgroup (F1) sets its own pair on top. Under `base`, so it is removed with the run and is not one of the
+/// places `left_in` reads.
+fn no_cgroup_under(base: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = base.join("sin-cgroup").join("raiz");
+    let own = base.join("sin-cgroup").join("propio");
+    std::fs::create_dir_all(&root).expect("creating the empty cgroup root of the self-test");
+    std::fs::write(&own, "").expect("creating the cgroup file, with no scope, of the self-test");
+    (root, own)
+}
+
 /// Runs `script --self-test` with HOME and XDG_CACHE_HOME, each a fresh, empty directory of the
 /// run's own, and `env` set on top (CI-J3). The judge's names are removed from the inherited
 /// environment first, so a run gets exactly what `env` gives it for them. This environment inherits
@@ -3311,6 +3326,7 @@ fn run_self_test(
     std::fs::create_dir_all(&cache).expect("creating the empty XDG_CACHE_HOME of the self-test");
     std::fs::create_dir_all(&tmp).expect("creating the TMPDIR of the self-test");
     std::fs::create_dir_all(&cluster_tmp).expect("creating the GATE_CLUSTER_TMP of the self-test");
+    let (cgroup_root, cgroup_own) = no_cgroup_under(&base);
     let mut command = std::process::Command::new(git_bash());
     command
         .arg(script)
@@ -3319,6 +3335,8 @@ fn run_self_test(
         .env("HOME", &home)
         .env("XDG_CACHE_HOME", &cache)
         .env("GATE_CLUSTER_TMP", &cluster_tmp)
+        .env("GATE_CGROUP_ROOT", &cgroup_root)
+        .env("GATE_PROC_SELF_CGROUP", &cgroup_own)
         .env_remove("TMPDIR");
     for (name, _) in JUDGE_ENVIRONMENT {
         command.env_remove(name);
@@ -3329,9 +3347,17 @@ fn run_self_test(
     if own_tmpdir {
         command.env("TMPDIR", &tmp);
     }
+    let cgroup_before = own_cgroup_path();
     let output = command
         .output()
         .expect("running the self-test of a judge script");
+    let cgroup_after = own_cgroup_path();
+    if cgroup_before != cgroup_after {
+        CGROUP_MOVES.lock().expect("the list of cgroup moves").push(format!(
+            "{} --self-test: the cgroup of the test went from {cgroup_before:?} to {cgroup_after:?}",
+            script.display()
+        ));
+    }
     let mut left = left_in("HOME", &home);
     left.extend(left_in("XDG_CACHE_HOME", &cache));
     left.extend(left_in("GATE_CLUSTER_TMP", &cluster_tmp));
@@ -3439,6 +3465,20 @@ struct SelfTestRun {
 /// result is the same either way.
 static JUDGE_ENV_SELF_TESTS: OnceLock<Vec<(&'static str, SelfTestRun)>> = OnceLock::new();
 
+/// The cgroup of this process: the path of its `0::` line in `/proc/self/cgroup`, `None` where there is no cgroup v2 (CI-K10, H1).
+/// Only the path is read, and not the children of the scope: a planner that delegates the scope moves every process in it,
+/// this one included, to `<scope>/juez`, so the process that looks sees its own path change.
+fn own_cgroup_path() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| path.trim().to_string())
+}
+
+/// The launches of `run_self_test` after which this process was in another cgroup than before it, each as the script and the
+/// two paths (CI-K10, H1). `run_self_test` fills it and `the_self_tests_do_not_move_the_cgroup_of_the_test` reads it.
+static CGROUP_MOVES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// The run of `name` under the judge's exported environment (CI-J7). Its output is what the test
 /// asserts on, with the same messages it had when it launched the script itself.
 fn judge_env_self_test(name: &str) -> &'static SelfTestRun {
@@ -3520,6 +3560,54 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
          was given, or under the foreign path it was handed (AJENO/). A self-test has to leave all \
          of them as it found them (D-J7b, D6, CI-F2), or a judge that runs next to it loses its \
          output or finds its lane: {leftovers:#?}"
+    );
+}
+
+/// CI-K10 (H1): every self-test starts with a cgroup tree that has no scope in it. The fixture is a script that says what
+/// the pair it was given is; the tree is the one `run_self_test` makes and removes, so the fixture reports it from inside.
+#[test]
+fn a_self_test_is_given_a_cgroup_tree_with_no_scope_to_delegate() {
+    let dir = std::env::temp_dir().join(format!("selftest-cgroup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("creating the directory of the fixture");
+    let script = dir.join("cgroup.sh");
+    let body = r#"echo "root-is-dir=$([ -d "${GATE_CGROUP_ROOT:-}" ] && echo yes || echo no)"
+echo "root-entries=$(ls -A "${GATE_CGROUP_ROOT:-/nonexistent}" 2>/dev/null | wc -l)"
+echo "own-is-file=$([ -f "${GATE_PROC_SELF_CGROUP:-}" ] && echo yes || echo no)"
+echo "own-scope-lines=$(grep -c '^0::' "${GATE_PROC_SELF_CGROUP:-/nonexistent}" 2>/dev/null)""#;
+    std::fs::write(&script, format!("#!/usr/bin/env bash\n{body}\nexit 0\n"))
+        .expect("writing the fixture");
+    let output = run_self_test(&script, &[], false).0;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "root-is-dir=yes",
+            "root-entries=0",
+            "own-is-file=yes",
+            "own-scope-lines=0"
+        ],
+        "a self-test has to start with GATE_CGROUP_ROOT an empty directory and GATE_PROC_SELF_CGROUP a file with no `0::` \
+         line, or a planner it starts for real reads the cgroup of whoever runs the test and delegates it (CI-J17, CI-K10): {stdout:?}"
+    );
+}
+
+/// CI-K10 (H1): no self-test moves the cgroup of the process that runs the test. `run_self_test` reads `/proc/self/cgroup` before
+/// and after each launch and notes the ones that differ; the round of the judge's scripts is forced here first, so the run of
+/// `run-all-tests.sh`, the one that starts a planner for real, is in the list. Where the scope is delegable (under `pesado`, and
+/// under the judge, where the step that runs this test is a scope of the outer planner) a planner that reads the real cgroup
+/// moves this process into `<scope>/juez` and the path changes; where it is not, `delegate()` returns False and the path never
+/// changes, so the equality holds either way and the guard is never mute. What makes it fail without a delegable scope is
+/// `a_self_test_is_given_a_cgroup_tree_with_no_scope_to_delegate`.
+#[test]
+fn the_self_tests_do_not_move_the_cgroup_of_the_test() {
+    let _ = judge_env_self_test("run-all-tests.sh");
+    let moves = CGROUP_MOVES.lock().expect("the list of cgroup moves");
+    assert!(
+        moves.is_empty(),
+        "a self-test started a planner that delegated the real cgroup of this process (CI-J17, CI-K10): {moves:#?}"
     );
 }
 
@@ -7434,17 +7522,26 @@ fn the_exclusive_check_refuses_what_runs_beside_other_steps() {
     );
 }
 
-/// The value of `os.environ.get("GATE_DAG", "<default>")` in the planner.
-fn gate_dag_default(planner: &str) -> String {
-    let key = "os.environ.get(\"GATE_DAG\", \"";
-    let line = planner
+/// What the gate asks of the planner when nobody sets GATE_DAG, as its own self-test measured it (CI-K10, H2): the row `planner`
+/// of `merge-gate.sh --self-test` runs a copy of the gate with GATE_DAG removed from its environment, reads `asked=` in the `plan:`
+/// line the planner printed and says it in a line of its own. It is what a default put anywhere between the gate and the planner
+/// (an `export GATE_DAG=…` in merge-gate.sh or in gate-lock.sh) turns into; the literal in gate-dag.py is only one of those places.
+fn gate_dag_default() -> String {
+    let run = judge_env_self_test("merge-gate.sh");
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    let key = "gate default: GATE_DAG unset asks for ";
+    stdout
         .lines()
-        .find(|line| line.contains(key))
-        .expect("gate-dag.py reads GATE_DAG with a default");
-    line.split(key)
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .expect("a default between quotes")
+        .find_map(|line| line.strip_prefix(key))
+        .unwrap_or_else(|| {
+            panic!(
+                "merge-gate.sh --self-test did not say what the gate asks for when GATE_DAG is unset (exit {:?}): {}{}",
+                run.output.status.code(),
+                stdout,
+                String::from_utf8_lossy(&run.output.stderr)
+            )
+        })
+        .trim()
         .to_string()
 }
 
@@ -7457,6 +7554,8 @@ fn activation_problem(default: &str, pending: usize) -> Option<String> {
     })
 }
 
+/// CI-K10 (H2): judged on the default the gate really has (`gate_dag_default`, read from the plan its own self-test printed), not
+/// on the literal in gate-dag.py.
 #[test]
 fn the_dag_is_not_the_default_while_a_latency_line_is_pending() {
     let refused = activation_problem("1", 2);
@@ -7472,7 +7571,7 @@ fn the_dag_is_not_the_default_while_a_latency_line_is_pending() {
         .iter()
         .filter(|line| line.evidence == "pendiente")
         .count();
-    let default = gate_dag_default(&read("scripts/gate-dag.py"));
+    let default = gate_dag_default();
     if let Some(problem) = activation_problem(&default, pending) {
         panic!("{problem}");
     }

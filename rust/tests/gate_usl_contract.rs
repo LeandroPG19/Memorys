@@ -39,7 +39,8 @@
 //! - the sweep environment without the profile of the row -> U7 and U20; a profile `bin` again -> U9.
 //! - B3 without the cold filter -> U12; the slack from `L_in` alone -> U12; juez-cuda by run count -> U13.
 //! - the knee chosen without simulating -> U14; a simulator that ignores `c` -> U14; a gain threshold of 0 -> U14.
-//! - `J_hist` read from today's table -> U16; a command of a profile that drifted from `run-all-tests.sh`, or that moved to the lane of another row -> U17.
+//! - `J_hist` read from today's table -> U16; a command of a profile that drifted from `run-all-tests.sh`, or that moved to the lane of another row -> U17;
+//!   a flag added to a cargo call of a lane (`--no-default-features`), or a call that compiles in the lanes and no profile names -> U17.
 //! - a wait without a deadline -> U18.
 
 use serde_json::{Value, json};
@@ -1171,6 +1172,38 @@ fn u20_el_barrido_toma_el_perfil_de_la_fila_de_la_tabla_del_arbol() {
     assert!(fx.llamadas().is_empty(), "no cargo without the profile");
 }
 
+#[test]
+fn u21_el_barrido_construye_en_el_target_de_su_fila_de_la_tabla_del_arbol() {
+    // The target is not a copy in the tool either (CI-K10, H5): the sweep builds where the row of its profile says, so a row
+    // that moves to another `target:` moves the sweep with it, and never leaves a second set of artifacts in the old one.
+    for (perfil, fila_vieja, nuevo, j) in [
+        ("debug", "target:T_dbg", "target:T_dbg2", "2"),
+        ("release", "target:T_rel", "target:T_rel2", "4"),
+    ] {
+        let fx = Fx::new(&format!("u21-{perfil}"));
+        let otra = TABLA.replace("{DBG}", "8").replace(fila_vieja, nuevo);
+        assert!(otra.contains(nuevo), "anchor: the table names {nuevo}");
+        write(&fx.tree.join("scripts/gate-dag.txt"), &otra);
+        fx.commit("another target for the rows of the profile");
+        let salida = fx.run(&["barrido", "--perfil", perfil, "--j", j, "--reps", "1"]);
+        assert_eq!(salida.code, Some(0), "{perfil}: {}", salida.text());
+        let esperado = fx
+            .destinos
+            .join(fx.clave_del_arbol())
+            .join(nuevo.trim_start_matches("target:"));
+        let llamadas = fx.llamadas();
+        assert!(!llamadas.is_empty(), "{perfil}: the sweep called cargo");
+        for llamada in &llamadas {
+            assert_eq!(
+                Path::new(&llamada.target),
+                esperado,
+                "{perfil}: `cargo {}` builds in the target of the row of the table",
+                llamada.args
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // U12-U17: the recommendation
 
@@ -1610,19 +1643,133 @@ fn u16_el_j_de_las_corridas_sale_de_git_no_de_la_tabla_de_hoy() {
 // ---------------------------------------------------------------------------------------------
 // U17: the profiles against the judge
 
-/// Is `orden` in the judge's script? A line of the script has it literally, or, for the compile-only
-/// form `... --no-run` of a test run, the script runs the same order without the flag.
-fn aparece(script: &str, orden: &str) -> bool {
-    if script.contains(orden) {
-        return true;
+/// A flag that only reports (CI-K4: `--timings` on every cargo call of the judge, `--message-format=json…` where the gate reads
+/// the artifacts): it changes no input of the build and the sweep does not ask for it. The list is closed on purpose: any other
+/// flag of a call is a different build.
+fn es_bandera_de_informe(ficha: &str) -> bool {
+    ficha == "--timings" || ficha.starts_with("--message-format=")
+}
+
+/// The tokens of a cargo call to compare: without its report flags and without `--no-run`, the compile-only form of a `test`
+/// that the sweep uses where the judge runs it. Everything else has to be there, in the same order.
+fn orden_comparable(fichas: &[String]) -> Vec<String> {
+    let mut orden = Vec::new();
+    for ficha in fichas {
+        if !es_bandera_de_informe(ficha) && ficha.as_str() != "--no-run" {
+            orden.push(ficha.clone());
+        }
     }
-    let Some(sin_flag) = orden.strip_suffix(" --no-run") else {
-        return false;
-    };
-    script.lines().any(|l| {
-        let l = l.trim_end();
-        l == sin_flag || l.ends_with(&format!(" {sin_flag}"))
-    })
+    orden
+}
+
+/// The flags of cargo whose next token is their value, not a target to select.
+const BANDERAS_CON_VALOR: [&str; 7] = [
+    "--features",
+    "--bin",
+    "--package",
+    "-p",
+    "--target",
+    "--profile",
+    "--manifest-path",
+];
+
+/// What an order compiles, without what it only selects to run: `--lib`, `--test <name>` and bare names pick which of the
+/// targets that `cargo test` compiles are run, and what comes after `--` in a `test` is for the test binary. A
+/// `cargo test --lib -- --ignored` compiles what `cargo test --no-run` compiles. Anything else, in particular a feature, a
+/// profile, `--bins` or `-p`, stays: it changes what is built.
+fn forma_normal(orden: &[String]) -> Vec<String> {
+    let es_test = orden.first().is_some_and(|f| f == "test");
+    let mut forma = Vec::new();
+    let mut despues_de_guiones = false;
+    let mut i = 0;
+    while i < orden.len() {
+        let ficha = orden[i].as_str();
+        if despues_de_guiones {
+            forma.push(orden[i].clone());
+        } else if ficha == "--" {
+            if es_test {
+                break;
+            }
+            despues_de_guiones = true;
+            forma.push(orden[i].clone());
+        } else if ficha == "--lib" {
+        } else if ficha == "--test" {
+            i += 1;
+        } else if i > 0 && ficha.starts_with('-') {
+            forma.push(orden[i].clone());
+            if BANDERAS_CON_VALOR.contains(&ficha) && i + 1 < orden.len() {
+                i += 1;
+                forma.push(orden[i].clone());
+            }
+        } else if i == 0 {
+            forma.push(orden[i].clone());
+        }
+        i += 1;
+    }
+    forma
+}
+
+/// Subcommands of cargo that compile nothing, each with why a call of it is not an order of any profile. A subcommand that is
+/// not here and is not an order of the profile is a compilation the sweep does not measure.
+const NO_COMPILAN: [(&str, &str); 1] = [("fmt", "rustfmt reads the sources and builds nothing")];
+
+/// The `echo "…"` strings of a line of shell removed: a message that names a cargo order is not a call of it.
+fn sin_echos(linea: &str) -> String {
+    let mut salida = String::new();
+    let mut resto = linea;
+    while let Some(en) = resto.find("echo \"") {
+        salida.push_str(&resto[..en]);
+        let tras = &resto[en + "echo \"".len()..];
+        resto = match tras.find('"') {
+            Some(fin) => &tras[fin + 1..],
+            None => "",
+        };
+    }
+    salida.push_str(resto);
+    salida
+}
+
+/// The cargo calls in `texto`, each as its tokens from the subcommand on: the line continuations joined, the strings of `echo`
+/// out, a call ends at the shell word that ends a command (`||`, `&&`, `;`, `|`, a redirection or the `)` of a `$(…)`).
+fn llamadas_de_cargo(texto: &str) -> Vec<Vec<String>> {
+    let mut llamadas = Vec::new();
+    for linea in texto.replace("\\\n", " ").lines() {
+        let linea = sin_echos(linea);
+        let fichas: Vec<&str> = linea.split_whitespace().collect();
+        for (i, ficha) in fichas.iter().enumerate() {
+            if *ficha != "cargo" && !ficha.ends_with("$(cargo") {
+                continue;
+            }
+            let mut llamada = Vec::new();
+            for resto in &fichas[i + 1..] {
+                let corte = ["||", "&&", ";", "|"].contains(resto)
+                    || resto.starts_with('>')
+                    || resto.starts_with("2>");
+                if corte {
+                    break;
+                }
+                let cierra = resto.ends_with(')') || resto.ends_with(")\"");
+                let ficha = if cierra {
+                    resto.trim_end_matches(['"', ')'])
+                } else {
+                    resto
+                };
+                if !ficha.is_empty() {
+                    llamada.push(ficha.to_string());
+                }
+                if cierra {
+                    break;
+                }
+            }
+            llamadas.push(llamada);
+        }
+    }
+    llamadas
+}
+
+/// The tokens of a line of the fake cargo log (`"$*"`), split like a shell would.
+fn fichas_de(args: &str) -> Vec<String> {
+    args.split_whitespace().map(String::from).collect()
 }
 
 /// The body of `step_<id>()` in merge-gate.sh: the lines between its header and the `}` that closes it (the same helper as
@@ -1683,11 +1830,10 @@ fn alcance_del_carril(script: &str, carril: &str) -> String {
 
 #[test]
 fn u17_las_ordenes_de_cada_perfil_existen_tal_cual_en_los_carriles_de_su_fila() {
-    // `--timings` (CI-K4) is a report flag on every cargo call of the judge: it changes no input of the build, and the sweep
-    // does not ask for it, so an order matches the script with the flag taken out of it.
-    let script = fs::read_to_string(scripts().join("run-all-tests.sh"))
-        .expect("run-all-tests.sh")
-        .replace(" --timings", "");
+    // The orders of the profile and the cargo calls of the lanes of its row are compared as lists of tokens, both ways, with
+    // the report flags and `--no-run` taken out (`orden_comparable`): a substring would still be there after a flag is added to
+    // the call, and says nothing of a call that the profile does not name.
+    let script = fs::read_to_string(scripts().join("run-all-tests.sh")).expect("run-all-tests.sh");
     let gate = fs::read_to_string(scripts().join("merge-gate.sh")).expect("merge-gate.sh");
     for perfil in ["debug", "release"] {
         let fx = Fx::new(&format!("u17-{perfil}"));
@@ -1715,13 +1861,100 @@ fn u17_las_ordenes_de_cada_perfil_existen_tal_cual_en_los_carriles_de_su_fila() 
             .map(|c| alcance_del_carril(&script, c))
             .collect::<Vec<_>>()
             .join("\n");
-        for llamada in &llamadas[..llamadas.len() / 2] {
-            let orden = format!("cargo {}", llamada.args);
+        let en_los_carriles = llamadas_de_cargo(&alcance);
+        let comparables: Vec<Vec<String>> = en_los_carriles
+            .iter()
+            .map(|llamada| orden_comparable(llamada))
+            .collect();
+        let del_perfil: Vec<Vec<String>> = llamadas[..llamadas.len() / 2]
+            .iter()
+            .map(|llamada| orden_comparable(&fichas_de(&llamada.args)))
+            .collect();
+        for orden in &del_perfil {
             assert!(
-                aparece(&alcance, &orden),
-                "profile {perfil}: the order {orden:?} is not run by the lanes {carriles:?} of the row {fila} in scripts/run-all-tests.sh"
+                comparables.contains(orden),
+                "profile {perfil}: the order {orden:?} is not, token for token, a cargo call of the lanes {carriles:?} of the row {fila} in scripts/run-all-tests.sh: {comparables:?}"
             );
         }
+        let formas_del_perfil: Vec<Vec<String>> =
+            del_perfil.iter().map(|orden| forma_normal(orden)).collect();
+        for (llamada, comparable) in en_los_carriles.iter().zip(&comparables) {
+            let subcomando = llamada.first().map(String::as_str).unwrap_or_default();
+            if NO_COMPILAN.iter().any(|(nombre, _)| *nombre == subcomando) {
+                continue;
+            }
+            assert!(
+                formas_del_perfil.contains(&forma_normal(comparable)),
+                "profile {perfil}: the lanes {carriles:?} of the row {fila} run `cargo {}`, which compiles something no order of the profile does ({formas_del_perfil:?}). Add it to PERFILES in scripts/gate_usl.py, or to NO_COMPILAN here with the reason it compiles nothing",
+                llamada.join(" ")
+            );
+        }
+    }
+}
+
+/// The two ways of `u17` are judged on lines that are not the judge's: a flag added to a call, a call the profile does not
+/// name, and the calls that are only a selection of what the profile compiles.
+#[test]
+fn u17b_las_fichas_de_una_llamada_distinguen_lo_que_compila_de_lo_que_solo_informa_o_selecciona() {
+    let llamadas = llamadas_de_cargo(
+        "  echo \"=== cargo fmt --check ===\"\n  cargo fmt --check\n  out=\"$(cargo build --bin memory-industry --message-format=json-render-diagnostics --timings)\" \\\n    || { echo \"FAIL: cargo build --bin memory-industry failed\" >&2; exit 1; }\n  run_counted x 1 cargo test --lib --timings \\\n    -- --ignored --nocapture\n  cargo build --release --features docs,cuda --bins --message-format=json --timings >\"$j\" \\\n    || exit 1\n  run_counted d 0 cargo test \"${DISCOVERED[@]}\" --no-default-features --timings -- --ignored\n",
+    );
+    let esperadas: Vec<Vec<String>> = [
+        "fmt --check",
+        "build --bin memory-industry --message-format=json-render-diagnostics --timings",
+        "test --lib --timings -- --ignored --nocapture",
+        "build --release --features docs,cuda --bins --message-format=json --timings",
+        "test \"${DISCOVERED[@]}\" --no-default-features --timings -- --ignored",
+    ]
+    .iter()
+    .map(|orden| fichas_de(orden))
+    .collect();
+    assert_eq!(llamadas, esperadas, "the calls found in the text");
+
+    let perfil = orden_comparable(&fichas_de("build --bin memory-industry"));
+    let con_bandera = orden_comparable(&fichas_de(
+        "build --bin memory-industry --no-default-features --timings",
+    ));
+    assert_ne!(
+        con_bandera, perfil,
+        "a flag that is not a report flag is part of the order"
+    );
+    assert_eq!(
+        orden_comparable(&fichas_de(
+            "build --bin memory-industry --message-format=json-render-diagnostics --timings"
+        )),
+        perfil,
+        "report flags are not part of the order"
+    );
+    assert_eq!(
+        orden_comparable(&fichas_de("test --no-run")),
+        orden_comparable(&fichas_de("test --timings")),
+        "`--no-run` is the compile-only form of the same order"
+    );
+    let compila = forma_normal(&orden_comparable(&fichas_de("test --no-run")));
+    for seleccion in [
+        "test --lib -- --ignored --nocapture",
+        "test --test v016_chunking --test v020_role_separation --timings",
+        "test \"${DISCOVERED[@]}\" --timings -- --ignored",
+    ] {
+        assert_eq!(
+            forma_normal(&orden_comparable(&fichas_de(seleccion))),
+            compila,
+            "{seleccion}: a selection of the targets of `cargo test` compiles what `cargo test` compiles"
+        );
+    }
+    for otra in [
+        "test --no-default-features",
+        "test --release",
+        "test -p other",
+        "check --all-targets",
+        "build --bins",
+    ] {
+        assert_ne!(
+            forma_normal(&orden_comparable(&fichas_de(otra))),
+            compila,
+            "{otra}: compiles something other than `cargo test`"
+        );
     }
 }
 
