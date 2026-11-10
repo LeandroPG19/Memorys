@@ -54,6 +54,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
   live=$!
   trap 'kill "$live" 2>/dev/null || true; rm -rf "$tmp" "$hermetic"' EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
+  # What the planner prints between the OK of the judge's server and the banner of its first block: the plan
+  # of the machine (CI-K4), the note that the scope is not delegated (CI-E4; the stand-in cgroup tree of the
+  # self-tests has no `0::` line, so it is always printed) and the row it starts (CI-F3.3b-2). Any other line
+  # there is still a failure.
+  planner_lines='^(plan: |note: the scope is not delegated |dag: P env:)'
 
   # fake_tree NAME RUN_ALL_TESTS_BODY
   fake_tree() {
@@ -967,7 +972,7 @@ FAKE
     # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
     # CI-K4 (D-K4q): and, before the first block, the plan of the machine it measured (`plan: ...`).
     planner_gap=0
-    while [[ "${lines[at+2+planner_gap]:-}" =~ ^(plan:\ |dag:\ P\ env:) ]]; do planner_gap=$(( planner_gap + 1 )); done
+    while [[ "${lines[at+2+planner_gap]:-}" =~ $planner_lines ]]; do planner_gap=$(( planner_gap + 1 )); done
     [[ "${lines[at+2+planner_gap]:-}" == "=== cargo audit ===" ]] \
       || self_fail "$name: the line after the judge's OK (and the planner's lines) is '${lines[at+2+planner_gap]:-}', not the banner of cargo audit, the first step after the readiness check"
     if grep -qxF "$answer" "$tmp/$name.out"; then
@@ -1010,7 +1015,7 @@ FAKE
     # CI-K4 (D-K4q): and, before the first block, the plan of the machine it measured (`plan: ...`).
     skip=1
     next="$(sed -n "$((at+skip))p" "$tmp/$name.out")"
-    while [[ "$next" =~ ^(plan:\ |dag:\ P\ env:) ]]; do
+    while [[ "$next" =~ $planner_lines ]]; do
       skip=$(( skip + 1 ))
       next="$(sed -n "$((at+skip))p" "$tmp/$name.out")"
     done
@@ -1392,7 +1397,7 @@ down mut'
     # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
     # CI-K4 (D-K4q): and, before the first block, the plan of the machine it measured (`plan: ...`).
     planner_gap=0
-    while [[ "${lines[at+1+planner_gap]:-}" =~ ^(plan:\ |dag:\ P\ env:) ]]; do planner_gap=$(( planner_gap + 1 )); done
+    while [[ "${lines[at+1+planner_gap]:-}" =~ $planner_lines ]]; do planner_gap=$(( planner_gap + 1 )); done
     [[ "${lines[at+1+planner_gap]:-}" == "=== cargo audit ===" ]] \
       || self_fail "$name: the line after the OK line (and the planner's lines) is '${lines[at+1+planner_gap]:-}', not the banner of cargo audit"
     if [[ -n "$password" ]] && grep -qF "$password" "$tmp/$name.out"; then
