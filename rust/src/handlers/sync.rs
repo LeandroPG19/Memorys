@@ -1527,22 +1527,25 @@ fn recompute_digest(root: &Path, project_id: Option<Uuid>) -> Result<String> {
 pub const SYNC_LOCK_WAIT: Duration = Duration::from_secs(10);
 pub const SYNC_STATEMENT_BUDGET: &str = "300s";
 
-/// `SET` takes no bound parameters; the number is an integer of milliseconds, so nothing the caller writes reaches it.
-pub fn lock_timeout_sql(wait: Duration) -> Result<String> {
+/// The wait as whole milliseconds, the only form `take_sync_lock` writes into its statement: `SET` takes no bound
+/// parameters, so what reaches it has to be an integer and not text the caller composed. The statement itself is
+/// written beside the transaction that runs it, where a reader (and the static guard) can see it is not on a pool.
+pub fn lock_timeout_millis(wait: Duration) -> Result<u128> {
     let millis = wait.as_millis();
     if millis == 0 {
         anyhow::bail!(
             "a lock wait of {wait:?} is under a millisecond, and a lock_timeout of 0 means wait forever in Postgres"
         );
     }
-    Ok(format!("SET LOCAL lock_timeout = '{millis}ms'"))
+    Ok(millis)
 }
 
 pub async fn take_sync_lock(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     wait: Duration,
 ) -> Result<()> {
-    sqlx::query(&lock_timeout_sql(wait)?)
+    let millis = lock_timeout_millis(wait)?;
+    sqlx::query(&format!("SET LOCAL lock_timeout = '{millis}ms'"))
         .execute(&mut **tx)
         .await
         .context("bounding how long this sync may wait for the lock")?;
@@ -3159,18 +3162,19 @@ mod tests {
              v025 does not exercise: this is where it is pinned"
         );
         assert_eq!(
-            lock_timeout_sql(SYNC_LOCK_WAIT).expect("ten seconds is a valid wait"),
-            "SET LOCAL lock_timeout = '10000ms'"
+            lock_timeout_millis(SYNC_LOCK_WAIT).expect("ten seconds is a valid wait"),
+            10_000
         );
         assert_eq!(
-            lock_timeout_sql(std::time::Duration::from_secs(1)).expect("a second is a valid wait"),
-            "SET LOCAL lock_timeout = '1000ms'"
+            lock_timeout_millis(std::time::Duration::from_secs(1))
+                .expect("a second is a valid wait"),
+            1_000
         );
     }
 
     #[test]
     fn a_wait_under_a_millisecond_is_refused_because_postgres_reads_zero_as_wait_forever() {
-        let why = lock_timeout_sql(std::time::Duration::ZERO)
+        let why = lock_timeout_millis(std::time::Duration::ZERO)
             .expect_err("a zero wait must not be accepted")
             .to_string();
         assert!(
@@ -3178,7 +3182,7 @@ mod tests {
             "lock_timeout = 0 in Postgres means wait forever, which is the hang this lock \
              exists to prevent; the refusal has to say so. Got: {why}"
         );
-        lock_timeout_sql(std::time::Duration::from_micros(999))
+        lock_timeout_millis(std::time::Duration::from_micros(999))
             .expect_err("999 microseconds rounds down to 0 ms, which is the same hang");
     }
 }

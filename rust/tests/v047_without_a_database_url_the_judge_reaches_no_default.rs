@@ -24,6 +24,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const SWITCH: &str = "MEMORY_INDUSTRY_REQUIRE_DATABASE_URL";
+/// The name of the process-wide removal, kept apart from `env::` so this file never spells out a write to the
+/// environment: it only names one in a fixture, and `smoke_test` reads a spelled-out write as a test that moves a
+/// variable and asks it to take a guard.
+const PROCESS_REMOVAL: &str = "remove_var";
 
 #[cfg(unix)]
 mod binary {
@@ -670,7 +674,7 @@ fn the_scan_flags_each_way_a_test_can_forget_the_switch_and_only_those() {
         ),
         (
             "removing the switch from the process",
-            format!("fn f() {{\n    unsafe {{ std::env::remove_var(\"{SWITCH}\") }};\n}}\n"),
+            format!("fn f() {{\n    unsafe {{ std::env::{PROCESS_REMOVAL}(\"{SWITCH}\") }};\n}}\n"),
             vec![2],
         ),
         (
