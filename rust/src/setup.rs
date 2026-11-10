@@ -663,4 +663,58 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// The order of D-DB3, over every class of input.
+    ///
+    /// The oracle is written apart from `url_source` on purpose: each input
+    /// carries the class it belongs to as a literal, so the expectation never
+    /// goes through the `trim` and `is_empty` the code under test uses. The
+    /// URLs are labelled and never printed: a failure names the row.
+    #[test]
+    fn url_source_decides_in_the_order_of_given_then_cloud_then_the_switch() {
+        // (label, value, is it a URL?). A blank is a URL: `given` is not trimmed,
+        // as `resolve_database_url` has always read it.
+        let given: [(&str, &str, bool); 3] = [
+            ("empty", "", false),
+            ("a url", "postgresql://x", true),
+            ("a blank", " ", true),
+        ];
+        // (label, value, does it switch the refusal on?). Only nothing, or
+        // whitespace alone, leaves it off.
+        let require: [(&str, &str, bool); 7] = [
+            ("empty", "", false),
+            ("two blanks", "  ", false),
+            ("1", "1", true),
+            ("0", "0", true),
+            ("true", "true", true),
+            ("a foreign word", "ajeno", true),
+            ("1 between blanks", " 1 ", true),
+        ];
+
+        let mut rows = 0;
+        for (given_label, g, is_a_url) in given {
+            for cloud in [false, true] {
+                for (require_label, r, switches) in require {
+                    let expected = match (is_a_url, cloud, switches) {
+                        (true, _, _) => UrlSource::Given,
+                        (false, true, _) => UrlSource::CloudWithoutUrl,
+                        (false, false, true) => UrlSource::Refused,
+                        (false, false, false) => UrlSource::Default,
+                    };
+                    assert_eq!(
+                        url_source(g, cloud, r),
+                        expected,
+                        "DATABASE_URL {given_label}, cloud {cloud}, switch {require_label}: a \
+                         URL always wins, then the cloud mode (which fails closed on its own), \
+                         then the switch, and only without any of them the default path"
+                    );
+                    rows += 1;
+                }
+            }
+        }
+        assert_eq!(
+            rows, 42,
+            "3 URLs x 2 modes x 7 switch values: a table that lost a row proves less than it says"
+        );
+    }
 }

@@ -61,6 +61,8 @@ impl Scratch {
             .env_remove("GIT_INDEX_FILE")
             .env_remove("CUBA_SYNC_DIR")
             .env_remove("DATABASE_URL")
+            // A hook that ran the binary without a URL must stop, not use the developer's database.
+            .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.base.join("empty-gitconfig"))
             .env("XDG_CONFIG_HOME", self.base.join("no-xdg-config"))
