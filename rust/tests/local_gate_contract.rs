@@ -8664,3 +8664,173 @@ fn the_dc_row_only_compiles_and_lints_the_build_without_docs() {
         "the row DC opens no database and reads no model: its only resource is its target. Row: {row}"
     );
 }
+
+/// The name of the switch that makes `resolve_database_url` refuse, with exit 2, to fall back on the
+/// default database (T-DBURL). The judge exports it so that a process it starts without a
+/// `DATABASE_URL` reaches neither the developer's corpus on 127.0.0.1:5488 nor Docker.
+const REQUIRE_DATABASE_URL: &str = "MEMORY_INDUSTRY_REQUIRE_DATABASE_URL";
+
+/// What makes a line of a gate script a step: it starts the tests, the binary or one of the other
+/// gates, which is where a process without a database URL would be born.
+const GATE_STEP_MARKS: [&str; 9] = [
+    "cargo test",
+    "cargo llvm-cov",
+    "cargo mutants",
+    "scripts/run-all-tests.sh",
+    "scripts/crap-gate.sh",
+    "scripts/mutants-gate.sh",
+    "gate-dag.py",
+    "\"$bin\"",
+    "\"$CUBA_BINARY_PATH\"",
+];
+
+/// The code of `body` outside its self-test: no comments and no `echo` lines, which name steps
+/// without running them. `(line number, trimmed line)`.
+fn gate_code(body: &str) -> Vec<(usize, &str)> {
+    outside_self_test(body)
+        .into_iter()
+        .map(|(n, line)| (n, line.trim()))
+        .filter(|(_, line)| !line.starts_with('#') && !line.starts_with("echo "))
+        .collect()
+}
+
+/// The line of the first step of `body`, if it has one.
+fn first_gate_step(body: &str) -> Option<usize> {
+    gate_code(body)
+        .into_iter()
+        .find(|(_, line)| GATE_STEP_MARKS.iter().any(|mark| line.contains(mark)))
+        .map(|(n, _)| n)
+}
+
+/// What is wrong with how `body` exports the switch, as sentences; empty when it is right: one
+/// `export MEMORY_INDUSTRY_REQUIRE_DATABASE_URL=1` outside the self-test, before the first step,
+/// and nothing that unsets it.
+fn require_database_url_problems(body: &str) -> Vec<String> {
+    let code = gate_code(body);
+    let export = format!("export {REQUIRE_DATABASE_URL}=1");
+    let exports: Vec<usize> = code
+        .iter()
+        .filter(|(_, line)| *line == export)
+        .map(|(n, _)| *n)
+        .collect();
+    let mut problems = Vec::new();
+
+    match exports.as_slice() {
+        [] => problems.push(format!(
+            "no line outside the self-test exports {REQUIRE_DATABASE_URL}=1"
+        )),
+        [only] => {
+            if let Some(step) = first_gate_step(body)
+                && *only > step
+            {
+                problems.push(format!(
+                    "the export of {REQUIRE_DATABASE_URL} is on line {only}, after the first step \
+                     on line {step}: that step runs without it"
+                ));
+            }
+        }
+        many => problems.push(format!(
+            "{REQUIRE_DATABASE_URL}=1 is exported {} times (lines {many:?}); one export is the \
+             rule, so that nobody has to guess which one counts",
+            many.len()
+        )),
+    }
+    for (n, line) in &code {
+        let unsets = line.contains(REQUIRE_DATABASE_URL)
+            && (line.starts_with("unset ") || line.contains(" -u ") || line.contains("env -u"));
+        if unsets {
+            problems.push(format!(
+                "line {n} takes {REQUIRE_DATABASE_URL} away outside the self-test: a step after \
+                 it runs without the switch"
+            ));
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_switch_check_fails_on_each_way_the_judge_can_forget_to_export_it() {
+    let export = format!("export {REQUIRE_DATABASE_URL}=1");
+    let rows: [(&str, String, bool); 10] = [
+        (
+            "the export before the first step",
+            format!("{export}\ncargo test\n"),
+            false,
+        ),
+        ("no export at all", "cargo test\n".to_string(), true),
+        (
+            "the export after the first step",
+            format!("scripts/run-all-tests.sh\n{export}\n"),
+            true,
+        ),
+        (
+            "the export with an empty value",
+            format!("export {REQUIRE_DATABASE_URL}=\ncargo test\n"),
+            true,
+        ),
+        (
+            "an unset after the export",
+            format!("{export}\nunset {REQUIRE_DATABASE_URL}\ncargo test\n"),
+            true,
+        ),
+        (
+            "an env -u that starts a step without it",
+            format!("{export}\nenv -u {REQUIRE_DATABASE_URL} cargo test\n"),
+            true,
+        ),
+        (
+            "an export that lives only in the self-test",
+            format!("{SELF_TEST_BEGIN}\n{export}\n{SELF_TEST_END}\ncargo test\n"),
+            true,
+        ),
+        (
+            "two exports",
+            format!("{export}\n{export}\ncargo test\n"),
+            true,
+        ),
+        (
+            "a comment and an echo that name a step before the export",
+            format!("# cargo test comes later\necho \"cargo test\"\n{export}\ncargo test\n"),
+            false,
+        ),
+        (
+            "a step only inside the self-test before the export",
+            format!("{SELF_TEST_BEGIN}\ncargo test\n{SELF_TEST_END}\n{export}\ncargo test\n"),
+            false,
+        ),
+    ];
+
+    for (name, body, red) in rows {
+        let problems = require_database_url_problems(&body);
+        assert_eq!(
+            !problems.is_empty(),
+            red,
+            "{name}: expected {}, got {problems:?}",
+            if red { "a problem" } else { "none" }
+        );
+    }
+}
+
+/// The two scripts that start the tests of the judge. `merge-gate.sh` exports the switch beside the
+/// owner of the gate lock, before its first step; `run-all-tests.sh` beside `CUBA_JUDGE`, because it
+/// is also started alone. A script that lost the line starts its tests with no guard against the
+/// default database; no test would say so, because the ones that need it would simply not exist yet.
+#[test]
+fn both_judge_scripts_export_the_switch_before_their_first_step() {
+    for script in ["scripts/merge-gate.sh", "scripts/run-all-tests.sh"] {
+        let body = read(script).replace("\r\n", "\n");
+        assert!(
+            first_gate_step(&body).is_some(),
+            "{script} has no line the scan takes for a step, so a green answer would prove \
+             nothing: the marks are {GATE_STEP_MARKS:?}"
+        );
+        let problems = require_database_url_problems(&body);
+        assert!(
+            problems.is_empty(),
+            "{script} must export {REQUIRE_DATABASE_URL}=1 once, outside its self-test and before \
+             its first step, so that a process the judge starts with no DATABASE_URL (a Python \
+             client, a call in the test process) refuses with exit 2 instead of reaching the \
+             database the developer's own memory lives in. Problems: {problems:#?}"
+        );
+    }
+}
