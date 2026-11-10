@@ -936,3 +936,20 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
 - **9-nov 18:24 · Spec de CI-K3 lista** (`ci-rapido-K3.spec.md`): de los 120 ficheros de `rust/tests`, 25 se agrupan en 2 binarios (`group_no_server`, 16 módulos y 96 tests; `group_scratch_db`, 9 módulos y 40 tests) y 95 se quedan por estado de proceso o de servidor (59 son los `#[ignore]` de D2 sobre brain_gate). Forma: raíz `tests/<grupo>.rs` con módulos por `#[path]`, para que el juez y sus contratos no cambien. El ahorro no se afirma hasta medirlo con `--timings`. Hallazgo: `gate_usl_contract.rs` tiene un aserto de reloj sin línea en gate-latency.txt (rojo seguro en la integración). **Lanzados:** un ensayo en seco de la integración (worktree `Memorys-ci-pre`: autotests cortos, espejos en Python de los contratos e interacciones entre tajadas, con arreglo de lo que confirme) y la implementación de CI-K3 (worktree `Memorys-ci-k3`). En marcha además: el perfil de los autotests lentos, la auditoría de lanzamientos del contrato y CI-K4. Nada encolado en `pesado`.
 
 - **9-nov 18:28 · Auditoría del contrato (revisor, solo lectura).** Por ronda, `local_gate_contract` lanza 22 autotests reales en vez de 14: la tanda del test de residuos relanza los 8 guiones que cargan gate-lock.sh, con los cuatro caros, y las dos tandas corren a la vez (pico de 12, no de 6). Sobran ≈823 s de proceso por ronda. El juez corre este binario dos veces (plano y `--features docs`). Suelo tras fusionar las tandas: el autotest más lento (hoy quality-gate, ≈6 min), que es lo que acorta el perfil en curso. Tres puntos ciegos del D6 actual: no ve la raíz creada vacía; un solo directorio para los 8; gate-cluster y gate-audit descartan el `GATE_CLUSTER_TMP` que reciben. **CI-K6 abierta** (spec `ci-rapido-K6.spec.md`, worktree `Memorys-ci-k6`): trinquete de un lanzamiento por guion, `GATE_CLUSTER_TMP` propio por corrida, y los valores-ruta ajenos del entorno del juez bajo un directorio observado, para no perder la única diferencia real entre las dos tandas. Implementación lanzada. Pendiente de decidir con Leandro: que la vuelta `--features docs` no repita los binarios de contrato que solo leen guiones (no enlazan el crate).
+
+- **9-nov 18:38 · Encargo externo (análisis sobre 0.30.0, pegado por Leandro) validado contra el árbol local.** Comprobado sin compilar, en `Memorys-ci-integ`:
+
+  | Tarea | Estado aquí | Qué se hace |
+  |---|---|---|
+  | T0 tiempos por paso | Hecha (gate_history, test-times; `--timings` en CI-K4) | — |
+  | T1 `ort` sin el descargador | **Viva.** Cargo.toml:37 lleva `tls-native-vendored`; `cargo tree -i openssl-sys` lo confirma (ort-sys ← ureq ← native-tls) | CI-K7, sobre la rama de release (dependencias del producto) |
+  | T4 `docs` en el pase principal | **Viva, decisión de Leandro.** `default = []`; 6 `feature = "docs"` y 0 `not`; el E2E corre contra un binario `--features cuda` sin docs y se publica `docs,cuda` | Pregunta |
+  | T2 un binario por build de release | **Viva.** B3 compila `--bins`: dos enlaces con LTO fat | CI-K7 (variante A) |
+  | T3 perfil sin LTO fat para tests de release | Evaluada en F5: release no es crítico (32 % de holgura); ya existe `[profile.quick]` | No ahora; se mide en la campaña |
+  | T9 lo barato primero | Hecha (F1) | — |
+  | T7 flujos de GitHub | Viva (`cargo install` de audit, deny y cross; `actions/cache` con clave solo de Cargo.lock) | Después de la 0.31 (toca publish.yml) |
+  | T8 `jobs = 3` | Hecha en el juez (jobs por fila; CI-K4 los calcula de la PC) | — |
+  | T6 mutación | Paso 1 cubierto por la semilla por contenido (F4) y el A/B de sccache pendiente; paso 2 (crate `search-core`) es refactor de producto | Después de la 0.31 |
+  | T5 nextest y agrupar tests | Fase B = CI-K3 (25 de 120). Fase A choca con `ci-rapido.md` (nextest como veredicto con estado global) | Pregunta |
+
+  Especificador de **CI-K7** lanzado (T1 y T2, y el análisis de T4 para la decisión). Versión depurada enviada a la sesión de Mapupita (`l24-ci-e6`), con lo que aplica a su juez.
