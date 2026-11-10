@@ -287,7 +287,12 @@ async fn reranking_reorders_candidates_by_relevance() {
         memory_industry::search::rerank::is_configured(),
         "no reranker model on disk: this suite measures the model path and cannot report on it"
     );
-    memory_industry::search::rerank::warm_up().await;
+    // Opens the session and nothing else. `warm_up` would also run a batch of 50 candidates (47 s
+    // on the CPU with 8 threads) whose result this test throws away: the warm-up test above owns
+    // that batch. `rerank_within` loads through this same call.
+    tokio::task::spawn_blocking(memory_industry::search::rerank::enabled)
+        .await
+        .expect("the load of the reranker session did not panic");
     assert!(
         memory_industry::search::rerank::enabled(),
         "the reranker is configured but did not load: {:?}. That is the failure this test \

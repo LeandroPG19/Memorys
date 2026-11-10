@@ -16,7 +16,16 @@
 //! - the monotonic clock (`JumpClock`): "30 seconds later" is an `advance`, not a sleep;
 //! - the HTTP client of the bridge keeps no idle connections, so a daemon that is stopped is
 //!   really gone for the next request and not still answering on a pooled socket;
-//! - the state directory is under the temp dir, never the user's home or `%LOCALAPPDATA%`.
+//! - the state directory is under the temp dir, never the user's home or `%LOCALAPPDATA%`;
+//! - the models: every daemon here starts with the reranker and the embedder switched off
+//!   (`start_daemon`). Nothing in this file asks a model anything, and a daemon that warms the
+//!   judge's real reranker starts a batch of 50 candidates in a `spawn_blocking` thread that
+//!   nobody can cancel: the daemon serves after `WARM_CEILING`, the test goes on, and the runtime
+//!   of a `#[tokio::test]` waits for that thread when the test ends. Measured over 17 passes of
+//!   the judge's debug row, the binary took about 28 s plus about 32 s for every test that ended
+//!   with the batch still running (the "running for over 60 seconds" notice): 90 to 219 s for
+//!   9 tests and 12 daemons. `v029_accounts_over_real_http` has the same four variables for the
+//!   same reason (553 s to 10.9 s).
 //!
 //! `MEMORY_INDUSTRY_REQUIRE_ACCOUNTS` only bites on a bind other machines could reach, and
 //! `0.0.0.0` is the one such address every machine has. J5 binds it for the length of the test
@@ -157,6 +166,17 @@ async fn start_daemon(bind: &str, pool: &PgPool, env: &[(&str, Option<&str>)]) -
             "MEMORY_INDUSTRY_WARM_BEFORE_SERVE_SECS",
             WARM_CEILING.as_secs().to_string(),
         );
+        // The models stay off, see the header: the same four variables as
+        // `v029_accounts_over_real_http::serve`, set for every daemon of this binary and never
+        // removed. No test here reads them back or asks a model anything: the calls are `ping`,
+        // `cuba_whoami`, `/identity`, `/pair` and `/health`.
+        std::env::set_var("CUBA_RERANKER_PATH", "disabled-by-resource-plan");
+        std::env::set_var("CUBA_NLI_PATH", "disabled-by-resource-plan");
+        std::env::set_var(
+            "ONNX_MODEL_PATH",
+            std::env::temp_dir().join("v029-bridge-no-such-model"),
+        );
+        std::env::set_var("CUBA_WARM_RERANKER", "0");
         for name in [
             "CUBA_PANEL",
             "CUBA_HTTP_ALLOWED_ORIGINS",
@@ -172,6 +192,15 @@ async fn start_daemon(bind: &str, pool: &PgPool, env: &[(&str, Option<&str>)]) -
             }
         }
     }
+    // Presence anchor: with the four lines above gone the daemon would resolve the reranker the
+    // judge exports (or the cache's) and the warm-up would be back. `resolved_model_dir` reads
+    // the environment the daemon is about to read, and is `None` only for the plan's marker.
+    assert!(
+        memory_industry::search::rerank::resolved_model_dir().is_none(),
+        "the daemons of this binary must start with no reranker: nothing here asks a model \
+         anything, and a real one costs a 50-candidate warm-up batch per daemon that the test \
+         runtime waits for (90-219 s for this binary)"
+    );
     let pool = pool.clone();
     let port = ephemeral::port();
     let addr = format!("{bind}:{port}");
