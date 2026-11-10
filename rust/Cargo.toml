@@ -32,7 +32,8 @@ pgvector = { version = "0.4", features = ["sqlx"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-ort = { version = "=2.0.0-rc.12", features = ["load-dynamic", "tls-native-vendored", "half"] }
+# default-features off: the default `download-binaries` builds ureq and OpenSSL for ort-sys's build script, which returns at once under `load-dynamic`.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "api-24", "load-dynamic", "half"] }
 # Direct only to open ONNX Runtime before `ort` does: rc.12 deadlocks on a
 # library it cannot load (see `embeddings::onnx::load_onnxruntime_once`). The
 # version `ort` already pulls in, so the lock gains an edge and no crate.
