@@ -4,6 +4,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::sync::chunk::{
@@ -283,7 +284,7 @@ async fn export_into(
 ) -> Result<Value> {
     let root = root.to_path_buf();
     let mut lock = pool.begin().await?;
-    take_sync_lock(&mut lock).await?;
+    take_sync_lock(&mut lock, SYNC_LOCK_WAIT).await?;
 
     let project_id = if scope == "all" {
         None
@@ -1520,11 +1521,28 @@ fn recompute_digest(root: &Path, project_id: Option<Uuid>) -> Result<String> {
     Ok(digest.finish(project_id))
 }
 
-pub const SYNC_LOCK_WAIT: &str = "10s";
+/// How long a sync waits for the lock another sync holds. A parameter of `take_sync_lock` and not a setting of the
+/// environment: Postgres reads `lock_timeout = 0` as wait forever, so a variable written wrong in production would
+/// bring back the hang this wait exists to end.
+pub const SYNC_LOCK_WAIT: Duration = Duration::from_secs(10);
 pub const SYNC_STATEMENT_BUDGET: &str = "300s";
 
-async fn take_sync_lock(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
-    sqlx::query(&format!("SET LOCAL lock_timeout = '{SYNC_LOCK_WAIT}'"))
+/// `SET` takes no bound parameters; the number is an integer of milliseconds, so nothing the caller writes reaches it.
+pub fn lock_timeout_sql(wait: Duration) -> Result<String> {
+    let millis = wait.as_millis();
+    if millis == 0 {
+        anyhow::bail!(
+            "a lock wait of {wait:?} is under a millisecond, and a lock_timeout of 0 means wait forever in Postgres"
+        );
+    }
+    Ok(format!("SET LOCAL lock_timeout = '{millis}ms'"))
+}
+
+pub async fn take_sync_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    wait: Duration,
+) -> Result<()> {
+    sqlx::query(&lock_timeout_sql(wait)?)
         .execute(&mut **tx)
         .await
         .context("bounding how long this sync may wait for the lock")?;
@@ -1541,7 +1559,7 @@ async fn take_sync_lock(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Resul
         .await
         .map_err(|e| {
             anyhow::anyhow!(
-                "another sync is holding the lock and this one waited {SYNC_LOCK_WAIT} for it. \
+                "another sync is holding the lock and this one waited {wait:?} for it. \
                  The export writes files and prunes the ones it did not write, and the import \
                  runs in one transaction, so the two must never overlap. Nothing was written. \
                  Underlying: {e}"
@@ -1856,7 +1874,7 @@ async fn import(
     };
 
     let mut tx = pool.begin().await?;
-    take_sync_lock(&mut tx).await?;
+    take_sync_lock(&mut tx, SYNC_LOCK_WAIT).await?;
 
     let scoped = match manifest.project_id {
         Some(pid) => {
@@ -3130,6 +3148,38 @@ mod tests {
              content of an import behind a review queue"
         );
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn the_production_wait_for_the_sync_lock_is_ten_seconds_and_is_written_in_milliseconds() {
+        assert_eq!(
+            SYNC_LOCK_WAIT,
+            std::time::Duration::from_secs(10),
+            "the wait a real sync gives the lock is the one thing the injected-wait test in \
+             v025 does not exercise: this is where it is pinned"
+        );
+        assert_eq!(
+            lock_timeout_sql(SYNC_LOCK_WAIT).expect("ten seconds is a valid wait"),
+            "SET LOCAL lock_timeout = '10000ms'"
+        );
+        assert_eq!(
+            lock_timeout_sql(std::time::Duration::from_secs(1)).expect("a second is a valid wait"),
+            "SET LOCAL lock_timeout = '1000ms'"
+        );
+    }
+
+    #[test]
+    fn a_wait_under_a_millisecond_is_refused_because_postgres_reads_zero_as_wait_forever() {
+        let why = lock_timeout_sql(std::time::Duration::ZERO)
+            .expect_err("a zero wait must not be accepted")
+            .to_string();
+        assert!(
+            why.contains("wait forever"),
+            "lock_timeout = 0 in Postgres means wait forever, which is the hang this lock \
+             exists to prevent; the refusal has to say so. Got: {why}"
+        );
+        lock_timeout_sql(std::time::Duration::from_micros(999))
+            .expect_err("999 microseconds rounds down to 0 ms, which is the same hang");
     }
 }
 

@@ -1,17 +1,13 @@
-use serde_json::json;
-use uuid::Uuid;
+use std::time::{Duration, Instant};
 
 #[tokio::test]
 #[ignore]
 async fn a_sync_that_cannot_get_the_lock_gives_up_and_says_why() {
     let url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL env var required for integration tests");
-    let bundle = std::env::temp_dir().join(format!("cuba-stuck-{}", Uuid::new_v4()));
     let pool = memory_industry::db::create_pool(&url)
         .await
         .expect("connect to test database");
-    std::fs::create_dir_all(&bundle).expect("a scratch bundle directory");
-    unsafe { std::env::set_var("CUBA_SYNC_DIR", &bundle) };
 
     let mut holder = pool.begin().await.expect("begin the blocking transaction");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -20,30 +16,29 @@ async fn a_sync_that_cannot_get_the_lock_gives_up_and_says_why() {
         .await
         .expect("hold the sync lock the way a running import would");
 
-    let started = std::time::Instant::now();
+    // The wait is a parameter: production gives 10 s (pinned by a unit test in handlers/sync.rs), and
+    // this test gives 1 s so that it does not sit out the production wait to prove the wait ends.
+    let wait = Duration::from_secs(1);
+    let mut waiter = pool.begin().await.expect("begin the waiting transaction");
+    let started = Instant::now();
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        memory_industry::handlers::dispatch(
-            &pool,
-            "cuba_sync",
-            json!({"action": "export", "scope": "all", "dir": bundle.display().to_string()}),
-        ),
+        wait * 5,
+        memory_industry::handlers::sync::take_sync_lock(&mut waiter, wait),
     )
     .await;
-
     let elapsed = started.elapsed();
-    let inner = outcome.unwrap_or_else(|_| {
+
+    let taken = outcome.unwrap_or_else(|_| {
         panic!(
-            "the sync was still waiting for the lock after 60s. pg_advisory_xact_lock blocks \
-             forever by default, and lock_timeout, statement_timeout and \
-             idle_in_transaction_session_timeout were all measured at 0 on this database — so a \
-             sync that collided with another had no way to end. A hung handler is worse than a \
-             failed one: it holds a connection and reports nothing"
+            "still waiting for the lock after 5 × the wait: lock_timeout is not the one taking \
+             effect. pg_advisory_xact_lock blocks forever by default, and a sync that collided \
+             with another had no way to end: a hung handler is worse than a failed one, it holds \
+             a connection and reports nothing"
         )
     });
 
-    let why = match inner {
-        Ok(v) => panic!("the export ran while another transaction held the sync lock: {v}"),
+    let why = match taken {
+        Ok(()) => panic!("the lock was taken while another transaction held it"),
         Err(e) => format!("{e:#}"),
     };
     assert!(
@@ -52,12 +47,15 @@ async fn a_sync_that_cannot_get_the_lock_gives_up_and_says_why() {
          database fault and goes looking in the wrong place. Got: {why}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(30),
-        "it gave up after {elapsed:?}, which is far past the configured wait: the timeout is not \
-         the one taking effect"
+        why.contains("waited 1s"),
+        "the error names the wait it gave up after, which is the one it was given. Got: {why}"
+    );
+    assert!(
+        elapsed >= wait,
+        "it gave up after {elapsed:?}, before the {wait:?} it was told to wait: what ended it was \
+         not the lock_timeout but some other, instant failure"
     );
 
+    drop(waiter);
     drop(holder);
-    let _ = std::fs::remove_dir_all(&bundle);
-    unsafe { std::env::remove_var("CUBA_SYNC_DIR") };
 }
