@@ -983,6 +983,17 @@ self_test() {
   hermetic="$(mktemp -d)"
   mkdir -p "$hermetic/home" "$hermetic/cache"
   export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
+  # Measured 2026-11-09 under WSL: the PATH of a shell there ends in the directories of Windows (68 of them,
+  # /mnt/c/..., served over 9p), and a command that does not exist is looked for in every one before bash says
+  # so. The rows ask for cygpath, which only Git Bash has, more than two hundred times: each miss was 3 to 16 s
+  # of clock and no CPU, which is where the minutes of this self-test went. No row runs a tool of Windows, so
+  # those directories are left out of the PATH the rows and their children get. A PATH with none is unchanged.
+  path_kept=""
+  IFS=: read -ra path_dirs <<<"$PATH"
+  for path_dir in "${path_dirs[@]}"; do
+    [[ "$path_dir" == /mnt/[a-z]/* ]] || path_kept+="${path_kept:+:}$path_dir"
+  done
+  export PATH="$path_kept"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp" "$hermetic"' EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
@@ -1749,7 +1760,7 @@ FAKE
   slice=user.slice/user-1000.slice
   self_scope='0::/user.slice/user-1000.slice/session-1.scope'
   cg_tree() { g5_root="$tmp/cg.$1/root"; g5_self="$tmp/cg.$1/self"; mkdir -p "$g5_root"; printf '%s\n' "$2" >"$g5_self"; }
-  cg_put() { mkdir -p "$g5_root/$1"; printf '%s\n' "$3" >"$g5_root/$1/$2"; }
+  cg_put() { [[ -d "$g5_root/$1" ]] || mkdir -p "$g5_root/$1"; printf '%s\n' "$3" >"$g5_root/$1/$2"; }
 
   # J5.1: 32 GB of cap with 20 GB in use leaves 12 GB under the cgroup, against the 40 GB
   # that MemAvailable says: the margin is the smaller, 12 GB, and 12 GB is 3 jobs, not 6.
@@ -1860,10 +1871,28 @@ FAKE
   # added under the scope, or when only the tightest level is in the tree. Three shapes of one
   # tree, one KB each, and the one the generator computed.
   p2_plan() { bash "$ROOT/scripts/mutants-gate.sh" --jobs-plan "$1" "$2" 2>/dev/null | sed -n 's/^jobs=//p' || true; }
+  # Measured 2026-11-09: these two loops start this script 600 times (360 and 240), and in series that was a third
+  # of this self-test. The cases are still drawn here, one after another from the one seed, so they are the cases
+  # they were; what is judged at the same time is each case, in a child that says its own red. par_wait waits for
+  # every child it is given and exits 1 if one of them did: a child nobody waits for is a green nobody saw.
+  # Four at a time, or the cores less two when that is fewer: measured on 24 threads, the whole self-test was
+  # 57 s with 1, 38 s with 4, 38 s with 8 and 40 s with 22, and its CPU 62, 69, 86 and 138 s (the children are
+  # all fork). MUTANTS_SELF_TEST_JOBS=1 is the series, and gives the same verdict.
+  par_jobs=$(( $(nproc 2>/dev/null || echo 3) - 2 ))
+  (( par_jobs <= 4 )) || par_jobs=4
+  par_jobs="${MUTANTS_SELF_TEST_JOBS:-$par_jobs}"
+  [[ "$par_jobs" =~ ^[1-9][0-9]*$ ]] || par_jobs=1
+  par_pids=()
+  par_wait() {
+    local pid bad=0
+    for pid in "$@"; do wait "$pid" || bad=1; done
+    (( bad == 0 )) || exit 1
+  }
   RANDOM=20261106
   for ((p2_n = 0; p2_n < 120; p2_n++)); do
     p2_c=$(( RANDOM % 64 + 1 ))
     p2_kb=$(( (RANDOM * 32768 + RANDOM) % 80000001 ))
+    (
     p2_j="$(p2_plan "$p2_c" "$p2_kb")"
     [[ "$p2_j" =~ ^[1-6]$ ]] || self_fail "P2 seed 20261106, case $p2_n: --jobs-plan $p2_c $p2_kb printed '$p2_j', not a number of jobs from 1 to 6"
     p2_half=$(( p2_c / 2 )); (( p2_half >= 1 )) || p2_half=1
@@ -1874,9 +1903,15 @@ FAKE
     [[ "$p2_more" =~ ^[0-9]+$ ]] && (( p2_more >= p2_j )) || self_fail "P2 seed 20261106, case $p2_n: one more core gave '$p2_more' jobs, fewer than $p2_j"
     p2_more="$(p2_plan "$p2_c" $(( p2_kb + 4194304 )))"
     [[ "$p2_more" =~ ^[0-9]+$ ]] && (( p2_more >= p2_j )) || self_fail "P2 seed 20261106, case $p2_n: one GB more available gave '$p2_more' jobs, fewer than $p2_j"
+    ) &
+    par_pids+=("$!")
+    if (( ${#par_pids[@]} >= par_jobs )); then par_wait "${par_pids[@]}"; par_pids=(); fi
   done
+  par_wait ${par_pids[@]+"${par_pids[@]}"}
+  par_pids=()
 
   g5_meminfo p3 'MemTotal:       2000000000 kB' 'MemAvailable:   2000000000 kB'
+  p3_meminfo="$tmp/meminfo.p3"
   for ((p3_n = 0; p3_n < 60; p3_n++)); do
     p3_levels=$(( RANDOM % 4 + 1 ))
     p3_path=""; p3_lvl=(); p3_max=(); p3_cur=()
@@ -1898,35 +1933,39 @@ FAKE
       if [[ -z "$p3_want" ]] || (( p3_v < p3_want )); then p3_want=$p3_v; p3_tight=$p3_i; fi
     done
     p3_last=$(( p3_levels - 1 ))
-
-    cg_tree "p3a$p3_n" "0::/${p3_lvl[p3_last]}"
-    for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
-      cg_put "${p3_lvl[p3_i]}" memory.max "${p3_max[p3_i]}"
-      cg_put "${p3_lvl[p3_i]}" memory.current "${p3_cur[p3_i]}"
-    done
-    g5_run --available-kb "$tmp/meminfo.p3"
-    [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
-      || self_fail "P3 seed 20261106, case $p3_n: the margin of $p3_levels levels was '$(cat "$tmp/g5.out")' (exit $rc), not the minimum over them, $p3_want KB"
-
     p3_perm=()
     for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do p3_perm[p3_i]=$p3_i; done
     for ((p3_i = p3_last; p3_i > 0; p3_i--)); do
       p3_j=$(( RANDOM % (p3_i + 1) )); p3_t=${p3_perm[p3_i]}; p3_perm[p3_i]=${p3_perm[p3_j]}; p3_perm[p3_j]=$p3_t
     done
+
+    (
+    # A directory of this case's: its four trees, and the g5.out and g5.err of its runs.
+    tmp="$tmp/p3.$p3_n"
+    mkdir -p "$tmp"
+    cg_tree "p3a$p3_n" "0::/${p3_lvl[p3_last]}"
+    for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
+      cg_put "${p3_lvl[p3_i]}" memory.max "${p3_max[p3_i]}"
+      cg_put "${p3_lvl[p3_i]}" memory.current "${p3_cur[p3_i]}"
+    done
+    g5_run --available-kb "$p3_meminfo"
+    [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
+      || self_fail "P3 seed 20261106, case $p3_n: the margin of $p3_levels levels was '$(cat "$tmp/g5.out")' (exit $rc), not the minimum over them, $p3_want KB"
+
     cg_tree "p3b$p3_n" "0::/${p3_lvl[p3_last]}"
     for ((p3_i = 0; p3_i < p3_levels; p3_i++)); do
       p3_src=${p3_perm[p3_i]}
       cg_put "${p3_lvl[p3_i]}" memory.max "${p3_max[p3_src]}"
       cg_put "${p3_lvl[p3_i]}" memory.current "${p3_cur[p3_src]}"
     done
-    g5_run --available-kb "$tmp/meminfo.p3"
+    g5_run --available-kb "$p3_meminfo"
     [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
       || self_fail "P3 seed 20261106, case $p3_n: the same limits on other levels gave '$(cat "$tmp/g5.out")' (exit $rc), not $p3_want KB"
 
     cg_tree "p3c$p3_n" "0::/${p3_lvl[p3_tight]}"
     cg_put "${p3_lvl[p3_tight]}" memory.max "${p3_max[p3_tight]}"
     cg_put "${p3_lvl[p3_tight]}" memory.current "${p3_cur[p3_tight]}"
-    g5_run --available-kb "$tmp/meminfo.p3"
+    g5_run --available-kb "$p3_meminfo"
     [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
       || self_fail "P3 seed 20261106, case $p3_n: the tightest level alone gave '$(cat "$tmp/g5.out")' (exit $rc), not $p3_want KB"
 
@@ -1937,10 +1976,15 @@ FAKE
     done
     cg_put "${p3_lvl[p3_last]}/extra" memory.max max
     cg_put "${p3_lvl[p3_last]}/extra" memory.current 1
-    g5_run --available-kb "$tmp/meminfo.p3"
+    g5_run --available-kb "$p3_meminfo"
     [[ "$rc" == 0 && "$(cat "$tmp/g5.out")" == "$p3_want" ]] \
       || self_fail "P3 seed 20261106, case $p3_n: a level with max under the scope gave '$(cat "$tmp/g5.out")' (exit $rc), not $p3_want KB"
+    ) &
+    par_pids+=("$!")
+    if (( ${#par_pids[@]} >= par_jobs )); then par_wait "${par_pids[@]}"; par_pids=(); fi
   done
+  par_wait ${par_pids[@]+"${par_pids[@]}"}
+  par_pids=()
   unset g5_root g5_self
 
   # --- J1.9 (D-J1d): the mutation step, with a DATABASE_URL, asks that server who it is
@@ -2707,11 +2751,15 @@ REAL
   # The tools of /usr/bin and /bin, each one linked, but the rustup proxies: /usr/bin/cargo and rustc are
   # links to rustup here, so no PATH that names /usr/bin can be without cargo.
   mkdir -p "$tmp/f4d/nocargo"
+  # One ln for all of them (measured 2026-11-09: one ln each was 1638 processes, 4 s): the first of each name, as before.
+  local -A f4d_seen=()
+  f4d_links=()
   for tool in /usr/bin/* /bin/*; do
     name="${tool##*/}"
     case "$name" in cargo|cargo-*|rustc|rustup|rust-*) continue ;; esac
-    if [[ -x "$tool" && ! -e "$tmp/f4d/nocargo/$name" ]]; then ln -s "$tool" "$tmp/f4d/nocargo/$name"; fi
+    if [[ -x "$tool" && -z "${f4d_seen[$name]:-}" ]]; then f4d_seen[$name]=1; f4d_links+=("$tool"); fi
   done
+  ln -s -t "$tmp/f4d/nocargo" -- "${f4d_links[@]}"
   node_bin="$(command -v node || true)"
   [[ -z "$node_bin" ]] || ln -sf "$node_bin" "$tmp/f4d/nocargo/node"
   printf '#!/bin/bash\nexec "$(dirname "$0")/cargo" "$@"\n' > "$tmp/f4d/nocargo/cargo-mutants"

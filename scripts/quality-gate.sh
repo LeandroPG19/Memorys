@@ -1189,6 +1189,17 @@ if [[ "${1:-}" == "--self-test" ]]; then
   hermetic="$(mktemp -d)"
   mkdir -p "$hermetic/home" "$hermetic/cache"
   export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
+  # Measured 2026-11-09 under WSL: the PATH of a shell there ends in the directories of Windows (68 of them,
+  # /mnt/c/..., served over 9p), and a command that does not exist is looked for in every one before bash says
+  # so. The rows ask for cygpath, which only Git Bash has, more than two hundred times: each miss was 3 to 16 s
+  # of clock and no CPU, which is where the minutes of this self-test went. No row runs a tool of Windows, so
+  # those directories are left out of the PATH the rows and their children get. A PATH with none is unchanged.
+  path_kept=""
+  IFS=: read -ra path_dirs <<<"$PATH"
+  for path_dir in "${path_dirs[@]}"; do
+    [[ "$path_dir" == /mnt/[a-z]/* ]] || path_kept+="${path_kept:+:}$path_dir"
+  done
+  export PATH="$path_kept"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp" "$hermetic"' EXIT
   mkdir -p "$tmp/src"
