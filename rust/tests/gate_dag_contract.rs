@@ -3484,27 +3484,30 @@ fn a_measure_that_fails_falls_back_to_series_and_says_so() {
     check(&fx, &broken.env(), "nproc");
 }
 
-/// A step that marks that it is inside (`in/<id>`), counts how many are, and waits for the others until `open` exists or
-/// `ticks` x 0.1 s pass (`ticks` is in the control directory, 0 for the run that seeds the history). Whoever sees three
-/// inside opens the barrier. The count it saw goes to `counts`. $1 id, $2 unused, $3 control directory.
+/// A step of the barrier of E7a.5. It marks that it entered (`in/<id>`, never removed during a run) and does not leave until
+/// `want` rows have entered, or until `ticks` x 0.1 s pass (both are in the control directory; absent, 0, for the run that
+/// seeds the history). Nobody leaves before `want` have entered, so when the `want`-th enters the `want` are alive together,
+/// whatever the load of the machine; a row that enters after the others left finds `want` marks already and goes on. Before
+/// leaving it writes how many rows were alive (`in` less `out`, read in that order, so it never counts more than are) to
+/// `counts`, and then its mark in `out/<id>`. The deadline only runs out if the planner could not start the rows that
+/// the barrier waits for. $1 id, $2 unused, $3 control directory.
 const BARRIER_SH: &str = r#"#!/bin/sh
 id="$1"
 control="$3"
-mkdir -p "$control/in"
+mkdir -p "$control/in" "$control/out"
 echo "=== $id banner"
 : > "$control/in/$id"
-ls "$control/in" | wc -l | tr -d ' ' >> "$control/counts"
+want=$(cat "$control/want" 2>/dev/null || echo 0)
 limit=$(cat "$control/ticks" 2>/dev/null || echo 0)
 i=0
-while [ ! -e "$control/open" ] && [ "$i" -lt "$limit" ]; do
-    if [ "$(ls "$control/in" | wc -l)" -ge 3 ]; then
-        : > "$control/open"
-        break
-    fi
+while [ "$(ls "$control/in" | wc -l | tr -d ' ')" -lt "$want" ] && [ "$i" -lt "$limit" ]; do
     sleep 0.1
     i=$((i + 1))
 done
-rm -f "$control/in/$id"
+entered=$(ls "$control/in" | wc -l | tr -d ' ')
+left=$(ls "$control/out" | wc -l | tr -d ' ')
+echo $((entered - left)) >> "$control/counts"
+: > "$control/out/$id"
 echo "Running unittests fake $id"
 echo "test result: ok. 1 passed; 0 failed"
 "#;
@@ -3513,13 +3516,15 @@ echo "test result: ok. 1 passed; 0 failed"
 /// are one DAG. Three rows with no dependency and no shared resource, each naming 8 jobs, with almost no CPU or RAM in the
 /// history, so that only the jobs can hold one back. With J = 16 two fit (8 + 8) and the third waits with `jobs`, in
 /// `auto` and in `maximo`; with J = 24 the three are inside together and none waits for `lanes` or `jobs`. The barrier is
-/// a directory of marks and a deadline, not a sleep.
+/// a directory of marks that no row leaves before `want` have entered, with a deadline of 20 s that runs out only if the
+/// planner cannot start the rows, so what the test says does not depend on how long a row takes to start. Where only two
+/// fit, nobody can see the third not coming in by waiting for it: the planner says it, with the reason `jobs` of the row
+/// that waited and the instants of its records (the last row to start started after the first one to end).
 #[test]
 fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_maximo() {
-    // The deadline of the barrier is the cost of proving that a third row did not come in: 2 s where only two fit, where
-    // the rows that wait for it wait all of it, and 4 s where the three fit, where the barrier opens as soon as the three
-    // are inside, so a slow start of a row on a loaded machine costs nothing there.
-    let drive = |name: &str, cpu_max: &str, nproc: &str, mem_gib: u64, ticks: &str| {
+    // 20 s of barrier, under the 30 s `run_command` gives a planner: it is spent only if the rows the barrier waits for cannot
+    // be inside together, which is what a red of this test is. `want` is how many rows must be inside together to leave.
+    let drive = |name: &str, cpu_max: &str, nproc: &str, mem_gib: u64, want: &str| {
         let mut fx = Fixture::new(name, cpu_max, MEM_OPEN);
         let script = fx.base.join("barrera.sh");
         write(&script, BARRIER_SH);
@@ -3537,15 +3542,16 @@ fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_max
             fx.usage(id, 10_000);
         }
         fx.seed();
-        write(&fx.control.join("ticks"), ticks);
+        write(&fx.control.join("want"), want);
+        write(&fx.control.join("ticks"), "200");
         let host = machine(&fx, "jobs-vivos", nproc, mem_gib * KIB_PER_GIB);
         (fx, host)
     };
     let go = |fx: &Fixture, host: &Machine, mode: &str| -> (u32, Vec<Value>, String) {
-        for name in ["counts", "open"] {
-            let _ = fs::remove_file(fx.control.join(name));
+        let _ = fs::remove_file(fx.control.join("counts"));
+        for name in ["in", "out"] {
+            let _ = fs::remove_dir_all(fx.control.join(name));
         }
-        let _ = fs::remove_dir_all(fx.control.join("in"));
         let before = snapshot(&fx.history, "pasos.jsonl");
         let run = fx.run_env(mode, &host.env());
         assert_green(&run, mode);
@@ -3569,7 +3575,7 @@ fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_max
             .collect()
     };
 
-    let (fx, host) = drive("e7a-jobs-16", "1600000 100000", "16", 40, "20");
+    let (fx, host) = drive("e7a-jobs-16", "1600000 100000", "16", 40, "2");
     for mode in ["auto", "maximo"] {
         let (inside, steps, line) = go(&fx, &host, mode);
         assert!(
@@ -3591,6 +3597,18 @@ fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_max
             why.iter().all(|reason| reason != "lanes"),
             "{mode}: there are no lanes to wait for: {steps:?}"
         );
+        let first_end = steps
+            .iter()
+            .map(|record| num(record, "fin"))
+            .fold(f64::MAX, f64::min);
+        let last_start = steps
+            .iter()
+            .map(|record| num(record, "inicio"))
+            .fold(f64::MIN, f64::max);
+        assert!(
+            last_start >= first_end,
+            "{mode}: the three rows were alive at once, the last started at {last_start} and the first ended at {first_end}: {steps:?}"
+        );
         let overlapped = steps
             .iter()
             .filter(|record| record["solape_s"].as_f64().is_some_and(|s| s > 0.0))
@@ -3601,7 +3619,7 @@ fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_max
         );
     }
 
-    let (fx, host) = drive("e7a-jobs-24", "max 100000", "24", 64, "40");
+    let (fx, host) = drive("e7a-jobs-24", "max 100000", "24", 64, "3");
     let (inside, steps, line) = go(&fx, &host, "auto");
     assert!(
         line.contains(" jobs=24 (gate) asked=auto runs=dag"),
