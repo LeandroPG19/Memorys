@@ -99,8 +99,8 @@ PERFILES: dict[str, dict[str, Any]] = {
         "fila": "B3",
         "target": "T_rel",
         "ordenes": [
-            ["test", "--release", "--features", "cuda", "--no-run", "--lib", "--test", "v017_rerank_gpu"],
-            ["build", "--release", "--features", "cuda", "--bins"],
+            ["test", "--release", "--features", "docs,cuda", "--no-run", "--lib", "--test", "v017_rerank_gpu"],
+            ["build", "--release", "--features", "docs,cuda", "--bins"],
         ],
         "rejilla": [4, 6, 8, 12, 16],
     },

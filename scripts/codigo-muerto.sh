@@ -97,7 +97,8 @@ server_only_files() {
 # marker is rust/tests/ci_contract.rs's to judge, not this script's.
 check_server_only_tests_run_locally() {
   local ci="$1" gate="$2" tests="$3" today="$4" uncovered=0 file reason expired
-  local plain='^DATABASE_URL="\$GATE_DATABASE_URL" cargo test$'
+  # CI-K4: every cargo call of the judge carries --timings, a report flag; the plain cargo test is still the plain one.
+  local plain='^DATABASE_URL="\$GATE_DATABASE_URL" cargo test( --timings)?$'
   while read -r file; do
     [[ -z "$file" ]] && continue
     reason="$(head -n 1 "$file" | tr -d '\r')"
@@ -106,7 +107,7 @@ check_server_only_tests_run_locally() {
       echo "FAIL: $file opens with '$SERVER_MARKER' and no reason after it" >&2
       uncovered=$((uncovered + 1))
     fi
-    if ! grep -q "$plain" "$gate"; then
+    if ! grep -Eq "$plain" "$gate"; then
       echo "FAIL: ci.yml keeps $file out of the check job because run-all-tests.sh runs it in" >&2
       echo "      its plain cargo test against GATE_DATABASE_URL, and that line is gone" >&2
       uncovered=$((uncovered + 1))
