@@ -2,8 +2,9 @@
 """History of the local judge's runs (CI-F3, F3.1): the only writer of the JSONL history.
 
 Root: `${CI_TIEMPOS_DIR:-$HOME/.cache/ci-tiempos}/memory-industry/`, created when missing. One
-folder per UTC day holds `corridas.jsonl`, `pasos.jsonl`, `unidades.jsonl`, `indice.jsonl` and
-`flaky.jsonl`. Writes go under flock on `.candado` in the root. Every record has `repo`.
+folder per UTC day holds `corridas.jsonl`, `pasos.jsonl`, `unidades.jsonl`, `indice.jsonl`, `flaky.jsonl`
+and `usl.jsonl` (the points of the USL sweep of gate_usl.py, CI-F5a). Writes go under flock on `.candado` in
+the root. Every record has `repo`.
 
 It never changes a verdict. The library calls and `registrar` turn any failure into one
 `history: ...` line on stderr per process and exit 0; a history that cannot be written, a lock
@@ -12,7 +13,7 @@ an illegible manifest is exit 2. What was not measured is written as null, never
 is diagnosis only.
 
 Library use (the planner and the contract tests): run_start, step_start, step_end, units,
-run_end, lower_bounds, leer_jsonl. CLI (the serial writer): `registrar`, a JSON manifest on stdin.
+run_end, lower_bounds, leer_jsonl, usl_point. CLI (the serial writer): `registrar`, a JSON manifest on stdin.
 """
 
 from __future__ import annotations
@@ -513,6 +514,13 @@ def run_end(
         hilos=hilos,
         oom_kill=oom_kill,
     )
+
+
+@_sin_veredicto
+def usl_point(registro: dict[str, Any]) -> None:
+    """One point of a USL sweep (CI-F5a, D-F5l) into `usl.jsonl`, with `repo`, under the same lock. Like every
+    writer here it never raises: a point that cannot be written is the one `history:` warning."""
+    _escribir("usl.jsonl", {"repo": REPO, **registro})
 
 
 def _camino(
