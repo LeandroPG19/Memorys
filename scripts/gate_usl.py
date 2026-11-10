@@ -5,9 +5,10 @@
 scripts/gate-dag.txt and the orchestrator reviews and commits it, because the table's hash is the key
 of the history (D-F5r).
 
-- `barrido --perfil {debug,bin,release}`: compiles what a row of the judge compiles, at several
-  CARGO_BUILD_JOBS (J), crate cold and without incremental, and writes one point per J and replica
-  to `usl.jsonl` through gate_history.usl_point. Exit 2 when the machine is busy.
+- `barrido --perfil {debug,release}`: compiles what a row of the judge compiles, at several
+  CARGO_BUILD_JOBS (J), crate cold and without incremental, with the profile tokens of the row in
+  scripts/gate-dag.txt (CI-K4), and writes one point per J and replica to `usl.jsonl` through
+  gate_history.usl_point. Exit 2 when the machine is busy or the table cannot be read.
 - `ajustar --perfil P`: fits X(J) = lambda*J / (1 + sigma*(J-1) + kappa*J*(J-1)) to the points by
   least squares on the relative error, lambda profiled, over a fixed grid (no randomness). Exit 3
   when the fit is not reliable (five criteria, the first one that fails is the reason).
@@ -77,7 +78,9 @@ BORDE = 1 - 1e-9
 EXCLUSIVAS = frozenset({"exclusive", "boundary"})
 
 # Mapa fijo perfil -> fila (spec 3). The orders are the compilations of that row in run-all-tests.sh, in
-# its order (D-F5f); `cargo test --no-run` is the compile-only form of the judge's `cargo test`.
+# its order (D-F5f); `cargo test --no-run` is the compile-only form of the judge's `cargo test`. There is no
+# profile of the E2E row: since CI-F3.4 it is a reader that runs the release binary B3 built and compiles
+# nothing, and the release binary is compiled by B3, which `release` measures.
 PERFILES: dict[str, dict[str, Any]] = {
     "debug": {
         "fila": "DBG",
@@ -88,12 +91,6 @@ PERFILES: dict[str, dict[str, Any]] = {
             ["test", "--no-run"],
         ],
         "rejilla": [2, 4, 8, 12, 16, 24],
-    },
-    "bin": {
-        "fila": "E2E",
-        "target": "T_rel",
-        "ordenes": [["build", "--bin", "memory-industry"]],
-        "rejilla": [1, 2, 4, 6, 8],
     },
     "release": {
         "fila": "B3",
@@ -524,6 +521,20 @@ def _punto(
     }
 
 
+def _fila_de_la_tabla(id_: str) -> Any:
+    """The row of scripts/gate-dag.txt that a profile sweeps: its tokens are the profile of the sweep (D-K4f)."""
+    dag = gate_dag()
+    tabla = os.path.join(raiz(), "scripts", "gate-dag.txt")
+    try:
+        pasos = dag.parse_table(tabla)
+    except (OSError, dag.Refusal) as err:
+        fallar(f"the table {tabla} cannot be read ({err}): the sweep cannot know the profile of {id_}")
+    fila = next((p for p in pasos if p.id == id_), None)
+    if fila is None:
+        fallar(f"the table {tabla} has no row {id_}: the sweep cannot know its profile")
+    return fila
+
+
 def cmd_barrido(args: argparse.Namespace) -> int:
     perfil = PERFILES.get(args.perfil)
     if perfil is None:
@@ -535,6 +546,7 @@ def cmd_barrido(args: argparse.Namespace) -> int:
         fallar("--reps has to be 1 or more")
     plazo_s = _plazo_orden()
     dag = gate_dag()
+    fila = _fila_de_la_tabla(perfil["fila"])
     psi_archivo = os.environ.get("GATE_USL_PSI", PSI_ARCHIVO)
     psi = dag.psi_some_avg10(psi_archivo)
     if psi is None:
@@ -546,7 +558,9 @@ def cmd_barrido(args: argparse.Namespace) -> int:
     sha, sucio = dag.git_state(raiz())
     huella_ini = gate_history.huella(raiz())
     cores = dag.capacities()[0]
-    base = {**os.environ, "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": destino}
+    # The profile of the row is in the hash of every unit (D-K4f): without its tokens the sweep would measure another build
+    # and leave a second set of artifacts in the target of the judge.
+    base = {**os.environ, **dag.profile_of(fila), "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": destino}
     barrido = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}"
     for orden in perfil["ordenes"]:
         # the warm-up leaves the dependencies built; it writes nothing

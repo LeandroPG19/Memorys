@@ -1,7 +1,9 @@
 # Time ceiling per test binary, per judge host. scripts/test-times.sh reads it
 # as the last step of merge-gate.sh, over the gate's own log up to the line
 # `=== end of timed steps ===`: every `finished in` printed by the cargo test calls
-# of run-all-tests.sh and of the --features docs step, summed per binary.
+# of run-all-tests.sh, summed per binary. Since CI-K8 each binary runs once per judge:
+# the --features docs pass is gone (docs is a default feature, the build without it is
+# only linted), so a binary is no longer summed over two passes.
 #
 # A line: <os> <binary> <floor_s> <ceiling_s> <owner> <expires> <reason>
 #   os         windows (Git Bash) or linux. A host is judged by its own lines only.
@@ -42,6 +44,19 @@
 # CI-J7 (7-nov, orquestador-0.31) re-sets linux local_gate_contract to 44/133 from one measurement of the binary alone under
 # pesado: 44.18 s per round, 2 x 44.18 = 88.36 s; floor = floor(0.5 x 88.36) = 44, ceiling = ceil(1.5 x 88.36) = 133.
 
+# CI-K8 (10-nov, orquestador-0.31): one pass. Every line below that was set on the sum of two passes is set again on one.
+# Per-pass times come from the same logs: the carriles runs of 7-nov that the lines above call alone under pesado
+# (073815, 082500, 091943, 113706; the plain pass and the docs pass are two samples of one pass), and from today's
+# one-pass run of the contracts (verif-unica-20261110-083518, jobs=24). k = 1.3 with the four runs, 1.5 with one.
+# Lines that go: linux v029_accounts_redeem (one pass 1.89-2.07 s), v029_doctor_reads_only_its_world (2.29-2.44 s),
+# v029_accounts_over_real_http (4.66-5.03 s) and v045_a_merge_reaches_the_database (1.48-1.58 s): 1.3 x the slowest is under
+# the default of 10 s, so by the rule they have no line; the default still catches the 33 s and the 635 s they once guarded.
+# linux v046_migrations_apply_over_an_existing_schema needs none: its 12.94 s in the 19th run were 4.70 s here and 8.24 s of
+# the docs pass that no longer exists. linux v017_rerank_gpu and nli_cost are NOT touched: the backlog (ci-rapido.md, 8-nov
+# 15:47) decided that no ceiling moves on one run and that nli_cost is reproduced apart first; they wait for the final runs.
+# The windows lines are not touched either: this host does not measure them, and they still describe two passes (the sums
+# of two passes put the floor of windows local_gate_contract and v029_bridge_against_the_real_daemon on the edge of one pass).
+
 windows v029_bridge_against_the_real_daemon 52 399 orquestador-0.31 2026-11-30 a real daemon and the bridge against it, run by the plain cargo test and again by --features docs; 105.9-306.2 s in five runs, the widest spread of the judge and not explained yet
 windows local_gate_contract 58 217 orquestador-0.31 2026-11-30 every gate script's --self-test, each a throwaway gate tree of stand-ins, run twice; Git Bash forks slowly (16 s on linux); 116.5-166.5 s
 windows lib:memory_industry 23 68 orquestador-0.31 2026-11-30 the unit tests, run plain, --ignored, gpu:: in release and --features docs; 47.1-52.0 s
@@ -54,15 +69,11 @@ windows v045_a_merge_reaches_the_database 2 11 orquestador-0.31 2026-11-30 5.9-8
 windows v017_rerank_gpu 2 11 orquestador-0.31 2026-11-30 the real reranker on the GPU in release; 5.8-8.2 s (213 s on the CPU of the linux judge)
 windows v029_accounts_redeem 2 11 orquestador-0.31 2026-11-30 5.6-8.0 s, too close to the default to live under it
 
-linux v029_bridge_against_the_real_daemon 95 387 orquestador-0.31 2026-11-30 a real daemon and the bridge against it, twice per run; 191.0-257.8 s in two runs
+linux v029_bridge_against_the_real_daemon 45 286 orquestador-0.31 2026-11-30 a real daemon and the bridge against it; CI-K8: one pass, 90.32-219.39 s over the eight passes of the four complete runs alone under pesado of 7-nov (073815, 082500, 091943, 113706), k = 1.3; the widest spread of the judge and not explained yet; pending: to be set again by the first complete one-pass judge run
 linux v017_rerank_gpu 106 327 orquestador-0.31 2026-11-30 the reranker on the CPU: the ONNX runtime in WSL is the CPU one (doctor, 2026-10-14); 212.9-217.4 s. The GPU runtime in WSL brings it down, and this line with it
-linux lib:memory_industry 23 71 orquestador-0.31 2026-11-30 the unit tests, run plain, --ignored, gpu:: in release and --features docs; 46.6-47.2 s
-linux v029_accounts_over_real_http 5 16 orquestador-0.31 2026-11-30 real HTTP daemons over scratch databases, cloned from a template since T4a: 10.41 s in the F0 run of 2d61589 (6-nov-2026, one run; ceiling = ceil(1.5 x 10.41), floor = floor(0.5 x 10.41)); fcebc6c measured 33.5-39.3 s before the clone, and 635-847 s before 0.30: the ceiling still catches a return to that
+linux lib:memory_industry 13 35 orquestador-0.31 2026-11-30 the unit tests, run plain, --ignored and gpu:: in release (CI-K8: one pass, docs is a default feature); 26.44-26.77 s in the plain pass of the four complete runs alone under pesado of 7-nov (073815, 082500, 091943, 113706), k = 1.3; pending: to be set again by the first complete one-pass judge run
 linux v017_relation_scan 4 25 orquestador-0.31 2026-11-30 asks the generative LLM over the network; four complete runs of the judge, alone under pesado: 19.18 s (20261107-073815), 9.45 s (20261107-082500), 11.24 s (20261107-091943), 8.47 s (20261107-113706)
 linux v016_extract_without_sampling 5 26 orquestador-0.31 2026-11-30 asks the generative LLM over the network; 11.6-16.8 s
-linux local_gate_contract 44 133 orquestador-0.31 2026-11-30 the --self-test of the 13 gate scripts (SCRIPTS_WITH_SELF_TEST) under the judge's exported environment, one OnceLock run per script and six launches at a time (CI-J7); measured from the binary alone under pesado, 44.18 s per round, both rounds summed 88.36 s (the serial figure was 110/331, 220.26 s in the carriles run 20261107-073815); pending: to be set again by the next complete judge run
-linux gate_dag_contract 7 23 orquestador-0.31 2026-11-30 gate_dag_contract, run in both rounds (plain and --features docs): 7.57 s + 7.57 s = 15.14 s in the carriles run 20261107-073815, one run alone under pesado; it had no line, so the default 10 s applied
+linux local_gate_contract 34 103 orquestador-0.31 2026-11-30 the --self-test of the gate scripts under the judge's exported environment, one OnceLock run per script and six launches at a time (CI-J7); CI-K8: one pass, 131 tests in 68.17 s on 2026-11-10 (verif-unica-20261110-083518, one run, k = 1.5; floor = floor(0.5 x 68.17), ceiling = ceil(1.5 x 68.17)); pending: to be set again by the first complete one-pass judge run
+linux gate_dag_contract 5 16 orquestador-0.31 2026-11-30 gate_dag_contract; CI-K8: one pass, 74 tests in 10.25 s on 2026-11-10 (verif-unica-20261110-083518, one run, k = 1.5; floor = floor(0.5 x 10.25), ceiling = ceil(1.5 x 10.25)); it had 7/23 from 7.57 s a round with fewer tests; pending: to be set again by the first complete one-pass judge run
 linux v025_a_stuck_sync_fails_instead_of_hanging 5 16 orquestador-0.31 2026-11-30 waits for a stuck sync to give up, which is what it proves; 10.2 s
-linux v029_doctor_reads_only_its_world 3 13 orquestador-0.31 2026-11-30 7.9-8.4 s, too close to the default to live under it
-linux v029_accounts_redeem 3 11 orquestador-0.31 2026-11-30 6.9-7.3 s, too close to the default to live under it
-linux v045_a_merge_reaches_the_database 1 11 orquestador-0.31 2026-11-30 2.4-6.8 s, too close to the default to live under it
