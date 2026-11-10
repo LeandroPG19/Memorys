@@ -33,6 +33,8 @@ The real machine and a judge that does not lose the hour. 0.30.0 was proved and 
 
 - **`tokenizers` keeps only `onig`, its regex engine.** The progress bar and the C++ suffix array served training, which this crate never does. `number_prefix` (RUSTSEC-2025-0119, unmaintained) leaves `Cargo.lock` and its exception is gone from `scripts/advisory-exceptions.txt`, `.cargo/audit.toml` and `deny.toml`.
 
+- **`docs` is a default feature: `cargo build` and `cargo install` build what is published.** `cuba_docs` stays off and unadvertised unless `CUBA_DOCS=1` or `CUBA_MODE=completo`.
+
 ### Gate
 
 - **The judge ends by judging the time of every test binary.** `scripts/test-times.sh --judge` reads the log `merge-gate.sh` already writes, sums `finished in` per binary and fails over its ceiling, under its floor, or on a dead, malformed or expired line; exit 2 when it cannot measure. Ceilings are per OS (the reranker is 6 s on the Windows GPU and 213 s on the Linux CPU), default 10 s, each line with reason, owner and expiry; the ten slowest print on every run. Over the real 0.30 logs the Windows runs and the Linux `b110ac2` are green and the pre-0.30 logs are red on exactly what 0.30 fixed (`v029_accounts` 1180 s). Declared deviation from `ci.md`: stable `libtest` has no JSON, so the number comes from text. (G7)
