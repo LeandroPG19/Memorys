@@ -436,15 +436,22 @@ contracts) and `lane_E` (the E2E, the doctor, the MCP live session and the eval 
   `B3` `T_rel`. The readers `DBG`, `CT`, `D2`, `D3` and `NLI` read the `T_dbg` that `B1` builds, and the
   release readers `REL` and `E2E` the `T_rel` that `B3` builds.
 - A step without a `target:` keeps the `CARGO_TARGET_DIR` of the gate.
-- `GATE_DAG` chooses how the planner runs the one table. `0` or `serie` (the default) is the series: the
-  rows in idx order, one at a time. `1`, `maximo` and `auto` are one and the same DAG: a row starts when its
-  deps ended green and the admission below lets it in. The switch is the environment of `gate-dag.py`;
-  `merge-gate.sh` does not set it.
-- A DAG that was asked for still runs in series, and a `note:` line says why, when the scope the gate runs
+- `GATE_DAG` chooses how the planner runs the one table. With nothing set (the default since CI-E24,
+  2026-11-10) it asks for `auto`, the DAG. `0` or `serie` forces the series: the rows in idx order, one at a
+  time. `1`, `maximo` and `auto` are one and the same DAG: a row starts when its deps ended green and the
+  admission below lets it in. The switch is the environment of `gate-dag.py`; `merge-gate.sh` does not set
+  it. Measured on 2026-11-10 on the 24 threads of this machine, with the crate recompiled: the series in
+  991 s, the DAG in 387.5 s alone and in 583 s in a shared turn of 12 CPUs.
+- The DAG cannot be the default while a line of `scripts/gate-latency.txt` is `pendiente`:
+  `the_dag_is_not_the_default_while_a_latency_line_is_pending` (D-F34n). Going back is one word: `"auto"` to
+  `"0"` in `gate-dag.py`.
+- A DAG, asked for or by default, still runs in series, and a `note:` line says why, when the scope the gate runs
   in is not delegated (nothing could be measured or killed per row), when the history has no green serial
   run of this table (so a table whose rows changed starts in series), when `DATABASE_URL` names a server of
   the operator (every row would share it, and sqlx drops databases by name), or when the machine could not
-  be measured (then with one job). The run is recorded with the mode that ran.
+  be measured (then with one job). The run is recorded with the mode that ran. So the first run of a table, every run
+  with an operator's `DATABASE_URL` and every run outside a delegated cgroup (outside `pesado`, and on Windows) is a
+  series.
 - Before the first row the planner measures the machine, with the same count `gate_cargo_jobs` makes, and
   prints its plan in one line: `plan: nproc=… cgroup_cpu=… ram_free=… GiB disk_free=… GB battery=… jobs=N
   (gate|operator|failed) asked=<serie|auto|maximo> runs=<serie|dag>`, followed by the reason in

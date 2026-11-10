@@ -19,6 +19,8 @@ Publishing is **`./scripts/release.sh vX.Y.Z`** and nothing else. When `merge-ga
 | `./scripts/merge-gate.sh` | The SIL. fmt, clippy `-D warnings`, `--ignored`, e2e (no soft-skip), deny, audit, `codigo-muerto`, `crap-gate` floor, `mutants-gate` on mmr/rrf/cache. | A fraction (`cargo test --lib`). GitHub Actions. |
 | `./scripts/quality-gate.sh` | CRAP/lizard + `cargo mutants` on `rust/src` **in the diff**. | A substitute for the SIL. Does not run merge-gate. |
 
+The SIL runs its rows as a DAG by default since 2026-11-10 (about 6.5 min alone, 10 min in a shared turn of `pesado -p`); `GATE_DAG=0` forces the series (16.5 min). The first run of a changed table, a run with an operator's `DATABASE_URL` and a run outside `pesado` are a series by themselves: `docs/gate.md` says why.
+
 `quality-gate` after the SIL when the change touched `rust/src` or Python. A missing lizard / cargo-mutants is exit 2: the hardener does not close.
 
 ## Six-pack
