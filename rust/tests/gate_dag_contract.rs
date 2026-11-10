@@ -122,6 +122,12 @@ impl Fixture {
         write(&scope.join("memory.stat"), "anon 0\ninactive_file 0\n");
         write(&scope.join("cgroup.subtree_control"), "");
         write(&proc_self, "0::/scope\n");
+        // CI-E7a (D-E7b): R is the RAM free less its reserve, so the planner reads MemAvailable on every run, and a test
+        // that does not name a machine gets 64 GiB of its own and not the free memory of whoever runs `cargo test`.
+        write(
+            &base.join("meminfo-default"),
+            "MemTotal:       67108864 kB\nMemFree:        67108864 kB\nMemAvailable:   67108864 kB\n",
+        );
         Fixture {
             base,
             script,
@@ -274,6 +280,7 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("TMPDIR", &self.tmp)
+            .env("GATE_PROC_MEMINFO", self.base.join("meminfo-default"))
             .envs(extra.iter().copied())
             .env("GATE_CGROUP_ROOT", &self.cgroups)
             .env("GATE_PROC_SELF_CGROUP", &self.proc_self)
@@ -2157,6 +2164,7 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("TMPDIR", &self.tmp)
+            .env("GATE_PROC_MEMINFO", self.base.join("meminfo-default"))
             .envs(extra.iter().copied())
             .env("GATE_CGROUP_ROOT", &self.cgroups)
             .env("GATE_PROC_SELF_CGROUP", &self.proc_self)
@@ -3011,8 +3019,9 @@ fn the_target_of_a_row_is_under_the_key_the_planner_says() {
 
 // --- CI-K4: the profile of the judge, the reports of --timings and the plan of the machine ----------------------------
 // D-K4a, D-K4f (the profile), D-K4g..D-K4j (the reports of `cargo --timings` that a row leaves in its target, and what
-// the planner does with them), D-K4k..D-K4r (the machine the planner measures, the plan it prints, the lanes and the
-// jobs it hands out, the overlap it measures). The machine is the test's: a `nproc` that answers what the test says,
+// the planner does with them), D-K4k..D-K4r (the machine the planner measures, the plan it prints, the jobs it hands
+// out, the overlap it measures). CI-E7a-1 (D-E7a..D-E7f) changed three of them: the jobs are all the threads of the cap,
+// there is no table of lanes (`auto` is the DAG of `maximo`) and the admission counts with the measure of the plan. The machine is the test's: a `nproc` that answers what the test says,
 // the MemAvailable of its own /proc/meminfo (GATE_PROC_MEMINFO), the cgroup tree of the fixture and a root of power
 // supplies that the test makes (GATE_POWER_SUPPLY_ROOT). Nothing here reads the real one, and nothing sleeps to pass.
 
@@ -3226,10 +3235,10 @@ fn a_reader_with_another_profile_than_its_producer_is_refused_before_any_step_st
     );
 }
 
-/// Spec K4-B, D-K4q: the plan is one line of the planner, before the first block, and the same plan is kept in the line
-/// of the run in corridas.jsonl. The machine: 24 cores, a cgroup of 16 CPUs, MemAvailable 40 GiB and a cgroup that leaves
-/// 31 GiB (the lower one is the RAM free), no power supply. Jobs: min(24 - 2, 16, 31 / 2) = 15; lanes: 16 cores and
-/// 31 GiB are 2.
+/// Spec K4-B, D-K4q, E7a.2 (D-E7c): the plan is one line of the planner, before the first block, and the same plan is kept
+/// in the line of the run in corridas.jsonl. The machine: 24 cores, a cgroup of 16 CPUs, MemAvailable 40 GiB and a cgroup
+/// that leaves 31 GiB (the lower one is the RAM free), no power supply. Jobs: min(24, 16, 31 / 2) = 15. The plan has no
+/// lanes: neither the word in the line nor the key in the record.
 #[test]
 fn the_plan_of_the_machine_is_printed_before_the_first_block_and_recorded() {
     let mut fx = Fixture::new("k4-plan", "1600000 100000", "34359738368");
@@ -3279,9 +3288,10 @@ fn the_plan_of_the_machine_is_printed_before_the_first_block_and_recorded() {
         "{line}"
     );
     assert!(
-        line.contains(" GB battery=none jobs=15 (gate) lanes=2 asked=serie runs=serie"),
+        line.contains(" GB battery=none jobs=15 (gate) asked=serie runs=serie"),
         "{line}"
     );
+    assert!(!line.contains("lanes="), "the plan has no lanes: {line}");
     assert!(
         word_after(line, "disk_free=").parse::<u64>().is_ok(),
         "the free disk of a target that does not exist yet is the one of its first ancestor that does: {line}"
@@ -3302,7 +3312,11 @@ fn the_plan_of_the_machine_is_printed_before_the_first_block_and_recorded() {
     assert_eq!(plan["bateria"].as_str(), Some("none"), "{plan}");
     assert_eq!(plan["jobs"].as_u64(), Some(15), "{plan}");
     assert_eq!(plan["jobs_origen"].as_str(), Some("gate"), "{plan}");
-    assert_eq!(plan["carriles"].as_u64(), Some(2), "{plan}");
+    assert!(
+        plan.as_object()
+            .is_some_and(|fields| !fields.contains_key("carriles")),
+        "the plan of the record has no lanes: {plan}"
+    );
     assert_eq!(plan["pedido"].as_str(), Some("serie"), "{plan}");
     assert_eq!(plan["corre"].as_str(), Some("serie"), "{plan}");
     assert!(
@@ -3326,31 +3340,35 @@ fn the_jobs_of_the_operator_are_the_jobs_of_the_plan_and_the_line_says_so() {
     assert!(line.contains(" jobs=5 (operator) "), "{line}");
 }
 
-/// Spec K4-B, D-K4m: the lanes of the table of the rule, read with minimums: 3 with 16 cores and 48 GiB, 2 with 8 cores
-/// and 24 GiB, 1 below. What does not reach a step stays in the one below it. The cores are `nproc` here (no cgroup limit).
+/// Spec E7a.3 (D-E7b): the admission counts with the measure of the plan, and the run records what it counted as C and
+/// R. C is min(nproc, the CPUs of the cgroup); R is the RAM free (the lower of MemAvailable and what the cgroup leaves)
+/// less max(4 GiB, 10 % of it). By hand: 10 GiB free less max(4 GiB, 1 GiB) is 6 GiB. The machine is the fixture's, so the
+/// 7, the 3 and the 6 GiB are the same on a PC of 24 threads and 47 GiB.
 #[test]
-fn the_lanes_come_from_the_table_of_the_rule() {
-    let cases: [(&str, u64, &str); 8] = [
-        ("24", 64 * KIB_PER_GIB, "3"),
-        ("16", 48 * KIB_PER_GIB, "3"),
-        ("16", 50_226_790, "2"), // 47.9 GiB
-        ("15", 64 * KIB_PER_GIB, "2"),
-        ("8", 24 * KIB_PER_GIB, "2"),
-        ("8", 25_060_966, "1"), // 23.9 GiB
-        ("7", 64 * KIB_PER_GIB, "1"),
-        ("12", 20 * KIB_PER_GIB, "1"),
+fn the_admission_counts_with_the_machine_the_plan_measured() {
+    // (nproc, cpu.max, memory.max of the cgroup, MemAvailable in GiB, C, R in GiB)
+    let cases = [
+        ("7", "max 100000", MEM_OPEN, 10, 7, 6),
+        ("7", "300000 100000", MEM_OPEN, 10, 3, 6),
+        ("2", "300000 100000", "32212254720", 10, 2, 6),
     ];
-    for (nproc, mem_kib, lanes) in cases {
-        let mut fx = Fixture::new("k4-carriles", "max 100000", MEM_OPEN);
+    for (nproc, cpu_max, mem_max, mem_gib, cores, ram_gib) in cases {
+        let mut fx = Fixture::new("e7a-admision", cpu_max, mem_max);
         fx.table(&[(10, "a", "-", "0.1", "")]);
-        let host = machine(&fx, "carriles", nproc, mem_kib);
-        let run = fx.run_env("0", &host.env());
-        assert_green(&run, "a green table");
-        let line = plan_line_of(&run);
+        let host = machine(&fx, "admision", nproc, mem_gib * KIB_PER_GIB);
+        let before = snapshot(&fx.history, "corridas.jsonl");
+        let run = fx.run_env("serie", &host.env());
+        assert_green(&run, "a green table on a machine the test describes");
+        let runs = appended(&fx.history, "corridas.jsonl", &before);
+        let record = runs
+            .first()
+            .unwrap_or_else(|| panic!("no run line: {}{}", run.out, run.err));
+        let want = format!("{nproc} cores, {cpu_max}, memory.max {mem_max}, {mem_gib} GiB free");
+        assert_eq!(record["C"].as_u64(), Some(cores), "C with {want}: {record}");
         assert_eq!(
-            word_after(&line, "lanes="),
-            lanes,
-            "{nproc} cores and {mem_kib} kB of MemAvailable: {line}"
+            record["R"].as_u64(),
+            Some(ram_gib * GIB),
+            "R with {want}: {record}"
         );
     }
 }
@@ -3441,111 +3459,123 @@ echo "Running unittests fake $id"
 echo "test result: ok. 1 passed; 0 failed"
 "#;
 
-/// Spec K4-B, D-K4n, D-K4r: with `auto` at most as many rows are inside as the machine has lanes (2 here, by the
-/// measure), and the row that waits says `lanes`; with `maximo` the three are inside together. In `auto` two rows
-/// overlapped, so their `solape_s` is above 0. The barrier is a directory of marks and a deadline, not a sleep.
+/// Spec E7a.5 (D-E7c, D-E7e): the jobs of the rows alive never add up past the jobs of the machine, and `auto` and `maximo`
+/// are one DAG. Three rows with no dependency and no shared resource, each naming 8 jobs, with almost no CPU or RAM in the
+/// history, so that only the jobs can hold one back. With J = 16 two fit (8 + 8) and the third waits with `jobs`, in
+/// `auto` and in `maximo`; with J = 24 the three are inside together and none waits for `lanes` or `jobs`. The barrier is
+/// a directory of marks and a deadline, not a sleep.
 #[test]
-fn in_auto_no_more_rows_are_inside_than_the_lanes_and_in_maximo_they_all_are() {
-    let mut fx = Fixture::new("k4-carriles-vivos", "1600000 100000", MEM_OPEN);
-    let script = fx.base.join("barrera.sh");
-    write(&script, BARRIER_SH);
-    let rows = [
-        StepRow {
-            script: script.clone(),
-            ..fx.row(10, "a", "-", "1")
-        },
-        StepRow {
-            script: script.clone(),
-            ..fx.row(20, "b", "-", "1")
-        },
-        StepRow {
-            script,
-            ..fx.row(30, "c", "-", "1")
-        },
-    ];
-    table_of(&mut fx, &rows);
-    // A row that uses 0.01 CPU-seconds in the series that seeds the history asks for a fraction of a core afterwards,
-    // so what holds the third row back is the lanes and not the CPU admission of the history.
-    for id in ["a", "b", "c"] {
-        fx.usage(id, 10_000);
-    }
-    fx.seed();
-    let host = machine(&fx, "dos-carriles", "24", 40 * KIB_PER_GIB);
-    let reset = |fx: &Fixture| {
+fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_maximo() {
+    // The deadline of the barrier is the cost of proving that a third row did not come in: 2 s where only two fit, where
+    // the rows that wait for it wait all of it, and 4 s where the three fit, where the barrier opens as soon as the three
+    // are inside, so a slow start of a row on a loaded machine costs nothing there.
+    let drive = |name: &str, cpu_max: &str, nproc: &str, mem_gib: u64, ticks: &str| {
+        let mut fx = Fixture::new(name, cpu_max, MEM_OPEN);
+        let script = fx.base.join("barrera.sh");
+        write(&script, BARRIER_SH);
+        let rows = ["a", "b", "c"]
+            .into_iter()
+            .zip([10, 20, 30])
+            .map(|(id, idx)| StepRow {
+                script: script.clone(),
+                env: "CARGO_BUILD_JOBS=8",
+                ..fx.row(idx, id, "-", "1")
+            })
+            .collect::<Vec<_>>();
+        table_of(&mut fx, &rows);
+        for id in ["a", "b", "c"] {
+            fx.usage(id, 10_000);
+        }
+        fx.seed();
+        write(&fx.control.join("ticks"), ticks);
+        let host = machine(&fx, "jobs-vivos", nproc, mem_gib * KIB_PER_GIB);
+        (fx, host)
+    };
+    let go = |fx: &Fixture, host: &Machine, mode: &str| -> (u32, Vec<Value>, String) {
         for name in ["counts", "open"] {
             let _ = fs::remove_file(fx.control.join(name));
         }
         let _ = fs::remove_dir_all(fx.control.join("in"));
-    };
-    let most_inside = |fx: &Fixture| -> u32 {
-        read(&fx.control.join("counts"))
+        let before = snapshot(&fx.history, "pasos.jsonl");
+        let run = fx.run_env(mode, &host.env());
+        assert_green(&run, mode);
+        let most_inside = read(&fx.control.join("counts"))
             .lines()
             .filter_map(|line| line.trim().parse().ok())
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let steps = appended(&fx.history, "pasos.jsonl", &before);
+        assert_eq!(
+            steps.len(),
+            3,
+            "{mode}: the three rows ran green: {steps:?}"
+        );
+        (most_inside, steps, plan_line_of(&run))
     };
-    // The deadline of the barrier is the cost of proving that a third row did not come in: 2 s in auto, where the rows
-    // that wait for it wait all of it, and 4 s in maximo, where the barrier opens as soon as the three are inside, so a
-    // slow start of a row on a loaded machine costs nothing there.
-    write(&fx.control.join("ticks"), "20");
-
-    reset(&fx);
-    let before = snapshot(&fx.history, "pasos.jsonl");
-    let run = fx.run_env("auto", &host.env());
-    assert_green(&run, "auto");
-    let line = plan_line_of(&run);
-    assert!(
-        line.contains(" lanes=2 asked=auto runs=dag"),
-        "the measure gives 2 lanes and the history lets the DAG run: {line}"
-    );
-    assert_eq!(
-        most_inside(&fx),
-        2,
-        "in auto two rows are inside together and never three (the counts each row saw: {})",
-        read(&fx.control.join("counts"))
-    );
-    let steps = appended(&fx.history, "pasos.jsonl", &before);
-    assert_eq!(steps.len(), 3, "the three rows ran green: {steps:?}");
-    assert!(
+    let reasons = |steps: &[Value]| -> Vec<String> {
         steps
             .iter()
-            .any(|record| record["motivo"].as_str() == Some("lanes")),
-        "no row waited with the reason `lanes`: {steps:?}"
-    );
-    let overlapped = steps
-        .iter()
-        .filter(|record| record["solape_s"].as_f64().is_some_and(|s| s > 0.0))
-        .count();
-    assert!(
-        overlapped >= 2,
-        "two rows were inside together and their solape_s is above 0 ({overlapped} are): {steps:?}"
-    );
+            .filter_map(|record| record["motivo"].as_str().map(str::to_string))
+            .collect()
+    };
 
-    write(&fx.control.join("ticks"), "40");
-    reset(&fx);
-    let before = snapshot(&fx.history, "pasos.jsonl");
-    let run = fx.run_env("maximo", &host.env());
-    assert_green(&run, "maximo");
+    let (fx, host) = drive("e7a-jobs-16", "1600000 100000", "16", 40, "20");
+    for mode in ["auto", "maximo"] {
+        let (inside, steps, line) = go(&fx, &host, mode);
+        assert!(
+            line.contains(&format!(" jobs=16 (gate) asked={mode} runs=dag")),
+            "{mode}: 16 threads and 40 GiB are 16 jobs and the history lets the DAG run: {line}"
+        );
+        assert_eq!(
+            inside,
+            2,
+            "{mode} with J = 16: two rows of 8 jobs are inside together and never three (the counts each row saw: {})",
+            read(&fx.control.join("counts"))
+        );
+        let why = reasons(&steps);
+        assert!(
+            why.iter().any(|reason| reason == "jobs"),
+            "{mode}: no row waited with the reason `jobs`: {steps:?}"
+        );
+        assert!(
+            why.iter().all(|reason| reason != "lanes"),
+            "{mode}: there are no lanes to wait for: {steps:?}"
+        );
+        let overlapped = steps
+            .iter()
+            .filter(|record| record["solape_s"].as_f64().is_some_and(|s| s > 0.0))
+            .count();
+        assert!(
+            overlapped >= 2,
+            "{mode}: two rows were inside together and their solape_s is above 0 ({overlapped} are): {steps:?}"
+        );
+    }
+
+    let (fx, host) = drive("e7a-jobs-24", "max 100000", "24", 64, "40");
+    let (inside, steps, line) = go(&fx, &host, "auto");
+    assert!(
+        line.contains(" jobs=24 (gate) asked=auto runs=dag"),
+        "24 threads and 64 GiB are 24 jobs: {line}"
+    );
     assert_eq!(
-        most_inside(&fx),
+        inside,
         3,
-        "in maximo the three rows are inside together (the counts each row saw: {})",
+        "with J = 24 the three rows of 8 jobs are inside together (the counts each row saw: {})",
         read(&fx.control.join("counts"))
     );
-    let steps = appended(&fx.history, "pasos.jsonl", &before);
     assert!(
-        steps
+        reasons(&steps)
             .iter()
-            .all(|record| record["motivo"].as_str() != Some("lanes")),
-        "maximo does not hold a row back for lanes: {steps:?}"
+            .all(|reason| reason != "lanes" && reason != "jobs"),
+        "with J = 24 no row waits for lanes or jobs: {steps:?}"
     );
 }
 
-/// Spec K4-B, D-K4n: a row that names its jobs (12) gets them as a ceiling and not as a share. In `serie` it takes
-/// min(12, J); in `auto`, min(12, max(1, J / lanes)); in `maximo` its own 12. J = 14 here (16 cores less 2, 40 GiB of RAM
-/// is room for 20) with 2 lanes, so `auto` gives 7. On a machine that counts J = 5 the row takes 5 in series.
+/// Spec E7a.4 (D-E7d): a row that names its jobs (12) gets min(12, J) in every mode: the number it names is its ceiling,
+/// and `maximo` does not leave it above the jobs of the machine. J = 16 on a machine of 16 threads and 40 GiB (room for
+/// 20), J = 7 on one of 7 threads. An operator that names 1 job leaves the row 1.
 #[test]
-fn a_row_that_names_its_jobs_gets_them_as_a_ceiling_and_its_share_in_auto() {
+fn a_row_that_names_its_jobs_gets_the_lower_of_them_and_the_jobs_of_the_machine_in_every_mode() {
     let mut fx = Fixture::new("k4-reparto", "max 100000", MEM_OPEN);
     fx.table(&[(10, "w", "-", "0.2", "CARGO_BUILD_JOBS=12")]);
     let seen = |fx: &Fixture| -> String {
@@ -3555,34 +3585,31 @@ fn a_row_that_names_its_jobs_gets_them_as_a_ceiling_and_its_share_in_auto() {
             .unwrap_or_else(|| "unset".to_string())
     };
     let wide = machine(&fx, "ancha", "16", 40 * KIB_PER_GIB);
-    let run = fx.run_env("serie", &wide.env());
-    assert_green(&run, "serie");
-    assert_eq!(seen(&fx), "12", "serie: min(12, 14)");
-    let run = fx.run_env("auto", &wide.env());
-    assert_green(&run, "auto");
-    assert!(
-        plan_line_of(&run).contains(" lanes=2 asked=auto runs=dag"),
-        "{}",
-        run.out
-    );
-    assert_eq!(seen(&fx), "7", "auto: min(12, max(1, 14 / 2))");
-    let run = fx.run_env("maximo", &wide.env());
-    assert_green(&run, "maximo");
-    assert_eq!(seen(&fx), "12", "maximo leaves the number of the row");
     let narrow = machine(&fx, "estrecha", "7", 40 * KIB_PER_GIB);
-    let run = fx.run_env("serie", &narrow.env());
-    assert_green(&run, "serie on 7 cores");
-    assert_eq!(seen(&fx), "5", "serie: min(12, 5)");
-    // An operator that names 1 job and a machine with 2 lanes: 1 / 2 is 0 jobs, and cargo refuses 0, so the share has a floor.
+    for (host, jobs) in [(&wide, "12"), (&narrow, "7")] {
+        let run = fx.run_env("serie", &host.env());
+        assert_green(&run, "serie");
+        assert_eq!(seen(&fx), jobs, "serie: min(12, J)");
+        for mode in ["auto", "maximo"] {
+            let run = fx.run_env(mode, &host.env());
+            assert_green(&run, mode);
+            assert!(
+                plan_line_of(&run).contains(&format!(" asked={mode} runs=dag")),
+                "{}",
+                run.out
+            );
+            assert_eq!(seen(&fx), jobs, "{mode}: min(12, J)");
+        }
+    }
     let mut one = wide.env();
     one.push(("CARGO_BUILD_JOBS", "1"));
     let run = fx.run_env("auto", &one);
     assert_green(&run, "auto with the 1 job of the operator");
-    assert_eq!(seen(&fx), "1", "auto: min(12, max(1, 1 / 2))");
+    assert_eq!(seen(&fx), "1", "auto: min(12, 1)");
 }
 
-/// Spec K4-B, D-K4n, D-F3x: 0 and serie are the series, 1 and maximo are the DAG of today, auto is the DAG with lanes,
-/// and the plan says what was asked. Anything else is exit 2 with `GATE_DAG is`, and no row starts. Without GATE_DAG the
+/// Spec K4-B, D-K4n, D-F3x, E7a.6 (D-E7c): 0 and serie are the series, 1, maximo and auto are the DAG, and the plan says
+/// what was asked and has no lanes. Anything else is exit 2 with `GATE_DAG is`, and no row starts. Without GATE_DAG the
 /// default is the series (the default is `serie`, not `auto`: the DAG is activated in a commit of its own).
 #[test]
 fn gate_dag_takes_serie_auto_maximo_and_their_numbers_and_nothing_else() {
@@ -3604,6 +3631,10 @@ fn gate_dag_takes_serie_auto_maximo_and_their_numbers_and_nothing_else() {
             line.contains(&format!(" asked={asked} runs={runs}")),
             "GATE_DAG={value}: {line}"
         );
+        assert!(
+            !line.contains("lanes="),
+            "GATE_DAG={value}: the plan has no lanes: {line}"
+        );
     }
     for bad in ["2", "Serie", "dag"] {
         let mut fx = Fixture::new("k4-valor-malo", CPU_FOUR, MEM_OPEN);
@@ -3623,12 +3654,14 @@ fn gate_dag_takes_serie_auto_maximo_and_their_numbers_and_nothing_else() {
     }
 }
 
-/// Spec K4-B (the verdict does not depend on the machine): a table with a red in the row of idx 30, between greens, gives
-/// in `serie` and in `auto` (with history and 2 lanes) the same exit, the same `FAIL: <id> exited` and the same blocks
-/// for the rows before the red.
+/// Spec K4-B, E7a-V (the verdict does not depend on the machine): a table with a red in the row of idx 30, between greens,
+/// gives in `serie` and in `auto` on a machine of 4 threads and on one of 24 the same exit, the same `FAIL: <id> exited`
+/// and the same blocks for the rows before the red, and each row up to the red prints its `Running` block once in the
+/// three. The rows after the red are not compared: where the DAG started them before the red ended, they were stopped
+/// or they finished, and that depends on the clock. The machines do differ: the plan says 4 jobs and 24.
 #[test]
-fn the_same_red_is_reported_with_one_lane_and_with_many() {
-    let mut fx = Fixture::new("k4-veredicto", "1600000 100000", MEM_OPEN);
+fn the_same_red_is_reported_in_series_and_on_a_narrow_and_a_wide_machine() {
+    let mut fx = Fixture::new("k4-veredicto", "max 100000", MEM_OPEN);
     fx.table(&[
         (10, "s10", "-", "0.3", ""),
         (20, "s20", "-", "0.3", ""),
@@ -3638,14 +3671,18 @@ fn the_same_red_is_reported_with_one_lane_and_with_many() {
     ]);
     fx.seed();
     fx.rc("s30", "3");
-    let host = machine(&fx, "veredicto", "24", 40 * KIB_PER_GIB);
-    let serie = fx.run_env("serie", &host.env());
-    let auto = fx.run_env("auto", &host.env());
-    assert!(
-        plan_line_of(&auto).contains(" lanes=2 asked=auto runs=dag"),
-        "{}",
-        auto.out
-    );
+    let narrow = machine(&fx, "estrecha", "4", 40 * KIB_PER_GIB);
+    let wide = machine(&fx, "ancha", "24", 64 * KIB_PER_GIB);
+    let serie = fx.run_env("serie", &narrow.env());
+    let few = fx.run_env("auto", &narrow.env());
+    let many = fx.run_env("auto", &wide.env());
+    for (run, jobs) in [(&few, "4"), (&many, "24")] {
+        assert!(
+            plan_line_of(run).contains(&format!(" jobs={jobs} (gate) asked=auto runs=dag")),
+            "the run of {jobs} jobs: {}",
+            run.out
+        );
+    }
     let before_the_red = |run: &Run| -> String {
         let kept: Vec<&str> = run
             .out
@@ -3662,7 +3699,11 @@ fn the_same_red_is_reported_with_one_lane_and_with_many() {
             .unwrap_or_else(|| panic!("no block of s30: {}", run.out));
         kept[..red_at].join("\n")
     };
-    for (label, run) in [("serie", &serie), ("auto", &auto)] {
+    for (label, run) in [
+        ("serie", &serie),
+        ("4 threads", &few),
+        ("24 threads", &many),
+    ] {
         assert!(!run.timed_out, "{label}: did not finish in 30 s");
         assert_eq!(run.code, Some(3), "{label}: {}{}", run.out, run.err);
         assert!(
@@ -3670,17 +3711,29 @@ fn the_same_red_is_reported_with_one_lane_and_with_many() {
             "{label}: no `FAIL: s30 exited 3`: {}",
             run.out
         );
+        for id in ["s10", "s20", "s30"] {
+            assert_eq!(
+                run.out
+                    .matches(&format!("Running unittests fake {id}"))
+                    .count(),
+                1,
+                "{label}: the block of {id} is not printed once: {}",
+                run.out
+            );
+        }
     }
     let blocks = before_the_red(&serie);
     assert!(
         blocks.contains("=== s10 banner") && blocks.contains("=== s20 banner"),
         "the blocks before the red are not in the output of the series: {blocks}"
     );
-    assert_eq!(
-        blocks,
-        before_the_red(&auto),
-        "the blocks before the red differ between one lane and many"
-    );
+    for (label, run) in [("4 threads", &few), ("24 threads", &many)] {
+        assert_eq!(
+            blocks,
+            before_the_red(run),
+            "the blocks before the red differ between the series and {label}"
+        );
+    }
 }
 
 /// Spec K4-B, D-K4r: in series no row overlaps another, so every `solape_s` is 0, and after the line of the summary
@@ -3739,8 +3792,8 @@ type BatteryCase<'a> = (&'a str, Option<(&'a str, &'a str)>, &'a str);
 
 /// Spec K4-B, D-K4p: the battery and the disk are measured, printed and saved, and change nothing. A battery that
 /// discharges says `discharging`, one that does not says `ac`, a root with no battery or none at all says `none`, a
-/// `type` that cannot be read says `unknown`. In every case the jobs, the lanes and the mode are those of the machine
-/// without a battery, and the plan has no `failed=`.
+/// `type` that cannot be read says `unknown`. In every case the jobs and the mode are those of the machine without a
+/// battery (16 jobs: 24 cores under a cgroup of 16 CPUs, with 20 GiB of room), and the plan has no `failed=` and no lanes.
 #[test]
 fn the_battery_is_measured_and_changes_nothing() {
     let cases: [BatteryCase; 5] = [
@@ -3787,9 +3840,13 @@ fn the_battery_is_measured_and_changes_nothing() {
     for (tag, tail) in &tails {
         assert_eq!(
             tail, first,
-            "{tag} gave other jobs, lanes or mode than {first_tag}: the battery only gets measured"
+            "{tag} gave other jobs or mode than {first_tag}: the battery only gets measured"
         );
     }
+    assert_eq!(
+        first, "16 (gate) asked=serie runs=serie",
+        "the jobs and the mode of the plan of a machine of 24 threads under 16 CPUs, with no lanes"
+    );
 }
 
 /// A step that builds: it leaves four reports in the cargo-timings directory of the target the planner gave it (4, 6, 2
@@ -4048,16 +4105,20 @@ fn cargo_jobs(fx: &Fixture, host: &Machine, operator: Option<&str>) -> Jobs {
     }
 }
 
-/// Spec K4-B, D-K4k, D-K4l: the jobs are min(cores - 2, the CPUs of the cgroup, free RAM / 2 GiB), at least 1, and
-/// the line that says so names the three measures. The RAM free is the lower of MemAvailable and what the cgroup leaves:
-/// a cgroup that leaves 6 GiB of 100 GiB of MemAvailable gives 3.
+/// Spec K4-B, D-K4k, D-K4l, E7a.1 (D-E7a): the jobs are min(nproc, the CPUs of the cgroup, free RAM / 2 GiB), at least 1:
+/// all the threads of the cap, with none kept back, and the line that says so names the three measures. The RAM free is
+/// the lower of MemAvailable and what the cgroup leaves: a cgroup that leaves 6 GiB of 100 GiB of MemAvailable gives 3.
+/// The jobs of each case are by hand: 24 of 24 and 100 GiB / 2 = 50; the cgroup's 8 and 12; 10 GiB / 2 = 5; nproc 2 and
+/// 1; 3 GiB / 2 = 1 under 16 CPUs; 6 GiB / 2 = 3.
 #[test]
-fn the_cargo_jobs_are_the_cores_less_two_under_the_cgroup_and_two_gib_a_job() {
+fn the_cargo_jobs_are_all_the_threads_of_the_cap_under_the_cgroup_and_two_gib_a_job() {
     let cases = [
-        ("24", "max 100000", MEM_OPEN, 100, "22", "none"),
+        ("24", "max 100000", MEM_OPEN, 100, "24", "none"),
         ("24", "800000 100000", MEM_OPEN, 100, "8", "8"),
+        ("24", "1200000 100000", MEM_OPEN, 100, "12", "12"),
         ("24", "max 100000", MEM_OPEN, 10, "5", "none"),
-        ("2", "max 100000", MEM_OPEN, 100, "1", "none"),
+        ("2", "max 100000", MEM_OPEN, 100, "2", "none"),
+        ("1", "max 100000", MEM_OPEN, 100, "1", "none"),
         ("24", "1600000 100000", MEM_OPEN, 3, "1", "16"),
         ("24", "max 100000", "6442450944", 100, "3", "none"),
     ];
@@ -4136,6 +4197,163 @@ fn machine_without_memavailable(fx: &Fixture) -> Machine {
         "MemTotal:       49327104 kB\nMemFree:         1048576 kB\n",
     );
     host
+}
+
+// --- CI-E7a-1 (D-E7d, D-E7f): row_jobs and the admission, as properties --------------------------------------------------
+// There is no `proptest` in this crate (D-E7l): like the properties of gate_history_contract.rs, the generator is the
+// `random` of Python seeded with a fixed number (20261110), inside `python3 -I -B -c`, and what is small is enumerated.
+
+/// The planner as a module and a seeded generator. argv: the scripts directory.
+const PRELUDE_ADMISSION: &str = r#"
+import importlib.util, os, random, sys
+spec = importlib.util.spec_from_file_location("gate_dag", os.path.join(sys.argv[1], "gate-dag.py"))
+dag = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dag)
+GIB = 1 << 30
+rng = random.Random(20261110)
+
+def step(i, c, r_gib, named, models=False, exclusive=False):
+    """A row of the table: `named` is its CARGO_BUILD_JOBS (0 names none)."""
+    env = {"CARGO_BUILD_JOBS": str(named)} if named else {}
+    return dag.Step(10 * (i + 1), f"s{i}", [], ["models"] if models else [], "exclusive" if exclusive else "normal",
+                    c, r_gib, 1.0, env, ["true"])
+
+def claimed(s, jobs):
+    return dag.row_jobs(int(s.env["CARGO_BUILD_JOBS"]), jobs) if "CARGO_BUILD_JOBS" in s.env else 0
+
+def random_step(i, models_p=0.15, exclusive_p=0.05, named_from=(0, 1, 2, 4, 8, 12, 16)):
+    return step(i, rng.choice([0.25, 0.5, 1, 2, 4]), rng.choice([0.5, 1, 2, 4, 8]), rng.choice(named_from),
+                models=rng.random() < models_p, exclusive=rng.random() < exclusive_p)
+"#;
+
+/// P6 (E7a.P6), row_jobs: min(named, jobs) with a floor of 1, bounded by both and monotone in both, over every pair with
+/// 1 <= named <= 32 and 1 <= jobs <= 32; and the literal answers of a few pairs, worked out by hand.
+const BODY_ROW_JOBS: &str = r#"
+for named in range(1, 33):
+    for jobs in range(1, 33):
+        value = dag.row_jobs(named, jobs)
+        assert 1 <= value <= min(named, jobs), f"row_jobs({named}, {jobs}) = {value} is outside 1..{min(named, jobs)}"
+        if named < 32:
+            assert dag.row_jobs(named + 1, jobs) >= value, f"row_jobs fell when named went from {named} to {named + 1} at {jobs}"
+        if jobs < 32:
+            assert dag.row_jobs(named, jobs + 1) >= value, f"row_jobs fell when jobs went from {jobs} to {jobs + 1} at {named}"
+for named, jobs, want in [(12, 16, 12), (12, 7, 7), (1, 24, 1), (8, 24, 8), (32, 1, 1), (5, 5, 5)]:
+    assert dag.row_jobs(named, jobs) == want, f"row_jobs({named}, {jobs}) is not {want}"
+print("row_jobs pairs=1024")
+"#;
+
+/// P6 (E7a.P6), admission, three properties over seeded states:
+/// 1. monotone: a candidate that is admitted with some caps is still admitted with any cap that is greater or equal on
+///    each axis (CPU, RAM, jobs, the free memory of the models rule), one axis at a time and all of them together;
+/// 2. admitting one by one with `admission`, the jobs of the rows alive never add up past the jobs cap once two are alive;
+/// 3. a candidate with nobody alive and no exclusive row pending is admitted, whatever the caps.
+/// Then the answers of a few states with the reason by hand, which also fix the order of the reasons: exclusive, models
+/// (count, then free memory), CPU, jobs, RAM.
+const BODY_ADMISSION: &str = r#"
+admitted = waited = 0
+for _ in range(2000):
+    alive = [random_step(i) for i in range(rng.randint(1, 4))]
+    for row in alive:
+        row.anon_now = rng.choice([None, int(rng.uniform(0, 6) * GIB)])
+    candidate = random_step(len(alive))
+    earlier = rng.random() < 0.3
+    caps = [rng.uniform(1, 30), rng.randint(2, 60) * GIB, rng.randint(1, 40), rng.randint(0, 12) * GIB]
+    if dag.admission(candidate, alive, earlier, *caps) is not None:
+        waited += 1
+        continue
+    admitted += 1
+    for axis in range(4):
+        more = list(caps)
+        more[axis] += [rng.uniform(0, 10), rng.randint(0, 10) * GIB, rng.randint(0, 10), rng.randint(0, 10) * GIB][axis]
+        assert dag.admission(candidate, alive, earlier, *more) is None, f"admitted with {caps}, not with {more}"
+    more = [c + e for c, e in zip(caps, [rng.uniform(0, 10), rng.randint(0, 10) * GIB, rng.randint(0, 10), rng.randint(0, 10) * GIB])]
+    assert dag.admission(candidate, alive, earlier, *more) is None, f"admitted with {caps}, not with {more}"
+assert admitted >= 300 and waited >= 300, f"the states are not mixed: {admitted} admitted, {waited} waited"
+
+filled = held = 0
+for _ in range(500):
+    jobs = rng.randint(1, 32)
+    alive = []
+    for i in range(rng.randint(2, 8)):
+        row = random_step(i, models_p=0.0, exclusive_p=0.0, named_from=(1, 2, 4, 8, 12, 16, 24))
+        if dag.admission(row, alive, False, 1e9, 1e15, jobs, 1e15) is None:
+            alive.append(row)
+        else:
+            held += 1
+        if len(alive) >= 2:
+            filled += 1
+            total = sum(claimed(r, jobs) for r in alive)
+            assert total <= jobs, f"{len(alive)} rows alive claim {total} jobs of {jobs}"
+assert filled >= 300 and held >= 100, f"the fill is not mixed: {filled} states with two alive, {held} rows held"
+
+for _ in range(300):
+    candidate = random_step(0, exclusive_p=0.5)
+    caps = [rng.uniform(0, 2), rng.randint(0, 2) * GIB, rng.randint(1, 3), rng.randint(0, 2) * GIB]
+    assert dag.admission(candidate, [], False, *caps) is None, f"a lone row is held: {caps}"
+
+lone = step(0, 1, 1, 8, exclusive=True)
+assert dag.admission(lone, [], False, 0, 0, 1, 0) is None
+assert dag.admission(lone, [], True, 16, 40 * GIB, 16, 64 * GIB) == "exclusive"
+assert dag.admission(step(0, 1, 1, 8), [], True, 0, 0, 1, 0) is None
+
+a, b = step(0, 1, 1, 8), step(1, 1, 1, 8)
+assert dag.admission(b, [a], False, 16, 40 * GIB, 16, 64 * GIB) is None, "8 + 8 jobs fit in 16"
+assert dag.admission(b, [a], False, 16, 40 * GIB, 15, 64 * GIB) == "jobs", "8 + 8 jobs do not fit in 15"
+assert dag.admission(b, [a], False, 1.5, 40 * GIB, 15, 64 * GIB) == "cpu", "the CPU is judged before the jobs: 1 + 1 > 1.5"
+assert dag.admission(b, [a], False, 16, 1.5 * GIB, 15, 64 * GIB) == "jobs", "the jobs are judged before the RAM"
+assert dag.admission(b, [a], False, 16, 1.5 * GIB, 16, 64 * GIB) == "ram", "1 + 1 GiB do not fit in 1.5 GiB"
+a.anon_now = 3 * GIB
+assert dag.admission(b, [a], False, 16, 3.5 * GIB, 16, 64 * GIB) == "ram", "the RAM of a live row is max(its anon now, its estimate)"
+assert dag.admission(b, [a], False, 16, 4 * GIB, 16, 64 * GIB) is None
+assert dag.admission(step(1, 1, 1, 0), [step(0, 1, 1, 0)], False, 16, 40 * GIB, 1, 64 * GIB) is None, "rows that name no jobs claim none"
+assert dag.admission(step(1, 1, 1, 8), [a, step(2, 1, 1, 0)], False, 16, 40 * GIB, 16, 64 * GIB) is None
+ex = step(1, 1, 1, 8, exclusive=True)
+assert dag.admission(b, [ex], False, 16, 40 * GIB, 16, 64 * GIB) == "exclusive", "nothing starts beside an exclusive row"
+assert dag.admission(ex, [a], False, 16, 40 * GIB, 16, 64 * GIB) == "exclusive", "an exclusive row starts alone"
+m1, m2, m3 = (step(i, 1, 1, 1, models=True) for i in range(3))
+assert dag.admission(m3, [m1, m2], False, 16, 40 * GIB, 16, 64 * GIB) == "models", "no more than two rows with models"
+assert dag.admission(m2, [m1], False, 16, 40 * GIB, 16, 5 * GIB - 1) == "ram", "4 GiB of MemAvailable on top of its 1 GiB"
+assert dag.admission(m2, [m1], False, 16, 40 * GIB, 16, 5 * GIB) is None
+print("admission admitted=%d waited=%d filled=%d held=%d" % (admitted, waited, filled, held))
+"#;
+
+/// `python3 -I -B -c <prelude + body> <scripts dir>` under a `timeout` of 60 s, with HOME and TMPDIR of the fixture. The
+/// planner module is loaded, not run: nothing here starts a step or reads the machine.
+fn property_of(body: &str) -> String {
+    let fx = Fixture::new("e7a-propiedades", CPU_FOUR, MEM_OPEN);
+    let output = Command::new("timeout")
+        .args(["60", "python3", "-I", "-B", "-c"])
+        .arg(format!("{PRELUDE_ADMISSION}{body}"))
+        .arg(repo_root().join("scripts"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("HOME", &fx.home)
+        .env("TMPDIR", &fx.tmp)
+        .output()
+        .expect("python3 -I -B -c gate-dag");
+    assert!(
+        output.status.success(),
+        "the property failed (exit {:?}): {}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Spec E7a.P6 (D-E7d): `row_jobs(named, jobs)` is a function of the module, between 1 and min(named, jobs) and monotone in
+/// both arguments, for every pair up to 32.
+#[test]
+fn row_jobs_is_the_lower_of_the_two_numbers_with_a_floor_of_one() {
+    let out = property_of(BODY_ROW_JOBS);
+    assert!(out.contains("row_jobs pairs=1024"), "{out}");
+}
+
+/// Spec E7a.P6 (D-E7e, D-E7f): the admission is a pure function of the module, monotone in each cap, it never lets the jobs
+/// of the rows alive pass the jobs cap, and it admits a row that has nobody beside it.
+#[test]
+fn the_admission_is_monotone_and_the_jobs_alive_never_pass_the_cap() {
+    let out = property_of(BODY_ADMISSION);
+    assert!(out.starts_with("admission admitted="), "{out}");
 }
 
 // --- CI-J17: a planner inside another one does not delegate a second `juez` -----------------------------------------------

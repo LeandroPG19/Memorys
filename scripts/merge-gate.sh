@@ -1663,8 +1663,8 @@ down mut'
 
   # F1.1 (D-F1a): the gate counts its cores once, before its first cargo call: the cgroup's
   # CPUs under nproc's (8 under 24 here), exports CARGO_BUILD_JOBS with them and says so.
-  # CI-K4 (D-K4k, D-K4l): the jobs are min(nproc - 2, the CPUs of the cgroup, free RAM / 2 GiB), and the line names the
-  # three measures. The RAM of this machine is the self-test's (100 GiB in a /proc/meminfo of its own), so the 8 does
+  # CI-K4 (D-K4k, D-K4l), CI-E7a (D-E7a): the jobs are min(nproc, the CPUs of the cgroup, free RAM / 2 GiB), and the line
+  # names the three measures. The RAM of this machine is the self-test's (100 GiB in a /proc/meminfo of its own), so the 8 does
   # not depend on how much memory whoever runs it has free.
   printf 'MemTotal:       134217728 kB\nMemFree:        104857600 kB\nMemAvailable:   104857600 kB\n' >"$tmp/meminfo-100g"
   cg_tree f1jobs "800000 100000"

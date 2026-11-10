@@ -2,10 +2,10 @@
 """Lane planner of the local judge (CI-F3, F3.2).
 
 `run --table <file>` runs the step table. GATE_DAG=0 or serie (the default) is the series: the steps in
-idx order, one at a time. GATE_DAG=1 or maximo plans the DAG: a step starts when its dependencies exited 0,
-and it is admitted by CPU and RAM, recomputed on every event (a child exit, and a 1 s tick as a
-backup). GATE_DAG=auto is the same DAG with at most as many rows alive as the machine has lanes, and the jobs of the
-machine shared among them (CI-K4, D-K4m, D-K4n). The verdict is the series one: the red with the lowest idx wins, the steps before it
+idx order, one at a time. GATE_DAG=1, maximo or auto plans the DAG: a step starts when its dependencies exited 0,
+and it is admitted by exclusivity, models, CPU, jobs and RAM (`admission`), recomputed on every event (a child exit, and
+a 1 s tick as a backup). The jobs of the machine are the threads of its cap, and a row gets min(the jobs it names, the
+jobs of the machine) in every mode (CI-K4, D-K4n; CI-E7a, D-E7c, D-E7d). The verdict is the series one: the red with the lowest idx wins, the steps before it
 finish, the ones after it are stopped with TERM and, after a grace, KILL (D-F3d, J14g). A kernel kill (OOM, or a
 signal the planner did not send) gives no verdict: exit 2 (D-F3f), and so does a failure of the planner itself (J14e).
 A run is recorded with the mode that ran (J14a): GATE_DAG=1 with no delegated scope, with no serial history of this
@@ -102,10 +102,8 @@ ALLOWED_ENV = frozenset(
     }
 )
 NAME_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
-# CI-K4 (D-K4n): the values of GATE_DAG and what each one asks for.
+# CI-K4 (D-K4n): the values of GATE_DAG and what each one asks for (`auto` and `maximo` are one DAG since CI-E7a, D-E7c).
 ASKED = {"0": "serie", "serie": "serie", "auto": "auto", "1": "maximo", "maximo": "maximo"}
-# CI-K4 (D-K4m): the lanes of the rule of the judge, as (cores, GiB of free RAM) -> lanes, from the largest down.
-LANES_TABLE = ((16, 48, 3), (8, 24, 2))
 
 
 class Refusal(Exception):
@@ -546,7 +544,7 @@ def delegate(scope: str | None) -> bool:
     """Moves the planner and its scope's processes to scope/juez, then enables controllers. A scope that is already a `juez`
     is another planner's: it has processes of its own, so the kernel does not let it enable controllers for children, and a
     second `juez` inside it would go one level down for each planner that starts there (CI-J17). That planner is not delegated:
-    it runs in series, with no cap per lane, and the planner outside keeps its lanes."""
+    it runs in series, and the planner outside keeps its DAG."""
     if scope is None or os.path.basename(scope) == DELEGATED:
         return False
     if not os.access(os.path.join(scope, "cgroup.subtree_control"), os.W_OK):
@@ -605,19 +603,14 @@ def measure_machine() -> Measure:
     return measure
 
 
-def total_memory() -> int:
-    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-
-
 def capacities(measure: Measure | None = None) -> tuple[int, int]:
-    """Returns (C cores, R bytes): R is the scope's memory less max(4 GiB, 10 %). A cgroup that could not be read leaves the
-    machine's own cores and memory."""
+    """Returns (C cores, R bytes) with the numbers of the `plan:` line (D-E7b): C is min(nproc, the CPUs of the cgroup) and R
+    is the RAM free (the lower of MemAvailable and what the cgroup leaves) less max(4 GiB, 10 %). What could not be measured
+    counts as 1 core and no RAM: that planner runs in series, and nothing is admitted by these numbers."""
     measure = measure or measure_machine()
-    mem_kb = measure.cgroup_mem_kb
-    margin = int(mem_kb) * 1024 if mem_kb.isdigit() else total_memory()
-    ram = margin - max(MIN_RESERVE, margin // 10)
-    cpu = measure.cgroup_cpu if measure.cgroup_cpu else (os.cpu_count() or 1)
-    return cpu, ram
+    cpu = min((c for c in (measure.nproc, measure.cgroup_cpu) if c), default=1)
+    free = (measure.free_ram_kb or 0) * 1024
+    return cpu, max(0, free - max(MIN_RESERVE, free // 10))
 
 
 def disk_free_gb() -> int | None:
@@ -663,18 +656,6 @@ def battery_state() -> str:
     if unreadable:
         return "unknown"
     return "ac" if found else "none"
-
-
-def lanes_for(cores: int, free_ram_kb: int | None) -> int:
-    """D-K4m: the lanes of the rule: 3 from 16 cores and 48 GiB, 2 from 8 cores and 24 GiB, 1 below. What does not reach a
-    step stays in the one below it."""
-    if free_ram_kb is None:
-        return 1
-    gib = free_ram_kb / (1 << 20)
-    for min_cores, min_gib, lanes in LANES_TABLE:
-        if cores >= min_cores and gib >= min_gib:
-            return lanes
-    return 1
 
 
 # --- history ------------------------------------------------------------------
@@ -723,6 +704,61 @@ def ranks(steps: list[Step], dur: dict[str, float]) -> tuple[dict[str, float], d
     return rank, nxt
 
 
+# --- admission ----------------------------------------------------------------
+
+
+def row_jobs(named: int, jobs: int) -> int:
+    """D-E7d: the jobs a row that names `named` gets: the number is its ceiling, never above the jobs of the machine, and
+    cargo refuses 0."""
+    return max(1, min(named, jobs))
+
+
+def named_jobs(step: Step) -> int:
+    """The CARGO_BUILD_JOBS a row names; 0 for a row that names none or that names 0."""
+    value = step.env.get("CARGO_BUILD_JOBS", "")
+    return int(value) if value.isdigit() else 0
+
+
+def exclusive_wait(step: Step, alive: list[Step], earlier_pending: bool) -> bool:
+    """D-F3l: an exclusive row starts alone and after every lower idx; nothing starts beside it."""
+    if step.clase in EXCLUSIVE:
+        return bool(alive) or bool(earlier_pending)
+    return any(o.clase in EXCLUSIVE for o in alive)
+
+
+def admission(
+    step: Step,
+    alive: list[Step],
+    earlier_pending: bool,
+    cpu_cap: float,
+    ram_cap: float,
+    jobs_cap: int,
+    mem_free: float,
+) -> str | None:
+    """D-E7f: why a row that is ready has to wait, or None when it starts. One function for the planner and for the
+    simulation of gate_usl.py. In this order: `exclusive`; with nobody alive it starts; `models` (two alive) and `ram` (the
+    MemAvailable `mem_free` under MODELS_FLOOR plus its estimate); `cpu` (the sum of c over C); `jobs` (the sum of
+    row_jobs over the jobs cap, for the rows that name jobs, D-E7e); `ram` (the sum of what each live row holds, the
+    larger of its anon now and its estimate, over R). `earlier_pending` is whether a row of lower idx is still pending."""
+    if exclusive_wait(step, alive, earlier_pending):
+        return "exclusive"
+    if not alive:
+        return None
+    if "models" in step.recursos:
+        if sum("models" in o.recursos for o in alive) >= MAX_MODELS:
+            return "models"
+        if mem_free < MODELS_FLOOR + step.r:
+            return "ram"
+    if sum(o.c for o in alive) + step.c > cpu_cap:
+        return "cpu"
+    claimed = [row_jobs(n, jobs_cap) for n in map(named_jobs, [*alive, step]) if n]
+    if sum(claimed) > jobs_cap:
+        return "jobs"
+    if sum(max(o.anon_now or 0, o.r) for o in alive) + step.r > ram_cap:
+        return "ram"
+    return None
+
+
 # --- the planner --------------------------------------------------------------
 
 
@@ -752,9 +788,9 @@ NOMBRE_COTA = {"paso": "longest step", "cpu": "CPU", "ram": "RAM"}
 
 
 class Planner:
-    # D-K4n: the rows alive at once that `auto` allows; None is no cap. A class default, so that a planner made without
-    # __init__ (the property tests of the admission) has none.
-    lanes: int | None = None
+    # D-E7e: what the jobs of the rows alive may add up to. A class default, so that a planner made without __init__ (the
+    # property tests of the admission) has one.
+    jobs_cap: int = 1
 
     def __init__(self, steps: list[Step], asked: str, tabla: str, timed_end: str | None = None) -> None:
         self.steps = steps
@@ -779,7 +815,7 @@ class Planner:
         self.solo = not (self.dag and self.delegado and self.hist_runs and not self.shared_server and not self.machine.why)
         self.modo = "serie" if self.solo else "dag"
         self.plan = self.make_plan()
-        self.lanes = self.plan["carriles"] if asked == "auto" else None
+        self.jobs_cap = self.machine.jobs
         root = repo_root()
         sha, arbol_sucio = git_state(root)
         self.corrida: gate_history.Corrida | None = gate_history.run_start(
@@ -817,7 +853,6 @@ class Planner:
     def make_plan(self) -> dict[str, Any]:
         """D-K4q: what the planner measured of the machine and decided of it, with None for what it could not measure."""
         machine = self.machine
-        cores = min(c for c in (machine.nproc, machine.cgroup_cpu) if c) if (machine.nproc or machine.cgroup_cpu) else None
         free = machine.free_ram_kb
         return {
             "nproc": machine.nproc,
@@ -827,7 +862,6 @@ class Planner:
             "bateria": battery_state(),
             "jobs": machine.jobs,
             "jobs_origen": self.jobs_origin(),
-            "carriles": lanes_for(cores, free) if cores else 1,
             "pedido": self.asked,
             "corre": self.modo,
             "fallo": machine.why or None,
@@ -853,7 +887,7 @@ class Planner:
             f"plan: nproc={plan['nproc'] if plan['nproc'] is not None else 'unknown'} "
             f"cgroup_cpu={plan['cgroup_cpu'] if plan['cgroup_cpu'] is not None else 'none'} "
             f"ram_free={ram} GiB disk_free={disk} GB battery={plan['bateria']} "
-            f"jobs={plan['jobs']} ({plan['jobs_origen']}) lanes={plan['carriles']} "
+            f"jobs={plan['jobs']} ({plan['jobs_origen']}) "
             f"asked={self.asked} runs={self.modo}"
         )
         if reason:
@@ -943,32 +977,13 @@ class Planner:
 
     def wait_reason(self, step: Step) -> str | None:
         alive = self.running()
-        if self.exclusive_wait(step, alive):
-            return "exclusive"
-        if not alive:
-            return None
+        earlier_pending = any(o.idx < step.idx and o.state == "pending" for o in self.steps)
         if self.solo:
-            return "serie"
-        return self.capacity_wait(step, alive)
-
-    def exclusive_wait(self, step: Step, alive: list[Step]) -> bool:
-        if step.clase in EXCLUSIVE:
-            return bool(alive) or any(o.idx < step.idx and o.state == "pending" for o in self.steps)
-        return any(o.clase in EXCLUSIVE for o in alive)
-
-    def capacity_wait(self, step: Step, alive: list[Step]) -> str | None:
-        if self.lanes is not None and len(alive) >= self.lanes:
-            return "lanes"
-        if "models" in step.recursos:
-            if sum("models" in o.recursos for o in alive) >= MAX_MODELS:
-                return "models"
-            if mem_available() < MODELS_FLOOR + step.r:
-                return "ram"
-        if sum(o.c for o in alive) + step.c > self.cpu_cap:
-            return "cpu"
-        if sum(max(o.anon_now or 0, o.r) for o in alive) + step.r > self.ram:
-            return "ram"
-        return None
+            if exclusive_wait(step, alive, earlier_pending):
+                return "exclusive"
+            return "serie" if alive else None
+        mem_free = mem_available() if alive and "models" in step.recursos else 0
+        return admission(step, alive, earlier_pending, self.cpu_cap, self.ram, self.jobs_cap, mem_free)
 
     # steps
 
@@ -990,8 +1005,8 @@ class Planner:
         env = dict(os.environ)
         env["TMPDIR"] = tmp
         env.update(step.env)
-        if step.env.get("CARGO_BUILD_JOBS", "").isdigit():
-            env["CARGO_BUILD_JOBS"] = str(self.row_jobs(int(step.env["CARGO_BUILD_JOBS"])))
+        if named_jobs(step):
+            env["CARGO_BUILD_JOBS"] = str(row_jobs(named_jobs(step), self.jobs_cap))
         targets = [r[len("target:"):] for r in step.recursos if r.startswith("target:")]
         if targets:
             if "CARGO_TARGET_DIR" in step.env:
@@ -1006,16 +1021,6 @@ class Planner:
             die(f"step {step.id} would change {', '.join(outside)}, outside the closed list (D-F3j)")
         print(f"dag: {step.id} env: {' '.join(changed)}")
         return env
-
-    def row_jobs(self, named: int) -> int:
-        """D-K4n: what the row names is its ceiling, not its share. In series it takes min(its number, the jobs of the machine);
-        in `auto`, with the rows alive at once, min(its number, max(1, the jobs / the lanes)); in `maximo`, its own number."""
-        if self.asked == "maximo":
-            return named
-        jobs = self.plan["jobs"]
-        if self.asked == "serie" or self.solo:
-            return min(named, jobs)
-        return min(named, max(1, jobs // self.plan["carriles"]))
 
     def cgroup_for(self, step: Step) -> str | None:
         if not self.delegado:
@@ -1533,7 +1538,7 @@ def stop_on_signal(_signum: int, _frame: object) -> NoReturn:
 def run_table(path: str, timed_end: str | None = None) -> int:
     mode = os.environ.get("GATE_DAG", "0")
     if mode not in ASKED:
-        die(f"GATE_DAG is {mode!r}; it has to be 0 or serie (series), auto (DAG with lanes), or 1 or maximo (DAG)")
+        die(f"GATE_DAG is {mode!r}; it has to be 0 or serie (series), or 1, maximo or auto (DAG)")
     for signum in STOP_SIGNALS:
         signal.signal(signum, stop_on_signal)
     steps = parse_table(path)
@@ -1543,7 +1548,7 @@ def run_table(path: str, timed_end: str | None = None) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Lane planner of the local judge (CI-F3, F3.2).")
     commands = parser.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="run a step table: GATE_DAG=0 or serie, auto, or 1 or maximo")
+    run = commands.add_parser("run", help="run a step table: GATE_DAG=0 or serie, or 1, maximo or auto")
     run.add_argument("--table", required=True)
     run.add_argument("--timed-end", default=None, help="the line printed before the first untimed block (CI-F3.3b-2)")
     commands.add_parser("allowed-env", help="print the closed list of a step's environment, one name per line (CI-J13)")
