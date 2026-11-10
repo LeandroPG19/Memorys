@@ -2454,7 +2454,7 @@ fi
 # printed when the judge cannot read the report.
 echo "=== advisory exceptions (scripts/advisory-exceptions.txt) ==="
 adv_dir="$(mktemp -d)"
-adv_lock="$(cygpath -m "$ROOT/rust/Cargo.lock" 2>/dev/null || printf '%s' "$ROOT/rust/Cargo.lock")"
+adv_lock="$(gate_native_path m "$ROOT/rust/Cargo.lock")"
 (cd "$adv_dir" && timeout 120 cargo audit --json --no-fetch -f "$adv_lock" >audit.json 2>audit.err) || true
 adv_rc=0
 "$ROOT/scripts/advisory-exceptions.sh" --judge "$adv_dir/audit.json" || adv_rc=$?

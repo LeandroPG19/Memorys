@@ -2,6 +2,8 @@
 # Second judge: CRAP/complexity + mutation of the rust/src diff.
 # SIL = ./scripts/merge-gate.sh. This script does not run it.
 set -euo pipefail
+# CI-K9a: the judge does not use the interop of Windows. On Linux the PATH that WSL adds (/mnt/..., by 9p) goes before anything looks for a command: each one that is not found walks all of it. The same filter as gate_path_without_windows (gate-lock.sh), which this script cannot load first.
+if [[ "$OSTYPE" == linux* ]]; then k9_kept=""; IFS=: read -ra k9_dirs <<<"$PATH"; for k9_d in "${k9_dirs[@]}"; do [[ "$k9_d" == /mnt/* ]] || k9_kept="${k9_kept:+$k9_kept:}$k9_d"; done; PATH="$k9_kept"; unset k9_dirs k9_d k9_kept; fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 BASELINE="$ROOT/scripts/lizard-baseline.txt"
@@ -821,8 +823,12 @@ qg_mutate_legacy() {
     echo "FAIL: mutants-gate.sh --prepare-scratch printed no jobs= and scratch= lines: $plan" >&2
     return 2
   fi
-  scratch_native="$(cygpath -w "$scratch" 2>/dev/null || printf '%s' "$scratch")"
-  native="$(cygpath -m "$out" 2>/dev/null || printf '%s' "$out")"
+  scratch_native="$scratch"
+  native="$out"
+  if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+    scratch_native="$(cygpath -w "$scratch" 2>/dev/null || printf '%s' "$scratch")"
+    native="$(cygpath -m "$out" 2>/dev/null || printf '%s' "$out")"
+  fi
   (cd rust && TMP="$scratch_native" TEMP="$scratch_native" TMPDIR="$scratch" CARGO_PROFILE_DEV_DEBUG=0 \
     cargo mutants "$@" \
     --exclude-re "$MUTANTS_EXCLUDE_RE" --output "$native" \

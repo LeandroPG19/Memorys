@@ -36,6 +36,8 @@
 #                                                   ones LIST (a `cargo mutants --list --json`)
 #                                                   names, in both directions
 set -euo pipefail
+# CI-K9a: the judge does not use the interop of Windows. On Linux the PATH that WSL adds (/mnt/..., by 9p) goes before anything looks for a command: each one that is not found walks all of it. The same filter as gate_path_without_windows (gate-lock.sh), which this script cannot load first.
+if [[ "$OSTYPE" == linux* ]]; then k9_kept=""; IFS=: read -ra k9_dirs <<<"$PATH"; for k9_d in "${k9_dirs[@]}"; do [[ "$k9_d" == /mnt/* ]] || k9_kept="${k9_kept:+$k9_kept:}$k9_d"; done; PATH="$k9_kept"; unset k9_dirs k9_d k9_kept; fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 resolve_python() {
@@ -274,8 +276,8 @@ mutants_gb() { awk -v kb="$1" -v per="$MUTANTS_KB_PER_GB" 'BEGIN { printf "%.1f"
 # What cargo-mutants reads as its temp dir: TMP/TEMP on Windows, TMPDIR on Unix.
 mutants_system_temp() {
   local dir="${TMP:-${TEMP:-}}"
-  if [[ -n "$dir" ]] && command -v cygpath >/dev/null 2>&1; then
-    dir="$(cygpath -u "$dir")"
+  if [[ -n "$dir" ]] && gate_on_windows; then
+    dir="$(gate_native_path u "$dir")"
   else
     dir="${TMPDIR:-/tmp}"
   fi
@@ -290,7 +292,7 @@ MUTANTS_MARKER=.memory-industry-mutants
 
 mutants_scratch_dir() {
   local base="${MUTANTS_SCRATCH_DIR:-$(mutants_system_temp)}"
-  base="$(cygpath -u "$base" 2>/dev/null || printf '%s' "$base")"
+  base="$(gate_native_path u "$base")"
   printf '%s/memory-industry-mutants\n' "${base%/}"
 }
 
@@ -437,7 +439,7 @@ mutants_refuse_targets_in_tree() {
 mutants_refuse_target_dir_in_tree() {
   local dir="${CARGO_TARGET_DIR:-}"
   [[ -n "$dir" ]] || return 0
-  dir="$(cygpath -u "$dir" 2>/dev/null || printf '%s' "$dir")"
+  dir="$(gate_native_path u "$dir")"
   case "$dir" in
     /* | [A-Za-z]:*) ;;
     *) dir="$ROOT/rust/$dir" ;;
@@ -668,7 +670,7 @@ mutants_seed_inputs() { # the inputs the key is the hash of (D-F4d)
   printf 'format=%s\n' "$MUTANTS_SEED_FORMAT"
   for f in "$ROOT/rust/Cargo.lock" "$ROOT/rust/Cargo.toml" "$ROOT/rust/.cargo/config.toml" \
     "$ROOT/.cargo/config.toml" "${CARGO_HOME:-$HOME/.cargo}/config.toml" \
-    "$ROOT/rust/rust-toolchain.toml" "$ROOT/rust/rust-toolchain"; do
+    "$ROOT/rust-toolchain.toml" "$ROOT/rust/rust-toolchain.toml" "$ROOT/rust/rust-toolchain"; do
     if [[ -f "$f" ]]; then
       printf 'file %s %s\n' "${f#"$ROOT"/}" "$(sha256sum "$f" | cut -d' ' -f1)"
     else
@@ -909,7 +911,7 @@ mutants_lab_run() {
   # D-F4p: the epoch is the newest mtime of the seed (the third field of seed.before), never the start of this run.
   seed_epoch="$(awk '{print $NF}' "$OUT_DIR/seed.before" | LC_ALL=C sort -n | tail -n 1)"
   shim_scratch="$(cd "$MUTANTS_SCRATCH" && pwd -P)"
-  scratch_native="$(cygpath -w "$MUTANTS_SCRATCH" 2>/dev/null || printf '%s' "$MUTANTS_SCRATCH")"
+  scratch_native="$(gate_native_path w "$MUTANTS_SCRATCH")"
   # The build of each mutant gets its share of the cores the gate counted (CI-F1, D-F1b): max(1, floor(N / jobs)).
   build_jobs=$(( GATE_CARGO_JOBS / jobs ))
   (( build_jobs >= 1 )) || build_jobs=1

@@ -56,6 +56,35 @@ if declare -F gate_lock_is_loaded >/dev/null; then
   return 0
 fi
 gate_lock_is_loaded() { :; }
+
+# CI-K9a: the judge does not use the interop of Windows. WSL puts the PATH of Windows on the PATH of Linux (68 directories of
+# 9p on 2026-11-09), and a command that is not found walks all of it: `command -v cygpath` three times took 29.5 s, 0.05 s
+# without those entries, and the self-test of gate-cluster.sh spent 147 of its 189 s in 32 calls of gate_where. On Linux
+# nothing that starts with /mnt/ stays on PATH. PATH is already exported, so assigning it is enough (and an `export PATH` here
+# would make JUDGE_ENVIRONMENT hand the self-tests a foreign PATH they cannot run with). The scripts that cannot load this file
+# before they start carry the same filter as their second line of code.
+gate_path_without_windows() {
+  [[ "$OSTYPE" == linux* ]] || return 0
+  local dirs dir kept=""
+  IFS=: read -ra dirs <<<"$PATH"
+  for dir in "${dirs[@]}"; do
+    [[ "$dir" == /mnt/* ]] || kept="${kept:+$kept:}$dir"
+  done
+  PATH="$kept"
+}
+gate_path_without_windows
+
+# Whether this shell is Git Bash or Cygwin, decided by what the shell says it is and not by what is on PATH.
+gate_on_windows() { [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; }
+
+# gate_native_path MODE PATH: the path as cygpath -MODE (u, m or w) writes it on Windows, as it came anywhere else.
+gate_native_path() {
+  if gate_on_windows; then
+    cygpath "-$1" "$2" 2>/dev/null || printf '%s\n' "$2"
+  else
+    printf '%s\n' "$2"
+  fi
+}
 # shellcheck disable=SC2034 # read by the scripts that source this one
 GATE_LOCK="$HOME/.cache/cuba-gate/lock"
 GATE_LOCK_HELD=""
@@ -84,7 +113,7 @@ proc_start() {
 
 gate_where() {
   local root
-  root="$(cygpath -m / 2>/dev/null || echo /)"
+  root="$(gate_native_path m /)"
   printf '%s:%s\n' "$HOSTNAME" "${root// /_}"
 }
 
@@ -537,8 +566,24 @@ gate_require_node() {
     || gate_refuse "node $version is older than engines.node >=$need in package.json. nvm use $need, or put a newer node first on PATH."
 }
 
+# CI-K9b: the compiler the judge pins is the one rust-toolchain.toml of the root names. Whatever cargo it starts outside the
+# tree (the seed of the mutants, the labs, in ~/.cache or the scratch) does not see that file, and rustup takes `stable`:
+# the day `stable` moves, every mutant builds its dependencies with another compiler. The channel is read here and handed
+# down; without a file, or without a channel in it, nothing is exported and it says so.
+gate_pin_toolchain() {
+  local file="$GATE_REPO_ROOT/rust-toolchain.toml" channel
+  channel="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$file" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$channel" ]]; then
+    echo "note: $file is missing or names no channel, so RUSTUP_TOOLCHAIN is not set and a cargo outside the tree takes the default toolchain of rustup" >&2
+    return 0
+  fi
+  export RUSTUP_TOOLCHAIN="$channel"
+}
+
 gate_linux_env() {
+  gate_path_without_windows
   [[ "$(uname -s)" == Linux ]] || return 0
+  gate_pin_toolchain
   gate_target_dir_outside_the_tree
   gate_tmpdir_on_disk
   gate_require_node

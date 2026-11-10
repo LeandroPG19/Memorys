@@ -1728,8 +1728,8 @@ gate_bin() {
     | sed -n 's/.*"reason":"compiler-artifact".*"executable":"\([^"]*\)".*/\1/p' \
     | grep -E '[/\\]memory-industry(\.exe)?$' | tail -n 1 || true)"
   exe="${exe//\\\\/\\}"
-  if [[ -n "$exe" ]] && command -v cygpath >/dev/null 2>&1; then
-    exe="$(cygpath -u "$exe")"
+  if [[ -n "$exe" ]] && gate_on_windows; then
+    exe="$(gate_native_path u "$exe")"
   fi
   [[ -n "$exe" && -x "$exe" ]] \
     || { echo "FAIL: cargo build --bin memory-industry reported no executable for memory-industry (it reported: ${exe:-nothing})." >&2; exit 1; }

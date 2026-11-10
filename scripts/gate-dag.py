@@ -158,12 +158,19 @@ def p95(values: Iterable[float]) -> float:
     return ordered[min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)]
 
 
-def table_key(path: str) -> str:
-    """The key of the history (J14k): the sha256 of the rows of the table, each with its spaces collapsed, with no comment
-    and no blank line. A comment does not drop the history; a number of a row does."""
-    with open(path, encoding="utf-8") as fh:
-        rows = [" ".join(line.split()) for line in fh if line.strip() and not line.lstrip().startswith("#")]
+def table_key_of(content: bytes) -> str:
+    """The key of the history (J14k) of a table given as bytes: the sha256 of its rows, each with its spaces collapsed, with
+    no comment and no blank line. A comment does not drop the history; a number of a row does. gate_usl.py keys the tables
+    of git with this same function (K9c): there is no second way to spell the key."""
+    text = content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    rows = [" ".join(line.split()) for line in text.split("\n") if line.strip() and not line.lstrip().startswith("#")]
     return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+
+
+def table_key(path: str) -> str:
+    """The key of the history of the table in the file `path` (table_key_of)."""
+    with open(path, "rb") as fh:
+        return table_key_of(fh.read())
 
 
 def git_state(root: str) -> tuple[str | None, bool | None]:
