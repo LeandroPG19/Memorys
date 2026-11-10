@@ -8,13 +8,17 @@
 //! real history, the real target or HOME. Every process the test starts has a deadline.
 //!
 //! The interface these tests drive (standard library only, `python3 -I scripts/gate_usl.py <order>`):
-//! - `barrido --perfil {debug,bin,release} [--j 2,4,..] [--reps 2]`: one JSON line per point on stdout
+//! - `barrido --perfil {debug,release} [--j 2,4,..] [--reps 2]`: one JSON line per point on stdout
 //!   and in `usl.jsonl` (fields: repo, barrido, perfil, fila, J, rep, orden, seg, cpu_s, rss_pico, rc,
 //!   psi_ini, psi_fin, load, cargado, sha, huella, arbol_sucio, C, fecha; `orden` is the 0-based
 //!   position inside the replica), then `barrido <id>: <n> puntos, <k> cargados, <m> rojos`. A warm-up
 //!   of the whole profile at the highest J comes first and writes nothing. Exit 2: unknown profile,
 //!   no `CARGO_TARGET_DIR`, machine busy (`some avg10` of `GATE_USL_PSI` above 15 %), a red or timed
-//!   out warm-up (`GATE_USL_PLAZO_S`, 1800 s per cargo order by default) or a `huella` that moved.
+//!   out warm-up (`GATE_USL_PLAZO_S`, 1800 s per cargo order by default), a `huella` that moved or a
+//!   `scripts/gate-dag.txt` that cannot be read. Every cargo call of a sweep carries the profile tokens
+//!   (`CARGO_PROFILE_*`) of the row of its profile in that table (CI-K4): the profile is in the hash of
+//!   every unit, so a sweep without them measures another build and leaves a second set of artifacts in
+//!   the target of the judge. There is no `bin` profile: after CI-F3.4 the E2E row compiles nothing.
 //! - `ajustar --perfil P [--puntos JSONL] [--json]`: exit 0 reliable, 3 not reliable (the reason in
 //!   `motivo`), 2 unreadable input. `C` is the smallest `C` of the points.
 //! - `recomendar [--tabla T] [--json]`: exit 0 when it recommended (even "se conserva"), 3 when an
@@ -32,9 +36,10 @@
 //!   call); no `CARGO_INCREMENTAL=0` -> U7; no `os.utime` -> U8 "mtime"; the file rewritten -> U8 "huella".
 //! - the pressure read after the warm-up -> U9 (a cargo call); a loaded point not marked -> U10.
 //! - `usl_point` that raises -> U11; the write error of the history not caught -> U11.
+//! - the sweep environment without the profile of the row -> U7 and U20; a profile `bin` again -> U9.
 //! - B3 without the cold filter -> U12; the slack from `L_in` alone -> U12; juez-cuda by run count -> U13.
 //! - the knee chosen without simulating -> U14; a simulator that ignores `c` -> U14; a gain threshold of 0 -> U14.
-//! - `J_hist` read from today's table -> U16; a command of a profile that drifted from `run-all-tests.sh` -> U17.
+//! - `J_hist` read from today's table -> U16; a command of a profile that drifted from `run-all-tests.sh`, or that moved to the lane of another row -> U17.
 //! - a wait without a deadline -> U18.
 
 use serde_json::{Value, json};
@@ -60,20 +65,22 @@ const C_NUCLEOS: u32 = 24;
 const PSI_QUIETA: &str = "some avg10=1.00 avg60=0.00 avg300=0.00 total=0\n";
 const PSI_OCUPADA: &str = "some avg10=40.00 avg60=0.00 avg300=0.00 total=0\n";
 
-/// The judge's table with the figures that matter here (DBG at `{DBG}` jobs, B3 at 12 cores).
+/// The judge's table with the figures that matter here (DBG at `{DBG}` jobs, B3 at 12 cores) and the profile tokens that
+/// CI-K4 put on the rows that compile in the dev profile (DBG, its reader NLI and DC).
 const TABLA: &str = "\
 10 P - - normal 2 2 20 bash scripts/merge-gate.sh --step P
-20 DBG P target:T_dbg,cluster:C_dbg,models normal 8 8 421 CARGO_BUILD_JOBS={DBG} CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step DBG
-25 NLI DBG target:T_dbg,cluster:C_nli,models,reader exclusive 8 8 60 CARGO_BUILD_JOBS=8 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step NLI
+20 DBG P target:T_dbg,cluster:C_dbg,models normal 8 8 421 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS={DBG} CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step DBG
+25 NLI DBG target:T_dbg,cluster:C_nli,models,reader exclusive 8 8 60 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step NLI
 30 B3 P target:T_rel normal 12 16 150 CARGO_BUILD_JOBS=12 bash scripts/merge-gate.sh --step B3
 40 REL B3 target:T_rel,cluster:C_relh,models,reader normal 8 12 221 CARGO_BUILD_JOBS=2 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step REL
 50 E2E B3,DBG target:T_rel,cluster:C_e2e,models,reader normal 8 12 113 CARGO_BUILD_JOBS=2 bash scripts/merge-gate.sh --step E2E
-60 DC P target:T_docs,cluster:C_docs normal 8 8 325 CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DC
+60 DC P target:T_docs normal 8 8 325 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DC
 70 CV P target:T_cov,cluster:C_cov untimed 4 4 45 CARGO_BUILD_JOBS=4 bash scripts/merge-gate.sh --step CV
 80 M P target:T_mut,cluster:C_mut untimed 8 8 136 CARGO_BUILD_JOBS=8 MUTANTS_JOBS=6 bash scripts/merge-gate.sh --step M
 ";
 
-/// A `cargo` that notes `jobs incremental pwd target mtime-of-lib.rs args` (tab separated), sleeps 0.05 s
+/// A `cargo` that notes `jobs incremental pwd target mtime-of-lib.rs args profile` (tab separated; `profile` is its
+/// `CARGO_PROFILE_*` variables, sorted, one space after each), sleeps 0.05 s
 /// (`USL_FAKE_SLEEP` changes it) and exits `USL_FAKE_RC`. With `USL_FAKE_PSI_ON=n` the n-th call writes
 /// a loaded pressure into `GATE_USL_PSI` and every other call writes a quiet one.
 const CARGO_FALSO: &str = r#"#!/bin/sh
@@ -88,7 +95,7 @@ if [ -n "$USL_FAKE_PSI_ON" ]; then
     echo "some avg10=1.00 avg60=0.00 avg300=0.00 total=0" > "$GATE_USL_PSI"
   fi
 fi
-printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$CARGO_BUILD_JOBS" "$CARGO_INCREMENTAL" "$PWD" "$CARGO_TARGET_DIR" "$(stat -c %y src/lib.rs 2>/dev/null)" "$*" >> "$USL_FAKE_LOG"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$CARGO_BUILD_JOBS" "$CARGO_INCREMENTAL" "$PWD" "$CARGO_TARGET_DIR" "$(stat -c %y src/lib.rs 2>/dev/null)" "$*" "$(env | grep '^CARGO_PROFILE_' | LC_ALL=C sort | tr '\n' ' ')" >> "$USL_FAKE_LOG"
 sleep "${USL_FAKE_SLEEP:-0.05}"
 exit "${USL_FAKE_RC:-0}"
 "#;
@@ -146,6 +153,7 @@ struct Llamada {
     target: String,
     mtime: String,
     args: String,
+    perfil: String,
 }
 
 struct Fx {
@@ -202,6 +210,10 @@ impl Fx {
             .unwrap_or_else(|e| panic!("scripts/{fichero}: {e}"));
         }
         write(&fx.tree.join("rust/src/lib.rs"), "pub fn f() {}\n");
+        write(
+            &fx.tree.join("scripts/gate-dag.txt"),
+            &TABLA.replace("{DBG}", "8"),
+        );
         write(&fx.psi, PSI_QUIETA);
         write(&fx.sin_cgroup, "");
         write(&fx.bin.join("cargo"), CARGO_FALSO);
@@ -214,7 +226,10 @@ impl Fx {
 
     fn commit(&self, mensaje: &str) {
         git(&self.tree, &["add", "-A"]);
-        git(&self.tree, &["commit", "-q", "-m", mensaje]);
+        git(
+            &self.tree,
+            &["commit", "-q", "--allow-empty", "-m", mensaje],
+        );
     }
 
     fn comando(&self, args: &[&str], extra: &[(&str, Option<&str>)]) -> Command {
@@ -240,7 +255,10 @@ impl Fx {
             .env("USL_FAKE_DIR", &self.fake)
             .env("USL_FAKE_LOG", self.fake.join("llamadas.log"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("CARGO_INCREMENTAL")
+            .env_remove("CARGO_PROFILE_DEV_DEBUG")
+            .env_remove("CARGO_PROFILE_DEV_STRIP");
         for (nombre, valor) in extra {
             match valor {
                 Some(v) => cmd.env(nombre, v),
@@ -264,7 +282,7 @@ impl Fx {
             .lines()
             .map(|linea| {
                 let c: Vec<&str> = linea.split('\t').collect();
-                assert_eq!(c.len(), 6, "a line of the fake cargo log: {linea:?}");
+                assert_eq!(c.len(), 7, "a line of the fake cargo log: {linea:?}");
                 Llamada {
                     jobs: c[0].to_string(),
                     incr: c[1].to_string(),
@@ -272,6 +290,7 @@ impl Fx {
                     target: c[3].to_string(),
                     mtime: c[4].to_string(),
                     args: c[5].to_string(),
+                    perfil: c[6].trim().to_string(),
                 }
             })
             .collect()
@@ -385,6 +404,21 @@ fn scripts() -> PathBuf {
         .parent()
         .expect("repo root")
         .join("scripts")
+}
+
+/// The profile tokens (`CARGO_PROFILE_*`) of a row of a table, sorted and joined by a space. Written here from the
+/// sentence of the table's header (the leading NAME=value tokens of a row are its environment), not read from the planner.
+fn perfil_de_fila(tabla: &str, fila: &str) -> String {
+    let mut fichas: Vec<&str> = tabla
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .map(|l| l.split_whitespace().collect::<Vec<&str>>())
+        .filter(|campos| campos.get(1) == Some(&fila))
+        .flatten()
+        .filter(|ficha| ficha.starts_with("CARGO_PROFILE_"))
+        .collect();
+    fichas.sort_unstable();
+    fichas.join(" ")
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -746,13 +780,29 @@ fn ajustar_con_una_entrada_ilegible_sale_2() {
 // ---------------------------------------------------------------------------------------------
 // U7-U11: the sweep
 
+/// The three cargo orders of one point of the `debug` profile, in order.
+const ORDENES_DEBUG: [&str; 3] = [
+    "clippy --all-targets -- -D warnings",
+    "build --bin memory-industry",
+    "test --no-run",
+];
+
 #[test]
-fn u7_un_punto_por_j_y_replica_en_el_orden_fijado_con_su_j_y_sin_incremental() {
+fn u7_un_punto_por_j_y_replica_en_el_orden_fijado_con_su_j_sin_incremental_y_con_el_perfil_de_la_fila()
+ {
     let fx = Fx::new("u7");
+    let tabla =
+        fs::read_to_string(fx.tree.join("scripts/gate-dag.txt")).expect("the fixture's table");
+    let perfil_dbg = perfil_de_fila(&tabla, "DBG");
+    assert!(
+        perfil_dbg.contains("CARGO_PROFILE_DEV_DEBUG=0")
+            && perfil_dbg.contains("CARGO_PROFILE_DEV_STRIP=symbols"),
+        "anchor: the DBG row of the fixture carries the profile of CI-K4, or this test proves nothing: {perfil_dbg:?}"
+    );
     let salida = fx.run(&[
         "barrido",
         "--perfil",
-        "bin",
+        "debug",
         "--j",
         "1,2,4,6,8",
         "--reps",
@@ -760,20 +810,29 @@ fn u7_un_punto_por_j_y_replica_en_el_orden_fijado_con_su_j_y_sin_incremental() {
     ]);
     assert_eq!(salida.code, Some(0), "{}", salida.text());
     let llamadas = fx.llamadas();
-    assert_eq!(llamadas.len(), 11, "1 warm-up + 10 points");
+    assert_eq!(llamadas.len(), 3 * 11, "3 orders x (1 warm-up + 10 points)");
+    for (i, llamada) in llamadas.iter().enumerate() {
+        assert_eq!(
+            llamada.args,
+            ORDENES_DEBUG[i % 3],
+            "call {i}: the orders of a debug point, in order"
+        );
+        assert_eq!(
+            llamada.perfil, perfil_dbg,
+            "call {i} ({}): the sweep builds with the profile of the DBG row of the table",
+            llamada.args
+        );
+    }
     assert!(
-        llamadas
-            .iter()
-            .all(|l| l.args == "build --bin memory-industry"),
-        "the E2E profile is one build of the bin"
+        llamadas[..3].iter().all(|l| l.jobs == "8"),
+        "the warm-up runs at the highest J"
     );
-    assert_eq!(llamadas[0].jobs, "8", "the warm-up runs at the highest J");
     let lineas = fx.usl();
     assert_eq!(lineas.len(), 10, "the warm-up writes nothing");
     for linea in &lineas {
         assert_eq!(linea["repo"], json!("memory-industry"));
-        assert_eq!(linea["perfil"], json!("bin"));
-        assert_eq!(linea["fila"], json!("E2E"));
+        assert_eq!(linea["perfil"], json!("debug"));
+        assert_eq!(linea["fila"], json!("DBG"));
         for campo in CAMPOS_PUNTO {
             assert!(
                 linea.get(campo).is_some(),
@@ -806,20 +865,22 @@ fn u7_un_punto_por_j_y_replica_en_el_orden_fijado_con_su_j_y_sin_incremental() {
         "the last line of stdout: {resumen:?}"
     );
     let tree_rust = fs::canonicalize(fx.tree.join("rust")).expect("rust dir");
-    let destino = fx.destinos.join(fx.clave_del_arbol()).join("T_rel");
-    for (llamada, linea) in llamadas[1..].iter().zip(&lineas) {
-        assert_eq!(
-            llamada.jobs,
-            linea["J"].as_u64().expect("J").to_string(),
-            "CARGO_BUILD_JOBS of each measured call is the J of its line"
-        );
-        assert_eq!(llamada.incr, "0", "CARGO_INCREMENTAL=0");
-        assert_eq!(Path::new(&llamada.pwd), tree_rust, "cwd is <root>/rust");
-        assert_eq!(
-            Path::new(&llamada.target),
-            destino,
-            "the target of the E2E row"
-        );
+    let destino = fx.destinos.join(fx.clave_del_arbol()).join("T_dbg");
+    for (punto, linea) in lineas.iter().enumerate() {
+        for llamada in &llamadas[3 + 3 * punto..6 + 3 * punto] {
+            assert_eq!(
+                llamada.jobs,
+                linea["J"].as_u64().expect("J").to_string(),
+                "CARGO_BUILD_JOBS of each measured call is the J of its line"
+            );
+            assert_eq!(llamada.incr, "0", "CARGO_INCREMENTAL=0");
+            assert_eq!(Path::new(&llamada.pwd), tree_rust, "cwd is <root>/rust");
+            assert_eq!(
+                Path::new(&llamada.target),
+                destino,
+                "the target of the DBG row"
+            );
+        }
     }
     let marca = fs::read_to_string(destino.join(".gate-tree")).expect(".gate-tree");
     let real = fs::canonicalize(&fx.tree).expect("canonical tree");
@@ -853,15 +914,10 @@ fn u8_el_crate_se_enfria_por_mtime_y_la_huella_no_cambia() {
     assert_eq!(salida.code, Some(0), "{}", salida.text());
     let llamadas = fx.llamadas();
     assert_eq!(llamadas.len(), 9, "3 orders x (1 warm-up + 2 points)");
-    let ordenes = [
-        "clippy --all-targets -- -D warnings",
-        "build --bin memory-industry",
-        "test --no-run",
-    ];
     for (i, llamada) in llamadas.iter().enumerate() {
         assert_eq!(
             llamada.args,
-            ordenes[i % 3],
+            ORDENES_DEBUG[i % 3],
             "call {i}: the orders of a debug point, in order"
         );
     }
@@ -898,16 +954,19 @@ fn u9_maquina_ocupada_o_entrada_invalida_sale_2_sin_llamar_a_cargo() {
     );
 
     write(&fx.psi, PSI_QUIETA);
-    let salida = fx.run(&["barrido", "--perfil", "mutantes"]);
-    assert_eq!(salida.code, Some(2), "{}", salida.text());
-    assert!(
-        salida.text().contains("unknown profile"),
-        "{}",
-        salida.text()
-    );
+    // `bin` was the profile of the E2E row, which compiles nothing since CI-F3.4: it is not a profile any more.
+    for desconocido in ["mutantes", "bin"] {
+        let salida = fx.run(&["barrido", "--perfil", desconocido]);
+        assert_eq!(salida.code, Some(2), "{desconocido}: {}", salida.text());
+        assert!(
+            salida.text().contains("unknown profile"),
+            "{desconocido}: {}",
+            salida.text()
+        );
+    }
 
     let salida = fx.run_env(
-        &["barrido", "--perfil", "bin"],
+        &["barrido", "--perfil", "debug"],
         &[("CARGO_TARGET_DIR", None)],
     );
     assert_eq!(salida.code, Some(2), "{}", salida.text());
@@ -926,18 +985,18 @@ fn u10_un_punto_que_termina_con_presion_alta_queda_cargado() {
         &[
             "barrido",
             "--perfil",
-            "bin",
+            "release",
             "--j",
             "1,2,4,6,8",
             "--reps",
             "1",
         ],
-        &[("USL_FAKE_PSI_ON", Some("3"))],
+        &[("USL_FAKE_PSI_ON", Some("6"))],
     );
     assert_eq!(salida.code, Some(0), "{}", salida.text());
     let lineas = fx.usl();
     assert_eq!(lineas.len(), 5);
-    // call 1 is the warm-up, so call 3 belongs to the second point
+    // calls 1 and 2 are the warm-up (two orders), so call 6 is the last one of the second point
     for (i, linea) in lineas.iter().enumerate() {
         assert_eq!(linea["cargado"], json!(i == 1), "point {i}: {linea}");
     }
@@ -977,7 +1036,7 @@ fn u11_el_historial_nunca_cambia_la_salida() {
         &[
             "barrido",
             "--perfil",
-            "bin",
+            "release",
             "--j",
             "1,2,4,6,8",
             "--reps",
@@ -1007,8 +1066,8 @@ fn u11_el_historial_nunca_cambia_la_salida() {
         .arg("-c")
         .arg(
             "import sys\nsys.path.insert(0, sys.argv[1])\nimport gate_history as gh\n\
-             gh.usl_point({'perfil': 'bin', 'J': 4})\n\
-             gh.usl_point({'perfil': 'bin', 'J': {4, 8}})\n",
+             gh.usl_point({'perfil': 'release', 'J': 4})\n\
+             gh.usl_point({'perfil': 'release', 'J': {4, 8}})\n",
         )
         .arg(fx.tree.join("scripts"))
         .env("PYTHONDONTWRITEBYTECODE", "1")
@@ -1038,7 +1097,7 @@ fn u11_el_historial_nunca_cambia_la_salida() {
         "only the serialisable record is written: {lineas:?}"
     );
     assert_eq!(lineas[0]["repo"], json!("memory-industry"));
-    assert_eq!(lineas[0]["perfil"], json!("bin"));
+    assert_eq!(lineas[0]["perfil"], json!("release"));
 }
 
 #[test]
@@ -1046,7 +1105,7 @@ fn u18_un_cargo_colgado_se_corta_en_su_plazo() {
     let fx = Fx::new("u18");
     let t0 = Instant::now();
     let salida = fx.run_env(
-        &["barrido", "--perfil", "bin", "--j", "1", "--reps", "1"],
+        &["barrido", "--perfil", "release", "--j", "1", "--reps", "1"],
         &[
             ("USL_FAKE_SLEEP", Some("120")),
             ("GATE_USL_PLAZO_S", Some("1")),
@@ -1059,6 +1118,57 @@ fn u18_un_cargo_colgado_se_corta_en_su_plazo() {
         "the sweep waited {:?} for a cargo that hung",
         t0.elapsed()
     );
+}
+
+#[test]
+fn u20_el_barrido_toma_el_perfil_de_la_fila_de_la_tabla_del_arbol() {
+    // The tokens are not a copy in the tool: another profile in the table of the tree is another profile in the sweep.
+    let fx = Fx::new("u20");
+    let otra = TABLA.replace("{DBG}", "8").replace(
+        "CARGO_PROFILE_DEV_STRIP=symbols",
+        "CARGO_PROFILE_DEV_STRIP=none",
+    );
+    write(&fx.tree.join("scripts/gate-dag.txt"), &otra);
+    fx.commit("another profile for the dev rows");
+    let esperado = perfil_de_fila(&otra, "DBG");
+    assert!(
+        esperado.contains("CARGO_PROFILE_DEV_STRIP=none"),
+        "{esperado:?}"
+    );
+    let salida = fx.run(&["barrido", "--perfil", "debug", "--j", "2", "--reps", "1"]);
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    let llamadas = fx.llamadas();
+    assert_eq!(llamadas.len(), 6, "3 orders x (1 warm-up + 1 point)");
+    for llamada in &llamadas {
+        assert_eq!(llamada.perfil, esperado, "{}", llamada.args);
+    }
+
+    // A row with no profile tokens (B3 builds in release) passes none, whatever the environment of the caller.
+    let fx = Fx::new("u20-b3");
+    assert_eq!(
+        perfil_de_fila(TABLA, "B3"),
+        "",
+        "anchor: the B3 row has no profile tokens"
+    );
+    let salida = fx.run(&["barrido", "--perfil", "release", "--j", "4", "--reps", "1"]);
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    let llamadas = fx.llamadas();
+    assert_eq!(llamadas.len(), 4, "2 orders x (1 warm-up + 1 point)");
+    for llamada in &llamadas {
+        assert_eq!(llamada.perfil, "", "{}", llamada.args);
+    }
+
+    // A sweep that cannot read the row of its profile measures nothing: exit 2, and cargo is never reached.
+    let fx = Fx::new("u20-sin-tabla");
+    fs::remove_file(fx.tree.join("scripts/gate-dag.txt")).expect("remove the table");
+    let salida = fx.run(&["barrido", "--perfil", "debug", "--j", "2", "--reps", "1"]);
+    assert_eq!(salida.code, Some(2), "{}", salida.text());
+    assert!(
+        salida.text().contains("gate-dag.txt"),
+        "the message names the table: {}",
+        salida.text()
+    );
+    assert!(fx.llamadas().is_empty(), "no cargo without the profile");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1164,17 +1274,19 @@ const CURVA_DEBUG: Curva = Curva {
     kappa: 0.0008,
 };
 const NIVELES_DEBUG: [u32; 6] = [2, 4, 8, 12, 16, 24];
-/// A shallow curve: T(2) - T(J) is 6.2 s at J = 4 and under 10 s at every J, so no J buys the E2E row the 11.5 s
+/// A shallow curve: T(2) - T(J) is 6.2 s at J = 4 and under 10 s at every J, so no J buys a row at 2 jobs the 11.5 s
 /// threshold, but a gain above 0 is there for a threshold of 0 to propose (spec U14, sabotage "threshold 0").
-const CURVA_BIN: Curva = Curva {
+const CURVA_PLANA: Curva = Curva {
     lambda: 1.0 / 50.0,
     sigma: 0.5,
     kappa: 0.001,
 };
-const NIVELES_BIN: [u32; 5] = [1, 2, 4, 6, 8];
+const NIVELES_PLANOS: [u32; 5] = [1, 2, 4, 6, 8];
+/// The grid of the `release` profile (B3).
+const NIVELES_RELEASE: [u32; 5] = [4, 6, 8, 12, 16];
 
-/// Both profiles measured, plus an older and unreliable debug sweep that the last one must hide.
-fn barridos_buenos(fx: &Fx, con_bin: bool) {
+/// The debug profile measured, plus an older and unreliable debug sweep that the last one must hide.
+fn barridos_buenos(fx: &Fx) {
     let viejo = puntos_de(
         "debug",
         "DBG",
@@ -1187,10 +1299,6 @@ fn barridos_buenos(fx: &Fx, con_bin: bool) {
     let mut debug = exacta("debug", "DBG", CURVA_DEBUG, &NIVELES_DEBUG);
     con_rss(&mut debug, 2 << 30, (1 << 30) / 10);
     sembrar_barrido(fx, "20261104", "debug-bueno", &debug);
-    if con_bin {
-        let bin = exacta("bin", "E2E", CURVA_BIN, &NIVELES_BIN);
-        sembrar_barrido(fx, "20261104", "bin-bueno", &bin);
-    }
 }
 
 fn recomendar(fx: &Fx) -> (Salida, Value) {
@@ -1274,7 +1382,7 @@ fn u14_la_simulacion_elige_el_j_que_cabe_no_la_rodilla_y_solo_propone_si_gana_lo
     let fx = Fx::new("u14");
     let tabla = tabla_en_arbol(&fx, 8);
     historial_de(&fx, &tabla, 391.036, pasos_cortos);
-    barridos_buenos(&fx, true);
+    barridos_buenos(&fx);
     let antes = fs::read(fx.tree.join("scripts/gate-dag.txt")).expect("table");
     let (salida, v) = recomendar(&fx);
     assert_eq!(salida.code, Some(0), "{}", salida.text());
@@ -1315,33 +1423,15 @@ fn u14_la_simulacion_elige_el_j_que_cabe_no_la_rodilla_y_solo_propone_si_gana_lo
             assert_eq!(a, b, "only the cpu and the jobs of DBG change:\n{diff}");
         }
     }
-    let e2e = &v["calibradas"]["E2E"];
-    assert_eq!(e2e["propone"], json!(false), "{}", salida.text());
-    assert_eq!(e2e["J_propuesto"], e2e["J_actual"]);
-    let umbral = (0.02 * num(&v["L"])).max(10.0);
     assert!(
-        num(&e2e["ganancia_s"]) > 0.0,
-        "the E2E row has a gain, under the threshold: {}",
-        e2e["ganancia_s"]
-    );
-    assert!(
-        num(&e2e["ganancia_s"]) < umbral,
-        "E2E gain {} has to be under the threshold {umbral}",
-        e2e["ganancia_s"]
+        v["calibradas"]["E2E"].is_null(),
+        "E2E is critical but compiles nothing, so no profile calibrates it: {}",
+        salida.text()
     );
     assert!(
         num(&v["T_sim_propuesto"]) < num(&v["T_sim_actual"]),
         "{}",
         salida.text()
-    );
-    let texto = fx.run(&["recomendar"]);
-    assert!(
-        texto
-            .out
-            .lines()
-            .any(|l| l.contains("E2E") && l.contains("se conserva")),
-        "{}",
-        texto.text()
     );
     assert_eq!(
         fs::read(fx.tree.join("scripts/gate-dag.txt")).expect("table"),
@@ -1351,18 +1441,66 @@ fn u14_la_simulacion_elige_el_j_que_cabe_no_la_rodilla_y_solo_propone_si_gana_lo
 }
 
 #[test]
+fn u14b_una_fila_critica_con_una_curva_plana_se_conserva_y_con_umbral_cero_cambiaria() {
+    // DBG at 2 jobs on a shallow curve: some J is faster (gain > 0), none buys the threshold (spec U14, sabotage
+    // "threshold 0"). The gain has to be on a row that is critical and calibrated: since CI-F3.4 that is DBG alone.
+    let fx = Fx::new("u14b");
+    let tabla = tabla_en_arbol(&fx, 2);
+    historial_de(&fx, &tabla, 391.036, pasos_cortos);
+    let viejo = exacta("debug", "DBG", CURVA_PLANA, &NIVELES_PLANOS);
+    sembrar_barrido(&fx, "20261104", "debug-plano", &viejo);
+    let (salida, v) = recomendar(&fx);
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    let dbg = &v["calibradas"]["DBG"];
+    assert_eq!(dbg["J_actual"], json!(2), "{}", salida.text());
+    assert_eq!(dbg["propone"], json!(false), "{}", salida.text());
+    assert_eq!(dbg["J_propuesto"], dbg["J_actual"]);
+    let umbral = (0.02 * num(&v["L"])).max(10.0);
+    assert!(
+        num(&dbg["ganancia_s"]) > 0.0,
+        "the DBG row has a gain, under the threshold: {}",
+        dbg["ganancia_s"]
+    );
+    assert!(
+        num(&dbg["ganancia_s"]) < umbral,
+        "DBG gain {} has to be under the threshold {umbral}",
+        dbg["ganancia_s"]
+    );
+    assert!(
+        v["diff"].is_null(),
+        "no diff when nothing gains the threshold: {}",
+        v["diff"]
+    );
+    let texto = fx.run(&["recomendar"]);
+    assert!(
+        texto
+            .out
+            .lines()
+            .any(|l| l.contains("DBG") && l.contains("se conserva")),
+        "{}",
+        texto.text()
+    );
+}
+
+#[test]
 fn u15_sin_ajuste_fiable_para_una_fila_critica_sale_3_con_la_orden_que_falta() {
+    // DBG and B3 as long as each other: both are on the critical path, and only DBG has a sweep.
     let fx = Fx::new("u15");
     let tabla = tabla_en_arbol(&fx, 8);
-    historial_de(&fx, &tabla, 391.036, pasos_cortos);
-    barridos_buenos(&fx, false);
+    historial_de(&fx, &tabla, 206.174, pasos_cortos);
+    barridos_buenos(&fx);
     let (salida, v) = recomendar(&fx);
     assert_eq!(salida.code, Some(3), "{}", salida.text());
-    let orden_bin = "python3 -I scripts/gate_usl.py barrido --perfil bin";
-    assert!(salida.out.contains(orden_bin), "{}", salida.text());
+    let orden_release = "python3 -I scripts/gate_usl.py barrido --perfil release";
+    assert!(salida.out.contains(orden_release), "{}", salida.text());
     assert!(
         !salida.text().contains("--perfil debug"),
         "the debug sweep exists: {}",
+        salida.text()
+    );
+    assert!(
+        !salida.text().contains("--perfil bin"),
+        "E2E compiles nothing, so it asks for no sweep: {}",
         salida.text()
     );
     assert!(
@@ -1393,13 +1531,13 @@ fn u15_sin_ajuste_fiable_para_una_fila_critica_sale_3_con_la_orden_que_falta() {
     sembrar_barrido(
         &fx,
         "20261105",
-        "bin-plano",
-        &exacta("bin", "E2E", CURVA_BIN, &NIVELES_BIN),
+        "release-ancho",
+        &exacta("release", "B3", ancha, &NIVELES_RELEASE),
     );
     let (salida, v) = recomendar(&fx);
     assert_eq!(salida.code, Some(0), "{}", salida.text());
     let tope = u64::from(C_NUCLEOS);
-    for fila in ["DBG", "E2E"] {
+    for fila in ["DBG", "B3"] {
         let j = v["calibradas"][fila]["J_propuesto"]
             .as_u64()
             .expect("J_propuesto");
@@ -1448,7 +1586,7 @@ fn u16_el_j_de_las_corridas_sale_de_git_no_de_la_tabla_de_hoy() {
         &desconocida,
         &pasos_cortos(206.174, 900.0),
     );
-    barridos_buenos(&fx, true);
+    barridos_buenos(&fx);
     let (salida, v) = recomendar(&fx);
     let dbg = &v["calibradas"]["DBG"];
     assert_eq!(dbg["J_hist"], json!([4]), "{}", salida.text());
@@ -1487,14 +1625,71 @@ fn aparece(script: &str, orden: &str) -> bool {
     })
 }
 
+/// The body of `step_<id>()` in merge-gate.sh: the lines between its header and the `}` that closes it (the same helper as
+/// local_gate_contract.rs: each file of tests/ is its own binary and cannot share it).
+fn step_body(gate: &str, id: &str) -> Option<Vec<String>> {
+    funcion(gate, &format!("step_{id}"))
+}
+
+/// The --lane ids a step body runs, in the order its text gives them.
+fn lanes_in(body: &[String]) -> Vec<String> {
+    body.iter()
+        .flat_map(|line| {
+            line.split("--lane ")
+                .skip(1)
+                .filter_map(|rest| rest.split_whitespace().next())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The lines between `<name>() {` and the `}` at the start of a line that closes it.
+fn funcion(script: &str, nombre: &str) -> Option<Vec<String>> {
+    let cabecera = format!("{nombre}() {{");
+    let mut lineas = script.lines();
+    lineas.find(|l| l.trim_end() == cabecera)?;
+    Some(lineas.take_while(|l| *l != "}").map(String::from).collect())
+}
+
+/// What `lane_<id>()` of run-all-tests.sh runs: the lines of its body that are not comments and, transitively, those of
+/// every function of the script that one of them names (the build of the bin sits in `gate_bin`, which the lane reaches
+/// through `provision_gate_db`). A cargo order in a comment, or in a lane that is not this one, is not run by it.
+fn alcance_del_carril(script: &str, carril: &str) -> String {
+    let definidas: Vec<&str> = script
+        .lines()
+        .filter_map(|l| l.strip_suffix("() {"))
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .collect();
+    let mut vistas = vec![format!("lane_{carril}")];
+    let mut texto = String::new();
+    let mut i = 0;
+    while i < vistas.len() {
+        let cuerpo = funcion(script, &vistas[i])
+            .unwrap_or_else(|| panic!("run-all-tests.sh has no {}()", vistas[i]));
+        for linea in cuerpo.iter().filter(|l| !l.trim_start().starts_with('#')) {
+            texto.push_str(linea);
+            texto.push('\n');
+            for palabra in linea.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                if definidas.contains(&palabra) && !vistas.iter().any(|v| v == palabra) {
+                    vistas.push(palabra.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    texto
+}
+
 #[test]
-fn u17_las_ordenes_de_cada_perfil_existen_tal_cual_en_run_all_tests() {
+fn u17_las_ordenes_de_cada_perfil_existen_tal_cual_en_los_carriles_de_su_fila() {
     // `--timings` (CI-K4) is a report flag on every cargo call of the judge: it changes no input of the build, and the sweep
     // does not ask for it, so an order matches the script with the flag taken out of it.
     let script = fs::read_to_string(scripts().join("run-all-tests.sh"))
         .expect("run-all-tests.sh")
         .replace(" --timings", "");
-    for perfil in ["debug", "bin", "release"] {
+    let gate = fs::read_to_string(scripts().join("merge-gate.sh")).expect("merge-gate.sh");
+    for perfil in ["debug", "release"] {
         let fx = Fx::new(&format!("u17-{perfil}"));
         let salida = fx.run(&["barrido", "--perfil", perfil, "--j", "2", "--reps", "1"]);
         assert_eq!(salida.code, Some(0), "{perfil}: {}", salida.text());
@@ -1504,11 +1699,27 @@ fn u17_las_ordenes_de_cada_perfil_existen_tal_cual_en_run_all_tests() {
             "{perfil}: a warm-up and one point run the same orders: {} calls",
             llamadas.len()
         );
+        // The row of the profile is the one the sweep writes in its points, and its lanes are the ones its step runs.
+        let puntos = fx.usl();
+        let fila = puntos[0]["fila"].as_str().expect("fila").to_string();
+        let cuerpo = step_body(&gate, &fila).unwrap_or_else(|| {
+            panic!("merge-gate.sh has no step_{fila}() for the profile {perfil}")
+        });
+        let carriles = lanes_in(&cuerpo);
+        assert!(
+            !carriles.is_empty(),
+            "step_{fila}() of merge-gate.sh runs no --lane"
+        );
+        let alcance: String = carriles
+            .iter()
+            .map(|c| alcance_del_carril(&script, c))
+            .collect::<Vec<_>>()
+            .join("\n");
         for llamada in &llamadas[..llamadas.len() / 2] {
             let orden = format!("cargo {}", llamada.args);
             assert!(
-                aparece(&script, &orden),
-                "profile {perfil}: the order {orden:?} is not in scripts/run-all-tests.sh"
+                aparece(&alcance, &orden),
+                "profile {perfil}: the order {orden:?} is not run by the lanes {carriles:?} of the row {fila} in scripts/run-all-tests.sh"
             );
         }
     }
@@ -1601,7 +1812,7 @@ fn u19_recomendar_encuentra_las_corridas_aunque_la_tabla_cambie_de_comentarios_y
         "the fixture must hold two spellings of one table"
     );
     historial_de(&fx, &clave, 391.036, pasos_cortos);
-    barridos_buenos(&fx, true);
+    barridos_buenos(&fx);
     let (salida, v) = recomendar(&fx);
     let dbg = &v["calibradas"]["DBG"];
     assert_eq!(dbg["J_hist"], json!([8]), "{}", salida.text());
