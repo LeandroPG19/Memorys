@@ -1952,13 +1952,27 @@ fn a_row_with_models_that_has_nobody_beside_it_starts_with_little_memory() {
 }
 
 /// The production line of the plan, as tracing writes it (the nested form of the 19th run), for a tier, a reranker on
-/// the GPU or not, and the three pools.
+/// the GPU or not, and the three pools, on the 24 logical cores of the 19th run.
 fn plan_line(tier: &str, gpu: bool, embed: u32, rerank: u32, nli: u32) -> String {
+    plan_line_on(Some(24), tier, gpu, embed, rerank, nli)
+}
+
+/// `plan_line` for a machine of `cores` logical cores (`cores_logical`, the field tracing writes beside the plan), or,
+/// with `None`, for a line that does not carry them.
+fn plan_line_on(
+    cores: Option<u32>,
+    tier: &str,
+    gpu: bool,
+    embed: u32,
+    rerank: u32,
+    nli: u32,
+) -> String {
     let gpu = if gpu { " (GPU)" } else { "" };
+    let cores = cores.map_or(String::new(), |n| format!("\"cores_logical\":{n},"));
     format!(
         "{{\"timestamp\":\"2026-11-06T16:10:54.000112Z\",\"level\":\"INFO\",\"fields\":{{\"message\":\"resource plan\",\
          \"ram_total_mb\":48171,\"ram_available_mb\":27785,\"cgroup_limit_mb\":36864,\"swap_total_mb\":8192,\
-         \"cores_logical\":24,\"cores_physical\":12,\"plan\":\"nivel={tier} (embebedor + reranker + NLI) · \
+         {cores}\"cores_physical\":12,\"plan\":\"nivel={tier} (embebedor + reranker + NLI) · \
          presupuesto=27017 MiB · reserva=3320 MiB · modelos: embebedor=true reranker=true{gpu} nli=true · \
          hilos: embed={embed} rerank={rerank} nli={nli} · tokio: workers=4 blocking=16 · pool=4 · chunk=4 · \
          ood_fit=5000\"}}}}\n"
@@ -2061,6 +2075,88 @@ fn the_threads_of_the_plan_are_the_tables_except_the_reranker_on_a_gpu() {
         let run = fx.run("0");
         let label = format!(
             "case {} (gpu {gpu}, embed={embed} rerank={rerank} nli={nli})",
+            n + 1
+        );
+        assert!(!run.timed_out, "{label}: did not finish in 30 s");
+        assert_eq!(
+            run.code,
+            Some(want),
+            "{label}: exit {:?}, want {want}\n{}{}",
+            run.code,
+            run.out,
+            run.err
+        );
+        if want == 1 {
+            let block = block_of_e(&run);
+            assert!(
+                block.contains(&format!("FAIL: e: {text}")),
+                "{label}: the block does not say {text:?}: {block:?}"
+            );
+        }
+    }
+}
+
+/// CI-E13 (D-E13a): the verdict does not depend on the CPUs the judge runs with. The plan of production gives each pool
+/// half the logical cores, at least 1 and at most the table's number (rust/src/resources.rs: `half_cores.min(MAX_*)`), so
+/// a shared turn of 12 CPUs plans rerank=6 and is the same judge as one of 24 that plans rerank=8: the 10-nov run with
+/// 12 CPUs went red on `rerank=6, the rows with models set 8` with nothing wrong. What stays red is a plan that is not
+/// what its own cores give, up or down; the reranker on a GPU is not compared (P6), and a line with no cores is compared
+/// with the table's numbers as it is.
+#[test]
+fn the_pools_of_the_plan_follow_the_cpus_the_plan_saw() {
+    // (cores_logical, gpu, embed, rerank, nli, exit, the line the block carries)
+    let cases = [
+        (Some(12), false, 4, 6, 4, 0, ""),
+        (
+            Some(12),
+            false,
+            4,
+            8,
+            4,
+            1,
+            "resource plan rerank=8, the rows with models set 8 and 12 CPUs give 6",
+        ),
+        (
+            Some(12),
+            false,
+            4,
+            4,
+            4,
+            1,
+            "resource plan rerank=4, the rows with models set 8 and 12 CPUs give 6",
+        ),
+        (Some(6), false, 3, 3, 3, 0, ""),
+        (
+            Some(6),
+            false,
+            4,
+            3,
+            3,
+            1,
+            "resource plan embed=4, the rows with models set 4 and 6 CPUs give 3",
+        ),
+        (Some(1), false, 1, 1, 1, 0, ""),
+        (Some(12), true, 4, 2, 4, 0, ""),
+        (None, false, 4, 8, 4, 0, ""),
+        (
+            None,
+            false,
+            4,
+            6,
+            4,
+            1,
+            "resource plan rerank=6, the rows with models set 8",
+        ),
+    ];
+    for (n, (cores, gpu, embed, rerank, nli, want, text)) in cases.into_iter().enumerate() {
+        let mut fx = Fixture::new("e13-cpus", CPU_FOUR, MEM_OPEN);
+        plan_table(
+            &mut fx,
+            &plan_line_on(cores, "full", gpu, embed, rerank, nli),
+        );
+        let run = fx.run("0");
+        let label = format!(
+            "case {} (cores {cores:?}, gpu {gpu}, embed={embed} rerank={rerank} nli={nli})",
             n + 1
         );
         assert!(!run.timed_out, "{label}: did not finish in 30 s");

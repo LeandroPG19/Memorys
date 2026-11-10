@@ -123,7 +123,7 @@ plain/linux/v046_migrations_apply_over_an_existing_schema 1 pasada llana del 10-
 plain/linux/v08_project_scoping 0 pasada llana del 10-nov sobre b51e027
 plain/linux/v09_integration 0 pasada llana del 10-nov sobre b51e027
 contracts/linux/ci_contract 14 pasada llana del 10-nov sobre b51e027
-contracts/linux/gate_dag_contract 88 pasada llana del 10-nov sobre b51e027 (87: pasados + 18 fallados) y tanda 9 +1 test (the_planner_of_a_test_does_not_inherit_the_environment_of_the_judge)
+contracts/linux/gate_dag_contract 89 pasada llana del 10-nov sobre b51e027 (87: pasados + 18 fallados) y tanda 9 +1 test (the_planner_of_a_test_does_not_inherit_the_environment_of_the_judge) y CI-E13 +1 test (the_pools_of_the_plan_follow_the_cpus_the_plan_saw)
 contracts/linux/gate_history_contract 54 pasada llana del 10-nov sobre b51e027
 contracts/linux/gate_usl_contract 32 pasada llana del 10-nov sobre b51e027
 contracts/linux/group_no_server 101 pasada llana del 10-nov sobre b51e027
