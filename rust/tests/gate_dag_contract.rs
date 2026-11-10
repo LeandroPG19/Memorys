@@ -39,9 +39,10 @@ static SEQ: AtomicUsize = AtomicUsize::new(0);
 /// CI-K4 (D-K4n): `run_env` leaves GATE_DAG out of the environment, to see what the planner does by default.
 const UNSET: &str = "<unset>";
 
-/// What the judge exports to its lanes and to the processes under them, one name each: the same 32 as `JUDGE_ENVIRONMENT` in
-/// local_gate_contract.rs (the names `run_in_lane` of merge-gate.sh and the exports of merge-gate.sh and run-all-tests.sh
-/// hand down), which each one of them hands to a self-test as foreign. The contracts of the judge run under that
+/// What the judge exports to its lanes and to the processes under them, one name each: the 32 that `JUDGE_ENVIRONMENT` in
+/// local_gate_contract.rs has besides `CUBA_HANDLER_TIMEOUT_SECS` (33 there since CI-E14; only the row D3 names that one and
+/// the judge does not export it) — the names `run_in_lane` of merge-gate.sh and the exports of merge-gate.sh and
+/// run-all-tests.sh hand down, which each one of them hands to a self-test as foreign. The contracts of the judge run under that
 /// environment (`lane_CT` of run-all-tests.sh runs them with `DATABASE_URL` set), so a planner started from here with what
 /// its parent has would read the judge's: `DATABASE_URL` alone (gate-dag.py, J14d) puts every DAG in series. The planner of a
 /// test sees only what the test gives it.
@@ -2675,6 +2676,295 @@ fn a_step_that_leaves_processes_in_its_cgroup_is_named_an_orphan() {
         !run.text().contains("orphan"),
         "a step that left nothing is named an orphan: {}",
         run.text()
+    );
+}
+
+/// A fake step that leaves processes in its cgroup: when it ends it writes `control/procs-<id>` into the `cgroup.procs` of
+/// its own fake cgroup (the planner writes the pid of the step there when it starts it, so a file written before the run
+/// would be overwritten). $1 id, $2 seconds, $3 control directory; the cgroup of the row of idx 10 is next to `control`.
+const ORPHAN_SH: &str = r#"#!/bin/sh
+id="$1"
+control="$3"
+echo "=== $id banner"
+sleep "$2"
+cat "$control/procs-$id" > "$control/../cgroups/scope/paso-10-$id/cgroup.procs"
+exit 0
+"#;
+
+/// CI-E15: the note of an orphan says what was in the cgroup. The cgroup lists three pids in `cgroup.procs`: two live `sleep`
+/// and one that has already been reaped, which is skipped (its `/proc/<pid>/comm` is gone). `sleep x2` is what is said, and
+/// the note stays a note: the run is green. A cgroup whose only pid is the step's own, already dead, keeps the sentence of
+/// J14b with no parentheses.
+#[test]
+fn the_note_of_an_orphan_names_the_processes_that_were_in_the_cgroup() {
+    let mut fx = Fixture::new("e15-huerfanos", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "a", "-", "0.3", "")]);
+    write(&fx.script, ORPHAN_SH);
+    write(&fx.step_dir("a").join("cgroup.kill"), "");
+    fx.write_step("a", "cgroup.events", "populated 1\nfrozen 0\n");
+    let mut sleepers: Vec<std::process::Child> = (0..2)
+        .map(|_| {
+            Command::new("sleep")
+                .arg("43.5115")
+                .spawn()
+                .expect("a sleep for the cgroup")
+        })
+        .collect();
+    let mut gone = Command::new("true").spawn().expect("true");
+    gone.wait().expect("true ends");
+    let procs = format!(
+        "{}\n{}\n{}\n",
+        sleepers[0].id(),
+        gone.id(),
+        sleepers[1].id()
+    );
+    write(&fx.control.join("procs-a"), &procs);
+    let run = fx.run_env("0", &[("GATE_DAG_RMDIR_WAIT_S", "0.3")]);
+    for sleeper in &mut sleepers {
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+    assert_green(&run, "a step with two orphans that are `sleep`");
+    let note = run
+        .text()
+        .lines()
+        .find(|line| line.starts_with("note:") && line.contains("orphan processes"))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no note names the orphan processes: {}", run.text()));
+    assert!(
+        note.contains("paso-10-a ended with orphan processes in its cgroup (sleep x2);"),
+        "the note has to name the cgroup and the two `sleep` (and not the pid that was already gone): {note}"
+    );
+
+    let mut fx = Fixture::new("e15-huerfanos-vacio", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "a", "-", "0.3", "")]);
+    write(&fx.step_dir("a").join("cgroup.kill"), "");
+    fx.write_step("a", "cgroup.events", "populated 1\nfrozen 0\n");
+    let run = fx.run_env("0", &[("GATE_DAG_RMDIR_WAIT_S", "0.3")]);
+    assert_green(&run, "a step whose cgroup lists only its own dead pid");
+    assert!(
+        run.out
+            .contains("paso-10-a ended with orphan processes in its cgroup; they"),
+        "with no process left to name the note keeps the sentence without parentheses: {}",
+        run.text()
+    );
+}
+
+/// A fake step that leaves a file in its own TMPDIR (where the planner put it) and says which one it is in
+/// `control/tmpdir-<id>`; it exits with `control/rc-<id>`. $1 id, $2 seconds, $3 control directory.
+const SCRATCH_SH: &str = r#"#!/bin/sh
+id="$1"
+control="$3"
+echo "$TMPDIR" > "$control/tmpdir-$id"
+echo "=== $id banner"
+echo "left by $id" > "$TMPDIR/scratch"
+rc=$(cat "$control/rc-$id" 2>/dev/null || echo 0)
+echo "test result: ok. 1 passed; 0 failed"
+exit "$rc"
+"#;
+
+/// The rows `ids` (idx 10, 20, …) of `fx`, each the step of `SCRATCH_SH`.
+fn scratch_table(fx: &mut Fixture, ids: &[&'static str]) {
+    let script = fx.base.join("paso-scratch.sh");
+    write(&script, SCRATCH_SH);
+    let rows: Vec<StepRow> = ids
+        .iter()
+        .zip(1u32..)
+        .map(|(id, n)| StepRow {
+            script: script.clone(),
+            ..fx.row(10 * n, id, "-", "0.1")
+        })
+        .collect();
+    table_of(fx, &rows);
+}
+
+/// The TMPDIR the planner gave the row `id`, as the row said it: `<run directory>/tmp/<id>`. A test that reads it has the
+/// anchor of presence: the planner did make the directory, so that its absence afterwards is the planner's doing.
+fn tmpdir_of(fx: &Fixture, id: &str) -> PathBuf {
+    let said = read(&fx.control.join(format!("tmpdir-{id}")));
+    let path = PathBuf::from(said.trim());
+    assert!(
+        path.starts_with(&fx.tmp)
+            && path.to_string_lossy().contains("/memory-industry-dag.")
+            && path.ends_with(format!("tmp/{id}")),
+        "the row {id} was not given a TMPDIR under the run directory of the planner: {said:?}"
+    );
+    path
+}
+
+/// `<run directory>` from the TMPDIR of one of its rows.
+fn run_dir_of(tmpdir: &Path) -> PathBuf {
+    tmpdir
+        .parent()
+        .and_then(Path::parent)
+        .expect("tmp/<id> has a run directory above it")
+        .to_path_buf()
+}
+
+/// The run directories (`memory-industry-dag.*`) that are in the TMPDIR of the fixture.
+fn run_dirs_in(fx: &Fixture) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(&fx.tmp)
+        .expect("the TMPDIR of the fixture")
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("memory-industry-dag."))
+        .collect();
+    names.sort();
+    names
+}
+
+/// CI-E15: a run that ends green with a verdict leaves nothing of itself in TMPDIR. Each row writes in its own TMPDIR (the
+/// 65 MB of `tmp/CT` were the `scratch()` of the contracts) and the run directory, with its logs, stayed there for good.
+#[test]
+fn a_green_run_deletes_its_run_directory() {
+    let mut fx = Fixture::new("e15-verde", CPU_FOUR, MEM_OPEN);
+    scratch_table(&mut fx, &["a", "b"]);
+    let run = fx.run("0");
+    assert_green(&run, "two rows that leave a file in their TMPDIR");
+    let tmp_a = tmpdir_of(&fx, "a");
+    let tmp_b = tmpdir_of(&fx, "b");
+    assert_eq!(
+        run_dir_of(&tmp_a),
+        run_dir_of(&tmp_b),
+        "the two rows are of one run"
+    );
+    assert!(
+        !run_dir_of(&tmp_a).exists(),
+        "a green run left its run directory ({}): {:?}",
+        run_dir_of(&tmp_a).display(),
+        run_dirs_in(&fx)
+    );
+    assert_eq!(
+        run_dirs_in(&fx),
+        Vec::<String>::new(),
+        "a green run left a run directory in TMPDIR"
+    );
+}
+
+/// CI-E15: a red run keeps its run directory and names it, with the logs of every row and the TMPDIR of the row that went
+/// red; the TMPDIR of the row that ended green (`a`) is gone from the moment it ended.
+#[test]
+fn a_red_run_keeps_its_run_directory_and_names_it() {
+    let mut fx = Fixture::new("e15-rojo", CPU_FOUR, MEM_OPEN);
+    scratch_table(&mut fx, &["a", "b"]);
+    fx.rc("b", "1");
+    let run = fx.run("0");
+    assert!(!run.timed_out, "did not finish in 30 s");
+    assert_eq!(
+        run.code,
+        Some(1),
+        "the red row b decides the exit: {}{}",
+        run.out,
+        run.err
+    );
+    let tmp_a = tmpdir_of(&fx, "a");
+    let tmp_b = tmpdir_of(&fx, "b");
+    let dir = run_dir_of(&tmp_b);
+    assert!(
+        dir.is_dir(),
+        "a red run lost its run directory {}",
+        dir.display()
+    );
+    assert!(
+        run.out
+            .lines()
+            .any(|line| line == format!("dag: run directory: {}", dir.display())),
+        "a red run has to name the directory that holds its logs: {}",
+        run.out
+    );
+    assert_eq!(
+        read(&tmp_b.join("scratch")).trim(),
+        "left by b",
+        "the TMPDIR of the red row is where its diagnosis is"
+    );
+    assert!(
+        !tmp_a.exists(),
+        "the TMPDIR of a row that ended green stayed ({})",
+        tmp_a.display()
+    );
+    for log in ["pasos/10-a.log", "pasos/20-b.log"] {
+        assert!(
+            read(&dir.join(log)).contains("banner"),
+            "the log {log} of the run is not in the run directory"
+        );
+    }
+}
+
+/// CI-E15: a run with no verdict (here a row the kernel killed) keeps the run directory and the TMPDIR of the row it
+/// could not judge, as before: `an_oom_kill_prints_the_blocks_and_names_the_run_directory` says it names it.
+#[test]
+fn a_run_with_no_verdict_keeps_the_tmpdir_of_the_row_it_could_not_judge() {
+    let mut fx = Fixture::new("e15-sin-veredicto", CPU_FOUR, MEM_OPEN);
+    scratch_table(&mut fx, &["a", "b"]);
+    fx.oom("b");
+    let run = fx.run("0");
+    assert_eq!(run.code, Some(2), "{}{}", run.out, run.err);
+    let tmp_b = tmpdir_of(&fx, "b");
+    assert_eq!(
+        read(&tmp_b.join("scratch")).trim(),
+        "left by b",
+        "the TMPDIR of the row the kernel killed was deleted: {}",
+        run.text()
+    );
+    assert!(
+        run.text().contains(&format!(
+            "dag: run directory: {}",
+            run_dir_of(&tmp_b).display()
+        )),
+        "the run directory is named: {}",
+        run.text()
+    );
+}
+
+/// CI-E15: the red runs of other days do not pile up. A run directory of more than 7 days whose planner is gone is deleted
+/// when the next planner makes its own; one of 7 days or less stays, one whose `planner.pid` is a live process stays however
+/// old it is, and what is not a run directory is not touched.
+#[test]
+fn a_planner_deletes_the_run_directories_of_more_than_seven_days_whose_planner_is_gone() {
+    let mut fx = Fixture::new("e15-viejos", CPU_FOUR, MEM_OPEN);
+    scratch_table(&mut fx, &["a"]);
+    let mut dead = Command::new("true").spawn().expect("true");
+    dead.wait().expect("true ends");
+    let day = Duration::from_secs(24 * 3600);
+    let aged = |name: &str, days: u32, pid: Option<u32>| {
+        let dir = fx.tmp.join(name);
+        fs::create_dir_all(dir.join("pasos")).expect("a run directory of another day");
+        write(&dir.join("pasos/10-a.log"), "an old log\n");
+        if let Some(pid) = pid {
+            write(&dir.join("planner.pid"), &format!("{pid}\n"));
+        }
+        let when = std::time::SystemTime::now() - day * days;
+        File::open(&dir)
+            .and_then(|handle| handle.set_modified(when))
+            .expect("the age of the directory");
+        dir
+    };
+    let old = aged("memory-industry-dag.old000", 8, None);
+    let old_dead = aged("memory-industry-dag.dead00", 9, Some(dead.id()));
+    let young = aged("memory-industry-dag.young0", 6, None);
+    let busy = aged("memory-industry-dag.busy00", 30, Some(std::process::id()));
+    let other = aged("not-a-run-directory", 30, None);
+    let run = fx.run("0");
+    assert_green(&run, "a planner with run directories of other days around");
+    assert!(
+        !old.exists(),
+        "a run directory of 8 days with no planner pid was not deleted"
+    );
+    assert!(
+        !old_dead.exists(),
+        "a run directory of 9 days whose planner is dead was not deleted"
+    );
+    assert!(
+        young.exists(),
+        "a run directory of 6 days was deleted: it is not old enough"
+    );
+    assert!(
+        busy.exists(),
+        "a run directory whose planner.pid is a live process was deleted"
+    );
+    assert!(
+        other.exists(),
+        "a directory that is not a run directory was deleted"
     );
 }
 

@@ -2167,7 +2167,7 @@ def check_grammar(steps, lines):
         for name, value in s.env.items():
             assert name in dag.ROW_ENV, f"{s.id} was accepted with {name}, which a row may not name: {lines}"
             assert value != "", f"{s.id} was accepted with {name} empty: {lines}"
-            if name.endswith("_JOBS") or name.endswith("_THREADS"):
+            if name.endswith("_JOBS") or name.endswith("_THREADS") or name.endswith("_SECS"):
                 assert GRAMMAR_NUMBER.fullmatch(value), f"{s.id} was accepted with {name}={value!r}: {lines}"
         assert not any(word.startswith(HASH) for word in s.argv), f"{s.id} was accepted with a # in its order: {lines}"
         for name, value in (("cpu", s.cpu_tab), ("ram_gb", s.ram_tab), ("dur_s", s.dur_tab)):
@@ -2192,6 +2192,16 @@ for n in range(600):
     accepted += 1
     check_grammar(steps, lines)
 assert accepted > 0 and refused > 0, f"the mutations were all accepted or all refused ({accepted}/{refused})"
+
+# CI-E15: a `*_SECS` is a whole number above 0 as a `*_JOBS` and a `*_THREADS` are. The random mutations above reach the
+# row that names one only by chance, so each value is tried on that row by hand: the ones the program that reads it
+# (`u64`, above 0) takes are accepted, the others are the refusal of the grammar.
+secs_at = next(i for i, line in enumerate(rows) if "CUBA_HANDLER_TIMEOUT_SECS=" in line)
+for value, taken in (("60", True), ("1", True), ("0", False), ("-5", False), ("x", False), ("1.5", False), ("010", False), ("1e3", False)):
+    edited = list(rows)
+    edited[secs_at] = re.sub(r"CUBA_HANDLER_TIMEOUT_SECS=\S+", lambda _m: "CUBA_HANDLER_TIMEOUT_SECS=" + value, rows[secs_at])
+    answer = attempt(edited, f"secs-{value}.txt")
+    assert (answer is not None) == taken, f"CUBA_HANDLER_TIMEOUT_SECS={value!r} was {'refused' if answer is None else 'accepted'}, and the grammar says {'accepted' if taken else 'refused'}"
 print("p4 trials=600 accepted=%d refused=%d" % (accepted, refused))
 "#;
 

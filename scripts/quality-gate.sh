@@ -2891,7 +2891,7 @@ SFAKE
     shift
     local pid dog
     sy_rc=0
-    rm -f "$sy_log"
+    rm -f "$sy_log" "$sy_nap"
     (
       ROOT="$q_tree"
       cd "$q_tree"
@@ -2902,11 +2902,24 @@ SFAKE
       qg_study "$@"
     ) >"$tmp/study.out" 2>"$tmp/study.err" </dev/null &
     pid=$!
-    ( sleep 120; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    # The watchdog takes its own sleep with it when it is stopped: `kill "$dog"` alone ended the subshell and left
+    # `sleep 120` alive for two minutes, once per call, in the cgroup of the row that runs this self-test (CI-E15).
+    ( trap 'kill "$nap" 2>/dev/null' TERM; sleep 120 & nap=$!; echo "$nap" >"$sy_nap"; wait "$nap" && kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
     dog=$!
+    for _ in $(seq 3000); do [[ -s "$sy_nap" ]] && break; sleep 0.01; done
     wait "$pid" || sy_rc=$?
     kill "$dog" 2>/dev/null || true
     wait "$dog" 2>/dev/null || true
+    [[ -s "$sy_nap" ]] || st_fail "F6c.0: the watchdog of the study did not say the pid of its sleep"
+    for _ in $(seq 3000); do sy_running "$(<"$sy_nap")" || break; sleep 0.01; done
+    ! sy_running "$(<"$sy_nap")" || st_fail "F6c.0: the sleep of the watchdog of the study (pid $(<"$sy_nap")) outlived the study: stopping the watchdog has to stop its sleep too"
+  }
+  sy_nap="$tmp/study.nap"
+  sy_running() { # PID: it exists and has not exited (a zombie has)
+    local s st
+    { read -r s <"/proc/$1/stat"; } 2>/dev/null || return 1
+    read -r st _ <<<"${s##*) }"
+    [[ "$st" != Z && "$st" != X ]]
   }
   sy_said() { grep -qF -- "$1" "$tmp/study.out" "$tmp/study.err"; }
   sy_judged() { grep -c '^judge' "$sy_log" 2>/dev/null || true; }
