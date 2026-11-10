@@ -1606,6 +1606,19 @@ require_present() {
   "$@"
 }
 
+# CI-J14i: `claude -p` and `gemini -p` are probes of a service that can sit on a login nobody sees, and lane D3 waited
+# for it for ever. They run under GATE_LLM_PROBE_TIMEOUT_S (60 s; the self-test says 1). One that does not answer is exit
+# 2 naming it; one that fails at once is only a probe that did not pass, and the next one runs.
+llm_cli_answers() {
+  local cli="$1" what="$2" limit="${GATE_LLM_PROBE_TIMEOUT_S:-60}" rc=0
+  timeout "$limit" "$cli" -p "reply with the single word ok" --output-format text >/dev/null 2>&1 || rc=$?
+  if (( rc == 124 )); then
+    echo "FAIL: $what — $cli -p did not answer in $limit s (timeout), and the gate does not wait for it." >&2
+    exit 2
+  fi
+  (( rc == 0 ))
+}
+
 require_generative_llm() {
   local what="$1"
   shift
@@ -1641,13 +1654,13 @@ require_generative_llm() {
     fi
   fi
   if [[ "$ok" -eq 0 ]] && command -v claude >/dev/null 2>&1; then
-    if claude -p "reply with the single word ok" --output-format text >/dev/null 2>&1; then
+    if llm_cli_answers claude "$what"; then
       ok=1
       echo "OK  generative LLM via authenticated claude CLI"
     fi
   fi
   if [[ "$ok" -eq 0 ]] && command -v gemini >/dev/null 2>&1; then
-    if gemini -p "reply with the single word ok" --output-format text >/dev/null 2>&1; then
+    if llm_cli_answers gemini "$what"; then
       ok=1
       echo "OK  generative LLM via authenticated gemini CLI"
     fi

@@ -37,11 +37,9 @@ GATE_CLUSTER_ROOT="${GATE_CLUSTER_ROOT:-${GATE_CLUSTER_TMP:-/tmp}/memory-industr
 # How long a lane waits for its server to answer, in wall-clock seconds (K9). The judge keeps 30 s;
 # the rows set 1, because a test does not wait for a timeout it can shorten.
 GATE_CLUSTER_READY_TIMEOUT_S="${GATE_CLUSTER_READY_TIMEOUT_S:-30}"
-# The variables a libpq client reads from the environment (K8). The library drops them from every
-# call it makes, so a PGPORT or a PGHOSTADDR of the caller cannot move a lane off its socket.
-GATE_PG_ENV_UNSET=(-u PGHOST -u PGHOSTADDR -u PGPORT -u PGSERVICE -u PGSERVICEFILE -u PGPASSFILE
-  -u PGSSLMODE -u PGSSLCERT -u PGSSLKEY -u PGSSLROOTCERT -u PGOPTIONS -u PGDATABASE -u PGUSER
-  -u PGPASSWORD -u PGREQUIREPEER -u PGCONNECT_TIMEOUT)
+# The variables a libpq client reads from the environment (K8) are GATE_PG_ENV_UNSET, in gate-lock.sh (CI-J14i), which the
+# judge's identity query uses as well. The library drops them from every call it makes, so a PGPORT or a PGHOSTADDR of
+# the caller cannot move a lane off its socket.
 # shellcheck disable=SC2034 # read by the scripts that source this one
 declare -gA GATE_CLUSTER_DIR=()
 # shellcheck disable=SC2034

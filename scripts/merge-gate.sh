@@ -1957,6 +1957,27 @@ write_receipt() {
 # the verdict is the file, and the process just has not passed.
 GATE_REACHED_END=""
 GATE_PLANNER=""
+
+# CI-J14h: the clusters this gate's rows left under the root. A row killed by KILL (the kernel, or the planner after its
+# grace) runs no trap, and its cluster stays in tmpfs with this gate's owner on it. Taken down once the planner is
+# collected, so no row is still making one: the directories of the root whose owner starts with this gate's, as
+# gate_cluster_down does it, and the identity check of the library (gate_stop_pid, gate_identity_refusal) before any
+# signal. A directory whose postmaster.pid names a live process that is not its postgres stays, with the library's note.
+gate_cluster_down_owned() {
+  local dir owner pid
+  [[ -n "$GATE_OWNER" ]] || return 0
+  for dir in "$GATE_CLUSTER_ROOT"/*/; do
+    dir="${dir%/}"
+    [[ -d "$dir" && "${dir##*/}" =~ ^[a-z0-9][a-z0-9-]*\.[A-Za-z0-9]{6}$ && -f "$dir/owner" ]] || continue
+    owner="$(<"$dir/owner")"
+    [[ "$owner" == "$GATE_OWNER"* ]] || continue
+    pid="$(head -n 1 "$dir/data/postmaster.pid" 2>/dev/null || true)"
+    gate_stop_pid "$pid" "$dir" || continue
+    rm -rf -- "$dir"
+    echo "note: took down the cluster a row of this gate left under its root: $dir"
+  done
+}
+
 on_exit() {
   local code=$? tenths=0 stopped=0
   gate_cluster_down_all
@@ -1964,6 +1985,7 @@ on_exit() {
     kill -TERM "$GATE_PLANNER" 2>/dev/null || true
     wait "$GATE_PLANNER" 2>/dev/null || true
   fi
+  gate_cluster_down_owned
   if (( code == 0 )) && [[ -z "$GATE_REACHED_END" ]]; then
     code=2
     stopped=1
