@@ -86,6 +86,8 @@ fn bridge(home: &Home, args: &[&str]) -> Command {
         .args(args)
         .env("HOME", &home.0)
         .env_remove("DATABASE_URL")
+        // A bridge that reached the resolver must stop, not find the developer's database.
+        .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
         .stdin(Stdio::null());
     command
 }

@@ -317,6 +317,9 @@ fn account_help_exits_zero_without_the_database() {
         let out = Command::new(BIN)
             .args(["account", flag])
             .env_remove("DATABASE_URL")
+            // Outside the judge, with no URL and no switch, this child would reach the developer's
+            // own database: the switch makes it refuse at once instead.
+            .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
             // With no URL, a command that tried to open the database would stop here with exit 1
             // at once, instead of starting a PostgreSQL container and waiting for it.
             .env("CUBA_MODE", "red")
