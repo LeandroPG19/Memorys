@@ -3443,7 +3443,7 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
 /// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
 /// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
 /// self-test that takes it as its own fixture's identity is red under any other value.
-const JUDGE_ENVIRONMENT: [(&str, &str); 27] = [
+const JUDGE_ENVIRONMENT: [(&str, &str); 28] = [
     ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
     // CI-F3.3b-1b-i (D-F3k): merge-gate.sh exports the lock's directory so that the planner can write the
     // lane tickets under it. gate-lock.sh assigns GATE_LOCK itself, so no self-test reads what it inherits.
@@ -3484,6 +3484,9 @@ const JUDGE_ENVIRONMENT: [(&str, &str); 27] = [
     ("MUTANTS_JOBS", "7"),
     ("PYTHONUTF8", "0"),
     ("PYTHONIOENCODING", "latin-1"),
+    // CI-K9b: gate_linux_env exports the channel of rust-toolchain.toml for the cargo that runs outside the tree. A
+    // self-test that reads what it inherits would take this one as the channel of its fixture.
+    ("RUSTUP_TOOLCHAIN", "1.0.0-ajeno"),
 ];
 
 /// The names the judge's scripts export that no self-test is handed, each with its reason, its owner and the
@@ -8295,4 +8298,195 @@ fn toolchain_k1_finds_a_second_toolchain_file_anywhere_but_in_build_output() {
     let found = other_toolchain_files(&root);
     std::fs::remove_dir_all(&root).expect("clean the scratch tree");
     assert_eq!(found, ["a/b/rust-toolchain.toml", "rust/rust-toolchain"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// CI-K9a: the judge does not use the interop of Windows
+
+/// The BASH_ENV of the probe: the shell counts its commands (functions included, `set -T`), writes the PATH it has at each
+/// one over `K9_PROBE_OUT`, and exits at the `K9_PROBE_N`-th. What stays in the file is the PATH of the last command seen,
+/// at the `K9_PROBE_N`-th or when the script ended, whichever came first. A child bash skips it (`K9_PROBE_ON` is
+/// exported), so only the script that was launched is watched, and none of its self-test runs further than its first steps.
+const PATH_PROBE: &str = r#"if [[ -z "${K9_PROBE_ON:-}" ]]; then
+  export K9_PROBE_ON=1
+  k9_n=0
+  set -T
+  trap 'k9_n=$((k9_n + 1)); printf "%s" "$PATH" >"$K9_PROBE_OUT"; if ((k9_n >= K9_PROBE_N)); then exit 0; fi' DEBUG
+fi
+"#;
+
+/// The PATH `script --self-test` has once it has run `K9_PROBE_N` commands (or ended), launched with `ostype` as its
+/// OSTYPE when given and with a PATH that holds Windows directories first, in the middle and last. A loop counts each
+/// turn: the filter of a PATH of 8 entries takes about 40 commands, so the number leaves room for it. `None` if the
+/// script never ran a command.
+fn path_after_start(probe_dir: &Path, script: &str, ostype: Option<&str>) -> Option<String> {
+    let work = probe_dir.join(format!("{script}-{}", ostype.unwrap_or("own")));
+    let _ = std::fs::remove_dir_all(&work);
+    for dir in ["home", "xdg", "t", "stand"] {
+        std::fs::create_dir_all(work.join(dir)).expect("creating the directory of a probe run");
+    }
+    // quality-gate.sh refuses to start its self-test without lizard; the stand-in is only found, never run.
+    let lizard = work.join("stand").join("lizard");
+    std::fs::write(&lizard, "#!/bin/sh\nexit 0\n").expect("writing the lizard stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lizard, std::fs::Permissions::from_mode(0o755))
+            .expect("making the lizard stand-in executable");
+    }
+    let out = work.join("path.out");
+    let mut command = std::process::Command::new("timeout");
+    command
+        .args(["-k", "5", "120"])
+        .arg(git_bash())
+        .arg(repo_root().join("scripts").join(script))
+        .arg("--self-test")
+        .current_dir(repo_root())
+        .env_clear()
+        .env(
+            "PATH",
+            format!(
+                "{}:/mnt/c/k9a-windows:/usr/bin:/mnt/d/k9a/bin:/bin:/mntools/bin:/mnt/c/k9a-last",
+                work.join("stand").display()
+            ),
+        )
+        .env("HOME", work.join("home"))
+        .env("XDG_CACHE_HOME", work.join("xdg"))
+        .env("TMPDIR", work.join("t"))
+        .env("BASH_ENV", probe_dir.join("probe.sh"))
+        .env("K9_PROBE_OUT", &out)
+        .env("K9_PROBE_N", "80")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(ostype) = ostype {
+        command.env("OSTYPE", ostype);
+    }
+    command
+        .status()
+        .expect("running a script under the PATH probe");
+    std::fs::read_to_string(&out).ok()
+}
+
+/// K9a.1 and K9a.3. On Linux a script of the judge has no entry that starts with /mnt/ on its PATH by its 80th command,
+/// wherever the entry was and whoever launched it, and keeps the others (a neighbour such as /mntools included): every
+/// command it looks for and does not find walks the whole PATH, and the one WSL adds is 68 directories of 9p, 29.5 s
+/// for `command -v cygpath` three times (9-nov-2026). Where OSTYPE says msys the PATH is the user's and is not touched.
+/// The scripts are the ones of SCRIPTS_WITH_SELF_TEST, so a new one is judged without being listed here.
+#[test]
+fn every_judge_script_drops_the_windows_entries_of_its_path_at_the_start() {
+    let probe_dir = std::env::temp_dir().join(format!("k9a-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&probe_dir);
+    std::fs::create_dir_all(&probe_dir).expect("creating the directory of the probe");
+    std::fs::write(probe_dir.join("probe.sh"), PATH_PROBE).expect("writing the probe");
+    let results: Vec<(&str, Option<&str>, Option<String>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = SCRIPTS_WITH_SELF_TEST
+            .iter()
+            .flat_map(|&name| [(name, None), (name, Some("msys"))])
+            .map(|(name, ostype)| {
+                let probe_dir = &probe_dir;
+                scope.spawn(move || (name, ostype, path_after_start(probe_dir, name, ostype)))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("a probe run panicked"))
+            .collect()
+    });
+    let _ = std::fs::remove_dir_all(&probe_dir);
+    let mut problems = Vec::new();
+    for (name, ostype, seen) in &results {
+        let Some(path) = seen else {
+            problems.push(format!(
+                "scripts/{name} (OSTYPE {ostype:?}) ran no command, so its PATH was never seen"
+            ));
+            continue;
+        };
+        let entries: Vec<&str> = path.split(':').collect();
+        if ostype.is_some() {
+            if !entries.contains(&"/mnt/c/k9a-windows") {
+                problems.push(format!(
+                    "scripts/{name} changed the PATH where OSTYPE says msys: {path}"
+                ));
+            }
+            continue;
+        }
+        if entries.iter().any(|entry| entry.starts_with("/mnt/")) {
+            problems.push(format!("scripts/{name} still has /mnt/ entries: {path}"));
+        }
+        for kept in ["/usr/bin", "/bin", "/mntools/bin"] {
+            if !entries.contains(&kept) {
+                problems.push(format!("scripts/{name} lost {kept} from its PATH: {path}"));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "the PATH of the judge's scripts (CI-K9a): {problems:#?}"
+    );
+}
+
+/// K9a.2. Outside the self-tests, a script asks `cygpath` only after it has looked at OSTYPE: the line before a use,
+/// or the three before it, say `OSTYPE`, or the use is in gate-lock.sh, which owns the functions that do. Probing for
+/// the command instead decides "Windows" by what the PATH holds, and a PATH of 68 directories of 9p made each failed
+/// probe cost seconds. (The call of a function that wraps it is not a use: only the word is.) The scan has to fail first.
+#[test]
+fn outside_the_self_tests_cygpath_is_asked_only_where_ostype_says_windows() {
+    let fixture = "if [[ \"$OSTYPE\" == msys* ]]; then\n  p=\"$(cygpath -m /)\"\nfi\necho b\necho c\necho d\nq=\"$(cygpath -u /)\"\n";
+    assert_eq!(
+        cygpath_without_ostype(fixture),
+        vec![7],
+        "the scan of cygpath uses must see line 7 and only that one"
+    );
+    let mut offenders = Vec::new();
+    let mut seen = 0;
+    for entry in std::fs::read_dir(repo_root().join("scripts")).expect("scripts/") {
+        let path = entry.expect("an entry of scripts/").path();
+        let name = path
+            .file_name()
+            .expect("a file name")
+            .to_string_lossy()
+            .into_owned();
+        if !name.ends_with(".sh") || name == "gate-lock.sh" {
+            continue;
+        }
+        seen += 1;
+        let body = read(&format!("scripts/{name}")).replace("\r\n", "\n");
+        let code: String = outside_self_test(&body)
+            .into_iter()
+            .map(|(_, line)| format!("{line}\n"))
+            .collect();
+        for line in cygpath_without_ostype(&code) {
+            offenders.push(format!(
+                "scripts/{name} (line {line} of the code outside its self-test)"
+            ));
+        }
+    }
+    assert!(
+        seen >= 10,
+        "the scan read only {seen} scripts: it is broken"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these scripts ask cygpath without having looked at OSTYPE (CI-K9a): {offenders:#?}"
+    );
+}
+
+/// The lines (1-based) of `code` that use `cygpath` with no `OSTYPE` in the three lines before them or in their own.
+/// Comments are not uses.
+fn cygpath_without_ostype(code: &str) -> Vec<usize> {
+    let lines: Vec<&str> = code.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with('#') && line.contains("cygpath"))
+        .filter(|(index, line)| {
+            let from = index.saturating_sub(3);
+            !line.contains("OSTYPE")
+                && !lines[from..*index]
+                    .iter()
+                    .any(|before| before.contains("OSTYPE"))
+        })
+        .map(|(index, _)| index + 1)
+        .collect()
 }
