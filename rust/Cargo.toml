@@ -38,7 +38,8 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "
 # library it cannot load (see `embeddings::onnx::load_onnxruntime_once`). The
 # version `ort` already pulls in, so the lock gains an edge and no crate.
 libloading = "0.9.0"
-tokenizers = "0.21"
+# only `from_file` and `encode`: progressbar and esaxx_fast serve training, and onig is the regex engine the default had.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
