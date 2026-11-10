@@ -6135,7 +6135,9 @@ fn merge_gate_answers_the_step_mode_before_its_gate_runs() {
 
 // CI-F3.3b-2 (spec F3.3b-1b, «la tabla»): the rows of the judge, with their order, their dependencies and
 // their starting durations. The order of a row is its step; the dependencies are the spec's (DBG, B3, DC, CV and M
-// wait for P; REL waits for B3; E2E waits for B3 and DBG). B1 does not enter the table.
+// wait for P; REL and E2E wait for B3). B1 does not enter the table.
+// CI-E9 (D-E9a): E2E waited for B3 and DBG until F3, when its lane provisioned brain_gate with the debug binary of DBG;
+// since D-F34h it provisions with the release binary B3 left, so it waits for B3 only.
 // CI-F3.3c (D-F3l): NLI leaves DBG for its own row, exclusive, after DBG (it needs the target DBG built). Its clock
 // assertion (nli_entailment, < 500 ms) measured 1199 ms under contention. The dur of NLI is not measured yet.
 #[test]
@@ -6149,7 +6151,7 @@ fn the_step_table_has_the_nine_rows_of_the_judge_with_their_deps_and_durations()
         (25, "NLI", "DBG", "exclusive"),
         (30, "B3", "P", "normal"),
         (40, "REL", "B3", "normal"),
-        (50, "E2E", "B3,DBG", "normal"),
+        (50, "E2E", "B3", "normal"),
         (60, "DC", "P", "normal"),
         (70, "CV", "P", "untimed"),
         (80, "M", "P", "untimed"),
@@ -7829,6 +7831,160 @@ fn lane_e_provisions_with_the_release_binary_and_runs_no_cargo() {
         resolved < provision,
         "lane_E provisions before it resolves REL_BIN"
     );
+}
+
+/// CI-E9 (D-E9a): the row E2E waits for B3, which builds the release binary it runs, and for nothing that DBG makes: not
+/// DBG itself and not a row that waits for DBG.
+#[test]
+fn the_e2e_row_waits_for_b3_and_for_nothing_that_dbg_makes() {
+    let rows = dag_rows();
+    let e2e = rows
+        .iter()
+        .find(|row| row.1 == "E2E")
+        .expect("gate-dag.txt has no row E2E");
+    let deps: Vec<&str> = e2e.2.iter().map(String::as_str).collect();
+    assert_eq!(
+        deps,
+        ["B3"],
+        "E2E depends on {deps:?}: its lane reads the release binary B3 left and the cluster C_e2e, so it waits for B3 only"
+    );
+    assert!(
+        !depends_on(&rows, "E2E", "DBG", 0),
+        "E2E reaches DBG through its deps: it would start after the longest row of the table for nothing it reads"
+    );
+}
+
+/// The body of the shell function `name` in `code`, from its header to the closing brace in column 0.
+fn function_body(code: &str, name: &str) -> Vec<String> {
+    let header = format!("{name}() {{");
+    let mut lines = code.lines();
+    assert!(
+        lines.any(|line| line.trim_end() == header),
+        "run-all-tests.sh has no {header}"
+    );
+    lines
+        .take_while(|line| *line != "}")
+        .map(String::from)
+        .collect()
+}
+
+/// CI-E9 (D-E9a): what `lane_E` of `suite` reads that DBG makes, or lets it fall back to. "Reads" is what the lane runs or
+/// resolves: itself, `b3_record_sha` (the record B3 left) and `resolve_binary_path` (where the release binary is) may not
+/// name the debug build (`gate_bin`, any `cargo` call, the target or the cluster of DBG, a `/debug` path); and
+/// `provision_gate_db` names `gate_bin` only in its fallback for a caller that gives no binary, which `lane_E` never is:
+/// it asks for the record of B3 first, which refuses without it (exit 1, no build), and then gives the release binary.
+fn lane_e_reads_of_dbg(suite: &str) -> Vec<String> {
+    let code: String = script_code(suite)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let mut problems = Vec::new();
+    for name in ["lane_E", "b3_record_sha", "resolve_binary_path"] {
+        for line in function_body(&code, name) {
+            for needle in ["gate_bin", "cargo ", "T_dbg", "C_dbg", "dbg", "/debug"] {
+                if line.contains(needle) {
+                    problems.push(format!("{name} names `{needle}`: {}", line.trim()));
+                }
+            }
+        }
+    }
+    for line in function_body(&code, "provision_gate_db") {
+        if line.contains("gate_bin") && !line.trim_start().starts_with("[[ -n \"$bin\" ]] ||") {
+            problems.push(format!(
+                "provision_gate_db builds a binary outside the fallback for no binary: {}",
+                line.trim()
+            ));
+        }
+    }
+    let record_refuses = function_body(&code, "b3_record_sha")
+        .iter()
+        .any(|line| line.contains("B3 left no sha256 record") && line.contains("exit 1"));
+    if !record_refuses {
+        problems.push("b3_record_sha does not refuse (exit 1) when B3 left no record".to_string());
+    }
+    let lane = function_body(&code, "lane_E");
+    let record = lane.iter().position(|line| line.trim() == "b3_record_sha");
+    let provision = lane
+        .iter()
+        .position(|line| line.contains("provision_gate_db"));
+    match (record, provision) {
+        (None, _) => problems.push("lane_E does not ask for the record of B3".to_string()),
+        (Some(record), Some(provision)) if record > provision => {
+            problems.push("lane_E provisions before it asks for the record of B3".to_string());
+        }
+        _ => {}
+    }
+    match provision {
+        None => problems.push("lane_E does not provision brain_gate".to_string()),
+        Some(at) if !lane[at].contains("provision_gate_db \"$REL_BIN\"") => problems.push(format!(
+            "lane_E provisions without the release binary: {}",
+            lane[at].trim()
+        )),
+        Some(_) => {}
+    }
+    problems
+}
+
+/// CI-E9 (D-E9a, S-E9-2): the E2E lane reads nothing DBG produces, so its row can start while DBG still runs. The control is
+/// the real script, clean; each sabotage is one change that makes the lane read the debug build, provision without the
+/// binary of B3, skip its record or stop refusing without it, and each one has to be named.
+#[test]
+fn lane_e_reads_nothing_that_dbg_produces_and_refuses_without_the_record_of_b3() {
+    let suite = read("scripts/run-all-tests.sh");
+    let control = lane_e_reads_of_dbg(&suite);
+    assert!(
+        control.is_empty(),
+        "lane_E reads what DBG makes, so its row cannot leave DBG: {control:#?}"
+    );
+    let (head, tail) = suite
+        .split_once("lane_E() {\n")
+        .expect("run-all-tests.sh has no lane_E() {");
+    let sabotages = [
+        (
+            "the debug binary of the target",
+            format!(
+                "{head}lane_E() {{\nDBG_BIN=\"$(gate_target_dir)/debug/memory-industry\"\n{tail}"
+            ),
+            "/debug",
+        ),
+        (
+            "a provision with no binary",
+            suite.replacen(
+                "  provision_gate_db \"$REL_BIN\"\n",
+                "  provision_gate_db\n",
+                1,
+            ),
+            "without the release binary",
+        ),
+        (
+            "no record of B3 asked for",
+            format!(
+                "{head}lane_E() {{\n{}",
+                tail.replacen("\nb3_record_sha\n", "\n", 1)
+            ),
+            "does not ask for the record",
+        ),
+        (
+            "a record that does not refuse",
+            suite.replacen(
+                "is not known to be the one it built (run --lane B3 first).\" >&2; exit 1; }",
+                "is not known to be the one it built (run --lane B3 first).\" >&2; }",
+                1,
+            ),
+            "does not refuse",
+        ),
+    ];
+    for (what, sabotaged, named) in sabotages {
+        assert_ne!(
+            sabotaged, suite,
+            "the sabotage `{what}` changed nothing in run-all-tests.sh"
+        );
+        let problems = lane_e_reads_of_dbg(&sabotaged);
+        assert!(
+            problems.iter().any(|problem| problem.contains(named)),
+            "the sabotage `{what}` is not named (want a problem with `{named}`): {problems:#?}"
+        );
+    }
 }
 
 // --- CI-J15: the hygiene of the judge's scripts ------------------------------------------------------------------
