@@ -22,7 +22,11 @@ samples, whether `memory.stat` and `memory.current` were read at one instant, an
 is charged to that job and not to this scope. A scope that is not delegated is not measured and not written: every number of
 it is null, with the reason in `sin_medida`, and a `note: not measured (...)` line per reason.
 
-Not in the planner: the removal of old run directories (D-F3i) and the per-binary launcher (D-F3u).
+CI-E15: the planner cleans up after itself. The TMPDIR of a row that ends green is deleted when it ends, and the whole run
+directory (`<TMPDIR>/memory-industry-dag.*`, with the logs of the rows) when the run ends with exit 0 and a verdict. A red run
+names its directory (`dag: run directory:`) and keeps it, as a run with no verdict does, with the TMPDIR of every row that did
+not end green; the next planner deletes the ones that are more than 7 days old and whose planner (`planner.pid`) is gone.
+Not in the planner: the per-binary launcher (D-F3u).
 `exclusive` runs alone, after every lower idx: the conservative form of D-F3l, and with a
 delegated scope no other step's cgroup may still have processes when one starts or ends (D-F34o). The
 resource column (CI-F3.3c, D-F3g, CI-F3.4): `target:<T>` is where the step builds, under
@@ -39,7 +43,7 @@ CI-J18: the table has one reader, this one. `rows --table <file>` says what `run
 together (neither is `exclusive` and neither waits for the other, directly or through others), `a` before `b` by idx; a table
 that `run` refuses is exit 2, the same `FAIL:` line and nothing on stdout. gate-audit.sh asks it and does not read the table
 again. The grammar of a row is checked before anything starts (D-J18b): an id or a target of `[A-Za-z0-9_]+`, a cluster of
-`C_[a-z0-9]+` (so that the lane of a cluster is its name), an idx of `[1-9][0-9]*`, a `*_JOBS` or `*_THREADS` that is a
+`C_[a-z0-9]+` (so that the lane of a cluster is its name), an idx of `[1-9][0-9]*`, a `*_JOBS`, `*_THREADS` or `*_SECS` that is a
 whole number above 0, no value that is empty and no word that starts with `#` (a comment goes in its own line).
 """
 
@@ -301,7 +305,7 @@ def parse_env(rest: list[str], step_id: str, number: int) -> tuple[dict[str, str
             die(f"table line {number}: {name} is not one a row may name (D-F3j, D-J18c): step {step_id} not started")
         if not value:
             die(f"table line {number}: {name} of {step_id} has no value (D-J18b)")
-        if name.endswith(("_JOBS", "_THREADS")) and not WHOLE_NUMBER_RE.fullmatch(value):
+        if name.endswith(("_JOBS", "_THREADS", "_SECS")) and not WHOLE_NUMBER_RE.fullmatch(value):
             die(f"table line {number}: {name}={value!r} of {step_id} is not a whole number above 0 (D-J18b)")
         env[name] = value
         rest = rest[1:]
@@ -910,11 +914,48 @@ def admission(
 # --- the planner --------------------------------------------------------------
 
 
+RUN_DIR_PREFIX = "memory-industry-dag."
+# CI-E15: a run directory that was kept (a red run, or one with no verdict) is deleted by the next planner once it is this old.
+RUN_DIR_KEEP_S = 7 * 24 * 3600
+
+
+def planner_alive(run_dir: str) -> bool:
+    """The planner that made `run_dir` (the pid in its planner.pid) is still a process; with no readable pid it is not."""
+    try:
+        os.kill(int(read_text(os.path.join(run_dir, "planner.pid")) or ""), 0)
+    except (ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def sweep_old_run_dirs(root: str) -> None:
+    """CI-E15: the run directories of this user in `root` that are older than RUN_DIR_KEEP_S and whose planner is gone."""
+    cutoff = time.time() - RUN_DIR_KEEP_S
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.startswith(RUN_DIR_PREFIX) or not entry.is_dir(follow_symlinks=False):
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if info.st_uid == os.getuid() and info.st_mtime < cutoff and not planner_alive(entry.path):
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
 def make_run_dir() -> str:
-    """This run's scratch: a fresh directory with its pasos/ (the logs) and tmp/ (each TMPDIR)."""
-    run_dir = tempfile.mkdtemp(prefix="memory-industry-dag.")
+    """This run's scratch: a fresh directory with its pasos/ (the logs) and tmp/ (each TMPDIR), and the pid of this planner."""
+    sweep_old_run_dirs(tempfile.gettempdir())
+    run_dir = tempfile.mkdtemp(prefix=RUN_DIR_PREFIX)
     for sub in ("pasos", "tmp"):
         os.makedirs(os.path.join(run_dir, sub), exist_ok=True)
+    with open(os.path.join(run_dir, "planner.pid"), "w", encoding="utf-8") as fh:
+        fh.write(f"{os.getpid()}\n")
     return run_dir
 
 
@@ -1302,6 +1343,13 @@ class Planner:
             return
         if rc != 0:
             self.mark_red(step)
+        elif not (step.cg and populated(step.cg)):
+            self.drop_tmp(step)
+
+    def drop_tmp(self, step: Step) -> None:
+        """CI-E15: a row that ended green has nothing left to diagnose, so its private TMPDIR goes now (65 MB of `scratch()`
+        in the row CT). A row that went red, or whose processes are still alive, keeps it, and so does a run with no verdict."""
+        shutil.rmtree(os.path.join(self.run_dir, "tmp", step.id), ignore_errors=True)
 
     def plan_rc(self, step: Step) -> int:
         """D-F34b, D-F34c: a green row with models is judged against the plan lines of its log. The problem is the last
@@ -1354,6 +1402,7 @@ class Planner:
             return
         if not populated(path):
             return
+        named = orphans_named(path)
         killed = kill_cgroup(path)
         limit = seconds_from_env("GATE_DAG_RMDIR_WAIT_S", RMDIR_WAIT_S) if killed else 0.0
         deadline = time.monotonic() + limit
@@ -1363,7 +1412,8 @@ class Planner:
                 break
         if not step.parado:
             outcome = "they were killed" if not os.path.isdir(path) or not populated(path) else "they are still alive"
-            print(f"note: {os.path.basename(path)} ended with orphan processes in its cgroup; {outcome}")
+            seen = f" ({named})" if named else ""
+            print(f"note: {os.path.basename(path)} ended with orphan processes in its cgroup{seen}; {outcome}")
 
     @staticmethod
     def try_rmdir(path: str) -> bool:
@@ -1565,6 +1615,10 @@ class Planner:
             code = self.red.rc
         self.summary()
         self.annotate_run(code)
+        if code == 0:
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+        else:
+            print(f"dag: run directory: {self.run_dir}")
         return code
 
     # summary
@@ -1761,6 +1815,17 @@ def kill_cgroup(path: str) -> bool:
     except OSError:
         return False
     return True
+
+
+def orphans_named(path: str) -> str:
+    """CI-E15: the `comm` of the processes listed in the cgroup.procs of `path`, counted and by name (`bash x1, sleep x12`),
+    read before they are killed. A pid that is gone by the time its comm is read says nothing; '' when no name is left."""
+    counts: dict[str, int] = {}
+    for pid in (read_text(os.path.join(path, "cgroup.procs")) or "").split():
+        name = (read_text(f"/proc/{pid}/comm") or "").strip() if pid.isdigit() else ""
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return ", ".join(f"{name} x{count}" for name, count in sorted(counts.items()))
 
 
 def populated(path: str) -> bool:
