@@ -2873,3 +2873,124 @@ fn a_row_with_a_number_that_is_not_finite_and_above_zero_is_refused() {
     write(&fx.table, "10 rowx - - normal 1 5 0.05 /bin/true\n");
     assert_green(&fx.run("0"), "a row of good numbers");
 }
+
+// --- CI-J15a (H1): the key of a tree has one formula, and the planner says it -------------------------------------------
+
+/// `gate-dag.py tree-key <tree>` of `planner`, with the deadline every process of this file has: (exit code, stdout, stderr).
+fn planner_tree_key(planner: &Path, tree: &Path) -> (Option<i32>, String, String) {
+    let base = scratch("tree-key");
+    let out_path = base.join("salida.txt");
+    let err_path = base.join("error.txt");
+    let mut child = Command::new("python3")
+        .arg("-I")
+        .arg(planner)
+        .arg("tree-key")
+        .arg(tree)
+        .stdout(Stdio::from(File::create(&out_path).expect("stdout file")))
+        .stderr(Stdio::from(File::create(&err_path).expect("stderr file")))
+        .spawn()
+        .expect("python3");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let code = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status.code();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("`gate-dag.py tree-key` did not answer in 30 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (code, read(&out_path), read(&err_path))
+}
+
+/// The key of a tree as the judge's targets name it, written apart from the planner: the name of the directory of its
+/// realpath, a dash and the first 12 hex of the sha256 of that realpath, with no line break in what is hashed.
+fn expected_tree_key(tree: &Path) -> String {
+    let real = fs::canonicalize(tree).expect("the tree exists");
+    let mut child = Command::new("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("sha256sum");
+    let mut stdin = child.stdin.take().expect("sha256sum stdin");
+    std::io::Write::write_all(&mut stdin, real.to_string_lossy().as_bytes()).expect("write");
+    drop(stdin);
+    let out = child.wait_with_output().expect("sha256sum output");
+    let digest = String::from_utf8_lossy(&out.stdout).to_string();
+    let name = real
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the tree has a name");
+    format!("{name}-{}", &digest[..12])
+}
+
+/// CI-J15a: `gate-dag.py tree-key <tree>` prints `<name>-<12 hex>` of the realpath of the tree and nothing else, the same
+/// for a link to it. The gate-audit.sh asked it for the key of its tree, so the audit and the planner cannot disagree again:
+/// the audit used the sha256 of the realpath WITH its line break (`82dd32511c99` against `46cf9e6d38af`, measured on 9-nov).
+#[test]
+fn the_planner_says_the_key_of_a_tree_and_the_key_is_of_its_realpath() {
+    let base = scratch("tree-key-tree");
+    let tree = base.join("memory-industry");
+    fs::create_dir_all(&tree).expect("tree");
+    let planner = repo_root().join("scripts/gate-dag.py");
+    let (code, out, err) = planner_tree_key(&planner, &tree);
+    assert_eq!(
+        code,
+        Some(0),
+        "`gate-dag.py tree-key <tree>` has to print the key of the tree and exit 0: {err}"
+    );
+    assert_eq!(
+        out,
+        format!("{}\n", expected_tree_key(&tree)),
+        "the key is <name>-<12 hex of the sha256 of the realpath, with no line break>, and the only thing printed"
+    );
+    let link = base.join("link-to-the-tree");
+    std::os::unix::fs::symlink(&tree, &link).expect("symlink");
+    let (code, linked, err) = planner_tree_key(&planner, &link);
+    assert_eq!(code, Some(0), "the key of a link to a tree: {err}");
+    assert_eq!(
+        linked, out,
+        "a link to a tree is the tree: the key is of the realpath"
+    );
+}
+
+/// CI-J15a: a tree that does not exist has no key: exit 2 with a FAIL line and nothing on stdout, so the audit that asks
+/// for it stops and does not hash the empty string.
+#[test]
+fn a_tree_that_does_not_exist_has_no_key() {
+    let base = scratch("tree-key-missing");
+    let (code, out, err) = planner_tree_key(
+        &repo_root().join("scripts/gate-dag.py"),
+        &base.join("not-there"),
+    );
+    assert_eq!(code, Some(2), "exit {code:?}, want 2: {err}");
+    assert!(
+        out.is_empty(),
+        "a key was printed for a tree that does not exist: {out}"
+    );
+    assert!(err.contains("FAIL"), "the refusal says nothing: {err}");
+}
+
+/// CI-J15a (D-F3g): the target of a row is <CARGO_TARGET_DIR>/<the key tree-key says>/<T>. The planner builds the path with
+/// the same formula it prints, so there is one formula and two ways to ask it.
+#[test]
+fn the_target_of_a_row_is_under_the_key_the_planner_says() {
+    let mut fx = Fixture::new("tree-key-target", CPU_FOUR, MEM_OPEN);
+    let root = fx.base.join("target-root");
+    table_with_resources(&mut fx, &[(10, "DBG", "target:T_dbg", "1")]);
+    let run = fx.run_env(
+        "0",
+        &[("CARGO_TARGET_DIR", root.to_str().expect("utf-8 path"))],
+    );
+    assert_green(&run, "a step that names a target");
+    let (code, key, err) = planner_tree_key(&repo_root().join("scripts/gate-dag.py"), &repo_root());
+    assert_eq!(code, Some(0), "tree-key of the tree of the planner: {err}");
+    let seen = PathBuf::from(target_seen_by(&fx, "DBG").expect("the step got no CARGO_TARGET_DIR"));
+    assert_eq!(
+        seen,
+        root.join(key.trim()).join("T_dbg"),
+        "the target of the row is not under the key that tree-key says"
+    );
+}

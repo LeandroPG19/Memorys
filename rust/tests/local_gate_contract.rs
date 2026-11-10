@@ -4796,40 +4796,192 @@ fn the_mutation_seed_lives_outside_the_swept_scratch() {
     );
 }
 
+/// The key that signs the packages of the judge's Postgres (PGDG), which the script and the doc both name.
+const PGDG_SIGNING_KEY: &str = "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8";
+
+/// The value a script assigns on a line of its own, `NAME=value` at column 0.
+fn assigned(script: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    script.lines().find_map(|line| {
+        line.strip_prefix(prefix.as_str())
+            .map(|value| value.trim().to_string())
+    })
+}
+
+/// What is wrong between the constants of the judge's Postgres in gate-cluster.sh and what docs/gate.md says (E2). The values
+/// are read from the script (CI-J15e), so this holds no copy of them; and the major is derived from the version, written once.
+fn postgres_doc_problems(cluster: &str, doc: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for name in [
+        "GATE_PG_VERSION",
+        "GATE_PGVECTOR_VERSION",
+        "GATE_PG_LOCALE",
+        "GATE_PG_TIMEZONE",
+    ] {
+        match assigned(cluster, name) {
+            None => problems.push(format!(
+                "scripts/gate-cluster.sh does not set `{name}=` on a line of its own (E2)"
+            )),
+            Some(value) if value.is_empty() => problems.push(format!(
+                "scripts/gate-cluster.sh sets {name} to nothing (E2)"
+            )),
+            Some(value) => {
+                if !doc.contains(value.as_str()) {
+                    problems.push(format!(
+                        "docs/gate.md does not say {value}, which scripts/gate-cluster.sh sets as {name} (E2)"
+                    ));
+                }
+            }
+        }
+    }
+    for text in [("scripts/gate-cluster.sh", cluster), ("docs/gate.md", doc)] {
+        if !text.1.contains(PGDG_SIGNING_KEY) {
+            problems.push(format!(
+                "{} does not say the signing key {PGDG_SIGNING_KEY} (E2)",
+                text.0
+            ));
+        }
+    }
+    let version_at = cluster
+        .lines()
+        .position(|line| line.starts_with("GATE_PG_VERSION="));
+    let major_at = cluster
+        .lines()
+        .position(|line| line == "GATE_PG_MAJOR=${GATE_PG_VERSION%%.*}");
+    match (version_at, major_at) {
+        (Some(version), Some(major)) if version < major => {}
+        _ => problems.push(
+            "scripts/gate-cluster.sh has to derive its major from its version, after it: GATE_PG_MAJOR=${GATE_PG_VERSION%%.*} (CI-J15e)"
+                .to_string(),
+        ),
+    }
+    problems
+}
+
 /// CI-F2, E2: the judge's Postgres versions, locale and zone are written once, as constants of
 /// gate-cluster.sh, and docs/gate.md and the script name the same values, the fingerprint of the
-/// signing key included. A change to one of them without the other is red here.
+/// signing key included. A change to one of them without the other is red here. CI-J15e: the values are the
+/// script's, read from it, and the major (`GATE_PG_MAJOR`) is the first number of the version, not a second constant.
 #[test]
 fn the_judge_postgres_versions_are_written_once_and_the_doc_agrees() {
     let cluster = read("scripts/gate-cluster.sh").replace("\r\n", "\n");
     let doc = read("docs/gate.md");
-    for constant in [
-        "GATE_PG_VERSION=18.6",
-        "GATE_PGVECTOR_VERSION=0.8.7",
-        "GATE_PG_LOCALE=en_US.utf8",
-        "GATE_PG_TIMEZONE=Etc/UTC",
-    ] {
-        assert!(
-            cluster.lines().any(|line| line == constant),
-            "scripts/gate-cluster.sh does not set `{constant}` (E2)"
-        );
+    let problems = postgres_doc_problems(&cluster, &doc);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// CI-J15e. The check is judged first, on a script and a doc that agree and on the three ways to stop agreeing: the script
+/// moves and the doc does not, the major is a number written by hand, and the version is no longer on a line of its own.
+#[test]
+fn the_check_of_the_judge_postgres_versions_can_fail() {
+    let cluster = format!(
+        "GATE_PG_VERSION=18.6\nGATE_PG_MAJOR=${{GATE_PG_VERSION%%.*}}\nGATE_PGVECTOR_VERSION=0.8.7\nGATE_PG_LOCALE=en_US.utf8\nGATE_PG_TIMEZONE=Etc/UTC\n# signed by {PGDG_SIGNING_KEY}\n"
+    );
+    let doc =
+        format!("PostgreSQL 18.6, pgvector 0.8.7, en_US.utf8, Etc/UTC, key {PGDG_SIGNING_KEY}");
+    let clean = postgres_doc_problems(&cluster, &doc);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let moved = postgres_doc_problems(
+        &cluster.replace("GATE_PG_VERSION=18.6", "GATE_PG_VERSION=18.7"),
+        &doc,
+    );
+    assert!(
+        moved
+            .iter()
+            .any(|p| p.contains("18.7") && p.contains("docs/gate.md")),
+        "a version that moved in the script and not in the doc is named: {moved:#?}"
+    );
+    let by_hand = postgres_doc_problems(
+        &cluster.replace("GATE_PG_MAJOR=${GATE_PG_VERSION%%.*}", "GATE_PG_MAJOR=18"),
+        &doc,
+    );
+    assert!(
+        by_hand.iter().any(|p| p.contains("GATE_PG_MAJOR")),
+        "a major written by hand is named: {by_hand:#?}"
+    );
+    let hidden = postgres_doc_problems(
+        &cluster.replace("GATE_PG_VERSION=18.6", " GATE_PG_VERSION=18.6"),
+        &doc,
+    );
+    assert!(
+        hidden.iter().any(|p| p.contains("GATE_PG_VERSION=")),
+        "a version that is not on a line of its own is named: {hidden:#?}"
+    );
+}
+
+/// CI-J15e (H9): the image of production is the judge's Postgres: `pgvector/pgvector:pg<major>` with the major of
+/// GATE_PG_VERSION, in rust/src/setup.rs (`PG_IMAGE`) and in docker-compose.yml. A major that moves in one place and not
+/// in the others has the judge testing a server that nobody runs.
+fn production_image_problems(cluster: &str, setup: &str, compose: &str) -> Vec<String> {
+    let Some(version) = assigned(cluster, "GATE_PG_VERSION") else {
+        return vec!["scripts/gate-cluster.sh sets no GATE_PG_VERSION".to_string()];
+    };
+    let major = version.split('.').next().unwrap_or_default();
+    let want = format!("pgvector/pgvector:pg{major}");
+    let mut problems = Vec::new();
+    let in_setup = setup
+        .lines()
+        .find(|line| line.contains("const PG_IMAGE"))
+        .unwrap_or_default();
+    if !in_setup.contains(&format!("\"{want}\"")) {
+        problems.push(format!(
+            "rust/src/setup.rs: PG_IMAGE is `{in_setup}` and the judge's Postgres {version} says {want}"
+        ));
     }
-    for value in [
-        "18.6",
-        "0.8.7",
-        "en_US.utf8",
-        "Etc/UTC",
-        "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8",
-    ] {
-        assert!(
-            cluster.contains(value),
-            "scripts/gate-cluster.sh does not say {value} (E2)"
-        );
-        assert!(
-            doc.contains(value),
-            "docs/gate.md does not say {value}, which scripts/gate-cluster.sh uses (E2)"
-        );
+    let in_compose = compose
+        .lines()
+        .find(|line| line.trim_start().starts_with("image:") && line.contains("pgvector"))
+        .unwrap_or_default();
+    if in_compose.trim() != format!("image: {want}") {
+        problems.push(format!(
+            "docker-compose.yml: the image is `{}` and the judge's Postgres {version} says {want}",
+            in_compose.trim()
+        ));
     }
+    problems
+}
+
+#[test]
+fn the_production_image_is_the_major_of_the_judge_postgres() {
+    let problems = production_image_problems(
+        &read("scripts/gate-cluster.sh").replace("\r\n", "\n"),
+        &read("rust/src/setup.rs"),
+        &read("docker-compose.yml"),
+    );
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn the_check_of_the_production_image_can_fail() {
+    let cluster = "GATE_PG_VERSION=18.6\n";
+    let setup = "const PG_IMAGE: &str = \"pgvector/pgvector:pg18\";\n";
+    let compose = "services:\n  db:\n    image: pgvector/pgvector:pg18\n";
+    let clean = production_image_problems(cluster, setup, compose);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let old_setup = production_image_problems(
+        cluster,
+        "const PG_IMAGE: &str = \"pgvector/pgvector:pg17\";\n",
+        compose,
+    );
+    assert!(
+        old_setup.len() == 1 && old_setup[0].contains("setup.rs"),
+        "a PG_IMAGE of another major is named: {old_setup:#?}"
+    );
+    let old_compose = production_image_problems(
+        cluster,
+        setup,
+        "services:\n  db:\n    image: pgvector/pgvector:pg17\n",
+    );
+    assert!(
+        old_compose.len() == 1 && old_compose[0].contains("docker-compose.yml"),
+        "an image of another major in the compose is named: {old_compose:#?}"
+    );
+    let moved = production_image_problems("GATE_PG_VERSION=19.1\n", setup, compose);
+    assert_eq!(
+        moved.len(),
+        2,
+        "a judge that moves to 19 leaves both files behind: {moved:#?}"
+    );
 }
 
 /// CI-F2, C4: no gate script builds a TCP URL for a lane. The one construction of a lane's URL is
@@ -5342,46 +5494,103 @@ fn dag_rows() -> Vec<(u32, String, Vec<String>, String)> {
         .collect()
 }
 
+/// CI-J15e (H10): the rows that compile are the ones the table says: those that name a target and are not readers (a
+/// reader builds nothing in it). The list is derived, so a row that is added and compiles is judged without anybody
+/// adding its id here. As (id, target).
+fn compiling_rows(table: &str) -> Vec<(String, String)> {
+    table
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .filter_map(|line| {
+            let resources = resources_of(line);
+            if resources.iter().any(|r| r.as_str() == "reader") {
+                return None;
+            }
+            let target = resources.iter().find_map(|r| r.strip_prefix("target:"))?;
+            let id = line.split_whitespace().nth(1)?;
+            Some((id.to_string(), target.to_string()))
+        })
+        .collect()
+}
+
+/// The targets that more than one compiling row holds, each with its rows: two compiling rows in one target would wait on
+/// its lock and build over each other.
+fn shared_targets(rows: &[(String, String)]) -> Vec<String> {
+    let mut by_target: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for (id, target) in rows {
+        by_target
+            .entry(target.as_str())
+            .or_default()
+            .push(id.as_str());
+    }
+    by_target
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(target, ids)| format!("{target}: {}", ids.join(", ")))
+        .collect()
+}
+
 /// CI-F3.3c (D-F3g): every row that compiles builds in a target of its own, and the rows that read the release binary
-/// read the one B3 builds. Two compiling rows in one target would wait on its lock and build over each other.
+/// read the one a row that compiles built. Two compiling rows in one target would wait on its lock and build over each
+/// other. CI-J15e: the rows that compile are read from the table, not listed here.
 #[test]
 fn each_row_that_compiles_has_a_target_of_its_own_and_the_release_readers_share_b3s() {
-    let rows = dag_rows();
-    let target_of = |id: &str| -> String {
-        let (_, _, _, line) = rows
-            .iter()
-            .find(|(_, row, _, _)| row.as_str() == id)
-            .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"));
-        line.split_whitespace()
-            .nth(3)
-            .and_then(|recursos| recursos.split(',').find_map(|r| r.strip_prefix("target:")))
-            .unwrap_or_else(|| panic!("row {id} names no target: {line}"))
-            .to_string()
-    };
-    for (id, target) in [
-        ("DBG", "T_dbg"),
-        ("DC", "T_docs"),
-        ("CV", "T_cov"),
-        ("M", "T_mut"),
-        ("B3", "T_rel"),
-        ("REL", "T_rel"),
-        ("E2E", "T_rel"),
-    ] {
-        assert_eq!(
-            target_of(id),
-            target,
-            "row {id} must build in its own target"
+    let table = read("scripts/gate-dag.txt");
+    let compiling = compiling_rows(&table);
+    let ids: Vec<&str> = compiling.iter().map(|(id, _)| id.as_str()).collect();
+    for anchor in ["DBG", "B3", "DC", "CV", "M"] {
+        assert!(
+            ids.contains(&anchor),
+            "row {anchor} builds and the table does not say so: the rows that compile are {ids:?}"
         );
     }
-    let compiling: Vec<String> = ["DBG", "DC", "CV", "M", "B3"]
-        .iter()
-        .map(|id| target_of(id))
-        .collect();
-    let unique: std::collections::BTreeSet<&String> = compiling.iter().collect();
-    assert_eq!(
-        unique.len(),
-        compiling.len(),
-        "two compiling rows share a target: {compiling:?}"
+    let shared = shared_targets(&compiling);
+    assert!(
+        shared.is_empty(),
+        "two compiling rows share a target: {shared:?}"
+    );
+    for line in table
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+    {
+        let resources = resources_of(line);
+        if !resources.iter().any(|r| r.as_str() == "reader") {
+            continue;
+        }
+        let id = line.split_whitespace().nth(1).unwrap_or_default();
+        let target = resources
+            .iter()
+            .find_map(|r| r.strip_prefix("target:"))
+            .unwrap_or_default();
+        assert!(
+            compiling.iter().any(|(_, built)| built.as_str() == target),
+            "reader {id} reads {target}, which no row that compiles builds: {line}"
+        );
+    }
+}
+
+/// CI-J15e. The derivation is judged first, on a table with the ways to be wrong: a reader is not a compiling row, and a
+/// row added that builds in a target another row builds in is named with both.
+#[test]
+fn the_check_of_the_compiling_rows_can_fail() {
+    let table = "20 DBG P target:T_dbg normal 8 8 1 bash scripts/merge-gate.sh --step DBG\n\
+                 30 B3 P target:T_rel,cluster:C_b3 normal 8 8 1 bash scripts/merge-gate.sh --step B3\n\
+                 40 REL B3 target:T_rel,reader normal 8 8 1 bash scripts/merge-gate.sh --step REL\n";
+    let clean = compiling_rows(table);
+    assert_eq!(clean.len(), 2, "a reader (REL) does not compile: {clean:?}");
+    assert!(
+        shared_targets(&clean).is_empty(),
+        "a reader of T_rel is not a second builder of it: {clean:?}"
+    );
+    let sabotaged = format!(
+        "{table}50 NEW P target:T_rel normal 8 8 1 bash scripts/merge-gate.sh --step NEW\n"
+    );
+    let shared = shared_targets(&compiling_rows(&sabotaged));
+    assert_eq!(shared.len(), 1, "{shared:?}");
+    assert!(
+        shared[0].contains("T_rel") && shared[0].contains("B3") && shared[0].contains("NEW"),
+        "the shared target is named with both rows: {shared:?}"
     );
 }
 
@@ -5656,16 +5865,18 @@ fn merge_gate_answers_the_step_mode_before_its_gate_runs() {
 #[test]
 fn the_step_table_has_the_nine_rows_of_the_judge_with_their_deps_and_durations() {
     // The class of CV and M is `untimed` (CI-F3.3b-2): their output is past the judge's boundary line.
+    // CI-J15e (H10): the starting dur_s is not frozen here. It is the planner's first guess for a row with no history, and
+    // the numbers move with every measured run; the planner refuses a row whose dur_s is not above 0, and so does this.
     let expected = [
-        (10, "P", "-", "20", "normal"),
-        (20, "DBG", "P", "421", "normal"),
-        (25, "NLI", "DBG", "60", "exclusive"),
-        (30, "B3", "P", "150", "normal"),
-        (40, "REL", "B3", "221", "normal"),
-        (50, "E2E", "B3,DBG", "113", "normal"),
-        (60, "DC", "P", "325", "normal"),
-        (70, "CV", "P", "45", "untimed"),
-        (80, "M", "P", "136", "untimed"),
+        (10, "P", "-", "normal"),
+        (20, "DBG", "P", "normal"),
+        (25, "NLI", "DBG", "exclusive"),
+        (30, "B3", "P", "normal"),
+        (40, "REL", "B3", "normal"),
+        (50, "E2E", "B3,DBG", "normal"),
+        (60, "DC", "P", "normal"),
+        (70, "CV", "P", "untimed"),
+        (80, "M", "P", "untimed"),
     ];
     let table = read("scripts/gate-dag.txt");
     let rows: Vec<Vec<&str>> = table
@@ -5680,7 +5891,7 @@ fn the_step_table_has_the_nine_rows_of_the_judge_with_their_deps_and_durations()
         rows.len(),
         expected.len()
     );
-    for (row, (idx, id, deps, dur, class)) in rows.iter().zip(expected) {
+    for (row, (idx, id, deps, class)) in rows.iter().zip(expected) {
         assert_eq!(row[0], idx.to_string(), "row {id}: its idx");
         assert_eq!(row[1], id, "row {idx}: its id");
         assert_eq!(row[2], deps, "row {id}: its deps");
@@ -5688,7 +5899,13 @@ fn the_step_table_has_the_nine_rows_of_the_judge_with_their_deps_and_durations()
             row[4], class,
             "row {id}: its class (untimed rows are past the judge's boundary)"
         );
-        assert_eq!(row[7], dur, "row {id}: its starting dur_s");
+        let dur: f64 = row[7].parse().unwrap_or_else(|_| {
+            panic!("row {id}: its starting dur_s `{}` is not a number", row[7])
+        });
+        assert!(
+            dur > 0.0,
+            "row {id}: its starting dur_s is {dur}, and it has to be above 0"
+        );
         // CI-F3.3c (D-F3j): leading NAME=value tokens are the step's environment, and the order is what follows them.
         let order: Vec<&str> = row[8..]
             .iter()
@@ -5731,17 +5948,68 @@ fn row_value(env: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+/// The hardware threads of the machine the table is written for (CI-F3.3c, D-F3m): the plan of production gives each ORT
+/// pool half of them, up to the ceiling of that pool.
+const TABLE_MACHINE_THREADS: usize = 24;
+
+/// CI-J15b (H4): the ceilings of the ORT pools, read where the plan of production holds them: the
+/// `const MAX_<POOL>_INTRA_THREADS: usize = N;` of rust/src/resources.rs, as (the variable of the pool, N).
+fn plan_pool_ceilings(resources: &str) -> Vec<(String, usize)> {
+    ["EMBED", "NLI", "RERANK"]
+        .iter()
+        .map(|pool| {
+            let prefix = format!("const MAX_{pool}_INTRA_THREADS: usize = ");
+            let value = resources
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("resources.rs has no `{prefix}N;`"))
+                .trim_end_matches(';')
+                .trim()
+                .parse::<usize>()
+                .unwrap_or_else(|_| {
+                    panic!("the ceiling of the {pool} pool in resources.rs is not a whole number")
+                });
+            (format!("CUBA_{pool}_INTRA_THREADS"), value)
+        })
+        .collect()
+}
+
+/// What is wrong between the ORT pools the rows of `table` name and the plan of production (`resources`): a row with models
+/// names each pool with min(half the table's machine, the ceiling), and E2E names none, because there the plan decides.
+fn pool_problems(table: &str, resources: &str) -> Vec<String> {
+    let ceilings = plan_pool_ceilings(resources);
+    let mut problems = Vec::new();
+    for line in table
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+    {
+        let id = line.split_whitespace().nth(1).unwrap_or_default();
+        let models = resources_of(line).iter().any(|r| r.as_str() == "models");
+        let env = row_env(line);
+        for (name, ceiling) in &ceilings {
+            let want = if models && id != "E2E" {
+                Some((TABLE_MACHINE_THREADS / 2).min(*ceiling).to_string())
+            } else {
+                None
+            };
+            let got = row_value(&env, name);
+            if got != want {
+                problems.push(format!(
+                    "row {id}: {name} is {got:?} and the plan of production gives {want:?} (half of {TABLE_MACHINE_THREADS} threads, at most the {ceiling} of resources.rs)"
+                ));
+            }
+        }
+    }
+    problems
+}
+
 /// CI-F3.3c (D-F3j, D-F3m, V6): a row that builds names its cargo jobs, and a row with models names the three ORT pools
-/// with the values the serial judge uses on this 24-thread machine (available_parallelism()/2 capped at 4, 4 and 8).
-/// E2E names none. A row's cpu is the most it asks for (its jobs or its widest pool), so the planner never admits a row
-/// that asks for more than the table says.
+/// with the values of the plan of production on this 24-thread machine (CI-J15b: read from rust/src/resources.rs, in
+/// `the_ort_pools_of_the_rows_are_the_plan_of_production`). E2E names none. A row's cpu is the most it asks for (its jobs or
+/// its widest pool), so the planner never admits a row that asks for more than the table says.
 #[test]
 fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
-    const POOLS: [(&str, &str); 3] = [
-        ("CUBA_EMBED_INTRA_THREADS", "4"),
-        ("CUBA_NLI_INTRA_THREADS", "4"),
-        ("CUBA_RERANK_INTRA_THREADS", "8"),
-    ];
+    let pools = plan_pool_ceilings(&read("rust/src/resources.rs"));
     for line in read("scripts/gate-dag.txt").lines() {
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
@@ -5758,7 +6026,6 @@ fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
         });
         let recursos: Vec<&str> = tok[3].split(',').collect();
         let builds = recursos.iter().any(|r| r.starts_with("target:"));
-        let models = recursos.contains(&"models");
         if builds {
             let n = jobs.unwrap_or_else(|| {
                 panic!("row {id} builds in a target and names no CARGO_BUILD_JOBS: {line}")
@@ -5769,18 +6036,8 @@ fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
             );
         }
         let mut widest = jobs.unwrap_or(0);
-        for (name, value) in POOLS {
-            let want = if models && id != "E2E" {
-                Some(value)
-            } else {
-                None
-            };
-            assert_eq!(
-                row_value(&env, name).as_deref(),
-                want,
-                "row {id}: {name} (models rows set the three pools, E2E sets none): {line}"
-            );
-            if let Some(v) = want {
+        for (name, _) in &pools {
+            if let Some(v) = row_value(&env, name) {
                 widest = widest.max(v.parse().expect("a pool is a whole number"));
             }
         }
@@ -5835,10 +6092,8 @@ fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_its_own_cluster()
         ["CL", "D1", "D2", "D3"].map(String::from).to_vec(),
         "step_DBG no longer runs the NLI lane: it has its own row"
     );
-    assert!(
-        gate.lines().any(|line| line.trim() == "NLI) step_NLI ;;"),
-        "the --step dispatch names the NLI row"
-    );
+    // CI-J15e (H9): there is no `NLI) step_NLI ;;` arm any more: the dispatch is declare -F "step_$id", and the contract
+    // of the dispatch (`the_dispatch_of_a_step_is_derived_from_its_function_...`) holds that every row has its function.
 }
 
 #[test]
@@ -6230,10 +6485,10 @@ fn the_fixtures_of_the_audit_name_rows_that_exist() {
             && mentions.iter().any(|m| m.deps.is_some())
             && mentions
                 .iter()
-                .any(|m| m.resources.is_some() && m.deps.is_none())
-            && mentions.iter().any(|m| m.idx.is_some() && m.deps.is_none()),
-        "the scan of the self-test of gate-audit.sh found {named:?}: it no longer reads the heredocs, the \
-         au_tree specs and the directories, so it would be green over nothing"
+                .any(|m| m.resources.is_some() && m.deps.is_none()),
+        "the scan of the self-test of gate-audit.sh found {named:?}: it no longer reads the heredocs and the \
+         au_tree specs, so it would be green over nothing (the audit does not write <idx>-<id> directories any more, \
+         since CI-J15a: it runs merge-gate.sh once and the planner starts the rows)"
     );
     let problems = fixture_problems(&lines, &table);
     assert!(
@@ -7284,5 +7539,412 @@ fn lane_e_provisions_with_the_release_binary_and_runs_no_cargo() {
     assert!(
         resolved < provision,
         "lane_E provisions before it resolves REL_BIN"
+    );
+}
+
+// --- CI-J15: the hygiene of the judge's scripts ------------------------------------------------------------------
+// J15a: the audit judges the real table. J15b: the ORT pools of the table come from resources.rs. J15c: one lane grammar
+// and one mark. J15d: gate-lock.sh is loaded once. J15e: copies that are derived. Each check is judged first on a fixture
+// with the ways to be wrong (the lesson of CI-J13: a check that cannot fail is a paragraph).
+
+/// The code of a gate script: the lines outside its self-test that are not comments, as (line number, line).
+fn script_code(body: &str) -> Vec<(usize, &str)> {
+    outside_self_test(body)
+        .into_iter()
+        .filter(|(_, line)| !line.trim_start().starts_with('#'))
+        .collect()
+}
+
+/// CI-J15b (H4). The ORT pools the rows of the table name are the plan of production on the table's machine, and that plan
+/// is in rust/src/resources.rs, not in a copy of it in this file.
+#[test]
+fn the_ort_pools_of_the_rows_are_the_plan_of_production() {
+    let problems = pool_problems(
+        &read("scripts/gate-dag.txt"),
+        &read("rust/src/resources.rs"),
+    );
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// CI-J15b. The sabotage of the spec: the ceiling of the reranker at 6 in resources.rs with the table at 8 is red, one
+/// problem per row with models (DBG, NLI and REL), and the control with the real files is clean.
+#[test]
+fn the_check_of_the_ort_pools_can_fail() {
+    let table = read("scripts/gate-dag.txt");
+    let resources = read("rust/src/resources.rs");
+    let control = pool_problems(&table, &resources);
+    assert!(control.is_empty(), "the control is not clean: {control:#?}");
+    let sabotaged = resources.replace(
+        "const MAX_RERANK_INTRA_THREADS: usize = 8;",
+        "const MAX_RERANK_INTRA_THREADS: usize = 6;",
+    );
+    assert_ne!(
+        sabotaged, resources,
+        "resources.rs no longer has `const MAX_RERANK_INTRA_THREADS: usize = 8;`: the sabotage changed nothing"
+    );
+    let problems = pool_problems(&table, &sabotaged);
+    assert_eq!(
+        problems.len(),
+        3,
+        "the rows with models (DBG, NLI, REL) name a reranker of 8 and the plan says 6: {problems:#?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .all(|p| p.contains("CUBA_RERANK_INTRA_THREADS") && p.contains("Some(\"6\")")),
+        "the problem names the pool and what the plan says: {problems:#?}"
+    );
+}
+
+/// The ids of the `step_<id>() {` functions of merge-gate.sh outside its self-test: the rows it can run.
+fn step_functions(gate: &str) -> Vec<String> {
+    script_code(gate)
+        .into_iter()
+        .filter_map(|(_, line)| {
+            let id = line.strip_prefix("step_")?.strip_suffix("() {")?;
+            Some(id.to_string())
+        })
+        .collect()
+}
+
+/// CI-J15e (H9). What is wrong with the dispatch of `--step` in merge-gate.sh: it runs the function `step_$id` when
+/// `declare -F` says there is one, no `case` arm holds an id written by hand, and the functions and the rows of the table are
+/// the same ids.
+fn dispatch_problems(gate: &str, table_ids: &[String]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let code = script_code(gate);
+    if !code
+        .iter()
+        .any(|(_, line)| line.contains("declare -F \"step_$id\""))
+    {
+        problems.push(
+            "gate_step_main does not ask `declare -F \"step_$id\"` before it runs a step"
+                .to_string(),
+        );
+    }
+    for (number, line) in &code {
+        let arm = line.trim();
+        if let Some((id, rest)) = arm.split_once(") step_")
+            && is_step_id(id)
+            && rest.ends_with(" ;;")
+        {
+            problems.push(format!(
+                "merge-gate.sh:{number}: `{arm}` is a case arm with an id written by hand; the dispatch is `declare -F \"step_$id\"`"
+            ));
+        }
+    }
+    let functions = step_functions(gate);
+    for id in table_ids {
+        if !functions.contains(id) {
+            problems.push(format!(
+                "row {id} of gate-dag.txt has no step_{id}() in merge-gate.sh"
+            ));
+        }
+    }
+    for function in &functions {
+        if !table_ids.contains(function) {
+            problems.push(format!(
+                "step_{function}() of merge-gate.sh is no row of gate-dag.txt"
+            ));
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_dispatch_of_a_step_is_derived_from_its_function_and_the_table_holds_the_same_ids() {
+    let ids: Vec<String> = dag_rows().into_iter().map(|(_, id, _, _)| id).collect();
+    let problems = dispatch_problems(&read("scripts/merge-gate.sh"), &ids);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// CI-J15e. The check is judged first: an honest script is clean, a `case` with the ids by hand is named, a function that is
+/// no row and a row that has no function are named.
+#[test]
+fn the_check_of_the_dispatch_can_fail() {
+    let ids = ["P".to_string(), "DBG".to_string()];
+    let honest = "step_P() {\n  :\n}\nstep_DBG() {\n  :\n}\n  declare -F \"step_$id\" >/dev/null || exit 2\n";
+    let clean = dispatch_problems(honest, &ids);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let by_hand = "step_P() {\n}\nstep_DBG() {\n}\n  case \"$id\" in\n    P) step_P ;;\n    DBG) step_DBG ;;\n  esac\n";
+    let problems = dispatch_problems(by_hand, &ids);
+    assert!(
+        problems.iter().any(|p| p.contains("declare -F")),
+        "a dispatch with no declare -F is named: {problems:#?}"
+    );
+    assert_eq!(
+        problems.iter().filter(|p| p.contains("case arm")).count(),
+        2,
+        "the two arms written by hand are named: {problems:#?}"
+    );
+    let ghost = format!("{honest}step_ZZ() {{\n}}\n");
+    assert!(
+        dispatch_problems(&ghost, &ids)
+            .iter()
+            .any(|p| p.contains("step_ZZ() of merge-gate.sh is no row")),
+        "a function that is no row is named"
+    );
+    let missing = "step_P() {\n}\n  declare -F \"step_$id\" >/dev/null || exit 2\n";
+    assert!(
+        dispatch_problems(missing, &ids)
+            .iter()
+            .any(|p| p.contains("row DBG") && p.contains("no step_DBG()")),
+        "a row with no function is named"
+    );
+}
+
+/// CI-J15a (H1). What is wrong with gate-audit.sh outside its self-test: the key of its tree comes from the planner
+/// (`gate-dag.py tree-key`), it hashes and resolves nothing itself, it takes the target root the planner takes
+/// (CARGO_TARGET_DIR) and it launches no row of the table: merge-gate.sh runs them.
+fn audit_problems(audit: &str) -> Vec<String> {
+    let code = script_code(audit);
+    let mut problems = Vec::new();
+    if !code
+        .iter()
+        .any(|(_, line)| line.contains("gate-dag.py") && line.contains("tree-key"))
+    {
+        problems.push(
+            "gate-audit.sh does not ask `gate-dag.py tree-key` for the key of its tree: the planner holds the one formula"
+                .to_string(),
+        );
+    }
+    for (number, line) in &code {
+        for (needle, why) in [
+            (
+                "sha256sum",
+                "hashes something itself: the key of a tree is the planner's",
+            ),
+            (
+                "realpath",
+                "resolves a path itself: the key of a tree is the planner's",
+            ),
+            (
+                "GATE_TARGET_ROOT",
+                "reads GATE_TARGET_ROOT, which the planner does not: its root is CARGO_TARGET_DIR",
+            ),
+            (
+                "\"${words[@]}\"",
+                "launches a row of the table by itself: merge-gate.sh runs them, with the ticket of the planner",
+            ),
+        ] {
+            if line.contains(needle) {
+                problems.push(format!("gate-audit.sh:{number}: {why}: `{}`", line.trim()));
+            }
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_audit_takes_its_tree_key_from_the_planner_and_launches_no_row() {
+    let problems = audit_problems(&read("scripts/gate-audit.sh").replace("\r\n", "\n"));
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn the_check_of_the_audit_can_fail() {
+    let honest = "key=\"$(python3 -I \"$GA_ROOT/scripts/gate-dag.py\" tree-key \"$GA_ROOT\")\"\n";
+    let clean = audit_problems(honest);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let old = "tree_key=\"$(basename \"$GA_ROOT\")-$(realpath \"$GA_ROOT\" | sha256sum | cut -c1-12)\"\n\
+               [[ -z \"${GATE_TARGET_ROOT:-}\" ]] || :\n\
+               strace -- \"${words[@]}\"\n";
+    let problems = audit_problems(old);
+    for needle in [
+        "tree-key",
+        "sha256sum",
+        "realpath",
+        "GATE_TARGET_ROOT",
+        "words[@]",
+    ] {
+        assert!(
+            problems.iter().any(|p| p.contains(needle)),
+            "the old audit is named for {needle}: {problems:#?}"
+        );
+    }
+}
+
+/// CI-J15c (H5). The lane grammar, the mark of the judge's servers and the encoding of a socket directory as a URL host are
+/// each written once, in gate-lock.sh, and the scripts that need them use the names. `scripts` is (name, body).
+fn judge_names_problems(scripts: &[(&str, &str)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut lane_re = 0;
+    let mut mark = 0;
+    let mut encoders = 0;
+    for (name, body) in scripts {
+        for (number, line) in script_code(body) {
+            let trimmed = line.trim();
+            if trimmed == "GATE_LANE_RE='[a-z0-9][a-z0-9-]*'" {
+                lane_re += 1;
+                continue;
+            }
+            if trimmed == "GATE_SERVER_MARK=memory-industry-gate" {
+                mark += 1;
+                continue;
+            }
+            for needle in [
+                "[a-z0-9][a-z0-9-]*",
+                "cluster_name=\"memory-industry-gate",
+                "memory-industry-gate-$GATE_LANE",
+                "'^memory-industry-gate",
+            ] {
+                if line.contains(needle) {
+                    problems.push(format!(
+                        "{name}:{number}: spells `{needle}` by hand; the lane grammar and the mark are GATE_LANE_RE and GATE_SERVER_MARK of gate-lock.sh: `{trimmed}`"
+                    ));
+                }
+            }
+            if line.contains("//\\//%2F}") {
+                encoders += 1;
+            }
+        }
+    }
+    if lane_re != 1 {
+        problems.push(format!(
+            "GATE_LANE_RE='[a-z0-9][a-z0-9-]*' is assigned {lane_re} times, and it has to be once"
+        ));
+    }
+    if mark != 1 {
+        problems.push(format!(
+            "GATE_SERVER_MARK=memory-industry-gate is assigned {mark} times, and it has to be once"
+        ));
+    }
+    if encoders != 1 {
+        problems.push(format!(
+            "the encoding of a socket directory as a URL host (`${{x//\\//%2F}}`) is written {encoders} times, and it has to be once, as a function"
+        ));
+    }
+    problems
+}
+
+#[test]
+fn the_lane_grammar_the_mark_and_the_socket_encoding_are_written_once() {
+    let names = [
+        "scripts/gate-lock.sh",
+        "scripts/gate-cluster.sh",
+        "scripts/merge-gate.sh",
+        "scripts/run-all-tests.sh",
+    ];
+    let bodies: Vec<String> = names
+        .iter()
+        .map(|name| read(name).replace("\r\n", "\n"))
+        .collect();
+    let scripts: Vec<(&str, &str)> = names
+        .iter()
+        .copied()
+        .zip(bodies.iter().map(String::as_str))
+        .collect();
+    let problems = judge_names_problems(&scripts);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn the_check_of_the_judge_names_can_fail() {
+    let lock = "GATE_SERVER_MARK=memory-industry-gate\nGATE_LANE_RE='[a-z0-9][a-z0-9-]*'\nencode() { printf '%s' \"${1//\\//%2F}\"; }\n";
+    let clean = judge_names_problems(&[("gate-lock.sh", lock)]);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let cluster = "  [[ \"$lane\" =~ ^[a-z0-9][a-z0-9-]*$ ]] || exit 2\n  -c cluster_name=\"memory-industry-gate-$lane\"\n  url=\"${1//\\//%2F}\"\n";
+    let problems = judge_names_problems(&[("gate-lock.sh", lock), ("gate-cluster.sh", cluster)]);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("gate-cluster.sh:1") && p.contains("[a-z0-9][a-z0-9-]*")),
+        "a lane grammar written by hand is named: {problems:#?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("gate-cluster.sh:2") && p.contains("cluster_name")),
+        "a mark written by hand is named: {problems:#?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("socket directory") && p.contains("2 times")),
+        "a second encoding of the socket host is named: {problems:#?}"
+    );
+}
+
+/// CI-J15d (H6). What is wrong with the loading of gate-lock.sh: it has a guard that returns when it is already loaded,
+/// before it assigns the lock; gate-cluster.sh does not assign ROOT or SELF in the shell that loads it; and merge-gate.sh reads
+/// the GATE_LOCK it inherited before it sources the file that assigns its own.
+fn load_guard_problems(lock: &str, cluster: &str, gate: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let lock_code = script_code(lock);
+    let guard = lock_code
+        .iter()
+        .position(|(_, line)| line.contains("return 0"));
+    let assigned_at = lock_code
+        .iter()
+        .position(|(_, line)| line.starts_with("GATE_LOCK_HELD="));
+    match (guard, assigned_at) {
+        (Some(guard), Some(assigned_at)) if guard < assigned_at => {}
+        _ => problems.push(
+            "gate-lock.sh has no load guard (a `return 0` for a library already loaded) before it assigns GATE_LOCK_HELD: loaded twice it empties the lock its caller holds"
+                .to_string(),
+        ),
+    }
+    for (number, line) in script_code(cluster) {
+        if line.starts_with("ROOT=") || line.starts_with("SELF=") {
+            problems.push(format!(
+                "gate-cluster.sh:{number}: assigns `{line}` in the shell that loads it: a library does not take the names of its caller"
+            ));
+        }
+    }
+    let gate_code = script_code(gate);
+    let saved = gate_code
+        .iter()
+        .position(|(_, line)| line.contains("GATE_LOCK"));
+    let sourced = gate_code
+        .iter()
+        .position(|(_, line)| line.contains("source \"$ROOT/scripts/gate-lock.sh\""));
+    match (saved, sourced) {
+        (Some(saved), Some(sourced)) if saved < sourced => {}
+        _ => problems.push(
+            "merge-gate.sh has to read the GATE_LOCK it inherited before it sources gate-lock.sh, which assigns its own"
+                .to_string(),
+        ),
+    }
+    problems
+}
+
+#[test]
+fn gate_lock_is_loaded_once_and_nobody_takes_the_names_of_their_caller() {
+    let problems = load_guard_problems(
+        &read("scripts/gate-lock.sh").replace("\r\n", "\n"),
+        &read("scripts/gate-cluster.sh").replace("\r\n", "\n"),
+        &read("scripts/merge-gate.sh").replace("\r\n", "\n"),
+    );
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn the_check_of_the_load_guard_can_fail() {
+    let lock =
+        "if declare -F gate_lock_loaded >/dev/null; then\n  return 0\nfi\nGATE_LOCK_HELD=\"\"\n";
+    let cluster = "source \"$(dirname \"${BASH_SOURCE[0]}\")/gate-lock.sh\"\n";
+    let gate = "GATE_LOCK_INHERITED=\"${GATE_LOCK:-}\"\nsource \"$ROOT/scripts/gate-lock.sh\"\n";
+    let clean = load_guard_problems(lock, cluster, gate);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let unguarded = load_guard_problems(
+        "GATE_LOCK_HELD=\"\"\nf() {\n  return 0\n}\n",
+        "ROOT=\"$(pwd)\"\nSELF=\"$ROOT/x\"\n",
+        "source \"$ROOT/scripts/gate-lock.sh\"\nGATE_LOCK_INHERITED=\"${GATE_LOCK:-}\"\n",
+    );
+    assert!(
+        unguarded.iter().any(|p| p.contains("no load guard")),
+        "a library with no guard is named: {unguarded:#?}"
+    );
+    assert_eq!(
+        unguarded
+            .iter()
+            .filter(|p| p.contains("gate-cluster.sh:"))
+            .count(),
+        2,
+        "ROOT and SELF assigned by a library are named: {unguarded:#?}"
+    );
+    assert!(
+        unguarded.iter().any(|p| p.contains("inherited")),
+        "a GATE_LOCK read after the source is named: {unguarded:#?}"
     );
 }

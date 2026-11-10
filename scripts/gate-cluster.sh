@@ -293,6 +293,7 @@ gate_cluster_sweep() {
 #   ./scripts/gate-cluster.sh --self-test
 # --- self-test begin ---
 if [[ "${1:-}" == "--self-test" && "${BASH_SOURCE[0]}" == "$0" ]]; then
+  SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-cluster.sh"
   hermetic="$(mktemp -d)"
   mkdir -p "$hermetic/home" "$hermetic/cache"
   export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
@@ -813,12 +814,65 @@ D2EOF
   lib nomk nomk "gate_cluster_up dbg"
   [[ "$rc" == 2 && "$out" == *"FAIL: mktemp could not"* ]] || self_fail "K10 mktemp: a mktemp that fails exits $rc, not 2 with its FAIL line: $out"
 
+  # CI-J15c (H5): una sola gramatica de carril y una sola marca. Un carril con guion (a-b) se crea Y pasa la guarda del servidor
+  # del juez, y la guarda no acepta una marca que la gramatica de carril no deja crear (mayuscula, guion final, doble guion
+  # inicial). El psql es un stand-in que contesta el cluster_name que se le da en FAKE_CN: el del carril, leido del argv con
+  # que el postgres del stand-in arranco.
+  fixture hyph 18.6 0.8.7 "en_US.utf8" tmpfs
+  printf '%s\n' '#!/bin/sh' 'echo "${FAKE_CN-memory-industry-gate}|7701731310526959658"' >"$tmp/hyph/bin/psql"
+  chmod +x "$tmp/hyph/bin/psql"
+  lib hyph hyph 'gate_cluster_up a-b >/dev/null || exit 3; cn="$(sed -n "s/^cluster_name=//p" "${GATE_CLUSTER_DIR[a-b]}/argv")"; GATE_LANE=a-b FAKE_CN="$cn" gate_require_judge_server "$GATE_CLUSTER_URL"; r=$?; gate_cluster_down a-b >/dev/null; exit $r'
+  [[ "$rc" == 0 && "$out" == *"OK  judge server a-b socket"* ]] \
+    || self_fail "J15c lane: a lane named a-b is made and then refused by the judge guard (rc $rc): $out"
+  for mark_row in memory-industry-gate:0 memory-industry-gate-dbg:0 memory-industry-gate-a-b:0 memory-industry-gate-Dbg:2 memory-industry-gate-:2 memory-industry-gate--x:2; do
+    lib hmark hyph 'gate_require_judge_server "postgresql://cuba:pw@127.0.0.1:5489/brain"' GATE_LANE= FAKE_CN="${mark_row%%:*}"
+    [[ "$rc" == "${mark_row##*:}" ]] \
+      || self_fail "J15c mark: a server named '${mark_row%%:*}' is judged with rc $rc, not ${mark_row##*:}: $out"
+  done
+
+  # CI-J15d (H6): una biblioteca que se carga dos veces no pisa al que la cargo. gate-cluster.sh no asigna ROOT ni SELF de
+  # quien la carga, y gate-lock.sh, que gate-cluster.sh carga otra vez, no reinicia el candado que quien lo cargo ya tomo
+  # (GATE_LOCK, GATE_LOCK_HELD y GATE_OWNER); lo que se asigna despues del source sigue valiendo.
+  rc=0
+  out="$(bash -c "ROOT=/caller/root; SELF=/caller/self.sh; source '$SELF'; printf '%s|%s' \"\$ROOT\" \"\$SELF\"" 2>&1)" || rc=$?
+  [[ "$rc" == 0 && "$out" == "/caller/root|/caller/self.sh" ]] \
+    || self_fail "J15d: loading gate-cluster.sh replaced ROOT or SELF of its caller (rc $rc): '$out'"
+  cat >"$tmp/keeplock.sh" <<'KL'
+source "$LIB"
+GATE_LOCK="$LOCKDIR"
+acquire_gate_lock "$GATE_LOCK" >/dev/null || exit 3
+held="$GATE_LOCK_HELD"
+owner="$GATE_OWNER"
+source "$LIB"
+[[ -n "$held" && "$GATE_LOCK_HELD" == "$held" ]] || { echo "GATE_LOCK_HELD was '$held' and is '$GATE_LOCK_HELD'"; exit 4; }
+[[ "$GATE_OWNER" == "$owner" ]] || { echo "GATE_OWNER changed"; exit 5; }
+[[ "$GATE_LOCK" == "$LOCKDIR" ]] || { echo "GATE_LOCK changed to $GATE_LOCK"; exit 6; }
+GATE_OWNER=assigned-after
+[[ "$GATE_OWNER" == assigned-after ]] || exit 7
+exit 0
+KL
+  rc=0
+  out="$(env LIB="$SELF" LOCKDIR="$tmp/keeplock.lock" timeout 60 bash "$tmp/keeplock.sh" 2>&1)" || rc=$?
+  [[ "$rc" == 0 ]] \
+    || self_fail "J15d: loading gate-cluster.sh after acquire_gate_lock did not keep the lock the caller holds (rc $rc): $out"
+
+  # CI-J15e (H9): el mayor del Postgres del juez es el primer numero de su version, escrita una sola vez. Una copia de la
+  # biblioteca cuya version dice 19.1 pide los binarios de postgresql-19.
+  mkdir -p "$tmp/pgmajor/scripts"
+  sed 's/^GATE_PG_VERSION=18\.6$/GATE_PG_VERSION=19.1/' "$SELF" >"$tmp/pgmajor/scripts/gate-cluster.sh"
+  cp "$(dirname "$SELF")/gate-lock.sh" "$tmp/pgmajor/scripts/gate-lock.sh"
+  grep -qx 'GATE_PG_VERSION=19.1' "$tmp/pgmajor/scripts/gate-cluster.sh" \
+    || self_fail "J15e major: the copy did not take version 19.1: the library no longer has GATE_PG_VERSION=18.6 on a line of its own"
+  out="$(env -u GATE_PG_BINDIR bash -c "source '$tmp/pgmajor/scripts/gate-cluster.sh'; printf '%s %s' \"\$GATE_PG_MAJOR\" \"\$GATE_PG_BINDIR\"" 2>&1)" || true
+  [[ "$out" == "19 /usr/lib/postgresql/19/bin" ]] \
+    || self_fail "J15e major: with version 19.1 the library says '$out', not '19 /usr/lib/postgresql/19/bin': the major is written twice"
+
   # K7 (D6): the default root, listed in full before and after the rows, with its live lane, is the same.
   default_after="$(default_seen)"
   [[ "$default_after" == "$default_before" ]] \
     || self_fail "D6: the default cluster root $default_root changed while the rows ran: $(diff <(printf '%s\n' "$default_before") <(printf '%s\n' "$default_after") | tr '\n' ' ')"
 
-  echo "OK  self-test: gate-cluster refuses a missing initdb, psql, a postgres 18.7, a pgvector 0.8.1, a locale without en_US.utf8, a root on disk, a root with a space, a relative root, a root that is a link, a chmod that fails, a socket path over 107 bytes; a postgres that dies at its start or never answers is exit 2 at the wall-clock timeout, without the password, and a postgres that takes 3 s a try does not stretch it; the whole output of a lane that comes up has no password; a lane does not inherit PGPORT or PGHOSTADDR, and it is on port 5432; down ends a lane by QUIT in under 3 s and keeps its log per run; TERM takes every lane down; a pid that is not the lane's postgres is never signalled; an empty pid is not alive; the sweep does not signal an owner of another pid namespace, judges each directory by its identity (exe and -D) with its own refusal, and goes on past a note and a refusal; a lane name, an empty GATE_OWNER and a failing mktemp are exit 2; the default cluster root, computed from GATE_CLUSTER_TMP and never created, is listed the same before and after the rows; a lane's log goes under XDG_CACHE_HOME; a lane's URL is a socket under its directory on port 5432"
+  echo "OK  self-test: gate-cluster refuses a missing initdb, psql, a postgres 18.7, a pgvector 0.8.1, a locale without en_US.utf8, a root on disk, a root with a space, a relative root, a root that is a link, a chmod that fails, a socket path over 107 bytes; a postgres that dies at its start or never answers is exit 2 at the wall-clock timeout, without the password, and a postgres that takes 3 s a try does not stretch it; the whole output of a lane that comes up has no password; a lane does not inherit PGPORT or PGHOSTADDR, and it is on port 5432; down ends a lane by QUIT in under 3 s and keeps its log per run; TERM takes every lane down; a pid that is not the lane's postgres is never signalled; an empty pid is not alive; the sweep does not signal an owner of another pid namespace, judges each directory by its identity (exe and -D) with its own refusal, and goes on past a note and a refusal; a lane name, an empty GATE_OWNER and a failing mktemp are exit 2; the default cluster root, computed from GATE_CLUSTER_TMP and never created, is listed the same before and after the rows; a lane's log goes under XDG_CACHE_HOME; a lane's URL is a socket under its directory on port 5432; a lane named a-b is made and passes the judge guard, which refuses a mark the lane grammar cannot make; a second load of the library keeps ROOT, SELF and the lock of its caller; the major is the first number of the version"
   exit 0
 fi
 # --- self-test end ---
