@@ -304,6 +304,14 @@ if [[ "${1:-}" == "--self-test" ]]; then
   hermetic="$(mktemp -d)"
   mkdir -p "$hermetic/home" "$hermetic/cache"
   export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
+  # CI-K10 (H1): the rows below launch a copy of merge-gate.sh, which runs the planner (gate-dag.py) for real, and a planner
+  # delegates the cgroup it runs in (CI-J17): read from the real /proc/self/cgroup it would make a `juez` inside the scope of
+  # whoever launched this self-test and move that scope's processes into it. This self-test gets a cgroup tree of its own with
+  # no `0::` line, so the planner has no scope to delegate; a row that needs a cgroup (F1, below) passes its own pair.
+  # local_gate_contract.rs gives the same pair to every self-test it launches; this one is for whoever launches it by hand.
+  mkdir -p "$hermetic/sin-cgroup/raiz"
+  : >"$hermetic/sin-cgroup/propio"
+  export GATE_CGROUP_ROOT="$hermetic/sin-cgroup/raiz" GATE_PROC_SELF_CGROUP="$hermetic/sin-cgroup/propio"
   tmp="$(mktemp -d)"
   sleep 300 &
   live=$!
@@ -482,6 +490,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     '  echo "stand-in cargo: the lock is still the one merge-gate took"' \
     'fi' \
     'echo "stand-in cargo: run.exit reads: $(cat "$HOME/.cache/cuba-gate/run.exit" 2>/dev/null)"' \
+    'echo "stand-in cargo: scopes in the cgroup of the planner: $(grep -c "^0::" "${GATE_PROC_SELF_CGROUP:-/proc/self/cgroup}" 2>/dev/null)"' \
     'exit 1' >"$tmp/bin/cargo"
   chmod +x "$tmp/bin/pg_isready" "$tmp/bin/psql" "$tmp/bin/cargo" "$tmp/bin/node"
   held_exit=0
@@ -498,6 +507,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
     || self_fail "run-all-tests.sh under merge-gate did not inherit its lock (exit $held_exit): $(cat "$tmp/merge-held.out")"
   grep -q "stand-in cargo: the lock is still the one merge-gate took" "$tmp/merge-held.out" \
     || self_fail "while run-all-tests.sh worked, the lock was not merge-gate's: $(cat "$tmp/merge-held.out")"
+  # CI-K10 (H1): the planner of this row ran with no scope to delegate. The stand-in reads the cgroup file the planner's step was
+  # given: a line `0::` there means the row reached a real cgroup, and the planner may have made a `juez` in it.
+  grep -q "stand-in cargo: scopes in the cgroup of the planner: 0$" "$tmp/merge-held.out" \
+    || self_fail "the planner of the row that launches merge-gate.sh saw a cgroup scope it could delegate: $(grep 'scopes in the cgroup' "$tmp/merge-held.out")"
   (( held_exit == 1 )) || self_fail "merge-gate exited $held_exit where the stand-in cargo fails it with 1"
   [[ ! -e "$tmp/home2/.cache/cuba-gate/lock" ]] || self_fail "merge-gate exited and left its lock behind"
   if grep -q "stopped naming this run" "$tmp/merge-held.out"; then

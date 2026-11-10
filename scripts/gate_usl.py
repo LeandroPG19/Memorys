@@ -84,7 +84,6 @@ EXCLUSIVAS = frozenset({"exclusive", "boundary"})
 PERFILES: dict[str, dict[str, Any]] = {
     "debug": {
         "fila": "DBG",
-        "target": "T_dbg",
         "ordenes": [
             ["clippy", "--all-targets", "--", "-D", "warnings"],
             ["build", "--bin", "memory-industry"],
@@ -94,7 +93,6 @@ PERFILES: dict[str, dict[str, Any]] = {
     },
     "release": {
         "fila": "B3",
-        "target": "T_rel",
         "ordenes": [
             ["test", "--release", "--features", "docs,cuda", "--no-run", "--lib", "--test", "v017_rerank_gpu"],
             ["build", "--release", "--features", "docs,cuda", "--bins"],
@@ -553,13 +551,15 @@ def cmd_barrido(args: argparse.Namespace) -> int:
         fallar(f"the pressure cannot be read from {psi_archivo}: the machine cannot be called quiet")
     if psi > PSI_MAX:
         fallar(f"busy: some avg10 of {psi_archivo} is {psi:.2f} %, above {PSI_MAX:.0f} %; nothing was run")
-    destino = dag.target_dir(perfil["target"])
+    destino = dag.target_dir(dag.target_of(fila))
     cwd = os.path.join(raiz(), "rust")
     sha, sucio = dag.git_state(raiz())
     huella_ini = gate_history.huella(raiz())
     cores = dag.capacities()[0]
     # The profile of the row is in the hash of every unit (D-K4f): without its tokens the sweep would measure another build
     # and leave a second set of artifacts in the target of the judge.
+    # CARGO_INCREMENTAL=0 stays a literal: DBG, NLI and DC carry it in their rows, B3 and REL (release) do not, and the sweep of
+    # release has always built with it (CI-K10, H5).
     base = {**os.environ, **dag.profile_of(fila), "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": destino}
     barrido = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}"
     for orden in perfil["ordenes"]:
