@@ -270,6 +270,7 @@ The exit is 0 only if the reference is green and nothing differs; 1 if the refer
 - **Why text.** `cargo test` on stable has no machine-readable timing: libtest's `--format json` needs `-Z unstable-options`, and `nextest` cannot be the verdict here (it splits a binary into processes, and this crate keeps global state behind a `Mutex`). The summary line of libtest is the one stable source, and the reader refuses anything it cannot pair: a header without a result before the next header or the boundary, a log without the boundary or without a single timed binary, are exit 2.
 - **The ceilings.** `scripts/test-time-ceilings.txt`, one line per binary and host: `<os> <binary> <floor_s> <ceiling_s> <owner> <expires> <reason>`. A host (`windows` under Git Bash, `linux`) is judged by its own lines: the CPU-only Linux judge runs the reranker in 213 s and Windows on its GPU in 6 s, so one number for both would let a 30x regression on Windows through. A binary with no line has a ceiling of **10 s** and no floor: every regression 0.30 fixed measured more than 10 s on both hosts, and the slowest binary with no line measures under 7.
 - **Two ways.** Over the ceiling is red. Under the floor is red too: the line no longer describes the binary, and has to come down with it. The floor is half the fastest run and the ceiling 1.3 x the slowest (1.5 with fewer than three complete runs on that host), because the noise is per binary: 1.05x for `v029_accounts_over_real_http`, 2.9x for `v029_bridge_against_the_real_daemon`, 3.2x for a test that waits on a generative LLM over the network. One factor wide enough for the noisy ones would leave the steady ones loose.
+- **One line that is a bound, not a measure.** `v016_extract_without_sampling` calls the real CLI of a generative LLM, and the row that runs it (D3) names `CUBA_HANDLER_TIMEOUT_SECS=60`, so the extraction budget of the product, 60 % of it, is 36 s there and 18 s in production (CI-E14, a decision of 2026-11-10: in 17 runs the call took 7.5 to 18.3 s, and the one over 18 s was a red of the network, not of the code). Its ceiling is 1.1 x that budget until three runs with the 60 give it a line by the rule.
 - **Dead and expired.** A line whose binary this host's run did not run, or whose `rust/tests/<name>.rs` no longer exists, is red; so is one past its date, one that is malformed, one whose ceiling is not above 10 s and one repeated. Every red of a run is printed together, after the table of the 10 slowest, which is printed green or red.
 - **Before moving a line**, compare with the previous run of the same host and look at the machine's load: a run that shared the machine with another heavy job is not a measure (on 2026-10-13 a ceiling of 60 s in Mapupita-Rust read 73 s under load and 41 s alone). Then set the line by the rule above, with the run's numbers in its reason.
 - **Order.** It runs last, after `mutants-gate.sh`: a time red is drift, not broken behaviour, so the same run still reports codigo-muerto, crap-gate and mutation instead of stopping twenty minutes earlier. It waits (at most 30 s) for the boundary line to reach the log through `tee` before reading it.
@@ -403,7 +404,7 @@ contracts) and `lane_E` (the E2E, the doctor, the MCP live session and the eval 
   starts with `#` (a comment goes in a line of its own). The order may be preceded by `NAME=value` tokens,
   the environment of the step. Only the names of `ROW_ENV` in `gate-dag.py` may be written there
   (`CARGO_BUILD_JOBS`, `CARGO_INCREMENTAL`, `CARGO_PROFILE_DEV_DEBUG`, `CARGO_PROFILE_DEV_STRIP`, the three
-  `CUBA_*_INTRA_THREADS` and `MUTANTS_JOBS`), none with an empty value, and a `*_JOBS` or `*_THREADS` is a
+  `CUBA_*_INTRA_THREADS`, `MUTANTS_JOBS` and `CUBA_HANDLER_TIMEOUT_SECS`), none with an empty value, and a `*_JOBS` or `*_THREADS` is a
   whole number above 0. `PLANNER_ENV` (`TMPDIR`, `CARGO_TARGET_DIR`, `CUBA_GATE_LANE_TOKEN`) is what only the
   planner sets, and a step that would differ from the planner's own environment in any other variable is
   not started. The table as a whole is judged as well: a cluster belongs to one row, two rows in one target
@@ -457,6 +458,14 @@ contracts) and `lane_E` (the E2E, the doctor, the MCP live session and the eval 
   the cores of the live rows plus its own pass `C`; for `jobs`, while the cargo jobs of the live rows plus
   its own pass `N`, the jobs of the machine; and for `ram`, while what the live rows hold plus its estimate
   passes `R`. Ready rows are tried in the order of their critical-path rank.
+- The jobs of the rows that are ready when `P` ends have to fit together (CI-E14): `B3` names 12, `B1` 8 and `M` 4,
+  the 24 threads the table was written for. With `M` at 8 the green DAG run of 2026-11-10 kept `B1` waiting 180 s for
+  the reason `jobs` on a machine at 8.5 of 24 cores; `M` builds one crate per mutant and its width is `MUTANTS_JOBS`,
+  which is also its `cpu`. A contract adds the three up, so a row that asks for more says who waits.
+- A row with `models` that ends green is held against the `resource plan` line its binary wrote (D-F34b). The pools
+  it has to show are the ones that plan's own CPUs give (CI-E13, D-E13a): half of the line's `cores_logical`, at
+  least 1 and at most the number the rows name; a line without `cores_logical` is held against the table as it is,
+  and the reranker on the GPU is not compared. So the verdict is the same in a turn of 12 CPUs as in one of 24.
 - The cores, the memory and the duration of a row are the `cpu`, `ram_gb` and `dur_s` of the table until
   the history has green serial runs of that table. Then the duration is the median of the last five, and
   the cores and the memory are the p95 of what those runs used, the memory with a margin of 1.25.
