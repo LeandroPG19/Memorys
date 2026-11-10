@@ -980,6 +980,9 @@ class Planner:
     # D-E7e: what the jobs of the rows alive may add up to. A class default, so that a planner made without __init__ (the
     # property tests of the admission) has one.
     jobs_cap: int = 1
+    # CI-E15: the directory of the run, which `__init__` makes; None for a planner made without it, which then deletes and
+    # names nothing.
+    run_dir: str | None = None
     # CI-E4: class defaults too, so that such a planner measures nothing in the scope and writes nothing in it.
     delegate_why: str | None = None
     peak_fd: int | None = None
@@ -1349,7 +1352,8 @@ class Planner:
     def drop_tmp(self, step: Step) -> None:
         """CI-E15: a row that ended green has nothing left to diagnose, so its private TMPDIR goes now (65 MB of `scratch()`
         in the row CT). A row that went red, or whose processes are still alive, keeps it, and so does a run with no verdict."""
-        shutil.rmtree(os.path.join(self.run_dir, "tmp", step.id), ignore_errors=True)
+        if self.run_dir:
+            shutil.rmtree(os.path.join(self.run_dir, "tmp", step.id), ignore_errors=True)
 
     def plan_rc(self, step: Step) -> int:
         """D-F34b, D-F34c: a green row with models is judged against the plan lines of its log. The problem is the last
@@ -1596,7 +1600,7 @@ class Planner:
         that finished are printed in idx order, and the run directory, where all the logs are, is named."""
         try:
             self.flush()
-            print(f"dag: run directory: {self.run_dir}")
+            self.name_run_dir()
             sys.stdout.flush()
         except (OSError, ValueError):
             pass
@@ -1615,11 +1619,15 @@ class Planner:
             code = self.red.rc
         self.summary()
         self.annotate_run(code)
-        if code == 0:
+        if code == 0 and self.run_dir:
             shutil.rmtree(self.run_dir, ignore_errors=True)
-        else:
-            print(f"dag: run directory: {self.run_dir}")
+        elif code != 0:
+            self.name_run_dir()
         return code
+
+    def name_run_dir(self) -> None:
+        if self.run_dir:
+            print(f"dag: run directory: {self.run_dir}")
 
     # summary
 
