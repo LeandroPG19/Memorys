@@ -170,6 +170,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" cargo test --timings' > "$tmp/gate5.sh"
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate5.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
   [[ "$got" == "0" ]] || { echo "FAIL self-test: the plain cargo test with the --timings report flag of CI-K4 was not taken as the run of the marked files (got $got)" >&2; exit 1; }
+  # CI-E1 (D-E1a) counted the plain pass: the line goes through run_counted, and it is still the run of the marked files.
+  printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --timings' > "$tmp/gate6.sh"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate6.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "0" ]] || { echo "FAIL self-test: the plain cargo test counted by run_counted (CI-E1) was not taken as the run of the marked files (got $got)" >&2; exit 1; }
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-23 2>/dev/null | tail -1)"
   [[ "$got" == "1" ]] || { echo "FAIL self-test: a CI exclusion past its date was not caught (got $got)" >&2; exit 1; }
   printf '%s\n' '// needs-a-server:   ' 'mod common;' > "$tmp/tests/unexplained.rs"
