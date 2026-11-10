@@ -2,7 +2,7 @@
 
 #[test]
 fn connect_html_is_embedded_and_mentions_ticket_flow() {
-    let html = include_str!("../src/panel/connect.html");
+    let html = include_str!("../../src/panel/connect.html");
     assert!(html.contains("MemoryIndustry"));
     assert!(html.contains("/events/ticket"));
     assert!(html.contains("EventSource"));

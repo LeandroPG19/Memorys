@@ -11,10 +11,8 @@
 //! drops (`common::in_a_scratch_database`); the database the URL itself points at is never
 //! touched.
 
-mod common;
-
+use crate::common::in_a_scratch_database;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use common::in_a_scratch_database;
 use memory_industry::accounts::{self, Secret, code_key, normalize_code};
 use memory_industry::accounts_db::{self as db, ClaimOutcome, CredentialState};
 use serde_json::{Value, json};

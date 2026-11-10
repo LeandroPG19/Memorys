@@ -6914,7 +6914,7 @@ fn rust_files(dir: &Path, deep: bool) -> Vec<std::path::PathBuf> {
 fn files_with_clock_asserts() -> std::collections::BTreeMap<String, Vec<usize>> {
     let rust = repo_root().join("rust");
     let mut found = std::collections::BTreeMap::new();
-    for (folder, deep) in [("tests", false), ("src", true)] {
+    for (folder, deep) in [("tests", true), ("src", true)] {
         for path in rust_files(&rust.join(folder), deep) {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));

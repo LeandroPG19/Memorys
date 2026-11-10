@@ -1,8 +1,8 @@
 // The database that is down on purpose, shared by the test files that declare `mod dead_db;`.
 // It lives in a directory so cargo does not build it as a test target of its own and the
 // `for file in tests/*.rs` discovery, which does not recurse, never hands it to `--test`. It has
-// a single public item because each includer compiles its own copy and one that leaves an item
-// unused trips dead_code under clippy `-D warnings` (the same rule as `common/mod.rs`).
+// a single public item because each binary that declares it (a loose file, or the root of a group)
+// compiles its own copy and one that leaves an item unused trips dead_code under clippy `-D warnings` (the same rule as `common/mod.rs`).
 //
 // Why a listener that hangs up and not a port nobody listens on (`127.0.0.1:1`): sqlx 0.8 treats
 // a refused connection as "the server is starting" and retries it with backoff until

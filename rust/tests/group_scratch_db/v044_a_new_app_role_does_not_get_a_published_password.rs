@@ -16,16 +16,14 @@
 // They also never call `db::create_pool`: after migrating it runs
 // `provision_app_role`, which rewrites the password of the real `cuba_app`.
 
-mod empty_db;
-
 use std::future::Future;
 
-use empty_db::in_an_empty_database;
+use crate::empty_db::in_an_empty_database;
 use memory_industry::secure_cli::{AppRole, ensure_app_role};
 use sqlx::{Connection, Executor, PgConnection, PgPool, Row};
 
 const PUBLISHED_PASSWORD: &str = "app2026";
-const CREATE_APP_ROLE_SQL: &str = include_str!("../embed/create-app-role.sql");
+const CREATE_APP_ROLE_SQL: &str = include_str!("../../embed/create-app-role.sql");
 
 fn with_credentials(url: &str, role: &str, password: &str) -> String {
     let (scheme, rest) = url.split_once("://").expect("a database URL has a scheme");

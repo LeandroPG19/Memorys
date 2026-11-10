@@ -1,6 +1,6 @@
 use std::process::Command;
 
-mod dead_db;
+use crate::dead_db;
 
 fn run(args: &[&str]) -> (String, String, i32) {
     let out = Command::new(env!("CARGO_BIN_EXE_cuba-memorys"))

@@ -12,15 +12,13 @@
 //! binary inherits: without it the semantic dedup does not run, so this test says what is missing
 //! and stops before it creates anything.
 
-mod common;
-
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use common::in_a_scratch_database;
+use crate::common::in_a_scratch_database;
 use serde_json::{Value, json};
 use sqlx::Connection;
 

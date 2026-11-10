@@ -9,9 +9,7 @@
 //! drops (`common::in_a_scratch_database`); the database the URL itself points at is never
 //! touched.
 
-mod common;
-
-use common::in_a_scratch_database;
+use crate::common::in_a_scratch_database;
 use sqlx::{Executor, PgPool};
 use std::path::Path;
 
