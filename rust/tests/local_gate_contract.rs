@@ -3133,6 +3133,33 @@ fn relative_to(root: &Path, path: &Path) -> String {
 /// two launches at the same time never share a directory.
 static SELF_TEST_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
+/// The scripts of `scripts/` whose `--self-test` this process has launched (CI-K6). Each one is
+/// launched once, by `judge_env_self_test`, and every test reads that run: a second launch is a
+/// test that went back to launching a script the round already ran.
+static LAUNCHED_JUDGE_SCRIPTS: Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Panics when `script`, one of the judge's, was already launched in this process (CI-K6). The
+/// fixtures live outside `scripts/` and are launched as often as a test needs. The lock is held
+/// for the insert alone, never while a launch runs, and a poisoned one is used all the same: the
+/// set is only ever inserted into. A panic in the round that fills `judge_env_self_test` makes
+/// every reader try the round again; with this, each retry is red at once with this message, and
+/// the cause is the first red of the binary.
+fn note_launch_of_judge_script(script: &Path) {
+    if !script.starts_with(repo_root().join("scripts")) {
+        return;
+    }
+    let first = LAUNCHED_JUDGE_SCRIPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(script.to_path_buf());
+    assert!(
+        first,
+        "{} --self-test is launched a second time: read its run from judge_env_self_test",
+        script.display()
+    );
+}
+
 /// What gate-cluster.sh builds under the TMPDIR of a self-test, after the base (CI-J7): `/t` (the
 /// TMPDIR of the run), mktemp's `tmp.XXXXXXXXXX`, the root of the case `noowner` (the longest lib
 /// name that reaches gate_cluster_up), the lane `dbg.XXXXXX` and the socket file. 55 bytes.
@@ -3172,6 +3199,7 @@ fn run_self_test(
     env: &[(&str, &str)],
     own_tmpdir: bool,
 ) -> (std::process::Output, Vec<String>) {
+    note_launch_of_judge_script(script);
     let launch = SELF_TEST_LAUNCHES.fetch_add(1, Ordering::Relaxed);
     let base = self_test_parent().join(format!("st-{}-{launch}", std::process::id()));
     let longest = base.as_os_str().len() + SELF_TEST_SOCKET_SUFFIX.len();
