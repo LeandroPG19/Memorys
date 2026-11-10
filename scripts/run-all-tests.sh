@@ -1662,9 +1662,11 @@ gate_bin() {
   printf '%s\n' "$exe"
 }
 
+# CI-F3.4 (D-F34h): with a binary, the one the caller gives; without one, the debug build of gate_bin. The E2E lane
+# gives the release binary B3 left, so it compiles nothing and the database is migrated by the binary it judges.
 provision_gate_db() {
-  local bin
-  bin="$(gate_bin)"
+  local bin="${1:-}"
+  [[ -n "$bin" ]] || bin="$(gate_bin)"
   claim_database "$GATE_DB" || exit 1
   # doctor exits non-zero when ONNX_MODEL_PATH is empty (policy checks). Migrations
   # still apply first — trust the table count below, not the exit code alone.
@@ -1806,6 +1808,21 @@ sha_unchanged() {
   fi
 }
 
+# CI-F3.4 (D-F34i): a lane in a process of its own reads the sha256 B3 recorded next to the binary and holds the binary
+# against it. A lane that runs in B3's process has REL_SHA already. Without the record nothing says the binary on disk is
+# the one B3 built, so it is not judged.
+b3_record_sha() {
+  local record
+  [[ -z "${REL_SHA:-}" ]] || return 0
+  record="$(dirname "$REL_BIN")/.gate-release.sha256"
+  [[ -f "$record" ]] \
+    || { echo "FAIL: B3 left no sha256 record at $record: the binary $REL_BIN is not known to be the one it built (run --lane B3 first)." >&2; exit 1; }
+  REL_SHA="$(cut -d' ' -f1 "$record")"
+  [[ "$REL_SHA" =~ ^[0-9a-f]{64}$ ]] \
+    || { echo "FAIL: the sha256 record of B3 at $record does not start with a sha256: $(cat "$record")" >&2; exit 1; }
+  sha_unchanged "since B3"
+}
+
 lane_B3() {
 echo "=== release build (one cargo call with --no-run, the feature set production runs) ==="
 export CARGO_BUILD_JOBS="$GATE_RELEASE_JOBS"
@@ -1821,6 +1838,8 @@ cargo build --release --features cuda --bins --message-format=json >"$b3g_json" 
 check_fresh "$b3g_json" || { rm -f "$b3g_json"; exit 1; }
 rm -f "$b3g_json"
 sha_unchanged "after B3g"
+# CI-F3.4 (D-F34i): what R and E, each maybe in a process of its own, hold the binary against.
+printf '%s  %s\n' "$REL_SHA" "$REL_BIN" >"$(dirname "$REL_BIN")/.gate-release.sha256"
 }
 
 # --features cuda here too. The feature set is part of what cargo fingerprints,
@@ -1855,7 +1874,7 @@ lane_R() {
 # lane_E does, and checks it against its sha256 at the end.
 REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
 [[ -f "$REL_BIN" ]] || { echo "FAIL: no release binary at $REL_BIN: the B3 lane builds it (run --lane B3 first)." >&2; exit 1; }
-REL_SHA="${REL_SHA:-$(release_sha "$REL_BIN")}"
+b3_record_sha
 echo "=== reranker placement contracts (GPU feature live, no model needed) ==="
 run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
 
@@ -1884,16 +1903,15 @@ sha_unchanged "before E2E"
 
 lane_E() {
 export DATABASE_URL="$GATE_DATABASE_URL"
+REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
+[[ -f "$REL_BIN" ]] || { echo "FAIL: no release binary at $REL_BIN: the B3 lane builds it (run --lane B3 first)." >&2; exit 1; }
+b3_record_sha
 # CI-F3.3b-1: the e2e chain runs in a process of its own, with a cluster that has no brain_gate: E makes
 # it with the same provision D1 uses, and only when it is missing (D1 and E in one call share it).
+# CI-F3.4 (D-F34h): E compiles nothing. The provision runs the release binary B3 left, already held against its record.
 if [[ "$(psql_url "$ADMIN_DATABASE_URL" -Atc "SELECT count(*) FROM pg_database WHERE datname = '$GATE_DB'")" != 1 ]]; then
-  # lane_B3 exported the release job count for this whole process: the provision compiles the debug binary
-  # at the judge's count, as D1 does.
-  export CARGO_BUILD_JOBS="$GATE_CARGO_JOBS"
-  provision_gate_db
+  provision_gate_db "$REL_BIN"
 fi
-REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
-REL_SHA="${REL_SHA:-$(release_sha "$REL_BIN")}"
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
 CUBA_BINARY_PATH="$(resolve_binary_path)"
 export CUBA_BINARY_PATH

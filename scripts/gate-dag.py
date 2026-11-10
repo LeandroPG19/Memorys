@@ -8,11 +8,18 @@ backup). The verdict is the series one: the red with the lowest idx wins, the st
 finish, the ones after it are killed (D-F3d). A kernel kill (OOM, or a signal the planner did not
 send) gives no verdict: exit 2 (D-F3f).
 
-Not in F3.2: the model and cluster semaphores (D-F3q), the removal of old run directories (D-F3i) and
-the per-binary launcher (D-F3u). `exclusive` and `boundary` run alone, after every lower idx: the
-conservative form of D-F3l. The resource column names the target of a row (CI-F3.3c, D-F3g): the step
-builds under CARGO_TARGET_DIR/<tree key>/<target>, and a target that another tree marked is refused
-before the step starts. The other resources are parsed and ignored until F3.4.
+Not in the planner: the removal of old run directories (D-F3i) and the per-binary launcher (D-F3u).
+`exclusive` and `boundary` run alone, after every lower idx: the conservative form of D-F3l, and with a
+delegated scope no other step's cgroup may still have processes when one starts or ends (D-F34o). The
+resource column (CI-F3.3c, D-F3g, CI-F3.4): `target:<T>` is where the step builds, under
+CARGO_TARGET_DIR/<tree key>/<T>, and a target that another tree marked is refused before the step starts;
+`cluster:<C>` is a cluster of its own; `reader` reads the binary the target's builder left and builds
+nothing; `models` marks a row that loads the ONNX models. The table is judged before anything starts
+(D-F34f): a cluster in one row, rows in one target ordered by their dependencies unless both read it, a
+reader with its builder above it, and no resource of another kind. At most two rows with models are alive
+at once, and with another step alive one is admitted only with 4096 MiB of MemAvailable plus its own
+estimate (D-F34d, D-F34e). A row with models that ends green is judged against the resource plan the
+binary wrote in its log (D-F34b, D-F34c).
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
+import json
 import math
 import os
 import re
@@ -47,6 +55,18 @@ TICK_S = 1.0
 SAFETY = 1.25
 WINDOW = 5
 MIN_RESERVE = 4 * GIB
+# CI-F3.4 (D-F34d, D-F34e): the rows with models alive at once, and the MemAvailable a row with models needs on top of its own estimate.
+MAX_MODELS = 2
+MODELS_FLOOR = 4096 * (1 << 20)
+POOLS = {
+    "embed": "CUBA_EMBED_INTRA_THREADS",
+    "rerank": "CUBA_RERANK_INTRA_THREADS",
+    "nli": "CUBA_NLI_INTRA_THREADS",
+}
+PLAN_THREADS_RE = re.compile(r"hilos: embed=(\d+) rerank=(\d+) nli=(\d+)")
+PLAN_TIER_RE = re.compile(r"nivel=(\S+)")
+PLAN_GPU_RE = re.compile(r"reranker=\S+ \(GPU\)")
+MEM_AVAILABLE_RE = re.compile(r"^MemAvailable:\s+(\d+) kB", re.MULTILINE)
 # CI-F3.3b-2 (spec F3.3b-1b-iii): `untimed` schedules as `normal`; its block is past the judge's boundary line.
 CLASSES = frozenset({"normal", "exclusive", "boundary", "untimed"})
 EXCLUSIVE = frozenset({"exclusive", "boundary"})
@@ -280,6 +300,59 @@ def unique_steps(steps: list[Step]) -> dict[str, Step]:
     return by_id
 
 
+def ancestors(step: Step, by_id: dict[str, Step]) -> set[str]:
+    """The ids that `step` waits for, directly or through the steps it waits for."""
+    found: set[str] = set()
+    pending = list(step.deps)
+    while pending:
+        dep = pending.pop()
+        if dep not in found:
+            found.add(dep)
+            pending.extend(by_id[dep].deps)
+    return found
+
+
+def target_of(step: Step) -> str | None:
+    return next((r[len("target:") :] for r in step.recursos if r.startswith("target:")), None)
+
+
+def check_resource_kinds(steps: list[Step]) -> None:
+    """D-F34f: a resource is target:<T>, cluster:<C>, models or reader, and one cluster is one row's."""
+    clusters: dict[str, str] = {}
+    for step in steps:
+        for resource in step.recursos:
+            kind, _, name = resource.partition(":")
+            if resource in ("models", "reader"):
+                continue
+            if kind not in ("target", "cluster") or not name:
+                die(f"step {step.id} names the resource {resource}, which is none of target:<T>, cluster:<C>, models or reader (D-F34f)")
+            if kind == "cluster":
+                if name in clusters:
+                    die(f"steps {clusters[name]} and {step.id} both name cluster:{name}: one step per cluster (D-F34f)")
+                clusters[name] = step.id
+
+
+def check_target_order(steps: list[Step], by_id: dict[str, Step]) -> None:
+    """D-F34f: rows in one target are ordered by their dependencies unless both are readers, and a reader has above it
+    a row that is not a reader and builds the same target. With the dependencies, the overlap is impossible."""
+    above = {s.id: ancestors(s, by_id) for s in steps}
+    for n, first in enumerate(steps):
+        target = target_of(first)
+        if target is None:
+            if "reader" in first.recursos:
+                die(f"step {first.id} is a reader and names no target (D-F34f)")
+            continue
+        for second in steps[n + 1 :]:
+            if target_of(second) != target or ("reader" in first.recursos and "reader" in second.recursos):
+                continue
+            if first.id not in above[second.id] and second.id not in above[first.id]:
+                die(f"steps {first.id} and {second.id} share target {target} and neither depends on the other (D-F34f)")
+        if "reader" in first.recursos and not any(
+            target_of(by_id[a]) == target and "reader" not in by_id[a].recursos for a in above[first.id]
+        ):
+            die(f"step {first.id} reads target {target} and no step that builds {target} is above it (D-F34f)")
+
+
 def validate_table(steps: list[Step]) -> None:
     if not steps:
         die("the table has no steps")
@@ -288,6 +361,9 @@ def validate_table(steps: list[Step]) -> None:
         for dep in step.deps:
             if dep not in by_id or by_id[dep].idx >= step.idx:
                 die(f"step {step.id} depends on {dep}, which is not a step with a lower idx")
+    ordered = sorted(steps, key=lambda s: s.idx)
+    check_resource_kinds(ordered)
+    check_target_order(ordered, by_id)
 
 
 def parse_table(path: str) -> list[Step]:
@@ -299,6 +375,64 @@ def parse_table(path: str) -> list[Step]:
                 steps.append(parse_row(line, number))
     validate_table(steps)
     return sorted(steps, key=lambda s: s.idx)
+
+
+# --- the memory of the machine and the plan of the binary --------------------------
+
+
+def mem_available() -> int:
+    """MemAvailable in bytes, from GATE_PROC_MEMINFO (the fixtures') or /proc/meminfo (D-F34d). Unreadable is a refusal."""
+    path = os.environ.get("GATE_PROC_MEMINFO", "/proc/meminfo")
+    match = MEM_AVAILABLE_RE.search(read_text(path) or "")
+    if match is None:
+        die(f"no MemAvailable in {path}: the planner cannot admit a row with models without it (D-F34d)")
+    return int(match.group(1)) * 1024
+
+
+def pool_reference(steps: list[Step]) -> dict[str, int]:
+    """What the rows with models name for the three pools (D-F3m): the plan of production on this machine."""
+    for step in steps:
+        if "models" in step.recursos and all(name in step.env for name in POOLS.values()):
+            return {pool: int(step.env[name]) for pool, name in POOLS.items() if step.env[name].isdigit()}
+    return {}
+
+
+def decides_the_plan(step: Step) -> bool:
+    """A row with models that names no pool of its own is where the plan decides (D-F34c)."""
+    return "models" in step.recursos and not all(name in step.env for name in POOLS.values())
+
+
+def plan_lines(text: str) -> list[str]:
+    """The lines the binary wrote with tracing's JSON, `"message":"resource plan"`, as the log of a step holds them."""
+    return [line for line in text.splitlines() if line.lstrip().startswith("{") and '"message":"resource plan"' in line]
+
+
+def plan_text(line: str) -> str | None:
+    """The `plan` field of a resource plan line, nested in `fields` as tracing writes it or at the top; None if unreadable."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return None
+    fields = obj.get("fields", obj) if isinstance(obj, dict) else None
+    plan = fields.get("plan") if isinstance(fields, dict) else None
+    return plan if isinstance(plan, str) else None
+
+
+def plan_problem(line: str, reference: dict[str, int]) -> str | None:
+    """D-F34b: why this plan line is not the judge's: below the full tier, or other pools than the rows set (the
+    reranker's only when the plan keeps it off the GPU, where the pool of the CPU does not do the work)."""
+    plan = plan_text(line)
+    threads = PLAN_THREADS_RE.search(plan or "")
+    tier = PLAN_TIER_RE.search(plan or "")
+    if plan is None or threads is None or tier is None:
+        return f"unreadable resource plan line: {line}"
+    if tier.group(1) != "full":
+        return f"resource plan tier {tier.group(1)}, the judge needs full"
+    on_gpu = PLAN_GPU_RE.search(plan) is not None
+    for pool, value in zip(("embed", "rerank", "nli"), threads.groups()):
+        if pool in reference and int(value) != reference[pool] and not (pool == "rerank" and on_gpu):
+            return f"resource plan {pool}={value}, the rows with models set {reference[pool]}"
+    return None
 
 
 # --- cgroups and capacity -----------------------------------------------------
@@ -483,6 +617,7 @@ class Planner:
         self.cpu, self.ram = capacities()
         # CI-F3.3c: the cores admitted never add up past the machine's (C), not 1,25·C: SAFETY is for RAM only.
         self.cpu_cap = self.cpu
+        self.pools = pool_reference(steps)
         self.red: Step | None = None
         self.no_verdict: str | None = None
         self.cursor = 0
@@ -549,10 +684,26 @@ class Planner:
     def admit(self) -> None:
         for step in self.ready():
             reason = self.wait_reason(step)
-            if reason is None:
-                self.start(step)
-            else:
+            if reason is not None:
                 step.motivo = reason
+            elif self.leftover(step):
+                return
+            else:
+                self.start(step)
+
+    def leftover(self, step: Step) -> bool:
+        """D-F34o: an exclusive step starts and ends with no other step's cgroup holding processes. A step that left
+        its cgroup populated (a daemon outlived it; the rmdir of the planner fails in silence) gives no verdict. Only
+        in a delegated scope: without one the planner runs in series and the exclusivity holds by construction."""
+        if step.clase not in EXCLUSIVE or not self.delegado or not self.scope:
+            return False
+        own = f"paso-{step.idx}-{step.id}"
+        for path in sorted(glob.glob(os.path.join(glob.escape(self.scope), "paso-*"))):
+            events = read_kv(os.path.join(path, "cgroup.events"))
+            if os.path.basename(path) != own and events and events.get("populated") == 1:
+                self.no_verdict = f"no verdict: {step.id} is exclusive and {os.path.basename(path)} still had processes"
+                return True
+        return False
 
     def wait_reason(self, step: Step) -> str | None:
         alive = self.running()
@@ -570,6 +721,11 @@ class Planner:
         return any(o.clase in EXCLUSIVE for o in alive)
 
     def capacity_wait(self, step: Step, alive: list[Step]) -> str | None:
+        if "models" in step.recursos:
+            if sum("models" in o.recursos for o in alive) >= MAX_MODELS:
+                return "models"
+            if mem_available() < MODELS_FLOOR + step.r:
+                return "ram"
         if sum(o.c for o in alive) + step.c > self.cpu_cap:
             return "cpu"
         if sum(max(o.anon_now or 0, o.r) for o in alive) + step.r > self.ram:
@@ -679,6 +835,8 @@ class Planner:
         step.t_end = self.now()
         step.state = "done"
         self.measure(step)
+        if rc == 0 and not step.parado:
+            step.rc = rc = self.plan_rc(step)
         self.record_step(step)
         remove_cgroup(step.cg)
         if step.parado:
@@ -686,8 +844,28 @@ class Planner:
         if rc < 0 or (step.oom_kill or 0) > 0:
             self.no_verdict = self.no_verdict_text(step, rc)
             return
+        if self.leftover(step):
+            return
         if rc != 0:
             self.mark_red(step)
+
+    def plan_rc(self, step: Step) -> int:
+        """D-F34b, D-F34c: a green row with models is judged against the plan lines of its log. The problem is the last
+        line of its block, `FAIL: <id>: …`, and the row is red (rc 1), so D-F3d decides which red is reported."""
+        if "models" not in step.recursos:
+            return 0
+        text = read_text(step.log) or ""
+        lines = plan_lines(text)
+        problems = [plan_problem(line, self.pools) for line in lines]
+        problem = next((p for p in problems if p), None)
+        if problem is None and not lines and decides_the_plan(step):
+            problem = "no resource plan line (the row has models and names no pools, so its log has to show the plan the binary chose)"
+        if problem is None:
+            return 0
+        newline = "" if not text or text.endswith("\n") else "\n"
+        with open(step.log, "a", encoding="utf-8") as log:
+            log.write(f"{newline}FAIL: {step.id}: {problem}\n")
+        return 1
 
     def no_verdict_text(self, step: Step, rc: int) -> str:
         if step.oom_kill:
@@ -793,6 +971,8 @@ class Planner:
     def loop(self) -> None:
         while self.unfinished():
             self.admit()
+            if self.no_verdict:
+                return
             if not self.running():
                 if self.unfinished():
                     die("planner stuck: no step is running and none can start")
