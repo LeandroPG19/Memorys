@@ -1869,10 +1869,10 @@ FAKE
   # of this self-test. The cases are still drawn here, one after another from the one seed, so they are the cases
   # they were; what is judged at the same time is each case, in a child that says its own red. par_wait waits for
   # every child it is given and exits 1 if one of them did: a child nobody waits for is a green nobody saw.
-  # Four at a time, or the cores less two when that is fewer: measured on 24 threads, the whole self-test was
-  # 57 s with 1, 38 s with 4, 38 s with 8 and 40 s with 22, and its CPU 62, 69, 86 and 138 s (the children are
-  # all fork). MUTANTS_SELF_TEST_JOBS=1 is the series, and gives the same verdict.
-  par_jobs=$(( $(nproc 2>/dev/null || echo 3) - 2 ))
+  # Four at a time, or the cores when that is fewer (CI-E7a, D-E7k: no two cores kept back): measured on 24 threads,
+  # the whole self-test was 57 s with 1, 38 s with 4, 38 s with 8 and 40 s with 22, and its CPU 62, 69, 86 and 138 s
+  # (the children are all fork). MUTANTS_SELF_TEST_JOBS=1 is the series, and gives the same verdict.
+  par_jobs="$(nproc 2>/dev/null || echo 1)"
   (( par_jobs <= 4 )) || par_jobs=4
   par_jobs="${MUTANTS_SELF_TEST_JOBS:-$par_jobs}"
   [[ "$par_jobs" =~ ^[1-9][0-9]*$ ]] || par_jobs=1
