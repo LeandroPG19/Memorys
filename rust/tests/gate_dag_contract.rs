@@ -21,6 +21,9 @@
 //! - A scope without `cgroup.subtree_control` is not delegated: the planner runs in series (D-F3h).
 //! - A step starts with SIGINT and SIGQUIT at their default, even when the planner was started with them
 //!   ignored, as a background job of a non-interactive bash leaves them (CI-J10).
+//! - CI-E4: every record of `pasos.jsonl` and `corridas.jsonl` has `nucleos` and `sin_medida` (the reason of every null of a
+//!   field it covers); the run has `mem_muestra`, `serie_final_s` and `serie_cola_s`; stdout has `dag: resources:` after
+//!   `dag: T=` and `note: not measured (...)` lines, and a scope that is not delegated is neither measured nor written.
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -3785,6 +3788,438 @@ fn in_series_nothing_overlaps_and_each_row_gets_its_line_after_the_summary() {
             "`{line}`"
         );
     }
+}
+
+// --- CI-E4: CPU, cores, the peak split in what it is made of, and the seconds in series ----------------------------------
+// D-E4b to D-E4m. Every step is a bash script that writes into the fake scope what the real kernel would hold while a
+// step runs, so a run has numbers to read and the contract knows each one by hand. The history and the scope are the
+// fixture's; nothing here touches the real cgroup (CI-J17).
+
+/// The step of CI-E4. $1 id, $2 seconds, $3 control directory, $4 the fake scope, $5 the fake /proc/self/cgroup.
+/// `p` only records the first five bytes of `memory.peak` when it starts: `reset` if the planner zeroed it, `99999`
+/// if it did not. `a` records them too and then plays what a step does to a scope: it holds 2 GiB (its `memory.stat` is
+/// written first and replaced whole, so a read in between never sees the new `current` with the old stat), writes its
+/// peak where the planner's descriptor sees it (same inode, `>`), puts another file in the path (what a new `open` would
+/// read: the peak since the scope was born) and rewrites /proc/self/cgroup as the kernel does after the planner moves
+/// itself under `juez`. `b` holds 1 GiB and, when `control/b-after-a` exists, waits for `control/done-a` so that it ends
+/// after `a` whatever the load of the machine.
+const MEDIDA_SH: &str = r#"#!/bin/bash
+id="$1"; secs="$2"; control="$3"; scope="$4"; self_cgroup="$5"
+trap 'echo done > "$control/done-$id"' EXIT
+put() { printf "$2" > "$1.new" && mv "$1.new" "$1"; }
+case "$id" in
+p)
+    head -c 5 "$scope/memory.peak" > "$control/peak-reset-p"
+    ;;
+a)
+    head -c 5 "$scope/memory.peak" > "$control/peak-reset"
+    put "$scope/memory.stat" 'anon 1073741824\nfile 805306368\nshmem 268435456\nkernel 268435456\n'
+    put "$scope/memory.current" '2147483648'
+    printf '3221225472\n' > "$scope/memory.peak"
+    put "$scope/memory.peak" '999999999999\n'
+    printf '0::/scope/juez\n' > "$self_cgroup"
+    ;;
+b)
+    put "$scope/memory.stat" 'anon 536870912\nfile 268435456\nshmem 0\nkernel 268435456\n'
+    put "$scope/memory.current" '1073741824'
+    if [ -e "$control/b-after-a" ]; then
+        for _ in $(seq 400); do [ -e "$control/done-a" ] && break; sleep 0.05; done
+    fi
+    ;;
+esac
+sleep "$secs"
+"#;
+
+/// The table of CI-E4: `p` (idx 5, 0.1 s), `a` (idx 10, 0.3 s) and `b` (idx 20, 0.3 s) after it, a delegated scope of 4 CPUs
+/// whose `usage_usec` are 0.1, 0.6 and 0.3 CPU-seconds and whose `memory.peak` is 2 MiB, and in the scope the files a peak needs: `memory.peak` of
+/// 999999999999 (the peak since the scope was born), no memory held with a `memory.stat` that has the four fields, and
+/// a `juez` with other numbers (1 MiB), which is what a planner that looked the scope up again after delegating would read.
+fn e4_fixture(name: &str) -> Fixture {
+    let mut fx = Fixture::new(name, CPU_FOUR, MEM_OPEN);
+    let script = fx.base.join("medida.sh");
+    write(&script, MEDIDA_SH);
+    let scope = fx.cgroups.join("scope");
+    let mut text = String::new();
+    for (idx, id, deps, secs) in [
+        (5, "p", "-", "0.1"),
+        (10, "a", "p", "0.3"),
+        (20, "b", "p", "0.3"),
+    ] {
+        text.push_str(&format!(
+            "{idx} {id} {deps} - normal 1 5 {secs} /bin/bash {} {id} {secs} {} {} {}\n",
+            script.display(),
+            fx.control.display(),
+            scope.display(),
+            fx.proc_self.display()
+        ));
+        fx.steps.push((idx, id.to_string()));
+    }
+    write(&fx.table, &text);
+    for (_, id) in &fx.steps {
+        fx.write_defaults(id);
+        fx.write_step(id, "memory.peak", "2097152\n");
+    }
+    for (id, usec) in [("p", 100_000), ("a", 600_000), ("b", 300_000)] {
+        fx.usage(id, usec);
+    }
+    write(&scope.join("memory.peak"), "999999999999\n");
+    write(&scope.join("memory.current"), "0");
+    write(
+        &scope.join("memory.stat"),
+        "anon 0\nfile 0\nshmem 0\nkernel 0\n",
+    );
+    let juez = scope.join("juez");
+    fs::create_dir_all(&juez).expect("juez dir");
+    write(&juez.join("memory.peak"), "1048576");
+    write(&juez.join("memory.current"), "1048576");
+    write(
+        &juez.join("memory.stat"),
+        "anon 1048576\nfile 0\nshmem 0\nkernel 0\n",
+    );
+    fx
+}
+
+const E4_STEP_FIELDS: [&str; 4] = ["cpu_s", "nucleos", "mem_peak", "anon_max"];
+const E4_RUN_FIELDS: [&str; 6] = [
+    "cpu_s",
+    "nucleos",
+    "mem_peak",
+    "mem_muestra",
+    "serie_final_s",
+    "serie_cola_s",
+];
+
+/// D-E4h in both directions: of the fields a record covers, each one that is null has a reason in `sin_medida`, and each
+/// reason is of a field that is null and covered.
+fn e4_null_iff_reason(record: &Value, covered: &[&str], label: &str) {
+    let reasons = record["sin_medida"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{label}: `sin_medida` is not an object: {record}"));
+    for field in covered {
+        assert_eq!(
+            record[*field].is_null(),
+            reasons.contains_key(*field),
+            "{label}: `{field}` is {} and has {} reason: {record}",
+            record[*field],
+            if reasons.contains_key(*field) {
+                "a"
+            } else {
+                "no"
+            }
+        );
+    }
+    for key in reasons.keys() {
+        assert!(
+            covered.contains(&key.as_str()),
+            "{label}: `sin_medida` names `{key}`, which is not a field of this record: {record}"
+        );
+    }
+}
+
+/// Runs the table of `fx` with `gate_dag`, green, and returns the run, the three records of its steps and its one line of
+/// corridas.jsonl (what the history grew by since this call).
+fn e4_run(fx: &Fixture, gate_dag: &str) -> (Run, Vec<Value>, Value) {
+    let before_steps = snapshot(&fx.history, "pasos.jsonl");
+    let before_runs = snapshot(&fx.history, "corridas.jsonl");
+    let run = fx.run(gate_dag);
+    assert_green(&run, "CI-E4 run");
+    let steps = appended(&fx.history, "pasos.jsonl", &before_steps);
+    let mut runs = appended(&fx.history, "corridas.jsonl", &before_runs);
+    assert_eq!(steps.len(), 3, "{steps:?}\n{}", run.text());
+    assert_eq!(runs.len(), 1, "{runs:?}\n{}", run.text());
+    (run, steps, runs.remove(0))
+}
+
+fn e4_close(a: f64, b: f64, tolerance: f64) -> bool {
+    (a - b).abs() <= tolerance
+}
+
+/// Spec D-E4-1: a delegated scope in series leaves, with no null and no reason, the CPU of each step and of the run, the
+/// cores (CPU over the seconds of the step, CPU over the T of the run), the peak of the run read through a descriptor of
+/// its own that the planner zeroed before the first step, the sample of the highest `memory.current` split into what it
+/// is made of, and the seconds in series: `a` (the second row alive alone while `b` was ready) and `b` (the tail). `p`
+/// does not count: nothing else was ready while it ran.
+#[test]
+fn a_run_leaves_cpu_cores_the_split_peak_and_the_seconds_in_series_with_no_null_e4() {
+    let fx = e4_fixture("e4-completa");
+    let (run, steps, record) = e4_run(&fx, "0");
+    for id in ["peak-reset", "peak-reset-p"] {
+        assert_eq!(
+            read(&fx.control.join(id)),
+            "reset",
+            "{id}: the peak of the scope was not zeroed before the first step started"
+        );
+    }
+    for (id, cpu) in [("p", 0.1), ("a", 0.6), ("b", 0.3)] {
+        let step = by_id(&steps, id);
+        assert!(e4_close(num(step, "cpu_s"), cpu, 1e-9), "{id}: {step}");
+        assert!(
+            e4_close(num(step, "nucleos") * num(step, "seg"), cpu, 0.005),
+            "{id}: cores times seconds is the CPU: {step}"
+        );
+        assert_eq!(step["sin_medida"], json!({}), "{id}: {step}");
+        e4_null_iff_reason(step, &E4_STEP_FIELDS, id);
+    }
+    assert!(e4_close(num(&record, "cpu_s"), 1.0, 1e-9), "{record}");
+    assert!(
+        e4_close(num(&record, "nucleos") * num(&record, "T"), 1.0, 0.005),
+        "the cores of the run are its CPU over its T: {record}"
+    );
+    assert_eq!(record["sin_medida"], json!({}), "{record}");
+    e4_null_iff_reason(&record, &E4_RUN_FIELDS, "run");
+    assert_eq!(
+        record["mem_peak"].as_u64(),
+        Some(3_221_225_472),
+        "the peak is what the descriptor of the planner reads (3 GiB), not what a path says now (999999999999): {record}"
+    );
+    let muestra = &record["mem_muestra"];
+    for (key, bytes) in [
+        ("current", 2_147_483_648_u64),
+        ("anon", 1_073_741_824),
+        ("file", 805_306_368),
+        ("shmem", 268_435_456),
+        ("kernel", 268_435_456),
+    ] {
+        assert_eq!(
+            muestra[key].as_u64(),
+            Some(bytes),
+            "the sample of the highest memory.current has {key} = {bytes}: {record}"
+        );
+    }
+    let (a, b) = (by_id(&steps, "a"), by_id(&steps, "b"));
+    let t = num(muestra, "t");
+    assert!(
+        num(a, "inicio") <= t && t <= num(b, "inicio"),
+        "the highest sample is the one of a step `a` holding 2 GiB, between its start and the start of b: {muestra}"
+    );
+    assert!(
+        muestra["muestras"].as_u64().is_some_and(|n| n >= 5),
+        "at the start, at the end of p, a and b, and at the close: {muestra}"
+    );
+    assert!(
+        e4_close(
+            num(&record, "serie_final_s"),
+            num(a, "seg") + num(b, "seg"),
+            0.002
+        ),
+        "the seconds in series are those of a and b: {record}"
+    );
+    assert!(
+        e4_close(num(&record, "serie_cola_s"), num(b, "seg"), 0.002),
+        "the tail is b alone: {record}"
+    );
+    let lines: Vec<&str> = run.out.lines().collect();
+    let t_at = lines
+        .iter()
+        .position(|l| l.starts_with("dag: T="))
+        .unwrap_or_else(|| panic!("no summary line: {}", run.out));
+    let resources = lines.get(t_at + 1).copied().unwrap_or("");
+    assert!(
+        resources.starts_with("dag: resources:"),
+        "the line `dag: resources:` goes right after `dag: T=`: {resources:?}"
+    );
+    let words: Vec<&str> = resources.split_whitespace().collect();
+    for want in [
+        "cpu_s=1.00",
+        "mem_peak=3.00",
+        "current=2.00",
+        "anon=1.00",
+        "shmem=0.25",
+        "cache=0.50",
+        "kernel=0.25",
+    ] {
+        assert!(words.contains(&want), "`{resources}` lacks {want}");
+    }
+    for key in [
+        "cores=",
+        "at_t=",
+        "samples=",
+        "serie_final=",
+        "tail=",
+        "serie_share=",
+    ] {
+        assert!(
+            words
+                .iter()
+                .any(|w| w.starts_with(key) && !w.ends_with("n/a")),
+            "`{resources}` lacks a measured {key}"
+        );
+    }
+    let step_lines: Vec<&&str> = lines
+        .iter()
+        .filter(|l| l.starts_with("dag: step "))
+        .collect();
+    assert_eq!(step_lines.len(), 3, "{}", run.out);
+    for line in step_lines {
+        assert!(line.contains(" cores="), "`{line}` lacks cores=");
+    }
+    assert!(
+        !lines.iter().any(|l| l.starts_with("note: not measured")),
+        "everything was measured, so there is no note: {}",
+        run.out
+    );
+}
+
+/// Spec D-E4-2: in a DAG, `a` and `b` enter together and `b` ends after `a` (it waits for `done-a`, so the order does not
+/// depend on the load). The only second in series before the tail is the one in which the first row of the pair has
+/// started and the second has not: the spec says "entered together", and the gap is the start of one row after the
+/// other, which the records give as the difference of their `inicio`. The tail is what `b` does alone after `a`.
+#[test]
+fn in_a_dag_the_rows_that_enter_together_leave_only_the_tail_in_series_e4() {
+    let fx = e4_fixture("e4-dag");
+    fx.usage("a", 100_000);
+    fx.usage("b", 100_000);
+    write(&fx.control.join("b-after-a"), "");
+    fx.seed();
+    // The seeding run is over: `a` left /proc/self/cgroup under `juez` and `done-a` behind, and the DAG run starts as if it
+    // were a new one, in the scope and with no mark of the first.
+    write(&fx.proc_self, "0::/scope\n");
+    fs::remove_file(fx.control.join("done-a")).expect("done-a of the seeding run");
+    let (_, steps, record) = e4_run(&fx, "1");
+    assert_eq!(record["modo"], json!("dag"), "{record}");
+    let (a, b) = (by_id(&steps, "a"), by_id(&steps, "b"));
+    assert!(overlaps(a, b), "a and b did not run together: {a} {b}");
+    assert!(
+        num(b, "fin") > num(a, "fin"),
+        "b has to end after a: {a} {b}"
+    );
+    let tail = num(b, "fin") - num(a, "fin");
+    assert!(
+        e4_close(num(&record, "serie_cola_s"), tail, 0.002),
+        "the tail is what b does alone after a: {tail} {record}"
+    );
+    let gap = (num(a, "inicio") - num(b, "inicio")).abs();
+    let wait = num(&record, "serie_final_s") - num(&record, "serie_cola_s");
+    assert!(
+        e4_close(wait, gap, 0.002),
+        "nobody waited but the row that was admitted second, for the {gap} s it started after the first: {record}"
+    );
+    assert!(
+        wait < 0.25,
+        "two rows that enter together do not spend seconds in series before the tail: {record}"
+    );
+}
+
+/// Spec D-E4-3: a scope that is not delegated is not measured and the planner does not write a byte in it. In series: the
+/// note says it with its reason, every number of the scope is null with a reason that says `not delegated`, the seconds
+/// in series are still there (they come from the intervals, not from the cgroup), and one `note: not measured (` line
+/// names the fields. The first five bytes `p` and `a` read from `memory.peak` are `99999`: no `reset` was written.
+#[test]
+fn an_undelegated_scope_is_not_measured_says_so_in_series_and_is_not_touched_e4() {
+    let fx = e4_fixture("e4-sin-delegar");
+    fx.undelegate();
+    let (run, steps, record) = e4_run(&fx, "0");
+    assert!(
+        run.out.contains("note: the scope is not delegated ("),
+        "the note of a scope that is not delegated goes out in series too, with its reason: {}",
+        run.out
+    );
+    assert!(
+        run.out
+            .lines()
+            .any(|l| l.starts_with("note: not measured (")),
+        "one `note: not measured (` line names the fields: {}",
+        run.out
+    );
+    for step in &steps {
+        for field in E4_STEP_FIELDS {
+            assert!(step[field].is_null(), "{field} of a step: {step}");
+            assert!(
+                step["sin_medida"][field]
+                    .as_str()
+                    .is_some_and(|why| why.contains("not delegated")),
+                "{field} of a step has the reason `not delegated`: {step}"
+            );
+        }
+        e4_null_iff_reason(step, &E4_STEP_FIELDS, "undelegated step");
+    }
+    for field in ["cpu_s", "nucleos", "mem_peak", "mem_muestra"] {
+        assert!(record[field].is_null(), "{field} of the run: {record}");
+        assert!(
+            record["sin_medida"][field].is_string(),
+            "{field} of the run has a reason: {record}"
+        );
+    }
+    for field in ["serie_final_s", "serie_cola_s"] {
+        assert!(
+            record[field].as_f64().is_some(),
+            "{field} comes from the intervals and is measured: {record}"
+        );
+    }
+    e4_null_iff_reason(&record, &E4_RUN_FIELDS, "undelegated run");
+    for id in ["peak-reset", "peak-reset-p"] {
+        assert_eq!(
+            read(&fx.control.join(id)),
+            "99999",
+            "{id}: the planner wrote in the memory.peak of a scope that is not its own"
+        );
+    }
+    assert_eq!(
+        read(&fx.cgroups.join("scope").join("memory.peak")),
+        "999999999999\n"
+    );
+}
+
+/// Spec D-E4-4: what cannot be read is null with its path, never 0. The `cpu.stat` of `b` is gone and `memory.peak` cannot
+/// be opened for writing: `b` has no CPU and no cores and the reason names its file, `a` is measured, the run has no CPU
+/// and no cores (the reason names `b`) and no peak (`cannot be reset`: it does not fall back to reading the path, which
+/// would give the peak since the scope was born), and the sample is still there, because it does not need the descriptor.
+#[test]
+fn a_file_that_cannot_be_read_is_null_with_its_path_never_0_e4() {
+    let fx = e4_fixture("e4-no-lee");
+    fs::remove_file(fx.step_dir("b").join("cpu.stat")).expect("cpu.stat of b");
+    let peak = fx.cgroups.join("scope").join("memory.peak");
+    fs::set_permissions(&peak, fs::Permissions::from_mode(0o444)).expect("memory.peak 0444");
+    assert!(
+        fs::OpenOptions::new().write(true).open(&peak).is_err(),
+        "this test needs a user that file permissions bind, not root"
+    );
+    let (run, steps, record) = e4_run(&fx, "0");
+    let b = by_id(&steps, "b");
+    assert!(b["cpu_s"].is_null() && b["nucleos"].is_null(), "{b}");
+    assert!(
+        b["sin_medida"]["cpu_s"]
+            .as_str()
+            .is_some_and(|why| why.contains("paso-20-b/cpu.stat")),
+        "the reason names the file of b: {b}"
+    );
+    let a = by_id(&steps, "a");
+    assert!(e4_close(num(a, "cpu_s"), 0.6, 1e-9), "{a}");
+    assert!(
+        record["cpu_s"].is_null() && record["nucleos"].is_null(),
+        "{record}"
+    );
+    assert!(
+        record["sin_medida"]["cpu_s"]
+            .as_str()
+            .is_some_and(|why| why.contains('b')),
+        "the reason of the run names the step that was not measured: {record}"
+    );
+    assert!(
+        record["mem_peak"].is_null(),
+        "the peak of a scope that cannot be zeroed is not read from its path: {record}"
+    );
+    assert!(
+        record["sin_medida"]["mem_peak"]
+            .as_str()
+            .is_some_and(|why| why.contains("cannot be reset")),
+        "{record}"
+    );
+    assert!(
+        !record["mem_muestra"].is_null(),
+        "the sample does not depend on the descriptor of the peak: {record}"
+    );
+    for step in &steps {
+        e4_null_iff_reason(step, &E4_STEP_FIELDS, "step");
+    }
+    e4_null_iff_reason(&record, &E4_RUN_FIELDS, "run");
+    assert!(
+        run.out
+            .lines()
+            .any(|l| l.starts_with("note: not measured (") && l.contains("cannot be reset")),
+        "a `note: not measured (` line for the peak: {}",
+        run.out
+    );
 }
 
 /// (tag, the power supply the root holds as (type, status), the `battery=` the plan has to say), per case of the battery.
