@@ -10,20 +10,64 @@ const PG_PASSWORD: &str = "memorys2026";
 const PG_DB: &str = "brain";
 const PG_PORT: u16 = 5488;
 
+/// A process that must never touch the developer's own memory (the judge's tests) sets this to any
+/// non-empty value. Without a `DATABASE_URL` it then stops with exit 2 instead of taking the default
+/// database (`127.0.0.1:5488`) or creating the PostgreSQL container with Docker. It fails closed: a
+/// value like `true` or `yes` is as good as `1`, because a misspelt switch would open the very door
+/// it exists to close.
+const REQUIRE_DATABASE_URL: &str = "MEMORY_INDUSTRY_REQUIRE_DATABASE_URL";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UrlSource {
+    Given,
+    CloudWithoutUrl,
+    Refused,
+    Default,
+}
+
+/// Where the URL comes from, in this order: the one the operator gave (an explicit URL wins over the
+/// switch, and a blank still counts as given, as it always has); the cloud mode, which has no default
+/// and already fails closed; the switch; and only then the default path.
+fn url_source(given: &str, cloud: bool, require: &str) -> UrlSource {
+    if !given.is_empty() {
+        UrlSource::Given
+    } else if cloud {
+        UrlSource::CloudWithoutUrl
+    } else if !require.trim().is_empty() {
+        UrlSource::Refused
+    } else {
+        UrlSource::Default
+    }
+}
+
 pub async fn resolve_database_url() -> String {
-    if let Ok(url) = std::env::var("DATABASE_URL")
-        && !url.is_empty()
-    {
-        return url;
+    let given = std::env::var("DATABASE_URL").unwrap_or_default();
+    let require = std::env::var_os(REQUIRE_DATABASE_URL).unwrap_or_default();
+    match url_source(
+        &given,
+        crate::mode::active().is_cloud(),
+        &require.to_string_lossy(),
+    ) {
+        UrlSource::Given => return given,
+        UrlSource::CloudWithoutUrl => {
+            log("CUBA_MODE=red (nube) pero DATABASE_URL no está seteada.");
+            log("El modo red usa una base compartida en la nube — poné la URL de tu");
+            log("Postgres gestionado (Supabase/Neon/…), con TLS:");
+            log("  export DATABASE_URL=\"postgresql://user:pass@host/db?sslmode=require\"");
+            std::process::exit(1);
+        }
+        UrlSource::Refused => {
+            log(&format!(
+                "DATABASE_URL no está definida y {REQUIRE_DATABASE_URL} pide una explícita: no se \
+                 usa la base por defecto (127.0.0.1:{PG_PORT}) ni se arranca PostgreSQL en Docker. \
+                 Definí DATABASE_URL, o quitá {REQUIRE_DATABASE_URL} para volver a la configuración \
+                 automática."
+            ));
+            std::process::exit(2);
+        }
+        UrlSource::Default => {}
     }
 
-    if crate::mode::active().is_cloud() {
-        log("CUBA_MODE=red (nube) pero DATABASE_URL no está seteada.");
-        log("El modo red usa una base compartida en la nube — poné la URL de tu");
-        log("Postgres gestionado (Supabase/Neon/…), con TLS:");
-        log("  export DATABASE_URL=\"postgresql://user:pass@host/db?sslmode=require\"");
-        std::process::exit(1);
-    }
     if matches!(get_container_state(), ContainerState::Running) {
         return build_url();
     }

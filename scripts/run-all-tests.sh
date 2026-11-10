@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUST_DIR="$ROOT/rust"
 LIVE_DATABASE_URL="${DATABASE_URL:-postgresql://cuba:memorys2026@127.0.0.1:5488/brain}"
 export CUBA_JUDGE="${CUBA_JUDGE:-heuristic}"
+# This script also runs alone, so it carries the same refusal as merge-gate.sh: a process it starts
+# with no DATABASE_URL stops with exit 2 instead of reaching the developer's own database.
+export MEMORY_INDUSTRY_REQUIRE_DATABASE_URL=1
 
 # Every path this gate hands to another process is absolute, and the resolution
 # happens here, once, before anything derives anything from it.

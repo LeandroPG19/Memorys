@@ -1137,6 +1137,11 @@ acquire_gate_lock "$GATE_LOCK" || exit 1
 exit_file_running
 trap on_exit EXIT
 export CUBA_GATE_LOCK_OWNER="$GATE_OWNER"
+# No process of this judge may fall back on the developer's own database (127.0.0.1:5488) or create a
+# PostgreSQL container: without a DATABASE_URL it refuses with exit 2. Every step that has a database
+# is handed its URL; this is for the one that loses it. Before the first step, which is the refuse-
+# targets check below, and not beside `export DATABASE_URL`, which comes after it.
+export MEMORY_INDUSTRY_REQUIRE_DATABASE_URL=1
 
 # Whatever this commit's earlier receipt said, this run is its verdict now: a
 # red run on it takes it away, and a green one writes it again. A dirty start
