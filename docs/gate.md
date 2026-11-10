@@ -404,7 +404,7 @@ contracts) and `lane_E` (the E2E, the doctor, the MCP live session and the eval 
   starts with `#` (a comment goes in a line of its own). The order may be preceded by `NAME=value` tokens,
   the environment of the step. Only the names of `ROW_ENV` in `gate-dag.py` may be written there
   (`CARGO_BUILD_JOBS`, `CARGO_INCREMENTAL`, `CARGO_PROFILE_DEV_DEBUG`, `CARGO_PROFILE_DEV_STRIP`, the three
-  `CUBA_*_INTRA_THREADS`, `MUTANTS_JOBS` and `CUBA_HANDLER_TIMEOUT_SECS`), none with an empty value, and a `*_JOBS` or `*_THREADS` is a
+  `CUBA_*_INTRA_THREADS`, `MUTANTS_JOBS` and `CUBA_HANDLER_TIMEOUT_SECS`), none with an empty value, and a `*_JOBS`, `*_THREADS` or `*_SECS` is a
   whole number above 0. `PLANNER_ENV` (`TMPDIR`, `CARGO_TARGET_DIR`, `CUBA_GATE_LANE_TOKEN`) is what only the
   planner sets, and a step that would differ from the planner's own environment in any other variable is
   not started. The table as a whole is judged as well: a cluster belongs to one row, two rows in one target
@@ -458,6 +458,14 @@ contracts) and `lane_E` (the E2E, the doctor, the MCP live session and the eval 
   the cores of the live rows plus its own pass `C`; for `jobs`, while the cargo jobs of the live rows plus
   its own pass `N`, the jobs of the machine; and for `ram`, while what the live rows hold plus its estimate
   passes `R`. Ready rows are tried in the order of their critical-path rank.
+- The planner picks up what it makes (CI-E15). Each run has a directory `memory-industry-dag.<suffix>` under the
+  judge's `TMPDIR`, with `pasos/` (the log of each row), `tmp/<row>` (the row's own `TMPDIR`) and `planner.pid`. A
+  green row's `tmp/<row>` goes when the row ends; the whole directory goes when the run ends with exit 0 and a
+  verdict. A red run, or one with no verdict, keeps it and prints `dag: run directory: <path>` after its summary.
+  Before it makes its own, a planner deletes the siblings of more than seven days whose `planner.pid` no longer
+  names a live process. A row that ends with processes still in its cgroup gets them killed and named in a note:
+  `note: paso-21-CT ended with orphan processes in its cgroup (sleep x12); they were killed`. It is a note and not a
+  red: a child of a second that outlives its row would be a red by a race.
 - The jobs of the rows that are ready when `P` ends have to fit together (CI-E14): `B3` names 12, `B1` 8 and `M` 4,
   the 24 threads the table was written for. With `M` at 8 the green DAG run of 2026-11-10 kept `B1` waiting 180 s for
   the reason `jobs` on a machine at 8.5 of 24 cores; `M` builds one crate per mutant and its width is `MUTANTS_JOBS`,
