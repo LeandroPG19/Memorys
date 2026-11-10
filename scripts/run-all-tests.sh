@@ -208,6 +208,100 @@ source "$ROOT/scripts/gate-lock.sh"
 source "$ROOT/scripts/gate-cluster.sh"
 GATE_OWNED_DBS=()
 
+# --- the test counts (CI-J, D-J4b; CI-E1) -------------------------------------
+# A section that runs a different number of tests than its line in
+# scripts/test-section-counts.txt is red, in either direction: a test that stops
+# being run is the same silence as one that is skipped. The count is passed + failed
+# over the `test result:` lines of that section's cargo call. A section states either
+# one total, `<section> <tests> <motive>`, or one line per test binary,
+# `<section>/<linux|windows>/<binary> <tests> <motive>` (CI-E1: the plain pass), never both.
+# The judgement is one function, section_count_verdict, which run_counted calls for every
+# section and `--check-counts` calls over a log that was saved.
+SECTION_COUNTS="$ROOT/scripts/test-section-counts.txt"
+# The sections this gate ran and judged, in order (CI-J2, A7): run_counted appends each one. It is
+# the only list of sections: check_section_lines compares the count file with it, both ways.
+RAN_SECTIONS=""
+
+# section_count_verdict SECTION COUNTS: COUNTS is what `test-times.sh --count` printed (`<binary> <tests>` per
+# line). Prints the OK line and returns 0, or prints every FAIL line to stderr and returns 1: every difference at once,
+# so one run says all of them. A section with no line at all is not judged here: check_section_lines says it.
+section_count_verdict() {
+  local section="$1" counts="$2" os=linux ran bins zero expected shape totals binaries
+  gate_on_windows && os=windows
+  if [[ -r "$SECTION_COUNTS" ]]; then
+    shape="$(awk '!/^[[:space:]]*#/ && NF > 0 && index($1, "/") && !(NF >= 3 && $2 ~ /^[0-9]+$/ \
+        && $1 ~ "^[a-z][a-z0-9-]*/(linux|windows)/(lib:|bin:|doc:)?[A-Za-z0-9_-]+$") \
+        { printf "FAIL: scripts/test-section-counts.txt:%d: %c%s%c is not %c<section>/<linux|windows>/<binary> <tests> <motive>%c\n", NR, 39, $0, 39, 39, 39 }' "$SECTION_COUNTS")"
+    if [[ -n "$shape" ]]; then
+      printf '%s\n' "$shape" >&2
+      return 1
+    fi
+    totals="$(awk -v s="$section" '!/^[[:space:]]*#/ && NF >= 2 && $1 == s { n++ } END { print n + 0 }' "$SECTION_COUNTS")"
+    binaries="$(awk -v s="$section" '!/^[[:space:]]*#/ && NF >= 3 && index($1, s "/") == 1 { n++ } END { print n + 0 }' "$SECTION_COUNTS")"
+  else
+    totals=0
+    binaries=0
+  fi
+  if (( totals > 0 && binaries > 0 )); then
+    echo "FAIL: section $section has a total line and lines per binary in scripts/test-section-counts.txt: one or the other" >&2
+    return 1
+  fi
+  if (( binaries > 0 )); then
+    awk -v s="$section" -v os="$os" '
+      function err(msg) { print "FAIL: section " s " on " os ": " msg > "/dev/stderr"; bad++ }
+      BEGIN { prefix = s "/" os "/" }
+      NR == FNR { ran[$1] = $2; order[++n] = $1; ranned += $2; next }
+      !/^[[:space:]]*#/ && NF >= 3 && index($1, prefix) == 1 {
+        key = substr($1, length(prefix) + 1); want[key] = $2; wanted[++m] = key; lines += $2
+      }
+      END {
+        if (m == 0) {
+          print "FAIL: section " s " has lines per binary and none for " os ": the first judge on " os " sets them from its log" > "/dev/stderr"
+          exit 1
+        }
+        for (i = 1; i <= n; i++) {
+          k = order[i]
+          if (!(k in want)) err(k " ran " ran[k] " tests and has no line")
+          else if (want[k] != ran[k]) err(sprintf("%s: expected %d, ran %d (%+d)", k, want[k], ran[k], ran[k] - want[k]))
+        }
+        for (j = 1; j <= m; j++) if (!(wanted[j] in ran)) err(wanted[j] " has a line (" want[wanted[j]] ") and did not run")
+        if (bad > 0) {
+          err(bad " binaries differ from scripts/test-section-counts.txt (lines " lines ", ran " ranned "). Change a line only by what the diff of this change adds or removes in that binary; a difference the diff does not explain is a test lost or gained, not a new number.")
+          exit 1
+        }
+        print "OK  section " s ": " ranned " tests in " n " test binaries, each against its line for " os
+      }' <(printf '%s\n' "$counts") "$SECTION_COUNTS"
+    return
+  fi
+  read -r ran bins zero <<<"$(awk '{ ran += $2; bins++; if ($2 == 0) zero++ }
+    END { printf "%d %d %d\n", ran + 0, bins + 0, zero + 0 }' <<<"$counts")"
+  expected=""
+  (( totals == 0 )) || expected="$(awk -v s="$section" '!/^[[:space:]]*#/ && NF >= 2 && $1 == s { print $2; exit }' "$SECTION_COUNTS")"
+  if [[ -n "$expected" && ! "$expected" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: scripts/test-section-counts.txt says '$expected' for section $section, which is not a number." >&2
+    return 1
+  fi
+  if [[ -n "$expected" && "$expected" != "$ran" ]]; then
+    echo "FAIL: section $section: expected $expected, ran $ran tests ($bins test binaries). scripts/test-section-counts.txt says $expected: change that line only with the log that proves the new number." >&2
+    return 1
+  fi
+  echo "OK  section $section: $ran tests in $bins test binaries"
+}
+
+# --check-counts SECTION LOG judges a cargo log that was saved against the lines of the section, with the function the
+# judge itself uses. It opens no database, takes no lock and runs no cargo: 0 green, 1 red, 2 when it cannot read.
+# Only the lines of this host's system are judged (gate_on_windows), whichever system wrote them.
+if [[ "${1:-}" == "--check-counts" ]]; then
+  [[ $# -eq 3 ]] || { echo "FAIL: --check-counts takes a section and a cargo log: --check-counts SECTION LOG" >&2; exit 2; }
+  [[ -f "$3" ]] || { echo "FAIL: --check-counts: no log at $3" >&2; exit 2; }
+  counts="$("$ROOT/scripts/test-times.sh" --count "$3")" \
+    || { echo "FAIL: --check-counts: test-times.sh --count could not read $3 (see above)." >&2; exit 2; }
+  grep -Eq "^${2}[[:space:]/]" "$SECTION_COUNTS" 2>/dev/null \
+    || { echo "FAIL: scripts/test-section-counts.txt has no line for the section $2." >&2; exit 1; }
+  section_count_verdict "$2" "$counts" || exit 1
+  exit 0
+fi
+
 # The admin connection and psql_url are defined further down; these three only
 # run after them. They are the whole of what the ownership rule says to the
 # server, which is also what lets the self-test put a catalog in their place.
@@ -1697,22 +1791,12 @@ if [[ "$(free_gb)" -lt "$MIN_FREE_GB" ]]; then
   exit 1
 fi
 
-# --- the test counts (CI-J, D-J4b) -------------------------------------------
-# A section that runs a different number of tests than its line in
-# scripts/test-section-counts.txt is red, in either direction: a test that stops
-# being run is the same silence as one that is skipped. The count is passed + failed
-# over the `test result:` lines of that section's cargo call. A named section (one
-# that names its --test binaries) must also run every binary at least one test.
-SECTION_COUNTS="$ROOT/scripts/test-section-counts.txt"
-# The sections this gate ran and judged, in order (CI-J2, A7): run_counted appends each one. It is
-# the only list of sections: check_section_lines compares the count file with it, both ways.
-RAN_SECTIONS=""
-
+# --- the test counts (CI-J, D-J4b): the judgement is section_count_verdict, above --------
 # run_counted SECTION NAMED <command>: runs the call with its output shown and kept,
 # judges the count, and exits with the call's own code when the call failed. The count
 # is test-times.sh --count's, the one parse of a cargo log the judge has (D-J4d).
 run_counted() {
-  local section="$1" named="$2" log counts rc=0 want=0 arg expected ran bins zero
+  local section="$1" named="$2" log counts verdict rc=0 want=0 arg bins zero
   shift 2
   for arg in "$@"; do
     [[ "$arg" == --test ]] && want=$((want + 1))
@@ -1729,29 +1813,21 @@ run_counted() {
     exit 1
   fi
   rm -f "$log"
-  read -r ran bins zero <<<"$(awk '{ ran += $2; bins++; if ($2 == 0) zero++ }
-    END { printf "%d %d %d\n", ran + 0, bins + 0, zero + 0 }' <<<"$counts")"
-  expected="$(awk -v s="$section" '!/^[[:space:]]*#/ && NF >= 2 && $1 == s { print $2; exit }' "$SECTION_COUNTS" 2>/dev/null || true)"
-  if [[ -n "$expected" && ! "$expected" =~ ^[0-9]+$ ]]; then
-    echo "FAIL: scripts/test-section-counts.txt says '$expected' for section $section, which is not a number." >&2
-    exit 1
-  fi
-  if [[ -n "$expected" && "$expected" != "$ran" ]]; then
-    echo "FAIL: section $section: expected $expected, ran $ran tests ($bins test binaries). scripts/test-section-counts.txt says $expected: change that line only with the log that proves the new number." >&2
-    exit 1
-  fi
+  verdict="$(section_count_verdict "$section" "$counts")" || exit 1
+  read -r bins zero <<<"$(awk '{ bins++; if ($2 == 0) zero++ } END { printf "%d %d\n", bins + 0, zero + 0 }' <<<"$counts")"
   if [[ "$named" == 1 ]] && { (( bins != want )) || (( zero > 0 )); }; then
     echo "FAIL: section $section: $bins test binaries reported for $want named --test, $zero of them ran 0 tests. Each named binary has to run at least one test." >&2
     exit 1
   fi
   RAN_SECTIONS+=" $section"
-  echo "OK  section $section: $ran tests in $bins test binaries"
+  echo "$verdict"
 }
 
 # Every section that runs tests has its line, and every line is a section that runs.
 check_section_lines() {
   local listed name missing="" orphan=""
-  listed="$(awk '!/^[[:space:]]*#/ && NF >= 2 { print $1 }' "$SECTION_COUNTS" 2>/dev/null || true)"
+  # A line `<section>/<os>/<binary>` belongs to its section, once however many binaries it states (CI-E1).
+  listed="$(awk '!/^[[:space:]]*#/ && NF >= 2 { sub(/\/.*/, "", $1); if (!seen[$1]++) print $1 }' "$SECTION_COUNTS" 2>/dev/null || true)"
   for name in $RAN_SECTIONS; do
     grep -qxF "$name" <<<"$listed" || missing+=" $name"
   done
@@ -1981,7 +2057,7 @@ echo "=== throwaway database for every mutating step ==="
 provision_gate_db
 
 echo "=== cargo test (unit + smoke) ==="
-DATABASE_URL="$GATE_DATABASE_URL" cargo test --timings
+DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --timings
 }
 
 lane_D2() {
