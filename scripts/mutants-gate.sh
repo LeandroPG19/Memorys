@@ -583,7 +583,7 @@ def load(path):
     recount = {
         "caught": sum(1 for s, _ in mutants.values() if s == "CaughtMutant"),
         "missed": sum(1 for s, _ in mutants.values() if s == "MissedMutant"),
-        "timeout": sum(1 for s, _ in mutants.values() if s == "TimeoutMutant"),
+        "timeout": sum(1 for s, _ in mutants.values() if s == "Timeout"),
         "unviable": sum(1 for s, _ in mutants.values() if s == "Unviable"),
     }
     for field, count in recount.items():
@@ -2155,6 +2155,29 @@ PY
   cmp_run "$cmp_dir/ref/outcomes.json" "$cmp_dir/other_cargo/outcomes.json"
   if (( rc != 0 )) || ! grep -qF 'OK  classes: 4/4 identical' "$tmp/cmp.out"; then
     self_fail "F4a.2: a different cargo path in argv[0] was taken for a different test (exit $rc): $(cat "$tmp/cmp.out" "$tmp/cmp.err")"
+  fi
+
+  # F6c (the equivalence study of quality-gate.sh reads its classes with this comparator). cargo-mutants 27.1.0
+  # serializes the class of a mutant whose test timed out as "Timeout" (outcome.rs: Success, CaughtMutant,
+  # MissedMutant, Unviable, Failure, Timeout), and the comparator counted "TimeoutMutant", a name the tool never
+  # writes: a real timeout was in no total of its own. No fixture of F4 above holds a timeout; this is the first,
+  # written the way cargo-mutants writes it. mkout counts the old name for its own totals, so the total that
+  # cargo-mutants declares is spelled out, as in the row of a total that does not add up.
+  cmp_case tmo_ref Success "$(rec CaughtMutant "$N_MMR" "$T_REF"; rec Timeout "$N_RRF" "$T_REF"; rec Unviable "$N_CACHE" -; rec MissedMutant "$N_MISS" "$T_REF"; rec declare timeout 1)"
+  cmp_run "$cmp_dir/tmo_ref/outcomes.json" "$cmp_dir/tmo_ref/outcomes.json"
+  if (( rc != 0 )) || ! grep -qF 'OK  classes: 4/4 identical' "$tmp/cmp.out"; then
+    self_fail "F6c: a file with one \"Timeout\" record under timeout=1, compared with itself, was not 'OK  classes: 4/4 identical' (exit $rc; a timeout that the comparator does not count): $(cat "$tmp/cmp.out" "$tmp/cmp.err")"
+  fi
+  # The other direction: a "Timeout" record under a total of timeout=0 does not add up.
+  cmp_case tmo_undeclared Success "$(rec CaughtMutant "$N_MMR" "$T_REF"; rec Timeout "$N_RRF" "$T_REF"; rec Unviable "$N_CACHE" -; rec MissedMutant "$N_MISS" "$T_REF")"
+  cmp_run "$cmp_dir/ref/outcomes.json" "$cmp_dir/tmo_undeclared/outcomes.json"
+  if (( rc != 1 )) || ! grep -qF 'carries no per-mutant outcomes that add up to its totals: timeout is 0 and its records hold 1' "$tmp/cmp.err"; then
+    self_fail "F6c: a \"Timeout\" record under a total of timeout=0 was not refused with 'timeout is 0 and its records hold 1' (exit $rc): $(cat "$tmp/cmp.err")"
+  fi
+  # A timeout that turns caught is one difference, the class: the totals of both files add up, so nothing else.
+  cmp_run "$cmp_dir/tmo_ref/outcomes.json" "$cmp_dir/ref/outcomes.json"
+  if (( rc != 1 )) || ! grep -qF "class changed for $N_RRF: Timeout -> CaughtMutant" "$tmp/cmp.err" || [[ "$(grep -c '^FAIL' "$tmp/cmp.err")" != 1 ]]; then
+    self_fail "F6c: a Timeout that turns CaughtMutant was not exactly one FAIL, 'class changed for $N_RRF: Timeout -> CaughtMutant' (exit $rc): $(cat "$tmp/cmp.err")"
   fi
 
   # F4b. The dependencies are built once per content (D-F4c..j). Every row here runs the

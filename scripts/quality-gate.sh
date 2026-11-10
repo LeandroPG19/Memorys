@@ -17,8 +17,9 @@ qg_mutants_jobs() {
   printf '%s\n' "${plan#jobs=}"
 }
 
-# The two modes that only read and write files (CI-F6, F6b). They are dispatched before anything else of this script
-# runs, so that the judge can call itself for them without the banner or the diff: `--cover-index` and `--merge-select`.
+# The modes that only read and write files, or that run this script (CI-F6, F6b and F6c). They are dispatched before
+# anything else of this script runs, so that the judge can call itself for them without the banner or the diff:
+# `--cover-index`, `--merge-select` and `--study`.
 QG_SELF="$ROOT/scripts/$(basename "${BASH_SOURCE[0]}")"
 qg_py() { command -v python3 2>/dev/null || command -v python 2>/dev/null || true; }
 
@@ -197,10 +198,92 @@ sys.exit(red)
 PY
 }
 
+# The mode `--study REF DIR` (D-F6p): is cover (Q2) the judge it replaces? REF is `legacy` or `full`, the judge as it
+# runs today, and DIR is new or empty. It runs this script whole with QG_SELECT=REF and QG_KEEP_OUT=DIR/ref (that run is
+# the verdict of the reference), then whole with QG_SELECT=cover into a keep directory of its own, whose cover/ becomes
+# DIR/cover, and asks mutants-gate.sh --compare-classes for the class of every mutant in both. DIR/study.tsv has a row
+# for each mutant: its class in each run, the pass and the size of the subset of the cover run, and the seconds of its
+# test phase in each. Exit 0 only if the reference is green and no class changed; 1 if the reference is red or some class
+# differs; 2 if the study could not be run or compared (a DIR that is not empty, a REF that is not legacy or full, a
+# run that left no outcomes). Each run is the whole judge, lizard and exclusions included: they cost seconds beside the
+# mutation, and the two runs judge the same diff the same way.
+qg_study() {
+  local ref="${1:-}" dir="${2:-}" py ref_rc=0 cover_rc=0 cmp_rc=0 ref_out merged n diffs cmp_err
+  case "$ref" in
+    legacy | full) ;;
+    *)
+      echo "FAIL: --study REF DIR: REF is legacy or full, the judge that cover is compared with, not '$ref'" >&2
+      return 2
+      ;;
+  esac
+  [[ -n "$dir" ]] || { echo "FAIL: --study $ref DIR needs a directory for the study" >&2; return 2; }
+  if [[ -n "$(ls -A "$dir" 2>/dev/null || true)" ]]; then
+    echo "FAIL: --study DIR=$dir is not empty; name a new directory so that runs do not mix" >&2
+    return 2
+  fi
+  py="$(qg_py)"
+  [[ -n "$py" ]] || { echo "FAIL: python is required for --study" >&2; return 2; }
+  mkdir -p "$dir" || return 2
+  QG_SELECT="$ref" QG_KEEP_OUT="$dir/ref" bash "$QG_SELF" || ref_rc=$?
+  echo "study: reference exit $ref_rc"
+  ref_out="$dir/ref/$ref/outcomes.json"
+  if [[ ! -s "$ref_out" ]]; then
+    echo "FAIL: the reference run left no outcomes.json in $dir/ref/$ref (its exit was $ref_rc): there is nothing to compare cover with, and its run is not launched" >&2
+    return 2
+  fi
+  QG_SELECT=cover QG_KEEP_OUT="$dir/cover-run" bash "$QG_SELF" || cover_rc=$?
+  merged="$dir/cover-run/cover/merged.json"
+  if [[ ! -s "$merged" ]]; then
+    echo "FAIL: the cover run left no merged.json in $dir/cover-run/cover (its exit was $cover_rc; it may have turned itself off and run as full): there is nothing to compare" >&2
+    return 2
+  fi
+  mv "$dir/cover-run/cover" "$dir/cover" && rmdir "$dir/cover-run" || return 2
+  cmp_err="$(mktemp)"
+  "$ROOT/scripts/mutants-gate.sh" --compare-classes "$ref_out" "$dir/cover/merged.json" 2>"$cmp_err" || cmp_rc=$?
+  cat "$cmp_err" >&2
+  diffs="$(grep -c '^FAIL' "$cmp_err" || true)"
+  rm -f "$cmp_err"
+  n="$("$py" -I - "$ref_out" "$dir/cover/merged.json" "$dir/study.tsv" <<'PY'
+import json, sys
+ref_path, cover_path, out_path = sys.argv[1:4]
+def load(path):
+    rows = {}
+    for o in json.load(open(path, encoding="utf-8"))["outcomes"]:
+        if not isinstance(o.get("scenario"), dict):
+            continue
+        test = next((p.get("duration") for p in o.get("phase_results", []) if p.get("phase") == "Test"), None)
+        rows[o["scenario"]["Mutant"]["name"]] = (o.get("summary"), test, o.get("qg_select", {}))
+    return rows
+ref, cover = load(ref_path), load(cover_path)
+seconds = lambda d: "-" if d is None else f"{d:.3f}"
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write("name\tref\tcover\tpass\tk\tref_test_s\tcover_test_s\n")
+    for name in list(ref) + [m for m in cover if m not in ref]:
+        r, c = ref.get(name, ("-", None, {})), cover.get(name, ("-", None, {}))
+        f.write("\t".join([name, str(r[0]), str(c[0]), str(c[2].get("pass", "-")), str(c[2].get("subset", "-")), seconds(r[1]), seconds(c[1])]) + "\n")
+print(len(ref))
+PY
+)" || return 2
+  case "$cmp_rc" in
+    0) echo "study: $n/$n identical — Q2 may be adopted" ;;
+    1) echo "study: $diffs differ — Q2 is NOT adopted" ;;
+    *)
+      echo "FAIL: mutants-gate.sh --compare-classes exited $cmp_rc, so the classes were not compared" >&2
+      return 2
+      ;;
+  esac
+  (( ref_rc == 0 && cmp_rc == 0 )) || return 1
+}
+
 case "${1:-}" in
   --cover-index | --merge-select)
     mode_rc=0
     if [[ "$1" == --cover-index ]]; then qg_cover_index "${@:2}" || mode_rc=$?; else qg_merge_select "${@:2}" || mode_rc=$?; fi
+    exit "$mode_rc"
+    ;;
+  --study)
+    mode_rc=0
+    qg_study "${@:2}" || mode_rc=$?
     exit "$mode_rc"
     ;;
 esac
@@ -2701,6 +2784,262 @@ CPY
     st_fail "F6b.7: a diff with no mutants built a coverage map anyway, or did not say why cover was off: $(cat "$tmp/mut.out")"
   fi
 
+  # --- F6c (D-F6p): the study of equivalence -------------------------------------------------------------------
+  # `qg_study REF DIR` runs the judge, whole, twice through QG_SELF: once with QG_SELECT=REF and its outcomes kept
+  # in DIR/ref (the verdict of the reference), once with QG_SELECT=cover; it then asks mutants-gate.sh
+  # --compare-classes for the class of every mutant in both, writes DIR/study.tsv and says whether Q2 may be
+  # adopted. The judge is a stand-in with the same contract as the real one: no arguments, its mode in QG_SELECT
+  # and its keep directory in QG_KEEP_OUT; it refuses an unknown mode and a keep directory that is not empty (what
+  # the real one refuses before it mutates anything), keeps DIR/<mode>/outcomes.json or DIR/cover/merged.json
+  # as the real one does, and turns itself into `full` when it is told cover cannot run. The study is called in
+  # the tree of the rows, with its own mutants-gate.sh, and cut by a watchdog if it ever waits.
+  sy="$tmp/study"
+  mkdir -p "$sy/fix"
+  "$py" -I - "$sy/fix" "$cfix/names.txt" <<'SPY'
+import json, os, sys
+fix = sys.argv[1]
+names = [line.rstrip("\n") for line in open(sys.argv[2], encoding="utf-8") if line.strip()]
+assert len(names) == 6, names
+C, M, T, U = "CaughtMutant", "MissedMutant", "Timeout", "Unviable"
+ARGV = ["/usr/bin/cargo", "test", "--verbose", "--package=memory-industry@0.31.0", "--lib"]
+STATUS = "process" + "_status"
+REF_S = [21.5, 20.25, 22.0, 22.5, None, 19.75]
+COVER_S = [1.25, 1.5, 12.0, 3.0, None, 11.5]
+SELECT = [("A1", 2), ("B", 2), ("A0", 0), ("B", 1), ("A1", 1), ("A0", 0)]
+def outcomes(classes, seconds, select):
+    records = []
+    for i, (name, cls) in enumerate(zip(names, classes)):
+        phases = [{"phase": "Build", "duration": 1.0, STATUS: {"Failure": 101} if cls == U else "Success"}]
+        if cls != U:
+            phases.append({"phase": "Test", "duration": 90.0 if cls == T else seconds[i], STATUS: "Timeout" if cls == T else "Success", "argv": ARGV})
+        record = {"scenario": {"Mutant": {"name": name}}, "summary": cls, "log_path": f"log/m{i}.log", "phase_results": phases}
+        if select:
+            record["qg_select"] = {"pass": select[i][0], "subset": select[i][1]}
+        records.append(record)
+    baseline = {"scenario": "Baseline", "summary": "Success", "log_path": "log/baseline.log",
+                "phase_results": [{"phase": "Build", STATUS: "Success"}, {"phase": "Test", STATUS: "Success", "argv": ARGV}]}
+    count = lambda cls: sum(1 for c in classes if c == cls)
+    return {"outcomes": [baseline] + records, "total_mutants": len(records), "caught": count(C), "missed": count(M),
+            "timeout": count(T), "unviable": count(U), "success": 0, "cargo_mutants_version": "27.1.0"}
+GREEN = [C, C, C, C, U, C]
+cases = {
+    "green": (GREEN, GREEN),
+    "red": ([C, C, M, M, U, C], [C, C, M, M, U, C]),
+    "one": (GREEN, [M, C, C, C, U, C]),
+    "swap": ([C, C, M, M, U, C], [M, C, C, M, U, C]),
+    "timeout": ([C, C, C, T, U, C], GREEN),
+}
+for case, (ref, cover) in cases.items():
+    os.makedirs(os.path.join(fix, case), exist_ok=True)
+    json.dump(outcomes(ref, REF_S, None), open(os.path.join(fix, case, "ref.json"), "w", encoding="utf-8"))
+    json.dump(outcomes(cover, COVER_S, SELECT), open(os.path.join(fix, case, "merged.json"), "w", encoding="utf-8"))
+SPY
+  cat > "$sy/judge" <<'SFAKE'
+#!/usr/bin/env bash
+log="${FAKE_STUDY_LOG:?}"
+printf 'judge\t%s\t%s\t%s\t%s\n' "${QG_SELECT:-unset}" "${QG_KEEP_OUT:-unset}" "${QG_BASE:-unset}" "$#" >> "$log"
+mode="${QG_SELECT:-full}"
+case "$mode" in
+  legacy | full | cover) ;;
+  *)
+    echo "FAIL: QG_SELECT=$mode is not a mode of the mutation step (legacy, full or cover)." >&2
+    exit 2
+    ;;
+esac
+keep="${QG_KEEP_OUT:-}"
+if [[ -n "$keep" ]]; then
+  if [[ -n "$(ls -A "$keep" 2>/dev/null || true)" ]]; then
+    echo "FAIL: QG_KEEP_OUT=$keep is not empty; name a new directory so that runs do not mix" >&2
+    exit 2
+  fi
+  mkdir -p "$keep"
+fi
+rc="${FAKE_REF_RC:-0}"
+if [[ "$mode" == cover ]]; then
+  rc="${FAKE_COVER_RC:-0}"
+  if [[ "${FAKE_COVER_OFF:-}" == 1 ]]; then
+    echo "cover: off (1 test fails alone in the map: t_b)"
+    mode=full
+    echo "mode: full"
+    [[ -z "$keep" ]] || { mkdir -p "$keep/full" && cp "$FAKE_REF_OUTCOMES" "$keep/full/outcomes.json" && echo "kept: $keep/full"; }
+  else
+    echo "mode: cover"
+    [[ -z "$keep" ]] || { mkdir -p "$keep/cover" && cp "$FAKE_COVER_MERGED" "$keep/cover/merged.json" && echo "kept: $keep/cover"; }
+  fi
+else
+  echo "mode: $mode"
+  if [[ -n "$keep" && "${FAKE_REF_NO_OUTCOMES:-}" != 1 ]]; then
+    mkdir -p "$keep/$mode" && cp "$FAKE_REF_OUTCOMES" "$keep/$mode/outcomes.json" && echo "kept: $keep/$mode"
+  fi
+fi
+echo "=== fin quality-gate exit=$rc ==="
+exit "$rc"
+SFAKE
+  chmod +x "$sy/judge"
+  sy_log="$tmp/study.judge.log"
+  sy_run() { # [VAR=value]... -- REF DIR: qg_study in the tree of the rows; its exit in $sy_rc, its output in $tmp/study.{out,err}
+    local -a extra=()
+    while [[ "${1:-}" != -- ]]; do extra+=("$1"); shift; done
+    shift
+    local pid dog
+    sy_rc=0
+    rm -f "$sy_log"
+    (
+      ROOT="$q_tree"
+      cd "$q_tree"
+      QG_SELF="$sy/judge"
+      unset QG_SELECT QG_KEEP_OUT
+      export FAKE_STUDY_LOG="$sy_log" QG_BASE=feedface
+      for kv in ${extra[@]+"${extra[@]}"}; do export "${kv?}"; done
+      qg_study "$@"
+    ) >"$tmp/study.out" 2>"$tmp/study.err" </dev/null &
+    pid=$!
+    ( sleep 120; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    dog=$!
+    wait "$pid" || sy_rc=$?
+    kill "$dog" 2>/dev/null || true
+    wait "$dog" 2>/dev/null || true
+  }
+  sy_said() { grep -qF -- "$1" "$tmp/study.out" "$tmp/study.err"; }
+  sy_judged() { grep -c '^judge' "$sy_log" 2>/dev/null || true; }
+  # The columns of one row of study.tsv, by the name of the mutant: ref, cover, pass, k, seconds of test in each.
+  sy_row() { awk -F'\t' -v n="$2" 'NR > 1 && $1 == n {print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7}' "$1/study.tsv"; }
+  sy_fix() { printf 'FAKE_REF_OUTCOMES=%s/fix/%s/ref.json\nFAKE_COVER_MERGED=%s/fix/%s/merged.json\n' "$sy" "$1" "$sy" "$1"; }
+
+  # F6c.1: the same classes. Reference green: the study says Q2 may be adopted and exits 0. A DIR that does not exist is
+  # created; the two runs, the merged classes of the cover run and the table are all in it, and nothing else.
+  sy_d="$tmp/sy-1"
+  rm -rf "$sy_d"
+  mapfile -t sy_env < <(sy_fix green)
+  sy_run "${sy_env[@]}" -- legacy "$sy_d"
+  if (( sy_rc != 0 )) || ! sy_said 'study: 6/6 identical — Q2 may be adopted' || ! sy_said 'study: reference exit 0' || sy_said 'NOT adopted'; then
+    st_fail "F6c.1: two runs with the same six classes and a green reference did not exit 0 with 'study: 6/6 identical — Q2 may be adopted' and 'study: reference exit 0' (exit $sy_rc): $(cat "$tmp/study.out" "$tmp/study.err")"
+  fi
+  if [[ ! -s "$sy_d/ref/legacy/outcomes.json" || ! -s "$sy_d/cover/merged.json" || ! -s "$sy_d/study.tsv" ]] \
+    || [[ "$(ls -A "$sy_d" | LC_ALL=C sort | tr '\n' ' ')" != 'cover ref study.tsv ' ]]; then
+    st_fail "F6c.1: the study did not leave exactly ref/legacy/outcomes.json, cover/merged.json and study.tsv in DIR: $(cd "$sy_d" 2>/dev/null && find . | LC_ALL=C sort | tr '\n' ' ')"
+  fi
+  sy_calls="$(cut -f2-5 "$sy_log" | tr '\t' ' ')"
+  if [[ "$(sy_judged)" != 2 || "$(sed -n 1p "$sy_log" | cut -f2-3)" != "$(printf 'legacy\t%s/ref' "$sy_d")" \
+    || "$(sed -n 2p "$sy_log" | cut -f2)" != cover || "$(sed -n 2p "$sy_log" | cut -f3)" == "$sy_d/ref" || "$(sed -n 2p "$sy_log" | cut -f3)" == "$sy_d" \
+    || "$(cut -f4 "$sy_log" | sort -u | tr '\n' ' ')" != 'feedface ' || "$(cut -f5 "$sy_log" | sort -u | tr '\n' ' ')" != '0 ' ]]; then
+    st_fail "F6c.1: the judge was not run whole (no arguments) twice, the reference first with QG_SELECT=legacy and QG_KEEP_OUT=DIR/ref and then cover into a directory of its own, both with the same QG_BASE: $sy_calls"
+  fi
+  if ! sy_said 'mode: legacy' || ! sy_said 'mode: cover'; then
+    st_fail "F6c.1: the output of the two runs of the judge did not reach the output of the study: $(cat "$tmp/study.out")"
+  fi
+  [[ "$(awk 'NR == 1' "$sy_d/study.tsv")" == "$(printf 'name\tref\tcover\tpass\tk\tref_test_s\tcover_test_s')" && "$(awk 'NR > 1' "$sy_d/study.tsv" | wc -l)" == 6 ]] \
+    || st_fail "F6c.1: study.tsv is not a header (name, ref, cover, pass, k, ref_test_s, cover_test_s) and one row for each of the six mutants: $(cat "$sy_d/study.tsv")"
+  if [[ "$(sy_row "$sy_d" "${c_n[0]}")" != "$(printf 'CaughtMutant\tCaughtMutant\tA1\t2\t21.500\t1.250')" \
+    || "$(sy_row "$sy_d" "${c_n[2]}")" != "$(printf 'CaughtMutant\tCaughtMutant\tA0\t0\t22.000\t12.000')" \
+    || "$(sy_row "$sy_d" "${c_n[4]}")" != "$(printf 'Unviable\tUnviable\tA1\t1\t-\t-')" ]]; then
+    st_fail "F6c.1: study.tsv rows are not the class in each run, the pass and subset of the cover run and the seconds of the test phase with 3 decimals (- when there was no test): m1 '$(sy_row "$sy_d" "${c_n[0]}")' m3 '$(sy_row "$sy_d" "${c_n[2]}")' m5 '$(sy_row "$sy_d" "${c_n[4]}")'"
+  fi
+
+  # The reference can be full, and what the caller exported for the judge does not reach it: QG_SELECT=cover and a
+  # keep directory that is not empty would refuse the run if the study did not set its own.
+  sy_d="$tmp/sy-2"
+  rm -rf "$sy_d" "$tmp/sy-stale"
+  mkdir -p "$sy_d" "$tmp/sy-stale"
+  : > "$tmp/sy-stale/leftover"
+  sy_run "${sy_env[@]}" QG_SELECT=cover QG_KEEP_OUT="$tmp/sy-stale" -- full "$sy_d"
+  if (( sy_rc != 0 )) || ! sy_said 'study: 6/6 identical — Q2 may be adopted' || [[ ! -s "$sy_d/ref/full/outcomes.json" || ! -s "$sy_d/cover/merged.json" ]] \
+    || [[ "$(sed -n 1p "$sy_log" | cut -f2)" != full ]]; then
+    st_fail "F6c.1: '--study full' with QG_SELECT=cover and a QG_KEEP_OUT that is not empty in the environment did not run the reference as full into DIR/ref (exit $sy_rc): $(cat "$tmp/study.out" "$tmp/study.err"; cat "$sy_log")"
+  fi
+
+  # A red reference is a red study, and the study still says what it found: both runs missed m3 and m4, the same.
+  sy_d="$tmp/sy-3"
+  rm -rf "$sy_d"
+  mapfile -t sy_env < <(sy_fix red)
+  sy_run "${sy_env[@]}" FAKE_REF_RC=1 FAKE_COVER_RC=1 -- legacy "$sy_d"
+  if (( sy_rc != 1 )) || ! sy_said 'study: 6/6 identical — Q2 may be adopted' || ! sy_said 'study: reference exit 1' || [[ ! -s "$sy_d/study.tsv" ]]; then
+    st_fail "F6c.1: a red reference (exit 1) with the same classes in the cover run was not exit 1 with 'study: 6/6 identical' and 'study: reference exit 1' (exit $sy_rc): $(cat "$tmp/study.out" "$tmp/study.err")"
+  fi
+
+  # F6c.2: one class that differs. m1 is caught by the reference and missed by cover; the reference is green, and the
+  # study is not: a difference is red whatever the reference said.
+  sy_d="$tmp/sy-4"
+  rm -rf "$sy_d"
+  mapfile -t sy_env < <(sy_fix one)
+  sy_run "${sy_env[@]}" FAKE_COVER_RC=1 -- legacy "$sy_d"
+  if (( sy_rc != 1 )) || ! sy_said 'study: 1 differ — Q2 is NOT adopted' || ! sy_said "class changed for ${c_n[0]}: CaughtMutant -> MissedMutant" || sy_said 'may be adopted'; then
+    st_fail "F6c.2: m1 caught by the reference and missed by cover, with a green reference, was not exit 1 with 'study: 1 differ — Q2 is NOT adopted' and 'class changed for m1: CaughtMutant -> MissedMutant' (exit $sy_rc): $(cat "$tmp/study.out" "$tmp/study.err")"
+  fi
+  if [[ "$(sy_row "$sy_d" "${c_n[0]}" | cut -f1-2)" != "$(printf 'CaughtMutant\tMissedMutant')" ]]; then
+    st_fail "F6c.2: study.tsv was not written with the difference in it (m1: '$(sy_row "$sy_d" "${c_n[0]}")')"
+  fi
+
+  # The totals of both runs are the same here: m1 goes from caught to missed and m3 from missed to caught. A study that
+  # compared the totals would find the two identical.
+  sy_d="$tmp/sy-5"
+  rm -rf "$sy_d"
+  mapfile -t sy_env < <(sy_fix swap)
+  sy_run "${sy_env[@]}" FAKE_REF_RC=1 FAKE_COVER_RC=1 -- legacy "$sy_d"
+  if (( sy_rc != 1 )) || ! sy_said 'study: 2 differ — Q2 is NOT adopted' || ! sy_said "class changed for ${c_n[0]}: CaughtMutant -> MissedMutant" \
+    || ! sy_said "class changed for ${c_n[2]}: MissedMutant -> CaughtMutant" || sy_said 'may be adopted'; then
+    st_fail "F6c.2: a caught that turns missed and a missed that turns caught, with the same totals, was not 'study: 2 differ' naming both (exit $sy_rc): $(cat "$tmp/study.out" "$tmp/study.err")"
+  fi
+
+  # A timeout of the reference that cover catches: the class cargo-mutants writes as "Timeout" counts as one, so this is
+  # one difference and not two (the totals of the reference add up).
+  sy_d="$tmp/sy-6"
+  rm -rf "$sy_d"
+  mapfile -t sy_env < <(sy_fix timeout)
+  sy_run "${sy_env[@]}" FAKE_REF_RC=1 -- legacy "$sy_d"
+  if (( sy_rc != 1 )) || ! sy_said 'study: 1 differ — Q2 is NOT adopted' || ! sy_said "class changed for ${c_n[3]}: Timeout -> CaughtMutant" || sy_said 'may be adopted'; then
+    st_fail "F6c.2: a Timeout of the reference that cover catches was not exactly 'study: 1 differ' with 'class changed for m4: Timeout -> CaughtMutant' (exit $sy_rc): $(cat "$tmp/study.out" "$tmp/study.err")"
+  fi
+
+  # F6c.3: the study does not mix runs. A DIR with anything in it, a REF that is not legacy or full: exit 2 before the
+  # judge runs, and DIR is left as it was.
+  sy_d="$tmp/sy-7"
+  rm -rf "$sy_d"
+  mkdir -p "$sy_d"
+  : > "$sy_d/leftover"
+  mapfile -t sy_env < <(sy_fix green)
+  sy_run "${sy_env[@]}" -- legacy "$sy_d"
+  if (( sy_rc != 2 )) || [[ -e "$sy_log" ]] || ! sy_said 'not empty' || ! sy_said "$sy_d" || [[ "$(ls -A "$sy_d" | tr '\n' ' ')" != 'leftover ' ]]; then
+    st_fail "F6c.3: a DIR with a file in it was not exit 2 naming 'not empty' and DIR before the judge ran, with DIR untouched (exit $sy_rc, judge runs: $(sy_judged)): $(cat "$tmp/study.out" "$tmp/study.err")"
+  fi
+  for sy_ref in otra cover ''; do
+    sy_d="$tmp/sy-8"
+    rm -rf "$sy_d"
+    sy_run "${sy_env[@]}" -- "$sy_ref" "$sy_d"
+    if (( sy_rc != 2 )) || [[ -e "$sy_log" ]] || ! sy_said 'legacy' || ! sy_said 'full' || [[ -e "$sy_d" && -n "$(ls -A "$sy_d")" ]]; then
+      st_fail "F6c.3: '--study ${sy_ref:-<empty>}' was not exit 2 naming legacy and full before the judge ran, with nothing written (exit $sy_rc, judge runs: $(sy_judged)): $(cat "$tmp/study.out" "$tmp/study.err")"
+    fi
+  done
+  # The same through the script, which has to take the mode before its banner and its diff (the copy of the rows of F6b).
+  sy_d="$tmp/sy-9"
+  rm -rf "$sy_d"
+  qg_mode --study otra "$sy_d"
+  if (( rc != 2 )) || ! qg_said 'legacy' || grep -qF '=== quality-gate' "$tmp/mode.out"; then
+    st_fail "F6c.3: 'quality-gate.sh --study otra DIR' did not exit 2 naming legacy before the banner of the judge (exit $rc): $(cat "$tmp/mode.out" "$tmp/mode.err")"
+  fi
+  mkdir -p "$sy_d"
+  : > "$sy_d/leftover"
+  qg_mode --study legacy "$sy_d"
+  if (( rc != 2 )) || ! qg_said 'not empty' || grep -qF '=== quality-gate' "$tmp/mode.out" || [[ "$(ls -A "$sy_d" | tr '\n' ' ')" != 'leftover ' ]]; then
+    st_fail "F6c.3: 'quality-gate.sh --study legacy DIR' with a file in DIR did not exit 2 naming 'not empty' before the banner, with DIR untouched (exit $rc): $(cat "$tmp/mode.out" "$tmp/mode.err")"
+  fi
+
+  # A study that compared nothing says nothing. The reference left no outcomes (the judge was refused, or died): exit 2,
+  # and the three hours of the cover run are not spent; cover turned itself off (it ran as full, and there is no
+  # merged.json): exit 2 as well, never 'identical'.
+  sy_d="$tmp/sy-10"
+  rm -rf "$sy_d"
+  sy_run "${sy_env[@]}" FAKE_REF_RC=2 FAKE_REF_NO_OUTCOMES=1 -- legacy "$sy_d"
+  if (( sy_rc != 2 )) || [[ "$(sy_judged)" != 1 ]] || ! sy_said 'no outcomes.json' || sy_said 'identical' || [[ -e "$sy_d/study.tsv" ]]; then
+    st_fail "F6c.4: a reference that left no outcomes.json was not exit 2 naming it, with the cover run not launched and no study.tsv (exit $sy_rc, judge runs: $(sy_judged)): $(cat "$tmp/study.out" "$tmp/study.err")"
+  fi
+  sy_d="$tmp/sy-11"
+  rm -rf "$sy_d"
+  sy_run "${sy_env[@]}" FAKE_COVER_OFF=1 -- legacy "$sy_d"
+  if (( sy_rc != 2 )) || ! sy_said 'no merged.json' || sy_said 'identical' || sy_said 'may be adopted' || [[ -e "$sy_d/study.tsv" ]]; then
+    st_fail "F6c.4: a cover run that turned itself off (it ran as full: no merged.json) was not exit 2 naming 'no merged.json', with no 'identical' and no study.tsv (exit $sy_rc): $(cat "$tmp/study.out" "$tmp/study.err")"
+  fi
+
   echo "OK  self-test: the CRAP half reports CC violations, only CC violations, and"
   echo "    keys each function by name and ordinal, so moving one does not move its"
   echo "    key and two same-named functions in one file keep two; the ratchet is exact"
@@ -2721,6 +3060,10 @@ CPY
   echo "    it is a verdict; it turns itself off (and the step runs as full) for a test that fails alone, a marker"
   echo "    of cargo-mutants in the tree or a subset that fails without a mutant, and refuses to run (exit 2) with"
   echo "    no cargo-llvm-cov or no llvm-profdata/llvm-cov in the sysroot"
+  echo "    the study runs the judge whole twice (the reference and cover) with a keep directory of its own each, compares"
+  echo "    the class of every mutant (a timeout of the reference included) and not the totals, writes study.tsv, is red"
+  echo "    for a difference whatever the reference said, and refuses (exit 2) a DIR that is not empty, a REF that is not"
+  echo "    legacy or full, a reference that left no outcomes.json and a cover run that left no merged.json"
   exit 0
 fi
 # --- self-test end ---
