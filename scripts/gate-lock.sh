@@ -845,10 +845,10 @@ gate_free_ram_kb() {
   fi
 }
 
-# The jobs cargo gets are min(nproc - 2, the CPUs of the cgroup, free RAM / 2 GiB), at least 1: two cores stay for
-# the rest of the machine (pesado already keeps back 8 of 24, so the 2 come off nproc and not off the cgroup's quota),
-# and 2 GiB a job is what a rustc of this crate holds. The cgroup (gate_cgroup_read) is the tightest of the chain, so a
-# judge in a scope of 8 CPUs on a 24-core machine asks for 8 jobs, not 22.
+# The jobs cargo gets are min(nproc, the CPUs of the cgroup, free RAM / 2 GiB), at least 1 (CI-E7a, D-E7a): the judge that
+# holds the turn uses the whole machine, with no core kept back, and 2 GiB a job is what a rustc of this crate holds. The
+# cgroup (gate_cgroup_read) is the tightest of the chain, so a judge in a scope of 8 CPUs on a 24-core machine asks for 8
+# jobs, not 24.
 # The release build takes min(N, floor(margin GB / 4)), at least 1, with the margin the cgroup leaves
 # (MemAvailable where it sets no memory limit): the 4 GB per job build-gpu.sh used to cap with. The release margin is the
 # cgroup's and not MemAvailable's because pesado's MemoryMax is what kills the build, and that is the limit that holds here.
@@ -886,7 +886,7 @@ gate_cargo_jobs() {
   if [[ -n "$why" ]]; then
     jobs=1
   else
-    jobs=$(( cores - 2 ))
+    jobs="$cores"
     if [[ -n "$cg" ]] && (( cg < jobs )); then jobs="$cg"; fi
     if (( GATE_FREE_RAM_KB / 2097152 < jobs )); then jobs=$(( GATE_FREE_RAM_KB / 2097152 )); fi
     (( jobs >= 1 )) || jobs=1
