@@ -10,7 +10,7 @@ Second judge, chained, not a substitute: `./scripts/quality-gate.sh` (lizard + `
 
 | Step | What it proves |
 |---|---|
-| Postgres at `DATABASE_URL` (no default: the judge's own server, marked `cluster_name=memory-industry-gate`, see [Starting the judge's server](#starting-the-judges-server)) | The cluster that URL names is up before anything mutates, and the gate prints the port that answered. Without `pg_isready` on `PATH`, the container that publishes the port of `DATABASE_URL` is asked, not one picked by name |
+| Postgres at `DATABASE_URL` (no default: the judge's own server, marked `cluster_name=memory-industry-gate`, see [The judge's servers](#the-judges-servers)) | The cluster that URL names is up before anything mutates, and the gate prints the port that answered. Without `pg_isready` on `PATH`, the container that publishes the port of `DATABASE_URL` is asked, not one picked by name |
 | `cargo audit` | Known Rust advisories, judged first: it refreshes the RustSec database itself (at most 120 s, under `timeout 120`); a database it cannot refresh is exit 2, never a skip; then the advisory exceptions (below) are judged against a report of the same database made without ignores |
 | `scripts/advisory-exceptions.sh` | Every advisory the project ignores is in `scripts/advisory-exceptions.txt` with an owner, an expiry at most 180 days ahead and a reason, still matches an advisory of `rust/Cargo.lock`, and is ignored by `rust/.cargo/audit.toml` and `rust/deny.toml`, no more and no less. Red is exit 1, every problem at once; a report it cannot read is exit 2 |
 | `cargo deny` | licenses, bans, sources; advisories are judged by `cargo audit` alone |
@@ -31,7 +31,7 @@ Oracles and fixtures decide green — not an AI opinion.
 
 ## Cargo jobs and the release build
 
-- **Jobs.** `merge-gate.sh` counts the cores once, before its first cargo call: `N` is the CPUs the cgroup this gate runs in allows (`cpu.max` up the chain, read by `gate_cgroup_read`) under `nproc`, and it prints `cargo jobs=N (nproc=…, cgroup cpu=…)`. Every cargo call of the run takes `CARGO_BUILD_JOBS=N`. A `CARGO_BUILD_JOBS` the operator sets is kept, and the line says so. `rust/.cargo/config.toml` keeps `jobs = 3` for the laptop, which the environment overrides on the judge.
+- **Jobs.** `merge-gate.sh` counts the jobs of the machine once, before its first cargo call (`gate_cargo_jobs` in `scripts/gate-lock.sh`): `N = min(nproc, the CPUs of the cgroup, free RAM / 2 GiB)`, at least 1. The cgroup is the tightest of the chain this gate runs in (`cpu.max` up the chain, read by `gate_cgroup_read`), the free RAM is the lower of `MemAvailable` and what that chain leaves, and 2 GiB is what one rustc of this crate holds. No core is kept back: the judge holds the machine's single heavy-work slot, so a core it leaves idle is nobody's. It prints `cargo jobs=N (nproc=…, cgroup cpu=…, ram free=… GiB)` and exports `CARGO_BUILD_JOBS=N`; a row of `scripts/gate-dag.txt` that names its own `CARGO_BUILD_JOBS` gets the lower of that number and `N`. A measure that cannot be read (a cgroup file that is no number, no `MemAvailable`) is one job and a line that says what failed, never a refusal. A `CARGO_BUILD_JOBS` the operator sets is kept, and the line says so. `rust/.cargo/config.toml` keeps `jobs = 3` for the laptop, which the environment overrides on the judge.
 - **Release.** One release compile, `cargo test --release --features docs,cuda --no-run --lib --test v017_rerank_gpu` (the set that `publish.yml` publishes on Linux x64, written out and held equal to it by a contract), takes `min(N, floor(margin GB / 4))` jobs (at least 1), with the margin the cgroup leaves. The gate does not call `scripts/build-gpu.sh`: that script caps its own memory and nests `systemd-run` and `nice` inside the scope that already limits the gate.
 - **B3g.** `cargo build --release --features docs,cuda --bins --message-format=json` must report every unit `fresh`. A unit that compiled again means the binary the E2E would judge is not the one the `--no-run` built, and the gate stops by name.
 - **sha256.** The binary's sha256 is taken after the `--no-run` build and checked after B3g, before the E2E and before the doctor. A change between those steps stops the gate with `sha256 changed`.
@@ -54,7 +54,7 @@ Read this before trusting a green run (copied from the gate banner):
 
 ## The judge's servers
 
-On Linux, with no `DATABASE_URL`, the judge makes its own Postgres for each step, a **lane**, and takes it down when the step ends: `dbg` (`run-all-tests.sh`), `cov` (`crap-gate.sh`) and `mut` (`mutants-gate.sh`); the build without docs (row `DC`) opens none, since it reads no database. Each lane is a directory under `GATE_CLUSTER_ROOT` (by default `/tmp/memory-industry-gate-<uid>`, which is tmpfs), listens on its socket only (`listen_addresses` empty), has `fsync`, `synchronous_commit` and `full_page_writes` off, and is marked `cluster_name=memory-industry-gate-<lane>`. Its log goes to `~/.cache/cuba-gate/clusters/<lane>.log`. A judge that died leaves its lanes behind: the next one sweeps the ones whose owner is gone, after taking the lock, and touches nothing else.
+On Linux, with no `DATABASE_URL`, the judge makes its own Postgres for each row that names a `cluster:` in `scripts/gate-dag.txt`, a **lane**, and takes it down when the row ends: `b1`, `dbg`, `ct`, `d2`, `d3`, `nli`, `b3`, `rel` and `e2e` (the rows that call `run-all-tests.sh`), `cov` (`crap-gate.sh`) and `mut` (`mutants-gate.sh`); the first row (`P`) and the build without docs (row `DC`) open none, since they read no database. Each lane is a directory under `GATE_CLUSTER_ROOT` (by default `/tmp/memory-industry-gate-<uid>`, which is tmpfs), listens on its socket only (`listen_addresses` empty), has `fsync`, `synchronous_commit` and `full_page_writes` off, and is marked `cluster_name=memory-industry-gate-<lane>`. Its log goes to `${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/clusters/<lane>.log` (or under `GATE_CLUSTER_LOGS`). A judge that died leaves its lanes behind: the next one sweeps the ones whose owner is gone, after taking the lock, and touches nothing else.
 
 The versions are written once, in `scripts/gate-cluster.sh`, and this section says the same values:
 
@@ -281,6 +281,16 @@ Replay any log without cargo:
 ./scripts/test-times.sh --self-test
 ```
 
+## Test counts per section and per binary
+
+Every `cargo test` of `run-all-tests.sh` goes through `run_counted`, which counts the tests the call ran (passed + failed over its `test result:` lines, read by `test-times.sh --count`) and holds the number against `scripts/test-section-counts.txt`. A section that ran more or fewer tests than its line says is red: a test that stops being run is the same silence as one that is skipped.
+
+- **Two shapes of line.** A section states either one total, `<section> <tests> <motive>`, or one line per test binary, `<section>/<os>/<binary> <tests> <motive>`, never both. `<os>` is `linux` or `windows`, and a judge reads only the lines of its own system; a section with lines per binary and none for that system is red. `<binary>` is the key of the test times: the file name for `tests/<name>.rs`, and `lib:`, `bin:` or `doc:` plus the crate for the rest.
+- **The pass without `--ignored` is counted per binary**, in three sections: `plain` (the library and the test files that are not contracts of the judge, lane `D1`), `contracts` (the files of `JUDGE_CONTRACTS`, lane `CT`) and `doc` (the doctests, `doc/<os>/doc:memory_industry`, lane `CT`). Every binary of that pass is in exactly one of the three, and a contract holds the file to that: a test file with no line, a line whose file is gone and a file counted twice are red in milliseconds, not at the end of a judge. The `--ignored` and release sections state a total.
+- **Both ways and all at once.** A binary that ran and has no line, a line whose binary did not run and a number that differs are each named, in one run. Every section that runs tests has its line, and every line is a section that runs.
+- **The line of a binary changes in the same commit as its tests**, by what the diff of that commit adds or removes in that binary. A number is never copied from a red run: a difference the diff does not explain is a test lost or gained, not a new number.
+- **`--check-counts`.** `bash scripts/run-all-tests.sh --check-counts SECTION LOG` judges a cargo log that was saved against the lines of a section, with the function the judge itself uses. It opens no database, takes no lock and runs no cargo: 0 green, 1 red, 2 when it cannot read the log.
+
 ## Advisory exceptions
 
 Until 0.31 the project ignored advisories in two lists that did not agree: `rust/.cargo/audit.toml` held four, `rust/deny.toml` one, none had an owner or a date, and one of them (`RUSTSEC-2026-0002`, lru) had matched nothing since lru 0.18.5. Now there is one list, `scripts/advisory-exceptions.txt`, one line per advisory: `<advisory> <owner> <expires> <reason>`.
@@ -289,7 +299,7 @@ Until 0.31 the project ignored advisories in two lists that did not agree: `rust
 - **When it is judged.** Right after `cargo audit`, before `cargo deny`: `cargo audit --json --no-fetch -f rust/Cargo.lock` again, from a temporary directory so that no `audit.toml` applies, gives every advisory the lockfile carries, ignored ones included (0.42 s measured). `scripts/advisory-exceptions.sh --judge <report>` reads it. The exit of that call does not count: without ignores it finds the excepted advisories and exits 1, which is the point. A report that was made with ignores anyway (a `~/.cargo/audit.toml`) is exit 2: every excepted advisory would look unused.
 - **Red, exit 1, all at once:** a line that is malformed or repeated; an expiry in the past (the day of `expires` is still green) or more than 180 days ahead; an advisory the report does not carry, in `vulnerabilities` or in `warnings` (an unmaintained crate counts); an ID that one mirror ignores and the list does not, or the other way round, a crate spec in `deny.toml` included.
 - **Exit 2:** no report, one that is not `cargo audit --json`, a list or a TOML that is missing or does not parse, a Python without `tomllib` (3.11+).
-- **`cargo deny check advisories` by hand** says `advisory-not-detected` for the three current exceptions. cargo-deny resolves features (`sqlx-mysql` is never built) and, with `unmaintained = "workspace"`, does not report unmaintained crates deep in the tree. cargo-audit reads the lockfile and sees them, and it is the judge.
+- **`cargo deny check advisories` by hand** says `advisory-not-detected` for the three current exceptions. cargo-deny resolves features (`sqlx-mysql` and `sqlx-sqlite` are never built) and, with `unmaintained = "workspace"`, does not report unmaintained crates deep in the tree. cargo-audit reads the lockfile and sees them, and it is the judge.
 - **To add one:** the line in the text file with your name, a date and why it does not reach the binary and what ends it; the ID in both TOML files. To renew one, a new date and a reason that says what changed. To drop one, remove it from the three places.
 
     ./scripts/advisory-exceptions.sh --judge <report.json> [--today YYYY-MM-DD]
@@ -311,43 +321,109 @@ E2E asserts `cuba_decreto` query `count >= 1` after record. That used to pass wi
 
 ## Lanes of run-all-tests.sh (CI-F3.3a)
 
-`scripts/run-all-tests.sh` is split into one function per lane: `lane_CL` (fmt and clippy),
-`lane_D1` (throwaway database and the plain tests), `lane_D2` (the `--ignored` tests and the
-admin-role and embedding ones), `lane_NLI`, `lane_D3` (the generative-LLM tests), `lane_B3` (the
-release build and its freshness check), `lane_R` (the reranker contracts) and `lane_E` (the E2E,
-the doctor, the MCP live session and the eval smoke).
+`scripts/run-all-tests.sh` is split into one function per lane: `lane_CL` (fmt and clippy), `lane_B1`
+(`cargo test --no-run`, which builds every test binary of the debug target once, and the debug binary of
+the database), `lane_D1` (the throwaway database and the plain pass: the library and the files of `tests/`
+that are not contracts of the judge), `lane_CT` (the eight contracts of the judge and the doctests),
+`lane_D2` (the `--ignored` tests and the admin-role and embedding ones), `lane_D3` (the generative-LLM
+tests), `lane_NLI`, `lane_B3` (the release build and its freshness check), `lane_R` (the reranker
+contracts) and `lane_E` (the E2E, the doctor, the MCP live session and the eval smoke).
 
-- Without arguments the lanes run in the order of `DAG_LANES` in the script, which is the `idx`
-  order of `scripts/gate-dag.txt`. That is the serial judge, and its output is the same as before
-  the split.
+- Without arguments the lanes run in the order of `DAG_LANES` in the script, which is the `idx` order of
+  `scripts/gate-dag.txt`. That is the serial judge.
 - `scripts/run-all-tests.sh --lane <id>` runs only that lane. Several `--lane` in one call run in the
   order given, in one process and with one database (CI-F3.3b-1). A missing id, or one that is not in
   `DAG_LANES`, anywhere in the list, exits 2 before the lock is taken, before any lane is made and
   before cargo runs.
 - `merge-gate.sh` hands the table to the planner, `scripts/gate-dag.py`, once its preamble has run (the lock,
-  the server check, the sweep, the audit's cheap steps are the first row). The planner runs the nine rows of
-  `scripts/gate-dag.txt` in idx order: `P`, `DBG` (CL, D1, D2, D3), `NLI`, `B3`, `REL` (R), `E2E` (E), `DC` (clippy
-  of the build without docs, no tests), `CV` (crap-gate) and `M` (mutants-gate). Each row is `merge-gate.sh --step <id>`, a
-  process of its own with one cluster, and the work of a row is its `step_<id>()` function in merge-gate.sh.
-  `NLI` is an `exclusive` row: it asserts a clock (`nli_entailment` under 500 ms), so the planner runs nothing
-  next to it. Its tests open no database, but `run-all-tests.sh` runs only against a judge's server, so the row
-  has its own cluster like the others (CI-J12). It shares `T_dbg`, since it runs after `DBG` and alone.
-  Between processes only files cross: `REL` and `E2E` find the release binary of `B3` by its path.
+  the server check, the sweep). The planner runs the thirteen rows of `scripts/gate-dag.txt`:
+
+  | Row | Waits for | What it runs |
+  |---|---|---|
+  | `P` | nothing | the cheap steps: `cargo audit`, the advisory exceptions, `cargo deny`, `cargo fmt --check`, `codigo-muerto`, the npm smoke and the models check |
+  | `B1` | `P` | lanes CL and B1: fmt, `clippy --all-targets`, `cargo test --no-run` and the debug binary of the database. The only row that compiles the debug target |
+  | `DBG` | `B1` | lane D1, the plain pass: the library and the test files that are not contracts of the judge |
+  | `CT` | `B1` | lane CT: the eight contracts of the judge and the doctests; no database, no models |
+  | `D2` | `B1` | lane D2: the `--ignored` sections, the admin-role tests and the embedding model |
+  | `D3` | `B1` | lane D3: the tests that need a generative LLM |
+  | `NLI` | `B1` | lane NLI, alone (`exclusive`) |
+  | `B3` | `P` | lane B3: the release build and its freshness check |
+  | `REL` | `B3` | lane R: the reranker contracts on the release build |
+  | `E2E` | `B3` | lane E: the E2E, the doctor, the MCP live session and the eval smoke |
+  | `DC` | `P` | clippy of the build without docs, no tests |
+  | `CV` | `P` | `crap-gate.sh` |
+  | `M` | `P` | `mutants-gate.sh` |
+
+  Each row is `merge-gate.sh --step <id>`, a process of its own, with a cluster of its own when it names
+  one, and the work of a row is its `step_<id>()` function in merge-gate.sh. Between processes only files
+  cross: the readers of `B1` find its test binaries in their target, and `REL` and `E2E` find the release
+  binary of `B3` by its path.
+- `B1` is the only row that compiles the debug target. `DBG`, `CT`, `D2`, `D3` and `NLI` are its readers
+  (`reader` in the table): each waits for `B1` and for nothing else, has a cluster of its own, and runs
+  `cargo test` over what `B1` built, with one cargo job and exactly the profile tokens of `B1` (the profile is
+  in the hash of every unit, so another one would build the target again). A reader compiles nothing, and
+  the judge holds it to that: a `Compiling` line in the log of a section that counts tests is red (`cargo
+  compiled <unit> in a section that runs tests`), and so is a unit that is not `fresh` when a lane asks cargo
+  for the debug binary to provision its database, before the database is made. A unit compiled again would be
+  written over a binary that the row beside it may be running. Readers do not queue behind cargo's lock
+  either: measured on 2026-11-10 with two `cargo test` over one warm target, the second reached `Running`
+  6.1 s after the first and ended 62 s before it, with no `Blocking waiting for file lock` line.
+- `CT` runs the files of `JUDGE_CONTRACTS` in run-all-tests.sh (`ci_contract`, `gate_dag_contract`,
+  `gate_history_contract`, `gate_usl_contract`, `group_no_server`, `local_gate_contract`,
+  `packaging_contract` and `v047_without_a_database_url_the_judge_reaches_no_default`) and the doctests.
+  They judge the scripts and the files of the tree, and what they need of a server or a planner they make
+  themselves in a throwaway directory: none reads `DATABASE_URL` or calls the helpers that make a database
+  (a contract holds that), and none loads a model. So the row names no `models`, its lane makes no
+  `brain_gate`, and it does not wait behind the rows that load models. It still names a cluster, for the
+  reason `NLI` does. The split is made by name and never with `--skip`: every file of `tests/` runs without
+  `--ignored` in exactly one of `D1` and `CT`.
+- `NLI` is an `exclusive` row: it asserts a clock (`nli_entailment` under 500 ms), so the planner starts it
+  after every row of lower idx and runs nothing next to it. It is a reader of `B1` like the other four. Its
+  tests open no database, but `run-all-tests.sh` runs only against a judge's server, so the row has its own
+  cluster like the others (CI-J12).
+- `E2E` waits for `B3` only (CI-E9). Its lane compiles nothing and reads nothing that a debug row makes: it
+  provisions `brain_gate` in its own cluster with the release binary `B3` left, already held against the
+  sha256 `B3` recorded, so the database is migrated by the binary the E2E judges, and the row can start while
+  `DBG` still runs.
 - A row runs only with the ticket the planner hands it (`CUBA_GATE_LANE_TOKEN`): `--step` checks the ticket
   without spending it, and the lane it starts spends it. Run by hand without one, `--step` exits 2 and takes
-  no lock. A red row stops the planner at its idx; the boundary line `=== end of timed steps ===` is printed
-  by the planner before its first untimed row (CV), and `test-times --judge` reads the log up to it.
+  no lock. The verdict is the serial one in every mode: the red row of lowest idx wins, the rows before it
+  finish and the rows after it are stopped. The boundary line `=== end of timed steps ===` is printed by
+  the planner before its first untimed row (CV), and `test-times --judge` reads the log up to it.
 - `scripts/gate-dag.txt` is the table of the steps: `<idx> <id> <deps> <recursos> <clase> <cpu>
-  <ram_gb> <dur_s> <orden…>`. A test of the contracts reads it and checks its nine rows, their deps and
-  durations, that every row's order is its `--step`, that every `--lane` of a row is a function of
-  run-all-tests.sh, that `DAG_LANES` is those lanes in `idx` order, that the graph has no cycle and that
-  `REL` and `E2E` depend on `B3`, which builds the binary they read.
-- The lanes assume their dependencies have run: `--lane R` and `--lane E` need the release binary of
-  `B3` on disk (they recompute `REL_BIN` and `REL_SHA` from it), and `--lane E` provisions `brain_gate`
-  itself when the database is missing, with the same provision `D1` uses. The DAG scheduler that
-  enforces the order is CI-F3.3c; until then the serial chains are the only ones that run the lanes.
-- `DATABASE_URL` is exported as `GATE_DATABASE_URL` by `lane_D2` and again by `lane_E`, so each
-  lane reaches `brain_gate` on its own.
+  <ram_gb> <dur_s> <orden…>`. It has one reader, the planner (CI-J18): `gate-dag.py run --table <file>` runs
+  it, and `gate-dag.py rows --table <file>` says what `run` would run, a line `row <id> <recursos, or ->
+  <order without its NAME=value>` per row in idx order and a line `overlap <a> <b>` per pair of rows that can
+  be alive together (neither is `exclusive` and neither waits for the other). `gate-audit.sh` asks `rows`
+  and `gate_usl.py` calls the planner's parser, and neither reads the file again. A table that `run` refuses
+  is exit 2 from `rows` too, with the same `FAIL:` line and nothing on stdout.
+- The grammar of a row is checked before anything starts: an idx of `[1-9][0-9]*`; an id and a target of
+  `[A-Za-z0-9_]+`, which end up in paths; a cluster of `C_[a-z0-9]+`, whose lane is its name; a class of
+  `normal`, `exclusive` or `untimed`; `cpu`, `ram_gb` and `dur_s` finite and above 0; and no word that
+  starts with `#` (a comment goes in a line of its own). The order may be preceded by `NAME=value` tokens,
+  the environment of the step. Only the names of `ROW_ENV` in `gate-dag.py` may be written there
+  (`CARGO_BUILD_JOBS`, `CARGO_INCREMENTAL`, `CARGO_PROFILE_DEV_DEBUG`, `CARGO_PROFILE_DEV_STRIP`, the three
+  `CUBA_*_INTRA_THREADS` and `MUTANTS_JOBS`), none with an empty value, and a `*_JOBS` or `*_THREADS` is a
+  whole number above 0. `PLANNER_ENV` (`TMPDIR`, `CARGO_TARGET_DIR`, `CUBA_GATE_LANE_TOKEN`) is what only the
+  planner sets, and a step that would differ from the planner's own environment in any other variable is
+  not started. The table as a whole is judged as well: a cluster belongs to one row, two rows in one target
+  are ordered by their deps unless both are readers, and a reader has above it the row that builds its target.
+- The history of a table is keyed by its rows: the sha256 of the rows with their spaces collapsed, without
+  comments or blank lines, sorted. A comment or another order of the lines keeps the history; a number of a
+  row starts a new one.
+- A test of the contracts reads the table and checks its thirteen rows, their deps and classes, that every
+  starting duration is above 0, that every row's order is its `--step`, that every `--lane` of a row is a
+  function of run-all-tests.sh, that `DAG_LANES` is those lanes in `idx` order, that the graph has no cycle
+  and that `REL` and `E2E` depend on `B3`, which builds the binary they read.
+- The lanes assume their dependencies have run: `--lane D1`, `CT`, `D2`, `D3` and `NLI` run the test
+  binaries `B1` built, and `--lane R` and `--lane E` need the release binary of `B3` on disk (they recompute
+  `REL_BIN` and `REL_SHA` from it). The planner enforces that order through the deps of the table; run by
+  hand, a lane that finds its producer missing fails and names the lane to run first. `brain_gate` is made
+  by `ensure_gate_db` in whichever lane needs it and does not find it: `D2` and `D3` with the debug binary
+  of `B1`, `E` with the release binary of `B3`. In one process (a run with no `--lane`) `D1` makes it and
+  the rest find it.
+- `lane_D2`, `lane_D3` and `lane_E` each export `DATABASE_URL` as `GATE_DATABASE_URL`, the URL of
+  `brain_gate`, so each lane reaches it on its own.
 
 ## Targets per tree and the DAG switch (CI-F3.3c)
 
@@ -355,12 +431,90 @@ the doctor, the MCP live session and the eval smoke).
   `CARGO_TARGET_DIR/<tree key>/<T>`, where the tree key is the name of the tree's directory and 12 hex of
   the sha256 of its realpath. The directory writes that realpath in `.gate-tree`. A target whose
   `.gate-tree` names another tree is refused with exit 2 before cargo runs, and the step does not start.
-- The rows that compile have one target each: `DBG` `T_dbg`, `DC` `T_docs`, `CV` `T_cov`, `M` `T_mut`,
-  `B3` `T_rel`. The release readers `REL` and `E2E` read the `T_rel` that `B3` builds.
+- The rows that compile have one target each: `B1` `T_dbg`, `DC` `T_docs`, `CV` `T_cov`, `M` `T_mut`,
+  `B3` `T_rel`. The readers `DBG`, `CT`, `D2`, `D3` and `NLI` read the `T_dbg` that `B1` builds, and the
+  release readers `REL` and `E2E` the `T_rel` that `B3` builds.
 - A step without a `target:` keeps the `CARGO_TARGET_DIR` of the gate.
-- `GATE_DAG=0` (series, the default) and `GATE_DAG=1` (DAG) read the same table. The switch is the
-  environment of `gate-dag.py`; `merge-gate.sh` does not set it. Changing `scripts/gate-dag.txt`
-  changes its hash, so the planner starts that table in series until the history has a serial run of it.
+- `GATE_DAG` chooses how the planner runs the one table. `0` or `serie` (the default) is the series: the
+  rows in idx order, one at a time. `1`, `maximo` and `auto` are one and the same DAG: a row starts when its
+  deps ended green and the admission below lets it in. The switch is the environment of `gate-dag.py`;
+  `merge-gate.sh` does not set it.
+- A DAG that was asked for still runs in series, and a `note:` line says why, when the scope the gate runs
+  in is not delegated (nothing could be measured or killed per row), when the history has no green serial
+  run of this table (so a table whose rows changed starts in series), when `DATABASE_URL` names a server of
+  the operator (every row would share it, and sqlx drops databases by name), or when the machine could not
+  be measured (then with one job). The run is recorded with the mode that ran.
+- Before the first row the planner measures the machine, with the same count `gate_cargo_jobs` makes, and
+  prints its plan in one line: `plan: nproc=… cgroup_cpu=… ram_free=… GiB disk_free=… GB battery=… jobs=N
+  (gate|operator|failed) asked=<serie|auto|maximo> runs=<serie|dag>`, followed by the reason in
+  parentheses when a DAG that was asked for runs in series and by `failed=<what>` when a measure could not
+  be read. The disk and the battery are only measured: they change no decision.
+- In the DAG a ready row is admitted by what the machine has left (CI-E7a). `C` is `min(nproc, the CPUs of
+  the cgroup)` and `R` is the free RAM less the larger of 4 GiB and 10 %, both from the numbers of the
+  `plan:` line. An `exclusive` row starts alone, after every row of lower idx, and nothing starts beside it;
+  past that, with nobody alive a row always starts. Otherwise it waits, in this order: for `models`, while
+  two rows with models are alive or `MemAvailable` is under 4096 MiB plus its own estimate; for `cpu`, while
+  the cores of the live rows plus its own pass `C`; for `jobs`, while the cargo jobs of the live rows plus
+  its own pass `N`, the jobs of the machine; and for `ram`, while what the live rows hold plus its estimate
+  passes `R`. Ready rows are tried in the order of their critical-path rank.
+- The cores, the memory and the duration of a row are the `cpu`, `ram_gb` and `dur_s` of the table until
+  the history has green serial runs of that table. Then the duration is the median of the last five, and
+  the cores and the memory are the p95 of what those runs used, the memory with a margin of 1.25.
+
+## What a run records (CI-E4)
+
+The planner writes every run to the history, under
+`${CI_TIEMPOS_DIR:-$HOME/.cache/ci-tiempos}/memory-industry/<UTC day>/`: one line per row in `pasos.jsonl`
+and one per run in `corridas.jsonl`. `scripts/gate_history.py` is the only writer and never changes a
+verdict: a history that cannot be written is one `history:` line on stderr.
+
+- When the rows end the planner prints `dag: T=…` (the clock of the run against its lower bounds), then
+  `dag: resources: cpu_s=… cores=… mem_peak=… at_t=… current=… anon=… shmem=… cache=… kernel=… samples=…
+  serie_final=… tail=… serie_share=…`, then one `dag: step <id> seg=… wait=… overlap=… mem_peak=… cpu_s=…
+  cores=…` per row that ran. `n/a` is a number that was not measured.
+- `nucleos`, of a row and of a run, is the mean cores it used: its CPU seconds over its seconds (over `T`
+  for the run). The CPU of a row is its own cgroup's, and the CPU of a run is the sum of its rows', null
+  while one of them is null.
+- `mem_peak` of a run is the `memory.peak` of the scope the gate runs in, read through a descriptor of the
+  planner's own that is zeroed when the planner starts: a peak read by path would be the one since the scope
+  was born, the preamble of the gate included. `mem_peak` of a row is the peak of that row's cgroup.
+- The kernel keeps the mark of the total and not its parts, so `mem_muestra` of a run says what the memory
+  was made of at the highest `memory.current` the planner sampled (at the start, every second, at the end
+  of each row and at the close): `current`, and `anon`, `file`, `shmem` and `kernel` of `memory.stat`, with
+  its time `t` on the clock of the run and the number of samples, `muestras`. `cache` in the printed line is
+  `file` less `shmem`, the page cache that can be reclaimed. What happened between two samples is not known,
+  and the cache another job loaded first is charged to that job and not to this scope.
+- `serie_final_s` is the seconds the run spent with exactly one row alive while another was ready and had
+  not started, plus `serie_cola_s`, the seconds with one row alive after the last row had started (the
+  tail). One row alive while the others wait for their deps is the critical path and does not count.
+  `serie_share` in the line is `serie_final_s` over `T`.
+- What was not measured is written as null, never 0, and every null of a field the planner measures has
+  its reason: `sin_medida`, `{field: reason}`, in the record, and a `note: not measured (<fields>):
+  <reason>` line in the output. A scope that is not delegated is not measured at all: every number of the
+  run is null with that reason.
+
+## Calibrating the jobs of a row (`gate_usl.py`)
+
+`python3 -I scripts/gate_usl.py <order>` fits the Universal Scalability Law to the builds of the judge and
+proposes the `CARGO_BUILD_JOBS` of the rows that compile. It edits nothing: `recomendar` prints a diff of
+`scripts/gate-dag.txt` for the orchestrator to review and commit, because a number of a row is in the key of
+the history.
+
+- `barrido --perfil debug|release` compiles what one row compiles, cold and without incremental, at several
+  `CARGO_BUILD_JOBS`, and writes a point per level and replica to `usl.jsonl` in the history. There are two
+  profiles, one per row that compiles a target the tests run: `debug` is `B1` and `release` is `B3`. The
+  sweep takes the profile tokens and the target of its row from the table: the profile is in the hash of
+  every unit, so without them it would measure another build and leave a second set of artifacts in the
+  judge's target. `CARGO_TARGET_DIR` has to be set, as for the judge. The levels are fractions of the jobs
+  of the machine as the planner counts them. A grid of fewer than five levels, or a machine that is busy
+  (CPU pressure `some avg10` above 15 %), is exit 2 and nothing is run.
+- `ajustar --perfil P` fits the curve to the last sweep of a profile. Exit 3 when the fit is not reliable,
+  with the first criterion that failed.
+- `recomendar` gives the slack of each row and the jobs that a simulation of the DAG likes best, and it says
+  what it assumes, in a line that starts with `supone:` (and `"supone": "dag"` with `--json`): the DAG with
+  the planner's own admission, up to the jobs of the machine, and no contention. In series the clock is the
+  sum of the rows, which it does not calibrate. Exit 3 when a sweep or a cold serial run is missing, with
+  the order that makes it.
 
 ## Publishing
 
@@ -403,6 +557,8 @@ The receipt is a file in your home, not a signature: anyone who can write there 
 Versioned under `.cursor/rules/` (never a junction to `~/.cursor/rules`). Six-pack + TDD + two judges. Comments stay. Plant rules (Playwright, React Query, guardian-planta) are not copied here.
 
 Handoffs: `.cursor/handoffs/*.yml`, validated by `scripts/validar-handoff.sh` — shape, plus the two-pass protocol: `commit` has to exist in the repo and `tests: written|frozen` (required when `commit != none`) is checked by extracting the test regions at that commit and in the tree: the `#[cfg(test)]` regions of a `.rs`, a whole `.rs` under `tests/`, and in a `.sh` the lines between `# --- self-test begin ---` and `# --- self-test end ---`. A gate script whose `--self-test` dispatch sits outside a marked region, or whose markers do not pair, is refused whatever `tests` says. `written` fails when none moved, `frozen` when one did. An optional `paths:` list limits that comparison to the handoff's own slice, so that one agent's honest green pass is not refused for a test another agent edited in the same tree; it is refused empty, with a path that exists neither in the tree nor at `commit`, and with `commit: none`. `scripts/validar-handoff.sh --self-test` runs a fixture against each guard.
+
+Two handoffs are also judged by what their tests cost (CI-E6), after `written` and `frozen` and with no new field. From the specifier to the implementer, `task` or `evidence` names its `.cursor/handoffs/<name>.spec.md`, beside the `.yml`, and that spec carries a cost table with the header `| Escenario | Nivel | Segundos | Carril | Por qué no el barato |` and one row per `Escenario:` of its gherkin blocks, in both directions: the level is `pura`, `guion`, `servicio` or `e2e`, the seconds are a number, the lane is a row of `scripts/gate-dag.txt`, and with a level that is not `pura` the last cell says why the cheap one does not prove it. From the implementer, with `type: git_handoff` and a commit, `evidence: |` carries, each on an indented line of its own, a `segundos: <S> s; <bounded command>[; <its last line>]` per command that ran the new tests (when the line quotes cargo's `finished in Xs`, X has to be S: the number comes from the measured line, not from memory) and, if the slice touches `scripts/`, a `carril: <row id>; comparte: <resources of that row, or nada>`. The handoffs written before the rule pass through `scripts/handoffs-sin-coste.txt`: one line per handoff, `<sha256 of its content without CR> <name> <expiry> <owner> <reason>`. Handoffs are not versioned, so the content is the only identity a historic one keeps, and editing it makes it new. The list is closed (a contract of `local_gate_contract.rs` fixes how many lines it has and their latest expiry), a line past its date exempts nothing, and a malformed line turns red every judgement that reads the list.
 
 ## Weekly audit of the mutation judge (CI-F6, D-F6r)
 
