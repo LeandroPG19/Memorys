@@ -266,6 +266,13 @@ def parse_env(rest: list[str], step_id: str) -> tuple[dict[str, str], list[str]]
     return env, rest
 
 
+def tree_key(tree: str) -> str:
+    """CI-J15a: the key of a tree in the judge's targets: the name of its directory and 12 hex of the sha256 of its realpath,
+    with no line break in what is hashed. `target_dir` builds the path with it and `tree-key` says it, so the audit and
+    the planner ask the one formula. `tree` is already a realpath."""
+    return f"{os.path.basename(tree)}-{hashlib.sha256(tree.encode()).hexdigest()[:12]}"
+
+
 def target_dir(name: str) -> str:
     """CI-F3.3c (D-F3g): the target of a resource is <CARGO_TARGET_DIR>/<tree key>/<name>. The tree key is the name of
     the tree's directory and 12 hex of the sha256 of its realpath, so two trees under one root never share a target.
@@ -274,8 +281,7 @@ def target_dir(name: str) -> str:
     if not root:
         die(f"target {name}: CARGO_TARGET_DIR is not set, so there is no root to put the target under (D-F3g)")
     tree = os.path.realpath(repo_root())
-    key = f"{os.path.basename(tree)}-{hashlib.sha256(tree.encode()).hexdigest()[:12]}"
-    path = os.path.join(root, key, name)
+    path = os.path.join(root, tree_key(tree), name)
     marker = os.path.join(path, ".gate-tree")
     try:
         os.makedirs(path, exist_ok=True)
@@ -1292,9 +1298,17 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--table", required=True)
     run.add_argument("--timed-end", default=None, help="the line printed before the first untimed block (CI-F3.3b-2)")
     commands.add_parser("allowed-env", help="print the closed list of a step's environment, one name per line (CI-J13)")
+    key = commands.add_parser("tree-key", help="print the key of a tree in the judge's targets, <name>-<12 hex> of its realpath (CI-J15a)")
+    key.add_argument("tree")
     args = parser.parse_args(argv)
     if args.command == "allowed-env":
         sys.stdout.write("".join(f"{name}\n" for name in sorted(ALLOWED_ENV)))
+        return 0
+    if args.command == "tree-key":
+        if not os.path.isdir(args.tree):
+            sys.stderr.write(f"FAIL: tree-key: {args.tree} is not a directory, so it has no key\n")
+            return 2
+        sys.stdout.write(f"{tree_key(os.path.realpath(args.tree))}\n")
         return 0
     try:
         return run_table(args.table, args.timed_end)

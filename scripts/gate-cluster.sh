@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SELF="$ROOT/scripts/gate-cluster.sh"
-
 # The judge's own Postgres, one cluster per lane (CI-F2, D-F2b to D-F2h, corrections K1-K10). Sourced by
 # merge-gate.sh and run-all-tests.sh; run on its own it checks the binaries (--check) and its self-test is
 # (--self-test).
@@ -18,16 +15,17 @@ SELF="$ROOT/scripts/gate-cluster.sh"
 #   - The URL of a lane is a socket under GATE_CLUSTER_ROOT on port 5432, never TCP. Every call the library
 #     makes drops the PG* variables of its caller (GATE_PG_ENV_UNSET), so a PGPORT or a PGHOSTADDR cannot
 #     move a lane off its socket.
+# CI-J15d: this library takes no name of its caller: it does not assign ROOT or SELF, and its own path is read from BASH_SOURCE.
 # shellcheck source=scripts/gate-lock.sh
-source "$ROOT/scripts/gate-lock.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/gate-lock.sh"
 
 # --- the judge's Postgres (CI-F2, D-F2b to D-F2h; corrections K1-K10) -------
 # One source for the versions and the settings (D-F2b). PostgreSQL 18.6 and pgvector 0.8.7 are
 # the upstream versions the judge's image ran (Debian 12, PGDG); the host gets the same upstream
 # versions from PGDG, signed by B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8. docs/gate.md says the
 # same numbers, and a contract checks that both files do.
-GATE_PG_MAJOR=18
 GATE_PG_VERSION=18.6
+GATE_PG_MAJOR=${GATE_PG_VERSION%%.*}
 GATE_PGVECTOR_VERSION=0.8.7
 GATE_PG_LOCALE=en_US.utf8
 GATE_PG_TIMEZONE=Etc/UTC
@@ -134,7 +132,7 @@ gate_cluster_check() {
 gate_cluster_url() {
   [[ "${3:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
     || gate_refuse "gate_cluster_url: '${3:-}' is not a variable name, so the URL has no variable to be assigned to."
-  local url="postgresql://cuba:$2@${1//\//%2F}:5432/brain"
+  local url="postgresql://cuba:$2@$(gate_encode_host "$1"):5432/brain"
   printf -v "$3" '%s' "$url"
 }
 
@@ -145,8 +143,8 @@ gate_cluster_url() {
 gate_cluster_up() {
   local lane="$1" dir pw pid t0 t1 t2 deadline ready=0 how
   local -a extra=()
-  [[ "$lane" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
-    || gate_refuse "lane name '$lane' is not [a-z0-9][a-z0-9-]*: a lane is a directory name under the root."
+  [[ "$lane" =~ ^$GATE_LANE_RE$ ]] \
+    || gate_refuse "lane name '$lane' is not $GATE_LANE_RE: a lane is a directory name under the root."
   [[ -n "${GATE_OWNER:-}" ]] \
     || gate_refuse "GATE_OWNER is empty, so no lane can say whose it is. The gate's lock owner must be set before a lane is made."
   gate_cluster_check >/dev/null
@@ -170,7 +168,7 @@ gate_cluster_up() {
   if [[ "$GATE_PG_WAL_LEVEL" == minimal ]]; then extra=(-c max_wal_senders=0); fi
   env "${GATE_PG_ENV_UNSET[@]}" "$GATE_PG_BINDIR/postgres" -D "$dir/data" -k "$dir" \
     -c port=5432 -c listen_addresses= -c unix_socket_permissions=0700 \
-    -c cluster_name="memory-industry-gate-$lane" -c fsync=off -c synchronous_commit=off \
+    -c cluster_name="$GATE_SERVER_MARK-$lane" -c fsync=off -c synchronous_commit=off \
     -c full_page_writes=off -c max_connections=300 -c timezone="$GATE_PG_TIMEZONE" \
     -c log_timezone="$GATE_PG_TIMEZONE" -c lc_messages="$GATE_PG_LOCALE" \
     -c wal_level="$GATE_PG_WAL_LEVEL" ${extra[@]+"${extra[@]}"} \
@@ -245,7 +243,7 @@ gate_cluster_sweep() {
     dir="${dir%/}"
     [[ -d "$dir" ]] || continue
     base="${dir##*/}"
-    if ! [[ "$base" =~ ^([a-z0-9][a-z0-9-]*)\.[A-Za-z0-9]{6}$ ]]; then
+    if ! [[ "$base" =~ ^($GATE_LANE_RE)\.[A-Za-z0-9]{6}$ ]]; then
       echo "note: $dir is not a lane directory (<lane>.XXXXXX): it is left as it is"
       continue
     fi

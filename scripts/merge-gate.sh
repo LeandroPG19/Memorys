@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# CI-J15d (H6): gate-lock.sh assigns GATE_LOCK its own default when it is loaded, so the lock that a step inherited from the
+# gate is read before the load. --step refuses a lock that is not the one its own HOME names.
+GATE_LOCK_INHERITED="${GATE_LOCK:-}"
 
 # One gate at a time, for the whole of this one: run-all-tests.sh is only its
 # first half, and everything after it (clippy and tests under --features docs,
@@ -2039,7 +2042,7 @@ gate_cluster_down_owned() {
   [[ -n "$GATE_OWNER" ]] || return 0
   for dir in "$GATE_CLUSTER_ROOT"/*/; do
     dir="${dir%/}"
-    [[ -d "$dir" && "${dir##*/}" =~ ^[a-z0-9][a-z0-9-]*\.[A-Za-z0-9]{6}$ && -f "$dir/owner" ]] || continue
+    [[ -d "$dir" && "${dir##*/}" =~ ^$GATE_LANE_RE\.[A-Za-z0-9]{6}$ && -f "$dir/owner" ]] || continue
     owner="$(<"$dir/owner")"
     [[ "$owner" == "$GATE_OWNER"* ]] || continue
     pid="$(head -n 1 "$dir/data/postmaster.pid" 2>/dev/null || true)"
@@ -2473,8 +2476,10 @@ step_M() {
 # takes no lock and writes no verdict: its ticket is checked here, and the lane it starts is the one that spends it.
 gate_step_main() {
   local id="$1"
-  [[ -n "${CUBA_GATE_LANE_TOKEN:-}" && -n "${CUBA_GATE_LOCK_OWNER:-}" && -n "${GATE_LOCK:-}" ]] \
+  [[ -n "${CUBA_GATE_LANE_TOKEN:-}" && -n "${CUBA_GATE_LOCK_OWNER:-}" && -n "$GATE_LOCK_INHERITED" ]] \
     || gate_refuse "--step runs one row of scripts/gate-dag.txt, which the planner (gate-dag.py) starts with its lane ticket. Run scripts/merge-gate.sh for the whole gate."
+  [[ "$GATE_LOCK_INHERITED" == "$GATE_LOCK" ]] \
+    || gate_refuse "--step: the GATE_LOCK it inherited ($GATE_LOCK_INHERITED) is not the lock its own HOME names ($GATE_LOCK), so the ticket it holds is not of this gate's lock"
   lane_token_check "$GATE_LOCK" "$CUBA_GATE_LOCK_OWNER" || exit 2
   # CI-F3.3c: GATE_OWNER is a shell variable that acquire_gate_lock sets in gate_main, and a step is a process of its
   # own, so it starts empty. Its value is the record the lock holds now, which lane_token_check has just checked against
@@ -2488,18 +2493,11 @@ gate_step_main() {
   fi
   trap 'gate_cluster_down_all' EXIT
   trap 'exit 2' INT
-  case "$id" in
-    P) step_P ;;
-    DBG) step_DBG ;;
-    NLI) step_NLI ;;
-    B3) step_B3 ;;
-    REL) step_REL ;;
-    E2E) step_E2E ;;
-    DC) step_DC ;;
-    CV) step_CV ;;
-    M) step_M ;;
-    *) gate_refuse "--step: $id is no row of scripts/gate-dag.txt" ;;
-  esac
+  # CI-J15e (H9): the row is the function step_<id>, so a new row is its function and its line of the table, and no list of ids
+  # is kept here. The name is asked of declare -F before it is called: an id that is no function never reaches the call.
+  declare -F "step_$id" >/dev/null \
+    || gate_refuse "--step: $id is no row of scripts/gate-dag.txt: merge-gate.sh has no function step_$id"
+  "step_$id"
 }
 
 # The dispatch: one row of the table, or the whole gate. Bash reads this file from the top, and the rows and gate_main

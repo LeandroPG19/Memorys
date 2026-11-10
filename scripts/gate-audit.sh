@@ -4,7 +4,8 @@
 # Lee trazas de strace de los pasos de test y dice que pares de pasos que el DAG puede
 # solapar tocan lo mismo: rutas, puertos, clusteres de Postgres y la base viva.
 # Modos: --self-test (autotest hermetico), --analyze (solo lee trazas) y --run (lanza
-# los pasos de test bajo strace, en serie, y analiza lo que sale). Sin strace, --run sale 2.
+# merge-gate.sh en serie bajo strace, una sola vez, y analiza lo que sale: las filas de gate-dag.txt las lanza el
+# planificador y el audit las reconoce en la traza por su argv). Sin strace, --run sale 2.
 set -euo pipefail
 
 # --- self-test begin ---
@@ -660,8 +661,10 @@ FAKE
 fi
 # --- self-test end ---
 
-# El puerto vivo sale de gate-lock.sh (D-A11). Va despues del despacho de --self-test: el autotest no lo necesita.
+# El puerto vivo sale de gate-lock.sh (D-A11), y la raiz de los clusteres de gate-cluster.sh (CI-J15a), la misma que lee merge-gate.sh.
+# Van despues del despacho de --self-test: el autotest no lo necesita.
 source "$(dirname "$0")/gate-lock.sh"
+source "$(dirname "$0")/gate-cluster.sh"
 
 # --- analisis (D-A1 a D-A10): trazas de strace -> hallazgos -------------------
 # Lee trazas, nunca conecta a nada (D-A5). El analizador es gawk: el awk de esta
@@ -671,10 +674,9 @@ ga_fail() { echo "FAIL: audit: $*" >&2; exit 2; }
 ga_usage() {
   echo "uso: gate-audit.sh --self-test" >&2
   echo "     gate-audit.sh --analyze <trazas> --roots <f> --steps <f> [--overlap <f>] [--keys <f>] [--pg-tcp-allowed <puerto>]" >&2
-  echo "     gate-audit.sh --run [--step <id>[,<id>...]]" >&2
+  echo "     gate-audit.sh --run" >&2
   exit 2
 }
-ga_in() { local x; for x in "${@:2}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
 GA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 read -r -d '' GA_AWK <<'AWK' || true
@@ -724,14 +726,26 @@ function addev(k, kind, a, b, c, d,   i) {
   ek[k, i] = kind; ea[k, i] = a; eb[k, i] = b; ec[k, i] = c; ed[k, i] = d
   el[k, i] = FILENAME ":" FNR
 }
+function lastres(line,   off, s, at) {
+  # The result of a call: the last `)` followed by spaces and `= `. strace pads the result of a short line to a column
+  # (`vfork()      = 102`) and an argument can hold the same text, so neither the first `) = ` nor a single space will do.
+  at = 0; off = 0; s = line
+  while (match(s, /\) +=( |$)/)) {
+    at = off + RSTART
+    resfrom = off + RSTART + RLENGTH
+    off += RSTART + RLENGTH - 1
+    s = substr(line, off + 1)
+  }
+  return at
+}
 function parse_line(line,   op, cl, name, args, res, toks, nt, i, t, flags, nps, pth, pdt, dtok, rw, isopen, fam, port, bin, argv, i1, i2, child, ok, m) {
   op = index(line, "(")
   if (op == 0) fatal(FILENAME ":" FNR, "not a syscall line: " line)
   name = substr(line, 1, op - 1)
-  cl = index(line, ") = ")
+  cl = lastres(line)
   if (cl == 0) fatal(FILENAME ":" FNR, "a line with no result (cut?): " line)
   args = substr(line, op + 1, cl - op - 1)
-  res = substr(line, cl + 4)
+  res = substr(line, resfrom)
   if (name == "execve") {
     if (res !~ /^0/) return
     if (!match(args, /"[^"]*"/)) fatal(FILENAME ":" FNR, "execve with no path")
@@ -1037,47 +1051,51 @@ ga_propose() { # <informe> <salida>: propuesta de grupos, fuera del fichero vers
     }' "$1" | LC_ALL=C sort > "$2"
 }
 
-ga_run() { # --run: la auditoria de verdad, en serie y con la tabla de gate-dag.txt (D-A7, D-A8)
-  local only="" run="" max used tblines incomplete="" line idx id deps rec cls order ere
-  local tree_key t c arc=0 rc traced part gen
-  local -a ids=() parts=() only_ids=() words=() rows=()
+ga_run() { # --run: la auditoria de verdad: merge-gate.sh en serie bajo strace, una vez; las filas de gate-dag.txt se reconocen en la traza (D-A7, D-A8, CI-J15a)
+  local run max used tblines incomplete="" line idx id deps rec cls order ere key lane t part arc=0 rc=0 gen dag
+  local -a ids=() parts=() words=() dags=() planner_traces=()
   local -A deps_of=() cls_of=()
-  local -A traced_id=([DBG]=1 [NLI]=1 [REL]=1 [E2E]=1 [DC]=1 [CV]=1 [M]=1)
-  while (( $# )); do
-    case "$1" in
-      --step) only="${2:-}"; shift 2 ;;
-      *) ga_usage ;;
-    esac
-  done
+  (( $# == 0 )) || ga_usage
   command -v strace >/dev/null 2>&1 || ga_fail "strace is not installed (command -v strace found nothing). The audit is never skipped: install it (sudo apt install strace) and run it again."
   local sv
   sv="$(strace -V 2>/dev/null | sed -n '1s/.*version \([0-9][0-9.]*\).*/\1/p')"
   [[ -n "$sv" ]] || ga_fail "cannot read the strace version (strace -V)"
   [[ "$(printf '%s\n' 5.3 "$sv" | LC_ALL=C sort -V | head -n1)" == 5.3 ]] || ga_fail "strace $sv is older than 5.3: --seccomp-bpf together with -y needs it"
-  local table="$GA_ROOT/scripts/gate-dag.txt"
+  local table="$GA_ROOT/scripts/gate-dag.txt" gate="$GA_ROOT/scripts/merge-gate.sh"
   [[ -f "$table" ]] || ga_fail "needs scripts/gate-dag.txt (F3.3)"
+  [[ -f "$gate" ]] || ga_fail "needs scripts/merge-gate.sh: the audit runs it, and the planner starts the rows"
   max="${GATE_AUDIT_MAX_GB:-20}"
   [[ "$max" =~ ^[0-9]+$ ]] || ga_fail "GATE_AUDIT_MAX_GB must be a whole number of gigabytes, got $max"
   run="${GATE_AUDIT_RUN:-}"
   [[ -n "$run" ]] || run="$(mktemp -d "${TMPDIR:-/tmp}/memory-industry-audit.XXXXXX")"
   gen="$run/audit/gen"
   mkdir -p "$gen"
-  tree_key="$(basename "$GA_ROOT")-$(realpath "$GA_ROOT" | sha256sum | cut -c1-12)"
+  # La raiz de los targets es la del planificador (CARGO_TARGET_DIR, que merge-gate.sh fija si falta con esta misma funcion) y
+  # la clave del arbol la dice el planificador: una formula (CI-J15a).
+  gate_target_dir_outside_the_tree
+  key="$(python3 -I "$GA_ROOT/scripts/gate-dag.py" tree-key "$GA_ROOT")" || ga_fail "gate-dag.py tree-key could not name the tree $GA_ROOT"
+  [[ -n "$key" ]] || ga_fail "gate-dag.py tree-key printed nothing for $GA_ROOT"
   : > "$gen/steps"; : > "$gen/roots"; : > "$gen/overlap"
   tblines="$(grep -v -e '^#' -e '^[[:space:]]*$' "$table" | LC_ALL=C sort -k1,1n || true)"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
-    rows+=("$line")
     read -r idx id deps rec cls _ _ _ order <<< "$line"
     ids+=("$id"); deps_of[$id]="$deps"; cls_of[$id]="$cls"
-    ere="$(printf '%s' "$order" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g')"
+    # El paso es la orden sin los NAME=value de su entorno: el planificador los pone en el entorno y execve no los ve.
+    read -r -a words <<< "$order"
+    while (( ${#words[@]} > 0 )) && [[ "${words[0]}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do words=("${words[@]:1}"); done
+    (( ${#words[@]} > 0 )) || ga_fail "row $id of gate-dag.txt has no order after its NAME=value tokens"
+    ere="^$(printf '%s' "${words[*]}" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g')\$"
     printf '%s %s %s\n' "$id" "$rec" "$ere" >> "$gen/steps"
-    printf 'run %s %s/tmp/%s\n' "$id" "$run" "$id" >> "$gen/roots"
     IFS=',' read -r -a parts <<< "$rec"
     for part in "${parts[@]}"; do
       case "$part" in
-        target:*) t="${part#target:}"; [[ -z "${GATE_TARGET_ROOT:-}" ]] || printf 'target %s %s/%s/%s\n' "$t" "$GATE_TARGET_ROOT" "$tree_key" "$t" >> "$gen/roots" ;;
-        cluster:*) c="${part#cluster:}"; [[ -z "${GATE_CLUSTER_ROOT:-}" ]] || printf 'cluster %s %s/%s.\n' "$c" "$GATE_CLUSTER_ROOT" "$c" >> "$gen/roots" ;;
+        target:*) t="${part#target:}"; printf 'target %s %s/%s/%s\n' "$t" "$CARGO_TARGET_DIR" "$key" "$t" >> "$gen/roots" ;;
+        cluster:C_*)
+          lane="${part#cluster:C_}"
+          [[ "$lane" =~ ^$GATE_LANE_RE$ ]] || ga_fail "row $id names ${part#cluster:}, and $lane is not a lane name ($GATE_LANE_RE)"
+          printf 'cluster %s %s/%s.\n' "${part#cluster:}" "$GATE_CLUSTER_ROOT" "$lane" >> "$gen/roots" ;;
+        cluster:*) ga_fail "row $id names the cluster ${part#cluster:}, which is not C_<lane>: the lane is read from its name" ;;
       esac
     done
   done <<< "$tblines"
@@ -1091,27 +1109,24 @@ ga_run() { # --run: la auditoria de verdad, en serie y con la tabla de gate-dag.
       printf '%s %s\n' "$a" "$b" >> "$gen/overlap"
     done
   done
-  if [[ -n "$only" ]]; then IFS=',' read -r -a only_ids <<< "$only"; fi
-  for line in "${rows[@]}"; do
-    read -r idx id deps rec cls _ _ _ order <<< "$line"
-    read -r -a words <<< "$order"
-    traced=0
-    if [[ -n "${traced_id[$id]:-}" ]]; then
-      if [[ -z "$only" ]] || ga_in "$id" "${only_ids[@]}"; then traced=1; fi
-    fi
-    mkdir -p "$run/audit/$idx-$id"
-    rc=0
-    if (( traced )); then
-      strace --seccomp-bpf -f -ff -y -qq -e signal=none \
-        -e trace=execve,clone,clone3,fork,vfork,chdir,fchdir,open,openat,creat,mkdir,mkdirat,rename,renameat,renameat2,unlink,unlinkat,link,symlink,bind,connect \
-        -o "$run/audit/$idx-$id/t" -- "${words[@]}" >"$run/audit/$idx-$id.log" 2>&1 || rc=$?
-    else
-      "${words[@]}" >"$run/audit/$idx-$id.log" 2>&1 || rc=$?
-    fi
-    used="$(du -sb "$run/audit" | cut -f1)"
-    (( used <= max * 1073741824 )) || ga_fail "the traces in $run/audit weigh $used bytes, over GATE_AUDIT_MAX_GB=$max; they are kept, not truncated"
-    (( rc == 0 )) || incomplete+="$id exited $rc; "
-  done
+  mkdir -p "$run/audit/gate"
+  # -s 1024: strace corta los argv a 32 caracteres, y el del planificador (rutas de la tabla) y el de una fila no caben; las rutas
+  # de open, mkdir y connect las imprime enteras con cualquier -s.
+  GATE_DAG=0 strace --seccomp-bpf -f -ff -y -qq -s 1024 -e signal=none \
+    -e trace=execve,clone,clone3,fork,vfork,chdir,fchdir,open,openat,creat,mkdir,mkdirat,rename,renameat,renameat2,unlink,unlinkat,link,symlink,bind,connect \
+    -o "$run/audit/gate/t" -- bash "$gate" >"$run/audit/gate.log" 2>&1 || rc=$?
+  used="$(du -sb "$run/audit" | cut -f1)"
+  (( used <= max * 1073741824 )) || ga_fail "the traces in $run/audit weigh $used bytes, over GATE_AUDIT_MAX_GB=$max; they are kept, not truncated"
+  (( rc == 0 )) || incomplete+="merge-gate.sh exited $rc; "
+  # El directorio de corrida del planificador (<TMPDIR>/memory-industry-dag.XXXXXX) es donde cada fila tiene su TMPDIR privado.
+  # Sale de la traza del proceso que corre la tabla de este arbol: los tests del juez corren otros planificadores, con sus tablas.
+  while IFS= read -r line; do planner_traces+=("$line"); done < <(grep -rlF -e "\"run\", \"--table\", \"$table\"" "$run/audit/gate" || true)
+  if (( ${#planner_traces[@]} > 0 )); then
+    while IFS= read -r line; do dags+=("$line"); done < <(grep -hE '^mkdir(at)?\(' "${planner_traces[@]}" | grep -oE '"[^"]*/memory-industry-dag\.[A-Za-z0-9_]+"' | tr -d '"' | LC_ALL=C sort -u || true)
+  fi
+  (( ${#dags[@]} == 1 )) || ga_fail "the audit needs the run directory of the planner (memory-industry-dag.XXXXXX, made by the process that runs $table) and saw ${#dags[@]}: without it no row's private directory can be judged. ${incomplete:+$incomplete}The traces are kept in $run/audit/gate"
+  dag="${dags[0]}"
+  for id in "${ids[@]}"; do printf 'run %s %s/tmp/%s\n' "$id" "$dag" "$id" >> "$gen/roots"; done
   ga_analyze "$run/audit" "$gen/roots" "$gen/steps" "$gen/overlap" "" 0 "$run/audit/report.tsv" || arc=$?
   (( arc != 2 )) || exit 2
   ga_propose "$run/audit/report.tsv" "$run/audit/groups.proposed.txt"
