@@ -19,17 +19,22 @@
 #   down (D-F3l); if it is a src module the lot stops and goes to Leandro, because it would make DBG exclusive.
 # Only nli_entailment prints its measure, so it is the only one with a ratio: the 500 ms limit over the 1199 ms of the
 #   6-nov run under six autotests: 0.42.
+# CI-E24 (10-nov): dag-verde:<n> counts the DAG runs that gave a verdict in which the file ran green with its asserts as they are
+#   now, from the logs of campana-final-20261110-134727 (B1 red in D3, B2 green) and -152701 (B1 red in DBG, B2 green). A run that
+#   was red in another row counts for the files that ran green in it. An assert that changed after a run is not counted by that
+#   run (CI-E18 c648640 for discovery, pair and gate_history_contract; CI-E21 and CI-E15 for scratch_databases_clone_one_template
+#   and gate_dag_contract): those lines stay pendiente, or count only the runs after the change.
 tests/nli_entailment.rs exclusive 0.42 orquestador-0.31 2026-11-06 listón 500 ms; 1199 ms por veredicto con seis autotests encima (6-nov 09:39), 37,7 ms quieta, 104,8 ms en la fila NLI sola (19.ª)
-tests/gate_dag_contract.rs shared pendiente orquestador-0.31 2026-11-30 CI-J14g: una fila sorda a TERM muere por KILL al acabar la gracia (1 s) y el planificador no la espera (tope 12 s); en CT sin medida; se mide en las corridas DAG finales
-tests/gate_history_contract.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en CT sin medida; se mide en las corridas DAG finales
-tests/gate_usl_contract.rs shared pendiente orquestador-0.31 2026-11-30 CI-F5a U18: un cargo colgado se corta en su plazo (1 s) y el barrido no lo espera (tope 30 s); en CT sin medida; se mide en las corridas DAG finales
-tests/scratch_databases_clone_one_template.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
-tests/v025_a_stuck_sync_fails_instead_of_hanging.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
-tests/v029_accounts_over_real_http.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
-tests/v029_auto_host_beacon.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
-tests/v042_health_says_what_degraded.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
-src/bridge/discovery.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
-src/bridge/pair.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
-src/bridge/proxy.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
-src/doctor.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
-src/search/rerank.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+tests/gate_dag_contract.rs shared pendiente orquestador-0.31 2026-11-30 CI-J14g: una fila sorda a TERM muere por KILL al acabar la gracia (1 s) y el planificador no la espera (tope 12 s); verde en CT en 3 corridas DAG del 10-nov (134727 B1 y B2, 152701 B2) pero con el planificador de antes de CI-E15 (02e4023) y 5 tests menos; se cuenta desde las corridas DAG finales
+tests/gate_history_contract.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: su aserto de H8 cambió en CI-E18 (c648640: espera de cerrojo 1.5 s, tope 4 s); verde en CT en 1 sola corrida DAG posterior (152701 B2; en 152701 B1 la fila CT no corrió); las de 134727 son del aserto anterior; se completa con las corridas DAG finales
+tests/gate_usl_contract.rs shared dag-verde:3 orquestador-0.31 2026-11-10 CI-F5a U18: un cargo colgado se corta en su plazo (1 s) y el barrido no lo espera (tope 30 s); verde en la fila CT de 3 corridas DAG del 10-nov (campana-final 134727 B1 y B2, 152701 B2), 32 tests
+tests/scratch_databases_clone_one_template.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: CI-E21 (6ace8a3, 1f77831) le añadió dos tests con asertos de reloj que ninguna corrida DAG ha corrido (las 3 corridas verdes del 10-nov corrieron sus 3 tests de antes); se cuenta desde las corridas DAG finales
+tests/v025_a_stuck_sync_fails_instead_of_hanging.rs shared dag-verde:3 orquestador-0.31 2026-11-10 F3.3c-2 D7: su test #[ignore] corre en la fila D2 y salió ok en 3 corridas DAG del 10-nov (134727 B1 y B2, 152701 B2)
+tests/v029_accounts_over_real_http.rs shared dag-verde:3 orquestador-0.31 2026-11-10 F3.3c-2 D7: verde en la fila DBG de 3 corridas DAG del 10-nov (134727 B1 y B2, 152701 B2), 20 tests
+tests/v029_auto_host_beacon.rs shared dag-verde:3 orquestador-0.31 2026-11-10 F3.3c-2 D7: verde en la fila DBG de 3 corridas DAG del 10-nov (134727 B1 y B2, 152701 B2), 12 tests
+tests/v042_health_says_what_degraded.rs shared dag-verde:3 orquestador-0.31 2026-11-10 F3.3c-2 D7: verde en la fila DBG de 3 corridas DAG del 10-nov (134727 B1 y B2, 152701 B2), 5 tests
+src/bridge/discovery.rs shared dag-verde:2 orquestador-0.31 2026-11-10 F3.3c-2 D7: sus tres asertos de reloj cambiaron en CI-E18 (c648640); verde en la lib de la fila DBG de las 2 corridas DAG posteriores del 10-nov (152701 B1 y B2); las de 134727 son del aserto anterior y no cuentan
+src/bridge/pair.rs shared dag-verde:2 orquestador-0.31 2026-11-10 F3.3c-2 D7: su aserto de reloj cambió en CI-E18 (c648640); verde en la lib de la fila DBG de las 2 corridas DAG posteriores del 10-nov (152701 B1 y B2); las de 134727 son del aserto anterior y no cuentan
+src/bridge/proxy.rs shared dag-verde:4 orquestador-0.31 2026-11-10 F3.3c-2 D7: verde en la lib de la fila DBG de las 4 corridas DAG del 10-nov que dieron veredicto (134727 B1 y B2, 152701 B1 y B2)
+src/doctor.rs shared dag-verde:4 orquestador-0.31 2026-11-10 F3.3c-2 D7: verde en la lib de la fila DBG de las 4 corridas DAG del 10-nov que dieron veredicto (134727 B1 y B2, 152701 B1 y B2)
+src/search/rerank.rs shared dag-verde:4 orquestador-0.31 2026-11-10 F3.3c-2 D7: verde en la lib de la fila DBG de las 4 corridas DAG del 10-nov que dieron veredicto (134727 B1 y B2, 152701 B1 y B2)
