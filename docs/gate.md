@@ -113,6 +113,7 @@ Missing any of these is **FAIL**, never `SKIPPED`:
 - NLI + reranker
 - Generative LLM: `memory-industry llm set …` or `MEMORY_INDUSTRY_LLM_BASE_URL` or authenticated `claude`/`gemini` or MCP sampling
 - `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`, `cargo-audit`
+- `rustup`: `rust-toolchain.toml` at the root pins the compiler (an exact `N.N.N`, never `stable`) with the components and the release targets the gate and `publish.yml` use. Raising the version is one commit that changes `channel`; `rust/tests/local_gate_contract.rs` holds the file to what the scripts and workflows name. Run `rustup toolchain install` from the root once so it installs them.
 - Network to `github.com`: the audit step fetches `https://github.com/RustSec/advisory-db` first. Without it the gate stops with exit 2 in seconds.
 - `timeout` from GNU coreutils (`/usr/bin/timeout` in Git Bash and on Linux), not `C:\Windows\System32\timeout.exe`, which takes `/t` and turns the audit step red
 - `node` on `PATH`, at least the major in `engines.node` of `package.json` (see below)
