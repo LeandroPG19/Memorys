@@ -4439,8 +4439,12 @@ fn the_eval_reads_a_seeded_scratch_database_and_never_the_live_one() {
 /// CI-E1 (D-E1e): a section may instead state one line per test binary,
 /// `<section>/<linux|windows>/<binary> <tests> <motive>`; the section is the part before the
 /// first `/`, and a section states a total or lines per binary, never both.
-const CI_J_COUNTED_SECTIONS: [&str; 10] = [
+/// CI-E11 (D-E11e): the plain pass is three sections, `plain` (the library and the files of tests/ that are not
+/// contracts of the judge), `contracts` (those) and `doc`, each with one line per binary.
+const CI_J_COUNTED_SECTIONS: [&str; 12] = [
     "plain",
+    "contracts",
+    "doc",
     "discovered-ignored",
     "lib-ignored",
     "admin-role",
@@ -4674,79 +4678,414 @@ fn plain_line_differences(
     out
 }
 
-/// CI-E1 (D-E1a, D-E1b): the plain pass is the section `plain`, and it states one line per binary, no total: a
-/// total does not see a binary with 0 tests, nor a -1 in one binary and a +1 in another that cancel. The lines of
-/// `plain/linux/` are exactly the binaries of the tree, in both directions, so a test file added with no line, or a
-/// line whose file is gone, is red here in milliseconds and not at the end of a judge. `plain/windows/` lines, if
-/// there are any, name the same binaries.
-#[test]
-fn the_plain_pass_is_counted_per_binary_and_every_binary_has_its_line() {
-    let expected = plain_pass_binaries();
+/// CI-E11 (D-E11e): the names in `JUDGE_CONTRACTS=(…)` of `suite`, outside its self-test: the files of tests/ that need
+/// no server and run in the row CT, not in the plain pass of the row DBG.
+fn judge_contracts(suite: &str) -> Result<Vec<String>, String> {
+    let code: Vec<&str> = outside_self_test(suite)
+        .into_iter()
+        .map(|(_, line)| line)
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect();
+    let at = code
+        .iter()
+        .position(|line| line.trim_start().starts_with("JUDGE_CONTRACTS=("))
+        .ok_or_else(|| {
+            "run-all-tests.sh has no `JUDGE_CONTRACTS=(…)`: the files of tests/ that are contracts of the judge and run in \
+             the row CT (CI-E11, D-E11e)"
+                .to_string()
+        })?;
+    let mut names = Vec::new();
+    for line in &code[at..] {
+        names.extend(
+            line.replace("JUDGE_CONTRACTS=(", " ")
+                .replace(')', " ")
+                .split_whitespace()
+                .map(String::from),
+        );
+        if line.contains(')') {
+            break;
+        }
+    }
+    if names.is_empty() {
+        return Err("JUDGE_CONTRACTS=(…) of run-all-tests.sh names no file".to_string());
+    }
+    Ok(names)
+}
 
+type PassSections = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
+
+/// CI-E11 (D-E11e): how the binaries of the plain pass (`all`, the E1 set) are shared between the three sections:
+/// the library and the files of tests/ that are not contracts of the judge are `plain`, the contracts are `contracts`
+/// and the doctests are `doc`.
+fn sections_of_the_pass(
+    all: &std::collections::BTreeSet<String>,
+    contracts: &[String],
+) -> PassSections {
+    let doc: std::collections::BTreeSet<String> =
+        ["doc:memory_industry".to_string()].into_iter().collect();
+    let contracts: std::collections::BTreeSet<String> = contracts.iter().cloned().collect();
+    let plain = all
+        .iter()
+        .filter(|key| !contracts.contains(*key) && !doc.contains(*key))
+        .cloned()
+        .collect();
+    PassSections::from([
+        ("plain".to_string(), plain),
+        ("contracts".to_string(), contracts),
+        ("doc".to_string(), doc),
+    ])
+}
+
+/// What is wrong between the lines `declared` (section → binaries with a line) and the plain pass `all` shared out by
+/// JUDGE_CONTRACTS: a contract that is not a file of tests/, a binary with a line in two sections, and, per section, a
+/// binary with no line and a line with no binary. Each one by name.
+fn pass_line_problems(
+    declared: &PassSections,
+    all: &std::collections::BTreeSet<String>,
+    contracts: &[String],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for name in contracts {
+        if name.contains(':') || !all.contains(name) {
+            problems.push(format!(
+                "`{name}` of JUDGE_CONTRACTS is not a file of rust/tests/"
+            ));
+        }
+    }
+    let mut seen: std::collections::BTreeMap<&String, Vec<&String>> =
+        std::collections::BTreeMap::new();
+    for (section, keys) in declared {
+        for key in keys {
+            seen.entry(key).or_default().push(section);
+        }
+    }
+    for (key, sections) in seen.iter().filter(|(_, sections)| sections.len() > 1) {
+        problems.push(format!(
+            "`{key}` has a line in {} sections ({sections:?}): every binary is counted in one",
+            sections.len()
+        ));
+    }
+    let empty = std::collections::BTreeSet::new();
+    for (section, expected) in sections_of_the_pass(all, contracts) {
+        let got = declared.get(&section).unwrap_or(&empty);
+        problems.extend(
+            plain_line_differences(got, &expected)
+                .into_iter()
+                .map(|difference| format!("section {section}: {difference}")),
+        );
+    }
+    problems
+}
+
+/// CI-E11 (D-E11e, E11-3): the plain pass of CI-E1 is three sections (`plain`, `contracts` and `doc`), each with one line
+/// per binary and no total. The lines of the three are exactly the binaries of the pass, each in ONE section: `contracts`
+/// are the files of JUDGE_CONTRACTS and `doc` is the doctests of the library. A test file added with no line, a line whose
+/// file is gone, a file counted twice and a contract that is not a file are red here in milliseconds, and not at the end
+/// of a judge. The lines are not in the file until the orchestrator measures them (E1 and E11 are measured once, after
+/// E11): until then this test is red for `has no line`, by name, and nothing here invents a number.
+#[test]
+fn the_pass_is_counted_per_binary_in_plain_contracts_and_doc_and_every_binary_is_in_one() {
     // The comparison has to be able to fail before a clean answer from it means anything.
-    let tree_with_one_more: std::collections::BTreeSet<String> =
-        ["a", "x"].iter().map(|k| k.to_string()).collect();
-    let lines_with_one_more: std::collections::BTreeSet<String> =
-        ["a", "y"].iter().map(|k| k.to_string()).collect();
-    let fixture = plain_line_differences(&lines_with_one_more, &tree_with_one_more);
+    let set = |keys: &[&str]| -> std::collections::BTreeSet<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    };
+    let all = set(&[
+        "lib:memory_industry",
+        "doc:memory_industry",
+        "a",
+        "c1",
+        "c2",
+    ]);
+    let contracts = ["c1".to_string(), "c2".to_string()];
+    let honest = PassSections::from([
+        ("plain".to_string(), set(&["lib:memory_industry", "a"])),
+        ("contracts".to_string(), set(&["c1", "c2"])),
+        ("doc".to_string(), set(&["doc:memory_industry"])),
+    ]);
     assert!(
-        fixture
+        pass_line_problems(&honest, &all, &contracts).is_empty(),
+        "the partition that is right is refused: {:#?}",
+        pass_line_problems(&honest, &all, &contracts)
+    );
+    let mut twice = honest.clone();
+    twice
+        .get_mut("plain")
+        .expect("plain")
+        .insert("c1".to_string());
+    let mut missing = honest.clone();
+    missing
+        .get_mut("contracts")
+        .expect("contracts")
+        .remove("c2");
+    let mut ghost = honest.clone();
+    ghost
+        .get_mut("doc")
+        .expect("doc")
+        .insert("gone".to_string());
+    let problems = [&twice, &missing, &ghost].map(|d| pass_line_problems(d, &all, &contracts));
+    assert!(
+        problems[0]
             .iter()
-            .any(|d| d.contains("`x`") && d.contains("no line"))
-            && fixture
-                .iter()
-                .any(|d| d.contains("`y`") && d.contains("no such binary")),
-        "the comparison does not name a binary with no line and a line with no binary: {fixture:?}"
+            .any(|p| p.contains("`c1`") && p.contains("2 sections")),
+        "a binary with a line in plain and in contracts is not named: {:#?}",
+        problems[0]
+    );
+    assert!(
+        problems[1]
+            .iter()
+            .any(|p| p.contains("`c2`") && p.contains("no line")),
+        "a contract with no line is not named: {:#?}",
+        problems[1]
+    );
+    assert!(
+        problems[2]
+            .iter()
+            .any(|p| p.contains("`gone`") && p.contains("no such binary")),
+        "a line with no binary is not named: {:#?}",
+        problems[2]
+    );
+    let not_a_file = pass_line_problems(&honest, &all, &["c1".to_string(), "nope".to_string()]);
+    assert!(
+        not_a_file
+            .iter()
+            .any(|p| p.contains("`nope` of JUDGE_CONTRACTS is not a file")),
+        "a contract that is not a file of tests/ is not named: {not_a_file:#?}"
     );
 
+    let all = plain_pass_binaries();
+    let contracts =
+        judge_contracts(&read("scripts/run-all-tests.sh")).unwrap_or_else(|why| panic!("{why}"));
     let file = "scripts/test-section-counts.txt";
-    let text = read(file);
-    let mut linux = std::collections::BTreeSet::new();
-    let mut windows = std::collections::BTreeSet::new();
+    let mut linux = PassSections::new();
+    let mut windows = PassSections::new();
     let mut lib_tests = 0u64;
-    for raw in text.lines() {
+    for raw in read(file).lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let mut fields = line.split_whitespace();
         let id = fields.next().unwrap_or("");
-        assert_ne!(
-            id, "plain",
-            "{file} has a total line for `plain`: the plain pass states one line per binary, \
-             `plain/linux/<binary> <tests> <motive>` (CI-E1)"
+        assert!(
+            !["plain", "contracts", "doc"].contains(&id),
+            "{file} has a total line for `{id}`: the pass states one line per binary, \
+             `<plain|contracts|doc>/linux/<binary> <tests> <motive>` (CI-E1, CI-E11)"
         );
-        if let Some(key) = id.strip_prefix("plain/linux/") {
-            linux.insert(key.to_string());
-            if key == "lib:memory_industry" {
+        let parts: Vec<&str> = id.splitn(3, '/').collect();
+        if let [section, os, key] = parts.as_slice()
+            && ["plain", "contracts", "doc"].contains(section)
+        {
+            let target = if *os == "windows" {
+                &mut windows
+            } else {
+                &mut linux
+            };
+            target
+                .entry(section.to_string())
+                .or_default()
+                .insert(key.to_string());
+            if *os == "linux" && *section == "plain" && *key == "lib:memory_industry" {
                 lib_tests = fields.next().unwrap_or("").parse().unwrap_or(0);
             }
-        } else if let Some(key) = id.strip_prefix("plain/windows/") {
-            windows.insert(key.to_string());
         }
     }
-
-    let problems = plain_line_differences(&linux, &expected);
+    let problems = pass_line_problems(&linux, &all, &contracts);
     assert!(
         problems.is_empty(),
-        "the `plain/linux/` lines of {file} are not the binaries of the plain pass: {problems:#?}"
+        "the `plain/`, `contracts/` and `doc/` lines for linux in {file} are not the binaries of the plain pass, each in \
+         one section: {problems:#?}"
     );
     if !windows.is_empty() {
-        let problems = plain_line_differences(&windows, &expected);
+        let problems = pass_line_problems(&windows, &all, &contracts);
         assert!(
             problems.is_empty(),
-            "the `plain/windows/` lines of {file} are not the binaries of the plain pass: {problems:#?}"
+            "the lines for windows in {file} are not the binaries of the plain pass, each in one section: {problems:#?}"
         );
     }
+    let counted: usize = linux.values().map(|keys| keys.len()).sum();
     assert!(
-        linux.len() >= 100,
-        "{file} has {} `plain/linux/` lines; the plain pass has a hundred binaries or more, so a file \
-         that lost most of them would otherwise pass as the tree it describes",
-        linux.len()
+        counted >= 100,
+        "{file} has {counted} lines for linux in plain, contracts and doc; the plain pass has a hundred binaries or \
+         more, so a file that lost most of them would otherwise pass as the tree it describes"
     );
     assert!(
         lib_tests >= 1000,
         "{file} says `plain/linux/lib:memory_industry` runs {lib_tests} tests; the library runs more than a thousand"
+    );
+}
+
+/// The code of `source` with the comments and the insides of the string and char literals blanked, the same length and
+/// the same lines: what a scan for a call has to read, because a test that writes `common::x()` inside a string (a
+/// fixture of a contract) does not call it.
+fn code_only(source: &str) -> String {
+    let b = source.as_bytes();
+    let mut out = b.to_vec();
+    let blank = |out: &mut [u8], from: usize, to: usize| {
+        for byte in &mut out[from..to.min(b.len())] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let find = |from: usize, needle: &[u8]| -> Option<usize> {
+        b.get(from..)?
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|at| from + at)
+    };
+    let mut i = 0;
+    while i < b.len() {
+        let after_ident = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                let end = find(i, b"\n").unwrap_or(b.len());
+                blank(&mut out, i, end);
+                i = end;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let end = find(i + 2, b"*/").map_or(b.len(), |at| at + 2);
+                blank(&mut out, i, end);
+                i = end;
+            }
+            b'r' if !after_ident && b[i + 1..].iter().find(|c| **c != b'#') == Some(&b'"') => {
+                let hashes = b[i + 1..].iter().take_while(|c| **c == b'#').count();
+                let mut closing = vec![b'"'];
+                closing.extend(std::iter::repeat_n(b'#', hashes));
+                let body = i + 1 + hashes + 1;
+                let end = find(body, &closing).map_or(b.len(), |at| at + closing.len());
+                blank(&mut out, body, end.saturating_sub(closing.len()).max(body));
+                i = end;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                blank(&mut out, i + 1, j);
+                i = j + 1;
+            }
+            b'\'' => {
+                let literal_len = if b.get(i + 1) == Some(&b'\\') {
+                    find(i + 3, b"'").map(|at| at + 1 - i)
+                } else {
+                    let ch = source.get(i + 1..).and_then(|rest| rest.chars().next());
+                    ch.filter(|c| b.get(i + 1 + c.len_utf8()) == Some(&b'\''))
+                        .map(|c| c.len_utf8() + 2)
+                };
+                match literal_len {
+                    Some(len) => {
+                        blank(&mut out, i + 1, i + len - 1);
+                        i += len;
+                    }
+                    None => i += 1,
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// CI-E11 (D-E11e, E11-4): what makes `source`, a file of JUDGE_CONTRACTS, need a server, each one by what it found:
+/// the `// needs-a-server:` line that ci.yml reads, a read of `DATABASE_URL` through `env::var`, and a call into `common`
+/// or to `create_pool`. The row CT opens no database: its cluster has no `brain_gate`.
+fn needs_a_server(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    if source
+        .lines()
+        .any(|line| line.starts_with("// needs-a-server:"))
+    {
+        found.push("a `// needs-a-server:` line".to_string());
+    }
+    let code = code_only(source);
+    for needle in ["common::", "create_pool", "mod common"] {
+        if code.contains(needle) {
+            found.push(format!("`{needle}` in its code"));
+        }
+    }
+    for call in ["env::var(", "env::var_os("] {
+        for (at, _) in code.match_indices(call) {
+            if source[at..].starts_with(&format!("{call}\"DATABASE_URL\")")) {
+                found.push(format!(
+                    "a read of DATABASE_URL (`{call}\"DATABASE_URL\")`)"
+                ));
+            }
+        }
+    }
+    found
+}
+
+/// The source of the contract `name` of tests/ and, if it is a group with a directory of modules next to it
+/// (`group_no_server.rs` and `group_no_server/*.rs`), the modules.
+fn contract_source(name: &str) -> String {
+    let tests = repo_root().join("rust/tests");
+    let mut text = std::fs::read_to_string(tests.join(format!("{name}.rs")))
+        .unwrap_or_else(|e| panic!("rust/tests/{name}.rs: {e}"));
+    if let Ok(entries) = std::fs::read_dir(tests.join(name)) {
+        let mut modules: Vec<_> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .collect();
+        modules.sort();
+        for module in modules {
+            text.push('\n');
+            text.push_str(&std::fs::read_to_string(&module).unwrap_or_default());
+        }
+    }
+    text
+}
+
+/// CI-E11 (D-E11e, E11-4): no contract of the judge needs a server. The scan is judged first on a source that is clean
+/// and on one for each way of needing one, and on a contract that only WRITES those words inside a string (as
+/// ci_contract.rs does in its fixtures), which is not a call.
+#[test]
+fn no_contract_of_the_judge_needs_a_server() {
+    assert!(needs_a_server("#[test]\nfn t() {}\n").is_empty());
+    let marked = needs_a_server("// needs-a-server: it makes a database\nfn t() {}\n");
+    assert!(
+        marked.iter().any(|f| f.contains("needs-a-server")),
+        "the marker that ci.yml reads is not found: {marked:?}"
+    );
+    let common = needs_a_server(
+        "mod common;\nasync fn t() { common::in_a_scratch_database(\"x\").await; }\n",
+    );
+    assert!(
+        common.iter().any(|f| f.contains("common::")),
+        "a call into common is not found: {common:?}"
+    );
+    let pool = needs_a_server("fn t() { let _ = create_pool(\"x\"); }\n");
+    assert!(
+        pool.iter().any(|f| f.contains("create_pool")),
+        "a call to create_pool is not found: {pool:?}"
+    );
+    let env = needs_a_server("fn t() { let _ = std::env::var(\"DATABASE_URL\"); }\n");
+    assert!(
+        env.iter().any(|f| f.contains("DATABASE_URL")),
+        "a read of DATABASE_URL through env::var is not found: {env:?}"
+    );
+    let words_only = needs_a_server(
+        "fn t() {\n    let fixture = \"mod common;\\ncommon::x();\\nenv::var(\\\"DATABASE_URL\\\")\";\n    \
+         // create_pool and common::y() in a comment\n    let c = '\"'; let raw = r#\"create_pool(common::z)\"#;\n}\n",
+    );
+    assert!(
+        words_only.is_empty(),
+        "words inside a string, a comment, a char or a raw string are taken for a call: {words_only:?}"
+    );
+
+    let contracts =
+        judge_contracts(&read("scripts/run-all-tests.sh")).unwrap_or_else(|why| panic!("{why}"));
+    let problems: Vec<String> = contracts
+        .iter()
+        .flat_map(|name| {
+            needs_a_server(&contract_source(name))
+                .into_iter()
+                .map(move |found| format!("{name} needs a server: {found}"))
+        })
+        .collect();
+    assert!(
+        problems.is_empty(),
+        "a contract of JUDGE_CONTRACTS runs in the row CT, which has no brain_gate: {problems:#?}"
     );
 }
 
@@ -6059,13 +6398,14 @@ fn shared_targets(rows: &[(String, String)]) -> Vec<String> {
 
 /// CI-F3.3c (D-F3g): every row that compiles builds in a target of its own, and the rows that read the release binary
 /// read the one a row that compiles built. Two compiling rows in one target would wait on its lock and build over each
-/// other. CI-J15e: the rows that compile are read from the table, not listed here.
+/// other. CI-J15e: the rows that compile are read from the table, not listed here. CI-E11 (D-E11b): the row that compiles
+/// T_dbg is B1; DBG is a reader of it, like CT, D2, D3 and NLI.
 #[test]
 fn each_row_that_compiles_has_a_target_of_its_own_and_the_release_readers_share_b3s() {
     let table = read("scripts/gate-dag.txt");
     let compiling = compiling_rows(&table);
     let ids: Vec<&str> = compiling.iter().map(|(id, _)| id.as_str()).collect();
-    for anchor in ["DBG", "B3", "DC", "CV", "M"] {
+    for anchor in ["B1", "B3", "DC", "CV", "M"] {
         assert!(
             ids.contains(&anchor),
             "row {anchor} builds and the table does not say so: the rows that compile are {ids:?}"
@@ -6384,21 +6724,27 @@ fn merge_gate_answers_the_step_mode_before_its_gate_runs() {
 }
 
 // CI-F3.3b-2 (spec F3.3b-1b, «la tabla»): the rows of the judge, with their order, their dependencies and
-// their starting durations. The order of a row is its step; the dependencies are the spec's (DBG, B3, DC, CV and M
-// wait for P; REL and E2E wait for B3). B1 does not enter the table.
+// their starting durations. The order of a row is its step; the dependencies are the spec's (B1, B3, DC, CV and M
+// wait for P; REL and E2E wait for B3).
+// CI-E11 (D-E11b): B1 compiles T_dbg (fmt, clippy, `cargo test --no-run`, the binary) and DBG, CT, D2, D3 and NLI are its
+// readers, each waiting for B1 and for nothing else; they run the tests of the target B1 built.
 // CI-E9 (D-E9a): E2E waited for B3 and DBG until F3, when its lane provisioned brain_gate with the debug binary of DBG;
 // since D-F34h it provisions with the release binary B3 left, so it waits for B3 only.
 // CI-F3.3c (D-F3l): NLI leaves DBG for its own row, exclusive, after DBG (it needs the target DBG built). Its clock
 // assertion (nli_entailment, < 500 ms) measured 1199 ms under contention. The dur of NLI is not measured yet.
 #[test]
-fn the_step_table_has_the_nine_rows_of_the_judge_with_their_deps_and_durations() {
+fn the_step_table_has_the_thirteen_rows_of_the_judge_with_their_deps_and_durations() {
     // The class of CV and M is `untimed` (CI-F3.3b-2): their output is past the judge's boundary line.
     // CI-J15e (H10): the starting dur_s is not frozen here. It is the planner's first guess for a row with no history, and
     // the numbers move with every measured run; the planner refuses a row whose dur_s is not above 0, and so does this.
     let expected = [
         (10, "P", "-", "normal"),
-        (20, "DBG", "P", "normal"),
-        (25, "NLI", "DBG", "exclusive"),
+        (15, "B1", "P", "normal"),
+        (20, "DBG", "B1", "normal"),
+        (21, "CT", "B1", "normal"),
+        (22, "D2", "B1", "normal"),
+        (23, "D3", "B1", "normal"),
+        (25, "NLI", "B1", "exclusive"),
         (30, "B3", "P", "normal"),
         (40, "REL", "B3", "normal"),
         (50, "E2E", "B3", "normal"),
@@ -6576,9 +6922,10 @@ fn each_row_declares_the_cargo_jobs_and_the_threads_it_asks_for() {
     }
 }
 
-/// CI-F3.3c (D-F3l, V9, V10) and CI-J12: the NLI clock assertion runs in a row of its own, exclusive, after DBG (it needs
-/// DBG's target built), and DBG no longer names it. Its tests open no database, but run-all-tests refuses to run without
-/// the judge's server (gate_require_judge_server), so the row runs in a cluster of its own, as the other rows that call it.
+/// CI-F3.3c (D-F3l, V9, V10) and CI-J12: the NLI clock assertion runs in a row of its own, exclusive, after B1 (it needs
+/// the target B1 built; CI-E11, D-E11b: it used to wait for DBG), and DBG no longer names it. Its tests open no database, but
+/// run-all-tests refuses to run without the judge's server (gate_require_judge_server), so the row runs in a cluster of its
+/// own, as the other rows that call it.
 #[test]
 fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_its_own_cluster() {
     let table = read("scripts/gate-dag.txt");
@@ -6592,8 +6939,8 @@ fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_its_own_cluster()
     let nli = row_of("NLI");
     let tok: Vec<&str> = nli.split_whitespace().collect();
     assert_eq!(
-        tok[2], "DBG",
-        "NLI waits for DBG, which builds its binaries: {nli}"
+        tok[2], "B1",
+        "NLI waits for B1, which builds its binaries (CI-E11): {nli}"
     );
     assert_eq!(
         tok[4], "exclusive",
@@ -6617,11 +6964,155 @@ fn the_nli_clock_assertion_runs_alone_in_an_exclusive_row_with_its_own_cluster()
     let dbg_body = step_body(&gate, "DBG").expect("merge-gate.sh has a step_DBG()");
     assert_eq!(
         lanes_in(&dbg_body),
-        ["CL", "D1", "D2", "D3"].map(String::from).to_vec(),
-        "step_DBG no longer runs the NLI lane: it has its own row"
+        ["D1"].map(String::from).to_vec(),
+        "step_DBG runs the plain pass only (CI-E11): the lint and the build are B1's, the contracts are CT's, the --ignored \
+         sections D2's, the LLM one D3's and NLI has its own row"
     );
     // CI-J15e (H9): there is no `NLI) step_NLI ;;` arm any more: the dispatch is declare -F "step_$id", and the contract
     // of the dispatch (`the_dispatch_of_a_step_is_derived_from_its_function_...`) holds that every row has its function.
+}
+
+/// CI-E11 (D-E11a, D-E11b, E11-1): the row that compiles T_dbg is B1 and not DBG: its step runs the lanes CL (fmt and
+/// clippy) and B1 (`cargo test --no-run` and the binary of the database). DBG, CT, D2, D3 and NLI are readers of that target,
+/// each waiting for B1 and for nothing else, each with a cluster of its own named after its lane, and each step runs its
+/// lane alone.
+#[test]
+fn b1_compiles_t_dbg_and_five_readers_wait_for_it_alone_each_in_a_cluster_of_its_own() {
+    let rows = dag_rows();
+    let gate = read("scripts/merge-gate.sh");
+    let compiling = compiling_rows(&read("scripts/gate-dag.txt"));
+    let of_t_dbg: Vec<&str> = compiling
+        .iter()
+        .filter(|(_, target)| target == "T_dbg")
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert_eq!(
+        of_t_dbg,
+        ["B1"],
+        "the row that compiles T_dbg is B1, not DBG: {compiling:?}"
+    );
+    let row = |id: &str| {
+        rows.iter()
+            .find(|row| row.1 == id)
+            .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"))
+    };
+    let b1 = row("B1");
+    let b1_resources = resources_of(&b1.3);
+    assert!(
+        b1.2 == ["P"]
+            && b1_resources.contains(&"target:T_dbg".to_string())
+            && b1_resources.contains(&"cluster:C_b1".to_string())
+            && !b1_resources.contains(&"reader".to_string()),
+        "B1 waits for P, builds T_dbg and is no reader, in the cluster C_b1: {}",
+        b1.3
+    );
+    for (id, lane, class) in [
+        ("DBG", "dbg", "normal"),
+        ("CT", "ct", "normal"),
+        ("D2", "d2", "normal"),
+        ("D3", "d3", "normal"),
+        ("NLI", "nli", "exclusive"),
+    ] {
+        let (_, _, deps, line) = row(id);
+        let resources = resources_of(line);
+        assert_eq!(
+            deps,
+            &["B1".to_string()],
+            "{id} is a reader of T_dbg and waits for its producer B1 alone: {line}"
+        );
+        assert!(
+            resources.contains(&"target:T_dbg".to_string())
+                && resources.contains(&"reader".to_string())
+                && resources.contains(&format!("cluster:C_{lane}")),
+            "{id} reads T_dbg (reader) in the cluster C_{lane}: {line}"
+        );
+        assert_eq!(row_class(line), class, "the class of {id}: {line}");
+    }
+    for (id, lanes) in [
+        ("B1", vec!["CL", "B1"]),
+        ("DBG", vec!["D1"]),
+        ("CT", vec!["CT"]),
+        ("D2", vec!["D2"]),
+        ("D3", vec!["D3"]),
+        ("NLI", vec!["NLI"]),
+    ] {
+        let body =
+            step_body(&gate, id).unwrap_or_else(|| panic!("merge-gate.sh has no step_{id}()"));
+        assert_eq!(
+            lanes_in(&body),
+            lanes,
+            "step_{id} runs its lanes of run-all-tests.sh and nothing else"
+        );
+    }
+}
+
+/// CI-E11 (D-E11b, E11-12): a reader of T_dbg compiles nothing, so its row names ONE cargo job (a reader that claims more
+/// takes cores from a row that does compile) and the profile of the row that builds its target, token for token (the
+/// profile is in the hash of every unit: another one is a recompilation). A reader with models names the three ORT pools with
+/// the values of the other rows with models.
+#[test]
+fn the_readers_of_t_dbg_name_one_cargo_job_and_the_profile_and_the_pools_of_the_others() {
+    let rows = dag_rows();
+    let line_of = |id: &str| {
+        rows.iter()
+            .find(|row| row.1 == id)
+            .map(|row| row.3.clone())
+            .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"))
+    };
+    let producer = row_env(&line_of("B1"));
+    let profile = [
+        "CARGO_INCREMENTAL",
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_PROFILE_DEV_STRIP",
+    ];
+    let readers: Vec<&(u32, String, Vec<String>, String)> = rows
+        .iter()
+        .filter(|row| {
+            let resources = resources_of(&row.3);
+            resources.iter().any(|r| r == "reader") && resources.iter().any(|r| r == "target:T_dbg")
+        })
+        .collect();
+    assert!(
+        readers.len() >= 5,
+        "the readers of T_dbg are DBG, CT, D2, D3 and NLI: {:?}",
+        readers.iter().map(|row| row.1.as_str()).collect::<Vec<_>>()
+    );
+    let pools = [
+        "CUBA_EMBED_INTRA_THREADS",
+        "CUBA_NLI_INTRA_THREADS",
+        "CUBA_RERANK_INTRA_THREADS",
+    ];
+    let reference = row_env(&line_of("REL"));
+    for (_, id, _, line) in &readers {
+        let env = row_env(line);
+        let jobs = row_value(&env, "CARGO_BUILD_JOBS");
+        assert_eq!(
+            jobs.as_deref(),
+            Some("1"),
+            "reader {id} names CARGO_BUILD_JOBS={}, a reader compiles nothing and claims 1: {line}",
+            jobs.clone().unwrap_or_default()
+        );
+        for name in profile {
+            assert_eq!(
+                row_value(&env, name),
+                row_value(&producer, name),
+                "reader {id} does not name {name} as B1 does: {line}"
+            );
+        }
+        let models = resources_of(line).iter().any(|r| r == "models");
+        for name in pools {
+            let want = if models {
+                row_value(&reference, name)
+            } else {
+                None
+            };
+            assert_eq!(
+                row_value(&env, name),
+                want,
+                "reader {id} (models: {models}) names {name} other than the rows with models do: {line}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -7670,7 +8161,7 @@ fn lanes_naming_test(suite: &str, name: &str) -> Vec<String> {
         .map(|(_, line)| format!("{line}\n"))
         .collect();
     let mut lanes = Vec::new();
-    for lane in ["CL", "D1", "D2", "D3", "NLI", "B3", "R", "E"] {
+    for lane in ["CL", "B1", "D1", "CT", "D2", "D3", "NLI", "B3", "R", "E"] {
         let named = lane_body(&outside, lane).iter().any(|line| {
             !line.trim_start().starts_with('#')
                 && line
@@ -7833,8 +8324,8 @@ fn the_exclusive_check_refuses_what_runs_beside_other_steps() {
     assert!(
         in_dbg
             .iter()
-            .any(|p| p.contains("is exclusive and runs in row DBG (normal)")),
-        "a file that D2 discovers in DBG is not refused as exclusive: {in_dbg:#?}"
+            .any(|p| p.contains("is exclusive and runs in row D2 (normal)")),
+        "a file that D2 discovers in the row D2 is not refused as exclusive: {in_dbg:#?}"
     );
     let module = exclusive_problems("src/doctor.rs", &gate, &suite, "");
     assert!(
@@ -7958,8 +8449,8 @@ fn a_row_declares_a_cluster_exactly_when_its_step_runs_a_lane_in_one() {
 /// D-F34f, D-F34g: the table is what the planner judges before it starts. A row names a target to build in, or reads
 /// the target another row builds (`reader`, which only reads the binary on disk and waits for its producer). Two rows
 /// in one target are ordered by their dependencies unless both read it; a row that is not a reader has a target of its
-/// own; no cluster is shared; and every resource is of a kind the planner knows. REL and E2E read T_rel, B3's; NLI
-/// reads T_dbg, DBG's.
+/// own; no cluster is shared; and every resource is of a kind the planner knows. REL and E2E read T_rel, B3's; DBG, CT, D2,
+/// D3 and NLI read T_dbg, B1's (CI-E11).
 #[test]
 fn the_readers_read_the_target_of_their_producer_and_no_cluster_is_shared() {
     let mut rows = dag_rows();
@@ -8003,10 +8494,18 @@ fn the_readers_read_the_target_of_their_producer_and_no_cluster_is_shared() {
     readers.sort_unstable();
     assert_eq!(
         readers,
-        ["E2E", "NLI", "REL"],
-        "the readers of the table are REL and E2E (T_rel) and NLI (T_dbg), and only them"
+        ["CT", "D2", "D3", "DBG", "E2E", "NLI", "REL"],
+        "the readers of the table are REL and E2E (T_rel) and DBG, CT, D2, D3 and NLI (T_dbg), and only them"
     );
-    for (id, target) in [("REL", "T_rel"), ("E2E", "T_rel"), ("NLI", "T_dbg")] {
+    for (id, target) in [
+        ("REL", "T_rel"),
+        ("E2E", "T_rel"),
+        ("DBG", "T_dbg"),
+        ("CT", "T_dbg"),
+        ("D2", "T_dbg"),
+        ("D3", "T_dbg"),
+        ("NLI", "T_dbg"),
+    ] {
         let (_, _, _, line) = rows
             .iter()
             .find(|row| row.1 == id)
@@ -8045,7 +8544,8 @@ fn the_readers_read_the_target_of_their_producer_and_no_cluster_is_shared() {
 
 /// D-F34h: the E2E lane does not compile. It provisions its database with the release binary B3 left, after checking
 /// it against B3's sha256, and the provision that used to build a debug binary (gate_bin, in the target the readers of
-/// REL hold) is not called from it.
+/// REL hold) is not called from it. CI-E11 (D-E11f): it asks `ensure_gate_db`, which provisions only when the database is
+/// missing, and gives it the release binary.
 #[test]
 fn lane_e_provisions_with_the_release_binary_and_runs_no_cargo() {
     let suite = read("scripts/run-all-tests.sh");
@@ -8066,10 +8566,10 @@ fn lane_e_provisions_with_the_release_binary_and_runs_no_cargo() {
     }
     let provision = code
         .iter()
-        .position(|line| line.contains("provision_gate_db"))
-        .expect("lane_E provisions brain_gate when it is missing");
+        .position(|line| line.contains("ensure_gate_db"))
+        .expect("lane_E provisions brain_gate when it is missing, through ensure_gate_db (CI-E11, D-E11f)");
     assert!(
-        code[provision].contains("provision_gate_db \"$REL_BIN\""),
+        code[provision].contains("ensure_gate_db \"$REL_BIN\""),
         "lane_E provisions without the release binary: {}",
         code[provision]
     );
@@ -8154,9 +8654,7 @@ fn lane_e_reads_of_dbg(suite: &str) -> Vec<String> {
     }
     let lane = function_body(&code, "lane_E");
     let record = lane.iter().position(|line| line.trim() == "b3_record_sha");
-    let provision = lane
-        .iter()
-        .position(|line| line.contains("provision_gate_db"));
+    let provision = lane.iter().position(|line| line.contains("ensure_gate_db"));
     match (record, provision) {
         (None, _) => problems.push("lane_E does not ask for the record of B3".to_string()),
         (Some(record), Some(provision)) if record > provision => {
@@ -8166,7 +8664,7 @@ fn lane_e_reads_of_dbg(suite: &str) -> Vec<String> {
     }
     match provision {
         None => problems.push("lane_E does not provision brain_gate".to_string()),
-        Some(at) if !lane[at].contains("provision_gate_db \"$REL_BIN\"") => problems.push(format!(
+        Some(at) if !lane[at].contains("ensure_gate_db \"$REL_BIN\"") => problems.push(format!(
             "lane_E provisions without the release binary: {}",
             lane[at].trim()
         )),
@@ -8199,11 +8697,7 @@ fn lane_e_reads_nothing_that_dbg_produces_and_refuses_without_the_record_of_b3()
         ),
         (
             "a provision with no binary",
-            suite.replacen(
-                "  provision_gate_db \"$REL_BIN\"\n",
-                "  provision_gate_db\n",
-                1,
-            ),
+            suite.replacen("\nensure_gate_db \"$REL_BIN\"\n", "\nensure_gate_db\n", 1),
             "without the release binary",
         ),
         (
@@ -8262,7 +8756,7 @@ fn the_ort_pools_of_the_rows_are_the_plan_of_production() {
 }
 
 /// CI-J15b. The sabotage of the spec: the ceiling of the reranker at 6 in resources.rs with the table at 8 is red, one
-/// problem per row with models (DBG, NLI and REL), and the control with the real files is clean.
+/// problem per row with models (DBG, D2, NLI and REL; CI-E11 gave D2 its models), and the control with the real files is clean.
 #[test]
 fn the_check_of_the_ort_pools_can_fail() {
     let table = read("scripts/gate-dag.txt");
@@ -8280,8 +8774,8 @@ fn the_check_of_the_ort_pools_can_fail() {
     let problems = pool_problems(&table, &sabotaged);
     assert_eq!(
         problems.len(),
-        3,
-        "the rows with models (DBG, NLI, REL) name a reranker of 8 and the plan says 6: {problems:#?}"
+        4,
+        "the rows with models (DBG, D2, NLI, REL) name a reranker of 8 and the plan says 6: {problems:#?}"
     );
     assert!(
         problems
@@ -8993,8 +9487,9 @@ fn toolchain_k1_finds_a_second_toolchain_file_anywhere_but_in_build_output() {
 
 // --- CI-K4: the profile of the judge in the table, and the DAG that stays off by default --------------------------------
 
-/// CI-K4 (D-K4a, D-K4b): the rows that compile in the `dev` profile (DBG, NLI and DC; `test` inherits from `dev`, so the
-/// tokens are DEV and never TEST) carry exactly `CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0` and
+/// CI-K4 (D-K4a, D-K4b): the rows that compile in the `dev` profile (B1 and DC, and the readers of T_dbg, which name the
+/// profile of the row that builds their target: DBG, CT, D2, D3 and NLI, CI-E11; `test` inherits from `dev`, so the tokens
+/// are DEV and never TEST) carry exactly `CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0` and
 /// `CARGO_PROFILE_DEV_STRIP=symbols`, and no other row carries any `CARGO_INCREMENTAL` or `CARGO_PROFILE_*` token: the
 /// release rows (B3, REL, E2E) already build with no debuginfo and with strip, and CV and M have a seed and an
 /// instrumentation of their own that a profile of the table would move. The table is the one source: merge-gate.sh
@@ -9007,7 +9502,9 @@ fn only_the_rows_that_compile_in_dev_carry_the_profile_of_the_judge() {
         ("CARGO_PROFILE_DEV_STRIP", "symbols"),
     ];
     let rows = dag_rows();
-    for id in ["DBG", "NLI", "DC", "P", "B3", "REL", "E2E", "CV", "M"] {
+    for id in [
+        "B1", "DBG", "CT", "D2", "D3", "NLI", "DC", "P", "B3", "REL", "E2E", "CV", "M",
+    ] {
         assert!(
             rows.iter().any(|row| row.1 == id),
             "gate-dag.txt has no row {id}: the scan would pass over nothing"
@@ -9015,7 +9512,10 @@ fn only_the_rows_that_compile_in_dev_carry_the_profile_of_the_judge() {
     }
     for (_, id, _, line) in &rows {
         let env = row_env(line);
-        let carries = matches!(id.as_str(), "DBG" | "NLI" | "DC");
+        let carries = matches!(
+            id.as_str(),
+            "B1" | "DBG" | "CT" | "D2" | "D3" | "NLI" | "DC"
+        );
         for (name, value) in profile {
             let got = row_value(&env, name);
             if carries {

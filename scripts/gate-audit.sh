@@ -50,18 +50,30 @@ if [[ "${1:-}" == "--self-test" ]]; then
   au_std() { # <d>: roots, steps, overlap y keys de la tabla estandar
     # La forma de scripts/gate-dag.txt: ids, recursos y orden reales (el contrato J13 lo comprueba).
     cat > "$1/roots" <<'ROOTS'
+run B1 /r/run/tmp/B1
 run DBG /r/run/tmp/DBG
+run CT /r/run/tmp/CT
+run D2 /r/run/tmp/D2
+run D3 /r/run/tmp/D3
 run DC /r/run/tmp/DC
 target T_dbg /r/t/T_dbg
 target T_rel /r/t/T_rel
 target T_docs /r/t/T_docs
+cluster C_b1 /tc/b1.Cd34
 cluster C_dbg /tc/dbg.Ab12
+cluster C_ct /tc/ct.Kl12
+cluster C_d2 /tc/d2.Mn34
+cluster C_d3 /tc/d3.Op56
 cluster C_nli /tc/nli.Ef56
 cluster C_rel /tc/rel.Gh78
 cluster C_e2e /tc/e2e.Ij90
 ROOTS
     cat > "$1/steps" <<'STEPS'
-DBG target:T_dbg,cluster:C_dbg,models merge-gate\.sh --step DBG$
+B1 target:T_dbg,cluster:C_b1 merge-gate\.sh --step B1$
+DBG target:T_dbg,cluster:C_dbg,models,reader merge-gate\.sh --step DBG$
+CT target:T_dbg,cluster:C_ct,reader merge-gate\.sh --step CT$
+D2 target:T_dbg,cluster:C_d2,models,reader merge-gate\.sh --step D2$
+D3 target:T_dbg,cluster:C_d3,reader merge-gate\.sh --step D3$
 NLI target:T_dbg,cluster:C_nli,models,reader merge-gate\.sh --step NLI$
 DC target:T_docs merge-gate\.sh --step DC$
 REL target:T_rel,cluster:C_rel,models,reader merge-gate\.sh --step REL$
@@ -69,6 +81,8 @@ E2E target:T_rel,cluster:C_e2e,models,reader merge-gate\.sh --step E2E$
 STEPS
     cat > "$1/overlap" <<'OVERLAP'
 DBG DC
+DBG CT
+D2 D3
 REL E2E
 OVERLAP
     cat > "$1/keys" <<'KEYS'
@@ -230,7 +244,7 @@ FAKE
   row_a0b() { # --run sin GATE_AUDIT_RUN: el informe va bajo TMPDIR y HOME y XDG_CACHE_HOME quedan vacios (ni siquiera la raiz de target por omision se crea)
     local d h x t
     d="$(rd)"; h="$(mktemp -d)"; x="$(mktemp -d)"; t="$(mktemp -d)"
-    au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
+    au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
     env -u GATE_AUDIT_RUN -u CARGO_TARGET_DIR HOME="$h" XDG_CACHE_HOME="$x" TMPDIR="$t" PATH="$d/bin:$PATH" \
@@ -453,7 +467,7 @@ FAKE
   }
 
   row_a11() { # la propuesta de grupos sale en el directorio del informe y el fichero versionado no cambia
-    local d t prop; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    local d t prop; d="$(rd)"; au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal" "60 DC P target:T_docs normal"
     t="$d/tree"; prop="$d/run/audit/groups.proposed.txt"
     au_fake_strace "$d/bin"
     au_fx "$d"
@@ -472,7 +486,7 @@ FAKE
   }
 
   row_a12() { # sin strace no se audita, y se dice; con un strace que dice 5.2 tambien sale 2
-    local d rc=0; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
+    local d rc=0; d="$(rd)"; au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal"
     au_path_sin_strace "$d"
     PATH="$d/nobin" GATE_AUDIT_RUN="$d/run" FAKE_LLEGADA="$d/llegada.txt" \
       "$BASH" "$d/tree/scripts/gate-audit.sh" --run >"$d/out" 2>"$d/err" || rc=$?
@@ -489,7 +503,7 @@ FAKE
   }
 
   row_a13() { # el audit lanza merge-gate.sh UNA vez bajo strace, con GATE_DAG=0 y sin --step: las filas las lanza el planificador; el exit es el de --analyze
-    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "30 B3 P target:T_rel,cluster:C_b3 normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" \
+    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "30 B3 P target:T_rel,cluster:C_b3 normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal" \
       "60 DC P target:T_docs normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
@@ -510,7 +524,7 @@ FAKE
   }
 
   row_a13b() { # un merge-gate que sale distinto de 0 deja la auditoria incompleta: exit 2, el resto se escribe igual
-    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" \
+    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal" \
       "60 DC P target:T_docs normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
@@ -522,7 +536,7 @@ FAKE
   }
 
   row_a13c() { # trazas por encima de GATE_AUDIT_MAX_GB: exit 2 y sin truncar
-    local d rc=0; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
+    local d rc=0; d="$(rd)"; au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
     head -c 1048576 /dev/zero | tr '\0' x > "$d/fx/gate/t.999"
@@ -555,7 +569,7 @@ FAKE
   }
 
   row_a15() { # las filas llevan NAME=value delante y la orden --step: el audit las reconoce por el argv de merge-gate.sh --step <id>
-    local d line; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    local d line; d="$(rd)"; au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal" "60 DC P target:T_docs normal"
     line="$(grep ' DBG ' "$d/tree/scripts/gate-dag.txt")"
     row_has A15 "la fila de la tabla lleva su entorno y su orden" "$line" "CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DBG" || return 1
     au_fake_strace "$d/bin"
@@ -571,7 +585,7 @@ FAKE
   }
 
   row_a16() { # la raiz de un target es <CARGO_TARGET_DIR>/<clave de arbol>/<T>, y la clave sale de gate-dag.py tree-key, la misma formula del planificador
-    local d tt key; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    local d tt key; d="$(rd)"; au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal" "60 DC P target:T_docs normal"
     key="$(au_key "$d/tree")"
     row_want A16 "gate-dag.py tree-key" "$(python3 -I "$d/tree/scripts/gate-dag.py" tree-key "$d/tree" 2>/dev/null || true)" "$key" || return 1
     au_fake_strace "$d/bin"
@@ -586,7 +600,7 @@ FAKE
   }
 
   row_a17() { # el cluster de un carril vive en <GATE_CLUSTER_ROOT>/<carril>.XXXXXX, y el carril sale del nombre del recurso cluster:C_<carril>
-    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "25 NLI DBG target:T_dbg,cluster:C_nli,models,reader exclusive" \
+    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal" "25 NLI B1 target:T_dbg,cluster:C_nli,models,reader exclusive" \
       "60 DC P target:T_docs normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
@@ -599,7 +613,7 @@ FAKE
   }
 
   row_a18() { # el directorio de corrida del planificador sale de la traza: la fila que escribe en el de otra es intrusion, y sin ese directorio no hay auditoria
-    local d e dag; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    local d e dag; d="$(rd)"; au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal" "60 DC P target:T_docs normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
     dag="$d/tmp/memory-industry-dag.Ab12Cd"
@@ -608,7 +622,7 @@ FAKE
     row_want A18 exit "$RC" 1 || return 1
     row_atleast A18 "root-intrusion en la raiz de DBG" "$(au_count "$d/out" root-intrusion "$dag/tmp/DBG/stolen")" 1 || return 1
     row_has A18 "dice de quien" "$(cat "$d/out")" "writes in the run directory of DBG" || return 1
-    e="$(rd)"; au_tree "$e" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    e="$(rd)"; au_tree "$e" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal" "60 DC P target:T_docs normal"
     au_fake_strace "$e/bin"
     au_fx "$e"
     sed -i '/^mkdir(/d' "$e/fx/gate/t.120"
@@ -629,7 +643,7 @@ FAKE
   }
 
   row_a20() { # CI-J18 (J18a.3): una tabla que el planificador rechaza (un comentario al final de una fila) es exit 2 con el FAIL del planificador, y strace no se invoca
-    local d said; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
+    local d said; d="$(rd)"; au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal"
     sed -i '/ DBG /s/$/ # nota/' "$d/tree/scripts/gate-dag.txt"
     au_fake_strace "$d/bin"
     au_fx "$d"
@@ -642,7 +656,7 @@ FAKE
   }
 
   row_a21() { # CI-J18 (J18a.4): los pasos y los solapes del audit son lo que dice `gate-dag.py rows`, no la tabla leida otra vez en bash
-    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
+    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "15 B1 P target:T_dbg,cluster:C_b1 normal" "20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal" "60 DC P target:T_docs normal"
     mv "$d/tree/scripts/gate-dag.py" "$d/tree/scripts/gate-dag-real.py"
     cat > "$d/tree/scripts/gate-dag.py" <<'DAG'
 import os, subprocess, sys

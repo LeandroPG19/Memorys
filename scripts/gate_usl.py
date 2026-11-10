@@ -78,14 +78,15 @@ EMPATE_S = 5.0
 EMPATE_REL = 0.01
 BORDE = 1 - 1e-9
 
-# Mapa fijo perfil -> fila (spec 3). The orders are the compilations of that row in run-all-tests.sh, in
+# Mapa fijo perfil -> fila (spec 3). CI-E11 (D-E11i): the debug profile is B1, the row that compiles T_dbg; DBG, CT, D2, D3 and NLI
+# read what B1 built and compile nothing. The orders are the compilations of that row in run-all-tests.sh, in
 # its order (D-F5f); `cargo test --no-run` is the compile-only form of the judge's `cargo test`. There is no
 # profile of the E2E row: since CI-F3.4 it is a reader that runs the release binary B3 built and compiles
 # nothing, and the release binary is compiled by B3, which `release` measures. `fracciones` are the (numerator,
 # denominator) of J_m that the sweep measures (D-E7j): with 24 jobs they are the grids that the first sweeps used.
 PERFILES: dict[str, dict[str, Any]] = {
     "debug": {
-        "fila": "DBG",
+        "fila": "B1",
         "ordenes": [
             ["clippy", "--all-targets", "--", "-D", "warnings"],
             ["build", "--bin", "memory-industry"],
@@ -574,7 +575,7 @@ def cmd_barrido(args: argparse.Namespace) -> int:
     cores = dag.capacities(medida)[0]
     # The profile of the row is in the hash of every unit (D-K4f): without its tokens the sweep would measure another build
     # and leave a second set of artifacts in the target of the judge.
-    # CARGO_INCREMENTAL=0 stays a literal: DBG, NLI and DC carry it in their rows, B3 and REL (release) do not, and the sweep of
+    # CARGO_INCREMENTAL=0 stays a literal: B1, the readers of T_dbg and DC carry it in their rows, B3 and REL (release) do not, and the sweep of
     # release has always built with it (CI-K10, H5).
     base = {**os.environ, **dag.profile_of(fila), "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": destino}
     barrido = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}"

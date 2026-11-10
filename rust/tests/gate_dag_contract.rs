@@ -5078,20 +5078,25 @@ fn e2e_starts_when_b3_ends_while_dbg_still_runs_and_after_dbg_with_the_old_depen
 }
 
 /// The critical path of the real table with the durations of the 19th run (8-nov-2026, 220355b), the `seg` of its rows in
-/// `ci-tiempos/memory-industry/20261108/pasos.jsonl`: P 4.201, DBG 391.036, NLI 37.508, B3 1.693 (a warm build), REL 102.530,
-/// E2E 180.680, DC 224.391, CV 68.583, M 146.363. By hand, the chains of the table now:
-///   P -> DBG -> NLI  = 4.201 + 391.036 + 37.508  = 432.745
-///   P -> B3 -> E2E   = 4.201 +   1.693 + 180.680 = 186.574   (391.055 with the cold B3 of 206.174 that gate_usl_contract uses)
-///   P -> B3 -> REL   = 4.201 +   1.693 + 102.530 = 108.424
+/// `ci-tiempos/memory-industry/20261108/pasos.jsonl`: P 4.201, DBG 391.036 (its two halves, before CI-E11: the plain pass
+/// 164.87 and the rest), NLI 37.508, B3 1.693 (a warm build), REL 102.530, E2E 180.680, DC 224.391, CV 68.583, M 146.363;
+/// and, for the rows CI-E11 made, the figures of its spec (ci-rapido-E11.spec.md, §3): B1 5 (warm), CT 83.3 (the contracts),
+/// D2 111 (107.86 and its provision) and D3 93 (30.1 and the probe of `claude -p`). By hand, the chains of the table now:
 ///   P -> DC          = 4.201 + 224.391           = 228.592
-/// and the one it had with E2E behind DBG: P -> DBG -> E2E = 4.201 + 391.036 + 180.680 = 575.917 (the `LB_run` that run saved).
-/// So the path is P, DBG, NLI and its length is 432.745; DBG's own rank is DBG + NLI = 428.544, and E2E is a sink (180.680).
+///   P -> B3 -> E2E   = 4.201 +   1.693 + 180.680 = 186.574   (391.055 with the cold B3 of 206.174 that gate_usl_contract uses)
+///   P -> B1 -> DBG   = 4.201 +   5.000 + 164.870 = 174.071
+///   P -> B1 -> D2    = 4.201 +   5.000 + 111.000 = 120.201
+///   P -> B1 -> D3    = 102.201; P -> B1 -> CT = 92.501; P -> B1 -> NLI = 46.709
+/// With E11 the chain of 432.745 that went through DBG and NLI is gone (the spec's §3 stops at P -> B3 -> E2E and leaves DC
+/// out, which the 19th run says is longer, 228.592): the path is P, DC; with the cold B3 it is P, B3, E2E (391.055). B1 ranks
+/// itself plus the longest reader behind it (5 + 164.87 = 169.87), DBG ranks its own 164.87 (nothing waits behind it any more,
+/// NLI waits for B1), and E2E is a sink (180.680).
 const BODY_CRITICAL_PATH_19: &str = r#"
 steps = dag.parse_table(os.path.join(sys.argv[1], "gate-dag.txt"))
 
 def critical(b3):
-    dur = {"P": 4.201, "DBG": 391.036, "NLI": 37.508, "B3": b3, "REL": 102.530, "E2E": 180.680,
-           "DC": 224.391, "CV": 68.583, "M": 146.363}
+    dur = {"P": 4.201, "B1": 5.0, "DBG": 164.87, "CT": 83.3, "D2": 111.0, "D3": 93.0, "NLI": 37.508, "B3": b3,
+           "REL": 102.530, "E2E": 180.680, "DC": 224.391, "CV": 68.583, "M": 146.363}
     rank, nxt = dag.ranks(steps, dur)
     cur = max(steps, key=lambda s: rank[s.id])
     length, path = rank[cur.id], []
@@ -5100,20 +5105,29 @@ def critical(b3):
         cur = nxt[cur.id]
     return path, length, rank
 
-for b3 in (1.693, 206.174):
-    path, length, rank = critical(b3)
-    assert path == ["P", "DBG", "NLI"], f"the critical path with B3 {b3} is {path}, not P, DBG, NLI"
-    assert abs(length - 432.745) < 1e-6, f"its length with B3 {b3} is {length}, not 4.201 + 391.036 + 37.508 = 432.745"
-    assert abs(rank["DBG"] - 428.544) < 1e-6, f"DBG ranks {rank['DBG']}, not 391.036 + 37.508: something waits behind it"
-    assert abs(rank["E2E"] - 180.680) < 1e-6, f"E2E ranks {rank['E2E']}, not its own 180.680: something waits behind it"
-print("critical path P>DBG>NLI 432.745")
+path, length, rank = critical(1.693)
+assert path == ["P", "DC"], f"the critical path with a warm B3 is {path}, not P, DC"
+assert abs(length - 228.592) < 1e-6, f"its length is {length}, not 4.201 + 224.391 = 228.592"
+assert abs(rank["B1"] - 169.87) < 1e-6, f"B1 ranks {rank['B1']}, not 5 + 164.87: the longest reader behind it is DBG"
+assert abs(rank["DBG"] - 164.87) < 1e-6, f"DBG ranks {rank['DBG']}, not its own 164.87: something waits behind it"
+assert abs(rank["E2E"] - 180.680) < 1e-6, f"E2E ranks {rank['E2E']}, not its own 180.680: something waits behind it"
+
+path, length, rank = critical(206.174)
+assert path == ["P", "B3", "E2E"], f"the critical path with a cold B3 is {path}, not P, B3, E2E"
+assert abs(length - 391.055) < 1e-6, f"its length is {length}, not 4.201 + 206.174 + 180.680 = 391.055"
+print("critical path P>DC 228.592; cold B3 P>B3>E2E 391.055")
 "#;
 
-/// CI-E9 (D-E9a, S-E9-1): in the real table the critical path is P, DBG, NLI, and E2E is no longer behind DBG.
+/// CI-E9 (D-E9a, S-E9-1) and CI-E11 (D-E11b): in the real table E2E is no longer behind DBG and DBG is no longer behind a
+/// 391 s chain: with the readers of T_dbg beside each other the critical path of the 19th run is P, DC (and P, B3, E2E with a
+/// cold B3), and it no longer goes through DBG or NLI.
 #[test]
-fn the_critical_path_of_the_real_table_with_the_19th_run_is_p_dbg_nli() {
+fn the_critical_path_of_the_real_table_with_the_19th_run_is_p_dc_and_no_longer_goes_through_dbg() {
     let out = property_of(BODY_CRITICAL_PATH_19);
-    assert!(out.contains("critical path P>DBG>NLI 432.745"), "{out}");
+    assert!(
+        out.contains("critical path P>DC 228.592; cold B3 P>B3>E2E 391.055"),
+        "{out}"
+    );
 }
 
 // --- CI-J18: the table has one reader, and it refuses what it does not understand -------------------------------------

@@ -9,7 +9,9 @@
 # untimed (CI-F3.3b-2): the row schedules as normal, but its output is past the boundary line the judge of the test
 # times reads up to (the planner prints the line before the first untimed block): only CV and M are untimed.
 # criterio de cpu y ram: the most cpu and ram that the lanes of a row ask for in merge-gate.sh (cpu of the heaviest
-# lane of its chain, from the table before CI-F3.3b-2; P, DC, CV and M take the figures of the steps they run).
+# lane of its chain, from the table before CI-F3.3b-2; P, DC, CV and M take the figures of the steps they run). A reader of
+# T_dbg compiles nothing (CI-E11, D-E11b): its cargo jobs are 1 and its cpu is its widest ORT pool, or, with none, what its
+# tests use (CT runs its tests on 4 threads; D3 waits for a model server over the network, so 1).
 # dur_s: the starting duration of a row without history (ci-rapido-F3.spec.md, F3.3b-1b-ii); with history the planner
 # takes the median of its last runs.
 # The order of a row is its step: `bash scripts/merge-gate.sh --step <id>`, and merge-gate.sh step_<id>() holds the work.
@@ -21,13 +23,24 @@
 # there the plan decides, and the planner holds it against these (D-F34b). The cpu column is the most the row asks for: its
 # jobs or its widest pool, since the phases of a row do not run at once. NLI is exclusive: it asserts a clock
 # (nli_entailment, < 500 ms). Its tests open no database, but run-all-tests needs the judge's server (CI-J12), so it names a cluster.
-# CI-K4 (D-K4a, D-K4b, D-K4c, D-K4d, D-K4e, D-K4f): the rows that compile in the dev profile (DBG, NLI, DC; `test` inherits from
+# CI-K4 (D-K4a, D-K4b, D-K4c, D-K4d, D-K4e, D-K4f): the rows that compile in the dev profile (B1, DC; `test` inherits from
 # `dev`, so the tokens are DEV and never TEST) build with no incremental state, no debuginfo and with their symbols stripped:
-# the profile is in the hash of every unit, so it is written here, once, and a reader (NLI) names exactly the tokens of the
-# row that builds its target (DBG). The release rows (B3, REL, E2E) already build with debug = false and strip = true, and CV
+# the profile is in the hash of every unit, so it is written here, once, and a reader (DBG, CT, D2, D3, NLI) names exactly the
+# tokens of the row that builds its target (B1). The release rows (B3, REL, E2E) already build with debug = false and strip = true, and CV
 # and M have a seed and an instrumentation of their own that a profile of the table would move: they name none.
-20 DBG P target:T_dbg,cluster:C_dbg,models normal 8 8 421 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step DBG
-25 NLI DBG target:T_dbg,cluster:C_nli,models,reader exclusive 8 8 60 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step NLI
+# CI-E11 (D-E11a, D-E11b): the row that compiles T_dbg is B1 (fmt, clippy, `cargo test --no-run` and the binary of the
+# database); DBG (the plain pass), CT (the contracts of the judge and the doctests, no database and no models), D2 (the
+# --ignored sections, which make their database), D3 (the generative LLM, which makes its database) and NLI read what B1
+# built, each in a cluster of its own and each waiting for B1 and for nothing else. A reader runs `cargo test` and compiles
+# nothing: it names one cargo job and the profile of B1, or the hash of every unit would change and cargo would build it again.
+# B1 names no pool (it reads no model); a reader with models names the three. dur_s is the starting figure of each row: the
+# plain pass without the contracts, 164.9 s; the contracts, 83.3 s; D2, 107.9 s and its provision; D3, 30.1 s and the probe.
+15 B1 P target:T_dbg,cluster:C_b1 normal 8 8 120 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step B1
+20 DBG B1 target:T_dbg,cluster:C_dbg,models,reader normal 8 8 170 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step DBG
+21 CT B1 target:T_dbg,cluster:C_ct,reader normal 4 4 90 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 bash scripts/merge-gate.sh --step CT
+22 D2 B1 target:T_dbg,cluster:C_d2,models,reader normal 8 8 115 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step D2
+23 D3 B1 target:T_dbg,cluster:C_d3,reader normal 1 2 95 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 bash scripts/merge-gate.sh --step D3
+25 NLI B1 target:T_dbg,cluster:C_nli,models,reader exclusive 8 8 60 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=1 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step NLI
 30 B3 P target:T_rel,cluster:C_b3 normal 12 16 150 CARGO_BUILD_JOBS=12 bash scripts/merge-gate.sh --step B3
 40 REL B3 target:T_rel,cluster:C_rel,models,reader normal 8 12 221 CARGO_BUILD_JOBS=2 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step REL
 50 E2E B3 target:T_rel,cluster:C_e2e,models,reader normal 8 12 113 CARGO_BUILD_JOBS=2 bash scripts/merge-gate.sh --step E2E

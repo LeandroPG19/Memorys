@@ -638,8 +638,9 @@ fn the_gate_writes_its_own_exit_code_where_a_reader_can_find_it() {
     }
 }
 
-const UNIT_TESTS_ON_THE_GATE_DB: &str =
-    "DATABASE_URL=\"$GATE_DATABASE_URL\" run_counted plain 0 cargo test";
+/// CI-E11 (D-E11e): the plain pass is the library and the files of tests/ that are not contracts of the judge
+/// (`PLAIN_TESTS`), counted as the section `plain`; the contracts and the doctests run in the row CT, against no database.
+const UNIT_TESTS_ON_THE_GATE_DB: &str = "DATABASE_URL=\"$GATE_DATABASE_URL\" run_counted plain 0 cargo test --lib \"${PLAIN_TESTS[@]}\"";
 
 /// A line that runs `provision_gate_db`, as opposed to the one that defines it
 /// (`provision_gate_db() {`) or a comment that names it.
