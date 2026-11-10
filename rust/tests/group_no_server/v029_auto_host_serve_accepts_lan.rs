@@ -11,7 +11,7 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-mod dead_db;
+use crate::dead_db;
 
 /// The same ceiling `cli_contract` gives a serve that ends by itself against the dead database.
 const BUDGET: Duration = Duration::from_secs(60);

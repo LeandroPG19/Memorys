@@ -19,8 +19,8 @@
 //
 // It lives in a directory so cargo does not build it as a test target of its own and the
 // `for file in tests/*.rs` discovery in run-all-tests.sh, which does not recurse, never hands it
-// to `--test`. It has a single public item because each includer compiles its own copy and one
-// that leaves an item unused trips dead_code under clippy `-D warnings` (the same rule as
+// to `--test`. It has a single public item because each binary that declares it (a loose file, or
+// the root of a group) compiles its own copy and one that leaves an item unused trips dead_code under clippy `-D warnings` (the same rule as
 // `common/mod.rs`, `dead_db/` and `ephemeral/`).
 
 use std::future::Future;

@@ -1,7 +1,5 @@
 // needs-a-server: creates and drops its own database where DATABASE_URL points
-mod common;
-
-use common::in_a_scratch_database;
+use crate::common::in_a_scratch_database;
 use memory_industry::search::calibrate::{
     CalibrationReport, DEFAULT_ALPHA, load_ood_threshold, store_ood_threshold,
 };
@@ -10,7 +8,7 @@ use sqlx::{Executor, PgPool};
 
 /// The real migration, not a copy of it: the table this reads is the one the
 /// daemon has, and a later migration that changes it changes this test too.
-const CALIBRATION_TABLE: &str = include_str!("../migrations/0032_calibration.up.sql");
+const CALIBRATION_TABLE: &str = include_str!("../../migrations/0032_calibration.up.sql");
 
 /// None of the four constants the mutation run put in place of the body
 /// (None, 0.0, 1.0, -1.0), and exact in binary so it survives the round trip

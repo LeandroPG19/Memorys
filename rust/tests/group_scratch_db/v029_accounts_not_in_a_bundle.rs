@@ -8,10 +8,8 @@
 //! drops (`common::in_a_scratch_database`); the database the URL itself points at is never
 //! touched, and the export reads the scratch one.
 
-mod common;
-
+use crate::common::in_a_scratch_database;
 use chrono::{DateTime, TimeZone, Utc};
-use common::in_a_scratch_database;
 use memory_industry::accounts::{Secret, code_key, normalize_code};
 use memory_industry::accounts_db::{self as db, ClaimOutcome};
 use std::path::{Path, PathBuf};

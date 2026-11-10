@@ -2,9 +2,10 @@
 // directory so cargo does not build it as a test target of its own, and so
 // the `for file in tests/*.rs` discovery in run-all-tests.sh and ci.yml, which
 // does not recurse, never hands it to `--test`. Everything here has to be used
-// by every file that includes it: each of them compiles its own copy, and an
-// item one of them leaves unused is a dead_code warning that clippy
-// `-D warnings` turns into a failed gate.
+// by every binary that declares it (a loose file, or the root of a group, where
+// the modules share one copy and what any of them uses counts): each binary
+// compiles its own copy, and an item it leaves unused is a dead_code warning
+// that clippy `-D warnings` turns into a failed gate.
 
 use std::future::Future;
 

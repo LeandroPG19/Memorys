@@ -8,10 +8,8 @@
 //! drops (`common::in_a_scratch_database`); the database the URL itself points at is never
 //! touched, and the binary is pointed at the scratch one through its own `DATABASE_URL`.
 
-mod common;
-
+use crate::common::in_a_scratch_database;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use common::in_a_scratch_database;
 use memory_industry::accounts::{Secret, code_key, normalize_code};
 use memory_industry::accounts_db::{self as db, ClaimOutcome};
 use sqlx::PgPool;
