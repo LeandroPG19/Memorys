@@ -3,7 +3,8 @@
 
 Root: `${CI_TIEMPOS_DIR:-$HOME/.cache/ci-tiempos}/memory-industry/`, created when missing. One
 folder per UTC day holds `corridas.jsonl`, `pasos.jsonl`, `unidades.jsonl`, `indice.jsonl`, `flaky.jsonl`
-and `usl.jsonl` (the points of the USL sweep of gate_usl.py, CI-F5a). Writes go under flock on `.candado` in
+and `usl.jsonl` (the points of the USL sweep of gate_usl.py, CI-F5a). The reports of `cargo --timings` that a
+row saved go to `<day>/timings/<run>/<idx>-<id>/` (CI-K4, D-K4h). Writes go under flock on `.candado` in
 the root. Every record has `repo`.
 
 It never changes a verdict. The library calls and `registrar` turn any failure into one
@@ -13,7 +14,7 @@ an illegible manifest is exit 2. What was not measured is written as null, never
 is diagnosis only.
 
 Library use (the planner and the contract tests): run_start, step_start, step_end, units,
-run_end, lower_bounds, camino_critico, leer_jsonl, usl_point. `anon_max` of a step is its anonymous memory plus the pages its
+run_end, lower_bounds, camino_critico, leer_jsonl, usl_point, keep_timings, solape_s. `anon_max` of a step is its anonymous memory plus the pages its
 tmpfs holds (`shmem`): what is charged to the scope and cannot be reclaimed without swap. CLI (the serial writer): `registrar`, a JSON manifest on stdin.
 """
 
@@ -24,6 +25,8 @@ import functools
 import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -42,6 +45,10 @@ FLAKE_DAYS = 7
 LOCK_TIMEOUT_S = 2.0
 TEST_TIMES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-times.sh")
 COTAS = ("camino", "cpu", "ram", "paso")
+# CI-K4 (D-K4j): the reports of `--timings` are kept for 30 UTC days; the day folders and their jsonl files never go.
+TIMINGS_DIAS = 30
+# CI-K4 (D-K4h): what cargo writes on stderr when it saves a report, the only place that says which report a call made.
+INFORME_RE = re.compile(r"^\s*Timing report saved to (.+?)\s*$")
 
 _avisado = False
 _candado_roto = False
@@ -248,6 +255,8 @@ def _paso(
     anon_max: int | None,
     oom_kill: int | None,
     psi: dict[str, float | None] | None,
+    timings: dict[str, Any] | None = None,
+    solape_s: float | None = None,
 ) -> None:
     """A step's line. A time nobody gave is null: the registrar never invents one."""
     corrida.cpus.append(cpu_s)
@@ -273,6 +282,8 @@ def _paso(
             "anon_max": anon_max,
             "oom_kill": oom_kill,
             "psi": psi,
+            "timings": timings,
+            "solape_s": _r(solape_s),
         },
     )
 
@@ -293,6 +304,8 @@ def step_end(
     anon_max: int | None = None,
     oom_kill: int | None = None,
     psi: dict[str, float | None] | None = None,
+    timings: dict[str, Any] | None = None,
+    solape_s: float | None = None,
 ) -> None:
     """The library's own step: a missing inicio or fin is the module clock's."""
     _paso(
@@ -309,7 +322,87 @@ def step_end(
         anon_max,
         oom_kill,
         psi,
+        timings,
+        solape_s,
     )
+
+
+def _informes_nombrados(log_path: str) -> list[str]:
+    """The paths `Timing report saved to <path>` names in the log of a row, in order and with repeats."""
+    nombrados: list[str] = []
+    with open(log_path, encoding="utf-8", errors="replace") as fh:
+        for linea in fh:
+            coincide = INFORME_RE.match(linea)
+            if coincide:
+                nombrados.append(coincide.group(1))
+    return nombrados
+
+
+def _podar_informes(raiz: str) -> None:
+    """D-K4j: the timings/ of the day folders older than TIMINGS_DIAS UTC days go; the folder and its jsonl stay. A name
+    that is not a day is not touched, and a folder that cannot be read is not a failure of the run."""
+    hoy = datetime.now(timezone.utc).date()
+    try:
+        carpetas = os.listdir(raiz)
+    except OSError:
+        return
+    for carpeta in carpetas:
+        try:
+            dia = datetime.strptime(carpeta, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if (hoy - dia).days > TIMINGS_DIAS:
+            shutil.rmtree(os.path.join(raiz, carpeta, "timings"), ignore_errors=True)
+
+
+@_sin_veredicto
+def keep_timings(corrida: Corrida, paso: Paso, log_path: str) -> dict[str, Any] | None:
+    """D-K4h: the reports the log of a row names go from where cargo left them to
+    `<root>/<day>/timings/<run>/<idx>-<id>/`, moved and not copied, and the answer is what was kept:
+    `{dir, n, bytes, perdidos, faltan}`, with `dir` relative to the root of the history, `perdidos` the times a path is
+    named again and `faltan` the paths that are not there. The log is the only source: a report it does not name (the
+    one of another call, `cargo-timing.html`) stays where it is. None when the log names none; and None, with the one
+    `history:` line, when the history cannot take them (they stay in the target). Keeping also prunes the retention."""
+    nombrados = _informes_nombrados(log_path)
+    if not nombrados:
+        return None
+    unicos = list(dict.fromkeys(nombrados))
+    existentes = [ruta for ruta in unicos if os.path.isfile(ruta)]
+    raiz = history_root()
+    relativo = "/".join((datetime.now(timezone.utc).strftime("%Y%m%d"), "timings", corrida.run, f"{paso.idx}-{paso.id}"))
+    peso = 0
+    if existentes:
+        destino = os.path.join(raiz, *relativo.split("/"))
+        os.makedirs(destino, exist_ok=True)
+        for ruta in existentes:
+            peso += os.path.getsize(ruta)
+            shutil.move(ruta, os.path.join(destino, os.path.basename(ruta)))
+    _podar_informes(raiz)
+    return {
+        "dir": relativo if existentes else None,
+        "n": len(existentes),
+        "bytes": peso,
+        "perdidos": len(nombrados) - len(unicos),
+        "faltan": len(unicos) - len(existentes),
+    }
+
+
+def solape_s(intervalos: list[tuple[float, float]], i: int) -> float:
+    """D-K4r: the seconds of the interval `i` in which at least one other interval of `intervalos` is alive: the union of
+    the others over `i`, and not the sum of their intersections. Two intervals that touch do not overlap."""
+    inicio, fin = intervalos[i]
+    otros = sorted(
+        (max(a, inicio), min(b, fin))
+        for j, (a, b) in enumerate(intervalos)
+        if j != i and a < fin and b > inicio
+    )
+    total = 0.0
+    hasta = inicio
+    for a, b in otros:
+        if b > hasta:
+            total += b - max(a, hasta)
+            hasta = b
+    return total
 
 
 def _test_times_units(log_path: str) -> str | None:
@@ -464,6 +557,7 @@ def _cerrar(
     load: float | None = None,
     hilos: int | None = None,
     oom_kill: int | None = None,
+    plan: dict[str, Any] | None = None,
 ) -> None:
     cpus = _todos_medidos(corrida.cpus)
     cpu_total = None if cpus is None else sum(cpus)
@@ -490,6 +584,7 @@ def _cerrar(
         "load": _r(load, 2),
         "hilos": hilos,
         "oom_kill": oom_kill,
+        "plan": plan,
         "fecha": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     _escribir("corridas.jsonl", registro)
@@ -511,8 +606,10 @@ def run_end(
     load: float | None = None,
     hilos: int | None = None,
     oom_kill: int | None = None,
+    plan: dict[str, Any] | None = None,
 ) -> None:
-    """The library's own run end: a missing T is the module clock's. What nobody measured is None."""
+    """The library's own run end: a missing T is the module clock's. What nobody measured is None. `plan` is what the
+    planner measured of the machine and decided (D-K4q)."""
     _cerrar(
         corrida,
         rc,
@@ -526,6 +623,7 @@ def run_end(
         load=load,
         hilos=hilos,
         oom_kill=oom_kill,
+        plan=plan,
     )
 
 
@@ -639,6 +737,8 @@ def registrar(manifiesto: dict[str, Any]) -> None:
             p.get("anon_max"),
             p.get("oom_kill"),
             p.get("psi"),
+            p.get("timings"),
+            p.get("solape_s"),
         )
         pasos[p["id"]] = paso
     for u in manifiesto.get("unidades", []):
@@ -664,6 +764,7 @@ def registrar(manifiesto: dict[str, Any]) -> None:
         load=manifiesto.get("load"),
         hilos=manifiesto.get("hilos"),
         oom_kill=manifiesto.get("oom_kill"),
+        plan=manifiesto.get("plan"),
     )
 
 

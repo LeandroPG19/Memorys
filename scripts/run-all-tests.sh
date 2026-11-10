@@ -1748,7 +1748,7 @@ cd "$RUST_DIR"
 # release/ or cuba-memorys (CI-J, D-J2a). A build that fails prepares nothing (J2.2).
 gate_bin() {
   local out exe
-  out="$(cargo build --bin memory-industry --message-format=json-render-diagnostics)" \
+  out="$(cargo build --bin memory-industry --message-format=json-render-diagnostics --timings)" \
     || { echo "FAIL: cargo build --bin memory-industry failed: no database is prepared from a binary that did not build." >&2; exit 1; }
   exe="$(printf '%s\n' "$out" \
     | sed -n 's/.*"reason":"compiler-artifact".*"executable":"\([^"]*\)".*/\1/p' \
@@ -1828,7 +1828,7 @@ echo "=== cargo fmt --check ==="
 cargo fmt --check
 
 echo "=== cargo clippy (--all-targets: without it, tests/ is never linted) ==="
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --timings -- -D warnings
 }
 
 lane_D1() {
@@ -1836,7 +1836,7 @@ echo "=== throwaway database for every mutating step ==="
 provision_gate_db
 
 echo "=== cargo test (unit + smoke) ==="
-DATABASE_URL="$GATE_DATABASE_URL" cargo test
+DATABASE_URL="$GATE_DATABASE_URL" cargo test --timings
 }
 
 lane_D2() {
@@ -1861,26 +1861,26 @@ for file in tests/*.rs; do
 done
 echo "deferred ${#DEFERRED_SECTIONS[@]} file(s) to their own sections: ${DEFERRED_SECTIONS[*]}"
 echo "running $(( ${#DISCOVERED[@]} / 2 )) discovered test file(s)"
-run_counted discovered-ignored 0 cargo test "${DISCOVERED[@]}" -- --ignored --nocapture
+run_counted discovered-ignored 0 cargo test "${DISCOVERED[@]}" --timings -- --ignored --nocapture
 
-run_counted lib-ignored 0 cargo test --lib -- --ignored --nocapture
+run_counted lib-ignored 0 cargo test --lib --timings -- --ignored --nocapture
 
 echo "=== admin-role tests (they rewrite roles and the audit log) ==="
-CUBA_APP_ROLE=0 run_counted admin-role 1 cargo test --test v020_audit_update_applies --test v020_role_separation \
+CUBA_APP_ROLE=0 run_counted admin-role 1 cargo test --test v020_audit_update_applies --test v020_role_separation --timings \
            -- --ignored --nocapture
 
 require_present "tests that need the embedding model" "$ONNX_MODEL_PATH/model_quantized.onnx" \
-  run_counted embedding-model 1 cargo test --test v016_chunking -- --ignored --nocapture
+  run_counted embedding-model 1 cargo test --test v016_chunking --timings -- --ignored --nocapture
 }
 
 lane_NLI() {
 require_present "tests that need the NLI model" "$CUBA_NLI_PATH" \
-  run_counted nli 1 cargo test --test nli_entailment --test nli_cost --test nli_probe -- --ignored --nocapture
+  run_counted nli 1 cargo test --test nli_entailment --test nli_cost --test nli_probe --timings -- --ignored --nocapture
 }
 
 lane_D3() {
 require_generative_llm "tests that need a generative LLM (extract / relation-scan)" \
-  run_counted generative-llm 1 cargo test --test v016_extract_without_sampling --test v017_relation_scan \
+  run_counted generative-llm 1 cargo test --test v016_extract_without_sampling --test v017_relation_scan --timings \
              -- --ignored --nocapture
 }
 
@@ -1926,14 +1926,14 @@ b3_record_sha() {
 lane_B3() {
 echo "=== release build (one cargo call with --no-run, the feature set production runs) ==="
 export CARGO_BUILD_JOBS="$GATE_RELEASE_JOBS"
-cargo test --release --features cuda --no-run --lib --test v017_rerank_gpu
+cargo test --release --features cuda --no-run --lib --test v017_rerank_gpu --timings
 REL_BIN="$(resolve_binary_path)"
 [[ -f "$REL_BIN" ]] || { echo "FAIL: the release build left no binary at $REL_BIN." >&2; exit 1; }
 REL_SHA="$(release_sha "$REL_BIN")"
 
 echo "=== B3g (every unit of the bins is fresh after the --no-run build) ==="
 b3g_json="$(mktemp)"
-cargo build --release --features cuda --bins --message-format=json >"$b3g_json" \
+cargo build --release --features cuda --bins --message-format=json --timings >"$b3g_json" \
   || { rm -f "$b3g_json"; echo "FAIL: the release build of the bins failed (B3g)." >&2; exit 1; }
 check_fresh "$b3g_json" || { rm -f "$b3g_json"; exit 1; }
 rm -f "$b3g_json"
@@ -1976,7 +1976,7 @@ REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
 [[ -f "$REL_BIN" ]] || { echo "FAIL: no release binary at $REL_BIN: the B3 lane builds it (run --lane B3 first)." >&2; exit 1; }
 b3_record_sha
 echo "=== reranker placement contracts (GPU feature live, no model needed) ==="
-run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
+run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu --timings -- --nocapture
 
 # The library half of the same hole. The cfg! that actually decides placement is
 # in gpu::wants_gpu, which returns false before reading the device variable when
@@ -1990,11 +1990,11 @@ run_counted reranker-placement 1 cargo test --release --features cuda --test v01
 # unit itself. In debug it would be a third feature set (debug bare, release
 # cuda, debug cuda) and a full rebuild of everything under it.
 echo "=== placement table under the feature that changes it ==="
-run_counted placement-table 0 cargo test --release --features cuda --lib gpu:: -- --nocapture
+run_counted placement-table 0 cargo test --release --features cuda --lib gpu:: --timings -- --nocapture
 
 require_present "reranker tests (release: 387s in debug, seconds here)" \
   "$CUBA_RERANKER_PATH/model.onnx" \
-  run_counted reranker-model 1 cargo test --release --features cuda --test v017_rerank_gpu -- --ignored --nocapture
+  run_counted reranker-model 1 cargo test --release --features cuda --test v017_rerank_gpu --timings -- --ignored --nocapture
 
 check_section_lines
 
