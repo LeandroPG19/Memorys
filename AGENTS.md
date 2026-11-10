@@ -78,3 +78,4 @@ Published migrations through **0060** are frozen (SHA-384). Wrong shipped SQL ge
 
 - Progress lives in `backlog/` (the source of truth for what is done); git is the source of truth for the code.
 - Notion is the management view: the MemoryIndustry space, https://app.notion.com/p/410c9ec4d5d2814ea7e2c981c25ae20b (Cortes, Tareas, Decisiones, Bugs y lecciones, Despliegues, Conocimiento). A task is not opened, moved or closed in one without the other.
+- Judge timings as the project grows: when closing a batch, adding tests or steps to the judge, or when a run takes longer than before, apply the `ci-escala` skill. This repo's starting numbers, budgets and missing guards (CI-E1 to CI-E8) are in `docs/ci/metodologia-de-escala.md` (internal, kept local like the rest of `docs/*`).
