@@ -1238,6 +1238,8 @@ FAKE
     shift
     full_tree "$name"
     cp "$t/standin/memory-industry" "$t/target/release/memory-industry"
+    # CI-F3.4 (D-F34i): the record B3 leaves next to the binary, which R and E read when they run in a process of their own.
+    sha256sum "$t/target/release/memory-industry" >"$t/target/release/.gate-release.sha256"
     printf '{"content":"fake observation"}\n%.0s' 1 2 3 4 5 >"$t/rust/eval-datasets/smoke-corpus.jsonl"
     rc=0
     env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT HOME="$t/home" \
@@ -1284,6 +1286,56 @@ FAKE
   (( rc == 0 )) || self_fail "F3.3b-1: --lane E alone exits $rc, not 0: $(cat "$tmp/lane_e_alone.out")"
   [[ "$(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null || true)" == 1 ]] \
     || self_fail "F3.3b-1: --lane E alone did not provision brain_gate (CREATE DATABASE brain_gate seen $(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null || echo 0) times): $(cat "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null)"
+
+  # CI-F3.4 (D-F34i, R1): B3 leaves the sha256 of the release binary next to it (`<sha>  <path>`), and R and E, each in a
+  # process of its own, hold the binary against it. A binary rewritten after B3 is refused by E before it provisions
+  # anything, with the sha256 named and the step the record comes from.
+  full_tree r1
+  printf '{"content":"fake observation"}\n%.0s' 1 2 3 4 5 >"$tmp/r1/rust/eval-datasets/smoke-corpus.jsonl"
+  run_args r1 --lane B3
+  (( rc == 0 )) || self_fail "F3.4 R1: --lane B3 exits $rc, not 0: $(cat "$tmp/r1.out")"
+  r1_bin="$tmp/r1/target/release/memory-industry"
+  r1_record="$tmp/r1/target/release/.gate-release.sha256"
+  [[ -f "$r1_record" ]] \
+    || self_fail "F3.4 R1: B3 left no .gate-release.sha256 next to the release binary: $(ls -A "$tmp/r1/target/release")"
+  [[ "$(cut -d' ' -f1 "$r1_record")" == "$(sha256sum "$r1_bin" | cut -d' ' -f1)" ]] \
+    || self_fail "F3.4 R1: the record of B3 does not hold the sha256 of the release binary: $(cat "$r1_record")"
+  [[ "$(cut -d' ' -f3- "$r1_record")" == "$r1_bin" ]] \
+    || self_fail "F3.4 R1: the record of B3 does not name the release binary after its sha256 (<sha>  <path>): $(cat "$r1_record")"
+  run_args r1 --lane R
+  (( rc == 0 )) || self_fail "F3.4 R1: --lane R after B3, in its own process, exits $rc, not 0: $(cat "$tmp/r1.out")"
+  run_args r1 --lane E
+  (( rc == 0 )) || self_fail "F3.4 R1: --lane E after B3 and R, in its own process, exits $rc, not 0: $(cat "$tmp/r1.out")"
+  # A comment after the stand-in's last command: the sha256 changes and the binary still runs, so an E that took the binary
+  # without holding it against B3's record would end green here.
+  echo "# rewritten after B3" >>"$r1_bin"
+  run_args r1 --lane E
+  (( rc == 1 )) \
+    || self_fail "F3.4 R1: E accepted a release binary that changed after B3 (exit $rc, want 1): $(cat "$tmp/r1.out")"
+  grep -qF 'sha256 changed' "$tmp/r1.out" && grep -qF 'since B3' "$tmp/r1.out" \
+    || self_fail "F3.4 R1: E refused the changed binary without saying 'sha256 changed' and 'since B3': $(cat "$tmp/r1.out")"
+
+  # CI-F3.4 (D-F34i, R2): without B3's record R and E do not guess. The binary is on disk and nothing says it is the one B3
+  # built, so R refuses, naming what is missing.
+  full_tree r2
+  cp "$tmp/r2/standin/memory-industry" "$tmp/r2/target/release/memory-industry"
+  run_args r2 --lane R
+  (( rc == 1 )) \
+    || self_fail "F3.4 R2: R ran without B3's record (exit $rc, want 1): $(cat "$tmp/r2.out")"
+  grep -qF 'B3 left no sha256 record' "$tmp/r2.out" \
+    || self_fail "F3.4 R2: R refused without saying 'B3 left no sha256 record': $(cat "$tmp/r2.out")"
+
+  # CI-F3.4 (D-F34h, R3): E provisions brain_gate with the release binary and compiles nothing: the fake cargo logs every
+  # call, and there is none. The provision is the `doctor` the binary runs with no arguments, the one whose line the
+  # stand-in logs without --json (the placement check logs `doctor --json`).
+  release_run lane_e_nocargo --lane E
+  (( rc == 0 )) || self_fail "F3.4 R3: --lane E alone exits $rc, not 0: $(cat "$tmp/lane_e_nocargo.out")"
+  [[ ! -e "$tmp/lane_e_nocargo/home/cargo.calls" ]] \
+    || self_fail "F3.4 R3: lane E ran cargo: $(cat "$tmp/lane_e_nocargo/home/cargo.calls")"
+  [[ "$(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_e_nocargo/home/psql.calls" 2>/dev/null || true)" == 1 ]] \
+    || self_fail "F3.4 R3: --lane E alone did not provision brain_gate once: $(cat "$tmp/lane_e_nocargo/home/psql.calls" 2>/dev/null)"
+  grep -qxF "$tmp/lane_e_nocargo/target/release/memory-industry doctor" "$tmp/lane_e_nocargo/home/bin.calls" 2>/dev/null \
+    || self_fail "F3.4 R3: the provision did not call the release binary's doctor: $(cat "$tmp/lane_e_nocargo/home/bin.calls" 2>/dev/null)"
 
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
@@ -1610,9 +1662,11 @@ gate_bin() {
   printf '%s\n' "$exe"
 }
 
+# CI-F3.4 (D-F34h): with a binary, the one the caller gives; without one, the debug build of gate_bin. The E2E lane
+# gives the release binary B3 left, so it compiles nothing and the database is migrated by the binary it judges.
 provision_gate_db() {
-  local bin
-  bin="$(gate_bin)"
+  local bin="${1:-}"
+  [[ -n "$bin" ]] || bin="$(gate_bin)"
   claim_database "$GATE_DB" || exit 1
   # doctor exits non-zero when ONNX_MODEL_PATH is empty (policy checks). Migrations
   # still apply first — trust the table count below, not the exit code alone.
@@ -1754,6 +1808,21 @@ sha_unchanged() {
   fi
 }
 
+# CI-F3.4 (D-F34i): a lane in a process of its own reads the sha256 B3 recorded next to the binary and holds the binary
+# against it. A lane that runs in B3's process has REL_SHA already. Without the record nothing says the binary on disk is
+# the one B3 built, so it is not judged.
+b3_record_sha() {
+  local record
+  [[ -z "${REL_SHA:-}" ]] || return 0
+  record="$(dirname "$REL_BIN")/.gate-release.sha256"
+  [[ -f "$record" ]] \
+    || { echo "FAIL: B3 left no sha256 record at $record: the binary $REL_BIN is not known to be the one it built (run --lane B3 first)." >&2; exit 1; }
+  REL_SHA="$(cut -d' ' -f1 "$record")"
+  [[ "$REL_SHA" =~ ^[0-9a-f]{64}$ ]] \
+    || { echo "FAIL: the sha256 record of B3 at $record does not start with a sha256: $(cat "$record")" >&2; exit 1; }
+  sha_unchanged "since B3"
+}
+
 lane_B3() {
 echo "=== release build (one cargo call with --no-run, the feature set production runs) ==="
 export CARGO_BUILD_JOBS="$GATE_RELEASE_JOBS"
@@ -1769,6 +1838,8 @@ cargo build --release --features cuda --bins --message-format=json >"$b3g_json" 
 check_fresh "$b3g_json" || { rm -f "$b3g_json"; exit 1; }
 rm -f "$b3g_json"
 sha_unchanged "after B3g"
+# CI-F3.4 (D-F34i): what R and E, each maybe in a process of its own, hold the binary against.
+printf '%s  %s\n' "$REL_SHA" "$REL_BIN" >"$(dirname "$REL_BIN")/.gate-release.sha256"
 }
 
 # --features cuda here too. The feature set is part of what cargo fingerprints,
@@ -1803,7 +1874,7 @@ lane_R() {
 # lane_E does, and checks it against its sha256 at the end.
 REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
 [[ -f "$REL_BIN" ]] || { echo "FAIL: no release binary at $REL_BIN: the B3 lane builds it (run --lane B3 first)." >&2; exit 1; }
-REL_SHA="${REL_SHA:-$(release_sha "$REL_BIN")}"
+b3_record_sha
 echo "=== reranker placement contracts (GPU feature live, no model needed) ==="
 run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
 
@@ -1832,16 +1903,15 @@ sha_unchanged "before E2E"
 
 lane_E() {
 export DATABASE_URL="$GATE_DATABASE_URL"
+REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
+[[ -f "$REL_BIN" ]] || { echo "FAIL: no release binary at $REL_BIN: the B3 lane builds it (run --lane B3 first)." >&2; exit 1; }
+b3_record_sha
 # CI-F3.3b-1: the e2e chain runs in a process of its own, with a cluster that has no brain_gate: E makes
 # it with the same provision D1 uses, and only when it is missing (D1 and E in one call share it).
+# CI-F3.4 (D-F34h): E compiles nothing. The provision runs the release binary B3 left, already held against its record.
 if [[ "$(psql_url "$ADMIN_DATABASE_URL" -Atc "SELECT count(*) FROM pg_database WHERE datname = '$GATE_DB'")" != 1 ]]; then
-  # lane_B3 exported the release job count for this whole process: the provision compiles the debug binary
-  # at the judge's count, as D1 does.
-  export CARGO_BUILD_JOBS="$GATE_CARGO_JOBS"
-  provision_gate_db
+  provision_gate_db "$REL_BIN"
 fi
-REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
-REL_SHA="${REL_SHA:-$(release_sha "$REL_BIN")}"
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
 CUBA_BINARY_PATH="$(resolve_binary_path)"
 export CUBA_BINARY_PATH

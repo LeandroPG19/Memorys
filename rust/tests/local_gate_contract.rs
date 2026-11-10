@@ -6527,3 +6527,762 @@ fn main() { let mod_x = 1; let test = 2; }
         Vec::<String>::new()
     );
 }
+
+// --- CI-F3.4: the latency list, the resources of the rows and the release binary of the E2E ------------------------
+// D-F34g..F34p. scripts/gate-latency.txt names, one line per file under rust/, every file whose tests assert on a
+// wall clock, with the class the file needs in the judge: `exclusive` runs alone (the NLI row), `shared` can run
+// beside other steps. The detector below is the one the list is kept against, and this file is read by it too.
+
+/// The macro the detector looks for, in two pieces: a literal of it followed by an open parenthesis anywhere in this
+/// file would be a wall-clock assert of its own, and the file would need a line in the list.
+const ASSERT_MACRO: [&str; 2] = ["assert", "!"];
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `word` is in `text` as a whole word.
+fn contains_word(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + word.len()..].chars().next();
+        !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
+    })
+}
+
+/// The names a line of `text` binds with `let <name> = … .elapsed() …`, up to the first `;` of the line: the form
+/// `let per_call = t0.elapsed() / 5;` that a search of the assert alone does not see.
+fn elapsed_bindings(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in text.lines() {
+        for (at, _) in line.match_indices("let") {
+            let rest = &line[at + 3..];
+            let after_let = rest.trim_start();
+            if after_let.len() == rest.len() {
+                continue;
+            }
+            let after_mut = after_let
+                .strip_prefix("mut")
+                .filter(|more| more.starts_with(char::is_whitespace))
+                .map_or(after_let, str::trim_start);
+            let name: String = after_mut.chars().take_while(|c| is_word_char(*c)).collect();
+            if name.is_empty() {
+                continue;
+            }
+            let after_name = after_mut[name.len()..].trim_start();
+            let value = if let Some(typed) = after_name.strip_prefix(':') {
+                match typed.find('=') {
+                    Some(equals) if equals > 0 => &typed[equals + 1..],
+                    _ => continue,
+                }
+            } else if let Some(value) = after_name.strip_prefix('=') {
+                value
+            } else {
+                continue;
+            };
+            if value.split(';').next().unwrap_or("").contains(".elapsed()") {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// D-F34l: the 1-based lines of `text` where a wall-clock assert starts. A `debug_` or plain assert macro whose
+/// argument, with its parentheses balanced, has `<` or `>` and either `.elapsed()` itself or a name bound on one line
+/// to an `.elapsed()` in the same file. A timeout around a future and an `.elapsed()` that is only printed are not.
+fn clock_asserts(text: &str) -> Vec<usize> {
+    if !text.contains(".elapsed()") {
+        return Vec::new();
+    }
+    let bound = elapsed_bindings(text);
+    let needle = ASSERT_MACRO.concat();
+    let mut lines = Vec::new();
+    for (at, _) in text.match_indices(&needle) {
+        let start = if text[..at].ends_with("debug_") {
+            at - "debug_".len()
+        } else {
+            at
+        };
+        if text[..start].chars().next_back().is_some_and(is_word_char) {
+            continue;
+        }
+        let after = &text[at + needle.len()..];
+        let args = after.trim_start();
+        if !args.starts_with('(') {
+            continue;
+        }
+        let body_start = at + needle.len() + (after.len() - args.len()) + 1;
+        let rest = &text[body_start..];
+        let mut depth = 1;
+        let length = rest
+            .bytes()
+            .position(|byte| {
+                match byte {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map_or(rest.len(), |at| at + 1);
+        let body = &rest[..length];
+        let compares = body.contains('<') || body.contains('>');
+        let on_a_clock =
+            body.contains(".elapsed()") || bound.iter().any(|name| contains_word(body, name));
+        if compares && on_a_clock {
+            lines.push(text[..start].matches('\n').count() + 1);
+        }
+    }
+    lines
+}
+
+/// The Rust files of `dir`, and of the folders under it when `deep`.
+fn rust_files(dir: &Path, deep: bool) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if deep {
+                files.extend(rust_files(&path, true));
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// Every file with a wall-clock assert, as `tests/<file>.rs` or `src/<path>.rs` (relative to rust/), with its lines.
+fn files_with_clock_asserts() -> std::collections::BTreeMap<String, Vec<usize>> {
+    let rust = repo_root().join("rust");
+    let mut found = std::collections::BTreeMap::new();
+    for (folder, deep) in [("tests", false), ("src", true)] {
+        for path in rust_files(&rust.join(folder), deep) {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let lines = clock_asserts(&text);
+            if !lines.is_empty() {
+                let name = path
+                    .strip_prefix(&rust)
+                    .expect("under rust/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                found.insert(name, lines);
+            }
+        }
+    }
+    found
+}
+
+/// One line of scripts/gate-latency.txt (D-F34k): file, class, evidence, owner, date, and the reason.
+struct LatencyLine {
+    number: usize,
+    file: String,
+    class: String,
+    evidence: String,
+    owner: String,
+    date: String,
+    reason: String,
+}
+
+fn latency_lines() -> Vec<LatencyLine> {
+    read("scripts/gate-latency.txt")
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(|(index, line)| {
+            let mut fields = line.split_whitespace();
+            let mut next = |what: &str| {
+                fields
+                    .next()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "scripts/gate-latency.txt:{}: no {what}; a line is `file class evidence owner date reason`: {line}",
+                            index + 1
+                        )
+                    })
+                    .to_string()
+            };
+            let file = next("file");
+            let class = next("class");
+            let evidence = next("evidence");
+            let owner = next("owner");
+            let date = next("date");
+            let reason = fields.collect::<Vec<_>>().join(" ");
+            LatencyLine {
+                number: index + 1,
+                file,
+                class,
+                evidence,
+                owner,
+                date,
+                reason,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn the_latency_list_names_every_file_with_a_wall_clock_assert_and_only_those() {
+    let found = files_with_clock_asserts();
+    assert!(
+        !found.is_empty(),
+        "the detector found no file with a wall-clock assert under rust/tests and rust/src: it sees nothing, so a list kept against it proves nothing"
+    );
+    let listed = latency_lines();
+    for file in found.keys() {
+        assert!(
+            listed.iter().any(|line| line.file == *file),
+            "{file} has a wall-clock assert and no line in scripts/gate-latency.txt"
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for line in &listed {
+        assert!(
+            repo_root().join("rust").join(&line.file).is_file(),
+            "scripts/gate-latency.txt:{}: {} is not a file under rust/",
+            line.number,
+            line.file
+        );
+        assert!(
+            found.contains_key(&line.file),
+            "{} has no wall-clock assert, and scripts/gate-latency.txt:{} lists it",
+            line.file,
+            line.number
+        );
+        assert!(
+            seen.insert(line.file.clone()),
+            "scripts/gate-latency.txt:{}: {} is listed twice",
+            line.number,
+            line.file
+        );
+    }
+}
+
+/// D-F34l, the four forms. The macro is written ASSERT in the fixtures and put back before they are read, so this file
+/// does not hold the text the detector looks for.
+#[test]
+fn the_clock_detector_sees_the_form_with_a_variable_and_not_what_is_only_printed() {
+    let forms = [
+        (
+            "an elapsed inside the assert",
+            "ASSERT!(started.elapsed() < Duration::from_secs(3), \"slow\");",
+            true,
+        ),
+        (
+            "binding form",
+            "let took = t.elapsed();\nwork();\nASSERT!(\n    took < LIMIT,\n    \"slow\"\n);",
+            true,
+        ),
+        (
+            "a measure that is only printed",
+            "let dt = t0.elapsed();\neprintln!(\"{dt:?}\");",
+            false,
+        ),
+        (
+            "an assert on a number",
+            "assert_eq!(report.warmup_ms, 0.0);",
+            false,
+        ),
+    ];
+    for (name, text, want) in forms {
+        let detected = !clock_asserts(&text.replace("ASSERT", "assert")).is_empty();
+        assert_eq!(
+            detected,
+            want,
+            "{name} {}: the detector of D-F34l has to {} it",
+            if detected { "detected" } else { "not detected" },
+            if want { "see" } else { "leave" }
+        );
+    }
+}
+
+/// The kind of evidence a line carries (D-F34k): a ratio with two decimals, `dag-verde:<n>` with n >= 1, or pending.
+fn evidence_kind(evidence: &str) -> Option<&'static str> {
+    let digits = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_digit());
+    if evidence == "pendiente" {
+        return Some("pending");
+    }
+    if let Some(runs) = evidence.strip_prefix("dag-verde:") {
+        return (digits(runs) && runs.parse::<u32>().is_ok_and(|n| n >= 1)).then_some("dag");
+    }
+    let (whole, decimals) = evidence.split_once('.')?;
+    (digits(whole) && decimals.len() == 2 && digits(decimals)).then_some("ratio")
+}
+
+fn latency_date(line: &LatencyLine) -> chrono::NaiveDate {
+    assert!(
+        line.date.len() == 10,
+        "scripts/gate-latency.txt:{}: the date {} is not AAAA-MM-DD",
+        line.number,
+        line.date
+    );
+    chrono::NaiveDate::parse_from_str(&line.date, "%Y-%m-%d").unwrap_or_else(|e| {
+        panic!(
+            "scripts/gate-latency.txt:{}: the date {} is not AAAA-MM-DD: {e}",
+            line.number, line.date
+        )
+    })
+}
+
+/// The last day a pending line may name (D-F34k): the lot that closes F3.
+const PENDING_LAST_DAY: (i32, u32, u32) = (2026, 11, 30);
+
+#[test]
+fn every_latency_line_has_its_five_fields_and_a_pending_one_has_a_date_to_come() {
+    let today = chrono::Utc::now().date_naive();
+    let last =
+        chrono::NaiveDate::from_ymd_opt(PENDING_LAST_DAY.0, PENDING_LAST_DAY.1, PENDING_LAST_DAY.2)
+            .expect("a real day");
+    let lines = latency_lines();
+    assert!(
+        !lines.is_empty(),
+        "scripts/gate-latency.txt has no line: a list with nothing in it proves nothing"
+    );
+    for line in &lines {
+        let at = format!("scripts/gate-latency.txt:{}", line.number);
+        assert!(
+            matches!(line.class.as_str(), "exclusive" | "shared"),
+            "{at}: the class of {} is {}, not exclusive or shared",
+            line.file,
+            line.class
+        );
+        let kind = evidence_kind(&line.evidence).unwrap_or_else(|| {
+            panic!(
+                "{at}: the evidence of {} is {}: a ratio with two decimals, dag-verde:<n> with n of 1 or more, or pendiente",
+                line.file, line.evidence
+            )
+        });
+        assert!(
+            !line.owner.is_empty() && !line.reason.is_empty(),
+            "{at}: {} needs an owner and a reason",
+            line.file
+        );
+        let date = latency_date(line);
+        if kind == "pending" {
+            assert!(
+                date > today,
+                "pending line {} expired on {} ({at}; today is {today})",
+                line.file,
+                line.date
+            );
+            assert!(
+                date <= last,
+                "pending line {} is dated {} ({at}), after the {last} the lot closes",
+                line.file,
+                line.date
+            );
+        }
+    }
+}
+
+/// The ids of the `--lane` functions of run-all-tests.sh whose body names `--test <name>`.
+fn lanes_naming_test(suite: &str, name: &str) -> Vec<String> {
+    let outside: String = outside_self_test(suite)
+        .iter()
+        .map(|(_, line)| format!("{line}\n"))
+        .collect();
+    let mut lanes = Vec::new();
+    for lane in ["CL", "D1", "D2", "D3", "NLI", "B3", "R", "E"] {
+        let named = lane_body(&outside, lane).iter().any(|line| {
+            !line.trim_start().starts_with('#')
+                && line
+                    .split("--test ")
+                    .skip(1)
+                    .any(|rest| rest.split_whitespace().next() == Some(name))
+        });
+        if named {
+            lanes.push(lane.to_string());
+        }
+    }
+    lanes
+}
+
+/// The body of `lane_<id>()` in run-all-tests.sh, as `step_body` does for merge-gate.sh.
+fn lane_body(suite: &str, id: &str) -> Vec<String> {
+    let header = format!("lane_{id}() {{");
+    let mut lines = suite.lines();
+    assert!(
+        lines.any(|line| line.trim_end() == header),
+        "run-all-tests.sh has no {header}"
+    );
+    lines
+        .take_while(|line| *line != "}")
+        .map(String::from)
+        .collect()
+}
+
+/// The names in `RUN_ELSEWHERE=(…)` of lane_D2: the files its discovery leaves for their own sections.
+fn run_elsewhere(suite: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut inside = false;
+    for line in lane_body(suite, "D2") {
+        if line.trim_start().starts_with("RUN_ELSEWHERE=(") {
+            inside = true;
+        }
+        if inside {
+            names.extend(
+                line.replace("RUN_ELSEWHERE=(", " ")
+                    .replace(')', " ")
+                    .split_whitespace()
+                    .map(String::from),
+            );
+            if line.contains(')') {
+                break;
+            }
+        }
+    }
+    names
+}
+
+fn row_class(line: &str) -> String {
+    line.split_whitespace()
+        .nth(4)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// D-F34p: what keeps the file `file`, named `exclusive` in scripts/gate-latency.txt, from being coherent with the
+/// judge. A src module is never exclusive (the lib runs in DBG, DC, CV and M). A test file is exclusive only if the
+/// lanes that name it with --test are those of rows of the class exclusive (or boundary), the discovery of D2 leaves it
+/// to them, and every test in it is #[ignore], so that the calls without --ignored of D1, DC and M only list it.
+fn exclusive_problems(file: &str, gate: &str, suite: &str, source: &str) -> Vec<String> {
+    if file.starts_with("src/") {
+        return vec![format!(
+            "{file}: a src module cannot be exclusive while lib runs in DBG, DC, CV and M"
+        )];
+    }
+    let name = Path::new(file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("a file name");
+    let rows = dag_rows();
+    let rows_running = |lane: &str| -> Vec<(String, String)> {
+        rows.iter()
+            .filter(|(_, id, _, _)| {
+                step_body(gate, id).is_some_and(|body| lanes_in(&body).iter().any(|l| l == lane))
+            })
+            .map(|(_, id, _, line)| (id.clone(), row_class(line)))
+            .collect()
+    };
+    let mut problems = Vec::new();
+    let mut lanes = lanes_naming_test(suite, name);
+    if !run_elsewhere(suite).iter().any(|left| left == name) {
+        lanes.push("D2".to_string());
+    }
+    for lane in lanes {
+        for (row, class) in rows_running(&lane) {
+            if !matches!(class.as_str(), "exclusive" | "boundary") {
+                problems.push(format!(
+                    "{file} is exclusive and runs in row {row} ({class}): lane {lane} of run-all-tests.sh runs it"
+                ));
+            }
+        }
+    }
+    let tests = source
+        .lines()
+        .filter(|l| {
+            l.trim_start().starts_with("#[test]") || l.trim_start().starts_with("#[tokio::test")
+        })
+        .count();
+    let ignored = source
+        .lines()
+        .filter(|l| l.trim_start().starts_with("#[ignore"))
+        .count();
+    if tests != ignored {
+        problems.push(format!(
+            "{file} is exclusive and has {tests} tests and {ignored} #[ignore]: the calls without --ignored of D1, DC and M would run the rest beside other steps"
+        ));
+    }
+    problems
+}
+
+#[test]
+fn a_file_that_is_exclusive_in_the_latency_list_is_exclusive_in_the_judge() {
+    let gate = read("scripts/merge-gate.sh");
+    let suite = read("scripts/run-all-tests.sh");
+    let exclusive: Vec<LatencyLine> = latency_lines()
+        .into_iter()
+        .filter(|line| line.class == "exclusive")
+        .collect();
+    assert!(
+        !exclusive.is_empty(),
+        "scripts/gate-latency.txt has no exclusive file: the NLI row asserts a clock and runs alone, so there is one"
+    );
+    for line in &exclusive {
+        let source = if line.file.starts_with("src/") {
+            String::new()
+        } else {
+            read(&format!("rust/{}", line.file))
+        };
+        let problems = exclusive_problems(&line.file, &gate, &suite, &source);
+        assert!(
+            problems.is_empty(),
+            "scripts/gate-latency.txt:{}: {problems:#?}",
+            line.number
+        );
+    }
+}
+
+/// The guard of the test above can fail: a file that the discovery of D2 runs in DBG, a src module, and a file with a
+/// test that is not ignored are each refused, and the file the NLI row runs is not.
+#[test]
+fn the_exclusive_check_refuses_what_runs_beside_other_steps() {
+    let gate = read("scripts/merge-gate.sh");
+    let suite = read("scripts/run-all-tests.sh");
+    let ok = exclusive_problems(
+        "tests/nli_entailment.rs",
+        &gate,
+        &suite,
+        &read("rust/tests/nli_entailment.rs"),
+    );
+    assert!(ok.is_empty(), "the file of the NLI row is refused: {ok:#?}");
+    let in_dbg = exclusive_problems(
+        "tests/v029_accounts_over_real_http.rs",
+        &gate,
+        &suite,
+        &read("rust/tests/v029_accounts_over_real_http.rs"),
+    );
+    assert!(
+        in_dbg
+            .iter()
+            .any(|p| p.contains("is exclusive and runs in row DBG (normal)")),
+        "a file that D2 discovers in DBG is not refused as exclusive: {in_dbg:#?}"
+    );
+    let module = exclusive_problems("src/doctor.rs", &gate, &suite, "");
+    assert!(
+        module.iter().any(|p| p.contains("cannot be exclusive")),
+        "a src module is not refused as exclusive: {module:#?}"
+    );
+    let half = "#[tokio::test]\n#[ignore]\nasync fn a() {}\n#[tokio::test]\nasync fn b() {}\n";
+    let loose = exclusive_problems("tests/nli_entailment.rs", &gate, &suite, half);
+    assert!(
+        loose.iter().any(|p| p.contains("2 tests and 1 #[ignore]")),
+        "a file with a test that is not ignored is not refused as exclusive: {loose:#?}"
+    );
+}
+
+/// The value of `os.environ.get("GATE_DAG", "<default>")` in the planner.
+fn gate_dag_default(planner: &str) -> String {
+    let key = "os.environ.get(\"GATE_DAG\", \"";
+    let line = planner
+        .lines()
+        .find(|line| line.contains(key))
+        .expect("gate-dag.py reads GATE_DAG with a default");
+    line.split(key)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a default between quotes")
+        .to_string()
+}
+
+/// D-F34n: the DAG is the default only with evidence, which is no pending line in the latency list.
+fn activation_problem(default: &str, pending: usize) -> Option<String> {
+    (default == "1" && pending > 0).then(|| {
+        format!(
+            "GATE_DAG defaults to 1 with {pending} pending line(s) in scripts/gate-latency.txt: the DAG is not the default before they have their evidence"
+        )
+    })
+}
+
+#[test]
+fn the_dag_is_not_the_default_while_a_latency_line_is_pending() {
+    let refused = activation_problem("1", 2);
+    assert!(
+        refused.is_some_and(|text| text.contains("GATE_DAG defaults to 1 with 2 pending line(s)")),
+        "a default of 1 with two pending lines is not refused"
+    );
+    assert!(
+        activation_problem("0", 2).is_none() && activation_problem("1", 0).is_none(),
+        "the guard refuses a default of 0, or a list with nothing pending"
+    );
+    let pending = latency_lines()
+        .iter()
+        .filter(|line| line.evidence == "pendiente")
+        .count();
+    let default = gate_dag_default(&read("scripts/gate-dag.py"));
+    if let Some(problem) = activation_problem(&default, pending) {
+        panic!("{problem}");
+    }
+}
+
+/// The cluster names a row declares in its resources: `cluster:C_b3` is `b3`.
+fn clusters_of(line: &str) -> Vec<String> {
+    resources_of(line)
+        .iter()
+        .filter_map(|r| r.strip_prefix("cluster:C_"))
+        .map(String::from)
+        .collect()
+}
+
+/// The resources of a row (its fourth field), without the `-` of a row that names none.
+fn resources_of(line: &str) -> Vec<String> {
+    line.split_whitespace()
+        .nth(3)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|resource| *resource != "-")
+        .map(String::from)
+        .collect()
+}
+
+/// D-F34j: a row declares a cluster exactly when its step runs a lane in one. B3 builds the release binary in a lane
+/// of its own and its row said nothing, which left the one-step-per-cluster rule with a hole.
+#[test]
+fn a_row_declares_a_cluster_exactly_when_its_step_runs_a_lane_in_one() {
+    let gate = read("scripts/merge-gate.sh");
+    for (_, id, _, line) in dag_rows() {
+        let body =
+            step_body(&gate, &id).unwrap_or_else(|| panic!("merge-gate.sh has no step_{id}()"));
+        let lanes: Vec<String> = body
+            .iter()
+            .filter(|code| !code.trim_start().starts_with('#'))
+            .filter_map(|code| code.split("run_in_lane ").nth(1))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .map(String::from)
+            .collect();
+        let clusters = clusters_of(&line);
+        for lane in &lanes {
+            assert!(
+                clusters.contains(lane),
+                "step_{id} runs run_in_lane {lane} and its row declares no cluster:C_{lane}: {line}"
+            );
+        }
+        for cluster in &clusters {
+            assert!(
+                lanes.contains(cluster),
+                "row {id} declares cluster:C_{cluster} and step_{id} runs no run_in_lane {cluster}: {line}"
+            );
+        }
+    }
+}
+
+/// D-F34f, D-F34g: the table is what the planner judges before it starts. A row names a target to build in, or reads
+/// the target another row builds (`reader`, which only reads the binary on disk and waits for its producer). Two rows
+/// in one target are ordered by their dependencies unless both read it; a row that is not a reader has a target of its
+/// own; no cluster is shared; and every resource is of a kind the planner knows. REL and E2E read T_rel, B3's; NLI
+/// reads T_dbg, DBG's.
+#[test]
+fn the_readers_read_the_target_of_their_producer_and_no_cluster_is_shared() {
+    let mut rows = dag_rows();
+    rows.sort_by_key(|row| row.0);
+    let target_of = |line: &str| {
+        resources_of(line)
+            .iter()
+            .find_map(|r| r.strip_prefix("target:").map(String::from))
+    };
+    let is_reader = |line: &str| resources_of(line).iter().any(|r| r == "reader");
+    for (n, (_, a, _, line_a)) in rows.iter().enumerate() {
+        let Some(target) = target_of(line_a) else {
+            continue;
+        };
+        for (_, b, _, line_b) in &rows[n + 1..] {
+            if target_of(line_b).as_deref() != Some(target.as_str()) {
+                continue;
+            }
+            let both_read = is_reader(line_a) && is_reader(line_b);
+            assert!(
+                both_read || depends_on(&rows, b, a, 0) || depends_on(&rows, a, b, 0),
+                "{a} and {b} share {target} and neither depends on the other"
+            );
+        }
+    }
+    let mut builders = std::collections::BTreeMap::new();
+    for (_, id, _, line) in rows.iter().filter(|row| !is_reader(&row.3)) {
+        if let Some(target) = target_of(line)
+            && let Some(other) = builders.insert(target.clone(), id.clone())
+        {
+            panic!(
+                "{other} and {id} both build in {target}: a row that is not a reader has a target of its own"
+            );
+        }
+    }
+    let mut readers: Vec<&str> = rows
+        .iter()
+        .filter(|(_, _, _, line)| is_reader(line))
+        .map(|(_, id, _, _)| id.as_str())
+        .collect();
+    readers.sort_unstable();
+    assert_eq!(
+        readers,
+        ["E2E", "NLI", "REL"],
+        "the readers of the table are REL and E2E (T_rel) and NLI (T_dbg), and only them"
+    );
+    for (id, target) in [("REL", "T_rel"), ("E2E", "T_rel"), ("NLI", "T_dbg")] {
+        let (_, _, _, line) = rows
+            .iter()
+            .find(|row| row.1 == id)
+            .unwrap_or_else(|| panic!("gate-dag.txt has no row {id}"));
+        assert!(
+            is_reader(line) && target_of(line).as_deref() == Some(target),
+            "row {id} is a reader of {target}: it reads the binary its producer built and builds nothing: {line}"
+        );
+        assert!(
+            rows.iter().any(|(_, producer, _, other)| {
+                !is_reader(other)
+                    && target_of(other).as_deref() == Some(target)
+                    && depends_on(&rows, id, producer, 0)
+            }),
+            "reader {id} of {target} has no row that builds {target} above it"
+        );
+    }
+    let mut clusters = std::collections::BTreeMap::new();
+    for (_, id, _, line) in &rows {
+        for cluster in clusters_of(line) {
+            if let Some(other) = clusters.insert(cluster.clone(), id.clone()) {
+                panic!("rows {other} and {id} share cluster:C_{cluster}: one step per cluster");
+            }
+        }
+        for resource in resources_of(line) {
+            assert!(
+                resource == "models"
+                    || resource == "reader"
+                    || resource.starts_with("target:")
+                    || resource.starts_with("cluster:"),
+                "row {id} names the resource {resource}, which is none of target:, cluster:, models or reader"
+            );
+        }
+    }
+}
+
+/// D-F34h: the E2E lane does not compile. It provisions its database with the release binary B3 left, after checking
+/// it against B3's sha256, and the provision that used to build a debug binary (gate_bin, in the target the readers of
+/// REL hold) is not called from it.
+#[test]
+fn lane_e_provisions_with_the_release_binary_and_runs_no_cargo() {
+    let suite = read("scripts/run-all-tests.sh");
+    let body = lane_body(&suite, "E");
+    let code: Vec<&String> = body
+        .iter()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect();
+    for line in &code {
+        assert!(
+            !line.contains("cargo "),
+            "lane_E runs cargo, and the E2E reads a binary that is already built: {line}"
+        );
+        assert!(
+            !line.contains("gate_bin"),
+            "lane_E calls gate_bin, which builds a debug binary: {line}"
+        );
+    }
+    let provision = code
+        .iter()
+        .position(|line| line.contains("provision_gate_db"))
+        .expect("lane_E provisions brain_gate when it is missing");
+    assert!(
+        code[provision].contains("provision_gate_db \"$REL_BIN\""),
+        "lane_E provisions without the release binary: {}",
+        code[provision]
+    );
+    let resolved = code
+        .iter()
+        .position(|line| line.trim_start().starts_with("REL_BIN="))
+        .expect("lane_E resolves REL_BIN");
+    assert!(
+        resolved < provision,
+        "lane_E provisions before it resolves REL_BIN"
+    );
+}
