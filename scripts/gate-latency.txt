@@ -20,7 +20,9 @@
 # Only nli_entailment prints its measure, so it is the only one with a ratio: the 500 ms limit over the 1199 ms of the
 #   6-nov run under six autotests: 0.42.
 tests/nli_entailment.rs exclusive 0.42 orquestador-0.31 2026-11-06 listón 500 ms; 1199 ms por veredicto con seis autotests encima (6-nov 09:39), 37,7 ms quieta, 104,8 ms en la fila NLI sola (19.ª)
+tests/gate_dag_contract.rs shared pendiente orquestador-0.31 2026-11-30 CI-J14g: una fila sorda a TERM muere por KILL al acabar la gracia (1 s) y el planificador no la espera (tope 12 s); en DBG sin medida; se mide en las corridas DAG finales
 tests/gate_history_contract.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
+tests/gate_usl_contract.rs shared pendiente orquestador-0.31 2026-11-30 CI-F5a U18: un cargo colgado se corta en su plazo (1 s) y el barrido no lo espera (tope 30 s); en DBG sin medida; se mide en las corridas DAG finales
 tests/scratch_databases_clone_one_template.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
 tests/v025_a_stuck_sync_fails_instead_of_hanging.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales
 tests/v029_accounts_over_real_http.rs shared pendiente orquestador-0.31 2026-11-30 F3.3c-2 D7: en DBG sin medida; se mide en las corridas DAG finales

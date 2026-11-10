@@ -815,7 +815,7 @@ def _tablas_conocidas(tabla: str) -> dict[str, bytes]:
     """{sha256: content} of the table as of today and of every commit that changed it (D-F5s)."""
     with open(tabla, "rb") as fh:
         actual = fh.read()
-    conocidas = {gate_dag().sha256_of(tabla): actual}
+    conocidas = {hashlib.sha256(actual).hexdigest(): actual}
     real, base = os.path.realpath(tabla), os.path.realpath(raiz())
     relativa = os.path.relpath(real, base)
     if relativa.startswith(".."):
