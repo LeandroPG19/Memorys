@@ -300,6 +300,12 @@ FAKE
   # `timeout` is looked up here, in the PATH of the self-test, and not in the PATH the row is given.
   row_s="${GATE_SELFTEST_ROW_S:-240}"
   row_bound=(timeout -k 5 "$row_s")
+  # CI-J17: the copy runs the planner (gate-dag.py) for real, and a planner delegates the cgroup it runs in: one that reads the
+  # real /proc/self/cgroup and /sys/fs/cgroup from inside the judge's own scope creates a `juez` inside it and moves the
+  # judge's processes. A row gets a cgroup tree of its own with no `0::` line, so the planner has no scope to delegate and
+  # the gate counts no limit; a row that needs a cgroup (F1) passes its own GATE_CGROUP_ROOT and GATE_PROC_SELF_CGROUP.
+  mkdir -p "$tmp/sin-cgroup/raiz"
+  : >"$tmp/sin-cgroup/propio"
   run_copy() { run_copy_as "$judge_test_url" "$@"; }
   run_copy_as() {
     local base="$1" name="$2" fail_at="${3:-}"
@@ -310,7 +316,8 @@ FAKE
     # CI-F3.3c (the judge's names): a row takes the target root of the gate from its own HOME, not from the judge's
     # CARGO_TARGET_DIR, which is a foreign directory no user can make. A row that needs one passes it in "$@".
     { "${row_bound[@]}" env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS -u CARGO_TARGET_DIR HOME="$tmp/$name/home" \
-        PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" ${start[@]+"${start[@]}"} "$@" \
+        PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" ${start[@]+"${start[@]}"} \
+        GATE_CGROUP_ROOT="$tmp/sin-cgroup/raiz" GATE_PROC_SELF_CGROUP="$tmp/sin-cgroup/propio" "$@" \
         "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 </dev/null || rc=$?; } 2>/dev/null
     (( rc != 124 )) || self_fail "$name: the gate was still running after $row_s s, so it is waiting for something that does not come: $(tail -n 5 "$tmp/$name.out" 2>/dev/null)"
   }
