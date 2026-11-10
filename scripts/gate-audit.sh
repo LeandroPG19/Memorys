@@ -57,12 +57,11 @@ cluster C_dbg /tc/dbg.Ab12
 cluster C_nli /tc/nli.Ef56
 cluster C_rel /tc/rel.Gh78
 cluster C_e2e /tc/e2e.Ij90
-cluster C_docs /tc/docs.Cd34
 ROOTS
     cat > "$1/steps" <<'STEPS'
 DBG target:T_dbg,cluster:C_dbg,models merge-gate\.sh --step DBG$
 NLI target:T_dbg,cluster:C_nli,models,reader merge-gate\.sh --step NLI$
-DC target:T_docs,cluster:C_docs merge-gate\.sh --step DC$
+DC target:T_docs merge-gate\.sh --step DC$
 REL target:T_rel,cluster:C_rel,models,reader merge-gate\.sh --step REL$
 E2E target:T_rel,cluster:C_e2e,models,reader merge-gate\.sh --step E2E$
 STEPS
@@ -112,7 +111,6 @@ KEYS
     tr_exec "$1" "$4" "/r/t/T_dbg/debug/deps/$5" "$5"
     case "$3" in
       DBG) tr_unix "$1" "$4" /tc/dbg.Ab12/.s.PGSQL.5432 0 ;;
-      DC) tr_unix "$1" "$4" /tc/docs.Cd34/.s.PGSQL.5432 0 ;;
     esac
   }
 
@@ -196,7 +194,6 @@ FAKE
     tr_exec "$fx" 131 /usr/bin/bash bash scripts/merge-gate.sh --step DC
     tr_fork "$fx" 131 132
     tr_exec "$fx" 132 "$tt/T_docs/debug/deps/beta-0123456789abcdef" beta-0123456789abcdef
-    tr_unix "$fx" 132 "$d/clusters/docs.Cd34Ef/.s.PGSQL.5432" 0
     tr_open "$fx" 132 w "$dag/tmp/DC/b"
     tr_open "$fx" 132 w "$tt/T_docs/debug/out"
   }
@@ -335,11 +332,11 @@ FAKE
     local d; d="$(rd)"; au_std "$d"
     tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
     tr_unix "$d/tr" 101 /tc/dbg.Ab12/.s.PGSQL.5432 0
-    tr_unix "$d/tr" 101 /tc/docs.Cd34/.s.PGSQL.5432 0
+    tr_unix "$d/tr" 101 /tc/nli.Ef56/.s.PGSQL.5432 0
     tr_unix "$d/tr" 101 /var/run/postgresql/.s.PGSQL.5432 0
     au_run "$d"
     row_atleast A5 "pg-connect del suyo" "$(au_count "$d/out" pg-connect /tc/dbg.Ab12)" 1 || return 1
-    row_atleast A5 "pg-socket-cross" "$(au_count "$d/out" pg-socket-cross /tc/docs.Cd34)" 1 || return 1
+    row_atleast A5 "pg-socket-cross" "$(au_count "$d/out" pg-socket-cross /tc/nli.Ef56)" 1 || return 1
     row_atleast A5 "pg-socket-outside" "$(au_count "$d/out" pg-socket-outside /var/run/postgresql)" 1 || return 1
   }
 
@@ -454,7 +451,7 @@ FAKE
   }
 
   row_a11() { # la propuesta de grupos sale en el directorio del informe y el fichero versionado no cambia
-    local d t prop; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    local d t prop; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
     t="$d/tree"; prop="$d/run/audit/groups.proposed.txt"
     au_fake_strace "$d/bin"
     au_fx "$d"
@@ -491,7 +488,7 @@ FAKE
 
   row_a13() { # el audit lanza merge-gate.sh UNA vez bajo strace, con GATE_DAG=0 y sin --step: las filas las lanza el planificador; el exit es el de --analyze
     local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "30 B3 P target:T_rel,cluster:C_b3 normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" \
-      "60 DC P target:T_docs,cluster:C_docs normal"
+      "60 DC P target:T_docs normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
     au_go "$d"
@@ -512,7 +509,7 @@ FAKE
 
   row_a13b() { # un merge-gate que sale distinto de 0 deja la auditoria incompleta: exit 2, el resto se escribe igual
     local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" \
-      "60 DC P target:T_docs,cluster:C_docs normal"
+      "60 DC P target:T_docs normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
     printf '101\n' > "$d/tree/scripts/exit-gate"
@@ -556,7 +553,7 @@ FAKE
   }
 
   row_a15() { # las filas llevan NAME=value delante y la orden --step: el audit las reconoce por el argv de merge-gate.sh --step <id>
-    local d line; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    local d line; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
     line="$(grep ' DBG ' "$d/tree/scripts/gate-dag.txt")"
     row_has A15 "la fila de la tabla lleva su entorno y su orden" "$line" "CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DBG" || return 1
     au_fake_strace "$d/bin"
@@ -572,7 +569,7 @@ FAKE
   }
 
   row_a16() { # la raiz de un target es <CARGO_TARGET_DIR>/<clave de arbol>/<T>, y la clave sale de gate-dag.py tree-key, la misma formula del planificador
-    local d tt key; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    local d tt key; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
     key="$(au_key "$d/tree")"
     row_want A16 "gate-dag.py tree-key" "$(python3 -I "$d/tree/scripts/gate-dag.py" tree-key "$d/tree" 2>/dev/null || true)" "$key" || return 1
     au_fake_strace "$d/bin"
@@ -587,19 +584,20 @@ FAKE
   }
 
   row_a17() { # el cluster de un carril vive en <GATE_CLUSTER_ROOT>/<carril>.XXXXXX, y el carril sale del nombre del recurso cluster:C_<carril>
-    local d; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    local d; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "25 NLI DBG target:T_dbg,cluster:C_nli,models,reader exclusive" \
+      "60 DC P target:T_docs normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
-    tr_unix "$d/fx/gate" 122 "$d/clusters/docs.Cd34Ef/.s.PGSQL.5432" 0
+    tr_unix "$d/fx/gate" 122 "$d/clusters/nli.Ef56Gh/.s.PGSQL.5432" 0
     au_go "$d"
     row_want A17 exit "$RC" 1 || return 1
     row_atleast A17 "pg-connect al cluster propio" "$(au_count "$d/out" pg-connect "$d/clusters/dbg.Ab12Cd")" 1 || return 1
-    row_atleast A17 "pg-socket-cross al de otro carril" "$(au_count "$d/out" pg-socket-cross "$d/clusters/docs.Cd34Ef")" 1 || return 1
+    row_atleast A17 "pg-socket-cross al de otro carril" "$(au_count "$d/out" pg-socket-cross "$d/clusters/nli.Ef56Gh")" 1 || return 1
     row_want A17 "ningun pg-socket-outside" "$(au_count "$d/out" pg-socket-outside "")" 0 || return 1
   }
 
   row_a18() { # el directorio de corrida del planificador sale de la traza: la fila que escribe en el de otra es intrusion, y sin ese directorio no hay auditoria
-    local d e dag; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    local d e dag; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
     au_fake_strace "$d/bin"
     au_fx "$d"
     dag="$d/tmp/memory-industry-dag.Ab12Cd"
@@ -608,7 +606,7 @@ FAKE
     row_want A18 exit "$RC" 1 || return 1
     row_atleast A18 "root-intrusion en la raiz de DBG" "$(au_count "$d/out" root-intrusion "$dag/tmp/DBG/stolen")" 1 || return 1
     row_has A18 "dice de quien" "$(cat "$d/out")" "writes in the run directory of DBG" || return 1
-    e="$(rd)"; au_tree "$e" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    e="$(rd)"; au_tree "$e" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs normal"
     au_fake_strace "$e/bin"
     au_fx "$e"
     sed -i '/^mkdir(/d' "$e/fx/gate/t.120"
