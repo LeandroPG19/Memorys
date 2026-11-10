@@ -49,10 +49,23 @@
 # terminal is seen. A record from another host or another MSYS installation
 # cannot be looked up from here, and is refused with the path to remove by hand
 # rather than guessed at.
+# CI-J15d (H6): this file is loaded once per shell. gate-cluster.sh sources it too, and a second load would empty the
+# lock its caller already holds (GATE_LOCK, GATE_LOCK_HELD and GATE_OWNER). The guard is a function and not a variable so
+# that a variable of the environment cannot say "already loaded" to a shell that has nothing.
+if declare -F gate_lock_is_loaded >/dev/null; then
+  return 0
+fi
+gate_lock_is_loaded() { :; }
 # shellcheck disable=SC2034 # read by the scripts that source this one
 GATE_LOCK="$HOME/.cache/cuba-gate/lock"
 GATE_LOCK_HELD=""
 GATE_OWNER=""
+# CI-J15c (H5): the mark of the judge's servers (cluster_name), the grammar of the name of a lane and the encoding of a socket
+# directory as the host of a URL are written here once. gate-cluster.sh makes the lanes with them and the guard of the
+# judge's server below judges with them, so a lane that can be made is a lane that can be judged.
+GATE_SERVER_MARK=memory-industry-gate
+GATE_LANE_RE='[a-z0-9][a-z0-9-]*'
+gate_encode_host() { printf '%s' "${1//\//%2F}"; }
 # The live corpus port (D-A11): the one place the port is spelled as code. The scripts
 # that must refuse it read this name, not the number.
 # shellcheck disable=SC2034 # read by the scripts that source this one
@@ -616,7 +629,7 @@ gate_require_given_database_url() {
 
 gate_require_judge_server() {
   local url="${1:-}" port identity cn sysid
-  local identity_re='^[^|]*[|][0-9]+$' mark_re='^memory-industry-gate(-[A-Za-z0-9]+)?$'
+  local identity_re='^[^|]*[|][0-9]+$' mark_re="^$GATE_SERVER_MARK(-$GATE_LANE_RE)?\$"
   gate_require_given_database_url "$url"
   command -v psql >/dev/null 2>&1 \
     || gate_refuse "psql is not on PATH, so the judge cannot read which server DATABASE_URL names (cluster_name and system_identifier). Install the PostgreSQL client tools."
@@ -654,9 +667,9 @@ gate_require_judge_server() {
   # D-F2i: a lane (GATE_LANE set) is judged by its own name and by its own socket under this root. Its
   # cluster_name is memory-industry-gate-<lane> and nothing else, and its URL is never TCP.
   if [[ -n "${GATE_LANE:-}" ]]; then
-    [[ "$cn" == "memory-industry-gate-$GATE_LANE" ]] \
-      || gate_refuse "lane $GATE_LANE is served by '$cn' (system_identifier $sysid), not by memory-industry-gate-$GATE_LANE: lanes do not cross (D-F2i)."
-    [[ -n "${GATE_CLUSTER_ROOT:-}" && "${url#*@}" == "${GATE_CLUSTER_ROOT//\//%2F}%2F"* ]] \
+    [[ "$cn" == "$GATE_SERVER_MARK-$GATE_LANE" ]] \
+      || gate_refuse "lane $GATE_LANE is served by '$cn' (system_identifier $sysid), not by $GATE_SERVER_MARK-$GATE_LANE: lanes do not cross (D-F2i)."
+    [[ -n "${GATE_CLUSTER_ROOT:-}" && "${url#*@}" == "$(gate_encode_host "$GATE_CLUSTER_ROOT")%2F"* ]] \
       || gate_refuse "lane $GATE_LANE has a URL that is not a socket under ${GATE_CLUSTER_ROOT:-no root} (D-F2i): a lane is never TCP."
     GATE_JUDGE_SYSID="$sysid"
     local sockdir="${url#*@}"

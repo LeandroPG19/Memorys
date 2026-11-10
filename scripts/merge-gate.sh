@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# CI-J15d (H6): gate-lock.sh assigns GATE_LOCK its own default when it is loaded, so the lock that a step inherited from the
+# gate is read before the load. --step refuses a lock that is not the one its own HOME names.
+GATE_LOCK_INHERITED="${GATE_LOCK:-}"
 
 # One gate at a time, for the whole of this one: run-all-tests.sh is only its
 # first half, and everything after it (clippy and tests under --features docs,
@@ -1607,8 +1610,26 @@ down mut'
   fi
   grep -q '^5 ' "$tmp/f1operator/home/cargo.jobs" \
     || self_fail "F1.2: no cargo call kept the CARGO_BUILD_JOBS=5 the operator set (a row that names none must keep it): $(cat "$tmp/f1operator/home/cargo.jobs")"
-  if grep -qvE '^(5|8|12|4|2) ' "$tmp/f1operator/home/cargo.jobs"; then
-    self_fail "F1.2: a cargo call saw neither the operator's 5 nor the jobs its row names in gate-dag.txt: $(cat "$tmp/f1operator/home/cargo.jobs")"
+  table_jobs="$(grep -o 'CARGO_BUILD_JOBS=[0-9]*' "$tmp/f1operator/scripts/gate-dag.txt" | cut -d= -f2 | sort -un | paste -sd'|' -)"
+  [[ -n "$table_jobs" ]] \
+    || self_fail "F1.2: no row of gate-dag.txt names a CARGO_BUILD_JOBS, so the jobs of the rows cannot be read from it"
+  if grep -qvE "^(5|$table_jobs) " "$tmp/f1operator/home/cargo.jobs"; then
+    self_fail "F1.2: a cargo call saw neither the operator's 5 nor the jobs its row names in gate-dag.txt ($table_jobs): $(cat "$tmp/f1operator/home/cargo.jobs")"
+  fi
+  # CI-J15e (H10): the jobs of the rows are the table's and not a list copied here. A table whose DC row names 6, a number
+  # the list used to lack, gives the cargo call of DC its 6, and the numbers read from that table hold it.
+  cg_tree f1table "800000 100000"
+  fake_tree f1table "$reads_while_running"
+  sed -i 's/CARGO_BUILD_JOBS=8 bash scripts\/merge-gate.sh --step DC$/CARGO_BUILD_JOBS=6 bash scripts\/merge-gate.sh --step DC/' "$tmp/f1table/scripts/gate-dag.txt"
+  grep -q 'CARGO_BUILD_JOBS=6 bash scripts/merge-gate.sh --step DC$' "$tmp/f1table/scripts/gate-dag.txt" \
+    || self_fail "F1.2 table: the copy of the table did not take 6 jobs for DC: the DC row no longer ends in 'CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DC'"
+  run_copy f1table "" CARGO_BUILD_JOBS=5 GATE_CGROUP_ROOT="$tmp/cg/f1table/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1table/self"
+  (( rc == 0 )) || self_fail "F1.2 table: a gate whose DC row names 6 jobs exited $rc: $(cat "$tmp/f1table.out")"
+  grep -q '^6 ' "$tmp/f1table/home/cargo.jobs" \
+    || self_fail "F1.2 table: no cargo call saw the 6 jobs the DC row of the table names: $(cat "$tmp/f1table/home/cargo.jobs")"
+  table_jobs="$(grep -o 'CARGO_BUILD_JOBS=[0-9]*' "$tmp/f1table/scripts/gate-dag.txt" | cut -d= -f2 | sort -un | paste -sd'|' -)"
+  if grep -qvE "^(5|$table_jobs) " "$tmp/f1table/home/cargo.jobs"; then
+    self_fail "F1.2 table: a cargo call saw neither the operator's 5 nor the jobs the table names ($table_jobs): $(cat "$tmp/f1table/home/cargo.jobs")"
   fi
 
   # F2: the run-all-tests stand-in of the rows below answers --check-models (its verdict is
@@ -1812,6 +1833,59 @@ exit 0'
   [[ -z "$(steps_of step_foreign)" ]] || self_fail "--step with a foreign ticket ran a step: $(steps_of step_foreign)"
   [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-planted ]] || self_fail "--step with a foreign ticket spent the planner's ticket"
 
+  # CI-J15e (H9): the dispatch of a row is its function step_<id>: a new row is its function and its line of the table, and no
+  # case holds the ids written by hand. The tree gets a step_Q the real script does not have and `--step Q`, with its ticket,
+  # runs it. An id that is no function is refused with 2 and named, and an id with shell in it runs nothing.
+  fake_tree step_new "$step_run_all"
+  awk '/^if \[\[ "\$\{1:-\}" == --step \]\]; then$/ { print "step_Q() { echo \"q-ran\" >>\"$HOME/steps\"; }" } { print }' \
+    "$tmp/step_new/scripts/merge-gate.sh" >"$tmp/step_new/scripts/merge-gate.new"
+  mv "$tmp/step_new/scripts/merge-gate.new" "$tmp/step_new/scripts/merge-gate.sh"
+  grep -qxF 'step_Q() { echo "q-ran" >>"$HOME/steps"; }' "$tmp/step_new/scripts/merge-gate.sh" \
+    || self_fail "J15e dispatch: the fixture got no step_Q: the dispatch line of merge-gate.sh is not the one the row looks for"
+  step_lock="$tmp/step_new/home/.cache/cuba-gate/lock"
+  mkdir -p "$step_lock/lanes"
+  owner_record "$$" fixture-owner >"$step_lock/owner"
+  printf '%s' tok-new >"$step_lock/lanes/20-DBG"
+  step_new_run() { # <id>: step_rc and $tmp/step_new.out
+    step_rc=0
+    env -i PATH="$tmp/step_new/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_new/home" GATE_LOCK="$step_lock" \
+      CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-new \
+      "$BASH" "$tmp/step_new/scripts/merge-gate.sh" --step "$1" >"$tmp/step_new.out" 2>&1 || step_rc=$?
+  }
+  step_new_run Q
+  (( step_rc == 0 )) || self_fail "J15e dispatch: --step Q, a function step_Q with no case arm, exited $step_rc, not 0: $(cat "$tmp/step_new.out")"
+  [[ "$(grep -cx 'q-ran' "$tmp/step_new/home/steps")" == 1 ]] \
+    || self_fail "J15e dispatch: --step Q did not run step_Q once: $(steps_of step_new)"
+  for bad_id in ZZZ 'Q;touch "$HOME/pwn"' '../x'; do
+    : >"$tmp/step_new/home/steps"
+    step_new_run "$bad_id"
+    (( step_rc == 2 )) || self_fail "J15e dispatch: --step '$bad_id' exited $step_rc, not 2: $(cat "$tmp/step_new.out")"
+    [[ -z "$(steps_of step_new)" && ! -e "$tmp/step_new/home/pwn" ]] \
+      || self_fail "J15e dispatch: --step '$bad_id' ran something: $(steps_of step_new)"
+  done
+  step_new_run ZZZ
+  grep -qF 'ZZZ' "$tmp/step_new.out" || self_fail "J15e dispatch: the refusal of --step ZZZ does not name it: $(cat "$tmp/step_new.out")"
+
+  # CI-J15d (H6): the lock a step inherits is the gate's. GATE_LOCK of the environment is read before gate-lock.sh is loaded,
+  # because the load assigns the default of the HOME, and a step whose inherited lock is not the one its HOME names is refused
+  # with 2 naming GATE_LOCK, before any lane, with the ticket unspent. Here the HOME's own lock holds a valid owner and
+  # ticket, so a step that read the default instead of what it inherited would run.
+  fake_tree step_lock "$step_run_all"
+  step_lock="$tmp/step_lock/home/.cache/cuba-gate/lock"
+  mkdir -p "$step_lock/lanes" "$tmp/step_lock/elsewhere/lock"
+  owner_record "$$" fixture-owner >"$step_lock/owner"
+  printf '%s' tok-lock >"$step_lock/lanes/20-DBG"
+  step_rc=0
+  env -i PATH="$tmp/step_lock/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_lock/home" GATE_LOCK="$tmp/step_lock/elsewhere/lock" \
+    CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-lock \
+    "$BASH" "$tmp/step_lock/scripts/merge-gate.sh" --step DBG >"$tmp/step_lock.out" 2>&1 || step_rc=$?
+  (( step_rc == 2 )) || self_fail "J15d: --step with an inherited GATE_LOCK that is not its HOME's exited $step_rc, not 2: $(cat "$tmp/step_lock.out")"
+  grep -qF 'GATE_LOCK' "$tmp/step_lock.out" \
+    || self_fail "J15d: the refusal of a different GATE_LOCK does not name it: $(cat "$tmp/step_lock.out")"
+  [[ -z "$(steps_of step_lock)" && ! -e "$tmp/step_lock/home/lane.owners" ]] \
+    || self_fail "J15d: --step with another GATE_LOCK made a lane or ran a step: $(steps_of step_lock)"
+  [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-lock ]] || self_fail "J15d: --step with another GATE_LOCK spent the ticket"
+
   # CI-J14h: a row that dies by KILL runs no trap, so the cluster it made stays under the root with this gate's owner on
   # it. The gate's exit, once it has collected the planner, takes down the directories of the root whose owner is its own
   # (the identity check of the library decides what is a postgres of theirs) and no other. The row makes three: this
@@ -1968,7 +2042,7 @@ gate_cluster_down_owned() {
   [[ -n "$GATE_OWNER" ]] || return 0
   for dir in "$GATE_CLUSTER_ROOT"/*/; do
     dir="${dir%/}"
-    [[ -d "$dir" && "${dir##*/}" =~ ^[a-z0-9][a-z0-9-]*\.[A-Za-z0-9]{6}$ && -f "$dir/owner" ]] || continue
+    [[ -d "$dir" && "${dir##*/}" =~ ^$GATE_LANE_RE\.[A-Za-z0-9]{6}$ && -f "$dir/owner" ]] || continue
     owner="$(<"$dir/owner")"
     [[ "$owner" == "$GATE_OWNER"* ]] || continue
     pid="$(head -n 1 "$dir/data/postmaster.pid" 2>/dev/null || true)"
@@ -2402,8 +2476,10 @@ step_M() {
 # takes no lock and writes no verdict: its ticket is checked here, and the lane it starts is the one that spends it.
 gate_step_main() {
   local id="$1"
-  [[ -n "${CUBA_GATE_LANE_TOKEN:-}" && -n "${CUBA_GATE_LOCK_OWNER:-}" && -n "${GATE_LOCK:-}" ]] \
+  [[ -n "${CUBA_GATE_LANE_TOKEN:-}" && -n "${CUBA_GATE_LOCK_OWNER:-}" && -n "$GATE_LOCK_INHERITED" ]] \
     || gate_refuse "--step runs one row of scripts/gate-dag.txt, which the planner (gate-dag.py) starts with its lane ticket. Run scripts/merge-gate.sh for the whole gate."
+  [[ "$GATE_LOCK_INHERITED" == "$GATE_LOCK" ]] \
+    || gate_refuse "--step: the GATE_LOCK it inherited ($GATE_LOCK_INHERITED) is not the lock its own HOME names ($GATE_LOCK), so the ticket it holds is not of this gate's lock"
   lane_token_check "$GATE_LOCK" "$CUBA_GATE_LOCK_OWNER" || exit 2
   # CI-F3.3c: GATE_OWNER is a shell variable that acquire_gate_lock sets in gate_main, and a step is a process of its
   # own, so it starts empty. Its value is the record the lock holds now, which lane_token_check has just checked against
@@ -2417,18 +2493,11 @@ gate_step_main() {
   fi
   trap 'gate_cluster_down_all' EXIT
   trap 'exit 2' INT
-  case "$id" in
-    P) step_P ;;
-    DBG) step_DBG ;;
-    NLI) step_NLI ;;
-    B3) step_B3 ;;
-    REL) step_REL ;;
-    E2E) step_E2E ;;
-    DC) step_DC ;;
-    CV) step_CV ;;
-    M) step_M ;;
-    *) gate_refuse "--step: $id is no row of scripts/gate-dag.txt" ;;
-  esac
+  # CI-J15e (H9): the row is the function step_<id>, so a new row is its function and its line of the table, and no list of ids
+  # is kept here. The name is asked of declare -F before it is called: an id that is no function never reaches the call.
+  declare -F "step_$id" >/dev/null \
+    || gate_refuse "--step: $id is no row of scripts/gate-dag.txt: merge-gate.sh has no function step_$id"
+  "step_$id"
 }
 
 # The dispatch: one row of the table, or the whole gate. Bash reads this file from the top, and the rows and gate_main

@@ -4,7 +4,8 @@
 # Lee trazas de strace de los pasos de test y dice que pares de pasos que el DAG puede
 # solapar tocan lo mismo: rutas, puertos, clusteres de Postgres y la base viva.
 # Modos: --self-test (autotest hermetico), --analyze (solo lee trazas) y --run (lanza
-# los pasos de test bajo strace, en serie, y analiza lo que sale). Sin strace, --run sale 2.
+# merge-gate.sh en serie bajo strace, una sola vez, y analiza lo que sale: las filas de gate-dag.txt las lanza el
+# planificador y el audit las reconoce en la traza por su argv). Sin strace, --run sale 2.
 set -euo pipefail
 
 # --- self-test begin ---
@@ -16,7 +17,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   CI_TIEMPOS_DIR="$SELF_TMP/tiempos"; GATE_CLUSTER_ROOT="$SELF_TMP/clusters"
   mkdir -p "$HOME" "$cache" "$TMPDIR" "$CI_TIEMPOS_DIR" "$GATE_CLUSTER_ROOT" "$SELF_TMP/standins"
   export HOME XDG_CACHE_HOME TMPDIR CI_TIEMPOS_DIR GATE_CLUSTER_ROOT
-  unset GATE_AUDIT_RUN GATE_AUDIT_MAX_GB
+  unset GATE_AUDIT_RUN GATE_AUDIT_MAX_GB GATE_DAG CARGO_TARGET_DIR GATE_CLUSTER_TMP
   # Un strace de pega: si una fila lo llama sin fingirlo, sale 97 y la fila queda roja.
   printf '#!/usr/bin/env bash\necho "stand-in strace used outside a row" >&2\nexit 97\n' > "$SELF_TMP/standins/strace"
   chmod +x "$SELF_TMP/standins/strace"
@@ -54,16 +55,16 @@ target T_rel /r/t/T_rel
 target T_docs /r/t/T_docs
 cluster C_dbg /tc/dbg.Ab12
 cluster C_nli /tc/nli.Ef56
-cluster C_relh /tc/relh.Gh78
+cluster C_rel /tc/rel.Gh78
 cluster C_e2e /tc/e2e.Ij90
 cluster C_docs /tc/docs.Cd34
 ROOTS
     cat > "$1/steps" <<'STEPS'
 DBG target:T_dbg,cluster:C_dbg,models merge-gate\.sh --step DBG$
-NLI target:T_dbg,cluster:C_nli,models merge-gate\.sh --step NLI$
+NLI target:T_dbg,cluster:C_nli,models,reader merge-gate\.sh --step NLI$
 DC target:T_docs,cluster:C_docs merge-gate\.sh --step DC$
-REL target:T_rel,cluster:C_relh,models merge-gate\.sh --step REL$
-E2E target:T_rel,cluster:C_e2e,models merge-gate\.sh --step E2E$
+REL target:T_rel,cluster:C_rel,models,reader merge-gate\.sh --step REL$
+E2E target:T_rel,cluster:C_e2e,models,reader merge-gate\.sh --step E2E$
 STEPS
     cat > "$1/overlap" <<'OVERLAP'
 DBG DC
@@ -104,6 +105,7 @@ KEYS
   }
   tr_bind() { tr_put "$1" "$2" "bind(5<socket:[3]>, {sa_family=AF_INET, sin_port=htons($3), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = 0"; } # <trdir> <pid> <puerto>
   tr_bind_unix() { tr_put "$1" "$2" "bind(5<socket:[4]>, {sa_family=AF_UNIX, sun_path=\"$3\"}, 110) = 0"; }
+  tr_mkdir() { tr_put "$1" "$2" "mkdir(\"$3\", 0700) = 0"; } # <trdir> <pid> <ruta>: el planificador hace su directorio de corrida
   tr_lane() { # <trdir> <pid-bash> <paso> <pid-test> <binario>: un paso con su unidad, que ancla una conexion a su cluster
     tr_exec "$1" "$2" /usr/bin/bash bash scripts/merge-gate.sh --step "$3"
     tr_fork "$1" "$2" "$4"
@@ -114,17 +116,24 @@ KEYS
     esac
   }
 
-  # Arbol de fixture para --run: el guion, su tabla (<idx> <id> <deps> <recursos> <clase>), una orden falsa por paso y un centinela.
-  au_fake_step() {
-    cat > "$1" <<'STEP'
+  # Arbol de fixture para --run: lo que el audit necesita de un arbol de verdad (el guion, sus bibliotecas, el planificador y
+  # la tabla con la forma de la real: NAME=value delante y la orden `bash scripts/merge-gate.sh --step <id>`), un merge-gate
+  # falso que solo anota como lo lanzaron, un strace falso que entrega las trazas del fixture y un centinela. El audit no
+  # lanza filas: lanza merge-gate.sh una vez y las filas las lanza el planificador.
+  au_fake_merge_gate() {
+    cat > "$1" <<'GATE'
 #!/usr/bin/env bash
-printf '%s\n' "$1" >> "$FAKE_LLEGADA"
-ex="$(dirname "$0")/exit-$1"
+{
+  printf 'GATE_DAG=%s\n' "${GATE_DAG-unset}"
+  printf 'args=%s\n' "$*"
+  printf 'CARGO_TARGET_DIR=%s\n' "${CARGO_TARGET_DIR-unset}"
+} >> "$FAKE_LLEGADA"
+ex="$(dirname "$0")/exit-gate"
 [[ -f "$ex" ]] && exit "$(cat "$ex")"
 exit 0
-STEP
+GATE
   }
-  au_fake_strace() { # <bindir>: anota su invocacion, copia las trazas de su paso y ejecuta la orden tras --
+  au_fake_strace() { # <bindir>: anota su invocacion, copia las trazas de su directorio de salida y ejecuta la orden tras --
     mkdir -p "$1"
     cat > "$1/strace" <<'FAKE'
 #!/usr/bin/env bash
@@ -148,37 +157,55 @@ FAKE
     chmod +x "$1/strace"
   }
   au_tree() { # <d> "<idx> <id> <deps> <recursos> <clase>"...
-    local d="$1" t="$1/tree" spec idx id deps rec cls
+    local d="$1" t="$1/tree" spec idx id deps rec cls env f
     shift
     mkdir -p "$t/scripts"
     cp "$GA" "$t/scripts/gate-audit.sh"
-    cp "$(dirname "$GA")/gate-lock.sh" "$t/scripts/gate-lock.sh"
-    au_fake_step "$t/scripts/fake-step.sh"
+    for f in gate-lock.sh gate-cluster.sh gate-dag.py gate_history.py; do cp "$(dirname "$GA")/$f" "$t/scripts/$f"; done
+    au_fake_merge_gate "$t/scripts/merge-gate.sh"
     printf 'SENTINEL\n' > "$t/scripts/gate-groups.txt"
     : > "$t/scripts/gate-dag.txt"
     for spec in "$@"; do
       read -r idx id deps rec cls <<<"$spec"
-      printf '%s %s %s %s %s 1 1 1 bash %s/scripts/fake-step.sh %s\n' "$idx" "$id" "$deps" "$rec" "$cls" "$t" "$id" >> "$t/scripts/gate-dag.txt"
+      env=""
+      [[ "$rec" != *target:* ]] || env="CARGO_BUILD_JOBS=8 "
+      printf '%s %s %s %s %s 1 1 1 %sbash scripts/merge-gate.sh --step %s\n' "$idx" "$id" "$deps" "$rec" "$cls" "$env" "$id" >> "$t/scripts/gate-dag.txt"
     done
   }
-  au_fx13() { # <d>: trazas benignas de DBG y DC (cada una escribe solo en su raiz y ancla su cluster) para --run
-    local d="$1" fx="$1/fx" t="$1/tree"
-    tr_exec "$fx/20-DBG" 100 /usr/bin/bash bash "$t/scripts/fake-step.sh" DBG
-    tr_fork "$fx/20-DBG" 100 101
-    tr_exec "$fx/20-DBG" 101 /r/t/T_dbg/debug/deps/alfa-0123456789abcdef alfa-0123456789abcdef
-    tr_unix "$fx/20-DBG" 101 "$d/clusters/C_dbg.Ab12/.s.PGSQL.5432" 0
-    tr_open "$fx/20-DBG" 101 w "$d/run/tmp/DBG/a"
-    tr_exec "$fx/60-DC" 200 /usr/bin/bash bash "$t/scripts/fake-step.sh" DC
-    tr_fork "$fx/60-DC" 200 201
-    tr_exec "$fx/60-DC" 201 /r/t/T_dbg/debug/deps/beta-0123456789abcdef beta-0123456789abcdef
-    tr_unix "$fx/60-DC" 201 "$d/clusters/C_docs.Cd34/.s.PGSQL.5432" 0
-    tr_open "$fx/60-DC" 201 w "$d/run/tmp/DC/b"
+  au_key() { # <arbol> -> <nombre>-<12 hex>: la clave de arbol con la formula del planificador, escrita aparte: sha256 del realpath SIN salto de linea
+    local real
+    real="$(realpath "$1")"
+    printf '%s-%s' "$(basename "$real")" "$(printf '%s' "$real" | sha256sum | cut -c1-12)"
   }
-  au_go13() { # <d>: corre --run sobre el arbol de fixture; RC
+  au_fx() { # <d>: trazas benignas de una corrida de merge-gate: el planificador hace su directorio y lanza DBG y DC, cada una con su cluster, su target y su raiz
+    local d="$1" fx="$1/fx/gate" t="$1/tree" tt dag
+    tt="$d/targets/$(au_key "$t")"
+    dag="$d/tmp/memory-industry-dag.Ab12Cd"
+    tr_exec "$fx" 100 /usr/bin/bash bash "$t/scripts/merge-gate.sh"
+    tr_fork "$fx" 100 120
+    tr_exec "$fx" 120 /usr/bin/python3 python3 -I "$t/scripts/gate-dag.py" run --table "$t/scripts/gate-dag.txt"
+    tr_mkdir "$fx" 120 "$dag"
+    tr_fork "$fx" 120 121
+    tr_exec "$fx" 121 /usr/bin/bash bash scripts/merge-gate.sh --step DBG
+    tr_fork "$fx" 121 122
+    tr_exec "$fx" 122 "$tt/T_dbg/debug/deps/alfa-0123456789abcdef" alfa-0123456789abcdef
+    tr_unix "$fx" 122 "$d/clusters/dbg.Ab12Cd/.s.PGSQL.5432" 0
+    tr_open "$fx" 122 w "$dag/tmp/DBG/a"
+    tr_open "$fx" 122 w "$tt/T_dbg/debug/out"
+    tr_fork "$fx" 120 131
+    tr_exec "$fx" 131 /usr/bin/bash bash scripts/merge-gate.sh --step DC
+    tr_fork "$fx" 131 132
+    tr_exec "$fx" 132 "$tt/T_docs/debug/deps/beta-0123456789abcdef" beta-0123456789abcdef
+    tr_unix "$fx" 132 "$d/clusters/docs.Cd34Ef/.s.PGSQL.5432" 0
+    tr_open "$fx" 132 w "$dag/tmp/DC/b"
+    tr_open "$fx" 132 w "$tt/T_docs/debug/out"
+  }
+  au_go() { # <d> [VAR=value...]: corre --run sobre el arbol de fixture, con la raiz de target y la de clusteres del fixture; RC
     local d="$1"
+    shift
     RC=0
-    FAKE_STRACE_LOG="$d/strace.log" FAKE_STRACE_FX="$d/fx" FAKE_LLEGADA="$d/llegada.txt" \
-      PATH="$d/bin:$PATH" GATE_AUDIT_RUN="$d/run" GATE_CLUSTER_ROOT="$d/clusters" \
+    env FAKE_STRACE_LOG="$d/strace.log" FAKE_STRACE_FX="$d/fx" FAKE_LLEGADA="$d/llegada.txt" \
+      PATH="$d/bin:$PATH" GATE_AUDIT_RUN="$d/run" GATE_CLUSTER_ROOT="$d/clusters" CARGO_TARGET_DIR="$d/targets" "$@" \
       "$BASH" "$d/tree/scripts/gate-audit.sh" --run >"$d/out" 2>"$d/err" || RC=$?
   }
   au_path_sin_strace() { # <d> -> <d>/nobin: enlaces a /usr/bin y /bin menos strace
@@ -201,13 +228,13 @@ FAKE
     row_want A0 "HOME y XDG_CACHE_HOME vacios" "$(find "$h" "$x" -mindepth 1 | wc -l | tr -d ' ')" 0 || return 1
   }
 
-  row_a0b() { # --run sin GATE_AUDIT_RUN: el informe va bajo TMPDIR y HOME y XDG_CACHE_HOME quedan vacios
+  row_a0b() { # --run sin GATE_AUDIT_RUN: el informe va bajo TMPDIR y HOME y XDG_CACHE_HOME quedan vacios (ni siquiera la raiz de target por omision se crea)
     local d h x t
     d="$(rd)"; h="$(mktemp -d)"; x="$(mktemp -d)"; t="$(mktemp -d)"
     au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
     au_fake_strace "$d/bin"
-    au_fx13 "$d"
-    env -u GATE_AUDIT_RUN HOME="$h" XDG_CACHE_HOME="$x" TMPDIR="$t" PATH="$d/bin:$PATH" \
+    au_fx "$d"
+    env -u GATE_AUDIT_RUN -u CARGO_TARGET_DIR HOME="$h" XDG_CACHE_HOME="$x" TMPDIR="$t" PATH="$d/bin:$PATH" \
       FAKE_STRACE_LOG="$d/strace.log" FAKE_STRACE_FX="$d/fx" FAKE_LLEGADA="$d/llegada.txt" \
       GATE_CLUSTER_ROOT="$d/clusters" "$BASH" "$d/tree/scripts/gate-audit.sh" --run >"$d/out" 2>"$d/err" || true
     row_want A0b "HOME y XDG_CACHE_HOME vacios tras --run" "$(find "$h" "$x" -mindepth 1 | wc -l | tr -d ' ')" 0 || return 1
@@ -430,12 +457,12 @@ FAKE
     local d t prop; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
     t="$d/tree"; prop="$d/run/audit/groups.proposed.txt"
     au_fake_strace "$d/bin"
-    au_fx13 "$d"
-    tr_open "$d/fx/20-DBG" 101 w "$HOME/.cache/x/shared"
-    tr_open "$d/fx/60-DC" 201 w "$HOME/.cache/x/shared"
-    tr_open "$d/fx/60-DC" 201 r "$t/models/emb.onnx"
-    tr_bind "$d/fx/20-DBG" 101 8787
-    au_go13 "$d"
+    au_fx "$d"
+    tr_open "$d/fx/gate" 122 w "$HOME/.cache/x/shared"
+    tr_open "$d/fx/gate" 132 w "$HOME/.cache/x/shared"
+    tr_open "$d/fx/gate" 132 r "$t/models/emb.onnx"
+    tr_bind "$d/fx/gate" 122 8787
+    au_go "$d"
     row_want A11 "propuesta escrita" "$([[ -f "$prop" ]] && echo si || echo no)" si || return 1
     row_atleast A11 "grupo db" "$(awk '$2 ~ /(^|,)db(,|$)/ { n++ } END { print n + 0 }' "$prop")" 1 || return 1
     row_atleast A11 "grupo models" "$(awk '$2 ~ /(^|,)models(,|$)/ { n++ } END { print n + 0 }' "$prop")" 1 || return 1
@@ -453,7 +480,7 @@ FAKE
     row_want A12 exit "$rc" 2 || return 1
     row_has A12 "motivo" "$(cat "$d/err")" "strace is not installed" || return 1
     row_has A12 "nunca" "$(cat "$d/err")" "never skipped" || return 1
-    row_want A12 "ningun paso lanzado" "$([[ -e "$d/llegada.txt" ]] && echo si || echo no)" no || return 1
+    row_want A12 "merge-gate no lanzado" "$([[ -e "$d/llegada.txt" ]] && echo si || echo no)" no || return 1
     au_fake_strace "$d/bin52"
     rc=0
     FAKE_STRACE_VERSION=5.2 FAKE_STRACE_LOG="$d/strace.log" FAKE_STRACE_FX="$d/fx" FAKE_LLEGADA="$d/llegada.txt" \
@@ -462,46 +489,49 @@ FAKE
     row_has A12 "version 5.2" "$(cat "$d/err2")" "5.2" || return 1
   }
 
-  row_a13() { # el strace falso recibe solo los pasos de tests, en orden de idx, y el exit es el de --analyze
-    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "30 B3 P target:T_rel normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" \
+  row_a13() { # el audit lanza merge-gate.sh UNA vez bajo strace, con GATE_DAG=0 y sin --step: las filas las lanza el planificador; el exit es el de --analyze
+    local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "30 B3 P target:T_rel,cluster:C_b3 normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" \
       "60 DC P target:T_docs,cluster:C_docs normal"
     au_fake_strace "$d/bin"
-    au_fx13 "$d"
-    au_go13 "$d"
+    au_fx "$d"
+    au_go "$d"
     row_want A13 exit "$RC" 0 || return 1
-    row_want A13 "orden de llegada" "$(paste -sd' ' "$d/llegada.txt")" "P DBG B3 DC" || return 1
-    row_want A13 "invocaciones de strace" "$(wc -l < "$d/strace.log" | tr -d ' ')" 2 || return 1
-    row_has A13 "DBG traced" "$(cat "$d/strace.log")" "audit/20-DBG/t" || return 1
-    row_has A13 "DC traced" "$(cat "$d/strace.log")" "audit/60-DC/t" || return 1
-    row_want A13 "-ff en las dos" "$(grep -c -- ' -ff ' "$d/strace.log" || true)" 2 || return 1
-    row_want A13 "-y en las dos" "$(grep -c -- ' -y ' "$d/strace.log" || true)" 2 || return 1
+    row_want A13 "invocaciones de strace" "$(wc -l < "$d/strace.log" | tr -d ' ')" 1 || return 1
+    row_has A13 "trazas en audit/gate" "$(cat "$d/strace.log")" "audit/gate/t" || return 1
+    row_has A13 "el merge-gate del arbol" "$(cat "$d/strace.log")" "$d/tree/scripts/merge-gate.sh" || return 1
+    row_want A13 "ninguna fila lanzada por el audit" "$(grep -c -- '--step' "$d/strace.log" || true)" 0 || return 1
+    row_want A13 "merge-gate lanzado una vez" "$(grep -c '^GATE_DAG=' "$d/llegada.txt" || true)" 1 || return 1
+    row_want A13 "en serie" "$(sed -n 's/^GATE_DAG=//p' "$d/llegada.txt")" 0 || return 1
+    row_want A13 "sin argumentos" "$(sed -n 's/^args=//p' "$d/llegada.txt")" "" || return 1
+    row_want A13 "la raiz de target del analisis es la de merge-gate" "$(sed -n 's/^CARGO_TARGET_DIR=//p' "$d/llegada.txt")" "$d/targets" || return 1
+    row_want A13 "-ff" "$(grep -c -- ' -ff ' "$d/strace.log" || true)" 1 || return 1
+    row_want A13 "-y" "$(grep -c -- ' -y ' "$d/strace.log" || true)" 1 || return 1
+    row_want A13 "-f" "$(grep -c -- ' -f ' "$d/strace.log" || true)" 1 || return 1
     row_want A13 "sin -v" "$(grep -c -- ' -v ' "$d/strace.log" || true)" 0 || return 1
   }
 
-  row_a13b() { # un paso que sale distinto de 0 deja la auditoria incompleta: exit 2, el resto se escribe igual
+  row_a13b() { # un merge-gate que sale distinto de 0 deja la auditoria incompleta: exit 2, el resto se escribe igual
     local d; d="$(rd)"; au_tree "$d" "10 P - - normal" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" \
       "60 DC P target:T_docs,cluster:C_docs normal"
     au_fake_strace "$d/bin"
-    au_fx13 "$d"
-    printf '101\n' > "$d/tree/scripts/exit-DBG"
-    au_go13 "$d"
+    au_fx "$d"
+    printf '101\n' > "$d/tree/scripts/exit-gate"
+    au_go "$d"
     row_want A13b exit "$RC" 2 || return 1
-    row_has A13b "incompleta" "$(cat "$d/out" "$d/err")" "incomplete: DBG exited 101" || return 1
-    row_has A13b "DC corrio" "$(paste -sd' ' "$d/llegada.txt")" "DC" || return 1
+    row_has A13b "incompleta" "$(cat "$d/out" "$d/err")" "incomplete: merge-gate.sh exited 101" || return 1
     row_want A13b "report.tsv escrito" "$([[ -f "$d/run/audit/report.tsv" ]] && echo si || echo no)" si || return 1
   }
 
   row_a13c() { # trazas por encima de GATE_AUDIT_MAX_GB: exit 2 y sin truncar
     local d rc=0; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal"
     au_fake_strace "$d/bin"
-    au_fx13 "$d"
-    head -c 1048576 /dev/zero | tr '\0' x > "$d/fx/20-DBG/t.999"
-    FAKE_STRACE_LOG="$d/strace.log" FAKE_STRACE_FX="$d/fx" FAKE_LLEGADA="$d/llegada.txt" \
-      PATH="$d/bin:$PATH" GATE_AUDIT_RUN="$d/run" GATE_CLUSTER_ROOT="$d/clusters" GATE_AUDIT_MAX_GB=0 \
-      "$BASH" "$d/tree/scripts/gate-audit.sh" --run >"$d/out" 2>"$d/err" || rc=$?
+    au_fx "$d"
+    head -c 1048576 /dev/zero | tr '\0' x > "$d/fx/gate/t.999"
+    au_go "$d" GATE_AUDIT_MAX_GB=0
+    rc="$RC"
     row_want A13c exit "$rc" 2 || return 1
     row_has A13c "tope" "$(cat "$d/err")" "GATE_AUDIT_MAX_GB" || return 1
-    row_want A13c "trazas sin truncar" "$(wc -c < "$d/run/audit/20-DBG/t.999" | tr -d ' ')" 1048576 || return 1
+    row_want A13c "trazas sin truncar" "$(wc -c < "$d/run/audit/gate/t.999" | tr -d ' ')" 1048576 || return 1
   }
 
   row_a14() { # formato exacto: cinco campos por linea, ordenadas, con la clave de --keys
@@ -523,6 +553,79 @@ FAKE
     LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2 -k3,3 -k4,4 -c "$d/findings" 2>/dev/null || orden=$?
     row_want A14 "ordenadas por clase, paso, unidad y recurso" "$orden" 0 || return 1
     row_atleast A14 "clave de --keys" "$(au_fcount "$d/out" 3 v029_bridge_against_the_real_daemon)" 1 || return 1
+  }
+
+  row_a15() { # las filas llevan NAME=value delante y la orden --step: el audit las reconoce por el argv de merge-gate.sh --step <id>
+    local d line; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    line="$(grep ' DBG ' "$d/tree/scripts/gate-dag.txt")"
+    row_has A15 "la fila de la tabla lleva su entorno y su orden" "$line" "CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DBG" || return 1
+    au_fake_strace "$d/bin"
+    au_fx "$d"
+    tr_open "$d/fx/gate" 122 w "$HOME/.cache/x/shared"
+    tr_open "$d/fx/gate" 132 w "$HOME/.cache/x/shared"
+    au_go "$d"
+    row_want A15 exit "$RC" 1 || return 1
+    row_atleast A15 "path-conflict" "$(au_count "$d/out" path-conflict "$HOME/.cache/x/shared")" 1 || return 1
+    row_want A15 "los pasos del conflicto son DBG y DC" \
+      "$(awk -F'\t' -v p="$HOME/.cache/x/shared" '$1 == "path-conflict" && index($0, p) { print $2 }' "$d/out" | head -n 1)" "DBG,DC" || return 1
+    row_want A15 "ninguna unidad sin paso" "$(awk -F'\t' 'index($2, "?") { n++ } END { print n + 0 }' "$d/out")" 0 || return 1
+  }
+
+  row_a16() { # la raiz de un target es <CARGO_TARGET_DIR>/<clave de arbol>/<T>, y la clave sale de gate-dag.py tree-key, la misma formula del planificador
+    local d tt key; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    key="$(au_key "$d/tree")"
+    row_want A16 "gate-dag.py tree-key" "$(python3 -I "$d/tree/scripts/gate-dag.py" tree-key "$d/tree" 2>/dev/null || true)" "$key" || return 1
+    au_fake_strace "$d/bin"
+    au_fx "$d"
+    tt="$d/targets/$key"
+    tr_open "$d/fx/gate" 132 w "$tt/T_dbg/stolen"
+    au_go "$d"
+    row_want A16 exit "$RC" 1 || return 1
+    row_atleast A16 "root-intrusion en el target de DBG" "$(au_count "$d/out" root-intrusion "$tt/T_dbg/stolen")" 1 || return 1
+    row_has A16 "dice que target" "$(cat "$d/out")" "writes in target T_dbg without declaring it" || return 1
+    row_want A16 "el target propio sin hallazgo" "$(au_count "$d/out" '*' "$tt/T_dbg/debug/out")" 0 || return 1
+  }
+
+  row_a17() { # el cluster de un carril vive en <GATE_CLUSTER_ROOT>/<carril>.XXXXXX, y el carril sale del nombre del recurso cluster:C_<carril>
+    local d; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    au_fake_strace "$d/bin"
+    au_fx "$d"
+    tr_unix "$d/fx/gate" 122 "$d/clusters/docs.Cd34Ef/.s.PGSQL.5432" 0
+    au_go "$d"
+    row_want A17 exit "$RC" 1 || return 1
+    row_atleast A17 "pg-connect al cluster propio" "$(au_count "$d/out" pg-connect "$d/clusters/dbg.Ab12Cd")" 1 || return 1
+    row_atleast A17 "pg-socket-cross al de otro carril" "$(au_count "$d/out" pg-socket-cross "$d/clusters/docs.Cd34Ef")" 1 || return 1
+    row_want A17 "ningun pg-socket-outside" "$(au_count "$d/out" pg-socket-outside "")" 0 || return 1
+  }
+
+  row_a18() { # el directorio de corrida del planificador sale de la traza: la fila que escribe en el de otra es intrusion, y sin ese directorio no hay auditoria
+    local d e dag; d="$(rd)"; au_tree "$d" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    au_fake_strace "$d/bin"
+    au_fx "$d"
+    dag="$d/tmp/memory-industry-dag.Ab12Cd"
+    tr_open "$d/fx/gate" 132 w "$dag/tmp/DBG/stolen"
+    au_go "$d"
+    row_want A18 exit "$RC" 1 || return 1
+    row_atleast A18 "root-intrusion en la raiz de DBG" "$(au_count "$d/out" root-intrusion "$dag/tmp/DBG/stolen")" 1 || return 1
+    row_has A18 "dice de quien" "$(cat "$d/out")" "writes in the run directory of DBG" || return 1
+    e="$(rd)"; au_tree "$e" "20 DBG P target:T_dbg,cluster:C_dbg,models normal" "60 DC P target:T_docs,cluster:C_docs normal"
+    au_fake_strace "$e/bin"
+    au_fx "$e"
+    sed -i '/^mkdir(/d' "$e/fx/gate/t.120"
+    au_go "$e"
+    row_want A18 "sin directorio de corrida" "$RC" 2 || return 1
+    row_has A18 "motivo" "$(cat "$e/err")" "run directory" || return 1
+  }
+
+  row_a19() { # strace alinea el resultado de una llamada corta a una columna (`vfork()      = 102`): se lee igual que el de una sola separacion
+    local d; d="$(rd)"; au_std "$d"
+    tr_lane "$d/tr" 100 DBG 101 alfa-0123456789abcdef
+    tr_put "$d/tr" 101 'vfork()                                 = 102'
+    tr_put "$d/tr" 101 'chdir("/r")                             = 0'
+    tr_put "$d/tr" 102 "openat(AT_FDCWD</r>, \"$HOME/.cache/x/padded\", O_WRONLY|O_CREAT, 0644)    = 5</$HOME/.cache/x/padded>"
+    au_run "$d"
+    row_want A19 "una traza de strace con el resultado alineado se lee" "$RC" 0 || return 1
+    row_atleast A19 "la escritura del hijo creado por vfork" "$(au_count "$d/out" home-write "$HOME/.cache/x/padded")" 1 || return 1
   }
 
   row_a0 || exit 1
@@ -548,13 +651,20 @@ FAKE
   row_a13b || exit 1
   row_a13c || exit 1
   row_a14 || exit 1
+  row_a15 || exit 1
+  row_a16 || exit 1
+  row_a17 || exit 1
+  row_a18 || exit 1
+  row_a19 || exit 1
   echo "OK  self-test: gate-audit"
   exit 0
 fi
 # --- self-test end ---
 
-# El puerto vivo sale de gate-lock.sh (D-A11). Va despues del despacho de --self-test: el autotest no lo necesita.
+# El puerto vivo sale de gate-lock.sh (D-A11), y la raiz de los clusteres de gate-cluster.sh (CI-J15a), la misma que lee merge-gate.sh.
+# Van despues del despacho de --self-test: el autotest no lo necesita.
 source "$(dirname "$0")/gate-lock.sh"
+source "$(dirname "$0")/gate-cluster.sh"
 
 # --- analisis (D-A1 a D-A10): trazas de strace -> hallazgos -------------------
 # Lee trazas, nunca conecta a nada (D-A5). El analizador es gawk: el awk de esta
@@ -564,10 +674,9 @@ ga_fail() { echo "FAIL: audit: $*" >&2; exit 2; }
 ga_usage() {
   echo "uso: gate-audit.sh --self-test" >&2
   echo "     gate-audit.sh --analyze <trazas> --roots <f> --steps <f> [--overlap <f>] [--keys <f>] [--pg-tcp-allowed <puerto>]" >&2
-  echo "     gate-audit.sh --run [--step <id>[,<id>...]]" >&2
+  echo "     gate-audit.sh --run" >&2
   exit 2
 }
-ga_in() { local x; for x in "${@:2}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
 GA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 read -r -d '' GA_AWK <<'AWK' || true
@@ -617,14 +726,26 @@ function addev(k, kind, a, b, c, d,   i) {
   ek[k, i] = kind; ea[k, i] = a; eb[k, i] = b; ec[k, i] = c; ed[k, i] = d
   el[k, i] = FILENAME ":" FNR
 }
+function lastres(line,   off, s, at) {
+  # The result of a call: the last `)` followed by spaces and `= `. strace pads the result of a short line to a column
+  # (`vfork()      = 102`) and an argument can hold the same text, so neither the first `) = ` nor a single space will do.
+  at = 0; off = 0; s = line
+  while (match(s, /\) +=( |$)/)) {
+    at = off + RSTART
+    resfrom = off + RSTART + RLENGTH
+    off += RSTART + RLENGTH - 1
+    s = substr(line, off + 1)
+  }
+  return at
+}
 function parse_line(line,   op, cl, name, args, res, toks, nt, i, t, flags, nps, pth, pdt, dtok, rw, isopen, fam, port, bin, argv, i1, i2, child, ok, m) {
   op = index(line, "(")
   if (op == 0) fatal(FILENAME ":" FNR, "not a syscall line: " line)
   name = substr(line, 1, op - 1)
-  cl = index(line, ") = ")
+  cl = lastres(line)
   if (cl == 0) fatal(FILENAME ":" FNR, "a line with no result (cut?): " line)
   args = substr(line, op + 1, cl - op - 1)
-  res = substr(line, cl + 4)
+  res = substr(line, resfrom)
   if (name == "execve") {
     if (res !~ /^0/) return
     if (!match(args, /"[^"]*"/)) fatal(FILENAME ":" FNR, "execve with no path")
@@ -930,47 +1051,51 @@ ga_propose() { # <informe> <salida>: propuesta de grupos, fuera del fichero vers
     }' "$1" | LC_ALL=C sort > "$2"
 }
 
-ga_run() { # --run: la auditoria de verdad, en serie y con la tabla de gate-dag.txt (D-A7, D-A8)
-  local only="" run="" max used tblines incomplete="" line idx id deps rec cls order ere
-  local tree_key t c arc=0 rc traced part gen
-  local -a ids=() parts=() only_ids=() words=() rows=()
+ga_run() { # --run: la auditoria de verdad: merge-gate.sh en serie bajo strace, una vez; las filas de gate-dag.txt se reconocen en la traza (D-A7, D-A8, CI-J15a)
+  local run max used tblines incomplete="" line idx id deps rec cls order ere key lane t part arc=0 rc=0 gen dag
+  local -a ids=() parts=() words=() dags=() planner_traces=()
   local -A deps_of=() cls_of=()
-  local -A traced_id=([DBG]=1 [NLI]=1 [REL]=1 [E2E]=1 [DC]=1 [CV]=1 [M]=1)
-  while (( $# )); do
-    case "$1" in
-      --step) only="${2:-}"; shift 2 ;;
-      *) ga_usage ;;
-    esac
-  done
+  (( $# == 0 )) || ga_usage
   command -v strace >/dev/null 2>&1 || ga_fail "strace is not installed (command -v strace found nothing). The audit is never skipped: install it (sudo apt install strace) and run it again."
   local sv
   sv="$(strace -V 2>/dev/null | sed -n '1s/.*version \([0-9][0-9.]*\).*/\1/p')"
   [[ -n "$sv" ]] || ga_fail "cannot read the strace version (strace -V)"
   [[ "$(printf '%s\n' 5.3 "$sv" | LC_ALL=C sort -V | head -n1)" == 5.3 ]] || ga_fail "strace $sv is older than 5.3: --seccomp-bpf together with -y needs it"
-  local table="$GA_ROOT/scripts/gate-dag.txt"
+  local table="$GA_ROOT/scripts/gate-dag.txt" gate="$GA_ROOT/scripts/merge-gate.sh"
   [[ -f "$table" ]] || ga_fail "needs scripts/gate-dag.txt (F3.3)"
+  [[ -f "$gate" ]] || ga_fail "needs scripts/merge-gate.sh: the audit runs it, and the planner starts the rows"
   max="${GATE_AUDIT_MAX_GB:-20}"
   [[ "$max" =~ ^[0-9]+$ ]] || ga_fail "GATE_AUDIT_MAX_GB must be a whole number of gigabytes, got $max"
   run="${GATE_AUDIT_RUN:-}"
   [[ -n "$run" ]] || run="$(mktemp -d "${TMPDIR:-/tmp}/memory-industry-audit.XXXXXX")"
   gen="$run/audit/gen"
   mkdir -p "$gen"
-  tree_key="$(basename "$GA_ROOT")-$(realpath "$GA_ROOT" | sha256sum | cut -c1-12)"
+  # La raiz de los targets es la del planificador (CARGO_TARGET_DIR, que merge-gate.sh fija si falta con esta misma funcion) y
+  # la clave del arbol la dice el planificador: una formula (CI-J15a).
+  gate_target_dir_outside_the_tree
+  key="$(python3 -I "$GA_ROOT/scripts/gate-dag.py" tree-key "$GA_ROOT")" || ga_fail "gate-dag.py tree-key could not name the tree $GA_ROOT"
+  [[ -n "$key" ]] || ga_fail "gate-dag.py tree-key printed nothing for $GA_ROOT"
   : > "$gen/steps"; : > "$gen/roots"; : > "$gen/overlap"
   tblines="$(grep -v -e '^#' -e '^[[:space:]]*$' "$table" | LC_ALL=C sort -k1,1n || true)"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
-    rows+=("$line")
     read -r idx id deps rec cls _ _ _ order <<< "$line"
     ids+=("$id"); deps_of[$id]="$deps"; cls_of[$id]="$cls"
-    ere="$(printf '%s' "$order" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g')"
+    # El paso es la orden sin los NAME=value de su entorno: el planificador los pone en el entorno y execve no los ve.
+    read -r -a words <<< "$order"
+    while (( ${#words[@]} > 0 )) && [[ "${words[0]}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do words=("${words[@]:1}"); done
+    (( ${#words[@]} > 0 )) || ga_fail "row $id of gate-dag.txt has no order after its NAME=value tokens"
+    ere="^$(printf '%s' "${words[*]}" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g')\$"
     printf '%s %s %s\n' "$id" "$rec" "$ere" >> "$gen/steps"
-    printf 'run %s %s/tmp/%s\n' "$id" "$run" "$id" >> "$gen/roots"
     IFS=',' read -r -a parts <<< "$rec"
     for part in "${parts[@]}"; do
       case "$part" in
-        target:*) t="${part#target:}"; [[ -z "${GATE_TARGET_ROOT:-}" ]] || printf 'target %s %s/%s/%s\n' "$t" "$GATE_TARGET_ROOT" "$tree_key" "$t" >> "$gen/roots" ;;
-        cluster:*) c="${part#cluster:}"; [[ -z "${GATE_CLUSTER_ROOT:-}" ]] || printf 'cluster %s %s/%s.\n' "$c" "$GATE_CLUSTER_ROOT" "$c" >> "$gen/roots" ;;
+        target:*) t="${part#target:}"; printf 'target %s %s/%s/%s\n' "$t" "$CARGO_TARGET_DIR" "$key" "$t" >> "$gen/roots" ;;
+        cluster:C_*)
+          lane="${part#cluster:C_}"
+          [[ "$lane" =~ ^$GATE_LANE_RE$ ]] || ga_fail "row $id names ${part#cluster:}, and $lane is not a lane name ($GATE_LANE_RE)"
+          printf 'cluster %s %s/%s.\n' "${part#cluster:}" "$GATE_CLUSTER_ROOT" "$lane" >> "$gen/roots" ;;
+        cluster:*) ga_fail "row $id names the cluster ${part#cluster:}, which is not C_<lane>: the lane is read from its name" ;;
       esac
     done
   done <<< "$tblines"
@@ -984,27 +1109,24 @@ ga_run() { # --run: la auditoria de verdad, en serie y con la tabla de gate-dag.
       printf '%s %s\n' "$a" "$b" >> "$gen/overlap"
     done
   done
-  if [[ -n "$only" ]]; then IFS=',' read -r -a only_ids <<< "$only"; fi
-  for line in "${rows[@]}"; do
-    read -r idx id deps rec cls _ _ _ order <<< "$line"
-    read -r -a words <<< "$order"
-    traced=0
-    if [[ -n "${traced_id[$id]:-}" ]]; then
-      if [[ -z "$only" ]] || ga_in "$id" "${only_ids[@]}"; then traced=1; fi
-    fi
-    mkdir -p "$run/audit/$idx-$id"
-    rc=0
-    if (( traced )); then
-      strace --seccomp-bpf -f -ff -y -qq -e signal=none \
-        -e trace=execve,clone,clone3,fork,vfork,chdir,fchdir,open,openat,creat,mkdir,mkdirat,rename,renameat,renameat2,unlink,unlinkat,link,symlink,bind,connect \
-        -o "$run/audit/$idx-$id/t" -- "${words[@]}" >"$run/audit/$idx-$id.log" 2>&1 || rc=$?
-    else
-      "${words[@]}" >"$run/audit/$idx-$id.log" 2>&1 || rc=$?
-    fi
-    used="$(du -sb "$run/audit" | cut -f1)"
-    (( used <= max * 1073741824 )) || ga_fail "the traces in $run/audit weigh $used bytes, over GATE_AUDIT_MAX_GB=$max; they are kept, not truncated"
-    (( rc == 0 )) || incomplete+="$id exited $rc; "
-  done
+  mkdir -p "$run/audit/gate"
+  # -s 1024: strace corta los argv a 32 caracteres, y el del planificador (rutas de la tabla) y el de una fila no caben; las rutas
+  # de open, mkdir y connect las imprime enteras con cualquier -s.
+  GATE_DAG=0 strace --seccomp-bpf -f -ff -y -qq -s 1024 -e signal=none \
+    -e trace=execve,clone,clone3,fork,vfork,chdir,fchdir,open,openat,creat,mkdir,mkdirat,rename,renameat,renameat2,unlink,unlinkat,link,symlink,bind,connect \
+    -o "$run/audit/gate/t" -- bash "$gate" >"$run/audit/gate.log" 2>&1 || rc=$?
+  used="$(du -sb "$run/audit" | cut -f1)"
+  (( used <= max * 1073741824 )) || ga_fail "the traces in $run/audit weigh $used bytes, over GATE_AUDIT_MAX_GB=$max; they are kept, not truncated"
+  (( rc == 0 )) || incomplete+="merge-gate.sh exited $rc; "
+  # El directorio de corrida del planificador (<TMPDIR>/memory-industry-dag.XXXXXX) es donde cada fila tiene su TMPDIR privado.
+  # Sale de la traza del proceso que corre la tabla de este arbol: los tests del juez corren otros planificadores, con sus tablas.
+  while IFS= read -r line; do planner_traces+=("$line"); done < <(grep -rlF -e "\"run\", \"--table\", \"$table\"" "$run/audit/gate" || true)
+  if (( ${#planner_traces[@]} > 0 )); then
+    while IFS= read -r line; do dags+=("$line"); done < <(grep -hE '^mkdir(at)?\(' "${planner_traces[@]}" | grep -oE '"[^"]*/memory-industry-dag\.[A-Za-z0-9_]+"' | tr -d '"' | LC_ALL=C sort -u || true)
+  fi
+  (( ${#dags[@]} == 1 )) || ga_fail "the audit needs the run directory of the planner (memory-industry-dag.XXXXXX, made by the process that runs $table) and saw ${#dags[@]}: without it no row's private directory can be judged. ${incomplete:+$incomplete}The traces are kept in $run/audit/gate"
+  dag="${dags[0]}"
+  for id in "${ids[@]}"; do printf 'run %s %s/tmp/%s\n' "$id" "$dag" "$id" >> "$gen/roots"; done
   ga_analyze "$run/audit" "$gen/roots" "$gen/steps" "$gen/overlap" "" 0 "$run/audit/report.tsv" || arc=$?
   (( arc != 2 )) || exit 2
   ga_propose "$run/audit/report.tsv" "$run/audit/groups.proposed.txt"
