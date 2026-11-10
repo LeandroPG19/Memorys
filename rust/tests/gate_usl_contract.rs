@@ -1556,6 +1556,10 @@ fn u18_la_clave_de_la_tabla_es_la_que_escribe_el_planificador() {
         .env("CI_TIEMPOS_DIR", &historial)
         .env("HOME", &fx.home)
         .env("TMPDIR", &fx.base)
+        // CI-J17: a planner that reads the real cgroup of whoever runs this test delegates it (a `juez` inside the judge's
+        // own scope). This one gets a tree with no `0::` line, which is a scope there is nothing to delegate in.
+        .env("GATE_CGROUP_ROOT", &fx.base)
+        .env("GATE_PROC_SELF_CGROUP", &fx.sin_cgroup)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

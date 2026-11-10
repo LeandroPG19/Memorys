@@ -4137,3 +4137,123 @@ fn machine_without_memavailable(fx: &Fixture) -> Machine {
     );
     host
 }
+
+// --- CI-J17: a planner inside another one does not delegate a second `juez` -----------------------------------------------
+// The planner delegates the cgroup it runs in: `<scope>/juez` for itself and the processes of the scope. A planner that
+// starts inside that `juez` (the self-test of the gate and the contracts start real ones) went down one level more each
+// time, and on 2026-11-10 the scope of the judge ended in `…/juez/juez/juez/…` with hundreds of levels.
+
+/// Every directory under `root`, the way a walk of the cgroup tree would see it.
+fn dirs_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(dirs_under(&path));
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// A cgroup directory of the fake tree the way cgroupfs makes one: with its own `cgroup.subtree_control`, writable.
+fn make_fake_cgroup(dir: &Path) {
+    fs::create_dir_all(dir).expect("fake cgroup dir");
+    write(&dir.join("cgroup.subtree_control"), "");
+}
+
+/// J17 (scenario 1): a planner whose cgroup is already called `juez` does not make another one inside it, does not move
+/// the processes of that `juez` and does not touch its controllers; it says the scope is not delegated and runs in series.
+#[test]
+fn a_planner_in_a_scope_called_juez_does_not_delegate_it_again() {
+    let mut fx = Fixture::new("j17-juez", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "s10", "-", "0.1", "")]);
+    let juez = fx.cgroups.join("scope").join("juez");
+    make_fake_cgroup(&juez);
+    write(&juez.join("cgroup.procs"), "4242\n");
+    write(&fx.proc_self, "0::/scope/juez\n");
+    let run = fx.run("1");
+    assert_green(&run, "a planner started inside a `juez`");
+    assert!(
+        !juez.join("juez").exists(),
+        "the planner made {}: a `juez` inside a `juez`",
+        juez.join("juez").display()
+    );
+    assert_eq!(
+        read(&juez.join("cgroup.procs")),
+        "4242\n",
+        "the planner moved processes of the `juez` it runs in"
+    );
+    assert_eq!(
+        read(&juez.join("cgroup.subtree_control")),
+        "",
+        "the planner enabled controllers in the `juez` it runs in"
+    );
+    assert!(
+        run.out.contains("the scope is not delegated"),
+        "the planner did not say that a `juez` is not delegated again: {}",
+        run.out
+    );
+}
+
+/// J17 (scenario 3): the planner of the judge starts a second planner from one of its rows, as the self-test and the
+/// contracts do. The second one sees the cgroup the first one moved its processes to, `scope/juez`: its `/proc/self/cgroup`
+/// is a file of the fixture that says so, and its `scope/juez` has the `cgroup.subtree_control` cgroupfs gives every directory.
+#[test]
+fn two_planners_one_inside_the_other_leave_no_juez_inside_a_juez() {
+    let mut fx = Fixture::new("j17-anidado", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "anidado", "-", "0.1", "")]);
+    let juez = fx.cgroups.join("scope").join("juez");
+    let inner_self = fx.base.join("proc-self-cgroup-dentro");
+    write(&inner_self, "0::/scope/juez\n");
+    let inner_table = fx.base.join("tabla-dentro.txt");
+    write(
+        &inner_table,
+        &format!(
+            "10 hoja - - normal 1 5 0.05 /bin/sh {} hoja 0.05 {}\n",
+            fx.script.display(),
+            fx.control.display()
+        ),
+    );
+    let launcher = fx.base.join("planificador-dentro.sh");
+    write(
+        &launcher,
+        "#!/bin/sh\n# $1 juez of the outer planner, $2 /proc/self/cgroup of the inner one, $3 planner, $4 its table\n\
+         : > \"$1/cgroup.subtree_control\"\n\
+         GATE_PROC_SELF_CGROUP=\"$2\" exec python3 -I \"$3\" run --table \"$4\"\n",
+    );
+    write(
+        &fx.table,
+        &format!(
+            "10 anidado - - normal 1 5 0.3 /bin/sh {} {} {} {} {}\n",
+            launcher.display(),
+            juez.display(),
+            inner_self.display(),
+            repo_root().join("scripts/gate-dag.py").display(),
+            inner_table.display()
+        ),
+    );
+    let run = fx.run("0");
+    assert_green(&run, "a planner that starts a planner");
+    assert!(
+        juez.is_dir(),
+        "the outer planner did not make its `juez`, so there was nothing to nest in: {}",
+        run.out
+    );
+    assert!(
+        fx.control.join("env-hoja.txt").is_file(),
+        "the inner planner did not run its row: {}{}",
+        run.out,
+        run.err
+    );
+    let nested: Vec<_> = dirs_under(&fx.cgroups)
+        .into_iter()
+        .filter(|dir| dir.ends_with("juez/juez"))
+        .collect();
+    assert!(
+        nested.is_empty(),
+        "a `juez` inside a `juez`: {nested:?}\n{}{}",
+        run.out,
+        run.err
+    );
+}
