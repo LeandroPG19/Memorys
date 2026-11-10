@@ -25,12 +25,16 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// CI-K4 (D-K4n): `run_env` leaves GATE_DAG out of the environment, to see what the planner does by default.
+const UNSET: &str = "<unset>";
 
 const GIB: u64 = 1 << 30;
 const MEM_OPEN: &str = "max";
@@ -256,8 +260,16 @@ impl Fixture {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let out_path = self.base.join(format!("salida-{n}.txt"));
         let err_path = self.base.join(format!("error-{n}.txt"));
+        if gate_dag == UNSET {
+            command.env_remove("GATE_DAG");
+        } else {
+            command.env("GATE_DAG", gate_dag);
+        }
+        // CI-K4 (D-K4l): the jobs the planner counts are the ones of the machine the test describes, never the
+        // CARGO_BUILD_JOBS of whoever runs `cargo test` (pesado exports one).
         let mut child = command
-            .env("GATE_DAG", gate_dag)
+            .env_remove("CARGO_BUILD_JOBS")
+            .env_remove("GATE_CARGO_JOBS_FROM_GATE")
             .env("CI_TIEMPOS_DIR", &self.history)
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
@@ -1023,7 +1035,9 @@ fn gate_dag_zero_runs_exactly_the_series() {
     assert_green(&dag, "GATE_DAG=1");
     let blocks = |text: &str| -> String {
         text.lines()
-            .filter(|l| !l.starts_with("dag:") && !l.starts_with("note:"))
+            .filter(|l| {
+                !l.starts_with("dag:") && !l.starts_with("note:") && !l.starts_with("plan:")
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -2993,4 +3007,1130 @@ fn the_target_of_a_row_is_under_the_key_the_planner_says() {
         root.join(key.trim()).join("T_dbg"),
         "the target of the row is not under the key that tree-key says"
     );
+}
+
+// --- CI-K4: the profile of the judge, the reports of --timings and the plan of the machine ----------------------------
+// D-K4a, D-K4f (the profile), D-K4g..D-K4j (the reports of `cargo --timings` that a row leaves in its target, and what
+// the planner does with them), D-K4k..D-K4r (the machine the planner measures, the plan it prints, the lanes and the
+// jobs it hands out, the overlap it measures). The machine is the test's: a `nproc` that answers what the test says,
+// the MemAvailable of its own /proc/meminfo (GATE_PROC_MEMINFO), the cgroup tree of the fixture and a root of power
+// supplies that the test makes (GATE_POWER_SUPPLY_ROOT). Nothing here reads the real one, and nothing sleeps to pass.
+
+/// The tokens DBG, NLI and DC carry in gate-dag.txt (D-K4a).
+const PROFILE: &str =
+    "CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols";
+const PROFILE_NAMES: [&str; 3] = [
+    "CARGO_INCREMENTAL",
+    "CARGO_PROFILE_DEV_DEBUG",
+    "CARGO_PROFILE_DEV_STRIP",
+];
+const KIB_PER_GIB: u64 = 1 << 20;
+
+/// A machine the test describes: the `nproc` it answers (first on PATH), its /proc/meminfo and its power supplies.
+struct Machine {
+    path: String,
+    meminfo: String,
+    power: String,
+}
+
+impl Machine {
+    fn env(&self) -> Vec<(&str, &str)> {
+        vec![
+            ("PATH", self.path.as_str()),
+            ("GATE_PROC_MEMINFO", self.meminfo.as_str()),
+            ("GATE_POWER_SUPPLY_ROOT", self.power.as_str()),
+        ]
+    }
+}
+
+/// `nproc` prints `nproc` (a number, or whatever a test wants to be refused), MemAvailable is `mem_kib`, and the
+/// machine has no power supply at all (a root that does not exist). `tag` keeps two machines of one fixture apart.
+fn machine(fx: &Fixture, tag: &str, nproc: &str, mem_kib: u64) -> Machine {
+    let bin = fx.base.join(format!("bin-{tag}"));
+    fs::create_dir_all(&bin).expect("bin dir");
+    let fake = bin.join("nproc");
+    write(&fake, &format!("#!/bin/sh\necho {nproc}\n"));
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("nproc executable");
+    let meminfo = fx.base.join(format!("meminfo-{tag}"));
+    fs::copy(fx.meminfo(mem_kib), &meminfo).expect("meminfo of the machine");
+    Machine {
+        path: format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+        meminfo: meminfo.display().to_string(),
+        power: fx.base.join("sin-baterias").display().to_string(),
+    }
+}
+
+/// The first line of the planner's stdout that starts with `plan:` (D-K4q).
+fn plan_line_of(run: &Run) -> String {
+    run.out
+        .lines()
+        .find(|line| line.starts_with("plan:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the planner printed no `plan:` line:\n{}{}",
+                run.out, run.err
+            )
+        })
+        .to_string()
+}
+
+/// The word that follows `key` in `text`, up to the next space.
+fn word_after<'a>(text: &'a str, key: &str) -> &'a str {
+    text.split(key)
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or("")
+}
+
+/// Spec K4-A, D-K4a: a row starts with the profile its row names, over the one it inherits, and the line that names the
+/// variables it changed lists the three names and no value.
+#[test]
+fn a_row_gets_the_profile_of_the_judge_over_the_one_it_inherits() {
+    let mut fx = Fixture::new("k4-perfil", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "p", "-", "0.1", PROFILE)]);
+    let run = fx.run_env(
+        "0",
+        &[
+            ("CARGO_INCREMENTAL", "1"),
+            ("CARGO_PROFILE_DEV_DEBUG", "2"),
+            ("CARGO_PROFILE_DEV_STRIP", "none"),
+        ],
+    );
+    assert_green(&run, "a row that names the profile of the judge");
+    let env = read(&fx.control.join("env-p.txt"));
+    for want in [
+        "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_DEV_DEBUG=0",
+        "CARGO_PROFILE_DEV_STRIP=symbols",
+    ] {
+        assert!(
+            env.lines().any(|line| line == want),
+            "the step did not see {want}: {env}"
+        );
+    }
+    let named = run
+        .out
+        .lines()
+        .find(|line| line.starts_with("dag: p env:"))
+        .unwrap_or_else(|| panic!("no `dag: p env:` line: {}", run.out));
+    for name in PROFILE_NAMES {
+        assert!(
+            named.split_whitespace().any(|word| word == name),
+            "`{named}` does not name {name}"
+        );
+    }
+    assert!(
+        !named.contains('='),
+        "the line of the changed variables carries a value: {named}"
+    );
+}
+
+/// Spec K4-A: the closed list of the step environment holds the three names of the profile, asked of the planner.
+#[test]
+fn the_closed_list_of_the_step_environment_holds_the_names_of_the_profile() {
+    let names = planner_allowed_env();
+    for name in PROFILE_NAMES {
+        assert!(
+            names.iter().any(|listed| listed == name),
+            "{name} is not in the list the planner printed: {names:?}"
+        );
+    }
+}
+
+/// Spec K4-A, D-K4f: a reader has exactly the profile tokens of the row that builds its target, because the profile is
+/// in the hash of every unit and a reader with another one would build inside a row that builds nothing. A table where
+/// it does not is exit 2 before any step starts, naming the reader, the producer, the variable and the decision. The
+/// same tokens, in any order, are accepted.
+#[test]
+fn a_reader_with_another_profile_than_its_producer_is_refused_before_any_step_starts() {
+    let producer = "CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_STRIP=symbols";
+    let cases = [
+        (
+            "a reader without a token its producer has",
+            producer,
+            "CARGO_PROFILE_DEV_STRIP=symbols",
+            "CARGO_INCREMENTAL",
+        ),
+        (
+            "a reader with another value of the same variable",
+            producer,
+            "CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_STRIP=debuginfo",
+            "CARGO_PROFILE_DEV_STRIP",
+        ),
+        (
+            "a reader with a token its producer lacks",
+            "CARGO_INCREMENTAL=0",
+            producer,
+            "CARGO_PROFILE_DEV_STRIP",
+        ),
+    ];
+    for (defect, builds, reads, variable) in cases {
+        let mut fx = Fixture::new("k4-lector", CPU_FOUR, MEM_OPEN);
+        let rows = [
+            StepRow {
+                env: builds,
+                ..fx.row(10, "DBG", "target:T_dbg,cluster:C_dbg", "0.1")
+            },
+            StepRow {
+                deps: "DBG",
+                env: reads,
+                ..fx.row(20, "NLI", "target:T_dbg,cluster:C_nli,reader", "0.1")
+            },
+        ];
+        table_of(&mut fx, &rows);
+        let root = target_root(&fx);
+        let run = fx.run_env("0", &[("CARGO_TARGET_DIR", root.as_str())]);
+        assert_eq!(
+            run.code,
+            Some(2),
+            "{defect}: exit {:?}, want 2\n{}{}",
+            run.code,
+            run.out,
+            run.err
+        );
+        for word in ["FAIL:", "NLI", "DBG", variable, "D-K4f"] {
+            assert!(
+                run.err.contains(word),
+                "{defect}: the refusal does not say {word}: {}",
+                run.err
+            );
+        }
+        assert!(
+            fx.started().is_empty(),
+            "{defect}: a step started although the table is refused: {:?}",
+            fx.started()
+        );
+    }
+    let mut fx = Fixture::new("k4-lector-igual", CPU_FOUR, MEM_OPEN);
+    let rows = [
+        StepRow {
+            env: producer,
+            ..fx.row(10, "DBG", "target:T_dbg,cluster:C_dbg", "0.1")
+        },
+        StepRow {
+            deps: "DBG",
+            env: "CARGO_PROFILE_DEV_STRIP=symbols CARGO_INCREMENTAL=0",
+            ..fx.row(20, "NLI", "target:T_dbg,cluster:C_nli,reader", "0.1")
+        },
+    ];
+    table_of(&mut fx, &rows);
+    let root = target_root(&fx);
+    let run = fx.run_env("0", &[("CARGO_TARGET_DIR", root.as_str())]);
+    assert_green(
+        &run,
+        "a reader with the same profile tokens as its producer",
+    );
+}
+
+/// Spec K4-B, D-K4q: the plan is one line of the planner, before the first block, and the same plan is kept in the line
+/// of the run in corridas.jsonl. The machine: 24 cores, a cgroup of 16 CPUs, MemAvailable 40 GiB and a cgroup that leaves
+/// 31 GiB (the lower one is the RAM free), no power supply. Jobs: min(24 - 2, 16, 31 / 2) = 15; lanes: 16 cores and
+/// 31 GiB are 2.
+#[test]
+fn the_plan_of_the_machine_is_printed_before_the_first_block_and_recorded() {
+    let mut fx = Fixture::new("k4-plan", "1600000 100000", "34359738368");
+    write(
+        &fx.cgroups.join("scope").join("memory.current"),
+        "1073741824",
+    );
+    fx.table(&[(10, "a", "-", "0.1", ""), (20, "b", "-", "0.1", "")]);
+    let host = machine(&fx, "plan", "24", 40 * KIB_PER_GIB);
+    let ghost = fx
+        .base
+        .join("target-aun-sin-hacer")
+        .join("mas")
+        .join("hondo");
+    let ghost = ghost.display().to_string();
+    let mut env = host.env();
+    env.push(("CARGO_TARGET_DIR", ghost.as_str()));
+    let before = snapshot(&fx.history, "corridas.jsonl");
+    let run = fx.run_env("0", &env);
+    assert_green(&run, "a green table on a measured machine");
+    let lines: Vec<&str> = run.out.lines().collect();
+    let first_block = lines
+        .iter()
+        .position(|line| line.contains("=== a banner"))
+        .expect("the block of the first row");
+    let plan_at = lines
+        .iter()
+        .position(|line| line.starts_with("plan:"))
+        .unwrap_or_else(|| panic!("no `plan:` line:\n{}{}", run.out, run.err));
+    assert!(
+        plan_at < first_block,
+        "the plan (line {plan_at}) is not before the block of the first row (line {first_block}): {}",
+        run.out
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("plan:"))
+            .count(),
+        1,
+        "the plan is one line: {}",
+        run.out
+    );
+    let line = lines[plan_at];
+    assert!(
+        line.starts_with("plan: nproc=24 cgroup_cpu=16 ram_free=31.0 GiB disk_free="),
+        "{line}"
+    );
+    assert!(
+        line.contains(" GB battery=none jobs=15 (gate) lanes=2 asked=serie runs=serie"),
+        "{line}"
+    );
+    assert!(
+        word_after(line, "disk_free=").parse::<u64>().is_ok(),
+        "the free disk of a target that does not exist yet is the one of its first ancestor that does: {line}"
+    );
+    let runs = appended(&fx.history, "corridas.jsonl", &before);
+    let plan = &runs
+        .first()
+        .unwrap_or_else(|| panic!("no run line: {}{}", run.out, run.err))["plan"];
+    assert_eq!(plan["nproc"].as_u64(), Some(24), "{plan}");
+    assert_eq!(plan["cgroup_cpu"].as_u64(), Some(16), "{plan}");
+    assert!(
+        plan["ram_free"]
+            .as_f64()
+            .is_some_and(|gib| (gib - 31.0).abs() < 0.05),
+        "ram_free of the plan is in GiB, the lower of MemAvailable and the cgroup's margin: {plan}"
+    );
+    assert!(plan["disk_free"].is_u64(), "{plan}");
+    assert_eq!(plan["bateria"].as_str(), Some("none"), "{plan}");
+    assert_eq!(plan["jobs"].as_u64(), Some(15), "{plan}");
+    assert_eq!(plan["jobs_origen"].as_str(), Some("gate"), "{plan}");
+    assert_eq!(plan["carriles"].as_u64(), Some(2), "{plan}");
+    assert_eq!(plan["pedido"].as_str(), Some("serie"), "{plan}");
+    assert_eq!(plan["corre"].as_str(), Some("serie"), "{plan}");
+    assert!(
+        plan.as_object()
+            .is_some_and(|fields| fields.get("fallo").is_some_and(Value::is_null)),
+        "what was measured and did not fail leaves `fallo` as null: {plan}"
+    );
+}
+
+/// Spec K4-B, D-K4l: a CARGO_BUILD_JOBS of the operator is the jobs of the plan, and the line says whose they are.
+#[test]
+fn the_jobs_of_the_operator_are_the_jobs_of_the_plan_and_the_line_says_so() {
+    let mut fx = Fixture::new("k4-plan-operador", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "a", "-", "0.1", "")]);
+    let host = machine(&fx, "operador", "24", 100 * KIB_PER_GIB);
+    let mut env = host.env();
+    env.push(("CARGO_BUILD_JOBS", "5"));
+    let run = fx.run_env("0", &env);
+    assert_green(&run, "an operator that names 5 jobs");
+    let line = plan_line_of(&run);
+    assert!(line.contains(" jobs=5 (operator) "), "{line}");
+}
+
+/// Spec K4-B, D-K4m: the lanes of the table of the rule, read with minimums: 3 with 16 cores and 48 GiB, 2 with 8 cores
+/// and 24 GiB, 1 below. What does not reach a step stays in the one below it. The cores are `nproc` here (no cgroup limit).
+#[test]
+fn the_lanes_come_from_the_table_of_the_rule() {
+    let cases: [(&str, u64, &str); 8] = [
+        ("24", 64 * KIB_PER_GIB, "3"),
+        ("16", 48 * KIB_PER_GIB, "3"),
+        ("16", 50_226_790, "2"), // 47.9 GiB
+        ("15", 64 * KIB_PER_GIB, "2"),
+        ("8", 24 * KIB_PER_GIB, "2"),
+        ("8", 25_060_966, "1"), // 23.9 GiB
+        ("7", 64 * KIB_PER_GIB, "1"),
+        ("12", 20 * KIB_PER_GIB, "1"),
+    ];
+    for (nproc, mem_kib, lanes) in cases {
+        let mut fx = Fixture::new("k4-carriles", "max 100000", MEM_OPEN);
+        fx.table(&[(10, "a", "-", "0.1", "")]);
+        let host = machine(&fx, "carriles", nproc, mem_kib);
+        let run = fx.run_env("0", &host.env());
+        assert_green(&run, "a green table");
+        let line = plan_line_of(&run);
+        assert_eq!(
+            word_after(&line, "lanes="),
+            lanes,
+            "{nproc} cores and {mem_kib} kB of MemAvailable: {line}"
+        );
+    }
+}
+
+/// Spec K4-B, D-K4o: a measure that fails is not a refusal. The planner runs in series, with one job, and says what it
+/// could not measure, in the plan line and in the run's own record. The history is there and the mode is auto, so it
+/// is the failure and not the lack of history that puts it in series. Three ways to fail: a cgroup file that is not a
+/// number, a MemAvailable that is not there, and a `nproc` that is not a number.
+#[test]
+fn a_measure_that_fails_falls_back_to_series_and_says_so() {
+    let seeded = |name: &str| {
+        let mut fx = Fixture::new(name, CPU_FOUR, MEM_OPEN);
+        fx.table(&[(10, "a", "-", "0.2", ""), (20, "b", "-", "0.2", "")]);
+        fx.seed();
+        fx
+    };
+    let check = |fx: &Fixture, env: &[(&str, &str)], why: &str| {
+        let before_steps = snapshot(&fx.history, "pasos.jsonl");
+        let before_runs = snapshot(&fx.history, "corridas.jsonl");
+        let run = fx.run_env("auto", env);
+        assert_green(&run, why);
+        let line = plan_line_of(&run);
+        assert!(line.contains(" runs=serie"), "{why}: {line}");
+        assert!(line.contains(" jobs=1 (failed)"), "{why}: {line}");
+        let failed = line
+            .split(" failed=")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{why}: the plan line says nothing failed: {line}"));
+        assert!(failed.contains(why), "{why}: `{failed}` does not name it");
+        let steps = appended(&fx.history, "pasos.jsonl", &before_steps);
+        assert!(
+            !overlaps(by_id(&steps, "a"), by_id(&steps, "b")),
+            "{why}: the rows ran together although the measure failed"
+        );
+        let runs = appended(&fx.history, "corridas.jsonl", &before_runs);
+        let record = runs.first().expect("the run line");
+        assert_eq!(record["modo"].as_str(), Some("serie"), "{why}: {record}");
+        assert_eq!(record["plan"]["jobs"].as_u64(), Some(1), "{why}: {record}");
+        assert!(
+            record["plan"]["fallo"]
+                .as_str()
+                .is_some_and(|text| text.contains(why)),
+            "{why}: plan.fallo does not say it: {record}"
+        );
+    };
+    let fx = seeded("k4-falla-cgroup");
+    write(&fx.cgroups.join("scope").join("memory.max"), "basura");
+    check(&fx, &[], "memory.max");
+    let fx = seeded("k4-falla-memoria");
+    let without = fx.base.join("sin-memavailable");
+    write(
+        &without,
+        "MemTotal:       49327104 kB\nMemFree:         1048576 kB\n",
+    );
+    let without = without.display().to_string();
+    check(
+        &fx,
+        &[("GATE_PROC_MEMINFO", without.as_str())],
+        "MemAvailable",
+    );
+    let fx = seeded("k4-falla-nproc");
+    let broken = machine(&fx, "roto", "x", 40 * KIB_PER_GIB);
+    check(&fx, &broken.env(), "nproc");
+}
+
+/// A step that marks that it is inside (`in/<id>`), counts how many are, and waits for the others until `open` exists or
+/// `ticks` x 0.1 s pass (`ticks` is in the control directory, 0 for the run that seeds the history). Whoever sees three
+/// inside opens the barrier. The count it saw goes to `counts`. $1 id, $2 unused, $3 control directory.
+const BARRIER_SH: &str = r#"#!/bin/sh
+id="$1"
+control="$3"
+mkdir -p "$control/in"
+echo "=== $id banner"
+: > "$control/in/$id"
+ls "$control/in" | wc -l | tr -d ' ' >> "$control/counts"
+limit=$(cat "$control/ticks" 2>/dev/null || echo 0)
+i=0
+while [ ! -e "$control/open" ] && [ "$i" -lt "$limit" ]; do
+    if [ "$(ls "$control/in" | wc -l)" -ge 3 ]; then
+        : > "$control/open"
+        break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+done
+rm -f "$control/in/$id"
+echo "Running unittests fake $id"
+echo "test result: ok. 1 passed; 0 failed"
+"#;
+
+/// Spec K4-B, D-K4n, D-K4r: with `auto` at most as many rows are inside as the machine has lanes (2 here, by the
+/// measure), and the row that waits says `lanes`; with `maximo` the three are inside together. In `auto` two rows
+/// overlapped, so their `solape_s` is above 0. The barrier is a directory of marks and a deadline, not a sleep.
+#[test]
+fn in_auto_no_more_rows_are_inside_than_the_lanes_and_in_maximo_they_all_are() {
+    let mut fx = Fixture::new("k4-carriles-vivos", "1600000 100000", MEM_OPEN);
+    let script = fx.base.join("barrera.sh");
+    write(&script, BARRIER_SH);
+    let rows = [
+        StepRow {
+            script: script.clone(),
+            ..fx.row(10, "a", "", "1")
+        },
+        StepRow {
+            script: script.clone(),
+            ..fx.row(20, "b", "", "1")
+        },
+        StepRow {
+            script,
+            ..fx.row(30, "c", "", "1")
+        },
+    ];
+    table_of(&mut fx, &rows);
+    // A row that uses 0.01 CPU-seconds in the series that seeds the history asks for a fraction of a core afterwards,
+    // so what holds the third row back is the lanes and not the CPU admission of the history.
+    for id in ["a", "b", "c"] {
+        fx.usage(id, 10_000);
+    }
+    fx.seed();
+    let host = machine(&fx, "dos-carriles", "24", 40 * KIB_PER_GIB);
+    let reset = |fx: &Fixture| {
+        for name in ["counts", "open"] {
+            let _ = fs::remove_file(fx.control.join(name));
+        }
+        let _ = fs::remove_dir_all(fx.control.join("in"));
+    };
+    let most_inside = |fx: &Fixture| -> u32 {
+        read(&fx.control.join("counts"))
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .max()
+            .unwrap_or(0)
+    };
+    // The deadline of the barrier is the cost of proving that a third row did not come in: 2 s in auto, where the rows
+    // that wait for it wait all of it, and 4 s in maximo, where the barrier opens as soon as the three are inside, so a
+    // slow start of a row on a loaded machine costs nothing there.
+    write(&fx.control.join("ticks"), "20");
+
+    reset(&fx);
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run_env("auto", &host.env());
+    assert_green(&run, "auto");
+    let line = plan_line_of(&run);
+    assert!(
+        line.contains(" lanes=2 asked=auto runs=dag"),
+        "the measure gives 2 lanes and the history lets the DAG run: {line}"
+    );
+    assert_eq!(
+        most_inside(&fx),
+        2,
+        "in auto two rows are inside together and never three (the counts each row saw: {})",
+        read(&fx.control.join("counts"))
+    );
+    let steps = appended(&fx.history, "pasos.jsonl", &before);
+    assert_eq!(steps.len(), 3, "the three rows ran green: {steps:?}");
+    assert!(
+        steps
+            .iter()
+            .any(|record| record["motivo"].as_str() == Some("lanes")),
+        "no row waited with the reason `lanes`: {steps:?}"
+    );
+    let overlapped = steps
+        .iter()
+        .filter(|record| record["solape_s"].as_f64().is_some_and(|s| s > 0.0))
+        .count();
+    assert!(
+        overlapped >= 2,
+        "two rows were inside together and their solape_s is above 0 ({overlapped} are): {steps:?}"
+    );
+
+    write(&fx.control.join("ticks"), "40");
+    reset(&fx);
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run_env("maximo", &host.env());
+    assert_green(&run, "maximo");
+    assert_eq!(
+        most_inside(&fx),
+        3,
+        "in maximo the three rows are inside together (the counts each row saw: {})",
+        read(&fx.control.join("counts"))
+    );
+    let steps = appended(&fx.history, "pasos.jsonl", &before);
+    assert!(
+        steps
+            .iter()
+            .all(|record| record["motivo"].as_str() != Some("lanes")),
+        "maximo does not hold a row back for lanes: {steps:?}"
+    );
+}
+
+/// Spec K4-B, D-K4n: a row that names its jobs (12) gets them as a ceiling and not as a share. In `serie` it takes
+/// min(12, J); in `auto`, min(12, max(1, J / lanes)); in `maximo` its own 12. J = 14 here (16 cores less 2, 40 GiB of RAM
+/// is room for 20) with 2 lanes, so `auto` gives 7. On a machine that counts J = 5 the row takes 5 in series.
+#[test]
+fn a_row_that_names_its_jobs_gets_them_as_a_ceiling_and_its_share_in_auto() {
+    let mut fx = Fixture::new("k4-reparto", "max 100000", MEM_OPEN);
+    fx.table(&[(10, "w", "-", "0.2", "CARGO_BUILD_JOBS=12")]);
+    let seen = |fx: &Fixture| -> String {
+        read(&fx.control.join("env-w.txt"))
+            .lines()
+            .find_map(|line| line.strip_prefix("CARGO_BUILD_JOBS=").map(str::to_string))
+            .unwrap_or_else(|| "unset".to_string())
+    };
+    let wide = machine(&fx, "ancha", "16", 40 * KIB_PER_GIB);
+    let run = fx.run_env("serie", &wide.env());
+    assert_green(&run, "serie");
+    assert_eq!(seen(&fx), "12", "serie: min(12, 14)");
+    let run = fx.run_env("auto", &wide.env());
+    assert_green(&run, "auto");
+    assert!(
+        plan_line_of(&run).contains(" lanes=2 asked=auto runs=dag"),
+        "{}",
+        run.out
+    );
+    assert_eq!(seen(&fx), "7", "auto: min(12, max(1, 14 / 2))");
+    let run = fx.run_env("maximo", &wide.env());
+    assert_green(&run, "maximo");
+    assert_eq!(seen(&fx), "12", "maximo leaves the number of the row");
+    let narrow = machine(&fx, "estrecha", "7", 40 * KIB_PER_GIB);
+    let run = fx.run_env("serie", &narrow.env());
+    assert_green(&run, "serie on 7 cores");
+    assert_eq!(seen(&fx), "5", "serie: min(12, 5)");
+    // An operator that names 1 job and a machine with 2 lanes: 1 / 2 is 0 jobs, and cargo refuses 0, so the share has a floor.
+    let mut one = wide.env();
+    one.push(("CARGO_BUILD_JOBS", "1"));
+    let run = fx.run_env("auto", &one);
+    assert_green(&run, "auto with the 1 job of the operator");
+    assert_eq!(seen(&fx), "1", "auto: min(12, max(1, 1 / 2))");
+}
+
+/// Spec K4-B, D-K4n, D-F3x: 0 and serie are the series, 1 and maximo are the DAG of today, auto is the DAG with lanes,
+/// and the plan says what was asked. Anything else is exit 2 with `GATE_DAG is`, and no row starts. Without GATE_DAG the
+/// default is the series (the default is `serie`, not `auto`: the DAG is activated in a commit of its own).
+#[test]
+fn gate_dag_takes_serie_auto_maximo_and_their_numbers_and_nothing_else() {
+    let mut fx = Fixture::new("k4-valores", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "s10", "-", "0.3", ""), (20, "s20", "-", "0.3", "")]);
+    fx.seed();
+    for (value, asked, runs) in [
+        ("0", "serie", "serie"),
+        ("serie", "serie", "serie"),
+        ("1", "maximo", "dag"),
+        ("maximo", "maximo", "dag"),
+        ("auto", "auto", "dag"),
+        (UNSET, "serie", "serie"),
+    ] {
+        let run = fx.run(value);
+        assert_green(&run, value);
+        let line = plan_line_of(&run);
+        assert!(
+            line.contains(&format!(" asked={asked} runs={runs}")),
+            "GATE_DAG={value}: {line}"
+        );
+    }
+    for bad in ["2", "Serie", "dag"] {
+        let mut fx = Fixture::new("k4-valor-malo", CPU_FOUR, MEM_OPEN);
+        fx.table(&[(10, "s10", "-", "0.1", "")]);
+        let run = fx.run(bad);
+        assert_eq!(run.code, Some(2), "GATE_DAG={bad}: {}{}", run.out, run.err);
+        assert!(
+            run.err.contains("GATE_DAG is"),
+            "GATE_DAG={bad}: the refusal does not say `GATE_DAG is`: {}",
+            run.err
+        );
+        assert!(
+            fx.started().is_empty(),
+            "GATE_DAG={bad}: a row started: {:?}",
+            fx.started()
+        );
+    }
+}
+
+/// Spec K4-B (the verdict does not depend on the machine): a table with a red in the row of idx 30, between greens, gives
+/// in `serie` and in `auto` (with history and 2 lanes) the same exit, the same `FAIL: <id> exited` and the same blocks
+/// for the rows before the red.
+#[test]
+fn the_same_red_is_reported_with_one_lane_and_with_many() {
+    let mut fx = Fixture::new("k4-veredicto", "1600000 100000", MEM_OPEN);
+    fx.table(&[
+        (10, "s10", "-", "0.3", ""),
+        (20, "s20", "-", "0.3", ""),
+        (30, "s30", "-", "0.3", ""),
+        (40, "s40", "-", "0.3", ""),
+        (50, "s50", "-", "0.3", ""),
+    ]);
+    fx.seed();
+    fx.rc("s30", "3");
+    let host = machine(&fx, "veredicto", "24", 40 * KIB_PER_GIB);
+    let serie = fx.run_env("serie", &host.env());
+    let auto = fx.run_env("auto", &host.env());
+    assert!(
+        plan_line_of(&auto).contains(" lanes=2 asked=auto runs=dag"),
+        "{}",
+        auto.out
+    );
+    let before_the_red = |run: &Run| -> String {
+        let kept: Vec<&str> = run
+            .out
+            .lines()
+            .filter(|line| {
+                !line.starts_with("dag:")
+                    && !line.starts_with("note:")
+                    && !line.starts_with("plan:")
+            })
+            .collect();
+        let red_at = kept
+            .iter()
+            .position(|line| *line == "=== s30 banner")
+            .unwrap_or_else(|| panic!("no block of s30: {}", run.out));
+        kept[..red_at].join("\n")
+    };
+    for (label, run) in [("serie", &serie), ("auto", &auto)] {
+        assert!(!run.timed_out, "{label}: did not finish in 30 s");
+        assert_eq!(run.code, Some(3), "{label}: {}{}", run.out, run.err);
+        assert!(
+            run.out.contains("FAIL: s30 exited 3"),
+            "{label}: no `FAIL: s30 exited 3`: {}",
+            run.out
+        );
+    }
+    let blocks = before_the_red(&serie);
+    assert!(
+        blocks.contains("=== s10 banner") && blocks.contains("=== s20 banner"),
+        "the blocks before the red are not in the output of the series: {blocks}"
+    );
+    assert_eq!(
+        blocks,
+        before_the_red(&auto),
+        "the blocks before the red differ between one lane and many"
+    );
+}
+
+/// Spec K4-B, D-K4r: in series no row overlaps another, so every `solape_s` is 0, and after the line of the summary
+/// (`dag: T=`) there is one `dag: step <id> seg=… wait=… overlap=… mem_peak=… cpu_s=…` per row that ran, in idx order.
+#[test]
+fn in_series_nothing_overlaps_and_each_row_gets_its_line_after_the_summary() {
+    let mut fx = Fixture::new("k4-solape-serie", CPU_FOUR, MEM_OPEN);
+    fx.table(&[
+        (10, "s10", "-", "0.1", ""),
+        (20, "s20", "-", "0.1", ""),
+        (30, "s30", "-", "0.1", ""),
+    ]);
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run("0");
+    assert_green(&run, "series");
+    let steps = appended(&fx.history, "pasos.jsonl", &before);
+    assert_eq!(steps.len(), 3, "{steps:?}");
+    for record in &steps {
+        assert_eq!(
+            record["solape_s"].as_f64(),
+            Some(0.0),
+            "a row of the series overlapped another: {record}"
+        );
+    }
+    let after: Vec<&str> = run
+        .out
+        .lines()
+        .skip_while(|line| !line.starts_with("dag: T="))
+        .skip(1)
+        .filter(|line| line.starts_with("dag: step "))
+        .collect();
+    assert_eq!(
+        after.len(),
+        3,
+        "one line per row after the summary: {}",
+        run.out
+    );
+    for (line, id) in after.iter().zip(["s10", "s20", "s30"]) {
+        assert!(
+            line.starts_with(&format!("dag: step {id} seg=")),
+            "`{line}` is not the line of {id}, in idx order"
+        );
+        for key in [" wait=", " overlap=", " mem_peak=", " cpu_s="] {
+            assert!(line.contains(key), "`{line}` lacks{key}");
+        }
+        assert_eq!(
+            word_after(line, "overlap=").parse::<f64>().ok(),
+            Some(0.0),
+            "`{line}`"
+        );
+    }
+}
+
+/// Spec K4-B, D-K4p: the battery and the disk are measured, printed and saved, and change nothing. A battery that
+/// discharges says `discharging`, one that does not says `ac`, a root with no battery or none at all says `none`, a
+/// `type` that cannot be read says `unknown`. In every case the jobs, the lanes and the mode are those of the machine
+/// without a battery, and the plan has no `failed=`.
+#[test]
+fn the_battery_is_measured_and_changes_nothing() {
+    let cases: [(&str, Option<(&str, &str)>, &str); 5] = [
+        ("sin-ninguna", None, "none"),
+        (
+            "descargando",
+            Some(("Battery", "Discharging")),
+            "discharging",
+        ),
+        ("cargando", Some(("Battery", "Charging")), "ac"),
+        ("solo-red", Some(("Mains", "")), "none"),
+        ("type-ilegible", Some(("", "")), "unknown"),
+    ];
+    let mut tails = Vec::new();
+    for (tag, supply, want) in cases {
+        let mut fx = Fixture::new("k4-bateria", "1600000 100000", MEM_OPEN);
+        fx.table(&[(10, "a", "-", "0.1", "")]);
+        let mut host = machine(&fx, tag, "24", 40 * KIB_PER_GIB);
+        if let Some((kind, status)) = supply {
+            let root = fx.base.join("power_supply");
+            let unit = root.join("BAT0");
+            fs::create_dir_all(&unit).expect("a power supply");
+            if kind.is_empty() {
+                fs::create_dir_all(unit.join("type")).expect("a type that is a directory");
+            } else {
+                write(&unit.join("type"), &format!("{kind}\n"));
+            }
+            if !status.is_empty() {
+                write(&unit.join("status"), &format!("{status}\n"));
+            }
+            host.power = root.display().to_string();
+        }
+        let run = fx.run_env("0", &host.env());
+        assert_green(&run, tag);
+        let line = plan_line_of(&run);
+        assert_eq!(word_after(&line, "battery="), want, "{tag}: {line}");
+        assert!(
+            !line.contains(" failed="),
+            "{tag}: a battery that cannot be read is not a failed measure: {line}"
+        );
+        tails.push((tag, line.split(" jobs=").nth(1).unwrap_or("").to_string()));
+    }
+    let (first_tag, first) = &tails[0];
+    for (tag, tail) in &tails {
+        assert_eq!(
+            tail, first,
+            "{tag} gave other jobs, lanes or mode than {first_tag}: the battery only gets measured"
+        );
+    }
+}
+
+/// A step that builds: it leaves four reports in the cargo-timings directory of the target the planner gave it (4, 6, 2
+/// and 2 bytes: two that its log will name, one it will not, and the copy of the last one that cargo keeps) and says in
+/// its log which it saved, as cargo does on stderr: the lines are in `saved-<id>.txt` of the control directory, with
+/// `@D@` for the directory. $1 id, $2 seconds, $3 control directory.
+const REPORTS_SH: &str = r#"#!/bin/sh
+id="$1"
+control="$3"
+d="$CARGO_TARGET_DIR/cargo-timings"
+mkdir -p "$d"
+echo "$d" > "$control/timings-dir-$id"
+echo "=== $id banner"
+printf 'AAAA' > "$d/cargo-timing-20261109T120000Z.html"
+printf 'BBBBBB' > "$d/cargo-timing-20261109T120001Z.html"
+printf 'CC' > "$d/cargo-timing-20261109T120002Z.html"
+printf 'DD' > "$d/cargo-timing.html"
+if [ -f "$control/saved-$id.txt" ]; then
+    sed "s|@D@|$d|g" "$control/saved-$id.txt" >&2
+fi
+echo "Running unittests fake $id"
+echo "test result: ok. 1 passed; 0 failed"
+"#;
+
+const SAVED_TWO: &str = "   Compiling fake v0.0.0\n   Timing report saved to @D@/cargo-timing-20261109T120000Z.html\n   Timing report saved to @D@/cargo-timing-20261109T120001Z.html\n    Finished `dev` profile\n";
+const REPORT_NAMES: [&str; 4] = [
+    "cargo-timing-20261109T120000Z.html",
+    "cargo-timing-20261109T120001Z.html",
+    "cargo-timing-20261109T120002Z.html",
+    "cargo-timing.html",
+];
+
+/// A one-row table whose row `b` builds in the target T_x and leaves the four reports; `saved` is what its log says.
+fn reports_fixture(name: &str, saved: &str) -> Fixture {
+    let mut fx = Fixture::new(name, CPU_FOUR, MEM_OPEN);
+    let script = fx.base.join("informes.sh");
+    write(&script, REPORTS_SH);
+    write(&fx.control.join("saved-b.txt"), saved);
+    let rows = [StepRow {
+        resources: "target:T_x",
+        script,
+        ..fx.row(10, "b", "", "0.2")
+    }];
+    table_of(&mut fx, &rows);
+    fx
+}
+
+/// The cargo-timings directory of the target the row `b` of `reports_fixture` was given.
+fn reports_dir(fx: &Fixture) -> PathBuf {
+    PathBuf::from(read(&fx.control.join("timings-dir-b")).trim())
+}
+
+/// `reports_fixture` run in series with a target root of its own; the record of `b` in pasos.jsonl.
+fn run_reports(fx: &Fixture) -> (Run, Value) {
+    let root = target_root(fx);
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run_env("0", &[("CARGO_TARGET_DIR", root.as_str())]);
+    assert_green(&run, "a row that leaves reports");
+    let steps = appended(&fx.history, "pasos.jsonl", &before);
+    let record = by_id(&steps, "b").clone();
+    (run, record)
+}
+
+/// Spec K4-A, D-K4h: the reports a row's log names go from its target to the history, in the folder of its day, its
+/// run and its row, and the planner counts them with their exact weight. What the log does not name (a report of another
+/// call, cargo-timing.html, the copy of the last one) stays where it was.
+#[test]
+fn the_reports_a_row_names_move_from_its_target_to_the_history_with_its_row() {
+    let fx = reports_fixture("k4-informes", SAVED_TWO);
+    let (_, record) = run_reports(&fx);
+    let target = reports_dir(&fx);
+    let timings = &record["timings"];
+    assert!(timings.is_object(), "no timings in the record: {record}");
+    let dir = timings["dir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("timings.dir is not text: {record}"));
+    let parts: Vec<&str> = dir.split('/').collect();
+    assert_eq!(
+        parts.len(),
+        4,
+        "dir is <day>/timings/<run>/<idx>-<id>, relative to the root of the history: {dir}"
+    );
+    assert!(
+        parts[0].len() == 8 && parts[0].chars().all(|c| c.is_ascii_digit()),
+        "{dir}"
+    );
+    assert_eq!(parts[1], "timings", "{dir}");
+    assert_eq!(Some(parts[2]), record["run"].as_str(), "{dir}");
+    assert_eq!(parts[3], "10-b", "{dir}");
+    let history = fx.history.join("memory-industry");
+    for (name, body) in [(REPORT_NAMES[0], "AAAA"), (REPORT_NAMES[1], "BBBBBB")] {
+        assert_eq!(
+            read(&history.join(dir).join(name)),
+            body,
+            "{name} is not in the history, with its content"
+        );
+        assert!(
+            !target.join(name).exists(),
+            "{name} was copied, not moved: it is still in the target"
+        );
+    }
+    for kept in [REPORT_NAMES[2], REPORT_NAMES[3]] {
+        assert!(
+            target.join(kept).exists(),
+            "{kept} is not named by the log and was taken out of the target"
+        );
+    }
+    assert_eq!(timings["n"].as_u64(), Some(2), "{timings}");
+    assert_eq!(timings["bytes"].as_u64(), Some(10), "{timings}");
+    assert_eq!(timings["perdidos"].as_u64(), Some(0), "{timings}");
+    assert_eq!(timings["faltan"].as_u64(), Some(0), "{timings}");
+    assert!(
+        history.join(parts[0]).join("pasos.jsonl").is_file(),
+        "the reports are not in the folder of the day of the record"
+    );
+}
+
+/// Spec K4-A, D-K4h: a report named twice counts once and is `perdidos`; one the log names and the target lacks is
+/// `faltan`. The row is green and stays green.
+#[test]
+fn a_report_named_twice_or_missing_is_counted_and_changes_no_verdict() {
+    let saved = "   Timing report saved to @D@/cargo-timing-20261109T120000Z.html\n   Timing report saved to @D@/cargo-timing-20261109T120000Z.html\n   Timing report saved to @D@/cargo-timing-20269999T000000Z.html\n";
+    let fx = reports_fixture("k4-informes-cuenta", saved);
+    let (run, record) = run_reports(&fx);
+    assert_eq!(run.code, Some(0), "{}{}", run.out, run.err);
+    assert_eq!(record["rc"].as_i64(), Some(0), "{record}");
+    let timings = &record["timings"];
+    assert_eq!(timings["n"].as_u64(), Some(1), "{record}");
+    assert_eq!(timings["perdidos"].as_u64(), Some(1), "{record}");
+    assert_eq!(timings["faltan"].as_u64(), Some(1), "{record}");
+}
+
+/// Spec K4-A, D-K4h: a row whose log names no report has `timings` null, written as a key and not left out: a row that
+/// builds and names none, and a row with no target at all. What a row built stays in its target.
+#[test]
+fn a_row_that_names_no_report_has_timings_null_and_loses_nothing() {
+    let fx = reports_fixture("k4-sin-informes", "");
+    let (_, record) = run_reports(&fx);
+    assert!(
+        record
+            .as_object()
+            .is_some_and(|fields| fields.get("timings").is_some_and(Value::is_null)),
+        "timings has to be a key of the record and null: {record}"
+    );
+    let target = reports_dir(&fx);
+    for name in REPORT_NAMES {
+        assert!(
+            target.join(name).exists(),
+            "{name} was taken out of the target"
+        );
+    }
+    let mut fx = Fixture::new("k4-sin-informes-sin-target", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "q", "-", "0.1", "")]);
+    let before = snapshot(&fx.history, "pasos.jsonl");
+    let run = fx.run("0");
+    assert_green(&run, "a row with no target");
+    let steps = appended(&fx.history, "pasos.jsonl", &before);
+    assert!(
+        by_id(&steps, "q")
+            .as_object()
+            .is_some_and(|fields| fields.get("timings").is_some_and(Value::is_null)),
+        "{steps:?}"
+    );
+}
+
+/// Spec K4-A, D-K4h: a history that cannot be written does not change the verdict: the planner exits 0, says it once
+/// with a `history:` line, and the reports stay in the target. The control is the same row with a history that can be
+/// written, which moves them: without it the second half would pass over a planner that never moved anything. The
+/// unwritable history is a path under a regular file, which no user can make.
+#[test]
+fn a_history_that_cannot_be_written_changes_no_verdict_and_leaves_the_reports_in_the_target() {
+    let control = reports_fixture("k4-escritura-control", SAVED_TWO);
+    run_reports(&control);
+    assert!(
+        !reports_dir(&control).join(REPORT_NAMES[0]).exists(),
+        "control: with a history that can be written the report is not in the target any more"
+    );
+    let fx = reports_fixture("k4-escritura", SAVED_TWO);
+    let blocker = fx.base.join("no-es-un-directorio");
+    write(&blocker, "x");
+    let unwritable = blocker.join("historial").display().to_string();
+    let root = target_root(&fx);
+    let run = fx.run_env(
+        "0",
+        &[
+            ("CARGO_TARGET_DIR", root.as_str()),
+            ("CI_TIEMPOS_DIR", unwritable.as_str()),
+        ],
+    );
+    assert_green(&run, "a history that cannot be written");
+    let said = run
+        .err
+        .lines()
+        .filter(|line| line.starts_with("history:"))
+        .count();
+    assert_eq!(said, 1, "one `history:` line, no more: {}", run.err);
+    let target = reports_dir(&fx);
+    for name in REPORT_NAMES {
+        assert!(
+            target.join(name).exists(),
+            "{name} left the target although the history could not take it"
+        );
+    }
+}
+
+/// What `gate_cargo_jobs` (gate-lock.sh) prints and exports, in a bash of its own, on the machine of the test.
+struct Jobs {
+    code: Option<i32>,
+    line: String,
+    jobs: String,
+    release: String,
+    err: String,
+}
+
+/// `source gate-lock.sh; gate_cargo_jobs` under a `timeout` of 20 s, with the fixture's cgroup tree, `nproc` and
+/// MemAvailable of `machine`, and the CARGO_BUILD_JOBS of the operator only if `operator` names one.
+fn cargo_jobs(fx: &Fixture, machine: &Machine, operator: Option<&str>) -> Jobs {
+    let order = r#"source "$1" && gate_cargo_jobs && printf 'JOBS=%s RELEASE=%s\n' "$CARGO_BUILD_JOBS" "$GATE_RELEASE_JOBS""#;
+    let mut command = Command::new("timeout");
+    command
+        .args(["20", "bash", "-c", order, "gate-lock"])
+        .arg(repo_root().join("scripts").join("gate-lock.sh"))
+        .env_remove("CARGO_BUILD_JOBS")
+        .env_remove("GATE_CARGO_JOBS_FROM_GATE")
+        .env("HOME", &fx.home)
+        .env("TMPDIR", &fx.tmp)
+        .env("GATE_CGROUP_ROOT", &fx.cgroups)
+        .env("GATE_PROC_SELF_CGROUP", &fx.proc_self)
+        .envs(host.env());
+    if let Some(jobs) = operator {
+        command.env("CARGO_BUILD_JOBS", jobs);
+    }
+    let output = command.output().expect("bash sourcing gate-lock.sh");
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    let probe = out
+        .lines()
+        .find(|line| line.starts_with("JOBS="))
+        .unwrap_or("");
+    let value = |key: &str| -> String {
+        probe
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix(key))
+            .unwrap_or("")
+            .to_string()
+    };
+    Jobs {
+        code: output.status.code(),
+        line: out
+            .lines()
+            .find(|line| line.starts_with("cargo jobs="))
+            .unwrap_or("")
+            .to_string(),
+        jobs: value("JOBS="),
+        release: value("RELEASE="),
+        err: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Spec K4-B, D-K4k, D-K4l: the jobs are min(cores - 2, the CPUs of the cgroup, free RAM / 2 GiB), at least 1, and
+/// the line that says so names the three measures. The RAM free is the lower of MemAvailable and what the cgroup leaves:
+/// a cgroup that leaves 6 GiB of 100 GiB of MemAvailable gives 3.
+#[test]
+fn the_cargo_jobs_are_the_cores_less_two_under_the_cgroup_and_two_gib_a_job() {
+    let cases = [
+        ("24", "max 100000", MEM_OPEN, 100, "22", "none"),
+        ("24", "800000 100000", MEM_OPEN, 100, "8", "8"),
+        ("24", "max 100000", MEM_OPEN, 10, "5", "none"),
+        ("2", "max 100000", MEM_OPEN, 100, "1", "none"),
+        ("24", "1600000 100000", MEM_OPEN, 3, "1", "16"),
+        ("24", "max 100000", "6442450944", 100, "3", "none"),
+    ];
+    for (nproc, cpu_max, mem_max, mem_gib, jobs, cgroup) in cases {
+        let fx = Fixture::new("k4-trabajos", cpu_max, mem_max);
+        let host = machine(&fx, "trabajos", nproc, mem_gib * KIB_PER_GIB);
+        let got = cargo_jobs(&fx, &host, None);
+        let free = if mem_max == MEM_OPEN { mem_gib } else { 6 };
+        let want = format!(
+            "cargo jobs={jobs} (nproc={nproc}, cgroup cpu={cgroup}, ram free={free}.0 GiB)"
+        );
+        assert_eq!(got.code, Some(0), "{want}: {}", got.err);
+        assert_eq!(got.line, want, "{nproc} cores, {cpu_max}, {mem_gib} GiB");
+        assert_eq!(got.jobs, jobs, "CARGO_BUILD_JOBS: {want}");
+    }
+}
+
+/// Spec K4-B: a CARGO_BUILD_JOBS the operator set is kept, and the line says so (F1.2).
+#[test]
+fn the_jobs_the_operator_names_are_kept_and_the_line_says_so() {
+    let fx = Fixture::new("k4-trabajos-operador", "800000 100000", MEM_OPEN);
+    let host = machine(&fx, "operador", "24", 100 * KIB_PER_GIB);
+    let got = cargo_jobs(&fx, &host, Some("5"));
+    assert_eq!(got.code, Some(0), "{}", got.err);
+    assert_eq!(got.jobs, "5", "{}", got.line);
+    assert!(
+        got.line
+            .starts_with("cargo jobs=5 (CARGO_BUILD_JOBS set by the operator"),
+        "{}",
+        got.line
+    );
+}
+
+/// Spec K4-B, D-K4o: a measure that fails does not stop the gate. `gate_cargo_jobs` exports one job, says what it could
+/// not measure and names it, and the release builds take one too. Three ways to fail, as for the planner.
+#[test]
+fn a_measure_that_fails_gives_one_job_and_says_what_it_could_not_read() {
+    let fx = Fixture::new("k4-trabajos-falla-cgroup", "max 100000", "basura");
+    let host = machine(&fx, "falla", "24", 100 * KIB_PER_GIB);
+    let by_cgroup = cargo_jobs(&fx, &host, None);
+    let fx = Fixture::new("k4-trabajos-falla-memoria", "max 100000", MEM_OPEN);
+    let host = machine_without_memavailable(&fx);
+    let by_memory = cargo_jobs(&fx, &host, None);
+    let fx = Fixture::new("k4-trabajos-falla-nproc", "max 100000", MEM_OPEN);
+    let host = machine(&fx, "falla", "x", 100 * KIB_PER_GIB);
+    let by_nproc = cargo_jobs(&fx, &host, None);
+    for (got, why) in [
+        (by_cgroup, "memory.max"),
+        (by_memory, "MemAvailable"),
+        (by_nproc, "nproc"),
+    ] {
+        assert_eq!(
+            got.code,
+            Some(0),
+            "{why}: gate_cargo_jobs stopped the shell: {}",
+            got.err
+        );
+        assert!(
+            got.line
+                .starts_with("cargo jobs=1 (resource measure failed: ")
+                && got.line.ends_with("; series with one job)")
+                && got.line.contains(why),
+            "{why}: {}",
+            got.line
+        );
+        assert_eq!(got.jobs, "1", "{why}: {}", got.line);
+        assert_eq!(got.release, "1", "{why}: {}", got.line);
+    }
+}
+
+/// A machine whose /proc/meminfo has no MemAvailable.
+fn machine_without_memavailable(fx: &Fixture) -> Machine {
+    let host = machine(fx, "sin-memavailable", "24", 100 * KIB_PER_GIB);
+    write(
+        Path::new(&host.meminfo),
+        "MemTotal:       49327104 kB\nMemFree:         1048576 kB\n",
+    );
+    host
 }

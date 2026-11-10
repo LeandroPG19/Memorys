@@ -726,6 +726,7 @@ FAKE
       'echo "${CARGO_BUILD_JOBS-unset} $*" >>"$HOME/cargo.jobs"' \
       'if [ "$1" = "${FAKE_CARGO_FAIL:-none}" ]; then exit "${FAKE_CARGO_FAIL_EXIT:-1}"; fi' \
       'mkdir -p "$CARGO_TARGET_DIR/debug" "$CARGO_TARGET_DIR/release"' \
+      'case "$*" in *--timings*) [ -n "${FAKE_CARGO_NO_TIMING_LINE:-}" ] || echo "   Timing report saved to $CARGO_TARGET_DIR/cargo-timings/cargo-timing-20261109T120000Z.html" >&2 ;; esac' \
       'case "$*" in *--release*) [ -e "$CARGO_TARGET_DIR/release/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/release/memory-industry" ;; esac' \
       '[ -z "${FAKE_CHANGE_RELEASE_ON:-}" ] || case "$*" in *"$FAKE_CHANGE_RELEASE_ON"*) echo changed >"$CARGO_TARGET_DIR/release/memory-industry" ;; esac' \
       'if [ "$1" = build ]; then' \
@@ -1117,6 +1118,44 @@ FAKE
     self_fail "F1.2: a call that is not a release one did not keep the CARGO_BUILD_JOBS=5 the operator set: $(grep -v -- ' --release' "$tmp/f1op/home/cargo.jobs")"
   fi
 
+  # K4g (CI-K4, D-K4g): every cargo call that compiles (build, test, clippy) asks for `--timings`, before the `--` that
+  # hands the rest to the test binary, and a call that compiles nothing (fmt) asks for none. The stand-in cargo prints on
+  # stderr the line cargo prints when it is given the flag, `Timing report saved to <path>`, which lands in the logs that
+  # run_counted reads. The counts of a run with that line are the counts of a run without it (FAKE_CARGO_NO_TIMING_LINE).
+  full_tree k4g
+  full_run k4g
+  (( rc == 0 )) || self_fail "K4g: a full run whose every step passed exited $rc: $(cat "$tmp/k4g.out")"
+  [[ -s "$tmp/k4g/home/cargo.calls" ]] || self_fail "K4g: no cargo call was recorded"
+  for k4_sub in build test clippy fmt; do
+    grep -q "^$k4_sub" "$tmp/k4g/home/cargo.calls" \
+      || self_fail "K4g: the run made no cargo $k4_sub call, so the rule is not read over it: $(cat "$tmp/k4g/home/cargo.calls")"
+  done
+  while IFS= read -r k4_call; do
+    k4_sub="${k4_call%% *}"
+    k4_before="${k4_call%% -- *}"
+    case "$k4_sub" in
+      build|test|clippy)
+        case " $k4_before " in
+          *" --timings "*) ;;
+          *) self_fail "K4g: the cargo call '$k4_call' compiles and carries no --timings before its --" ;;
+        esac ;;
+      *)
+        case " $k4_call " in
+          *" --timings "*) self_fail "K4g: the cargo call '$k4_call' compiles nothing and was given --timings" ;;
+        esac ;;
+    esac
+  done <"$tmp/k4g/home/cargo.calls"
+  grep -q 'Timing report saved to' "$tmp/k4g.out" \
+    || self_fail "K4g: no call asked for --timings, so the line cargo prints for it never reached the log: $(cat "$tmp/k4g.out")"
+  full_tree k4quiet
+  full_run k4quiet FAKE_CARGO_NO_TIMING_LINE=1
+  (( rc == 0 )) || self_fail "K4g: a full run with no timing line exited $rc: $(cat "$tmp/k4quiet.out")"
+  grep -q 'Timing report saved to' "$tmp/k4quiet.out" \
+    && self_fail "K4g: the run that was to print no timing line printed one: $(grep 'Timing report' "$tmp/k4quiet.out")"
+  [[ -n "$(grep '^OK  section ' "$tmp/k4quiet.out")" ]] || self_fail "K4g: the run printed no OK  section line"
+  [[ "$(grep '^OK  section ' "$tmp/k4g.out")" == "$(grep '^OK  section ' "$tmp/k4quiet.out")" ]] \
+    || self_fail "K4g: the counts of the sections are not the same with and without the timing line: $(diff <(grep '^OK  section ' "$tmp/k4g.out") <(grep '^OK  section ' "$tmp/k4quiet.out") || true)"
+
   # F2.2 (D-F2b): --check-models asks the paths the tests ask, runs no cargo, and names what is missing
   # with the text of require_present.
   full_tree f2mok
@@ -1252,7 +1291,7 @@ FAKE
   release_run lane_pair --lane CL --lane D1
   (( rc == 0 )) || self_fail "F3.3b-1: --lane CL --lane D1 exits $rc, not 0: $(cat "$tmp/lane_pair.out")"
   pair_clippy="$(grep -n -m1 'clippy' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
-  pair_test="$(grep -n -m1 '^test$' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
+  pair_test="$(grep -n -m1 '^test --timings$' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
   [[ -n "$pair_clippy" && -n "$pair_test" && "$pair_clippy" -lt "$pair_test" ]] \
     || self_fail "F3.3b-1: --lane CL --lane D1 did not run CL and then D1 in that order (clippy at ${pair_clippy:-none}, test at ${pair_test:-none}): $(cat "$tmp/lane_pair/home/cargo.calls" 2>/dev/null)"
   [[ "$(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_pair/home/psql.calls" 2>/dev/null || true)" == 1 ]] \

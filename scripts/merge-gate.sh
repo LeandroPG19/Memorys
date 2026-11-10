@@ -843,7 +843,7 @@ FAKE
   run_copy times_last
   (( rc == 0 )) || self_fail "times_last: a gate whose every step passed exited $rc: $(cat "$tmp/times_last.out")"
   [[ "$(exit_file times_last)" == 0 ]] || self_fail "times_last: the exit file says '$(exit_file times_last)', not 0"
-  docs_at="$(step_at times_last '^cargo test --features docs$')"
+  docs_at="$(step_at times_last '^cargo test --features docs --timings$')"
   muerto_at="$(step_at times_last '^codigo-muerto$')"
   crap_at="$(step_at times_last '^crap-gate$')"
   mutants_at="$(step_at times_last '^mutants-gate$')"
@@ -949,10 +949,11 @@ FAKE
     [[ "${lines[at+1]:-}" == "OK  judge server :$port (cluster_name=memory-industry-gate, system_identifier=7701731310526959658)" ]] \
       || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the OK of the judge server on :$port"
     # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
+    # CI-K4 (D-K4q): and, before the first block, the plan of the machine it measured (`plan: ...`).
     planner_gap=0
-    [[ "${lines[at+2]:-}" =~ ^dag:\ P\ env: ]] && planner_gap=1
+    while [[ "${lines[at+2+planner_gap]:-}" =~ ^(plan:\ |dag:\ P\ env:) ]]; do planner_gap=$(( planner_gap + 1 )); done
     [[ "${lines[at+2+planner_gap]:-}" == "=== cargo audit ===" ]] \
-      || self_fail "$name: the line after the judge's OK is '${lines[at+2]:-}', not the banner of cargo audit, the first step after the readiness check"
+      || self_fail "$name: the line after the judge's OK (and the planner's lines) is '${lines[at+2+planner_gap]:-}', not the banner of cargo audit, the first step after the readiness check"
     if grep -qxF "$answer" "$tmp/$name.out"; then
       self_fail "$name: pg_isready's own answer is a line of the output: $(cat "$tmp/$name.out")"
     fi
@@ -990,10 +991,15 @@ FAKE
     at="$(grep -nxF -- "$want" "$tmp/$name.out" | head -1 | cut -d: -f1)"
     [[ -n "$at" ]] || self_fail "$name: no line '$want': $(cat "$tmp/$name.out")"
     # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
-    next="$(sed -n "$((at+1))p" "$tmp/$name.out")"
-    [[ "$next" =~ ^dag:\ P\ env: ]] && next="$(sed -n "$((at+2))p" "$tmp/$name.out")"
+    # CI-K4 (D-K4q): and, before the first block, the plan of the machine it measured (`plan: ...`).
+    skip=1
+    next="$(sed -n "$((at+skip))p" "$tmp/$name.out")"
+    while [[ "$next" =~ ^(plan:\ |dag:\ P\ env:) ]]; do
+      skip=$(( skip + 1 ))
+      next="$(sed -n "$((at+skip))p" "$tmp/$name.out")"
+    done
     [[ "$next" == "=== cargo audit ===" ]] \
-      || self_fail "$name: the line after the judge's OK (and the planner's line for P) is not the banner of cargo audit: $(cat "$tmp/$name.out")"
+      || self_fail "$name: the line after the judge's OK (and the planner's lines for P) is not the banner of cargo audit: $(cat "$tmp/$name.out")"
     grep -qxF 'PGOPTIONS=-c default_transaction_read_only=on' "$tmp/$name/home/psql.env" 2>/dev/null \
       || self_fail "$name: the identity query did not run read-only: $(cat "$tmp/$name/home/psql.env" 2>/dev/null || true)"
     # A F2b: the password goes to libpq in PGPASSWORD, for that one call, and never in the argv of psql
@@ -1083,8 +1089,8 @@ up e2e
 run-all-tests --lane E
 down e2e
 up docs
-cargo clippy --all-targets --features docs -- -D warnings
-cargo test --features docs
+cargo clippy --all-targets --features docs --timings -- -D warnings
+cargo test --features docs --timings
 down docs
 up cov
 crap-gate
@@ -1094,6 +1100,15 @@ mutants-gate
 down mut'
   [[ "$(grep -E '^(up |down |run-all-tests|crap-gate|mutants-gate|cargo .*--features docs)' "$tmp/c1/home/steps")" == "$lane_order" ]] \
     || self_fail "C1: the lanes and the steps are not in the order of D-F2c (up, its step, down, per lane): $(cat "$tmp/c1/home/steps")"
+  # CI-K4 (D-K4g): the two calls of DC compile and carry --timings before their `--` (the order above pins them to the
+  # letter); a call that compiles nothing (fmt, audit, deny) carries none.
+  for k4_sub in fmt audit deny; do
+    grep -q "^cargo $k4_sub" "$tmp/c1/home/steps" \
+      || self_fail "K4: the steps of C1 hold no cargo $k4_sub call, so the rule is not read over it: $(cat "$tmp/c1/home/steps")"
+  done
+  if grep -E '^cargo (fmt|audit|deny)' "$tmp/c1/home/steps" | grep -q -- '--timings'; then
+    self_fail "K4: a cargo call that compiles nothing was given --timings: $(grep -E '^cargo (fmt|audit|deny)' "$tmp/c1/home/steps")"
+  fi
   grep -qxE 'dbg postgresql://cuba:fakepw@[^ ]*%2Fdbg\.fk0000:5432/brain 7701731310526959658' "$tmp/c1/home/run-all.lanes" \
     || self_fail "C1: the full run did not see the URL and GATE_SERVER_SYSTEM_ID of its lane dbg: $(cat "$tmp/c1/home/run-all.lanes" 2>/dev/null)"
   # CI-F3.3b-1: the e2e chain has a cluster of its own, and it sees its URL and its identity, not the dbg one.
@@ -1358,10 +1373,11 @@ down mut'
     [[ "${lines[at]}" == "OK  Postgres :$port (container $container)" ]] \
       || self_fail "$name: the line said '${lines[at]}', not the port and the container that answered"
     # CI-F3.3b-2: the planner names the row it starts (`dag: P env: ...`) between the OK and the banner of its block.
+    # CI-K4 (D-K4q): and, before the first block, the plan of the machine it measured (`plan: ...`).
     planner_gap=0
-    [[ "${lines[at+1]:-}" =~ ^dag:\ P\ env: ]] && planner_gap=1
+    while [[ "${lines[at+1+planner_gap]:-}" =~ ^(plan:\ |dag:\ P\ env:) ]]; do planner_gap=$(( planner_gap + 1 )); done
     [[ "${lines[at+1+planner_gap]:-}" == "=== cargo audit ===" ]] \
-      || self_fail "$name: the line after the OK line is '${lines[at+1]:-}', not the banner of cargo audit"
+      || self_fail "$name: the line after the OK line (and the planner's lines) is '${lines[at+1+planner_gap]:-}', not the banner of cargo audit"
     if [[ -n "$password" ]] && grep -qF "$password" "$tmp/$name.out"; then
       self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
     fi
@@ -1577,12 +1593,16 @@ down mut'
 
   # F1.1 (D-F1a): the gate counts its cores once, before its first cargo call: the cgroup's
   # CPUs under nproc's (8 under 24 here), exports CARGO_BUILD_JOBS with them and says so.
+  # CI-K4 (D-K4k, D-K4l): the jobs are min(nproc - 2, the CPUs of the cgroup, free RAM / 2 GiB), and the line names the
+  # three measures. The RAM of this machine is the self-test's (100 GiB in a /proc/meminfo of its own), so the 8 does
+  # not depend on how much memory whoever runs it has free.
+  printf 'MemTotal:       134217728 kB\nMemFree:        104857600 kB\nMemAvailable:   104857600 kB\n' >"$tmp/meminfo-100g"
   cg_tree f1jobs "800000 100000"
   fake_tree f1jobs "$reads_while_running"
-  run_copy f1jobs "" GATE_CGROUP_ROOT="$tmp/cg/f1jobs/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1jobs/self"
+  run_copy f1jobs "" GATE_CGROUP_ROOT="$tmp/cg/f1jobs/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1jobs/self" GATE_PROC_MEMINFO="$tmp/meminfo-100g"
   (( rc == 0 )) || self_fail "F1.1: a gate whose every step passed exited $rc: $(cat "$tmp/f1jobs.out")"
-  grep -qE '^cargo jobs=8 \(nproc=24, cgroup cpu=8' "$tmp/f1jobs.out" \
-    || self_fail "F1.1: the gate did not print 'cargo jobs=8 (nproc=24, cgroup cpu=8' for 24 cores under an 8-CPU cgroup: $(grep 'cargo jobs' "$tmp/f1jobs.out" || echo 'no such line')"
+  grep -qxF 'cargo jobs=8 (nproc=24, cgroup cpu=8, ram free=100.0 GiB)' "$tmp/f1jobs.out" \
+    || self_fail "F1.1: the gate did not print 'cargo jobs=8 (nproc=24, cgroup cpu=8, ram free=100.0 GiB)' for 24 cores under an 8-CPU cgroup with 100 GiB free: $(grep 'cargo jobs' "$tmp/f1jobs.out" || echo 'no such line')"
   jobs_at="$(grep -n '^cargo jobs=' "$tmp/f1jobs.out" | head -1 | cut -d: -f1)"
   audit_at="$(grep -nxF '=== cargo audit ===' "$tmp/f1jobs.out" | head -1 | cut -d: -f1)"
   [[ -n "$jobs_at" && -n "$audit_at" ]] && (( jobs_at < audit_at )) \
@@ -1618,19 +1638,33 @@ down mut'
   fi
   # CI-J15e (H10): the jobs of the rows are the table's and not a list copied here. A table whose DC row names 6, a number
   # the list used to lack, gives the cargo call of DC its 6, and the numbers read from that table hold it.
+  # CI-K4 (D-K4n): the number of a row is its ceiling and not its share: in series a row takes min(its number, the jobs
+  # of the machine), and the operator's CARGO_BUILD_JOBS are the jobs of the machine. So this row sees its 6 only when
+  # the operator names more than 6 (12 here), and with the operator's 5 it would see 5.
   cg_tree f1table "800000 100000"
   fake_tree f1table "$reads_while_running"
   sed -i 's/CARGO_BUILD_JOBS=8 bash scripts\/merge-gate.sh --step DC$/CARGO_BUILD_JOBS=6 bash scripts\/merge-gate.sh --step DC/' "$tmp/f1table/scripts/gate-dag.txt"
   grep -q 'CARGO_BUILD_JOBS=6 bash scripts/merge-gate.sh --step DC$' "$tmp/f1table/scripts/gate-dag.txt" \
     || self_fail "F1.2 table: the copy of the table did not take 6 jobs for DC: the DC row no longer ends in 'CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DC'"
-  run_copy f1table "" CARGO_BUILD_JOBS=5 GATE_CGROUP_ROOT="$tmp/cg/f1table/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1table/self"
+  run_copy f1table "" CARGO_BUILD_JOBS=12 GATE_CGROUP_ROOT="$tmp/cg/f1table/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1table/self"
   (( rc == 0 )) || self_fail "F1.2 table: a gate whose DC row names 6 jobs exited $rc: $(cat "$tmp/f1table.out")"
   grep -q '^6 ' "$tmp/f1table/home/cargo.jobs" \
     || self_fail "F1.2 table: no cargo call saw the 6 jobs the DC row of the table names: $(cat "$tmp/f1table/home/cargo.jobs")"
   table_jobs="$(grep -o 'CARGO_BUILD_JOBS=[0-9]*' "$tmp/f1table/scripts/gate-dag.txt" | cut -d= -f2 | sort -un | paste -sd'|' -)"
-  if grep -qvE "^(5|$table_jobs) " "$tmp/f1table/home/cargo.jobs"; then
-    self_fail "F1.2 table: a cargo call saw neither the operator's 5 nor the jobs the table names ($table_jobs): $(cat "$tmp/f1table/home/cargo.jobs")"
+  if grep -qvE "^(12|$table_jobs) " "$tmp/f1table/home/cargo.jobs"; then
+    self_fail "F1.2 table: a cargo call saw neither the operator's 12 nor the jobs the table names ($table_jobs): $(cat "$tmp/f1table/home/cargo.jobs")"
   fi
+  # CI-K4 (D-K4n): the same table with the operator's 5 gives the DC row 5, not its 6: the operator's jobs are the ceiling.
+  cg_tree f1ceil "800000 100000"
+  fake_tree f1ceil "$reads_while_running"
+  sed -i 's/CARGO_BUILD_JOBS=8 bash scripts\/merge-gate.sh --step DC$/CARGO_BUILD_JOBS=6 bash scripts\/merge-gate.sh --step DC/' "$tmp/f1ceil/scripts/gate-dag.txt"
+  run_copy f1ceil "" CARGO_BUILD_JOBS=5 GATE_CGROUP_ROOT="$tmp/cg/f1ceil/root" GATE_PROC_SELF_CGROUP="$tmp/cg/f1ceil/self"
+  (( rc == 0 )) || self_fail "F1.2 ceiling: a gate whose DC row names 6 jobs under an operator of 5 exited $rc: $(cat "$tmp/f1ceil.out")"
+  if grep -q '^6 ' "$tmp/f1ceil/home/cargo.jobs"; then
+    self_fail "F1.2 ceiling: a cargo call saw the 6 jobs of the DC row although the operator's 5 are the jobs of the machine: $(cat "$tmp/f1ceil/home/cargo.jobs")"
+  fi
+  grep -q '^5 ' "$tmp/f1ceil/home/cargo.jobs" \
+    || self_fail "F1.2 ceiling: no cargo call saw the 5 jobs that bound the row of DC: $(cat "$tmp/f1ceil/home/cargo.jobs")"
 
   # F2: the run-all-tests stand-in of the rows below answers --check-models (its verdict is
   # FAKE_CHECK_MODELS_EXIT) and records a full run as one step. Anything else is a full run.
