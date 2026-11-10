@@ -99,7 +99,9 @@ check_server_only_tests_run_locally() {
   local ci="$1" gate="$2" tests="$3" today="$4" uncovered=0 file reason expired
   # CI-K4: every cargo call of the judge carries --timings, a report flag; the plain cargo test is still the plain one.
   # CI-E1: it is the section `plain` of run_counted, which counts its tests against scripts/test-section-counts.txt.
-  local plain='^DATABASE_URL="\$GATE_DATABASE_URL" (run_counted plain 0 )?cargo test( --timings)?$'
+  # CI-E11 (D-E11e): it is the library and PLAIN_TESTS, every file of tests/ that is not a contract of the judge; a plain pass
+  # that names no PLAIN_TESTS runs none of the marked files.
+  local plain='^DATABASE_URL="\$GATE_DATABASE_URL" (run_counted plain 0 )?cargo test( --lib "\$\{PLAIN_TESTS\[@\]\}")?( --timings)?$'
   while read -r file; do
     [[ -z "$file" ]] && continue
     reason="$(head -n 1 "$file" | tr -d '\r')"

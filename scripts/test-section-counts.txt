@@ -5,6 +5,11 @@
 #
 # CI-E1: el pase llano (`cargo test` sin filtro, sección `plain`) no declara un total sino UNA LÍNEA POR BINARIO:
 #   plain/<linux|windows>/<binario> <tests> <motivo>
+# CI-E11 (D-E11e): el pase llano son tres secciones, cada una con una línea por binario y ningún total: `plain` (la librería y los
+# ficheros de tests/ que no son contratos del juez: carril D1, fila DBG), `contracts` (los de JUDGE_CONTRACTS en run-all-tests.sh:
+# carril CT, fila CT, sin base de datos) y `doc` (los doctests, `doc/<linux|windows>/doc:memory_industry`, carril CT). La unión
+# de las tres es el conjunto de binarios de CI-E1 y cada binario está en una sola: cada línea de E1 cambió de prefijo con el MISMO
+# número. Las líneas se miden una sola vez, ya con estos prefijos (el orquestador, después de E11): hasta entonces no hay ninguna.
 # <binario> es la clave de `test-times.sh --count`: el nombre del fichero para tests/<x>.rs, y `lib:`, `bin:` o `doc:` más
 # el crate para lo demás. Una sección declara un total o líneas por binario, nunca las dos cosas. Cada juez lee solo las
 # líneas de su sistema (`windows` si $OSTYPE es msys o cygwin, `linux` en otro caso); sin líneas de su sistema es rojo.

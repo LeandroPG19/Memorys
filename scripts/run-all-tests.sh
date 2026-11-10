@@ -1850,7 +1850,7 @@ fi
 # CI-F3.3a (D-F3y, spec §4): the lanes of this script in idx order, as scripts/gate-dag.txt names them.
 # --lane <id> runs the lane it names; several --lane run in the order given, in this one process, with one
 # database (CI-F3.3b-1). A missing or unknown id, in any place of the list, is refused here, before the lock.
-DAG_LANES=(CL D1 D2 D3 NLI B3 R E)
+DAG_LANES=(CL B1 D1 CT D2 D3 NLI B3 R E)
 run_lanes=()
 while [[ "${1:-}" == --lane ]]; do
   [[ -n "${2:-}" ]] || { echo "FAIL: --lane needs a lane id, one of: ${DAG_LANES[*]}" >&2; exit 2; }
@@ -1948,7 +1948,18 @@ sweep_stale_artifacts() {
   echo "disk: ${after}G free after the sweep (was ${before}G)"
 }
 
-if [[ "$(free_gb)" -lt "$SWEEP_BELOW_GB" ]]; then
+# CI-E11 (D-E11h): the sweep is by the mtime of the artifacts, and a lane that runs tests (D1, CT, D2, D3, NLI, R, E) runs
+# binaries that another lane of the same target may have left a week ago and run now. Only a call that compiles sweeps: with no
+# --lane, or with CL, B1 or B3 among them. The floor of MIN_FREE_GB below stays for every call.
+call_compiles() {
+  local lane
+  (( ${#run_lanes[@]} > 0 )) || return 0
+  for lane in "${run_lanes[@]}"; do
+    case "$lane" in CL|B1|B3) return 0 ;; esac
+  done
+  return 1
+}
+if [[ "$(free_gb)" -lt "$SWEEP_BELOW_GB" ]] && call_compiles; then
   sweep_stale_artifacts
 fi
 
@@ -1963,11 +1974,16 @@ if [[ "$(free_gb)" -lt "$MIN_FREE_GB" ]]; then
 fi
 
 # --- the test counts (CI-J, D-J4b): the judgement is section_count_verdict, above --------
+# What a lane that runs tests says when cargo compiled a unit for it (CI-E11, D-E11d): the line of run_counted and of gate_bin.
+say_compiled() {
+  echo "FAIL: $1: cargo compiled $2 in a section that runs tests: the tests run what lane B1 (T_dbg) or B3 (T_rel) built; run that lane first (CI-E11, D-E11d)." >&2
+}
+
 # run_counted SECTION NAMED <command>: runs the call with its output shown and kept,
 # judges the count, and exits with the call's own code when the call failed. The count
 # is test-times.sh --count's, the one parse of a cargo log the judge has (D-J4d).
 run_counted() {
-  local section="$1" named="$2" log counts verdict rc=0 want=0 arg bins zero
+  local section="$1" named="$2" log counts verdict rc=0 want=0 arg bins zero unit
   shift 2
   for arg in "$@"; do
     [[ "$arg" == --test ]] && want=$((want + 1))
@@ -1977,6 +1993,14 @@ run_counted() {
   if (( rc != 0 )); then
     rm -f "$log"
     exit "$rc"
+  fi
+  # CI-E11 (D-E11d): a section that runs tests compiles nothing. B1 (T_dbg) and B3 (T_rel) built what it runs; a unit it
+  # compiles again is written over a binary that a lane beside it may be running.
+  unit="$(sed -n 's/^[[:space:]]*Compiling \([^ ]*\) .*/\1/p' "$log" | head -n 1)"
+  if [[ -n "$unit" ]]; then
+    say_compiled "section $section" "$unit"
+    rm -f "$log"
+    exit 1
   fi
   if ! counts="$("$ROOT/scripts/test-times.sh" --count "$log")"; then
     echo "FAIL: section $section: test-times.sh --count could not read the cargo log (see above)." >&2
@@ -2138,10 +2162,22 @@ cd "$RUST_DIR"
 # The binary the judge runs is the one cargo reports for this tree, built now: never a
 # copy left under target/ by an earlier build, and never a name looked up under
 # release/ or cuba-memorys (CI-J, D-J2a). A build that fails prepares nothing (J2.2).
+#
+# CI-E11 (D-E11d): `gate_bin read` is the form of a lane that reads T_dbg (D1, D2, D3): the binary is B1's, and a unit of
+# this call that is not fresh says cargo compiled something there, which is exit 1 before the database is made. B1 calls it
+# with no argument and builds.
 gate_bin() {
-  local out exe
+  local out exe stale
   out="$(cargo build --bin memory-industry --message-format=json-render-diagnostics --timings)" \
     || { echo "FAIL: cargo build --bin memory-industry failed: no database is prepared from a binary that did not build." >&2; exit 1; }
+  if [[ "${1:-}" == read ]]; then
+    stale="$(printf '%s\n' "$out" | grep '"reason":"compiler-artifact"' | grep -v '"fresh":true' \
+      | sed -n 's/.*"target":{[^}]*"name":"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+    if [[ -n "$stale" ]]; then
+      say_compiled "the provision of the database" "$stale"
+      exit 1
+    fi
+  fi
   exe="$(printf '%s\n' "$out" \
     | sed -n 's/.*"reason":"compiler-artifact".*"executable":"\([^"]*\)".*/\1/p' \
     | grep -E '[/\\]memory-industry(\.exe)?$' | tail -n 1 || true)"
@@ -2158,7 +2194,7 @@ gate_bin() {
 # gives the release binary B3 left, so it compiles nothing and the database is migrated by the binary it judges.
 provision_gate_db() {
   local bin="${1:-}"
-  [[ -n "$bin" ]] || bin="$(gate_bin)"
+  [[ -n "$bin" ]] || bin="$(gate_bin read)"
   claim_database "$GATE_DB" || exit 1
   # doctor exits non-zero when ONNX_MODEL_PATH is empty (policy checks). Migrations
   # still apply first — trust the table count below, not the exit code alone.
@@ -2213,6 +2249,42 @@ provision_gate_db() {
   echo "OK  second node database $PEER_DB ready ($peer_tables tables)"
 }
 
+# CI-E11 (D-E11f): the lanes that run tests against brain_gate make it when it is not there. D2 and D3 run in a cluster of their
+# own (their rows are separate processes) and E in another; in one process (a run with no --lane, or D1 and D2 in one call) the
+# first to need it makes it and the rest find it. With a binary, the one given; without one, the debug binary B1 built.
+# The check is a `[[ ]] ||` and not an `if` so that lane D1 holds the only call to provision_gate_db that starts a line, the one the
+# unit tests of the gate come after (doc_contract.rs).
+ensure_gate_db() {
+  local present
+  present="$(psql_url "$ADMIN_DATABASE_URL" -Atc "SELECT count(*) FROM pg_database WHERE datname = '$GATE_DB'")"
+  [[ "$present" == 1 ]] || provision_gate_db "${1:-}"
+}
+
+# CI-E11 (D-E11e): the files of tests/ that need no server and are contracts of the judge. They run in lane CT, in the row CT,
+# against no database; the library and every other file of tests/ run in lane D1. Every file of tests/ runs without --ignored
+# in exactly one of the two, because the split is made here, by name, and never with --skip or `test = false`.
+JUDGE_CONTRACTS=(ci_contract gate_dag_contract gate_history_contract gate_usl_contract group_no_server local_gate_contract packaging_contract v047_without_a_database_url_the_judge_reaches_no_default)
+
+# split_tests: PLAIN_TESTS and CONTRACT_TESTS, each a list of `--test <name>` pairs, from tests/*.rs and JUDGE_CONTRACTS. A name of
+# JUDGE_CONTRACTS that is no file is refused by name before any test runs: it would be a contract that runs nowhere.
+split_tests() {
+  local name file
+  for name in "${JUDGE_CONTRACTS[@]}"; do
+    [[ -f "tests/$name.rs" ]] \
+      || { echo "FAIL: JUDGE_CONTRACTS names $name and rust/tests/$name.rs is not a file (CI-E11, D-E11e)." >&2; exit 1; }
+  done
+  PLAIN_TESTS=()
+  CONTRACT_TESTS=()
+  for file in tests/*.rs; do
+    name="$(basename "$file" .rs)"
+    if printf '%s\n' "${JUDGE_CONTRACTS[@]}" | grep -qx "$name"; then
+      CONTRACT_TESTS+=(--test "$name")
+    else
+      PLAIN_TESTS+=(--test "$name")
+    fi
+  done
+}
+
 gate_cargo_jobs
 
 lane_CL() {
@@ -2223,15 +2295,38 @@ echo "=== cargo clippy (--all-targets: without it, tests/ is never linted) ==="
 cargo clippy --all-targets --timings -- -D warnings
 }
 
+# CI-E11 (D-E11b): B1 compiles T_dbg once, with `--no-run`, and the lanes that read it compile nothing: the debug binary of the
+# database, built here in compile mode, is the one their provision reads (`gate_bin read`).
+lane_B1() {
+echo "=== cargo test --no-run (every test binary of T_dbg, built once; the lanes that run them compile nothing) ==="
+cargo test --no-run --timings
+
+echo "=== the debug binary of the database ==="
+gate_bin >/dev/null
+}
+
 lane_D1() {
+split_tests
 echo "=== throwaway database for every mutating step ==="
 provision_gate_db
 
-echo "=== cargo test (unit + smoke) ==="
-DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --timings
+echo "=== cargo test (the library and the files of tests/ that are not contracts of the judge) ==="
+DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --lib "${PLAIN_TESTS[@]}" --timings
+}
+
+# CI-E11 (D-E11e): the contracts of the judge and the doctests, which open no database: the cluster of this lane has no
+# brain_gate and nothing here makes it.
+lane_CT() {
+split_tests
+echo "=== the contracts of the judge (no server) ==="
+DATABASE_URL="$GATE_DATABASE_URL" run_counted contracts 1 cargo test "${CONTRACT_TESTS[@]}" --timings
+
+echo "=== the doctests ==="
+DATABASE_URL="$GATE_DATABASE_URL" run_counted doc 0 cargo test --doc --timings
 }
 
 lane_D2() {
+ensure_gate_db
 echo "=== DB integration tests (--ignored) ==="
 export DATABASE_URL="$GATE_DATABASE_URL"
 # Every tests/*.rs is discovered, not listed. The list used to be written by hand
@@ -2271,6 +2366,8 @@ require_present "tests that need the NLI model" "$CUBA_NLI_PATH" \
 }
 
 lane_D3() {
+ensure_gate_db
+export DATABASE_URL="$GATE_DATABASE_URL"
 require_generative_llm "tests that need a generative LLM (extract / relation-scan)" \
   run_counted generative-llm 1 cargo test --test v016_extract_without_sampling --test v017_relation_scan --timings \
              -- --ignored --nocapture
@@ -2401,11 +2498,9 @@ REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
 [[ -f "$REL_BIN" ]] || { echo "FAIL: no release binary at $REL_BIN: the B3 lane builds it (run --lane B3 first)." >&2; exit 1; }
 b3_record_sha
 # CI-F3.3b-1: the e2e chain runs in a process of its own, with a cluster that has no brain_gate: E makes
-# it with the same provision D1 uses, and only when it is missing (D1 and E in one call share it).
+# it with the same provision D1 uses, and only when it is missing (D1 and E in one call share it): ensure_gate_db (CI-E11, D-E11f).
 # CI-F3.4 (D-F34h): E compiles nothing. The provision runs the release binary B3 left, already held against its record.
-if [[ "$(psql_url "$ADMIN_DATABASE_URL" -Atc "SELECT count(*) FROM pg_database WHERE datname = '$GATE_DB'")" != 1 ]]; then
-  provision_gate_db "$REL_BIN"
-fi
+ensure_gate_db "$REL_BIN"
 echo "=== E2E (25 MCP tools, subprocess per call) ==="
 CUBA_BINARY_PATH="$(resolve_binary_path)"
 export CUBA_BINARY_PATH

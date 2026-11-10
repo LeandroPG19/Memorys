@@ -2516,9 +2516,11 @@ run_in_lane() {
 # --- the rows of the judge (CI-F3.3b-2) ---------------------------------------------------------
 # The planner starts each row as `merge-gate.sh --step <id>`, a process of its own that reads this file from the top.
 # The flow above is gate_main, which only the else branch of the dispatch at the end calls, so the rows are defined
-# here, after it, and before the dispatch. Each row is one process and one cluster (D-F3b): DBG (CL..D3) shares one
-# throwaway database; B3 builds the release binary; REL and E2E find that binary on disk again (lane_R and lane_E in
-# run-all-tests.sh), so no variable crosses processes.
+# here, after it, and before the dispatch. Each row is one process and one cluster (D-F3b). CI-E11 (D-E11b): B1 lints and
+# compiles T_dbg (CL, B1) and its readers run what it built, each in a cluster of its own: DBG the plain pass (D1, which makes
+# its throwaway database), CT the contracts and the doctests (no database), D2 and D3 the --ignored sections (each makes
+# its database if it is missing) and NLI. B3 builds the release binary; REL and E2E find that binary on disk again (lane_R and
+# lane_E in run-all-tests.sh), so no variable crosses processes.
 step_P() {
 # The advisories are judged before the 20-minute test run: a judge idle for days
 # found its new advisory half an hour in, when 3 s would have said it. cargo audit
@@ -2590,8 +2592,20 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 # outside this repo, makes it. The judge never touches the live server.
 }
 
+step_B1() {
+  run_in_lane b1 "$ROOT/scripts/run-all-tests.sh" --lane CL --lane B1
+}
 step_DBG() {
-  run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane CL --lane D1 --lane D2 --lane D3
+  run_in_lane dbg "$ROOT/scripts/run-all-tests.sh" --lane D1
+}
+step_CT() {
+  run_in_lane ct "$ROOT/scripts/run-all-tests.sh" --lane CT
+}
+step_D2() {
+  run_in_lane d2 "$ROOT/scripts/run-all-tests.sh" --lane D2
+}
+step_D3() {
+  run_in_lane d3 "$ROOT/scripts/run-all-tests.sh" --lane D3
 }
 # CI-F3.3c (D-F3l): the NLI assertion (nli_entailment, < 500 ms) runs alone. CI-J12: run-all-tests refuses to run without
 # the judge's server, so NLI runs in a cluster of its own, as the rows that call it do. Its tests open no database.
@@ -2612,7 +2626,7 @@ step_DC() {
   # that changed under the run is refused here (D-J1c, A2). A lane is judged when it is made, so only the server of the
   # operator is asked again.
   [[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
-  # CI-K8 (D-K8d): the default build carries docs, and DBG ran its tests with it. The build without docs is compiled and
+  # CI-K8 (D-K8d): the default build carries docs, and the rows that run tests ran them with it. The build without docs is compiled and
   # linted here and runs no test, so no lane is made and no model is read. clippy -D warnings and not cargo check: it costs
   # the same, and a warning that exists only without docs (a variable that only a cfg(docs) block uses) is red.
   echo "=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ==="
