@@ -2019,7 +2019,7 @@ def make_planner(steps, solo):
 
 def check_alive(p):
     alive = p.running()
-    if any(s.clase in dag.EXCLUSIVE for s in alive):
+    if any(s.clase == "exclusive" for s in alive):
         assert len(alive) == 1, f"an exclusive step shares the machine with {[s.id for s in alive]}"
     if p.solo:
         assert len(alive) <= 1, f"in series, {[s.id for s in alive]} are alive"
@@ -2059,18 +2059,28 @@ def run_p3():
 print("p3 trials=%d" % run_p3())
 "#;
 
-/// J14m P4: `parse_table` over the real table with random mutations (a token changed to nan, inf, a negative, a 0, an
-/// overflow or text; a token or a row dropped, repeated or swapped) answers with a list of steps or a Refusal, never
-/// with another exception, and every step it accepts has numbers that are finite and above 0.
+/// J14m P4, widened by CI-J18 (J18e.P4): `parse_table` over the real table with random mutations (a token changed to nan,
+/// inf, a negative, a 0, an overflow or text, or to one of the words the grammar of D-J18b and D-J18c refuses; a token or a
+/// row dropped, repeated or swapped) answers with a list of steps or a Refusal, never with another exception, the same
+/// answer for the rows in another order (both refused, or the same steps), and every step it accepts has numbers that are
+/// finite and above 0 and says what the grammar says: names of `[A-Za-z0-9_]+`, clusters of `C_[a-z0-9]+`, an idx of
+/// `[1-9][0-9]*`, an environment inside `dag.ROW_ENV` with no empty value and numbers above 0 in its `*_JOBS` and
+/// `*_THREADS`, and no word of its order that starts with the comment mark. The seed is the one of J18 (20261110).
 const BODY_P4: &str = r#"
-import math
+import math, re
+HASH = chr(35)
+rng = random.Random(20261110)
 real = open(os.path.join(sys.argv[1], "gate-dag.txt"), encoding="utf-8").read().splitlines()
-rows = [line for line in real if line.strip() and not line.startswith(chr(35))]
+rows = [line for line in real if line.strip() and not line.startswith(HASH)]
 assert len(rows) >= 9, f"the real table has {len(rows)} rows"
 work = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
 TOKENS = ["nan", "inf", "-inf", "-1", "0", "1e999", "abc", "", "1,2", "-", "target:", "cluster:x", "models", "reader",
           "normal", "exclusive", "boundary", "untimed", "BOGUS", "FOO=bar", "CARGO_TARGET_DIR=/x", "99999999999999999999",
-          "1e-9", "0.0", "-0"]
+          "1e-9", "0.0", "-0",
+          "target:/etc", "target:../x", "target:a/b", "cluster:C_a/../b", "cluster:C_Dbg", "a/b", "-10", "1_0", "010",
+          "CARGO_BUILD_JOBS=ocho", "CARGO_BUILD_JOBS=", "CARGO_BUILD_JOBS=0", "CUBA_NLI_INTRA_THREADS=x",
+          "MUTANTS_JOBS=-1", "CARGO_INCREMENTAL=", HASH, HASH + "x", HASH + "nota", "TMPDIR=x",
+          "CUBA_GATE_LANE_TOKEN=x", "DATABASE_URL=x", "GATE_SERVER_SYSTEM_ID=x"]
 
 def mutate(lines):
     lines = list(lines)
@@ -2101,21 +2111,59 @@ def parse(lines, name):
         fh.write("\n".join(lines) + "\n")
     return dag.parse_table(path)
 
+def attempt(lines, name):
+    """The steps `parse_table` gives for these lines, or None for a Refusal; any other exception is the failure."""
+    try:
+        return parse(lines, name)
+    except dag.Refusal:
+        return None
+    except Exception as err:
+        raise AssertionError(f"parse_table raised {type(err).__name__}: {err} for {lines}")
+
+def listing(steps):
+    return None if steps is None else [
+        (s.idx, s.id, s.deps, s.recursos, s.clase, s.cpu_tab, s.ram_tab, s.dur_tab, sorted(s.env.items()), s.argv)
+        for s in steps]
+
+GRAMMAR_ID = re.compile(r"[A-Za-z0-9_]+")
+GRAMMAR_CLUSTER = re.compile(r"C_[a-z0-9]+")
+GRAMMAR_NUMBER = re.compile(r"[1-9][0-9]*")
+
+def check_grammar(steps, lines):
+    for s in steps:
+        assert GRAMMAR_ID.fullmatch(s.id), f"the id {s.id!r} was accepted: {lines}"
+        assert s.idx > 0, f"{s.id} was accepted with idx {s.idx}: {lines}"
+        for resource in s.recursos:
+            kind, _, name = resource.partition(":")
+            assert kind != "target" or GRAMMAR_ID.fullmatch(name), f"{s.id} was accepted with {resource}: {lines}"
+            assert kind != "cluster" or GRAMMAR_CLUSTER.fullmatch(name), f"{s.id} was accepted with {resource}: {lines}"
+        for name, value in s.env.items():
+            assert name in dag.ROW_ENV, f"{s.id} was accepted with {name}, which a row may not name: {lines}"
+            assert value != "", f"{s.id} was accepted with {name} empty: {lines}"
+            if name.endswith("_JOBS") or name.endswith("_THREADS"):
+                assert GRAMMAR_NUMBER.fullmatch(value), f"{s.id} was accepted with {name}={value!r}: {lines}"
+        assert not any(word.startswith(HASH) for word in s.argv), f"{s.id} was accepted with a # in its order: {lines}"
+        for name, value in (("cpu", s.cpu_tab), ("ram_gb", s.ram_tab), ("dur_s", s.dur_tab)):
+            assert math.isfinite(value) and value > 0, f"{s.id} was accepted with {name}={value}: {lines}"
+    for line in lines:
+        words = line.split()
+        if words and not words[0].startswith(HASH):
+            assert GRAMMAR_NUMBER.fullmatch(words[0]), f"an idx spelled {words[0]!r} was accepted: {lines}"
+
 assert len(parse(rows, "real.txt")) == len(rows), "the real table does not parse"
 accepted = refused = 0
 for n in range(600):
     lines = mutate(rows)
-    try:
-        steps = parse(lines, f"m{n}.txt")
-    except dag.Refusal:
+    shuffled = list(lines)
+    rng.shuffle(shuffled)
+    steps = attempt(lines, f"m{n}.txt")
+    assert listing(steps) == listing(attempt(shuffled, f"s{n}.txt")), \
+        f"the rows in another order give another answer: {lines} / {shuffled}"
+    if steps is None:
         refused += 1
         continue
-    except Exception as err:
-        raise AssertionError(f"parse_table raised {type(err).__name__}: {err} for {lines}")
     accepted += 1
-    for s in steps:
-        for name, value in (("cpu", s.cpu_tab), ("ram_gb", s.ram_tab), ("dur_s", s.dur_tab)):
-            assert math.isfinite(value) and value > 0, f"{s.id} was accepted with {name}={value}: {lines}"
+    check_grammar(steps, lines)
 assert accepted > 0 and refused > 0, f"the mutations were all accepted or all refused ({accepted}/{refused})"
 print("p4 trials=600 accepted=%d refused=%d" % (accepted, refused))
 "#;
@@ -2801,4 +2849,224 @@ fn los_nucleos_y_los_campos_nuevos_de_la_corrida_e4() {
         }
         assert_eq!(r3["sin_medida"], json!({}), "{name}: {r3}");
     }
+}
+
+// --- CI-J18: the grammar of a row, the target that stays under its root and the key that ignores the form ---------------
+// The properties of the revision of 10-nov, J18b/J18c/J18e. They run in process like those of J14m (`propiedad`), with their
+// own seed, 20261110, and no sleeps. The scripts dir is `sys.argv[1]` and the prelude has loaded `gate-dag.py` as `dag`.
+
+/// J18b.1 and J18c.1 (D-J18b, D-J18c): the real table with one row changed by each defect is a Refusal that names the line
+/// of the row (`table line N:`) and the thing that is wrong, and the real table as it is reads whole. The same process
+/// then puts each name the planner sets, and each base, in front of the order of a row: a row may not name any of them.
+/// Each case is (what it is, the row, the word to change, what it becomes, what the message has to name); an empty word to
+/// change appends. No case is read from the planner: they are the cells of the Gherkin.
+const BODY_J18_GRAMATICA: &str = r#"
+HASH = chr(35)
+real = open(os.path.join(sys.argv[1], "gate-dag.txt"), encoding="utf-8").read().split("\n")
+work = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+rows = [n for n, line in enumerate(real) if line.strip() and not line.lstrip().startswith(HASH)]
+
+def parse(lines):
+    path = os.path.join(work, "case.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    return dag.parse_table(path)
+
+def row_of(step_id):
+    return next(n for n in rows if real[n].split()[1] == step_id)
+
+def change(step_id, old, new):
+    n = row_of(step_id)
+    words = real[n].split()
+    if old:
+        assert old in words, f"{step_id} has no word {old!r}: the fixture of the test is stale"
+        words[words.index(old)] = new
+    else:
+        words.append(new)
+    lines = list(real)
+    lines[n] = " ".join(words)
+    return n + 1, lines
+
+def refused(label, number, lines, named):
+    try:
+        parse(lines)
+    except dag.Refusal as err:
+        said = str(err)
+    except Exception as err:
+        raise AssertionError(f"{label}: {type(err).__name__}: {err}")
+    else:
+        raise AssertionError(f"{label}: the table was accepted")
+    assert f"table line {number}:" in said, f"{label}: the refusal does not name the line {number}: {said}"
+    assert named in said, f"{label}: the refusal does not name {named!r}: {said}"
+
+assert len(parse(real)) == len(rows), "the real table is not read whole"
+DBG_TARGETS = "target:T_dbg,cluster:C_dbg,models"
+CASES = [
+    ("target:/etc", "DBG", DBG_TARGETS, "target:/etc,cluster:C_dbg,models", "/etc"),
+    ("target:../../../x", "DBG", DBG_TARGETS, "target:../../../x,cluster:C_dbg,models", "../../../x"),
+    ("target:a/b", "DBG", DBG_TARGETS, "target:a/b,cluster:C_dbg,models", "a/b"),
+    ("cluster:x", "DBG", DBG_TARGETS, "target:T_dbg,cluster:x,models", "cluster:x"),
+    ("cluster:C_a/../b", "DBG", DBG_TARGETS, "target:T_dbg,cluster:C_a/../b,models", "C_a/../b"),
+    ("cluster:C_Dbg", "DBG", DBG_TARGETS, "target:T_dbg,cluster:C_Dbg,models", "C_Dbg"),
+    ("the id a/b", "DBG", "DBG", "a/b", "a/b"),
+    ("idx -10", "DBG", "20", "-10", "-10"),
+    ("idx 0", "DBG", "20", "0", "0"),
+    ("idx 1_0", "DBG", "20", "1_0", "1_0"),
+    ("idx 010", "DBG", "20", "010", "010"),
+    ("CARGO_BUILD_JOBS=ocho", "DBG", "CARGO_BUILD_JOBS=8", "CARGO_BUILD_JOBS=ocho", "CARGO_BUILD_JOBS"),
+    ("CARGO_BUILD_JOBS=0", "DBG", "CARGO_BUILD_JOBS=8", "CARGO_BUILD_JOBS=0", "CARGO_BUILD_JOBS"),
+    ("CARGO_BUILD_JOBS empty", "DBG", "CARGO_BUILD_JOBS=8", "CARGO_BUILD_JOBS=", "CARGO_BUILD_JOBS"),
+    ("MUTANTS_JOBS=-1", "M", "MUTANTS_JOBS=6", "MUTANTS_JOBS=-1", "MUTANTS_JOBS"),
+    ("CUBA_NLI_INTRA_THREADS=x", "DBG", "CUBA_NLI_INTRA_THREADS=4", "CUBA_NLI_INTRA_THREADS=x", "CUBA_NLI_INTRA_THREADS"),
+    ("CARGO_INCREMENTAL empty", "DBG", "CARGO_INCREMENTAL=0", "CARGO_INCREMENTAL=", "CARGO_INCREMENTAL"),
+    ("a comment at the end of the row", "DBG", "", HASH + " nota", HASH),
+    ("the word " + HASH + "x in the order", "DBG", "bash", "bash " + HASH + "x", HASH + "x"),
+    ("the class boundary", "DBG", "normal", "boundary", "normal, exclusive or untimed"),
+]
+for label, step_id, old, new, named in CASES:
+    number, lines = change(step_id, old, new)
+    refused(label, number, lines, named)
+
+VARIABLES = ["TMPDIR", "CARGO_TARGET_DIR", "CUBA_GATE_LANE_TOKEN", "DATABASE_URL", "GATE_SERVER_SYSTEM_ID"]
+for name in VARIABLES:
+    number, lines = change("P", "bash", name + "=x bash")
+    refused(name + " before the order of a row", number, lines, name)
+assert len(parse(real)) == len(rows), "the real table is not read whole after the cases"
+print("j18 grammar cases=%d vars=%d" % (len(CASES), len(VARIABLES)))
+"#;
+
+/// J18e.P2 (D-J18b): `target_dir` over 500 names from the seed 20261110, with letters, digits, `_`, `.`, `/`, `..`, `-`,
+/// `~`, `$`, `é`, `\`, a space, a NUL, the empty name and one of 300 characters, and a root of the fixture three levels deep
+/// (so a `..` or an absolute name lands inside the fixture and is seen). Every name it accepts is `[A-Za-z0-9_]+`, its parent
+/// is exactly `<root>/<key of the tree>` and its `.gate-tree` names the tree; every such name of up to 255 characters is
+/// accepted; anything else is a Refusal and never another exception; and nothing is made in the fixture outside
+/// `<root>/<key>`. The names do not come from the planner.
+const BODY_J18_P2: &str = r#"
+import re
+rng = random.Random(20261110)
+base = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+root = os.path.join(base, "a", "b", "raiz")
+os.makedirs(root)
+os.environ["CARGO_TARGET_DIR"] = root
+tree = os.path.realpath(dag.repo_root())
+key = dag.tree_key(tree)
+under = os.path.join(root, key)
+SAFE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+PIECES = list("abcXYZ019_") + [".", "/", "..", "-", "~", "$", "é", "\\", " ", "\x00", "", "../.."]
+names = ["..", ".", "../x", "../../../x_escape", "a/b", "/etc", "", "é", "x" * 300, "a" * 255, "a" * 256, "T_dbg", "T dbg",
+         "T\x00x", "-", "~", "$HOME", "a\\b", "T_dbg/../../x"]
+while len(names) < 500:
+    if rng.random() < 0.4:
+        names.append("".join(rng.choice(SAFE) for _ in range(rng.randint(1, 40))))
+    else:
+        names.append("".join(rng.choice(PIECES) for _ in range(rng.randint(1, 6))))
+accepted = refused = 0
+for name in names:
+    fits = re.fullmatch(r"[A-Za-z0-9_]+", name) is not None
+    try:
+        path = dag.target_dir(name)
+    except dag.Refusal:
+        refused += 1
+        assert not (fits and len(name) <= 255), f"{name!r} is a name and was refused"
+        continue
+    except Exception as err:
+        raise AssertionError(f"target_dir({name!r}) raised {type(err).__name__}: {err}")
+    accepted += 1
+    assert fits, f"{name!r} is not a name and target_dir accepted it: {path}"
+    assert os.path.dirname(path) == under, f"{name!r} is under {os.path.dirname(path)}, not under {under}"
+    assert open(os.path.join(path, ".gate-tree"), encoding="utf-8").read().strip() == tree, f"{name!r}: .gate-tree"
+allowed = {os.path.join(base, "a"), os.path.join(base, "a", "b"), root, under}
+found = [os.path.join(where, entry) for where, dirs, files in os.walk(base) for entry in dirs + files]
+outside = [p for p in found if p not in allowed and not p.startswith(under + os.sep)]
+assert not outside, f"made outside <root>/<key>: {outside}"
+assert accepted >= 50 and refused >= 50, f"{accepted} accepted and {refused} refused: the names do not exercise both sides"
+print("j18 p2 names=%d accepted=%d refused=%d" % (len(names), accepted, refused))
+"#;
+
+/// J18e.P3 (D-J18d): `table_key_of` over 400 variants of the real table from the seed 20261110, and a sweep of every word.
+/// A variant that adds comments (also indented), blank lines, runs of spaces or tabs, CRLF or CR, or puts the rows in
+/// another order has the key of the real table; a variant that changes a word of a row, drops a row or repeats one has
+/// another. The sweep changes each word of each row of the real table in turn: the key sees all of them, so a key made of the
+/// start of each row would not pass. The key of the real table is also worked here from its definition (the sha256 of its
+/// normalised rows ordered by bytes and joined by a line break), so the answer is not only the planner's agreeing with itself.
+const BODY_J18_P3: &str = r#"
+import hashlib
+HASH = chr(35)
+rng = random.Random(20261110)
+real = open(os.path.join(sys.argv[1], "gate-dag.txt"), "rb").read()
+rows = [line for line in real.decode("utf-8").split("\n") if line.strip() and not line.lstrip().startswith(HASH)]
+assert len(rows) >= 9, f"the real table has {len(rows)} rows"
+key = dag.table_key_of(real)
+by_hand = hashlib.sha256("\n".join(sorted(" ".join(row.split()) for row in rows)).encode("utf-8")).hexdigest()
+assert key == by_hand, f"the key of the real table is {key}, and its definition gives {by_hand}"
+SPACES = [" ", "  ", "\t", " \t "]
+EOLS = ["\n", "\r\n", "\r"]
+COMMENTS = [HASH + " a comment", "   " + HASH + " indented", "\t" + HASH, "", "  ", "\t"]
+
+def same_form():
+    order = list(rows)
+    rng.shuffle(order)
+    out = []
+    for row in order:
+        out.extend(rng.choice(COMMENTS) for _ in range(rng.randint(0, 2)))
+        words = row.split()
+        out.append(rng.choice(["", " ", "\t"]) + "".join(w + rng.choice(SPACES) for w in words[:-1]) + words[-1]
+                   + rng.choice(["", " ", "\t"]))
+    body = "".join(line + rng.choice(EOLS) for line in out)
+    return body.rstrip("\r\n").encode("utf-8") if rng.random() < 0.3 else body.encode("utf-8")
+
+def other_word():
+    lines = list(rows)
+    op = rng.choice(["word", "word", "word", "drop", "repeat"])
+    i = rng.randrange(len(lines))
+    if op == "word":
+        words = lines[i].split()
+        j = rng.randrange(len(words))
+        new = rng.choice(["x", "9", "Z" + words[j], words[j] + "q", "normal", "target:T_x", "-"])
+        words[j] = new if new != words[j] else words[j] + "!"
+        lines[i] = " ".join(words)
+    elif op == "drop":
+        del lines[i]
+    else:
+        lines.insert(i, lines[i])
+    rng.shuffle(lines)
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+same = other = 0
+for n in range(400):
+    if n % 2 == 0:
+        assert dag.table_key_of(same_form()) == key, "a form that is not a word changed the key"
+        same += 1
+    else:
+        assert dag.table_key_of(other_word()) != key, "a table with another word, another count of rows has the same key"
+        other += 1
+swept = 0
+for i, row in enumerate(rows):
+    words = row.split()
+    for j in range(len(words)):
+        changed = list(rows)
+        changed[i] = " ".join(words[:j] + [words[j] + "!"] + words[j + 1:])
+        assert dag.table_key_of(("\n".join(changed) + "\n").encode("utf-8")) != key, f"word {j} of the row {words[1]} is not in the key"
+        swept += 1
+print("j18 p3 variants=400 same=%d different=%d swept=%d" % (same, other, swept))
+"#;
+
+#[test]
+fn j18b_1_a_row_that_is_not_the_grammar_is_refused_with_its_line_and_no_row_names_what_the_planner_sets()
+ {
+    propiedad("j18b-1", BODY_J18_GRAMATICA, "j18 grammar cases=20 vars=5");
+}
+
+#[test]
+fn j18e_p2_target_dir_stays_under_the_root_and_the_key_of_the_tree_for_every_name() {
+    propiedad("j18e-p2", BODY_J18_P2, "j18 p2 names=500");
+}
+
+#[test]
+fn j18e_p3_the_key_of_a_table_ignores_the_form_and_sees_every_word() {
+    propiedad(
+        "j18e-p3",
+        BODY_J18_P3,
+        "j18 p3 variants=400 same=200 different=200",
+    );
 }
