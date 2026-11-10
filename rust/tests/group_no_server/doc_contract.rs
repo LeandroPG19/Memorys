@@ -638,7 +638,8 @@ fn the_gate_writes_its_own_exit_code_where_a_reader_can_find_it() {
     }
 }
 
-const UNIT_TESTS_ON_THE_GATE_DB: &str = "DATABASE_URL=\"$GATE_DATABASE_URL\" cargo test";
+const UNIT_TESTS_ON_THE_GATE_DB: &str =
+    "DATABASE_URL=\"$GATE_DATABASE_URL\" run_counted plain 0 cargo test";
 
 /// A line that runs `provision_gate_db`, as opposed to the one that defines it
 /// (`provision_gate_db() {`) or a comment that names it.

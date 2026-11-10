@@ -4436,7 +4436,11 @@ fn the_eval_reads_a_seeded_scratch_database_and_never_the_live_one() {
 /// The sections of the judge that run tests by name or with `--ignored` each have a count in
 /// `scripts/test-section-counts.txt`, written as `<section> <tests> <motive>`. Every such
 /// section is named by a `--count` call in run-all-tests.sh, and every call has its line here.
-const CI_J_COUNTED_SECTIONS: [&str; 9] = [
+/// CI-E1 (D-E1e): a section may instead state one line per test binary,
+/// `<section>/<linux|windows>/<binary> <tests> <motive>`; the section is the part before the
+/// first `/`, and a section states a total or lines per binary, never both.
+const CI_J_COUNTED_SECTIONS: [&str; 10] = [
+    "plain",
     "discovered-ignored",
     "lib-ignored",
     "admin-role",
@@ -4457,7 +4461,7 @@ fn every_section_with_a_count_runs_and_every_count_has_a_section() {
          nombradas, con los números del log de F0 (ci-rapido-J-F1.spec.md, D-J4b)"
     );
     let text = read(file);
-    let mut ids: Vec<String> = Vec::new();
+    let mut ids: Vec<(usize, String)> = Vec::new();
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -4477,11 +4481,56 @@ fn every_section_with_a_count_runs_and_every_count_has_a_section() {
             "{file}:{}: `{id}` has no motive; a count without one is a number nobody can judge",
             index + 1
         );
-        ids.push(id.to_string());
+        ids.push((index + 1, id.to_string()));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (n, id) in &ids {
+        assert!(
+            seen.insert(id.as_str()),
+            "{file}:{n}: `{id}` is stated twice; the counter reads the first and the second would \
+             never be judged"
+        );
+    }
+    let mut sections: Vec<String> = Vec::new();
+    for (n, id) in &ids {
+        let parts: Vec<&str> = id.split('/').collect();
+        let section = parts[0];
+        if parts.len() > 1 {
+            assert!(
+                parts.len() == 3 && ["linux", "windows"].contains(&parts[1]),
+                "{file}:{n}: `{id}` is not `<section>/<linux|windows>/<binary>`"
+            );
+            let key = parts[2];
+            let name = key
+                .strip_prefix("lib:")
+                .or_else(|| key.strip_prefix("bin:"))
+                .or_else(|| key.strip_prefix("doc:"))
+                .unwrap_or(key);
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{file}:{n}: the binary `{key}` of `{id}` is not a file name, `lib:`, `bin:` or `doc:` \
+                 and a name"
+            );
+        }
+        sections.push(section.to_string());
+    }
+    for (n, id) in &ids {
+        let per_binary = id.contains('/');
+        let section = id.split('/').next().unwrap_or("");
+        let other_form = ids.iter().any(|(_, other)| {
+            other.split('/').next() == Some(section) && other.contains('/') != per_binary
+        });
+        assert!(
+            !other_form,
+            "{file}:{n}: the section `{section}` states a total and lines per binary: one or the other"
+        );
     }
     for id in CI_J_COUNTED_SECTIONS {
         assert!(
-            ids.iter().any(|i| i.as_str() == id),
+            sections.iter().any(|i| i.as_str() == id),
             "{file} has no line for the section `{id}`"
         );
     }
@@ -4534,7 +4583,7 @@ fn every_section_with_a_count_runs_and_every_count_has_a_section() {
     let mut called = calls;
     called.sort();
     called.dedup();
-    let mut named = ids.clone();
+    let mut named = sections.clone();
     named.sort();
     named.dedup();
     assert!(
@@ -4555,6 +4604,207 @@ fn every_section_with_a_count_runs_and_every_count_has_a_section() {
              run-all-tests.sh counts it: a line for a section that is not counted proves nothing"
         );
     }
+}
+
+/// CI-E1 (D-E1b): the binaries the plain pass of the judge (`cargo test` with no filter) runs, named as
+/// `test-times.sh` names them: the file for `tests/<name>.rs`, `lib:` and `doc:` for the library, and `bin:` for
+/// each `[[bin]]` that runs its unit tests. A `[[bin]]` with `test = false` prints no header in the log, so it has no
+/// line (F5c, efccf6e: the two bins share main.rs).
+fn plain_pass_binaries() -> std::collections::BTreeSet<String> {
+    let mut keys: std::collections::BTreeSet<String> =
+        ["lib:memory_industry", "doc:memory_industry"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+    let mut bins: Vec<(String, bool)> = Vec::new();
+    let mut in_bin = false;
+    for line in read("rust/Cargo.toml").lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_bin = line == "[[bin]]";
+            if in_bin {
+                bins.push((String::new(), true));
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if let (true, Some(bin)) = (in_bin, bins.last_mut()) {
+            match (key.trim(), value.trim()) {
+                ("name", name) => bin.0 = name.trim_matches('"').replace('-', "_"),
+                ("test", "false") => bin.1 = false,
+                _ => {}
+            }
+        }
+    }
+    keys.extend(
+        bins.into_iter()
+            .filter(|(_, tested)| *tested)
+            .map(|(name, _)| format!("bin:{name}")),
+    );
+    let tests = repo_root().join("rust/tests");
+    for entry in std::fs::read_dir(&tests).unwrap_or_else(|e| panic!("{}: {e}", tests.display())) {
+        let path = entry.expect("an entry of rust/tests").path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            keys.insert(
+                path.file_stem()
+                    .expect("a file name")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    keys
+}
+
+/// What differs between the binaries that have a line and the binaries the tree has, both ways and by name.
+fn plain_line_differences(
+    declared: &std::collections::BTreeSet<String>,
+    expected: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = expected
+        .difference(declared)
+        .map(|key| format!("`{key}` is a binary of the plain pass and has no line"))
+        .collect();
+    out.extend(
+        declared
+            .difference(expected)
+            .map(|key| format!("`{key}` has a line and no such binary in the tree")),
+    );
+    out
+}
+
+/// CI-E1 (D-E1a, D-E1b): the plain pass is the section `plain`, and it states one line per binary, no total: a
+/// total does not see a binary with 0 tests, nor a -1 in one binary and a +1 in another that cancel. The lines of
+/// `plain/linux/` are exactly the binaries of the tree, in both directions, so a test file added with no line, or a
+/// line whose file is gone, is red here in milliseconds and not at the end of a judge. `plain/windows/` lines, if
+/// there are any, name the same binaries.
+#[test]
+fn the_plain_pass_is_counted_per_binary_and_every_binary_has_its_line() {
+    let expected = plain_pass_binaries();
+
+    // The comparison has to be able to fail before a clean answer from it means anything.
+    let tree_with_one_more: std::collections::BTreeSet<String> =
+        ["a", "x"].iter().map(|k| k.to_string()).collect();
+    let lines_with_one_more: std::collections::BTreeSet<String> =
+        ["a", "y"].iter().map(|k| k.to_string()).collect();
+    let fixture = plain_line_differences(&lines_with_one_more, &tree_with_one_more);
+    assert!(
+        fixture
+            .iter()
+            .any(|d| d.contains("`x`") && d.contains("no line"))
+            && fixture
+                .iter()
+                .any(|d| d.contains("`y`") && d.contains("no such binary")),
+        "the comparison does not name a binary with no line and a line with no binary: {fixture:?}"
+    );
+
+    let file = "scripts/test-section-counts.txt";
+    let text = read(file);
+    let mut linux = std::collections::BTreeSet::new();
+    let mut windows = std::collections::BTreeSet::new();
+    let mut lib_tests = 0u64;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let id = fields.next().unwrap_or("");
+        assert_ne!(
+            id, "plain",
+            "{file} has a total line for `plain`: the plain pass states one line per binary, \
+             `plain/linux/<binary> <tests> <motive>` (CI-E1)"
+        );
+        if let Some(key) = id.strip_prefix("plain/linux/") {
+            linux.insert(key.to_string());
+            if key == "lib:memory_industry" {
+                lib_tests = fields.next().unwrap_or("").parse().unwrap_or(0);
+            }
+        } else if let Some(key) = id.strip_prefix("plain/windows/") {
+            windows.insert(key.to_string());
+        }
+    }
+
+    let problems = plain_line_differences(&linux, &expected);
+    assert!(
+        problems.is_empty(),
+        "the `plain/linux/` lines of {file} are not the binaries of the plain pass: {problems:#?}"
+    );
+    if !windows.is_empty() {
+        let problems = plain_line_differences(&windows, &expected);
+        assert!(
+            problems.is_empty(),
+            "the `plain/windows/` lines of {file} are not the binaries of the plain pass: {problems:#?}"
+        );
+    }
+    assert!(
+        linux.len() >= 100,
+        "{file} has {} `plain/linux/` lines; the plain pass has a hundred binaries or more, so a file \
+         that lost most of them would otherwise pass as the tree it describes",
+        linux.len()
+    );
+    assert!(
+        lib_tests >= 1000,
+        "{file} says `plain/linux/lib:memory_industry` runs {lib_tests} tests; the library runs more than a thousand"
+    );
+}
+
+/// The lines of `body` outside the self-test that run `cargo test` with tests to run (not `--no-run`, not a
+/// comment, not an `echo` that names it) and do not go through `run_counted` before the `cargo`.
+fn uncounted_cargo_tests(body: &str) -> Vec<(usize, String)> {
+    outside_self_test(body)
+        .into_iter()
+        .filter(|(_, line)| {
+            let line = line.trim_start();
+            !line.starts_with('#')
+                && !line.starts_with("echo ")
+                && line.contains("cargo test")
+                && !line.contains("--no-run")
+        })
+        .filter(|(_, line)| {
+            let before_cargo = &line[..line.find("cargo test").unwrap_or(0)];
+            !before_cargo
+                .split_whitespace()
+                .any(|word| word == "run_counted")
+        })
+        .map(|(n, line)| (n, line.trim().to_string()))
+        .collect()
+}
+
+/// CI-E1 (D-E1h): the plain pass was the last `cargo test` of the judge that ran tests and was not counted. The class is
+/// closed here: every `cargo test` of run-all-tests.sh that runs tests goes through `run_counted`, so a section that
+/// loses a test is red whatever section it is.
+#[test]
+fn every_cargo_test_of_run_all_tests_that_runs_tests_is_counted() {
+    // The scan has to be able to fail before a clean answer from it means anything.
+    let fixture = [
+        "echo \"=== cargo test (unit + smoke) ===\"",
+        "DATABASE_URL=\"$GATE_DATABASE_URL\" cargo test --timings",
+        "DATABASE_URL=\"$GATE_DATABASE_URL\" run_counted plain 0 cargo test --timings",
+        "cargo test --release --no-run --lib --timings",
+        "# the debug `cargo test` above",
+        "  run_counted nli 1 cargo test --test nli_cost --timings -- --ignored",
+    ]
+    .join("\n");
+    let found = uncounted_cargo_tests(&fixture);
+    assert_eq!(
+        found,
+        vec![(
+            2,
+            "DATABASE_URL=\"$GATE_DATABASE_URL\" cargo test --timings".to_string()
+        )],
+        "the scan must flag the `cargo test` that is not counted, and only it: not the echo, the counted \
+         calls, the --no-run or the comment"
+    );
+
+    let body = read("scripts/run-all-tests.sh");
+    let found = uncounted_cargo_tests(&body);
+    assert!(
+        found.is_empty(),
+        "run-all-tests.sh runs `cargo test` without `run_counted`, so the tests it runs are not counted \
+         against scripts/test-section-counts.txt and one that stops running is silent: {found:#?}"
+    );
 }
 
 /// The product test of migrations over an existing schema is in
