@@ -259,5 +259,85 @@ STUB
 fi
 # --- self-test end ---
 
-echo "qg-weekly-audit: no body yet (F6r, pass 1: only the self-test is written)" >&2
-exit 2
+# The study never touches a database, so the one the judge's shell may hold is not handed down.
+unset DATABASE_URL
+fail() { echo "qg-audit: FAIL: $*" >&2; exit 2; }
+
+branch="${QG_AUDIT_BRANCH:-main}"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/memory-industry/qg-audit"
+last="$state/last"
+mkdir -p "$state/work" || fail "cannot create $state"
+
+head="$(git -C "$ROOT" rev-parse --verify --quiet "$branch^{commit}")" || fail "the branch '$branch' is not in $ROOT"
+last_sha="" last_verdict="" last_stamp=""
+if [[ -f "$last" ]]; then read -r last_sha last_verdict last_stamp <"$last" || true; fi
+if [[ "$last_sha" == "$head" ]]; then
+  echo "qg-audit: unchanged: $branch is at ${head:0:12}, audited on ${last_stamp:-?} with verdict ${last_verdict:-?}"
+  exit 0
+fi
+
+# What the study judges the branch against: the base it is told, else the HEAD of the last audit with a verdict.
+base_ref="${QG_AUDIT_BASE:-$last_sha}"
+[[ -n "$base_ref" ]] || fail "the first audit has no earlier one to judge against: set QG_AUDIT_BASE to a ref"
+base="$(git -C "$ROOT" rev-parse --verify --quiet "$base_ref^{commit}")" || fail "the base '$base_ref' is not a commit of $ROOT"
+
+stamp="$(date +%Y-%m-%dT%H%M%S)"
+tag="$stamp-${head:0:12}"
+work="$state/work/$tag"
+tree="$work/tree"
+study="$work/study"
+log="$work/audit.log"
+final="" created=""
+# Whatever happens, the worktree goes, and an exit that no branch of this script chose is no verdict.
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  if [[ -n "$created" ]]; then
+    git -C "$ROOT" worktree remove --force "$tree" >/dev/null 2>&1 || echo "qg-audit: could not remove the worktree $tree" >&2
+    git -C "$ROOT" worktree prune >/dev/null 2>&1 || true
+  fi
+  rm -rf "$work"
+  [[ -z "$final" ]] || rc="$final"
+  [[ -n "$final" || "$rc" == 0 ]] || rc=2
+  exit "$rc"
+}
+finish() { final="$1"; exit "$1"; }
+trap cleanup EXIT
+trap 'exit 143' TERM INT HUP
+
+mkdir -p "$work" || fail "cannot create $work"
+git -C "$ROOT" worktree add --detach --quiet "$tree" "$head" >/dev/null || fail "cannot make the worktree of ${head:0:12}"
+created=1
+
+echo "qg-audit: $branch at ${head:0:12}, judged against ${base:0:12}"
+max_secs="${QG_AUDIT_MAX_SECS:-21600}"
+rc=0
+(
+  cd "$tree"
+  export QG_BASE="$base"
+  pesado -m 36G -w 3600 -n qg-auditoria -- \
+    timeout --kill-after=120 "$max_secs" bash scripts/quality-gate.sh --study full "$study"
+) >"$log" 2>&1 || rc=$?
+tail -n 20 "$log"
+
+if (( rc == 75 )); then
+  echo "qg-audit: pesado stayed busy for the whole wait: no audit, last unchanged"
+  finish 75
+fi
+verdict=2
+case "$rc" in
+  0 | 1) verdict="$rc" ;;
+  124) echo "qg-audit: the study did not finish in $max_secs s: no verdict" ;;
+  *) echo "qg-audit: the study exited $rc: no verdict" ;;
+esac
+
+out="$state/$tag"
+mkdir -p "$out"
+cp "$log" "$out/audit.log"
+[[ ! -f "$study/study.tsv" ]] || cp "$study/study.tsv" "$out/study.tsv"
+echo "$verdict" >"$out/verdict"
+if (( verdict < 2 )); then
+  echo "${head} $verdict $stamp" >"$last.new" && mv -f "$last.new" "$last"
+fi
+echo "qg-audit: verdict $verdict, kept in $out"
+finish "$verdict"
