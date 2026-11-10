@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Lane planner of the local judge (CI-F3, F3.2).
 
-`run --table <file>` runs the step table. GATE_DAG=0 or serie (the default) is the series: the steps in
-idx order, one at a time. GATE_DAG=1, maximo or auto plans the DAG: a step starts when its dependencies exited 0,
+`run --table <file>` runs the step table. GATE_DAG=0 or serie is the series: the steps in idx order, one at a time.
+GATE_DAG unset (the default since CI-E24), 1, maximo or auto plans the DAG: a step starts when its dependencies exited 0,
 and it is admitted by exclusivity, models, CPU, jobs and RAM (`admission`), recomputed on every event (a child exit, and
 a 1 s tick as a backup). The jobs of the machine are the threads of its cap, and a row gets min(the jobs it names, the
 jobs of the machine) in every mode (CI-K4, D-K4n; CI-E7a, D-E7c, D-E7d). The verdict is the series one: the red with the lowest idx wins, the steps before it
 finish, the ones after it are stopped with TERM and, after a grace, KILL (D-F3d, J14g). A kernel kill (OOM, or a
 signal the planner did not send) gives no verdict: exit 2 (D-F3f), and so does a failure of the planner itself (J14e).
-A run is recorded with the mode that ran (J14a): GATE_DAG=1 with no delegated scope, with no serial history of this
-table or with a DATABASE_URL in the environment runs in series, and is recorded as series. No step outlives the
+A run is recorded with the mode that ran (J14a): a DAG (asked for, or the default) with no delegated scope, with no serial
+history of this table or with a DATABASE_URL in the environment runs in series, and is recorded as series. No step outlives the
 planner: TERM and HUP stop it, and its exit stops every step and every `paso-*` cgroup of the scope (J14b).
 The planner measures the machine before it starts (cores, RAM free, disk, battery) and prints its plan in one line,
 `plan: ...` (CI-K4, D-K4q); a measure that cannot be read is a series with one job and the line says what (D-K4o).
@@ -1887,7 +1887,8 @@ def stop_on_signal(_signum: int, _frame: object) -> NoReturn:
 
 
 def run_table(path: str, timed_end: str | None = None) -> int:
-    mode = os.environ.get("GATE_DAG", "0")
+    # CI-E24: nobody asking is `auto`, with the same falls to the series as an `auto` that was written; `0` or `serie` forces the series.
+    mode = os.environ.get("GATE_DAG", "auto")
     if mode not in ASKED:
         die(f"GATE_DAG is {mode!r}; it has to be 0 or serie (series), or 1, maximo or auto (DAG)")
     for signum in STOP_SIGNALS:
@@ -1899,7 +1900,7 @@ def run_table(path: str, timed_end: str | None = None) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Lane planner of the local judge (CI-F3, F3.2).")
     commands = parser.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="run a step table: GATE_DAG=0 or serie, or 1, maximo or auto")
+    run = commands.add_parser("run", help="run a step table: GATE_DAG=0 or serie, or 1, maximo or auto (unset: auto)")
     run.add_argument("--table", required=True)
     run.add_argument("--timed-end", default=None, help="the line printed before the first untimed block (CI-F3.3b-2)")
     rows = commands.add_parser("rows", help="say the rows of a step table and the pairs that can be alive together (CI-J18)")
