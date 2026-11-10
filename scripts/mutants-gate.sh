@@ -583,7 +583,7 @@ def load(path):
     recount = {
         "caught": sum(1 for s, _ in mutants.values() if s == "CaughtMutant"),
         "missed": sum(1 for s, _ in mutants.values() if s == "MissedMutant"),
-        "timeout": sum(1 for s, _ in mutants.values() if s == "TimeoutMutant"),
+        "timeout": sum(1 for s, _ in mutants.values() if s == "Timeout"),
         "unviable": sum(1 for s, _ in mutants.values() if s == "Unviable"),
     }
     for field, count in recount.items():

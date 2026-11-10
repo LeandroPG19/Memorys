@@ -17,8 +17,9 @@ qg_mutants_jobs() {
   printf '%s\n' "${plan#jobs=}"
 }
 
-# The two modes that only read and write files (CI-F6, F6b). They are dispatched before anything else of this script
-# runs, so that the judge can call itself for them without the banner or the diff: `--cover-index` and `--merge-select`.
+# The modes that only read and write files, or that run this script (CI-F6, F6b and F6c). They are dispatched before
+# anything else of this script runs, so that the judge can call itself for them without the banner or the diff:
+# `--cover-index`, `--merge-select` and `--study`.
 QG_SELF="$ROOT/scripts/$(basename "${BASH_SOURCE[0]}")"
 qg_py() { command -v python3 2>/dev/null || command -v python 2>/dev/null || true; }
 
@@ -197,10 +198,92 @@ sys.exit(red)
 PY
 }
 
+# The mode `--study REF DIR` (D-F6p): is cover (Q2) the judge it replaces? REF is `legacy` or `full`, the judge as it
+# runs today, and DIR is new or empty. It runs this script whole with QG_SELECT=REF and QG_KEEP_OUT=DIR/ref (that run is
+# the verdict of the reference), then whole with QG_SELECT=cover into a keep directory of its own, whose cover/ becomes
+# DIR/cover, and asks mutants-gate.sh --compare-classes for the class of every mutant in both. DIR/study.tsv has a row
+# for each mutant: its class in each run, the pass and the size of the subset of the cover run, and the seconds of its
+# test phase in each. Exit 0 only if the reference is green and no class changed; 1 if the reference is red or some class
+# differs; 2 if the study could not be run or compared (a DIR that is not empty, a REF that is not legacy or full, a
+# run that left no outcomes). Each run is the whole judge, lizard and exclusions included: they cost seconds beside the
+# mutation, and the two runs judge the same diff the same way.
+qg_study() {
+  local ref="${1:-}" dir="${2:-}" py ref_rc=0 cover_rc=0 cmp_rc=0 ref_out merged n diffs cmp_err
+  case "$ref" in
+    legacy | full) ;;
+    *)
+      echo "FAIL: --study REF DIR: REF is legacy or full, the judge that cover is compared with, not '$ref'" >&2
+      return 2
+      ;;
+  esac
+  [[ -n "$dir" ]] || { echo "FAIL: --study $ref DIR needs a directory for the study" >&2; return 2; }
+  if [[ -n "$(ls -A "$dir" 2>/dev/null || true)" ]]; then
+    echo "FAIL: --study DIR=$dir is not empty; name a new directory so that runs do not mix" >&2
+    return 2
+  fi
+  py="$(qg_py)"
+  [[ -n "$py" ]] || { echo "FAIL: python is required for --study" >&2; return 2; }
+  mkdir -p "$dir" || return 2
+  QG_SELECT="$ref" QG_KEEP_OUT="$dir/ref" bash "$QG_SELF" || ref_rc=$?
+  echo "study: reference exit $ref_rc"
+  ref_out="$dir/ref/$ref/outcomes.json"
+  if [[ ! -s "$ref_out" ]]; then
+    echo "FAIL: the reference run left no outcomes.json in $dir/ref/$ref (its exit was $ref_rc): there is nothing to compare cover with, and its run is not launched" >&2
+    return 2
+  fi
+  QG_SELECT=cover QG_KEEP_OUT="$dir/cover-run" bash "$QG_SELF" || cover_rc=$?
+  merged="$dir/cover-run/cover/merged.json"
+  if [[ ! -s "$merged" ]]; then
+    echo "FAIL: the cover run left no merged.json in $dir/cover-run/cover (its exit was $cover_rc; it may have turned itself off and run as full): there is nothing to compare" >&2
+    return 2
+  fi
+  mv "$dir/cover-run/cover" "$dir/cover" && rmdir "$dir/cover-run" || return 2
+  cmp_err="$(mktemp)"
+  "$ROOT/scripts/mutants-gate.sh" --compare-classes "$ref_out" "$dir/cover/merged.json" 2>"$cmp_err" || cmp_rc=$?
+  cat "$cmp_err" >&2
+  diffs="$(grep -c '^FAIL' "$cmp_err" || true)"
+  rm -f "$cmp_err"
+  n="$("$py" -I - "$ref_out" "$dir/cover/merged.json" "$dir/study.tsv" <<'PY'
+import json, sys
+ref_path, cover_path, out_path = sys.argv[1:4]
+def load(path):
+    rows = {}
+    for o in json.load(open(path, encoding="utf-8"))["outcomes"]:
+        if not isinstance(o.get("scenario"), dict):
+            continue
+        test = next((p.get("duration") for p in o.get("phase_results", []) if p.get("phase") == "Test"), None)
+        rows[o["scenario"]["Mutant"]["name"]] = (o.get("summary"), test, o.get("qg_select", {}))
+    return rows
+ref, cover = load(ref_path), load(cover_path)
+seconds = lambda d: "-" if d is None else f"{d:.3f}"
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write("name\tref\tcover\tpass\tk\tref_test_s\tcover_test_s\n")
+    for name in list(ref) + [m for m in cover if m not in ref]:
+        r, c = ref.get(name, ("-", None, {})), cover.get(name, ("-", None, {}))
+        f.write("\t".join([name, str(r[0]), str(c[0]), str(c[2].get("pass", "-")), str(c[2].get("subset", "-")), seconds(r[1]), seconds(c[1])]) + "\n")
+print(len(ref))
+PY
+)" || return 2
+  case "$cmp_rc" in
+    0) echo "study: $n/$n identical — Q2 may be adopted" ;;
+    1) echo "study: $diffs differ — Q2 is NOT adopted" ;;
+    *)
+      echo "FAIL: mutants-gate.sh --compare-classes exited $cmp_rc, so the classes were not compared" >&2
+      return 2
+      ;;
+  esac
+  (( ref_rc == 0 && cmp_rc == 0 )) || return 1
+}
+
 case "${1:-}" in
   --cover-index | --merge-select)
     mode_rc=0
     if [[ "$1" == --cover-index ]]; then qg_cover_index "${@:2}" || mode_rc=$?; else qg_merge_select "${@:2}" || mode_rc=$?; fi
+    exit "$mode_rc"
+    ;;
+  --study)
+    mode_rc=0
+    qg_study "${@:2}" || mode_rc=$?
     exit "$mode_rc"
     ;;
 esac
