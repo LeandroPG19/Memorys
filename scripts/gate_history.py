@@ -13,7 +13,8 @@ an illegible manifest is exit 2. What was not measured is written as null, never
 is diagnosis only.
 
 Library use (the planner and the contract tests): run_start, step_start, step_end, units,
-run_end, lower_bounds, leer_jsonl, usl_point. CLI (the serial writer): `registrar`, a JSON manifest on stdin.
+run_end, lower_bounds, camino_critico, leer_jsonl, usl_point. `anon_max` of a step is its anonymous memory plus the pages its
+tmpfs holds (`shmem`): what is charged to the scope and cannot be reclaimed without swap. CLI (the serial writer): `registrar`, a JSON manifest on stdin.
 """
 
 from __future__ import annotations
@@ -179,6 +180,17 @@ def _tomar(candado: TextIO) -> bool:
             time.sleep(0.02)
 
 
+def _salto_pendiente(path: str) -> str:
+    """A newline when the file ends in a line cut halfway (a process killed in the middle of a write), so the next record
+    does not glue itself to it and get lost with it. Nothing for a file that is absent, empty or ends in a newline."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(-1, os.SEEK_END)
+            return "" if fh.read(1) == b"\n" else "\n"
+    except OSError:
+        return ""
+
+
 def _escribir(nombre: str, registro: dict[str, Any]) -> None:
     """Once the lock timed out in this process, the later writes skip it without waiting: the
     timeout is spent once, and the one warning already said what happened."""
@@ -195,8 +207,9 @@ def _escribir(nombre: str, registro: dict[str, Any]) -> None:
                 _candado_roto = True
                 _aviso(f"{nombre} not written: {candado_path} is held by another process for more than {_plazo_candado()} s; the later writes of this process skip it")
                 return
-            with open(os.path.join(carpeta, nombre), "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+            destino = os.path.join(carpeta, nombre)
+            with open(destino, "a", encoding="utf-8") as fh:
+                fh.write(_salto_pendiente(destino) + json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
     except OSError as err:
         _aviso(f"{nombre} not written under {carpeta} ({err})")
 
@@ -523,19 +536,38 @@ def usl_point(registro: dict[str, Any]) -> None:
     _escribir("usl.jsonl", {"repo": REPO, **registro})
 
 
-def _camino(
-    paso_id: str,
-    seg: dict[str, float],
-    deps: dict[str, list[str]],
-    memo: dict[str, float],
-    pila: tuple[str, ...] = (),
-) -> float:
-    if paso_id in pila:
-        raise ValueError("ciclo en las dependencias: " + " -> ".join(pila + (paso_id,)))
-    if paso_id not in memo:
-        previos = [_camino(d, seg, deps, memo, pila + (paso_id,)) for d in deps.get(paso_id, []) if d in seg]
-        memo[paso_id] = seg[paso_id] + max(previos, default=0.0)
-    return memo[paso_id]
+def camino_critico(seg: dict[str, float], deps: dict[str, list[str]]) -> tuple[float, list[str]]:
+    """The longest chain of dependencies, by the durations in `seg`: its length (the term `camino` of the bound) and the
+    chain itself, from its first step to its last. The one function of the critical path: the planner prints the chain
+    and the history gives the number from it. A dependency with no duration is skipped. A tie goes to the first step of
+    `seg` for the end of the chain and to the first of `deps[id]` for each step before it. A cycle raises ValueError
+    naming it."""
+    memo: dict[str, tuple[float, str | None]] = {}
+
+    def hasta(paso_id: str, pila: tuple[str, ...] = ()) -> tuple[float, str | None]:
+        if paso_id in pila:
+            raise ValueError("ciclo en las dependencias: " + " -> ".join(pila + (paso_id,)))
+        if paso_id not in memo:
+            previo: str | None = None
+            mejor = 0.0
+            for d in deps.get(paso_id, []):
+                if d in seg:
+                    largo = hasta(d, pila + (paso_id,))[0]
+                    if previo is None or largo > mejor:
+                        previo, mejor = d, largo
+            memo[paso_id] = (seg[paso_id] + mejor, previo)
+        return memo[paso_id]
+
+    if not seg:
+        return 0.0, []
+    fin = max(seg, key=lambda i: hasta(i)[0])
+    cadena: list[str] = []
+    paso: str | None = fin
+    while paso is not None:
+        cadena.append(paso)
+        paso = memo[paso][1]
+    cadena.reverse()
+    return memo[fin][0], cadena
 
 
 def _cota_cpu(records: list[dict[str, Any]], table: dict[str, Any]) -> float | None:
@@ -571,8 +603,7 @@ def lower_bounds(records: list[dict[str, Any]], table: dict[str, Any]) -> dict[s
     seg = {r["id"]: float(r["seg"]) for r in records if r.get("seg") is not None}
     cotas: dict[str, float | None] = dict.fromkeys(COTAS)
     if _columna(records, "seg") is not None:
-        memo: dict[str, float] = {}
-        cotas["camino"] = max(_camino(i, seg, table["deps"], memo) for i in seg)
+        cotas["camino"] = camino_critico(seg, table["deps"])[0]
         cotas["paso"] = max(seg.values())
     cotas["cpu"] = _cota_cpu(records, table)
     cotas["ram"] = _cota_ram(records, seg, table)

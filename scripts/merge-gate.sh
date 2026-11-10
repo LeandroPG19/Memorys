@@ -91,6 +91,16 @@ gate_cluster_down_all() {
   echo down-all >>"$HOME/steps"
   rm -f "$HOME/lanes.open"
 }
+# CI-J14h: what the gate's exit asks of the library when it takes down the directories a row left. As the real ones
+# answer it (gate-cluster.sh, K1, K2): a pid that is alive and is not the postgres of the directory gets no signal and
+# the directory stays; no stand-in is the postgres of anything.
+gate_pid_alive() { [[ "${1:-}" =~ ^[0-9]+$ ]] && kill -0 "$1" 2>/dev/null; }
+gate_identity_refusal() { printf 'exe is not %s/postgres (stand-in)' "$GATE_PG_BINDIR"; }
+gate_stop_pid() {
+  gate_pid_alive "$1" || return 0
+  echo "note: pid $1 is not the postgres of $2 ($(gate_identity_refusal "$1" "$2")): no signal is sent" >&2
+  return 1
+}
 FAKE
     # CI-F3.4 (D-F34c): the E2E row has models and names no pools, so the planner wants the resource plan the binary chose in
     # its log, as the real one writes it. The stand-in of the run-all-tests of lane E prints that line, tier full and the
@@ -157,6 +167,10 @@ FAKE
       'for a in "$@"; do printf "%s\n" "$a"; done >>"$HOME/psql.args"' \
       'printf "PGOPTIONS=%s\n" "${PGOPTIONS-}" >>"$HOME/psql.env"' \
       'printf "PGPASSWORD=%s\n" "${PGPASSWORD-}" >>"$HOME/psql.env"' \
+      'printf "PGCONNECT_TIMEOUT=%s\n" "${PGCONNECT_TIMEOUT-unset}" >>"$HOME/psql.env"' \
+      'printf "PGHOSTADDR=%s\n" "${PGHOSTADDR-unset}" >>"$HOME/psql.env"' \
+      'printf "PGREQUIREPEER=%s\n" "${PGREQUIREPEER-unset}" >>"$HOME/psql.env"' \
+      'if [ -n "${PGHOSTADDR:-}" ] || [ -n "${PGREQUIREPEER:-}" ]; then echo "psql: connection to server failed: libpq read PGHOSTADDR or PGREQUIREPEER from the environment, and the socket the URL names is not what it asked for (stand-in)" >&2; exit 2; fi' \
       'if [ -n "${FAKE_PSQL_EXIT:-}" ]; then echo "${FAKE_PSQL_STDERR:-psql: fake failure}" >&2; exit "$FAKE_PSQL_EXIT"; fi' \
       'lane="$(printf "%s" "$*" | sed -n "s/.*%2F\([a-z][a-z0-9-]*\)\.[A-Za-z0-9]\{6\}:5432.*/\1/p")"' \
       'if [ -n "$lane" ] && [ -z "${FAKE_PSQL_CLUSTER_NAME+x}" ]; then name="memory-industry-gate-$lane"; else name="${FAKE_PSQL_CLUSTER_NAME-memory-industry-gate}"; fi' \
@@ -1798,6 +1812,62 @@ exit 0'
   [[ -z "$(steps_of step_foreign)" ]] || self_fail "--step with a foreign ticket ran a step: $(steps_of step_foreign)"
   [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-planted ]] || self_fail "--step with a foreign ticket spent the planner's ticket"
 
+  # CI-J14h: a row that dies by KILL runs no trap, so the cluster it made stays under the root with this gate's owner on
+  # it. The gate's exit, once it has collected the planner, takes down the directories of the root whose owner is its own
+  # (the identity check of the library decides what is a postgres of theirs) and no other. The row makes three: this
+  # gate's (it goes), one of another owner (it stays) and one of this gate's whose postmaster.pid names a live process
+  # that is not its postgres (it stays, and the process is not signalled). The row kills the step's own shell, as the
+  # kernel kills a step under OOM, so the planner says no verdict and the gate leaves through its exit trap.
+  j14h_body='case "${1:-}" in --check-models) exit 0 ;; esac
+root="$HOME/cluster-root"
+mkdir -p "$root/dbg.own111" "$root/dbg.alien1" "$root/dbg.live11/data"
+printf "%s pidns=1\n" "$CUBA_GATE_LOCK_OWNER" >"$root/dbg.own111/owner"
+printf "%s pidns=1\n" "pid=1 start=1 where=elsewhere since=x token=alien" >"$root/dbg.alien1/owner"
+printf "%s pidns=1\n" "$CUBA_GATE_LOCK_OWNER" >"$root/dbg.live11/owner"
+echo LIVEPID >"$root/dbg.live11/data/postmaster.pid"
+echo made >"$HOME/j14h.made"
+kill -9 "$PPID"
+exit 1'
+  fake_tree j14h "${j14h_body//LIVEPID/$live}"
+  run_copy_as unset j14h ""
+  (( rc != 0 )) || self_fail "J14h: a gate whose step was killed exited 0: $(cat "$tmp/j14h.out")"
+  j14h_root="$tmp/j14h/home/cluster-root"
+  [[ -f "$tmp/j14h/home/j14h.made" ]] \
+    || self_fail "J14h: the step did not make its directories before it died, so the row proves nothing: $(cat "$tmp/j14h.out")"
+  [[ ! -e "$j14h_root/dbg.own111" ]] \
+    || self_fail "J14h: the cluster this gate's row left under its root is still there after the gate's exit: $(cat "$tmp/j14h.out")"
+  [[ -f "$j14h_root/dbg.alien1/owner" ]] \
+    || self_fail "J14h: the exit took down the cluster of another owner: it did not look at whose it was"
+  [[ -d "$j14h_root/dbg.live11" ]] \
+    || self_fail "J14h: the exit took down a directory whose postmaster.pid is a live process that is not its postgres: the identity check was not asked"
+  kill -0 "$live" 2>/dev/null \
+    || self_fail "J14h: the exit signalled a process that is not the postgres of the directory that names it"
+  grep -qF "note: pid $live is not the postgres of $j14h_root/dbg.live11" "$tmp/j14h.out" \
+    || self_fail "J14h: the exit left the directory of a live pid that is not its postgres without saying why: $(cat "$tmp/j14h.out")"
+
+  # CI-J14i: libpq reads PGHOSTADDR and PGREQUIREPEER from the environment, and with them it asks another host, or
+  # refuses the peer, instead of the socket of the lane's URL. The identity query of the judge's server drops the PG*
+  # variables of its caller, as every call of the lane library does (GATE_PG_ENV_UNSET), and sets its own deadline: the
+  # stand-in psql refuses as libpq would when it finds either of them, and records the three it was handed.
+  fake_tree j14i_psql "$lane_body"
+  run_copy_as unset j14i_psql "" PGHOSTADDR=127.0.0.1 PGREQUIREPEER=x
+  (( rc == 0 )) || self_fail "J14i: a gate with PGHOSTADDR and PGREQUIREPEER in its environment exited $rc, not 0: the identity query of the lane read them: $(cat "$tmp/j14i_psql.out")"
+  [[ -s "$tmp/j14i_psql/home/psql.env" ]] || self_fail "J14i: no identity query was made, so the row proves nothing"
+  for j14i_line in PGHOSTADDR=unset PGREQUIREPEER=unset PGCONNECT_TIMEOUT=10; do
+    grep -qxF "$j14i_line" "$tmp/j14i_psql/home/psql.env" \
+      || self_fail "J14i: the identity query was not handed $j14i_line: $(cat "$tmp/j14i_psql/home/psql.env")"
+  done
+  grep -vxF -e PGHOSTADDR=unset -e PGREQUIREPEER=unset -e PGCONNECT_TIMEOUT=10 "$tmp/j14i_psql/home/psql.env" \
+    | grep -qE '^(PGHOSTADDR|PGREQUIREPEER|PGCONNECT_TIMEOUT)=' \
+    && self_fail "J14i: an identity query saw one of the three with another value: $(cat "$tmp/j14i_psql/home/psql.env")"
+  # The identity query of a gate that was given the server (DATABASE_URL) is made the same way.
+  fake_tree j14i_ext "$lane_body"
+  run_copy_as "$ext" j14i_ext "" FAKE_PG_ANSWER='127.0.0.1:5489 - accepting connections' FAKE_PSQL_CLUSTER_NAME=memory-industry-gate \
+    PGHOSTADDR=127.0.0.1 PGREQUIREPEER=x
+  (( rc == 0 )) || self_fail "J14i: a gate with an external DATABASE_URL and PGHOSTADDR in its environment exited $rc, not 0: $(cat "$tmp/j14i_ext.out")"
+  grep -qxF PGCONNECT_TIMEOUT=10 "$tmp/j14i_ext/home/psql.env" \
+    || self_fail "J14i: the identity query of the external server has no deadline of its own: $(cat "$tmp/j14i_ext/home/psql.env")"
+
   echo "OK  self-test: the exit file says running while a gate runs and holds the whole"
   echo "    gate's verdict at the end, a step after the tests included; a gate killed"
   echo "    in the middle leaves 'running', never an old 0; a refused gate leaves it alone."
@@ -1822,6 +1892,8 @@ exit 0'
   echo "    the test times are judged last, over the gate's own log up to the npm step, and their red is the gate's"
   echo "    advisory exceptions are judged right after cargo audit, from a report made without ignores, and their red stops the gate before cargo deny;"
   echo "    a gate stopped by a signal it can catch (TERM) leaves 2 in the exit file, says so and leaves no receipt, never the 0 of its last command"
+  echo "    the gate's exit takes down, after it has collected the planner, the clusters its rows left under the root with its own owner on them, never the ones of another owner or the ones whose pid is not their postgres (J14h);"
+  echo "    the identity query of the judge's server drops the PGHOSTADDR and PGREQUIREPEER of its caller and has a deadline of its own (J14i);"
   echo "    gate_sweep_dead_targets removes the target of a tree whose .gate-tree names a path that is gone, and no other (a live tree, a key with no marker, a marker that names no tree, another name, a symlink, a neighbour of the root), says so with the size, and the gate runs it after taking the lock and after gate_linux_env"
   exit 0
 fi
@@ -1885,6 +1957,27 @@ write_receipt() {
 # the verdict is the file, and the process just has not passed.
 GATE_REACHED_END=""
 GATE_PLANNER=""
+
+# CI-J14h: the clusters this gate's rows left under the root. A row killed by KILL (the kernel, or the planner after its
+# grace) runs no trap, and its cluster stays in tmpfs with this gate's owner on it. Taken down once the planner is
+# collected, so no row is still making one: the directories of the root whose owner starts with this gate's, as
+# gate_cluster_down does it, and the identity check of the library (gate_stop_pid, gate_identity_refusal) before any
+# signal. A directory whose postmaster.pid names a live process that is not its postgres stays, with the library's note.
+gate_cluster_down_owned() {
+  local dir owner pid
+  [[ -n "$GATE_OWNER" ]] || return 0
+  for dir in "$GATE_CLUSTER_ROOT"/*/; do
+    dir="${dir%/}"
+    [[ -d "$dir" && "${dir##*/}" =~ ^[a-z0-9][a-z0-9-]*\.[A-Za-z0-9]{6}$ && -f "$dir/owner" ]] || continue
+    owner="$(<"$dir/owner")"
+    [[ "$owner" == "$GATE_OWNER"* ]] || continue
+    pid="$(head -n 1 "$dir/data/postmaster.pid" 2>/dev/null || true)"
+    gate_stop_pid "$pid" "$dir" || continue
+    rm -rf -- "$dir"
+    echo "note: took down the cluster a row of this gate left under its root: $dir"
+  done
+}
+
 on_exit() {
   local code=$? tenths=0 stopped=0
   gate_cluster_down_all
@@ -1892,6 +1985,7 @@ on_exit() {
     kill -TERM "$GATE_PLANNER" 2>/dev/null || true
     wait "$GATE_PLANNER" 2>/dev/null || true
   fi
+  gate_cluster_down_owned
   if (( code == 0 )) && [[ -z "$GATE_REACHED_END" ]]; then
     code=2
     stopped=1

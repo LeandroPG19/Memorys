@@ -1337,6 +1337,53 @@ FAKE
   grep -qxF "$tmp/lane_e_nocargo/target/release/memory-industry doctor" "$tmp/lane_e_nocargo/home/bin.calls" 2>/dev/null \
     || self_fail "F3.4 R3: the provision did not call the release binary's doctor: $(cat "$tmp/lane_e_nocargo/home/bin.calls" 2>/dev/null)"
 
+  # CI-J14i: the probes of the authenticated CLIs (`claude -p`, `gemini -p`, lane D3) have a deadline, 60 s unless
+  # GATE_LLM_PROBE_TIMEOUT_S says another (the rows say 1), and a CLI that does not answer in it is exit 2 naming the CLI,
+  # not a gate that waits for ever. One that fails at once is not a timeout: the next probe still runs. The `timeout` of the
+  # tree is a shim that records its arguments and runs the real one, so the default of 60 s is read, not waited for.
+  # llm_run NAME CLAUDE_BODY GEMINI_BODY [VAR=value ...]: lane D3 in NAME's tree with those CLIs (an empty body is no CLI)
+  # and no provider, under a deadline of its own so a row that waits is red and does not hang.
+  llm_run() {
+    local name="$1" claude_body="$2" gemini_body="$3" t="$tmp/$1"
+    shift 3
+    full_tree "$name"
+    printf '{"content":"fake observation"}\n%.0s' 1 2 3 4 5 >"$t/rust/eval-datasets/smoke-corpus.jsonl"
+    printf '%s\n' '#!/bin/sh' 'echo "$*" >>"$HOME/timeout.args"' 'exec /usr/bin/timeout "$@"' >"$t/bin/timeout"
+    [[ -z "$claude_body" ]] || printf '#!/bin/sh\n%s\n' "$claude_body" >"$t/bin/claude"
+    [[ -z "$gemini_body" ]] || printf '#!/bin/sh\n%s\n' "$gemini_body" >"$t/bin/gemini"
+    chmod +x "$t"/bin/*
+    rc=0
+    SECONDS=0
+    timeout 40 env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT -u MEMORY_INDUSTRY_LLM_PROVIDER \
+      -u CUBA_LLM_PROVIDER -u MEMORY_INDUSTRY_LLM_BASE_URL -u CUBA_LLM_BASE_URL HOME="$t/home" \
+      PATH="$t/bin:/usr/bin:/bin" DATABASE_URL="$rat_url" CARGO_TARGET_DIR="$t/target" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      ONNX_MODEL_PATH="$t/models" CUBA_RERANKER_PATH="$t/reranker" CUBA_NLI_PATH="$t/nli-model" "$@" \
+      "$BASH" "$t/scripts/run-all-tests.sh" --lane D3 >"$tmp/$name.out" 2>&1 || rc=$?
+    llm_seconds=$SECONDS
+  }
+  llm_run j14i_claude 'exec sleep 300' '' GATE_LLM_PROBE_TIMEOUT_S=1
+  (( rc == 2 )) \
+    || self_fail "J14i: claude -p that does not answer left the gate with $rc after ${llm_seconds}s, not 2 (124 is the deadline of this row): $(cat "$tmp/j14i_claude.out")"
+  grep -qF 'claude -p did not answer in 1 s' "$tmp/j14i_claude.out" \
+    || self_fail "J14i: the refusal does not say that claude -p did not answer in 1 s: $(cat "$tmp/j14i_claude.out")"
+  llm_run j14i_gemini '' 'exec sleep 300' GATE_LLM_PROBE_TIMEOUT_S=1
+  (( rc == 2 )) \
+    || self_fail "J14i: gemini -p that does not answer left the gate with $rc after ${llm_seconds}s, not 2: $(cat "$tmp/j14i_gemini.out")"
+  grep -qF 'gemini -p did not answer in 1 s' "$tmp/j14i_gemini.out" \
+    || self_fail "J14i: the refusal does not say that gemini -p did not answer in 1 s: $(cat "$tmp/j14i_gemini.out")"
+  # The probes that answer, and the one that fails at once, are as they were; the deadline is 60 s unless a row says another.
+  llm_run j14i_claude_ok 'exit 0' ''
+  grep -qxF 'OK  generative LLM via authenticated claude CLI' "$tmp/j14i_claude_ok.out" \
+    || self_fail "J14i: a claude -p that answers is not an LLM any more: $(cat "$tmp/j14i_claude_ok.out")"
+  grep -qE '^60 claude -p ' "$tmp/j14i_claude_ok/home/timeout.args" 2>/dev/null \
+    || self_fail "J14i: claude -p is not run under timeout 60: $(cat "$tmp/j14i_claude_ok/home/timeout.args" 2>/dev/null)"
+  llm_run j14i_gemini_ok 'exit 1' 'exit 0'
+  grep -qxF 'OK  generative LLM via authenticated gemini CLI' "$tmp/j14i_gemini_ok.out" \
+    || self_fail "J14i: a claude -p that fails at once stopped the probe of gemini -p: $(cat "$tmp/j14i_gemini_ok.out")"
+  grep -qE '^60 gemini -p ' "$tmp/j14i_gemini_ok/home/timeout.args" 2>/dev/null \
+    || self_fail "J14i: gemini -p is not run under timeout 60: $(cat "$tmp/j14i_gemini_ok/home/timeout.args" 2>/dev/null)"
+
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
   echo "    else; the run-all-tests.sh merge-gate launches works under its lock and"
@@ -1345,7 +1392,8 @@ FAKE
   echo "    still its own; a run on its own"
   echo "    refuses a DATABASE_URL it cannot derive brain_gate from, before any step;"
   echo "    the models are looked for under HOME/.cache, where the"
-  echo "    binary keeps them, whatever XDG_CACHE_HOME says"
+  echo "    binary keeps them, whatever XDG_CACHE_HOME says;"
+  echo "    claude -p and gemini -p run under a deadline (60 s, GATE_LLM_PROBE_TIMEOUT_S), and one that does not answer is exit 2 naming it (J14i)"
   exit 0
 fi
 # --- self-test end ---
@@ -1558,6 +1606,19 @@ require_present() {
   "$@"
 }
 
+# CI-J14i: `claude -p` and `gemini -p` are probes of a service that can sit on a login nobody sees, and lane D3 waited
+# for it for ever. They run under GATE_LLM_PROBE_TIMEOUT_S (60 s; the self-test says 1). One that does not answer is exit
+# 2 naming it; one that fails at once is only a probe that did not pass, and the next one runs.
+llm_cli_answers() {
+  local cli="$1" what="$2" limit="${GATE_LLM_PROBE_TIMEOUT_S:-60}" rc=0
+  timeout "$limit" "$cli" -p "reply with the single word ok" --output-format text >/dev/null 2>&1 || rc=$?
+  if (( rc == 124 )); then
+    echo "FAIL: $what — $cli -p did not answer in $limit s (timeout), and the gate does not wait for it." >&2
+    exit 2
+  fi
+  (( rc == 0 ))
+}
+
 require_generative_llm() {
   local what="$1"
   shift
@@ -1593,13 +1654,13 @@ require_generative_llm() {
     fi
   fi
   if [[ "$ok" -eq 0 ]] && command -v claude >/dev/null 2>&1; then
-    if claude -p "reply with the single word ok" --output-format text >/dev/null 2>&1; then
+    if llm_cli_answers claude "$what"; then
       ok=1
       echo "OK  generative LLM via authenticated claude CLI"
     fi
   fi
   if [[ "$ok" -eq 0 ]] && command -v gemini >/dev/null 2>&1; then
-    if gemini -p "reply with the single word ok" --output-format text >/dev/null 2>&1; then
+    if llm_cli_answers gemini "$what"; then
       ok=1
       echo "OK  generative LLM via authenticated gemini CLI"
     fi

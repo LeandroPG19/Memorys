@@ -5,8 +5,11 @@
 idx order, one at a time. GATE_DAG=1 plans the DAG: a step starts when its dependencies exited 0,
 and it is admitted by CPU and RAM, recomputed on every event (a child exit, and a 1 s tick as a
 backup). The verdict is the series one: the red with the lowest idx wins, the steps before it
-finish, the ones after it are killed (D-F3d). A kernel kill (OOM, or a signal the planner did not
-send) gives no verdict: exit 2 (D-F3f).
+finish, the ones after it are stopped with TERM and, after a grace, KILL (D-F3d, J14g). A kernel kill (OOM, or a
+signal the planner did not send) gives no verdict: exit 2 (D-F3f), and so does a failure of the planner itself (J14e).
+A run is recorded with the mode that ran (J14a): GATE_DAG=1 with no delegated scope, with no serial history of this
+table or with a DATABASE_URL in the environment runs in series, and is recorded as series. No step outlives the
+planner: TERM and HUP stop it, and its exit stops every step and every `paso-*` cgroup of the scope (J14b).
 
 Not in the planner: the removal of old run directories (D-F3i) and the per-binary launcher (D-F3u).
 `exclusive` and `boundary` run alone, after every lower idx: the conservative form of D-F3l, and with a
@@ -39,6 +42,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from typing import TYPE_CHECKING, Any, NoReturn
 
 # No bytecode next to the scripts (J7): the judge does not write __pycache__ into the tree.
@@ -55,6 +59,12 @@ TICK_S = 1.0
 SAFETY = 1.25
 WINDOW = 5
 MIN_RESERVE = 4 * GIB
+# CI-J14b, CI-J14g: the signals that stop the planner; a step that is stopped gets TERM and, when GATE_DAG_TERM_GRACE_S
+# (15 s) is over, KILL. A cgroup that still has processes after its step ended is killed and tried again for
+# GATE_DAG_RMDIR_WAIT_S (5 s). The two variables are for the contract tests, which shorten the waits.
+STOP_SIGNALS = frozenset({signal.SIGTERM, signal.SIGHUP})
+TERM_GRACE_S = 15.0
+RMDIR_WAIT_S = 5.0
 # CI-F3.4 (D-F34d, D-F34e): the rows with models alive at once, and the MemAvailable a row with models needs on top of its own estimate.
 MAX_MODELS = 2
 MODELS_FLOOR = 4096 * (1 << 20)
@@ -124,6 +134,15 @@ def read_int(path: str) -> int | None:
     return int(text) if text is not None and text.strip().isdigit() else None
 
 
+def seconds_from_env(name: str, default: float) -> float:
+    """A wait in seconds from the environment; a value that is not a number, or is negative, is the default."""
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value >= 0 else default
+
+
 def psi_some_avg10(path: str) -> float | None:
     text = read_text(path)
     for line in (text or "").splitlines():
@@ -139,9 +158,12 @@ def p95(values: Iterable[float]) -> float:
     return ordered[min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)]
 
 
-def sha256_of(path: str) -> str:
-    with open(path, "rb") as fh:
-        return hashlib.sha256(fh.read()).hexdigest()
+def table_key(path: str) -> str:
+    """The key of the history (J14k): the sha256 of the rows of the table, each with its spaces collapsed, with no comment
+    and no blank line. A comment does not drop the history; a number of a row does."""
+    with open(path, encoding="utf-8") as fh:
+        rows = [" ".join(line.split()) for line in fh if line.strip() and not line.lstrip().startswith("#")]
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
 
 
 def git_state(root: str) -> tuple[str | None, bool | None]:
@@ -211,6 +233,7 @@ class Step:
         self.cg: str | None = None
         self.rc: int | None = None
         self.parado = False
+        self.term_at: float | None = None
         self.motivo: str | None = None
         self.t_ready: float | None = None
         self.t_start: float | None = None
@@ -276,6 +299,9 @@ def parse_row(line: str, number: int) -> Step:
         idx, cpu, ram_gb, dur = int(tok[0]), float(tok[5]), float(tok[6]), float(tok[7])
     except ValueError:
         die(f"table line {number}: idx, cpu, ram_gb and dur_s have to be numbers")
+    for column, value in (("cpu", cpu), ("ram_gb", ram_gb), ("dur_s", dur)):
+        if not (math.isfinite(value) and value > 0):
+            die(f"table line {number}: {column} of {tok[1]} has to be a finite number above 0, not {value!r}")
     if tok[4] not in CLASSES:
         die(f"table line {number}: class {tok[4]} is not normal, exclusive or boundary")
     deps = [] if tok[2] == "-" else tok[2].split(",")
@@ -548,18 +574,6 @@ def ranks(steps: list[Step], dur: dict[str, float]) -> tuple[dict[str, float], d
     return rank, nxt
 
 
-def critical_chain(
-    steps: list[Step], rank: dict[str, float], nxt: dict[str, Step | None]
-) -> tuple[float, str]:
-    top = max(steps, key=lambda s: rank[s.id])
-    chain: list[str] = []
-    cur: Step | None = top
-    while cur is not None:
-        chain.append(cur.id)
-        cur = nxt[cur.id]
-    return rank[top.id], " -> ".join(chain)
-
-
 # --- the planner --------------------------------------------------------------
 
 
@@ -597,10 +611,17 @@ class Planner:
         # CI-F3.3b-2: the line the judge of the test times reads up to; printed once, before the first untimed block.
         self.timed_end = timed_end
         self.timed_end_printed = False
-        self.modo = "dag" if dag else "serie"
         self.t0 = time.monotonic()
         self.run_dir = make_run_dir()
         self.run_id = os.path.basename(self.run_dir)
+        self.hist_steps, self.hist_runs = load_history(tabla)
+        self.scope = scope_dir()
+        self.delegado = delegate(self.scope)
+        # CI-J14d: a DATABASE_URL of the operator is one server for every row, and sqlx drops databases by name.
+        self.shared_server = bool(os.environ.get("DATABASE_URL"))
+        # CI-J14a: what runs in series is recorded as series, so the next run of this table has a serial run to learn from.
+        self.solo = not (dag and self.delegado and self.hist_runs and not self.shared_server)
+        self.modo = "serie" if self.solo else "dag"
         root = repo_root()
         sha, arbol_sucio = git_state(root)
         self.corrida: gate_history.Corrida | None = gate_history.run_start(
@@ -611,9 +632,6 @@ class Planner:
             run=self.run_id,
             arbol_sucio=arbol_sucio,
         )
-        self.hist_steps, self.hist_runs = load_history(tabla)
-        self.scope = scope_dir()
-        self.delegado = delegate(self.scope)
         self.cpu, self.ram = capacities()
         # CI-F3.3c: the cores admitted never add up past the machine's (C), not 1,25·C: SAFETY is for RAM only.
         self.cpu_cap = self.cpu
@@ -627,7 +645,6 @@ class Planner:
         self.wake_r: int | None = None
         self.wake_w: int | None = None
         self.rank, self.nxt = self.estimated_ranks()
-        self.solo = not (dag and self.delegado and self.hist_runs)
         self.notes()
 
     def estimated_ranks(self) -> tuple[dict[str, float], dict[str, Step | None]]:
@@ -641,6 +658,8 @@ class Planner:
             print("note: the scope is not delegated: nothing is measured or killed per step, so the planner runs in series")
         elif self.dag and not self.hist_runs:
             print(f"note: no serial history for this table ({self.tabla[:12]}): the planner runs in series")
+        if self.dag and self.shared_server:
+            print("note: DATABASE_URL names a server this judge did not make, so every row shares it and sqlx drops databases by name: the planner runs in series")
 
     def estimate(self, step: Step) -> None:
         previous = self.hist_steps.get(step.id, [])[-WINDOW:]
@@ -778,27 +797,38 @@ class Planner:
         env = self.step_env(step, self.lane_ticket(step))
         step.cg = self.cgroup_for(step)
         step.log = os.path.join(self.run_dir, "pasos", f"{step.idx}-{step.id}.log")
-        with open(step.log, "wb") as log:
-            step.proc = subprocess.Popen(
-                step.argv,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                preexec_fn=step_entry(step.cg),
-            )
-        step.t_start = self.now()
-        if self.corrida is not None:
-            step.paso = gate_history.step_start(self.corrida, step.idx, step.id)
-        step.state = "running"
+        # CI-J14b: a stop signal between Popen and the step being marked as running would leave a step started that
+        # drain does not see. Blocked from before Popen until it is running, it arrives when it is unblocked, and drain
+        # knows the step. The step itself starts with them unblocked (step_entry).
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+        try:
+            with open(step.log, "wb") as log:
+                step.proc = subprocess.Popen(
+                    step.argv,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    preexec_fn=step_entry(step.cg),
+                )
+            if os.environ.get("GATE_DAG_TEST_TERM_AFTER_POPEN") == "1":
+                os.kill(os.getpid(), signal.SIGTERM)
+            step.t_start = self.now()
+            if self.corrida is not None:
+                step.paso = gate_history.step_start(self.corrida, step.idx, step.id)
+            step.state = "running"
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, before)
         self.sample_step(step)
 
     def anon_of(self, step: Step) -> int | None:
+        """The memory a step holds that the scope cannot give back (J14c): anon plus the pages its tmpfs holds (shmem),
+        which `anon` does not see and the postgres of each lane writes under the cluster root."""
         if not step.cg:
             return None
         stat = read_kv(os.path.join(step.cg, "memory.stat"))
-        return stat.get("anon") if stat else None
+        return stat["anon"] + stat.get("shmem", 0) if stat and "anon" in stat else None
 
     def sample_step(self, step: Step) -> None:
         value = self.anon_of(step)
@@ -838,7 +868,7 @@ class Planner:
         if rc == 0 and not step.parado:
             step.rc = rc = self.plan_rc(step)
         self.record_step(step)
-        remove_cgroup(step.cg)
+        self.remove_cgroup(step)
         if step.parado:
             return
         if rc < 0 or (step.oom_kill or 0) > 0:
@@ -886,6 +916,34 @@ class Planner:
             for name in ("cpu", "memory", "io")
         }
 
+    def remove_cgroup(self, step: Step) -> None:
+        """A finished step's own cgroup goes away. One that cannot be removed because processes are still in it (a
+        daemon the step left) is killed and tried again for GATE_DAG_RMDIR_WAIT_S, and its processes are named as orphans
+        in a note (J14b); one that cannot be removed for any other reason is left, unjudged."""
+        path = step.cg
+        if not path or self.try_rmdir(path):
+            return
+        if not populated(path):
+            return
+        killed = kill_cgroup(path)
+        limit = seconds_from_env("GATE_DAG_RMDIR_WAIT_S", RMDIR_WAIT_S) if killed else 0.0
+        deadline = time.monotonic() + limit
+        while populated(path) and time.monotonic() < deadline:
+            time.sleep(0.05)
+            if self.try_rmdir(path):
+                break
+        if not step.parado:
+            outcome = "they were killed" if not os.path.isdir(path) or not populated(path) else "they are still alive"
+            print(f"note: {os.path.basename(path)} ended with orphan processes in its cgroup; {outcome}")
+
+    @staticmethod
+    def try_rmdir(path: str) -> bool:
+        try:
+            os.rmdir(path)
+        except OSError:
+            return False
+        return True
+
     def record_step(self, step: Step) -> None:
         if self.corrida is None or step.paso is None:
             return
@@ -923,25 +981,54 @@ class Planner:
                 self.kill(other)
 
     def kill(self, step: Step) -> None:
+        """Stops a step: TERM to its group, so the EXIT trap of its shell runs (the clusters of its lane, the stage of the
+        mutants), and KILL when the grace is over (J14g). The loop reaps it; `enforce_grace` does the KILL."""
         step.parado = True
-        if step.cg and os.path.exists(os.path.join(step.cg, "cgroup.kill")):
-            try:
-                with open(os.path.join(step.cg, "cgroup.kill"), "w", encoding="utf-8") as fh:
-                    fh.write("1")
-            except OSError:
-                pass
+        if step.term_at is None:
+            step.term_at = time.monotonic()
+            self.signal_group(step, signal.SIGTERM)
+
+    def signal_group(self, step: Step, signum: int) -> None:
         try:
-            os.killpg(step.proc.pid, signal.SIGKILL)
+            os.killpg(step.proc.pid, signum)
         except ProcessLookupError:
             pass
 
+    def hard_kill(self, step: Step) -> None:
+        """KILL for the whole cgroup of the step, if it has one, and for its group."""
+        if step.cg:
+            kill_cgroup(step.cg)
+        self.signal_group(step, signal.SIGKILL)
+
+    def enforce_grace(self) -> None:
+        """A step that was sent TERM and is still alive when the grace ends is killed."""
+        limit = seconds_from_env("GATE_DAG_TERM_GRACE_S", TERM_GRACE_S)
+        for step in self.running():
+            if step.term_at is not None and step.proc.poll() is None and time.monotonic() - step.term_at >= limit:
+                self.hard_kill(step)
+
     def drain(self) -> None:
-        """Kills and reaps whatever is still running, however the loop ended."""
+        """Stops and reaps whatever is still running, however the loop ended: TERM, the grace, then KILL. After it, with a
+        delegated scope, every `paso-*` cgroup of the scope is killed, the ones this planner does not know too (J14b)."""
         alive = self.running()
         for step in alive:
             self.kill(step)
+        limit = seconds_from_env("GATE_DAG_TERM_GRACE_S", TERM_GRACE_S)
         for step in alive:
-            self.finish(step, step.proc.wait())
+            remaining = max(0.0, step.term_at + limit - time.monotonic())
+            try:
+                rc = step.proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                self.hard_kill(step)
+                rc = step.proc.wait()
+            self.finish(step, rc)
+        self.kill_scope_cgroups()
+
+    def kill_scope_cgroups(self) -> None:
+        if not (self.delegado and self.scope):
+            return
+        for path in sorted(glob.glob(os.path.join(glob.escape(self.scope), "paso-*"))):
+            kill_cgroup(path)
 
     def flush(self) -> None:
         """Prints each block in idx order, once every lower idx has finished."""
@@ -978,6 +1065,7 @@ class Planner:
                     die("planner stuck: no step is running and none can start")
                 break
             self.wait_event()
+            self.enforce_grace()
             self.reap()
             if self.no_verdict:
                 return
@@ -999,15 +1087,32 @@ class Planner:
 
     def execute(self) -> int:
         self.setup_signal()
+        finished = False
         try:
             self.loop()
+            finished = True
         finally:
-            self.drain()
-            self.teardown_signal()
+            try:
+                self.drain()
+            finally:
+                self.teardown_signal()
+                if not finished:
+                    self.leave_logs()
         return self.close()
+
+    def leave_logs(self) -> None:
+        """J14e: the planner stopped before its verdict (an exception, a signal, a kernel kill): the blocks of the steps
+        that finished are printed in idx order, and the run directory, where all the logs are, is named."""
+        try:
+            self.flush()
+            print(f"dag: run directory: {self.run_dir}")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
 
     def close(self) -> int:
         if self.no_verdict:
+            self.leave_logs()
             sys.stderr.write(self.no_verdict + "\n")
             self.annotate_run(2)
             return 2
@@ -1056,9 +1161,10 @@ class Planner:
     def bound_text(self, cota: str | None, dur: dict[str, Any]) -> str:
         """The term that gave the bound, the critical path spelled out step by step."""
         if cota == "camino":
-            rank, nxt = ranks(self.steps, dur)
-            _, chain_text = critical_chain(self.steps, rank, nxt)
-            return f"critical path: {chain_text}"
+            _, chain = gate_history.camino_critico(
+                {s.id: float(dur[s.id]) for s in self.steps}, {s.id: s.deps for s in self.steps}
+            )
+            return "critical path: " + " -> ".join(chain)
         return NOMBRE_COTA.get(cota or "", "")
 
     def bound(self, dur: dict[str, Any], cpu: dict[str, Any], anon: dict[str, Any]) -> tuple[float | None, str]:
@@ -1106,13 +1212,22 @@ class Planner:
         )
 
 
-def remove_cgroup(path: str | None) -> None:
-    """A finished step's own cgroup goes away; one that cannot be removed is left, unjudged."""
-    if path:
-        try:
-            os.rmdir(path)
-        except OSError:
-            pass
+def kill_cgroup(path: str) -> bool:
+    """Writes 1 to cgroup.kill of the cgroup at `path`; False where it has none or the write is refused."""
+    target = os.path.join(path, "cgroup.kill")
+    if not os.path.exists(target):
+        return False
+    try:
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("1")
+    except OSError:
+        return False
+    return True
+
+
+def populated(path: str) -> bool:
+    events = read_kv(os.path.join(path, "cgroup.events"))
+    return bool(events and events.get("populated") == 1)
 
 
 def fmt(value: float | None) -> str:
@@ -1140,10 +1255,12 @@ def step_entry(path: str | None) -> Callable[[], None]:
     """Runs in the child before exec (CI-J10): SIGINT and SIGQUIT back to their default, then the step's cgroup if it
     has one. The planner was started as a background job of merge-gate.sh, where bash ignores both on entry and cannot
     reset them, so every step and everything under it (a gate's trap for INT, D2) would inherit them ignored. The
-    planner's own disposition is not touched: stop_on_term is its TERM."""
+    planner's own disposition is not touched: stop_on_signal is its TERM and its HUP."""
     enter_cgroup = cgroup_entry(path) if path else None
 
     def enter() -> None:
+        # The planner blocks TERM and HUP while it starts a step (J14b), and a child keeps the mask of its parent.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         signal.signal(signal.SIGQUIT, signal.SIG_DFL)
         if enter_cgroup is not None:
@@ -1152,8 +1269,9 @@ def step_entry(path: str | None) -> Callable[[], None]:
     return enter
 
 
-def stop_on_term(_signum: int, _frame: object) -> NoReturn:
-    """CI-F3.3b-2: the gate's exit trap sends TERM here; the exit unwinds through execute, which kills the steps."""
+def stop_on_signal(_signum: int, _frame: object) -> NoReturn:
+    """CI-F3.3b-2: the gate's exit trap sends TERM here, and a closed terminal sends HUP (J14b); the exit unwinds through
+    execute, which stops the steps."""
     raise SystemExit(2)
 
 
@@ -1161,9 +1279,10 @@ def run_table(path: str, timed_end: str | None = None) -> int:
     mode = os.environ.get("GATE_DAG", "0")
     if mode not in ("0", "1"):
         die(f"GATE_DAG is {mode!r}; it has to be 0 (series) or 1 (DAG)")
-    signal.signal(signal.SIGTERM, stop_on_term)
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, stop_on_signal)
     steps = parse_table(path)
-    return Planner(steps, mode == "1", sha256_of(path), timed_end).execute()
+    return Planner(steps, mode == "1", table_key(path), timed_end).execute()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1181,6 +1300,12 @@ def main(argv: list[str] | None = None) -> int:
         return run_table(args.table, args.timed_end)
     except Refusal as err:
         sys.stderr.write(f"FAIL: {err}\n")
+        return 2
+    except Exception:
+        # CI-J14e: a failure of the planner itself is no verdict. An uncaught one would exit 1, which merge-gate reads as a
+        # test that went red.
+        traceback.print_exc()
+        sys.stderr.write("FAIL: the planner failed inside (the traceback is above): no verdict, exit 2\n")
         return 2
 
 

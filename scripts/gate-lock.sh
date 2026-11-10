@@ -585,6 +585,13 @@ gate_model_env() {
 # is about the server DATABASE_URL names and about nothing else. Sets
 # GATE_JUDGE_SYSID to the system_identifier it read.
 GATE_JUDGE_SYSID=""
+# The variables a libpq client reads from the environment (gate-cluster.sh, K8). Every call to the judge's Postgres drops
+# them first, so a PGHOSTADDR or a PGREQUIREPEER of the caller cannot send a lane's identity query to another host or
+# refuse its peer. gate-cluster.sh sources this file, and the lane library uses the same list.
+# shellcheck disable=SC2034 # read by the scripts that source this one
+GATE_PG_ENV_UNSET=(-u PGHOST -u PGHOSTADDR -u PGPORT -u PGSERVICE -u PGSERVICEFILE -u PGPASSFILE
+  -u PGSSLMODE -u PGSSLCERT -u PGSSLKEY -u PGSSLROOTCERT -u PGOPTIONS -u PGDATABASE -u PGUSER
+  -u PGPASSWORD -u PGREQUIREPEER -u PGCONNECT_TIMEOUT)
 
 gate_url_port() {
   local rest="${1#*://}" authority hostport
@@ -630,7 +637,7 @@ gate_require_judge_server() {
     pw="${userinfo#*:}"
     pw="$(printf '%b' "${pw//%/\\x}")"
   fi
-  identity="$(PGPASSWORD="$pw" PGOPTIONS='-c default_transaction_read_only=on' psql -X -At -F '|' -d "$dsn" \
+  identity="$(env "${GATE_PG_ENV_UNSET[@]}" PGCONNECT_TIMEOUT=10 PGPASSWORD="$pw" PGOPTIONS='-c default_transaction_read_only=on' psql -X -At -F '|' -d "$dsn" \
     -c "select current_setting('cluster_name'), system_identifier from pg_control_system()" 2>/dev/null)" || identity=""
   identity="${identity%$'\r'}"
   [[ "$identity" =~ $identity_re ]] \

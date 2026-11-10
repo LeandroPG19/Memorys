@@ -1749,3 +1749,403 @@ gate_dag = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate_dag)
 sys.exit(gate_dag.main(["run", "--table", sys.argv[2]]))
 "#;
+
+// --- CI-J14: the history keeps a half line apart, one function for the critical path, and the properties of the
+// planner. The properties run in process (`python3 -I -B -c`, like the rest of this file), with `random` seeded with a
+// fixed number and no sleeps: they take milliseconds, and the same run is the same run on every machine.
+
+/// J14f: a history that ends in a line cut halfway, with no `\n`, gets a `\n` before the next record, so the record
+/// that follows is read whole and the cut line is only itself. argv: none. Prints the path of the file it wrote.
+const BODY_LINEA_A_MEDIAS: &str = r#"
+import datetime
+day = os.path.join(gh.history_root(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d"))
+os.makedirs(day, exist_ok=True)
+with open(os.path.join(day, "pasos.jsonl"), "w", encoding="utf-8") as fh:
+    fh.write('{"a":1')
+corrida = gh.run_start(modo="serie", sha=None, huella=None, tabla="tabla-j14f")
+for idx, nombre in [(10, "fmt"), (20, "tests")]:
+    paso = gh.step_start(corrida, idx, nombre)
+    gh.step_end(corrida, paso, 0, inicio=0.0, fin=0.1)
+"#;
+
+/// J14f: the file is the three lines it should be: the cut one, and the two records, each whole.
+#[test]
+fn j14f_una_linea_a_medias_no_se_come_el_registro_siguiente() {
+    let fx = Fixture::new("j14f");
+    let out = py(&fx, BODY_LINEA_A_MEDIAS, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "two steps after a line cut halfway");
+    let files = files_named(&fx.root, "pasos.jsonl");
+    assert_eq!(files.len(), 1, "one day, one pasos.jsonl: {files:?}");
+    let body = fs::read_to_string(&files[0]).expect("pasos.jsonl");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "the cut line and the two records are three lines; the first record was glued to the cut one: {body:?}"
+    );
+    assert_eq!(
+        lines[0], "{\"a\":1",
+        "the cut line is kept as it was: {body:?}"
+    );
+    for (line, id) in lines[1..].iter().zip(["fmt", "tests"]) {
+        let record: Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("the record of {id} is not read whole ({e}): {line:?}"));
+        assert_eq!(record["id"].as_str(), Some(id), "{record}");
+    }
+    assert!(
+        body.ends_with('\n') && !body.contains("\n\n"),
+        "a history that ended in a newline gets no blank line: {body:?}"
+    );
+}
+
+/// J14j: the critical path is one function, in the history module (the low level), and it returns `(length, chain)`:
+/// the length the bound `LB` is made of and the chain the planner prints. Ties go to the first in the order of `seg`
+/// (the end of the chain) and to the first of the list `deps` (each step before it). A dependency that has no record
+/// is skipped. argv: none.
+const BODY_CAMINO_CRITICO: &str = r#"
+casos = [
+    ({"a": 1.0, "b": 1.0, "c": 1.5}, {"a": [], "b": ["a"], "c": []}),
+    ({"a": 1.0, "b": 1.0, "c": 2.0}, {"c": ["a", "b"]}),
+    ({"a": 1.0, "b": 2.0}, {"b": ["falta"]}),
+    ({"a": 1.0, "b": 1.0}, {}),
+]
+print(json.dumps([list(gh.camino_critico(seg, deps)) for seg, deps in casos]))
+"#;
+
+/// J14j: a dependency cycle is a ValueError that names it, as `lower_bounds` does today. argv: none.
+const BODY_CAMINO_CICLO: &str = r#"
+try:
+    gh.camino_critico({"a": 1.0, "b": 1.0}, {"a": ["b"], "b": ["a"]})
+except ValueError as err:
+    print("ValueError", err)
+"#;
+
+#[test]
+fn j14j_el_camino_critico_es_una_funcion_que_da_la_longitud_y_la_cadena() {
+    let fx = Fixture::new("j14j");
+    let out = py(&fx, BODY_CAMINO_CRITICO, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "gate_history.camino_critico");
+    let v: Value = serde_json::from_str(text(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("camino_critico did not print JSON: {e}: {}", show(&out)));
+    assert_eq!(
+        v,
+        json!([
+            [2.0, ["a", "b"]],
+            [3.0, ["a", "c"]],
+            [2.0, ["b"]],
+            [1.0, ["a"]]
+        ]),
+        "length and chain of the four cases (the chain from its first step to its last)"
+    );
+    let out = py(&fx, BODY_CAMINO_CICLO, &[], Some(fx.root.as_path()));
+    assert_ok(&out, "a cycle in camino_critico");
+    assert!(
+        text(&out.stdout).starts_with("ValueError") && text(&out.stdout).contains("ciclo"),
+        "a cycle is a ValueError that names it: {}",
+        show(&out)
+    );
+}
+
+/// The two modules and a seeded generator, for the properties. argv: none.
+const PRELUDIO_PROPIEDADES: &str = r#"
+import importlib.util, random, tempfile, time
+spec = importlib.util.spec_from_file_location("gate_dag", os.path.join(sys.argv[1], "gate-dag.py"))
+dag = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dag)
+GIB = 1 << 30
+rng = random.Random(20261109)
+
+def random_dag(n, pesos):
+    ids = [f"s{i}" for i in range(n)]
+    deps = {sid: (rng.sample(ids[:i], rng.randint(0, min(i, 3))) if i else []) for i, sid in enumerate(ids)}
+    seg = {sid: float(rng.choice(pesos)) for sid in ids}
+    return ids, deps, seg
+
+def longest(ids, deps, seg):
+    best = {}
+    for sid in ids:
+        best[sid] = seg[sid] + max((best[d] for d in deps[sid]), default=0.0)
+    return max(best.values())
+"#;
+
+/// J14m P1: for any DAG, the bound LB and the length of the chain the planner prints are the same number, and the
+/// chain is a path of the graph. The oracle is a dynamic program written here; the planner's text is parsed.
+const BODY_P1: &str = r#"
+def run_p1():
+    trials = 0
+    for pesos in ([0.5, 1.0, 2.5, 4.0], [1, 2, 3]):
+        for n in range(1, 11):
+            for _ in range(30):
+                ids, deps, seg = random_dag(n, pesos)
+                want = longest(ids, deps, seg)
+                records = [{"id": s, "seg": seg[s], "cpu_s": None, "anon_max": None} for s in ids]
+                lb = gh.lower_bounds(records, {"C": 4, "R": 10 * GIB, "deps": deps})
+                assert abs(lb["LB"] - want) < 1e-9, f"LB {lb} is not the longest path {want}: {deps} {seg}"
+                steps = [dag.Step(10 * (i + 1), s, deps[s], [], "normal", 1.0, 1.0, seg[s], {}, ["true"]) for i, s in enumerate(ids)]
+                planner = dag.Planner.__new__(dag.Planner)
+                planner.steps = steps
+                planner.cpu = 4
+                planner.ram = 10 * GIB
+                value, texto = planner.bound(seg, {}, {})
+                assert abs(value - want) < 1e-9, f"the planner's LB {value} is not {want}"
+                assert texto.startswith("critical path: "), f"no chain in {texto!r}"
+                chain = texto[len("critical path: "):].split(" -> ")
+                assert all(s in seg for s in chain), f"a step that is not in the table: {chain}"
+                assert all(a in deps[b] for a, b in zip(chain, chain[1:])), f"{chain} is not a path of {deps}"
+                assert not deps[chain[0]], f"the chain starts at {chain[0]}, which has dependencies: {deps}"
+                length = sum(seg[s] for s in chain)
+                assert abs(length - lb["LB"]) < 1e-9, f"the chain {chain} is {length} long and LB is {lb['LB']}: two functions"
+                trials += 1
+    return trials
+
+print("p1 trials=%d" % run_p1())
+"#;
+
+/// J14m P2: LB is a lower bound of a greedy scheduler that respects the dependencies, the cores and the memory
+/// (T >= LB); raising a `seg` or a `cpu_s`, or adding a dependency, never lowers it; raising C or R never raises it.
+const BODY_P2: &str = r#"
+C = 4
+R = 16 * GIB
+
+def instance(n):
+    ids, deps, seg = random_dag(n, [1, 2, 3, 5, 8])
+    cores = {s: float(rng.choice([1, 2, 4])) for s in ids}
+    mem = {s: rng.choice([1, 2, 4, 8]) * GIB for s in ids}
+    return ids, deps, seg, {s: cores[s] * seg[s] for s in ids}, mem
+
+def bound(ids, deps, seg, cpu_s, mem, cap=C, ram=R):
+    records = [{"id": s, "seg": seg[s], "cpu_s": cpu_s[s], "anon_max": mem[s]} for s in ids]
+    return gh.lower_bounds(records, {"C": cap, "R": ram, "deps": deps})["LB"]
+
+def greedy(ids, deps, seg, cpu_s, mem):
+    t = 0.0
+    done = set()
+    running = {}
+    pending = list(ids)
+    while pending or running:
+        moved = True
+        while moved:
+            moved = False
+            for s in list(pending):
+                cores = cpu_s[s] / seg[s]
+                if all(d in done for d in deps[s]) \
+                        and sum(cpu_s[r] / seg[r] for r in running) + cores <= C + 1e-12 \
+                        and sum(mem[r] for r in running) + mem[s] <= R:
+                    running[s] = t + seg[s]
+                    pending.remove(s)
+                    moved = True
+        assert running, f"the greedy scheduler is stuck with {pending} pending"
+        t = min(running.values())
+        for s in [r for r, end in running.items() if end <= t + 1e-12]:
+            del running[s]
+            done.add(s)
+    return t
+
+def run_p2():
+    trials = 0
+    for _ in range(300):
+        ids, deps, seg, cpu_s, mem = instance(rng.randint(1, 9))
+        lb = bound(ids, deps, seg, cpu_s, mem)
+        total = greedy(ids, deps, seg, cpu_s, mem)
+        assert total >= lb - 1e-9, f"a greedy schedule of {total} s is under the bound {lb}: {deps} {seg} {cpu_s} {mem}"
+        s = rng.choice(ids)
+        longer = dict(seg, **{s: seg[s] + rng.choice([1, 3])})
+        assert bound(ids, deps, longer, cpu_s, mem) >= lb - 1e-9, f"a longer {s} lowered the bound"
+        busier = dict(cpu_s, **{s: cpu_s[s] + rng.choice([1.0, 7.0])})
+        assert bound(ids, deps, seg, busier, mem) >= lb - 1e-9, f"more cpu_s in {s} lowered the bound"
+        heavier = dict(mem, **{s: mem[s] + rng.choice([1, 4]) * GIB})
+        assert bound(ids, deps, seg, cpu_s, heavier) >= lb - 1e-9, f"more memory in {s} lowered the bound"
+        pairs = [(a, b) for i, b in enumerate(ids) for a in ids[:i] if a not in deps[b]]
+        if pairs:
+            a, b = rng.choice(pairs)
+            linked = dict(deps, **{b: deps[b] + [a]})
+            assert bound(ids, linked, seg, cpu_s, mem) >= lb - 1e-9, f"a new dependency {a} -> {b} lowered the bound"
+        assert bound(ids, deps, seg, cpu_s, mem, cap=C + rng.choice([1, 4])) <= lb + 1e-9, "more cores raised the bound"
+        assert bound(ids, deps, seg, cpu_s, mem, ram=R + rng.choice([1, 8]) * GIB) <= lb + 1e-9, "more memory raised the bound"
+        trials += 1
+    return trials
+
+print("p2 trials=%d" % run_p2())
+"#;
+
+/// J14m P3: admission and verdict of the planner with no processes (the start of a step is a stand-in that marks it as
+/// running; a finish goes through the real `finish`). On random tables: the planner is never stuck; an exclusive step
+/// runs alone; with two or more alive the cores add up to no more than C and the memory to no more than R; no step
+/// starts before its dependencies exited 0; in series at most one is alive; the verdict is the red of the lowest idx,
+/// and every step before it exited 0.
+const BODY_P3: &str = r#"
+CORES = 8
+RAM_GIB = 24
+
+def random_steps(n):
+    steps = []
+    for i in range(n):
+        previous = [s.id for s in steps]
+        deps = rng.sample(previous, rng.randint(0, min(len(previous), 2))) if previous else []
+        clase = "exclusive" if rng.random() < 0.15 else "normal"
+        cpu = round(rng.uniform(0.5, CORES * 1.25), 2)
+        ram_gb = round(rng.uniform(0.5, RAM_GIB * 0.7), 2)
+        steps.append(dag.Step(10 * (i + 1), f"s{i}", deps, [], clase, cpu, ram_gb, 1.0, {}, ["true"]))
+    return steps
+
+def make_planner(steps, solo):
+    p = dag.Planner.__new__(dag.Planner)
+    p.steps = steps
+    p.by_id = {s.id: s for s in steps}
+    p.dag = True
+    p.solo = solo
+    p.rank = {s.id: rng.random() for s in steps}
+    p.t0 = time.monotonic()
+    p.delegado = False
+    p.scope = None
+    p.cpu_cap = CORES
+    p.ram = RAM_GIB * GIB
+    p.red = None
+    p.no_verdict = None
+    p.corrida = None
+
+    def start(step):
+        for d in step.deps:
+            assert p.by_id[d].state == "done" and p.by_id[d].rc == 0, f"{step.id} started before {d} exited 0"
+        step.state = "running"
+        step.t_start = p.now()
+
+    p.start = start
+    p.kill = lambda step: setattr(step, "parado", True)
+    return p
+
+def check_alive(p):
+    alive = p.running()
+    if any(s.clase in dag.EXCLUSIVE for s in alive):
+        assert len(alive) == 1, f"an exclusive step shares the machine with {[s.id for s in alive]}"
+    if p.solo:
+        assert len(alive) <= 1, f"in series, {[s.id for s in alive]} are alive"
+    if len(alive) >= 2:
+        assert sum(s.c for s in alive) <= p.cpu_cap + 1e-9, f"{[s.id for s in alive]} ask for more cores than {p.cpu_cap}"
+        assert sum(max(s.anon_now or 0, s.r) for s in alive) <= p.ram, f"{[s.id for s in alive]} ask for more memory than R"
+
+def run_p3():
+    trials = 0
+    for _ in range(300):
+        steps = random_steps(rng.randint(1, 10))
+        p = make_planner(steps, rng.random() < 0.3)
+        rcs = {s.id: rng.choice([0, 0, 0, 0, 0, 1, 2]) for s in steps}
+        guard = 0
+        while p.unfinished():
+            guard += 1
+            assert guard < 200, "the planner does not end"
+            p.admit()
+            assert not p.no_verdict, p.no_verdict
+            alive = p.running()
+            assert alive, f"stuck: nothing runs and these are left: {[(s.id, s.state) for s in steps]}"
+            check_alive(p)
+            step = rng.choice(alive)
+            p.finish(step, -9 if step.parado else rcs[step.id])
+        failed = [s for s in steps if s.state == "done" and not s.parado and s.rc != 0]
+        if failed:
+            lowest = min(failed, key=lambda s: s.idx)
+            assert p.red is lowest, f"the red is {p.red and p.red.id}, the lowest idx that failed is {lowest.id}"
+            for s in steps:
+                if s.idx < lowest.idx:
+                    assert s.state == "done" and s.rc == 0 and not s.parado, f"{s.id} is before the red {lowest.id} and did not exit 0"
+        else:
+            assert p.red is None, f"no step failed and the red is {p.red.id}"
+        trials += 1
+    return trials
+
+print("p3 trials=%d" % run_p3())
+"#;
+
+/// J14m P4: `parse_table` over the real table with random mutations (a token changed to nan, inf, a negative, a 0, an
+/// overflow or text; a token or a row dropped, repeated or swapped) answers with a list of steps or a Refusal, never
+/// with another exception, and every step it accepts has numbers that are finite and above 0.
+const BODY_P4: &str = r#"
+import math
+real = open(os.path.join(sys.argv[1], "gate-dag.txt"), encoding="utf-8").read().splitlines()
+rows = [line for line in real if line.strip() and not line.startswith(chr(35))]
+assert len(rows) >= 9, f"the real table has {len(rows)} rows"
+work = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+TOKENS = ["nan", "inf", "-inf", "-1", "0", "1e999", "abc", "", "1,2", "-", "target:", "cluster:x", "models", "reader",
+          "normal", "exclusive", "boundary", "untimed", "BOGUS", "FOO=bar", "CARGO_TARGET_DIR=/x", "99999999999999999999",
+          "1e-9", "0.0", "-0"]
+
+def mutate(lines):
+    lines = list(lines)
+    for _ in range(rng.randint(1, 3)):
+        op = rng.choice(["token", "delete", "dup", "swap", "drop", "append"])
+        i = rng.randrange(len(lines))
+        tok = lines[i].split()
+        if op == "token" and tok:
+            tok[rng.randrange(len(tok))] = rng.choice(TOKENS)
+            lines[i] = " ".join(tok)
+        elif op == "delete" and tok:
+            del tok[rng.randrange(len(tok))]
+            lines[i] = " ".join(tok)
+        elif op == "dup":
+            lines.insert(i, lines[i])
+        elif op == "swap":
+            j = rng.randrange(len(lines))
+            lines[i], lines[j] = lines[j], lines[i]
+        elif op == "drop" and len(lines) > 1:
+            del lines[i]
+        else:
+            lines[i] += " " + rng.choice(TOKENS)
+    return lines
+
+def parse(lines, name):
+    path = os.path.join(work, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return dag.parse_table(path)
+
+assert len(parse(rows, "real.txt")) == len(rows), "the real table does not parse"
+accepted = refused = 0
+for n in range(600):
+    lines = mutate(rows)
+    try:
+        steps = parse(lines, f"m{n}.txt")
+    except dag.Refusal:
+        refused += 1
+        continue
+    except Exception as err:
+        raise AssertionError(f"parse_table raised {type(err).__name__}: {err} for {lines}")
+    accepted += 1
+    for s in steps:
+        for name, value in (("cpu", s.cpu_tab), ("ram_gb", s.ram_tab), ("dur_s", s.dur_tab)):
+            assert math.isfinite(value) and value > 0, f"{s.id} was accepted with {name}={value}: {lines}"
+assert accepted > 0 and refused > 0, f"the mutations were all accepted or all refused ({accepted}/{refused})"
+print("p4 trials=600 accepted=%d refused=%d" % (accepted, refused))
+"#;
+
+/// The properties run as one process each, with the prelude of the generator.
+fn propiedad(nombre: &str, cuerpo: &str, intentos: &str) {
+    let fx = Fixture::new(nombre);
+    let codigo = format!("{PRELUDIO_PROPIEDADES}{cuerpo}");
+    let out = py(&fx, &codigo, &[], Some(fx.root.as_path()));
+    assert_ok(&out, nombre);
+    assert!(
+        text(&out.stdout).contains(intentos),
+        "{nombre} did not say it ran its trials ({intentos}): {}",
+        show(&out)
+    );
+}
+
+#[test]
+fn j14m_p1_el_lb_y_la_cadena_impresa_son_la_misma_cuenta() {
+    propiedad("j14m-p1", BODY_P1, "p1 trials=600");
+}
+
+#[test]
+fn j14m_p2_el_lb_es_una_cota_inferior_y_monotona() {
+    propiedad("j14m-p2", BODY_P2, "p2 trials=300");
+}
+
+#[test]
+fn j14m_p3_la_admision_y_el_veredicto_cumplen_sus_invariantes() {
+    propiedad("j14m-p3", BODY_P3, "p3 trials=300");
+}
+
+#[test]
+fn j14m_p4_la_tabla_da_una_lista_o_una_negativa_y_nunca_otra_excepcion() {
+    propiedad("j14m-p4", BODY_P4, "p4 trials=600");
+}
