@@ -18,6 +18,10 @@
 //!     ids with `gen_random_uuid()`, and a plain clone would share them);
 //!   - there is exactly one template, it takes no connections, and nobody is connected to it
 //!     (a clone from a template with a session on it waits 5 s and fails with 55006, measured);
+//!   - the builder waits for the last session to leave the database it is building before it
+//!     renames it (CI-E21: on 10-nov-2026 two builds in a row failed their RENAME with 55006
+//!     under load): `common::wait_until_no_session_is_left` outlasts a session that leaves late
+//!     and, when one never leaves, names it;
 //!   - `empty_db::in_an_empty_database` still hands out a database with no schema at all, which
 //!     v045_databases_of_one_server_migrate_at_once, v044_* and v043_a_model_of_another_width need.
 //!
@@ -338,6 +342,126 @@ async fn an_empty_scratch_database_has_no_schema_at_all() {
             "an empty scratch database has no table in public: v043_a_model_of_another_width \
              builds its own schema, and a stray vector column would break it"
         );
+    })
+    .await;
+}
+
+/// The name of the database a body was handed: what follows the last `/` of its URL.
+fn database_of(url: &str) -> String {
+    let cut = url.rfind('/').expect("a database URL ends in /<name>");
+    url[cut + 1..].to_owned()
+}
+
+/// Polls until the waiter's connection has run its first look at `pg_stat_activity`: its last
+/// query shows there once it did. This is the synchronisation of the first test, whatever the
+/// machine's speed; the deadline only turns a helper that never looks into a failure.
+async fn wait_until_the_waiter_has_looked(observer: &mut PgConnection) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let looked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE application_name = 'e21_waiter' AND query LIKE '%pg_stat_activity%')",
+        )
+        .fetch_one(&mut *observer)
+        .await
+        .expect("reading pg_stat_activity");
+        if looked {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the wait never ran its first look at pg_stat_activity within 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_wait_for_an_empty_database_outlasts_a_session_and_ends_when_it_leaves() {
+    in_an_empty_database("brain_tpl_wait", |url| async move {
+        let database = database_of(&url);
+        let maintenance = sibling_url(&url, "postgres");
+        let holder = PgConnection::connect(&url)
+            .await
+            .expect("connecting the session that stays");
+        let mut waiter = PgConnection::connect(&maintenance)
+            .await
+            .expect("connecting the waiter");
+        sqlx::query("SET application_name = 'e21_waiter'")
+            .execute(&mut waiter)
+            .await
+            .expect("naming the waiter");
+        let mut observer = PgConnection::connect(&maintenance)
+            .await
+            .expect("connecting the observer");
+
+        let waiting = tokio::spawn(async move {
+            common::wait_until_no_session_is_left(&mut waiter, &database, Duration::from_secs(60))
+                .await
+        });
+        wait_until_the_waiter_has_looked(&mut observer).await;
+        assert!(
+            !waiting.is_finished(),
+            "the wait ended while a session was still connected to the database: it looked at \
+             pg_stat_activity once, saw it, and the holder was there"
+        );
+
+        holder
+            .close()
+            .await
+            .expect("closing the session that stays");
+        tokio::time::timeout(Duration::from_secs(30), waiting)
+            .await
+            .expect("the wait did not end within 30 s of the last session leaving")
+            .expect("the waiting task panicked")
+            .expect("the wait has to end well once the database has no session");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_that_never_leaves_is_named_when_the_time_runs_out() {
+    in_an_empty_database("brain_tpl_stays", |url| async move {
+        let database = database_of(&url);
+        let mut holder = PgConnection::connect(&url)
+            .await
+            .expect("connecting the session that stays");
+        sqlx::query("SET application_name = 'e21_stays'")
+            .execute(&mut holder)
+            .await
+            .expect("naming the session that stays");
+        let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut holder)
+            .await
+            .expect("reading the pid of the session that stays");
+        let mut admin = PgConnection::connect(&sibling_url(&url, "postgres"))
+            .await
+            .expect("connecting the admin");
+
+        let within = Duration::from_millis(300);
+        let began = Instant::now();
+        let who = common::wait_until_no_session_is_left(&mut admin, &database, within)
+            .await
+            .expect_err("a session is connected for the whole time: the wait cannot end well");
+        assert!(
+            began.elapsed() >= within,
+            "the wait gave up before its time ran out: {who}"
+        );
+        for part in [
+            format!("pid {holder_pid} "),
+            "client backend".to_owned(),
+            "e21_stays".to_owned(),
+        ] {
+            assert!(
+                who.contains(&part),
+                "the error has to name who is still connected, and it lacks `{part}`: {who}"
+            );
+        }
+
+        holder
+            .close()
+            .await
+            .expect("closing the session that stays");
     })
     .await;
 }

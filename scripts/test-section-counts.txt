@@ -38,7 +38,7 @@ plain/linux/nli_cell_looks_once 1 pasada llana del 10-nov sobre b51e027
 plain/linux/nli_cost 0 pasada llana del 10-nov sobre b51e027
 plain/linux/nli_entailment 0 pasada llana del 10-nov sobre b51e027
 plain/linux/nli_probe 0 pasada llana del 10-nov sobre b51e027
-plain/linux/scratch_databases_clone_one_template 3 pasada llana del 10-nov sobre b51e027
+plain/linux/scratch_databases_clone_one_template 5 pasada llana del 10-nov sobre b51e027 y CI-E21 +2 tests (the_wait_for_an_empty_database_outlasts_a_session_and_ends_when_it_leaves, a_session_that_never_leaves_is_named_when_the_time_runs_out)
 plain/linux/smoke_test 20 pasada llana del 10-nov sobre b51e027
 plain/linux/v016_chunking 0 pasada llana del 10-nov sobre b51e027
 plain/linux/v016_extract_without_sampling 1 pasada llana del 10-nov sobre b51e027
