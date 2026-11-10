@@ -50,7 +50,7 @@ Every change is mergeable only when the **local** judge is green in this turn:
 
 | Gate | Requirement |
 |---|---|
-| **Local merge gate (SIL)** | Full suite: fmt, clippy `-D warnings`, throwaway DB, ONNX models, **generative LLM** (Ollama URL or claude/gemini), e2e MCP + live (no soft-skip), eval smoke, `--features docs`, `cargo deny`, npm smoke, audit, `codigo-muerto`, `crap-gate`, `mutants-gate` |
+| **Local merge gate (SIL)** | Full suite: fmt, clippy `-D warnings`, throwaway DB, ONNX models, **generative LLM** (Ollama URL or claude/gemini), e2e MCP + live (no soft-skip), eval smoke, clippy of the build without docs (`--no-default-features`), `cargo deny`, npm smoke, audit, `codigo-muerto`, `crap-gate`, `mutants-gate` |
 | **CLI** | `./scripts/memory-industry-test.sh all` ≡ merge-gate |
 | **Second judge** | `./scripts/quality-gate.sh` — lizard + `cargo mutants` on `rust/src` in the diff. Does **not** replace the SIL |
 | **Log** | No `SKIPPED`, no soft alerts — fix root causes |

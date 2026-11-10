@@ -6,8 +6,8 @@
 # receipt, last, is what merge-gate.sh leaves and scripts/release.sh reads.
 #
 # It lived inside run-all-tests.sh until merge-gate.sh needed it too. That
-# script calls run-all-tests.sh and then keeps going — clippy and tests under
-# --features docs, deny, audit, codigo-muerto, crap-gate, mutants-gate — and
+# script calls run-all-tests.sh and then keeps going — clippy of the build without
+# docs, deny, audit, codigo-muerto, crap-gate, mutants-gate — and
 # all of that ran after the lock was already released. A second gate started
 # in that window compiled into the same target directory and queued on the
 # same cargo lock as the first, which is the collision the lock exists for.

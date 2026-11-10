@@ -8,7 +8,7 @@ cd "$ROOT"
 GATE_LOCK_INHERITED="${GATE_LOCK:-}"
 
 # One gate at a time, for the whole of this one: run-all-tests.sh is only its
-# first half, and everything after it (clippy and tests under --features docs,
+# first half, and everything after it (clippy of the build without docs,
 # deny, audit, codigo-muerto, crap-gate, mutants-gate) builds in the same target
 # directory under the same cargo lock. Taken before anything else happens, so
 # a second gate is refused before it has checked, backed up or built anything.
@@ -2181,6 +2181,10 @@ echo "  · retrieval quality     the eval step is a smoke run. It proves the"
 echo "                          harness executes; it asserts no nDCG threshold."
 echo "  · other platforms       this judge runs on the merge machine (typically"
 echo "                          Linux x64). Cross-targets are not exercised here."
+echo "  · the build without docs --no-default-features is only compiled and"
+echo "                           linted (clippy -D warnings, row DC): no test runs"
+echo "                           without the docs feature, the default and what is"
+echo "                           published, with which every test runs once."
 echo ""
 echo "WHAT IT REQUIRES (missing = FAIL, never SKIPPED):"
 echo "  · ONNX embed + ORT      ~/.cache/memory-industry/models + onnxruntime"
@@ -2491,14 +2495,15 @@ step_E2E() {
   run_in_lane e2e "$ROOT/scripts/run-all-tests.sh" --lane E
 }
 step_DC() {
-  # The identity is asked again before the --features docs step, which reads the database after run-all-tests.sh:
-  # a server that changed under the run is refused here (D-J1c, A2). A lane is judged when it is made, so only the
-  # server of the operator is asked again.
+  # The identity is asked again after the rows of tests and before CV, which reads the database of the operator: a server
+  # that changed under the run is refused here (D-J1c, A2). A lane is judged when it is made, so only the server of the
+  # operator is asked again.
   [[ -n "$GATE_LANES" ]] || gate_require_judge_server "$DATABASE_URL"
-  # The models of the --features docs step are the ones of the full run (CI-J5): the same function sets them.
-  gate_model_env
-  echo "=== cargo clippy/test --features docs ==="
-  run_in_lane docs "$BASH" -c 'cd "$1" && cargo clippy --all-targets --features docs --timings -- -D warnings && cargo test --features docs --timings' gate "$ROOT/rust"
+  # CI-K8 (D-K8d): the default build carries docs, and DBG ran its tests with it. The build without docs is compiled and
+  # linted here and runs no test, so no lane is made and no model is read. clippy -D warnings and not cargo check: it costs
+  # the same, and a warning that exists only without docs (a variable that only a cfg(docs) block uses) is red.
+  echo "=== cargo clippy --all-targets --no-default-features (the build without docs: compiled and linted, no test runs) ==="
+  (cd "$ROOT/rust" && cargo clippy --all-targets --no-default-features --timings -- -D warnings)
 }
 step_CV() {
   echo "=== crap-gate (coverage floor) ==="
