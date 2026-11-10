@@ -1142,12 +1142,13 @@ fn anadir(fichero: &Path, lineas: &[Value]) {
     write(fichero, &cuerpo);
 }
 
-/// The table of the judge with DBG at `dbg_jobs` jobs, committed in the fixture repo; returns its sha256.
+/// The table of the judge with DBG at `dbg_jobs` jobs, committed in the fixture repo; returns the key of the history
+/// that the planner writes for it in `tabla` (K9c: `clave_de_tabla`, not the sha256 of the bytes of the file).
 fn tabla_en_arbol(fx: &Fx, dbg_jobs: u32) -> String {
     let texto = TABLA.replace("{DBG}", &dbg_jobs.to_string());
     write(&fx.tree.join("scripts/gate-dag.txt"), &texto);
     fx.commit(&format!("table with DBG at {dbg_jobs} jobs"));
-    format!("{:x}", Sha256::digest(texto.as_bytes()))
+    clave_de_tabla(&texto)
 }
 
 /// Three green serial runs: the first one cold (B3 206.174 s), the other two warm (B3 1.693 s).
@@ -1507,4 +1508,104 @@ fn u17_las_ordenes_de_cada_perfil_existen_tal_cual_en_run_all_tests() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// K9c: the key of the history of a table is the one the planner writes
+
+/// The key of the history (CI-J14k, gate-dag.py): the sha256 of the rows of the table, each with its spaces collapsed,
+/// without comments and blank lines, joined by a newline. Written here from that sentence, not read from the planner.
+fn clave_de_tabla(texto: &str) -> String {
+    let filas: Vec<String> = texto
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    format!("{:x}", Sha256::digest(filas.join("\n").as_bytes()))
+}
+
+#[test]
+fn u18_la_clave_de_la_tabla_es_la_que_escribe_el_planificador() {
+    // A known answer, worked by hand: the one row, as `sha256sum` sees it with no newline at the end.
+    assert_eq!(
+        clave_de_tabla("# a comment\n\n10   p  -  -  normal 1 1 1 sh -c true\n"),
+        "4548020ba9c0a9bb9784738d8e34ca22d7ddce74c8ae586f306f1f0549bd02b6",
+        "the helper that spells the key must agree with sha256 of '10 p - - normal 1 1 1 sh -c true'"
+    );
+    let fx = Fx::new("u18");
+    let tabla = fx.base.join("tabla-del-planificador.txt");
+    write(
+        &tabla,
+        "# a comment\n\n10   p  -  -  normal 1 1 1 sh -c true\n",
+    );
+    let historial = fx.base.join("historial-del-planificador");
+    let status = Command::new("python3")
+        .arg("-I")
+        .arg(fx.tree.join("scripts/gate-dag.py"))
+        .args(["run", "--table"])
+        .arg(&tabla)
+        .current_dir(&fx.tree)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GATE_DAG", "0")
+        .env("CI_TIEMPOS_DIR", &historial)
+        .env("HOME", &fx.home)
+        .env("TMPDIR", &fx.base)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("the planner");
+    assert!(
+        status.success(),
+        "the planner did not run the table: {status}"
+    );
+    let dia = fs::read_dir(historial.join("memory-industry"))
+        .expect("the planner wrote no history")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.join("pasos.jsonl").is_file())
+        .expect("the planner wrote no pasos.jsonl");
+    let escrito = fs::read_to_string(dia.join("pasos.jsonl")).expect("pasos.jsonl");
+    let paso: Value = serde_json::from_str(escrito.lines().next().expect("a step")).expect("json");
+    assert_eq!(
+        paso["tabla"],
+        json!(clave_de_tabla(&fs::read_to_string(&tabla).expect("table"))),
+        "the planner writes another key than the normalised one: {paso}"
+    );
+}
+
+#[test]
+fn u19_recomendar_encuentra_las_corridas_aunque_la_tabla_cambie_de_comentarios_y_espacios() {
+    let fx = Fx::new("u19");
+    // The table as it was committed first: a header comment and doubled spaces. Today's has neither. The history
+    // is keyed by the rows, so both are the same table, and the bytes of the two files are not.
+    let antes = format!(
+        "# the table of 9-nov\n\n{}",
+        TABLA.replace("{DBG}", "8").replace(' ', "  ")
+    );
+    write(&fx.tree.join("scripts/gate-dag.txt"), &antes);
+    fx.commit("table with comments");
+    let clave = tabla_en_arbol(&fx, 8);
+    assert_eq!(
+        clave,
+        clave_de_tabla(&antes),
+        "the fixture must hold two spellings of one table"
+    );
+    historial_de(&fx, &clave, 391.036, pasos_cortos);
+    barridos_buenos(&fx, true);
+    let (salida, v) = recomendar(&fx);
+    let dbg = &v["calibradas"]["DBG"];
+    assert_eq!(dbg["J_hist"], json!([8]), "{}", salida.text());
+    assert!(
+        dbg["runs"]
+            .as_array()
+            .is_some_and(|runs| runs.contains(&json!("run-1"))),
+        "the runs keyed as the planner keys its table were not found\n{}",
+        salida.text()
+    );
+    assert!(
+        !salida.text().contains("not in git"),
+        "a table git knows was reported as unknown\n{}",
+        salida.text()
+    );
 }

@@ -196,6 +196,8 @@ FAKE
     printf '%s\n' '#!/bin/sh' 'echo initdb >>"$HOME/initdb.calls"' 'exit 1' >"$t/pgbin/initdb"
     chmod +x "$t/pgbin/initdb"
     printf '{"engines":{"node":">=18"}}\n' >"$t/package.json"
+    # CI-K9b: and rust-toolchain.toml says which compiler it pins, or the gate says it is not pinned.
+    printf '[toolchain]\nchannel = "1.98.1"\n' >"$t/rust-toolchain.toml"
     # cargo fails the one subcommand named in FAIL_AT, and not its --version
     # probe, so the gate gets past "is cargo-deny installed" to the check. Each
     # call leaves its arguments in $HOME/steps, which is how a row reads the
@@ -1500,6 +1502,7 @@ down mut'
   mkdir -p "$tmp/env/scripts" "$tmp/env/bin" "$tmp/env/bare" "$tmp/env/home"
   cp "$ROOT/scripts/gate-lock.sh" "$tmp/env/scripts/"
   printf '{"engines":{"node":">=18"}}\n' >"$tmp/env/package.json"
+  printf '[toolchain]\nchannel = "1.98.1"\n' >"$tmp/env/rust-toolchain.toml"
   printf '#!/bin/sh\necho "${FAKE_UNAME:-Linux}"\n' >"$tmp/env/bin/uname"
   printf '#!/bin/sh\necho "${FAKE_FS:-ext2/ext3}"\n' >"$tmp/env/bin/stat"
   printf '#!/bin/sh\necho "${FAKE_NODE:-v20.0.0}"\n' >"$tmp/env/bin/node"
@@ -1524,7 +1527,7 @@ down mut'
     shift
     rc=0
     env -i HOME="$tmp/env/home" PATH="$tmp/env/bin:/usr/bin:/bin" "$@" "$BASH" -c \
-      'source "$1" && gate_linux_env && printf "CARGO_TARGET_DIR=%s\nTMPDIR=%s\n" "${CARGO_TARGET_DIR-unset}" "${TMPDIR-unset}"' \
+      'source "$1" && gate_linux_env && rt=unset && { [[ -z "${RUSTUP_TOOLCHAIN+x}" ]] || case "$(export -p)" in *"declare -x RUSTUP_TOOLCHAIN="*) rt="$RUSTUP_TOOLCHAIN" ;; *) rt=not-exported ;; esac; } && printf "CARGO_TARGET_DIR=%s\nTMPDIR=%s\nPATH=%s\nRUSTUP_TOOLCHAIN=%s\n" "${CARGO_TARGET_DIR-unset}" "${TMPDIR-unset}" "$PATH" "$rt"' \
       _ "$tmp/env/scripts/gate-lock.sh" >"$tmp/$n.out" 2>&1 || rc=$?
   }
   env_var() { sed -n "s/^$2=//p" "$tmp/$1.out"; }
@@ -1580,6 +1583,58 @@ down mut'
   (( rc == 0 )) || self_fail "gate_linux_env refused a machine that is not Linux (exit $rc): $(cat "$tmp/not_linux.out")"
   [[ "$(env_var not_linux CARGO_TARGET_DIR)" == unset && "$(env_var not_linux TMPDIR)" == unset ]] \
     || self_fail "gate_linux_env set variables on a machine that is not Linux: $(cat "$tmp/not_linux.out")"
+
+  # K9a.1 (CI-K9): the judge does not use the interop of Windows, and the PATH that WSL adds (68 directories of 9p on
+  # 2026-11-09) made every command that is not found cost seconds: `command -v cygpath` three times took 29.5 s. On Linux
+  # nothing that starts with /mnt/ stays on PATH, whatever its place; the others keep their order, a neighbour such as
+  # /mntools included. Where the shell says it is Windows (OSTYPE) the PATH is the user's own and is not touched.
+  env_run path_mnt PATH="$tmp/env/bin:/mnt/c/k9a-windows:/usr/bin:/mnt/d/k9a/bin:/mntools/bin:/bin:/mnt/c/last"
+  (( rc == 0 )) || self_fail "K9a.1: gate_linux_env exited $rc with /mnt/ entries on PATH: $(cat "$tmp/path_mnt.out")"
+  [[ "$(env_var path_mnt PATH)" == "$tmp/env/bin:/usr/bin:/mntools/bin:/bin" ]] \
+    || self_fail "K9a.1: with /mnt/ entries on PATH it was left as '$(env_var path_mnt PATH)', not '$tmp/env/bin:/usr/bin:/mntools/bin:/bin'"
+  env_run path_msys OSTYPE=msys PATH="$tmp/env/bin:/mnt/c/k9a-windows:/usr/bin:/bin"
+  [[ "$(env_var path_msys PATH)" == "$tmp/env/bin:/mnt/c/k9a-windows:/usr/bin:/bin" ]] \
+    || self_fail "K9a.3: where OSTYPE says msys the PATH was changed to '$(env_var path_msys PATH)'"
+
+  # K9a.2 and K9a.3: gate_where asks cygpath only where the shell says Windows. The stand-in notes each call it gets.
+  mkdir -p "$tmp/env/cyg"
+  printf '#!/bin/sh\necho called >>"%s"\necho C:/k9a-root\n' "$tmp/env/cyg.calls" >"$tmp/env/cyg/cygpath"
+  chmod +x "$tmp/env/cyg/cygpath"
+  where_run() { # NAME [VAR=value ...]: gate_where in a fresh bash, cygpath first on PATH
+    local n="$1"
+    shift
+    rm -f "$tmp/env/cyg.calls"
+    rc=0
+    env -i HOME="$tmp/env/home" PATH="$tmp/env/cyg:/usr/bin:/bin" "$@" "$BASH" -c 'source "$1" && gate_where' \
+      _ "$tmp/env/scripts/gate-lock.sh" >"$tmp/$n.out" 2>&1 || rc=$?
+  }
+  where_run where_linux
+  [[ ! -s "$tmp/env/cyg.calls" ]] \
+    || self_fail "K9a.2: on Linux gate_where asked cygpath $(wc -l <"$tmp/env/cyg.calls") time(s)"
+  [[ "$(cat "$tmp/where_linux.out")" == "$HOSTNAME:/" ]] \
+    || self_fail "K9a.2: on Linux gate_where said '$(cat "$tmp/where_linux.out")', not '$HOSTNAME:/'"
+  where_run where_msys OSTYPE=msys
+  [[ -s "$tmp/env/cyg.calls" && "$(cat "$tmp/where_msys.out")" == "$HOSTNAME:C:/k9a-root" ]] \
+    || self_fail "K9a.3: where OSTYPE says msys gate_where did not use cygpath: '$(cat "$tmp/where_msys.out")'"
+
+  # K9b (CI-K9): the judge pins the compiler for whatever cargo it starts outside the tree (the seed of the mutants, the
+  # labs: rustup does not see rust-toolchain.toml from there and takes `stable`). The channel is read from the file of the
+  # root. Without the file, or without a channel in it, nothing is exported and it says so; a value from outside gives way.
+  [[ "$(env_var target_default RUSTUP_TOOLCHAIN)" == 1.98.1 ]] \
+    || self_fail "K9b: gate_linux_env left RUSTUP_TOOLCHAIN '$(env_var target_default RUSTUP_TOOLCHAIN)', not the channel of rust-toolchain.toml (1.98.1)"
+  env_run pin_foreign RUSTUP_TOOLCHAIN=stable
+  [[ "$(env_var pin_foreign RUSTUP_TOOLCHAIN)" == 1.98.1 ]] \
+    || self_fail "K9b: a RUSTUP_TOOLCHAIN from outside ('stable') was kept as '$(env_var pin_foreign RUSTUP_TOOLCHAIN)', not the pinned 1.98.1"
+  mv "$tmp/env/rust-toolchain.toml" "$tmp/env/rust-toolchain.toml.away"
+  env_run pin_missing
+  mv "$tmp/env/rust-toolchain.toml.away" "$tmp/env/rust-toolchain.toml"
+  (( rc == 0 )) || self_fail "K9b: gate_linux_env exited $rc without rust-toolchain.toml: $(cat "$tmp/pin_missing.out")"
+  [[ "$(env_var pin_missing RUSTUP_TOOLCHAIN)" == unset ]] \
+    || self_fail "K9b: without rust-toolchain.toml RUSTUP_TOOLCHAIN was '$(env_var pin_missing RUSTUP_TOOLCHAIN)'"
+  grep -q 'rust-toolchain.toml' "$tmp/pin_missing.out" \
+    || self_fail "K9b: without rust-toolchain.toml the gate did not say so: $(cat "$tmp/pin_missing.out")"
+  [[ "$(env_var not_linux RUSTUP_TOOLCHAIN)" == unset ]] \
+    || self_fail "K9b: gate_linux_env pinned a toolchain on a machine that is not Linux"
 
   # --- CI-F1 rows (spec §4, F1 and F2): the cores the gate counts, the order of the cheap
   # steps, and the boundary test-times judges. cg_tree NAME CPU_MAX builds a cgroup v2 scope
@@ -2445,7 +2500,7 @@ fi
 # printed when the judge cannot read the report.
 echo "=== advisory exceptions (scripts/advisory-exceptions.txt) ==="
 adv_dir="$(mktemp -d)"
-adv_lock="$(cygpath -m "$ROOT/rust/Cargo.lock" 2>/dev/null || printf '%s' "$ROOT/rust/Cargo.lock")"
+adv_lock="$(gate_native_path m "$ROOT/rust/Cargo.lock")"
 (cd "$adv_dir" && timeout 120 cargo audit --json --no-fetch -f "$adv_lock" >audit.json 2>audit.err) || true
 adv_rc=0
 "$ROOT/scripts/advisory-exceptions.sh" --judge "$adv_dir/audit.json" || adv_rc=$?

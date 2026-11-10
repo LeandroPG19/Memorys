@@ -894,12 +894,25 @@ FAKE
   full_tree j21w
   printf '#!/bin/sh\necho %s\n' "$tmp/j21w/standin/memory-industry" >"$tmp/j21w/bin/cygpath"
   chmod +x "$tmp/j21w/bin/cygpath"
-  full_run j21w FAKE_CARGO_BUILD_EXE='C:\\Users\\x\\target\\debug\\memory-industry.exe'
+  full_run j21w OSTYPE=msys FAKE_CARGO_BUILD_EXE='C:\\Users\\x\\target\\debug\\memory-industry.exe'
   if grep -q 'reported no executable' "$tmp/j21w.out"; then
     self_fail "J2.1 (P1-c): a Windows-form executable that cargo reported was refused: $(cat "$tmp/j21w.out")"
   fi
   grep -qF "$tmp/j21w/standin/memory-industry doctor" "$tmp/j21w/home/bin.calls" 2>/dev/null \
     || self_fail "J2.1 (P1-c): doctor did not run with the path cygpath -u maps the Windows one to: $(cat "$tmp/j21w/home/bin.calls" 2>/dev/null || echo 'no doctor call')"
+
+  # K9a.2: on Linux nobody asks cygpath. The same stand-in, which notes every call it gets, sits first on PATH and the
+  # shell says it is not Windows (OSTYPE is bash's own here): the Windows-form executable is refused as it is, and the
+  # stand-in was never called. Looking for cygpath on PATH decided "Windows" by what the PATH held, and on this
+  # machine the PATH of Windows is 68 directories of 9p.
+  full_tree j21l
+  printf '#!/bin/sh\necho called >>"%s"\necho %s\n' "$tmp/j21l/home/cygpath.calls" "$tmp/j21l/standin/memory-industry" >"$tmp/j21l/bin/cygpath"
+  chmod +x "$tmp/j21l/bin/cygpath"
+  full_run j21l FAKE_CARGO_BUILD_EXE='C:\\Users\\x\\target\\debug\\memory-industry.exe'
+  [[ ! -s "$tmp/j21l/home/cygpath.calls" ]] \
+    || self_fail "K9a.2: on Linux run-all-tests.sh asked cygpath $(wc -l <"$tmp/j21l/home/cygpath.calls") time(s) to map the executable of cargo"
+  grep -q 'reported no executable' "$tmp/j21l.out" \
+    || self_fail "K9a.2: on Linux a Windows-form executable that is no file here was not refused as 'reported no executable': $(cat "$tmp/j21l.out")"
 
   # J3.1: the eval reads the scratch database brain_gate_eval, and asks for --json.
   full_tree j31
@@ -1757,8 +1770,8 @@ gate_bin() {
     | sed -n 's/.*"reason":"compiler-artifact".*"executable":"\([^"]*\)".*/\1/p' \
     | grep -E '[/\\]memory-industry(\.exe)?$' | tail -n 1 || true)"
   exe="${exe//\\\\/\\}"
-  if [[ -n "$exe" ]] && command -v cygpath >/dev/null 2>&1; then
-    exe="$(cygpath -u "$exe")"
+  if [[ -n "$exe" ]] && gate_on_windows; then
+    exe="$(gate_native_path u "$exe")"
   fi
   [[ -n "$exe" && -x "$exe" ]] \
     || { echo "FAIL: cargo build --bin memory-industry reported no executable for memory-industry (it reported: ${exe:-nothing})." >&2; exit 1; }

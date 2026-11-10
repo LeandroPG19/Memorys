@@ -24,7 +24,6 @@ import argparse
 import difflib
 import functools
 import glob
-import hashlib
 import importlib.util
 import itertools
 import json
@@ -812,10 +811,12 @@ def _jobs_de(contenido: bytes, fila: str) -> int | None:
 
 
 def _tablas_conocidas(tabla: str) -> dict[str, bytes]:
-    """{sha256: content} of the table as of today and of every commit that changed it (D-F5s)."""
+    """{key: content} of the table as of today and of every commit that changed it (D-F5s). The key is the one the planner
+    writes in the history (gate-dag.py table_key_of, K9c), not the sha256 of the bytes: a comment does not change it."""
+    clave = gate_dag().table_key_of
     with open(tabla, "rb") as fh:
         actual = fh.read()
-    conocidas = {hashlib.sha256(actual).hexdigest(): actual}
+    conocidas = {clave(actual): actual}
     real, base = os.path.realpath(tabla), os.path.realpath(raiz())
     relativa = os.path.relpath(real, base)
     if relativa.startswith(".."):
@@ -828,7 +829,7 @@ def _tablas_conocidas(tabla: str) -> dict[str, bytes]:
             ["git", "-C", base, "show", f"{commit}:{relativa}"], capture_output=True, check=False
         )
         if contenido.returncode == 0:
-            conocidas.setdefault(hashlib.sha256(contenido.stdout).hexdigest(), contenido.stdout)
+            conocidas.setdefault(clave(contenido.stdout), contenido.stdout)
     return conocidas
 
 
