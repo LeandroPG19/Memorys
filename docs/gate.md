@@ -401,3 +401,61 @@ The receipt is a file in your home, not a signature: anyone who can write there 
 Versioned under `.cursor/rules/` (never a junction to `~/.cursor/rules`). Six-pack + TDD + two judges. Comments stay. Plant rules (Playwright, React Query, guardian-planta) are not copied here.
 
 Handoffs: `.cursor/handoffs/*.yml`, validated by `scripts/validar-handoff.sh` — shape, plus the two-pass protocol: `commit` has to exist in the repo and `tests: written|frozen` (required when `commit != none`) is checked by extracting the test regions at that commit and in the tree: the `#[cfg(test)]` regions of a `.rs`, a whole `.rs` under `tests/`, and in a `.sh` the lines between `# --- self-test begin ---` and `# --- self-test end ---`. A gate script whose `--self-test` dispatch sits outside a marked region, or whose markers do not pair, is refused whatever `tests` says. `written` fails when none moved, `frozen` when one did. An optional `paths:` list limits that comparison to the handoff's own slice, so that one agent's honest green pass is not refused for a test another agent edited in the same tree; it is refused empty, with a path that exists neither in the tree nor at `commit`, and with `commit: none`. `scripts/validar-handoff.sh --self-test` runs a fixture against each guard.
+
+## Weekly audit of the mutation judge (CI-F6, D-F6r)
+
+`scripts/qg-weekly-audit.sh` runs `quality-gate.sh --study full DIR` on the HEAD of the integration branch, so that the equivalence of `full` and `cover` (D-F6p, D-F6q) is watched on the code as it changes and not only once. Leandro's decision of 2026-11-09: weekly, Sundays at 02:00. It is one run of the study, not a second judge: it does not replace `merge-gate.sh`, and nothing in the SIL waits for it.
+
+What one run does:
+
+1. Reads the HEAD of `QG_AUDIT_BRANCH` (default `main`) in the clone the script lives in. If it is the HEAD of the last audit that had a verdict, it says `unchanged` and exits 0 without taking the turn.
+2. Otherwise makes a detached worktree of that HEAD under `<state>/work/<stamp>-<sha12>/` and runs, from inside it, `pesado -m 36G -w 3600 -n qg-auditoria -- timeout --kill-after=120 $QG_AUDIT_MAX_SECS bash scripts/quality-gate.sh --study full <DIR>` with `QG_BASE` set and no `DATABASE_URL`. The wait for the turn is an hour and the study has `QG_AUDIT_MAX_SECS` (default 21600, 6 h; the study is expected to take 1.5 to 3 h, E) once it has it: nothing waits without a deadline. While it runs it holds the lock of `pesado`, so no agent compiles.
+3. Keeps `audit.log` (the output of the study) and `study.tsv` in `<state>/<stamp>-<sha12>/` together with a `verdict` file, and removes the worktree and the work directory, also when the study fails or the script is told to stop. The heavy part of the study (`DIR/ref`, `DIR/cover`) is not kept: a difference is diagnosed mutant by mutant from `study.tsv` (its pass and subset), as in the study's own procedure.
+
+`<state>` is `${XDG_STATE_HOME:-$HOME/.local/state}/memory-industry/qg-audit`. Its `last` file holds `<sha> <verdict> <stamp>` of the last audit with a verdict.
+
+| Exit | Meaning | `last` |
+|---|---|---|
+| 0 | `study: N/N identical`, or the HEAD is unchanged | moves (unless unchanged) |
+| 1 | the classes differ, or the reference is red | moves: the week has its answer |
+| 2 | no verdict: the study exited 2 or died, it did not finish in `QG_AUDIT_MAX_SECS`, or the audit could not set up (the branch or the base is not there, no base) | stays, so the next run tries again |
+| 75 | `pesado` stayed busy for the whole wait | stays |
+
+`QG_AUDIT_BASE` is the `QG_BASE` of the study, the ref whose diff to the HEAD is mutated. Without it, the base is the HEAD of the last audit with a verdict, so each audit judges what changed since. The first audit has no earlier one and exits 2 asking for `QG_AUDIT_BASE`. Set it to judge every week against the same base (the 0.31 base gives its 787 mutants) instead of the changes of the week. A diff with no `rust/src` file judges no mutant, and the exit alone does not say how many were judged: read the `study:` line of `audit.log`.
+
+Two `systemd --user` units run it. They live outside the repo, like `respaldo-memoria.timer`, and the PATH is set in the service because a user service does not read the login profile (`pesado` is in `~/.local/bin`, `cargo` in `~/.cargo/bin`).
+
+```ini
+# ~/.config/systemd/user/qg-auditoria-semanal.service
+[Unit]
+Description=Weekly audit of the mutation judge (quality-gate.sh --study full)
+[Service]
+Type=oneshot
+Nice=10
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+# The first audit needs a base; name it here (a ref of the clone) and keep the line to judge always against it.
+#Environment=QG_AUDIT_BASE=<ref>
+ExecStart=%h/proyectos/mcp-servers/Memorys/scripts/qg-weekly-audit.sh
+```
+
+```ini
+# ~/.config/systemd/user/qg-auditoria-semanal.timer
+[Unit]
+Description=Weekly audit of the mutation judge, Sundays at 02:00
+[Timer]
+OnCalendar=Sun *-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=300
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now qg-auditoria-semanal.timer
+systemctl --user list-timers qg-auditoria-semanal.timer      # the next Sunday
+journalctl --user -u qg-auditoria-semanal.service -n 50      # the last audit
+cat ~/.local/state/memory-industry/qg-audit/last             # <sha> <verdict> <stamp>
+```
+
+The service is `failed` after an exit 1, 2 or 75, which is how `systemctl --user --failed` shows a week that needs a look. `ExecStart` names the clone the script lives in: the audit reads `QG_AUDIT_BRANCH` from that clone's refs and the script has to exist in its checkout. `./scripts/qg-weekly-audit.sh --self-test` drives each of the rows above against a throwaway git repo with a stand-in `pesado` and a stand-in `quality-gate.sh`; it never takes the real turn and never writes under the real state directory.

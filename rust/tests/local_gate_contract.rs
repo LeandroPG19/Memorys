@@ -1803,7 +1803,7 @@ const SELF_TEST_END: &str = "# --- self-test end ---";
 /// Every script of `scripts/` that has a `--self-test` mode, in the order
 /// `read_dir` + sort gives. Two-way on purpose: a script that gains a mode, or
 /// loses its own, is red until this list says so.
-const SCRIPTS_WITH_SELF_TEST: [&str; 13] = [
+const SCRIPTS_WITH_SELF_TEST: [&str; 14] = [
     "advisory-exceptions.sh",
     "codigo-muerto.sh",
     "crap-gate.sh",
@@ -1812,6 +1812,7 @@ const SCRIPTS_WITH_SELF_TEST: [&str; 13] = [
     "gpu-placement-check.sh",
     "merge-gate.sh",
     "mutants-gate.sh",
+    "qg-weekly-audit.sh",
     "quality-gate.sh",
     "release.sh",
     "run-all-tests.sh",
@@ -3263,7 +3264,7 @@ fn listing_changes(before: &[String], after: &[String]) -> Vec<String> {
 }
 
 /// Concurrent launches at most (CI-J7). A self-test is a bash script that starts its own processes
-/// and mostly waits on them, so the cost is wall time. Six slots serve the thirteen launches of a
+/// and mostly waits on them, so the cost is wall time. Six slots serve the fourteen launches of a
 /// round without queuing each behind the last, and cap how many of their processes run at once next
 /// to the rest of the binary's tests. Chosen here, not measured: the orchestrator measures it in
 /// the whole-judge run, and a different number is a change of this constant only.
