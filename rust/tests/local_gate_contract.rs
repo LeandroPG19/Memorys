@@ -6527,3 +6527,350 @@ fn main() { let mod_x = 1; let test = 2; }
         Vec::<String>::new()
     );
 }
+
+// CI-K1: one compiler, pinned. Without `rust-toolchain.toml` every target of the judge is built
+// with whatever `stable` is that day, and the day it moves each of them is rebuilt whole while the
+// publish matrix stops using the compiler that was verified. Raising the version is one commit that
+// changes `channel`; this contract is what ties that commit to the components and targets.
+
+/// What the judge needs from the pinned toolchain beyond the compiler: `clippy` and `rustfmt` for
+/// its lint steps, `llvm-tools` for crap-gate and the `cover` mode of quality-gate.
+const TOOLCHAIN_COMPONENTS: [&str; 3] = ["clippy", "rustfmt", "llvm-tools"];
+
+/// The strings of `key = [...]` (or `key = "..."`) in a toolchain file, in order. The array may
+/// span lines; a `#` comment never counts.
+fn toml_strings(file: &str, key: &str) -> Vec<String> {
+    let lines: Vec<&str> = file
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .collect();
+    let Some(at) = lines.iter().position(|line| {
+        line.strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    }) else {
+        return Vec::new();
+    };
+    let mut value = lines[at]
+        .split_once('=')
+        .map_or(String::new(), |(_, v)| v.to_string());
+    for line in &lines[at + 1..] {
+        if value.contains(']') || !value.trim_start().starts_with('[') {
+            break;
+        }
+        value.push(' ');
+        value.push_str(line);
+    }
+    value
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn is_exact_version(channel: &str) -> bool {
+    let parts: Vec<&str> = channel.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `x86_64-unknown-linux-gnu` yes; `${{`, `"$T"`, `--target-dir` and prose no.
+fn is_target_triple(word: &str) -> bool {
+    let parts: Vec<&str> = word.split('-').collect();
+    parts.len() >= 3
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
+}
+
+/// The target triples a workflow or a script names literally: after `--target`, and as the value of
+/// a `target:` or `targets:` key. A `${{ matrix.target }}` or a shell variable names none; the
+/// matrix entries that feed it are `target:` lines of their own. maturin's `universal2-apple-darwin`
+/// (the PyPI job) is not a rustc triple: it is the two Apple ones, and it is read as both.
+fn targets_named(text: &str) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.starts_with('#')) {
+        let line = line.strip_prefix("- ").unwrap_or(line);
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let after_flag = words
+            .windows(2)
+            .filter(|pair| pair[0] == "--target")
+            .map(|pair| pair[1]);
+        let as_key = line
+            .strip_prefix("target:")
+            .or_else(|| line.strip_prefix("targets:"))
+            .into_iter()
+            .flat_map(|rest| rest.split(|c: char| c == ',' || c.is_whitespace()));
+        for word in after_flag.chain(as_key) {
+            let word = word.trim_matches(['"', '\'', ',']);
+            if word == "universal2-apple-darwin" {
+                found.insert("x86_64-apple-darwin".to_string());
+                found.insert("aarch64-apple-darwin".to_string());
+            } else if is_target_triple(word) {
+                found.insert(word.to_string());
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Every way the pinned toolchain can stop being the one the judge and the publication verified,
+/// one line each. Empty means green. `named` is what the workflows and scripts build with and
+/// `other_files` the toolchain files found anywhere else in the tree.
+fn toolchain_problems(file: &str, named: &[String], other_files: &[String]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let channel = toml_strings(file, "channel");
+    if !matches!(channel.as_slice(), [one] if is_exact_version(one)) {
+        problems.push(format!(
+            "channel must be one exact N.N.N version, found {channel:?}: `stable`, `beta` and `nightly` move under the cache"
+        ));
+    }
+    let components = toml_strings(file, "components");
+    for want in TOOLCHAIN_COMPONENTS {
+        if !components.iter().any(|c| c == want) {
+            problems.push(format!("components lacks {want}"));
+        }
+    }
+    let targets = toml_strings(file, "targets");
+    for target in named {
+        if !targets.contains(target) {
+            problems.push(format!(
+                "targets lacks {target}, which a workflow or a script builds with"
+            ));
+        }
+    }
+    for other in other_files {
+        problems.push(format!(
+            "{other} is a second toolchain file: a second compiler is a second cache"
+        ));
+    }
+    problems
+}
+
+/// Files named `rust-toolchain*` anywhere under `root` except the one at its top, relative and
+/// sorted. Build output, dependencies and git's own directory are not part of the tree.
+fn other_toolchain_files(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if kind.is_dir() {
+                let build_output = name == "target" || name.starts_with("target-");
+                if !build_output && name != ".git" && name != "node_modules" {
+                    walk(root, &path, out);
+                }
+            } else if name.starts_with("rust-toolchain") && path != root.join("rust-toolchain.toml")
+            {
+                out.push(relative_to(root, &path));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+const PINNED_TOOLCHAIN: &str = "\
+[toolchain]
+channel = \"1.99.0\"
+profile = \"minimal\"
+components = [\"clippy\", \"rustfmt\", \"llvm-tools\"]
+targets = [
+    \"x86_64-unknown-linux-gnu\",
+    \"x86_64-pc-windows-msvc\", # the judge's Windows branch
+]
+";
+
+fn the_targets_the_publication_builds() -> Vec<String> {
+    ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+        .map(String::from)
+        .to_vec()
+}
+
+#[test]
+fn toolchain_k1_the_tree_pins_one_compiler_with_what_the_judge_and_the_publication_build() {
+    let path = repo_root().join("rust-toolchain.toml");
+    let file = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "rust-toolchain.toml is missing from the repo root ({}): {e}. Without it every target is built with whatever `stable` is that day (CI-K1)",
+            path.display()
+        )
+    });
+    let publish = targets_named(&read(".github/workflows/publish.yml"));
+    assert!(
+        !publish.is_empty(),
+        "publish.yml names no target triple: the matrix moved, or targets_named reads the wrong key, and this contract would pass over nothing"
+    );
+    let mut named = std::collections::BTreeSet::from_iter(publish);
+    named.extend(targets_named(&read(".github/workflows/ci.yml")));
+    for entry in std::fs::read_dir(repo_root().join("scripts")).expect("scripts/") {
+        let path = entry.expect("entry").path();
+        let script = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ["sh", "ps1", "cmd"].contains(&ext));
+        if script {
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            named.extend(targets_named(&String::from_utf8_lossy(&bytes)));
+        }
+    }
+    let named: Vec<String> = named.into_iter().collect();
+    let others = other_toolchain_files(&repo_root());
+    assert_eq!(
+        toolchain_problems(&file, &named, &others),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn toolchain_k1_reads_the_targets_of_a_workflow_and_a_script_and_nothing_else() {
+    let workflow = "\
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: cuba-memorys-linux-x64
+          - os: macos-latest
+            target: universal2-apple-darwin
+          - os: windows-latest
+            target: x86_64
+    steps:
+      # target: riscv64gc-unknown-linux-gnu
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+        run: cargo build --release --features ${{ matrix.features }} --target ${{ matrix.target }}
+        run: cargo check --target-dir somewhere-else-entirely
+";
+    assert_eq!(
+        targets_named(workflow),
+        [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu"
+        ]
+    );
+    let script =
+        "cargo xwin build --release --target x86_64-pc-windows-msvc\nT=1 cargo b --target \"$T\"\n";
+    assert_eq!(targets_named(script), ["x86_64-pc-windows-msvc"]);
+    let literal_list =
+        "        with:\n          targets: wasm32-unknown-unknown, x86_64-unknown-linux-musl\n";
+    assert_eq!(
+        targets_named(literal_list),
+        ["wasm32-unknown-unknown", "x86_64-unknown-linux-musl"]
+    );
+    let renamed = workflow
+        .replace("target:", "tgt:")
+        .replace("--target ", "--tgt ");
+    assert_eq!(
+        targets_named(&renamed),
+        Vec::<String>::new(),
+        "a renamed key must read as nothing, which is what the presence anchor of the real tree catches"
+    );
+}
+
+#[test]
+fn toolchain_k1_the_guard_goes_red_with_each_sabotage_and_only_with_it() {
+    let named = the_targets_the_publication_builds();
+    assert_eq!(
+        toolchain_problems(PINNED_TOOLCHAIN, &named, &[]),
+        Vec::<String>::new()
+    );
+
+    for moving in ["stable", "beta", "nightly", "1.99", "1.99.0-beta.1", ""] {
+        let sabotaged = PINNED_TOOLCHAIN.replacen("1.99.0", moving, 1);
+        assert_ne!(
+            sabotaged, PINNED_TOOLCHAIN,
+            "the sabotage must change the file"
+        );
+        let problems = toolchain_problems(&sabotaged, &named, &[]);
+        assert_eq!(problems.len(), 1, "channel {moving:?}: {problems:?}");
+        assert!(
+            problems[0].starts_with("channel must be one exact N.N.N version"),
+            "{problems:?}"
+        );
+    }
+    let no_channel = PINNED_TOOLCHAIN.replacen("channel = \"1.99.0\"\n", "", 1);
+    assert_ne!(no_channel, PINNED_TOOLCHAIN);
+    assert_eq!(toolchain_problems(&no_channel, &named, &[]).len(), 1);
+
+    for component in TOOLCHAIN_COMPONENTS {
+        let sabotaged = PINNED_TOOLCHAIN.replacen(&format!("\"{component}\""), "\"rust-docs\"", 1);
+        assert_ne!(sabotaged, PINNED_TOOLCHAIN);
+        assert_eq!(
+            toolchain_problems(&sabotaged, &named, &[]),
+            [format!("components lacks {component}")]
+        );
+    }
+
+    let mut with_riscv = named.clone();
+    with_riscv.push("riscv64gc-unknown-linux-gnu".to_string());
+    let expected =
+        ["targets lacks riscv64gc-unknown-linux-gnu, which a workflow or a script builds with"];
+    assert_eq!(
+        toolchain_problems(PINNED_TOOLCHAIN, &with_riscv, &[]),
+        expected
+    );
+    let in_a_comment = format!("{PINNED_TOOLCHAIN}# targets = [\"riscv64gc-unknown-linux-gnu\"]\n");
+    assert_eq!(
+        toolchain_problems(&in_a_comment, &with_riscv, &[]),
+        expected,
+        "a commented-out target is not installed"
+    );
+    let one_line = PINNED_TOOLCHAIN.replacen(
+        "targets = [\n    \"x86_64-unknown-linux-gnu\",\n    \"x86_64-pc-windows-msvc\", # the judge's Windows branch\n]",
+        "targets = [\"x86_64-unknown-linux-gnu\"]",
+        1,
+    );
+    assert_ne!(one_line, PINNED_TOOLCHAIN);
+    assert_eq!(
+        toolchain_problems(&one_line, &named, &[]),
+        ["targets lacks x86_64-pc-windows-msvc, which a workflow or a script builds with"]
+    );
+
+    assert_eq!(
+        toolchain_problems(
+            PINNED_TOOLCHAIN,
+            &named,
+            &["rust/rust-toolchain.toml".to_string()]
+        ),
+        [
+            "rust/rust-toolchain.toml is a second toolchain file: a second compiler is a second cache"
+        ]
+    );
+}
+
+#[test]
+fn toolchain_k1_finds_a_second_toolchain_file_anywhere_but_in_build_output() {
+    let root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("k1-walk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for file in [
+        "rust-toolchain.toml",
+        "rust/rust-toolchain",
+        "a/b/rust-toolchain.toml",
+        "rust/target/rust-toolchain.toml",
+        "rust/target-sil/rust-toolchain.toml",
+        "npm/node_modules/x/rust-toolchain.toml",
+        ".git/rust-toolchain.toml",
+        "scripts/not-a-rust-toolchain.toml",
+    ] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, "[toolchain]\nchannel = \"1.99.0\"\n").expect("write");
+    }
+    let found = other_toolchain_files(&root);
+    std::fs::remove_dir_all(&root).expect("clean the scratch tree");
+    assert_eq!(found, ["a/b/rust-toolchain.toml", "rust/rust-toolchain"]);
+}
