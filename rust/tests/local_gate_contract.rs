@@ -3443,7 +3443,7 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
 /// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
 /// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
 /// self-test that takes it as its own fixture's identity is red under any other value.
-const JUDGE_ENVIRONMENT: [(&str, &str); 27] = [
+const JUDGE_ENVIRONMENT: [(&str, &str); 30] = [
     ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
     // CI-F3.3b-1b-i (D-F3k): merge-gate.sh exports the lock's directory so that the planner can write the
     // lane tickets under it. gate-lock.sh assigns GATE_LOCK itself, so no self-test reads what it inherits.
@@ -3482,6 +3482,12 @@ const JUDGE_ENVIRONMENT: [(&str, &str); 27] = [
     ("CUBA_NLI_INTRA_THREADS", "7"),
     ("CUBA_RERANK_INTRA_THREADS", "7"),
     ("MUTANTS_JOBS", "7"),
+    // CI-K4 (D-K4a): the planner gives the rows that compile in dev their profile (ALLOWED_ENV in gate-dag.py) and the
+    // judge does not export it. A foreign value of each, so a self-test that reads one of them fails here, and not
+    // under the planner.
+    ("CARGO_INCREMENTAL", "1"),
+    ("CARGO_PROFILE_DEV_DEBUG", "2"),
+    ("CARGO_PROFILE_DEV_STRIP", "none"),
     ("PYTHONUTF8", "0"),
     ("PYTHONIOENCODING", "latin-1"),
 ];
@@ -7336,9 +7342,9 @@ fn gate_dag_default(planner: &str) -> String {
 
 /// D-F34n: the DAG is the default only with evidence, which is no pending line in the latency list.
 fn activation_problem(default: &str, pending: usize) -> Option<String> {
-    (default == "1" && pending > 0).then(|| {
+    (matches!(default, "1" | "auto" | "maximo") && pending > 0).then(|| {
         format!(
-            "GATE_DAG defaults to 1 with {pending} pending line(s) in scripts/gate-latency.txt: the DAG is not the default before they have their evidence"
+            "GATE_DAG defaults to {default} with {pending} pending line(s) in scripts/gate-latency.txt: the DAG is not the default before they have their evidence"
         )
     })
 }
@@ -8295,4 +8301,80 @@ fn toolchain_k1_finds_a_second_toolchain_file_anywhere_but_in_build_output() {
     let found = other_toolchain_files(&root);
     std::fs::remove_dir_all(&root).expect("clean the scratch tree");
     assert_eq!(found, ["a/b/rust-toolchain.toml", "rust/rust-toolchain"]);
+}
+
+// --- CI-K4: the profile of the judge in the table, and the DAG that stays off by default --------------------------------
+
+/// CI-K4 (D-K4a, D-K4b): the rows that compile in the `dev` profile (DBG, NLI and DC; `test` inherits from `dev`, so the
+/// tokens are DEV and never TEST) carry exactly `CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0` and
+/// `CARGO_PROFILE_DEV_STRIP=symbols`, and no other row carries any `CARGO_INCREMENTAL` or `CARGO_PROFILE_*` token: the
+/// release rows (B3, REL, E2E) already build with no debuginfo and with strip, and CV and M have a seed and an
+/// instrumentation of their own that a profile of the table would move. The table is the one source: merge-gate.sh
+/// exports none of them.
+#[test]
+fn only_the_rows_that_compile_in_dev_carry_the_profile_of_the_judge() {
+    let profile = [
+        ("CARGO_INCREMENTAL", "0"),
+        ("CARGO_PROFILE_DEV_DEBUG", "0"),
+        ("CARGO_PROFILE_DEV_STRIP", "symbols"),
+    ];
+    let rows = dag_rows();
+    for id in ["DBG", "NLI", "DC", "P", "B3", "REL", "E2E", "CV", "M"] {
+        assert!(
+            rows.iter().any(|row| row.1 == id),
+            "gate-dag.txt has no row {id}: the scan would pass over nothing"
+        );
+    }
+    for (_, id, _, line) in &rows {
+        let env = row_env(line);
+        let carries = matches!(id.as_str(), "DBG" | "NLI" | "DC");
+        for (name, value) in profile {
+            let got = row_value(&env, name);
+            if carries {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(value),
+                    "row {id} compiles in dev and has to carry {name}={value}: {line}"
+                );
+            } else {
+                assert!(
+                    got.is_none(),
+                    "row {id} does not compile in dev and names {name}: {line}"
+                );
+            }
+        }
+        for (name, _) in &env {
+            let is_profile = name == "CARGO_INCREMENTAL" || name.starts_with("CARGO_PROFILE_");
+            assert!(
+                !is_profile || profile.iter().any(|(known, _)| known == name),
+                "row {id} names {name}, which is not one of the three tokens of the profile: {line}"
+            );
+        }
+    }
+}
+
+/// CI-K4 (D-K4n, S15): the DAG is not the default in any of the forms that turn it on, `1`, `maximo` or `auto`, while a
+/// line of the latency list is pending; `0` and `serie` are the series and are never refused. The guard is first judged
+/// on those values, and then (`the_dag_is_not_the_default_while_a_latency_line_is_pending`) on the file.
+#[test]
+fn the_dag_is_not_the_default_in_any_of_its_forms_while_a_latency_line_is_pending() {
+    for default in ["1", "auto", "maximo"] {
+        let refused = activation_problem(default, 2);
+        assert!(
+            refused.as_ref().is_some_and(|text| text.contains(&format!(
+                "GATE_DAG defaults to {default} with 2 pending line(s)"
+            ))),
+            "a default of {default} with two pending lines is not refused: {refused:?}"
+        );
+        assert!(
+            activation_problem(default, 0).is_none(),
+            "a default of {default} with nothing pending is refused"
+        );
+    }
+    for default in ["0", "serie"] {
+        assert!(
+            activation_problem(default, 2).is_none(),
+            "the series is refused as a default of {default}"
+        );
+    }
 }

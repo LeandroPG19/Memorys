@@ -2149,3 +2149,425 @@ fn j14m_p3_la_admision_y_el_veredicto_cumplen_sus_invariantes() {
 fn j14m_p4_la_tabla_da_una_lista_o_una_negativa_y_nunca_otra_excepcion() {
     propiedad("j14m-p4", BODY_P4, "p4 trials=600");
 }
+
+// --- CI-K4: the reports of `cargo --timings`, the overlap of the rows and the plan of the machine ---------------------
+// D-K4h (keep_timings moves the reports a row's log names, from its target to the day's folder of the history), D-K4j
+// (the folders of days older than 30 UTC days lose their timings/ and nothing else), D-K4q (`plan` in the run's line),
+// D-K4r (`solape_s`). The API these tests fix for pass 2:
+// - `keep_timings(corrida, paso, log_path) -> dict | None`: reads the lines `Timing report saved to <path>` of the log of
+//   the row and moves each report that exists to `<root>/<AAAAMMDD>/timings/<run>/<idx>-<id>/`. It returns
+//   `{dir, n, bytes, perdidos, faltan}` (`dir` relative to the root of the history; `perdidos` the times a path is named
+//   again, `faltan` the paths that are not there) or None: when the log names none, and when the history cannot take
+//   them (then one `history:` line, and the reports stay where they were). It also prunes the retention.
+// - `solape_s(intervalos, i)`: seconds of the interval `i` in which another interval of `intervalos` is alive.
+// - `step_end(..., timings=None, solape_s=None)` and `run_end(..., plan=None)` write those fields, null when not given.
+
+/// Four reports in `<objetivo>/cargo-timings` (4, 6, 2 and 2 bytes) and the function that keeps what a log names.
+/// argv: the directory of the target. `guardar(lineas)` writes the log, keeps, and returns what the day was before and
+/// after the call (a run that crosses midnight UTC names either) and what `keep_timings` returned.
+const K4_PRE: &str = r#"
+from datetime import datetime, timedelta, timezone
+objetivo = sys.argv[2]
+informes = objetivo + "/cargo-timings"
+os.makedirs(informes, exist_ok=True)
+for nombre, cuerpo in [("cargo-timing-20261109T120000Z.html", b"AAAA"), ("cargo-timing-20261109T120001Z.html", b"BBBBBB"),
+                       ("cargo-timing-20261109T120002Z.html", b"CC"), ("cargo-timing.html", b"DD")]:
+    with open(informes + "/" + nombre, "wb") as fh:
+        fh.write(cuerpo)
+def nombrado(nombre):
+    return "   Timing report saved to " + informes + "/" + nombre
+def dia():
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+def guardar(lineas):
+    log = objetivo + "/fila.log"
+    with open(log, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lineas) + "\n")
+    corrida = gh.run_start(modo="serie", sha=None, huella=None, tabla="t", run="run-k4")
+    paso = gh.step_start(corrida, 10, "DBG")
+    antes = dia()
+    res = gh.keep_timings(corrida, paso, log)
+    return {"res": res, "antes": antes, "despues": dia()}
+"#;
+
+const K4_NOMBRES: [&str; 4] = [
+    "cargo-timing-20261109T120000Z.html",
+    "cargo-timing-20261109T120001Z.html",
+    "cargo-timing-20261109T120002Z.html",
+    "cargo-timing.html",
+];
+
+const BODY_K4_GUARDAR: &str = r#"
+print(json.dumps(guardar(["   Compiling x v0.1.0", nombrado("cargo-timing-20261109T120000Z.html"),
+                          nombrado("cargo-timing-20261109T120001Z.html"), "    Finished `dev` profile"])))
+"#;
+
+const BODY_K4_CUENTA: &str = r#"
+print(json.dumps(guardar([nombrado("cargo-timing-20261109T120000Z.html"), nombrado("cargo-timing-20261109T120000Z.html"),
+                          nombrado("cargo-timing-20269999T000000Z.html")])))
+"#;
+
+const BODY_K4_NADA: &str = r#"
+print(json.dumps(guardar(["   Compiling x v0.1.0", "    Finished `dev` profile"])))
+"#;
+
+/// Folders of days 31, 30 and 29 days ago, and one that is no day, each with a timings/ and a pasos.jsonl; then a row
+/// that keeps a report today. The names of the folders come back with the answer.
+const BODY_K4_RETENCION: &str = r#"
+raiz = os.path.join(os.environ["CI_TIEMPOS_DIR"], "memory-industry")
+def sembrar(nombre):
+    carpeta = os.path.join(raiz, nombre)
+    os.makedirs(carpeta + "/timings/run-vieja/10-a", exist_ok=True)
+    with open(carpeta + "/timings/run-vieja/10-a/cargo-timing-vieja.html", "w") as fh:
+        fh.write("v")
+    with open(carpeta + "/pasos.jsonl", "w") as fh:
+        fh.write('{"id": "a"}\n')
+    return nombre
+hoy = datetime.now(timezone.utc)
+dias = {str(n): sembrar((hoy - timedelta(days=n)).strftime("%Y%m%d")) for n in (31, 30, 29)}
+dias["ninguno"] = sembrar("no-es-un-dia")
+resultado = guardar([nombrado("cargo-timing-20261109T120000Z.html")])
+resultado["dias"] = dias
+print(json.dumps(resultado))
+"#;
+
+/// The answer of a K4 body: the JSON line it printed.
+fn k4_answer(out: &Output) -> Value {
+    serde_json::from_str(text(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("the body printed no JSON: {e}\n{}", show(out)))
+}
+
+/// A target directory of the fixture for the K4 bodies, and where the reports are in it.
+fn k4_target(fx: &Fixture) -> PathBuf {
+    let dir = fx.base.join("objetivo");
+    fs::create_dir_all(&dir).expect("target dir");
+    dir
+}
+
+/// Spec K4-A, D-K4h: `keep_timings` moves what the log names, with the exact count and the exact weight, to the folder
+/// of the day, the run and the row, and `dir` is relative to the root of the history. What the log does not name stays.
+#[test]
+fn keep_timings_mueve_los_informes_que_nombra_el_log_y_cuenta_exacto() {
+    let fx = Fixture::new("k4-guardar");
+    let target = k4_target(&fx);
+    let out = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_GUARDAR}"),
+        &[path_str(&target)],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&out, "keep_timings of a log that names two reports");
+    let answer = k4_answer(&out);
+    let res = &answer["res"];
+    let dir = res["dir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("keep_timings gave no dir: {answer}\n{}", show(&out)));
+    let parts: Vec<&str> = dir.split('/').collect();
+    assert_eq!(parts.len(), 4, "<day>/timings/<run>/<idx>-<id>: {dir}");
+    assert!(
+        [&answer["antes"], &answer["despues"]]
+            .iter()
+            .any(|day| day.as_str() == Some(parts[0])),
+        "the day folder is the UTC day of the call: {dir} / {answer}"
+    );
+    assert_eq!(&parts[1..], ["timings", "run-k4", "10-DBG"], "{dir}");
+    assert_eq!(res["n"], json!(2), "{answer}");
+    assert_eq!(res["bytes"], json!(10), "{answer}");
+    assert_eq!(res["perdidos"], json!(0), "{answer}");
+    assert_eq!(res["faltan"], json!(0), "{answer}");
+    let kept = fx.root.join(REPO).join(dir);
+    for (name, body) in [(K4_NOMBRES[0], "AAAA"), (K4_NOMBRES[1], "BBBBBB")] {
+        assert_eq!(
+            fs::read_to_string(kept.join(name)).unwrap_or_default(),
+            body,
+            "{name} is not in {}",
+            kept.display()
+        );
+        assert!(
+            !target.join("cargo-timings").join(name).exists(),
+            "{name} was copied and not moved"
+        );
+    }
+    for stays in [K4_NOMBRES[2], K4_NOMBRES[3]] {
+        assert!(
+            target.join("cargo-timings").join(stays).exists(),
+            "{stays} is not named by the log and left the target"
+        );
+    }
+    assert_eq!(history_lines(&text(&out.stderr)), 0, "{}", show(&out));
+}
+
+/// Spec K4-A, D-K4h: a report named twice counts once and is a `perdido`; a path named that is not there is a `falta`.
+#[test]
+fn keep_timings_cuenta_lo_perdido_y_lo_que_falta() {
+    let fx = Fixture::new("k4-cuenta");
+    let target = k4_target(&fx);
+    let out = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_CUENTA}"),
+        &[path_str(&target)],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(
+        &out,
+        "keep_timings of a log with a repeated and a missing report",
+    );
+    let answer = k4_answer(&out);
+    let res = &answer["res"];
+    assert_eq!(res["n"], json!(1), "{res}");
+    assert_eq!(res["bytes"], json!(4), "{res}");
+    assert_eq!(res["perdidos"], json!(1), "{res}");
+    assert_eq!(res["faltan"], json!(1), "{res}");
+}
+
+/// Spec K4-A, D-K4h: a log that names no report gives None, moves nothing and says nothing.
+#[test]
+fn keep_timings_de_un_log_sin_informes_es_none_y_no_mueve_nada() {
+    let fx = Fixture::new("k4-nada");
+    let target = k4_target(&fx);
+    let out = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_NADA}"),
+        &[path_str(&target)],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&out, "keep_timings of a log with no report");
+    let answer = k4_answer(&out);
+    assert!(
+        answer.get("res").is_some_and(Value::is_null),
+        "no report named, so None: {answer}"
+    );
+    for name in K4_NOMBRES {
+        assert!(
+            target.join("cargo-timings").join(name).exists(),
+            "{name} left the target although the log named none"
+        );
+    }
+    assert!(
+        files_named(&fx.root, "cargo-timing-20261109T120000Z.html").is_empty(),
+        "a report reached the history"
+    );
+    assert_eq!(history_lines(&text(&out.stderr)), 0, "{}", show(&out));
+}
+
+/// Spec K4-A, D-K4h: a history that cannot be written is None, one `history:` line and the reports where they were.
+/// The control is the same call with a history that can be written, which moves them.
+#[test]
+fn keep_timings_con_un_historial_que_no_se_escribe_es_none_avisa_y_deja_los_informes() {
+    let fx = Fixture::new("k4-sin-escritura");
+    let target = k4_target(&fx);
+    let control = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_GUARDAR}"),
+        &[path_str(&target)],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&control, "control");
+    assert!(
+        !target.join("cargo-timings").join(K4_NOMBRES[0]).exists(),
+        "control: with a history that can be written the report moves"
+    );
+    let fx = Fixture::new("k4-sin-escritura-roto");
+    let target = k4_target(&fx);
+    let blocker = fx.base.join("no-es-un-directorio");
+    write(&blocker, "x");
+    let broken = blocker.join("historial");
+    let out = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_GUARDAR}"),
+        &[path_str(&target)],
+        Some(broken.as_path()),
+    );
+    assert_ok(&out, "keep_timings over a history that cannot be written");
+    assert!(
+        k4_answer(&out).get("res").is_some_and(Value::is_null),
+        "a history that cannot take the reports gives None: {}",
+        show(&out)
+    );
+    assert_eq!(
+        history_lines(&text(&out.stderr)),
+        1,
+        "one `history:` line: {}",
+        show(&out)
+    );
+    for name in K4_NOMBRES {
+        assert!(
+            target.join("cargo-timings").join(name).exists(),
+            "{name} left the target although the history could not take it"
+        );
+    }
+}
+
+/// Spec K4-A, D-K4j: when it keeps reports, `keep_timings` removes the timings/ of the day folders older than 30 UTC
+/// days (the one of 31 days), and only that: the one of exactly 30 days and the one of 29 stay whole, the `pasos.jsonl`
+/// of the old one stays as it was, and a folder that is no day is not touched.
+#[test]
+fn keep_timings_poda_los_timings_de_mas_de_30_dias_y_nada_mas() {
+    let fx = Fixture::new("k4-retencion");
+    let target = k4_target(&fx);
+    let out = py(
+        &fx,
+        &format!("{K4_PRE}{BODY_K4_RETENCION}"),
+        &[path_str(&target)],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&out, "keep_timings with old day folders");
+    let answer = k4_answer(&out);
+    let root = fx.root.join(REPO);
+    let day = |key: &str| root.join(answer["dias"][key].as_str().expect("a seeded folder"));
+    let old = day("31");
+    assert!(
+        !old.join("timings").exists(),
+        "the timings/ of a folder of 31 days is still there: {}",
+        show(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(old.join("pasos.jsonl")).unwrap_or_default(),
+        "{\"id\": \"a\"}\n",
+        "the pasos.jsonl of the old folder changed: the history is never pruned, only its reports"
+    );
+    for (key, why) in [
+        ("30", "30 days is not more than 30"),
+        ("29", "29 days"),
+        ("ninguno", "a folder that is no day"),
+    ] {
+        assert!(
+            day(key)
+                .join("timings/run-vieja/10-a/cargo-timing-vieja.html")
+                .is_file(),
+            "the timings/ of the folder of {why} was removed"
+        );
+    }
+    assert!(
+        answer["res"]["dir"].is_string(),
+        "the reports of today were kept: {answer}"
+    );
+}
+
+/// Spec K4-B, D-K4r, by hand: the seconds of the interval `i` in which another is alive, the union and not the sum.
+/// [(0,10),(2,4),(3,6)] is 4, 2 and 3; two intervals that touch do not overlap.
+#[test]
+fn solape_s_da_los_ejemplos_a_mano() {
+    let fx = Fixture::new("k4-solape-mano");
+    let out = py(
+        &fx,
+        r#"
+casos = [[(0, 10), (2, 4), (3, 6)], [(0, 5), (5, 9)], [(0, 5), (0, 5)], [(1, 2)]]
+print(json.dumps([[gh.solape_s(c, i) for i in range(len(c))] for c in casos]))
+"#,
+        &[],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&out, "solape_s over the examples");
+    let got: Vec<Vec<f64>> = serde_json::from_str(text(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", show(&out)));
+    assert_eq!(
+        got,
+        vec![
+            vec![4.0, 2.0, 3.0],
+            vec![0.0, 0.0],
+            vec![5.0, 5.0],
+            vec![0.0]
+        ]
+    );
+}
+
+/// Spec K4-B, D-K4r: for every combination of three integer intervals with 0 <= start < end <= 6, `solape_s` is what
+/// counting the unit cells of an interval that another one covers gives. The expectation is the count, not the formula.
+#[test]
+fn solape_s_coincide_con_contar_las_celdas_que_otro_cubre() {
+    let fx = Fixture::new("k4-solape-celdas");
+    let out = py(
+        &fx,
+        r#"
+import itertools
+intervalos = [(a, b) for a in range(7) for b in range(a + 1, 7)]
+print(json.dumps([[gh.solape_s(list(c), i) for i in range(3)] for c in itertools.product(intervalos, repeat=3)]))
+"#,
+        &[],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(&out, "solape_s over every combination");
+    let shown = show(&out);
+    let got: Vec<Vec<f64>> = serde_json::from_str(text(&out.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", &shown[..shown.len().min(300)]));
+    let intervals: Vec<(u32, u32)> = (0..7)
+        .flat_map(|a| (a + 1..7).map(move |b| (a, b)))
+        .collect();
+    let mut n = 0;
+    for a in &intervals {
+        for b in &intervals {
+            for c in &intervals {
+                let all = [*a, *b, *c];
+                for (i, own) in all.iter().enumerate() {
+                    let covered = (own.0..own.1)
+                        .filter(|cell| {
+                            all.iter()
+                                .enumerate()
+                                .any(|(j, other)| j != i && other.0 <= *cell && *cell < other.1)
+                        })
+                        .count() as f64;
+                    assert_eq!(
+                        got[n][i], covered,
+                        "solape_s({all:?}, {i}) is {} and the cells say {covered}",
+                        got[n][i]
+                    );
+                }
+                n += 1;
+            }
+        }
+    }
+    assert_eq!(got.len(), n, "the enumerations do not have the same size");
+}
+
+/// Spec K4-A, K4-B: `step_end` takes `timings` and `solape_s`, and `run_end` takes `plan`; the records carry them as
+/// given, and as null (a key, not a gap) when nobody gave them. The plan is also in the index.
+#[test]
+fn step_end_acepta_timings_y_solape_s_y_run_end_acepta_el_plan() {
+    let fx = Fixture::new("k4-campos");
+    let out = py(
+        &fx,
+        r#"
+corrida = gh.run_start(modo="serie", sha=None, huella=None, tabla="t", run="r1")
+p1 = gh.step_start(corrida, 10, "a")
+gh.step_end(corrida, p1, rc=0, timings={"dir": "20261109/timings/r1/10-a", "n": 2, "bytes": 10, "perdidos": 0, "faltan": 0}, solape_s=1.5)
+p2 = gh.step_start(corrida, 20, "b")
+gh.step_end(corrida, p2, rc=0)
+gh.run_end(corrida, rc=0, plan={"nproc": 24, "jobs": 15, "carriles": 2, "fallo": None})
+otra = gh.run_start(modo="serie", sha=None, huella=None, tabla="t", run="r2")
+gh.run_end(otra, rc=0)
+"#,
+        &[],
+        Some(fx.root.as_path()),
+    );
+    assert_ok(
+        &out,
+        "step_end with timings and solape_s, run_end with a plan",
+    );
+    assert_eq!(history_lines(&text(&out.stderr)), 0, "{}", show(&out));
+    let steps = records(&fx.root, "pasos.jsonl");
+    assert_eq!(
+        steps[0]["timings"],
+        json!({"dir": "20261109/timings/r1/10-a", "n": 2, "bytes": 10, "perdidos": 0, "faltan": 0}),
+        "{}",
+        steps[0]
+    );
+    assert_eq!(steps[0]["solape_s"], json!(1.5), "{}", steps[0]);
+    for campo in ["timings", "solape_s"] {
+        assert!(
+            steps[1].get(campo).is_some_and(Value::is_null),
+            "{campo} has to be a key of the record and null when nobody gave it: {}",
+            steps[1]
+        );
+    }
+    let plan = json!({"nproc": 24, "jobs": 15, "carriles": 2, "fallo": null});
+    for name in ["corridas.jsonl", "indice.jsonl"] {
+        let lines = records(&fx.root, name);
+        let first = lines.iter().find(|l| l["run"] == json!("r1"));
+        let second = lines.iter().find(|l| l["run"] == json!("r2"));
+        assert_eq!(first.map(|l| &l["plan"]), Some(&plan), "{name}: {lines:?}");
+        assert!(
+            second.is_some_and(|l| l.get("plan").is_some_and(Value::is_null)),
+            "a run that gave no plan has `plan` as a key and null in {name}: {lines:?}"
+        );
+    }
+}

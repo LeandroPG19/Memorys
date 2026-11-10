@@ -780,40 +780,93 @@ gate_cgroup_read() {
   done
 }
 
-# --- the cargo jobs of a gate run (CI-F1, D-F1a/b, F-c) ----------------------
-# N is the number of CPUs the gate may hand cargo: the cgroup's (gate_cgroup_read) under
-# nproc's, so a judge in a scope of 8 CPUs on a 24-core machine asks for 8 jobs, not 24.
-# The release build takes min(N, floor(margin GB / 4)), at least 1, with the margin the
-# cgroup leaves (MemAvailable where it sets no memory limit): the 4 GB per job build-gpu.sh
-# used to cap with. The release margin is the cgroup's and not MemAvailable's because
-# pesado's MemoryMax is what kills the build, and that is the limit that holds here.
+# --- the RAM and the cargo jobs of a gate run (CI-F1, D-F1a/b, F-c; CI-K4, D-K4k, D-K4l, D-K4o) -------------
+# gate_free_ram_kb sets GATE_FREE_RAM_KB: the RAM the gate can count on, in KB, the lower of MemAvailable
+# (GATE_PROC_MEMINFO when a fixture names a file, as gate-dag.py reads it) and the memory the cgroup chain leaves
+# (GATE_CG_MEM_KB, so it follows gate_cgroup_read). No MemAvailable is status 1 and the reason in GATE_FREE_RAM_WHY:
+# the callers say it and go on in series, they do not stop.
+gate_free_ram_kb() {
+  local meminfo="${GATE_PROC_MEMINFO:-/proc/meminfo}" available
+  GATE_FREE_RAM_KB=""
+  GATE_FREE_RAM_WHY=""
+  available="$(awk '$1 == "MemAvailable:" { print $2; exit }' "$meminfo" 2>/dev/null || true)"
+  if [[ ! "$available" =~ ^[0-9]+$ ]]; then
+    GATE_FREE_RAM_WHY="no MemAvailable in $meminfo"
+    return 1
+  fi
+  GATE_FREE_RAM_KB="$available"
+  if [[ -n "${GATE_CG_MEM_KB:-}" ]] && (( GATE_CG_MEM_KB < GATE_FREE_RAM_KB )); then
+    GATE_FREE_RAM_KB="$GATE_CG_MEM_KB"
+  fi
+}
+
+# The jobs cargo gets are min(nproc - 2, the CPUs of the cgroup, free RAM / 2 GiB), at least 1: two cores stay for
+# the rest of the machine (pesado already keeps back 8 of 24, so the 2 come off nproc and not off the cgroup's quota),
+# and 2 GiB a job is what a rustc of this crate holds. The cgroup (gate_cgroup_read) is the tightest of the chain, so a
+# judge in a scope of 8 CPUs on a 24-core machine asks for 8 jobs, not 22.
+# The release build takes min(N, floor(margin GB / 4)), at least 1, with the margin the cgroup leaves
+# (MemAvailable where it sets no memory limit): the 4 GB per job build-gpu.sh used to cap with. The release margin is the
+# cgroup's and not MemAvailable's because pesado's MemoryMax is what kills the build, and that is the limit that holds here.
 # A CARGO_BUILD_JOBS the operator set is kept and said; one this gate exported (the
 # GATE_CARGO_JOBS_FROM_GATE marker, which the children inherit) is not named as the operator's.
-# Sets GATE_CARGO_JOBS and GATE_RELEASE_JOBS. Must be called directly, not in a subshell:
-# the refusals are exits of this shell.
+# A measure that cannot be read (a cgroup file that is no number, nproc that is no number, no MemAvailable) is not a
+# refusal: one job, in series, said in the line with what could not be read (D-K4o). The limit that was not read could be
+# the MemoryMax of pesado, so the number that cannot kill the run is 1, and the operator can name another by hand.
+# Sets GATE_CARGO_JOBS and GATE_RELEASE_JOBS, GATE_NPROC (what nproc said) and GATE_RESOURCE_WHY when a measure failed.
+# Must be called directly, not
+# in a subshell: it exports.
 gate_cargo_jobs() {
-  local cores cg margin_kb margin_gb
-  GATE_CG_HINT="Set CARGO_BUILD_JOBS=<n> by hand."
-  gate_cgroup_read
-  cores="$(nproc)"
-  [[ "$cores" =~ ^[0-9]+$ ]] \
-    || gate_refuse "nproc printed '$cores', which is not a number of CPUs, so the cargo jobs cannot be counted. Set CARGO_BUILD_JOBS=<n> by hand."
+  local cores cg margin_kb margin_gb read_out why="" jobs tenths
+  GATE_CG_HINT=""
+  GATE_CG_MEM_KB=""
+  GATE_CG_CPUS=""
+  # In a subshell: the refusals of gate_cgroup_read are exits of the shell that calls it. Its hint (set the jobs by
+  # hand) is left out: what the line says already is that the jobs are 1, and the operator knows the way to name others.
+  if read_out="$( (gate_cgroup_read && printf 'OK|%s|%s' "$GATE_CG_MEM_KB" "$GATE_CG_CPUS") 2>&1 )"; then
+    IFS='|' read -r _ GATE_CG_MEM_KB GATE_CG_CPUS <<<"$read_out"
+  else
+    why="${read_out#FAIL: }"
+    why="${why%.}"
+  fi
+  cores="$(nproc 2>/dev/null || true)"
+  if [[ -z "$why" && ! "$cores" =~ ^[0-9]+$ ]]; then
+    why="nproc printed '$cores', which is not a number of CPUs"
+  fi
+  if [[ -z "$why" ]]; then
+    gate_free_ram_kb || why="$GATE_FREE_RAM_WHY"
+  fi
+  GATE_RESOURCE_WHY="$why"
+  GATE_NPROC="$cores"
   cg="$GATE_CG_CPUS"
-  GATE_CARGO_JOBS="$cores"
-  if [[ -n "$cg" ]] && (( cg < GATE_CARGO_JOBS )); then GATE_CARGO_JOBS="$cg"; fi
+  if [[ -n "$why" ]]; then
+    jobs=1
+  else
+    jobs=$(( cores - 2 ))
+    if [[ -n "$cg" ]] && (( cg < jobs )); then jobs="$cg"; fi
+    if (( GATE_FREE_RAM_KB / 2097152 < jobs )); then jobs=$(( GATE_FREE_RAM_KB / 2097152 )); fi
+    (( jobs >= 1 )) || jobs=1
+  fi
+  GATE_CARGO_JOBS="$jobs"
   if [[ -n "${CARGO_BUILD_JOBS:-}" && "$CARGO_BUILD_JOBS" != "${GATE_CARGO_JOBS_FROM_GATE:-}" ]]; then
     echo "cargo jobs=$CARGO_BUILD_JOBS (CARGO_BUILD_JOBS set by the operator; nproc=$cores, cgroup cpu=${cg:-none})"
   elif [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
-    export CARGO_BUILD_JOBS="$GATE_CARGO_JOBS" GATE_CARGO_JOBS_FROM_GATE="$GATE_CARGO_JOBS"
-    echo "cargo jobs=$GATE_CARGO_JOBS (nproc=$cores, cgroup cpu=${cg:-none})"
+    export CARGO_BUILD_JOBS="$jobs" GATE_CARGO_JOBS_FROM_GATE="$jobs"
+    if [[ -n "$why" ]]; then
+      echo "cargo jobs=1 (resource measure failed: $why; series with one job)"
+    else
+      tenths=$(( GATE_FREE_RAM_KB * 10 / 1048576 ))
+      echo "cargo jobs=$jobs (nproc=$cores, cgroup cpu=${cg:-none}, ram free=$(( tenths / 10 )).$(( tenths % 10 )) GiB)"
+    fi
   fi
   GATE_CARGO_JOBS="$CARGO_BUILD_JOBS"
   margin_kb="${GATE_CG_MEM_KB:-}"
   if [[ -z "$margin_kb" ]]; then
-    margin_kb="$(awk '$1 == "MemAvailable:" { print $2; exit }' /proc/meminfo 2>/dev/null || true)"
+    margin_kb="$(awk '$1 == "MemAvailable:" { print $2; exit }' "${GATE_PROC_MEMINFO:-/proc/meminfo}" 2>/dev/null || true)"
   fi
   GATE_RELEASE_JOBS="$GATE_CARGO_JOBS"
-  if [[ "$margin_kb" =~ ^[0-9]+$ ]]; then
+  if [[ -n "$why" ]]; then
+    GATE_RELEASE_JOBS=1
+  elif [[ "$margin_kb" =~ ^[0-9]+$ ]]; then
     margin_gb=$(( margin_kb / 1048576 ))
     if (( margin_gb / 4 < GATE_RELEASE_JOBS )); then GATE_RELEASE_JOBS=$(( margin_gb / 4 )); fi
   fi

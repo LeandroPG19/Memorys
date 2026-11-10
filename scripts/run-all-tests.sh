@@ -726,6 +726,7 @@ FAKE
       'echo "${CARGO_BUILD_JOBS-unset} $*" >>"$HOME/cargo.jobs"' \
       'if [ "$1" = "${FAKE_CARGO_FAIL:-none}" ]; then exit "${FAKE_CARGO_FAIL_EXIT:-1}"; fi' \
       'mkdir -p "$CARGO_TARGET_DIR/debug" "$CARGO_TARGET_DIR/release"' \
+      'case "$*" in *--timings*) [ -n "${FAKE_CARGO_NO_TIMING_LINE:-}" ] || echo "   Timing report saved to $CARGO_TARGET_DIR/cargo-timings/cargo-timing-20261109T120000Z.html" >&2 ;; esac' \
       'case "$*" in *--release*) [ -e "$CARGO_TARGET_DIR/release/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/release/memory-industry" ;; esac' \
       '[ -z "${FAKE_CHANGE_RELEASE_ON:-}" ] || case "$*" in *"$FAKE_CHANGE_RELEASE_ON"*) echo changed >"$CARGO_TARGET_DIR/release/memory-industry" ;; esac' \
       'if [ "$1" = build ]; then' \
@@ -1117,6 +1118,44 @@ FAKE
     self_fail "F1.2: a call that is not a release one did not keep the CARGO_BUILD_JOBS=5 the operator set: $(grep -v -- ' --release' "$tmp/f1op/home/cargo.jobs")"
   fi
 
+  # K4g (CI-K4, D-K4g): every cargo call that compiles (build, test, clippy) asks for `--timings`, before the `--` that
+  # hands the rest to the test binary, and a call that compiles nothing (fmt) asks for none. The stand-in cargo prints on
+  # stderr the line cargo prints when it is given the flag, `Timing report saved to <path>`, which lands in the logs that
+  # run_counted reads. The counts of a run with that line are the counts of a run without it (FAKE_CARGO_NO_TIMING_LINE).
+  full_tree k4g
+  full_run k4g
+  (( rc == 0 )) || self_fail "K4g: a full run whose every step passed exited $rc: $(cat "$tmp/k4g.out")"
+  [[ -s "$tmp/k4g/home/cargo.calls" ]] || self_fail "K4g: no cargo call was recorded"
+  for k4_sub in build test clippy fmt; do
+    grep -q "^$k4_sub" "$tmp/k4g/home/cargo.calls" \
+      || self_fail "K4g: the run made no cargo $k4_sub call, so the rule is not read over it: $(cat "$tmp/k4g/home/cargo.calls")"
+  done
+  while IFS= read -r k4_call; do
+    k4_sub="${k4_call%% *}"
+    k4_before="${k4_call%% -- *}"
+    case "$k4_sub" in
+      build|test|clippy)
+        case " $k4_before " in
+          *" --timings "*) ;;
+          *) self_fail "K4g: the cargo call '$k4_call' compiles and carries no --timings before its --" ;;
+        esac ;;
+      *)
+        case " $k4_call " in
+          *" --timings "*) self_fail "K4g: the cargo call '$k4_call' compiles nothing and was given --timings" ;;
+        esac ;;
+    esac
+  done <"$tmp/k4g/home/cargo.calls"
+  grep -q 'Timing report saved to' "$tmp/k4g.out" \
+    || self_fail "K4g: no call asked for --timings, so the line cargo prints for it never reached the log: $(cat "$tmp/k4g.out")"
+  full_tree k4quiet
+  full_run k4quiet FAKE_CARGO_NO_TIMING_LINE=1
+  (( rc == 0 )) || self_fail "K4g: a full run with no timing line exited $rc: $(cat "$tmp/k4quiet.out")"
+  grep -q 'Timing report saved to' "$tmp/k4quiet.out" \
+    && self_fail "K4g: the run that was to print no timing line printed one: $(grep 'Timing report' "$tmp/k4quiet.out")"
+  [[ -n "$(grep '^OK  section ' "$tmp/k4quiet.out")" ]] || self_fail "K4g: the run printed no OK  section line"
+  [[ "$(grep '^OK  section ' "$tmp/k4g.out")" == "$(grep '^OK  section ' "$tmp/k4quiet.out")" ]] \
+    || self_fail "K4g: the counts of the sections are not the same with and without the timing line: $(diff <(grep '^OK  section ' "$tmp/k4g.out") <(grep '^OK  section ' "$tmp/k4quiet.out") || true)"
+
   # F2.2 (D-F2b): --check-models asks the paths the tests ask, runs no cargo, and names what is missing
   # with the text of require_present.
   full_tree f2mok
@@ -1252,7 +1291,7 @@ FAKE
   release_run lane_pair --lane CL --lane D1
   (( rc == 0 )) || self_fail "F3.3b-1: --lane CL --lane D1 exits $rc, not 0: $(cat "$tmp/lane_pair.out")"
   pair_clippy="$(grep -n -m1 'clippy' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
-  pair_test="$(grep -n -m1 '^test$' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
+  pair_test="$(grep -n -m1 '^test --timings$' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
   [[ -n "$pair_clippy" && -n "$pair_test" && "$pair_clippy" -lt "$pair_test" ]] \
     || self_fail "F3.3b-1: --lane CL --lane D1 did not run CL and then D1 in that order (clippy at ${pair_clippy:-none}, test at ${pair_test:-none}): $(cat "$tmp/lane_pair/home/cargo.calls" 2>/dev/null)"
   [[ "$(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_pair/home/psql.calls" 2>/dev/null || true)" == 1 ]] \
@@ -1709,7 +1748,7 @@ cd "$RUST_DIR"
 # release/ or cuba-memorys (CI-J, D-J2a). A build that fails prepares nothing (J2.2).
 gate_bin() {
   local out exe
-  out="$(cargo build --bin memory-industry --message-format=json-render-diagnostics)" \
+  out="$(cargo build --bin memory-industry --message-format=json-render-diagnostics --timings)" \
     || { echo "FAIL: cargo build --bin memory-industry failed: no database is prepared from a binary that did not build." >&2; exit 1; }
   exe="$(printf '%s\n' "$out" \
     | sed -n 's/.*"reason":"compiler-artifact".*"executable":"\([^"]*\)".*/\1/p' \
@@ -1789,7 +1828,7 @@ echo "=== cargo fmt --check ==="
 cargo fmt --check
 
 echo "=== cargo clippy (--all-targets: without it, tests/ is never linted) ==="
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --timings -- -D warnings
 }
 
 lane_D1() {
@@ -1797,7 +1836,7 @@ echo "=== throwaway database for every mutating step ==="
 provision_gate_db
 
 echo "=== cargo test (unit + smoke) ==="
-DATABASE_URL="$GATE_DATABASE_URL" cargo test
+DATABASE_URL="$GATE_DATABASE_URL" cargo test --timings
 }
 
 lane_D2() {
@@ -1822,26 +1861,26 @@ for file in tests/*.rs; do
 done
 echo "deferred ${#DEFERRED_SECTIONS[@]} file(s) to their own sections: ${DEFERRED_SECTIONS[*]}"
 echo "running $(( ${#DISCOVERED[@]} / 2 )) discovered test file(s)"
-run_counted discovered-ignored 0 cargo test "${DISCOVERED[@]}" -- --ignored --nocapture
+run_counted discovered-ignored 0 cargo test "${DISCOVERED[@]}" --timings -- --ignored --nocapture
 
-run_counted lib-ignored 0 cargo test --lib -- --ignored --nocapture
+run_counted lib-ignored 0 cargo test --lib --timings -- --ignored --nocapture
 
 echo "=== admin-role tests (they rewrite roles and the audit log) ==="
-CUBA_APP_ROLE=0 run_counted admin-role 1 cargo test --test v020_audit_update_applies --test v020_role_separation \
+CUBA_APP_ROLE=0 run_counted admin-role 1 cargo test --test v020_audit_update_applies --test v020_role_separation --timings \
            -- --ignored --nocapture
 
 require_present "tests that need the embedding model" "$ONNX_MODEL_PATH/model_quantized.onnx" \
-  run_counted embedding-model 1 cargo test --test v016_chunking -- --ignored --nocapture
+  run_counted embedding-model 1 cargo test --test v016_chunking --timings -- --ignored --nocapture
 }
 
 lane_NLI() {
 require_present "tests that need the NLI model" "$CUBA_NLI_PATH" \
-  run_counted nli 1 cargo test --test nli_entailment --test nli_cost --test nli_probe -- --ignored --nocapture
+  run_counted nli 1 cargo test --test nli_entailment --test nli_cost --test nli_probe --timings -- --ignored --nocapture
 }
 
 lane_D3() {
 require_generative_llm "tests that need a generative LLM (extract / relation-scan)" \
-  run_counted generative-llm 1 cargo test --test v016_extract_without_sampling --test v017_relation_scan \
+  run_counted generative-llm 1 cargo test --test v016_extract_without_sampling --test v017_relation_scan --timings \
              -- --ignored --nocapture
 }
 
@@ -1887,14 +1926,14 @@ b3_record_sha() {
 lane_B3() {
 echo "=== release build (one cargo call with --no-run, the feature set production runs) ==="
 export CARGO_BUILD_JOBS="$GATE_RELEASE_JOBS"
-cargo test --release --features cuda --no-run --lib --test v017_rerank_gpu
+cargo test --release --features cuda --no-run --lib --test v017_rerank_gpu --timings
 REL_BIN="$(resolve_binary_path)"
 [[ -f "$REL_BIN" ]] || { echo "FAIL: the release build left no binary at $REL_BIN." >&2; exit 1; }
 REL_SHA="$(release_sha "$REL_BIN")"
 
 echo "=== B3g (every unit of the bins is fresh after the --no-run build) ==="
 b3g_json="$(mktemp)"
-cargo build --release --features cuda --bins --message-format=json >"$b3g_json" \
+cargo build --release --features cuda --bins --message-format=json --timings >"$b3g_json" \
   || { rm -f "$b3g_json"; echo "FAIL: the release build of the bins failed (B3g)." >&2; exit 1; }
 check_fresh "$b3g_json" || { rm -f "$b3g_json"; exit 1; }
 rm -f "$b3g_json"
@@ -1937,7 +1976,7 @@ REL_BIN="${REL_BIN:-$(resolve_binary_path)}"
 [[ -f "$REL_BIN" ]] || { echo "FAIL: no release binary at $REL_BIN: the B3 lane builds it (run --lane B3 first)." >&2; exit 1; }
 b3_record_sha
 echo "=== reranker placement contracts (GPU feature live, no model needed) ==="
-run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu -- --nocapture
+run_counted reranker-placement 1 cargo test --release --features cuda --test v017_rerank_gpu --timings -- --nocapture
 
 # The library half of the same hole. The cfg! that actually decides placement is
 # in gpu::wants_gpu, which returns false before reading the device variable when
@@ -1951,11 +1990,11 @@ run_counted reranker-placement 1 cargo test --release --features cuda --test v01
 # unit itself. In debug it would be a third feature set (debug bare, release
 # cuda, debug cuda) and a full rebuild of everything under it.
 echo "=== placement table under the feature that changes it ==="
-run_counted placement-table 0 cargo test --release --features cuda --lib gpu:: -- --nocapture
+run_counted placement-table 0 cargo test --release --features cuda --lib gpu:: --timings -- --nocapture
 
 require_present "reranker tests (release: 387s in debug, seconds here)" \
   "$CUBA_RERANKER_PATH/model.onnx" \
-  run_counted reranker-model 1 cargo test --release --features cuda --test v017_rerank_gpu -- --ignored --nocapture
+  run_counted reranker-model 1 cargo test --release --features cuda --test v017_rerank_gpu --timings -- --ignored --nocapture
 
 check_section_lines
 

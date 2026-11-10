@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Lane planner of the local judge (CI-F3, F3.2).
 
-`run --table <file>` runs the step table. GATE_DAG=0 (the default) is the series: the steps in
-idx order, one at a time. GATE_DAG=1 plans the DAG: a step starts when its dependencies exited 0,
+`run --table <file>` runs the step table. GATE_DAG=0 or serie (the default) is the series: the steps in
+idx order, one at a time. GATE_DAG=1 or maximo plans the DAG: a step starts when its dependencies exited 0,
 and it is admitted by CPU and RAM, recomputed on every event (a child exit, and a 1 s tick as a
-backup). The verdict is the series one: the red with the lowest idx wins, the steps before it
+backup). GATE_DAG=auto is the same DAG with at most as many rows alive as the machine has lanes, and the jobs of the
+machine shared among them (CI-K4, D-K4m, D-K4n). The verdict is the series one: the red with the lowest idx wins, the steps before it
 finish, the ones after it are stopped with TERM and, after a grace, KILL (D-F3d, J14g). A kernel kill (OOM, or a
 signal the planner did not send) gives no verdict: exit 2 (D-F3f), and so does a failure of the planner itself (J14e).
 A run is recorded with the mode that ran (J14a): GATE_DAG=1 with no delegated scope, with no serial history of this
 table or with a DATABASE_URL in the environment runs in series, and is recorded as series. No step outlives the
 planner: TERM and HUP stop it, and its exit stops every step and every `paso-*` cgroup of the scope (J14b).
+The planner measures the machine before it starts (cores, RAM free, disk, battery) and prints its plan in one line,
+`plan: ...` (CI-K4, D-K4q); a measure that cannot be read is a series with one job and the line says what (D-K4o).
 
 Not in the planner: the removal of old run directories (D-F3i) and the per-binary launcher (D-F3u).
 `exclusive` and `boundary` run alone, after every lower idx: the conservative form of D-F3l, and with a
@@ -36,6 +39,7 @@ import os
 import re
 import secrets
 import select
+import shutil
 import signal
 import statistics
 import subprocess
@@ -84,6 +88,9 @@ ALLOWED_ENV = frozenset(
     {
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_JOBS",
+        "CARGO_INCREMENTAL",
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_PROFILE_DEV_STRIP",
         "TMPDIR",
         "DATABASE_URL",
         "GATE_SERVER_SYSTEM_ID",
@@ -95,6 +102,10 @@ ALLOWED_ENV = frozenset(
     }
 )
 NAME_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+# CI-K4 (D-K4n): the values of GATE_DAG and what each one asks for.
+ASKED = {"0": "serie", "serie": "serie", "auto": "auto", "1": "maximo", "maximo": "maximo"}
+# CI-K4 (D-K4m): the lanes of the rule of the judge, as (cores, GiB of free RAM) -> lanes, from the largest down.
+LANES_TABLE = ((16, 48, 3), (8, 24, 2))
 
 
 class Refusal(Exception):
@@ -248,6 +259,7 @@ class Step:
         self.oom_kill: int | None = None
         self.psi: dict[str, float | None] | None = None
         self.paso: gate_history.Paso | None = None
+        self.solape_s: float | None = None
 
 
 def parse_env(rest: list[str], step_id: str) -> tuple[dict[str, str], list[str]]:
@@ -385,6 +397,32 @@ def check_target_order(steps: list[Step], by_id: dict[str, Step]) -> None:
             die(f"step {first.id} reads target {target} and no step that builds {target} is above it (D-F34f)")
 
 
+def profile_of(step: Step) -> dict[str, str]:
+    """The tokens of the row that give its cargo calls their profile: it is in the hash of every unit (D-K4f)."""
+    return {k: v for k, v in step.env.items() if k == "CARGO_INCREMENTAL" or k.startswith("CARGO_PROFILE_")}
+
+
+def check_reader_profile(steps: list[Step], by_id: dict[str, Step]) -> None:
+    """D-K4f: a reader has exactly the profile tokens of the row that builds its target. The profile is in the hash of every
+    unit of a build, so a reader with another one would rebuild the target of its producer inside a row that builds nothing."""
+    for step in steps:
+        target = target_of(step)
+        if "reader" not in step.recursos or target is None:
+            continue
+        for name in sorted(ancestors(step, by_id), key=lambda a: by_id[a].idx):
+            producer = by_id[name]
+            if target_of(producer) != target or "reader" in producer.recursos:
+                continue
+            built, read = profile_of(producer), profile_of(step)
+            differ = sorted(k for k in built.keys() | read.keys() if built.get(k) != read.get(k))
+            if differ:
+                die(
+                    f"step {step.id} reads target {target} that {producer.id} builds, and they do not name the same profile "
+                    f"({', '.join(differ)}): a reader has exactly the CARGO_INCREMENTAL and CARGO_PROFILE_* tokens of its "
+                    f"producer, or it would rebuild the target in a row that builds nothing (D-K4f)"
+                )
+
+
 def validate_table(steps: list[Step]) -> None:
     if not steps:
         die("the table has no steps")
@@ -396,6 +434,7 @@ def validate_table(steps: list[Step]) -> None:
     ordered = sorted(steps, key=lambda s: s.idx)
     check_resource_kinds(ordered)
     check_target_order(ordered, by_id)
+    check_reader_profile(ordered, by_id)
 
 
 def parse_table(path: str) -> list[Step]:
@@ -509,29 +548,118 @@ def delegate(scope: str | None) -> bool:
     return True
 
 
-def cgroup_limits() -> tuple[str, str]:
+class Measure:
+    """What the planner knows of the machine (CI-K4): the cores, the memory and the jobs that gate-lock.sh counts, with the
+    reason when it could not read them (D-K4o)."""
+
+    def __init__(self) -> None:
+        self.nproc: int | None = None
+        self.cgroup_cpu: int | None = None
+        self.cgroup_mem_kb: str = ""
+        self.free_ram_kb: int | None = None
+        self.jobs: int = 1
+        self.why: str = ""
+
+
+# One bash does the counting of gate-lock.sh, so the jobs of `gate_cargo_jobs` and the jobs of the plan are one number:
+# its fields, in the order of MEASURE_FIELDS, NUL separated.
+MEASURE_ORDER = (
+    'source "$1"; gate_cargo_jobs >/dev/null; '
+    'printf "%s\\0%s\\0%s\\0%s\\0%s\\0%s" "$GATE_NPROC" "$GATE_CG_CPUS" "$GATE_CG_MEM_KB" "$GATE_FREE_RAM_KB" '
+    '"$GATE_CARGO_JOBS" "$GATE_RESOURCE_WHY"'
+)
+
+
+def measure_machine() -> Measure:
+    """The machine as gate-lock.sh counts it. A bash that fails, or a number that is not one, is a measure that failed: one
+    job and the reason, never an exit (D-K4o)."""
+    measure = Measure()
     lock = os.path.join(repo_root(), "scripts", "gate-lock.sh")
-    order = 'source "$1"; gate_cgroup_read; printf "%s|%s" "$GATE_CG_MEM_KB" "$GATE_CG_CPUS"'
-    res = subprocess.run(
-        ["bash", "-c", order, "gate-dag", lock], capture_output=True, text=True, check=False
-    )
-    if res.returncode != 0:
-        die("gate_cgroup_read refused to read the limits: " + res.stderr.strip())
-    mem_kb, _, cpus = res.stdout.partition("|")
-    return mem_kb.strip(), cpus.strip()
+    res = subprocess.run(["bash", "-c", MEASURE_ORDER, "gate-dag", lock], capture_output=True, text=True, check=False)
+    fields = res.stdout.split("\0")
+    if res.returncode != 0 or len(fields) != 6:
+        measure.why = "the resource measure of gate-lock.sh failed: " + (res.stderr.strip() or f"exit {res.returncode}")
+        return measure
+    nproc, cpus, mem_kb, free_kb, jobs, why = fields
+    measure.cgroup_cpu = int(cpus) if cpus.isdigit() else None
+    measure.cgroup_mem_kb = mem_kb.strip()
+    measure.nproc = int(nproc) if nproc.isdigit() else None
+    measure.free_ram_kb = int(free_kb) if free_kb.isdigit() else None
+    measure.jobs = int(jobs) if jobs.isdigit() and int(jobs) > 0 else 1
+    measure.why = why.strip()
+    return measure
 
 
 def total_memory() -> int:
     return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
 
 
-def capacities() -> tuple[int, int]:
-    """Returns (C cores, R bytes): R is the scope's memory less max(4 GiB, 10 %)."""
-    mem_kb, cpus = cgroup_limits()
+def capacities(measure: Measure | None = None) -> tuple[int, int]:
+    """Returns (C cores, R bytes): R is the scope's memory less max(4 GiB, 10 %). A cgroup that could not be read leaves the
+    machine's own cores and memory."""
+    measure = measure or measure_machine()
+    mem_kb = measure.cgroup_mem_kb
     margin = int(mem_kb) * 1024 if mem_kb.isdigit() else total_memory()
     ram = margin - max(MIN_RESERVE, margin // 10)
-    cpu = int(cpus) if cpus.isdigit() and int(cpus) > 0 else (os.cpu_count() or 1)
+    cpu = measure.cgroup_cpu if measure.cgroup_cpu else (os.cpu_count() or 1)
     return cpu, ram
+
+
+def disk_free_gb() -> int | None:
+    """D-K4p: the GiB free where the targets live: CARGO_TARGET_DIR, or its first ancestor that exists (the repo's own
+    filesystem without one). Only measured: unreadable is None, not a failure."""
+    path = os.environ.get("CARGO_TARGET_DIR") or repo_root()
+    while path and not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return shutil.disk_usage(path).free // GIB
+    except OSError:
+        return None
+
+
+def battery_state() -> str:
+    """D-K4p: `discharging` when a battery discharges, `ac` when there is one and it does not, `none` when there is none (no
+    root, as in WSL), `unknown` when a supply cannot be read. Only measured: it changes no decision."""
+    root = os.environ.get("GATE_POWER_SUPPLY_ROOT", "/sys/class/power_supply")
+    try:
+        units = sorted(os.listdir(root))
+    except (FileNotFoundError, NotADirectoryError):
+        return "none"
+    except OSError:
+        return "unknown"
+    found, unreadable = False, False
+    for unit in units:
+        try:
+            with open(os.path.join(root, unit, "type"), encoding="utf-8") as fh:
+                kind = fh.read().strip()
+            if kind != "Battery":
+                continue
+            found = True
+            with open(os.path.join(root, unit, "status"), encoding="utf-8") as fh:
+                if fh.read().strip() == "Discharging":
+                    return "discharging"
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unreadable = True
+    if unreadable:
+        return "unknown"
+    return "ac" if found else "none"
+
+
+def lanes_for(cores: int, free_ram_kb: int | None) -> int:
+    """D-K4m: the lanes of the rule: 3 from 16 cores and 48 GiB, 2 from 8 cores and 24 GiB, 1 below. What does not reach a
+    step stays in the one below it."""
+    if free_ram_kb is None:
+        return 1
+    gib = free_ram_kb / (1 << 20)
+    for min_cores, min_gib, lanes in LANES_TABLE:
+        if cores >= min_cores and gib >= min_gib:
+            return lanes
+    return 1
 
 
 # --- history ------------------------------------------------------------------
@@ -609,10 +737,15 @@ NOMBRE_COTA = {"paso": "longest step", "cpu": "CPU", "ram": "RAM"}
 
 
 class Planner:
-    def __init__(self, steps: list[Step], dag: bool, tabla: str, timed_end: str | None = None) -> None:
+    # D-K4n: the rows alive at once that `auto` allows; None is no cap. A class default, so that a planner made without
+    # __init__ (the property tests of the admission) has none.
+    lanes: int | None = None
+
+    def __init__(self, steps: list[Step], asked: str, tabla: str, timed_end: str | None = None) -> None:
         self.steps = steps
         self.by_id = {s.id: s for s in steps}
-        self.dag = dag
+        self.asked = asked
+        self.dag = asked != "serie"
         self.tabla = tabla
         # CI-F3.3b-2: the line the judge of the test times reads up to; printed once, before the first untimed block.
         self.timed_end = timed_end
@@ -625,9 +758,13 @@ class Planner:
         self.delegado = delegate(self.scope)
         # CI-J14d: a DATABASE_URL of the operator is one server for every row, and sqlx drops databases by name.
         self.shared_server = bool(os.environ.get("DATABASE_URL"))
+        # CI-K4 (D-K4o): a measure that could not be read puts the planner in series, with one job, and the plan says what.
+        self.machine = measure_machine()
         # CI-J14a: what runs in series is recorded as series, so the next run of this table has a serial run to learn from.
-        self.solo = not (dag and self.delegado and self.hist_runs and not self.shared_server)
+        self.solo = not (self.dag and self.delegado and self.hist_runs and not self.shared_server and not self.machine.why)
         self.modo = "serie" if self.solo else "dag"
+        self.plan = self.make_plan()
+        self.lanes = self.plan["carriles"] if asked == "auto" else None
         root = repo_root()
         sha, arbol_sucio = git_state(root)
         self.corrida: gate_history.Corrida | None = gate_history.run_start(
@@ -638,7 +775,7 @@ class Planner:
             run=self.run_id,
             arbol_sucio=arbol_sucio,
         )
-        self.cpu, self.ram = capacities()
+        self.cpu, self.ram = capacities(self.machine)
         # CI-F3.3c: the cores admitted never add up past the machine's (C), not 1,25·C: SAFETY is for RAM only.
         self.cpu_cap = self.cpu
         self.pools = pool_reference(steps)
@@ -651,7 +788,64 @@ class Planner:
         self.wake_r: int | None = None
         self.wake_w: int | None = None
         self.rank, self.nxt = self.estimated_ranks()
+        self.print_plan()
         self.notes()
+
+    def jobs_origin(self) -> str:
+        """Whose the jobs of the plan are: the operator's CARGO_BUILD_JOBS (not the one this gate exported), a failed measure
+        (one job), or the gate's own count."""
+        named = os.environ.get("CARGO_BUILD_JOBS")
+        if named and named != os.environ.get("GATE_CARGO_JOBS_FROM_GATE"):
+            return "operator"
+        return "failed" if self.machine.why else "gate"
+
+    def make_plan(self) -> dict[str, Any]:
+        """D-K4q: what the planner measured of the machine and decided of it, with None for what it could not measure."""
+        machine = self.machine
+        cores = min(c for c in (machine.nproc, machine.cgroup_cpu) if c) if (machine.nproc or machine.cgroup_cpu) else None
+        free = machine.free_ram_kb
+        return {
+            "nproc": machine.nproc,
+            "cgroup_cpu": machine.cgroup_cpu,
+            "ram_free": None if free is None else round(free / (1 << 20), 1),
+            "disk_free": disk_free_gb(),
+            "bateria": battery_state(),
+            "jobs": machine.jobs,
+            "jobs_origen": self.jobs_origin(),
+            "carriles": lanes_for(cores, free) if cores else 1,
+            "pedido": self.asked,
+            "corre": self.modo,
+            "fallo": machine.why or None,
+        }
+
+    def runs_reason(self) -> str:
+        """Why a DAG that was asked for runs in series, in the words of the notes; empty when it does not."""
+        if not self.dag or not self.solo or self.machine.why:
+            return ""
+        if not self.delegado:
+            return "the scope is not delegated"
+        if not self.hist_runs:
+            return "no serial history for this table"
+        return "DATABASE_URL names a server of the operator"
+
+    def print_plan(self) -> None:
+        """D-K4q: the plan, in one line, before the first block."""
+        plan = self.plan
+        ram = "unknown" if plan["ram_free"] is None else f"{plan['ram_free']:.1f}"
+        disk = "unknown" if plan["disk_free"] is None else str(plan["disk_free"])
+        reason = self.runs_reason()
+        line = (
+            f"plan: nproc={plan['nproc'] if plan['nproc'] is not None else 'unknown'} "
+            f"cgroup_cpu={plan['cgroup_cpu'] if plan['cgroup_cpu'] is not None else 'none'} "
+            f"ram_free={ram} GiB disk_free={disk} GB battery={plan['bateria']} "
+            f"jobs={plan['jobs']} ({plan['jobs_origen']}) lanes={plan['carriles']} "
+            f"asked={self.asked} runs={self.modo}"
+        )
+        if reason:
+            line += f" ({reason})"
+        if plan["fallo"]:
+            line += f" failed={plan['fallo']}"
+        print(line)
 
     def estimated_ranks(self) -> tuple[dict[str, float], dict[str, Step | None]]:
         """Each step's estimate from its history, then the critical-path ranks over those durations."""
@@ -666,6 +860,8 @@ class Planner:
             print(f"note: no serial history for this table ({self.tabla[:12]}): the planner runs in series")
         if self.dag and self.shared_server:
             print("note: DATABASE_URL names a server this judge did not make, so every row shares it and sqlx drops databases by name: the planner runs in series")
+        if self.dag and self.machine.why:
+            print(f"note: the machine could not be measured ({self.machine.why}): the planner runs in series with one job")
 
     def estimate(self, step: Step) -> None:
         previous = self.hist_steps.get(step.id, [])[-WINDOW:]
@@ -746,6 +942,8 @@ class Planner:
         return any(o.clase in EXCLUSIVE for o in alive)
 
     def capacity_wait(self, step: Step, alive: list[Step]) -> str | None:
+        if self.lanes is not None and len(alive) >= self.lanes:
+            return "lanes"
         if "models" in step.recursos:
             if sum("models" in o.recursos for o in alive) >= MAX_MODELS:
                 return "models"
@@ -777,6 +975,8 @@ class Planner:
         env = dict(os.environ)
         env["TMPDIR"] = tmp
         env.update(step.env)
+        if step.env.get("CARGO_BUILD_JOBS", "").isdigit():
+            env["CARGO_BUILD_JOBS"] = str(self.row_jobs(int(step.env["CARGO_BUILD_JOBS"])))
         targets = [r[len("target:"):] for r in step.recursos if r.startswith("target:")]
         if targets:
             if "CARGO_TARGET_DIR" in step.env:
@@ -791,6 +991,16 @@ class Planner:
             die(f"step {step.id} would change {', '.join(outside)}, outside the closed list (D-F3j)")
         print(f"dag: {step.id} env: {' '.join(changed)}")
         return env
+
+    def row_jobs(self, named: int) -> int:
+        """D-K4n: what the row names is its ceiling, not its share. In series it takes min(its number, the jobs of the machine);
+        in `auto`, with the rows alive at once, min(its number, max(1, the jobs / the lanes)); in `maximo`, its own number."""
+        if self.asked == "maximo":
+            return named
+        jobs = self.plan["jobs"]
+        if self.asked == "serie" or self.solo:
+            return min(named, jobs)
+        return min(named, max(1, jobs // self.plan["carriles"]))
 
     def cgroup_for(self, step: Step) -> str | None:
         if not self.delegado:
@@ -950,9 +1160,18 @@ class Planner:
             return False
         return True
 
+    def overlap_of(self, step: Step) -> float:
+        """D-K4r: the seconds of this row in which another one ran: the union, over the rows that started. A row still
+        running is counted up to the end of this one, which is as far as its interval can touch it."""
+        started = [s for s in self.steps if s.t_start is not None]
+        intervals = [(s.t_start, s.t_end if s.t_end is not None else step.t_end) for s in started]
+        return gate_history.solape_s(intervals, started.index(step))
+
     def record_step(self, step: Step) -> None:
+        step.solape_s = self.overlap_of(step)
         if self.corrida is None or step.paso is None:
             return
+        timings = gate_history.keep_timings(self.corrida, step.paso, step.log) if step.log else None
         gate_history.step_end(
             self.corrida,
             step.paso,
@@ -967,6 +1186,8 @@ class Planner:
             anon_max=step.anon_max,
             oom_kill=step.oom_kill,
             psi=step.psi,
+            timings=timings,
+            solape_s=step.solape_s,
         )
 
     # verdict
@@ -1193,6 +1414,18 @@ class Planner:
             f"T/LB_run={ratio(total, self.lb_run)}; steps={len(self.steps)}; C={self.cpu}; "
             f"R={self.ram / GIB:.2f} GiB; mode={self.modo}"
         )
+        for step in self.ran_steps():
+            print(self.step_line(step))
+
+    @staticmethod
+    def step_line(step: Step) -> str:
+        """D-K4r: the numbers of one row, as the history keeps them."""
+        peak = "n/a" if step.mem_peak is None else f"{step.mem_peak / GIB:.2f}"
+        cpu = "n/a" if step.cpu_s is None else f"{step.cpu_s:.2f}"
+        return (
+            f"dag: step {step.id} seg={step.t_end - step.t_start:.2f} wait={step.t_start - step.t_ready:.2f} "
+            f"overlap={step.solape_s or 0.0:.2f} mem_peak={peak} cpu_s={cpu}"
+        )
 
     def ran_steps(self) -> list[Step]:
         return [s for s in self.steps if s.rc is not None]
@@ -1215,6 +1448,7 @@ class Planner:
             load=loadavg(),
             hilos=self.cpu,
             oom_kill=sum(oom) if oom and all(o is not None for o in oom) else None,
+            plan=self.plan,
         )
 
 
@@ -1283,18 +1517,18 @@ def stop_on_signal(_signum: int, _frame: object) -> NoReturn:
 
 def run_table(path: str, timed_end: str | None = None) -> int:
     mode = os.environ.get("GATE_DAG", "0")
-    if mode not in ("0", "1"):
-        die(f"GATE_DAG is {mode!r}; it has to be 0 (series) or 1 (DAG)")
+    if mode not in ASKED:
+        die(f"GATE_DAG is {mode!r}; it has to be 0 or serie (series), auto (DAG with lanes), or 1 or maximo (DAG)")
     for signum in STOP_SIGNALS:
         signal.signal(signum, stop_on_signal)
     steps = parse_table(path)
-    return Planner(steps, mode == "1", table_key(path), timed_end).execute()
+    return Planner(steps, ASKED[mode], table_key(path), timed_end).execute()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Lane planner of the local judge (CI-F3, F3.2).")
     commands = parser.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="run a step table: GATE_DAG=0 series, GATE_DAG=1 DAG")
+    run = commands.add_parser("run", help="run a step table: GATE_DAG=0 or serie, auto, or 1 or maximo")
     run.add_argument("--table", required=True)
     run.add_argument("--timed-end", default=None, help="the line printed before the first untimed block (CI-F3.3b-2)")
     commands.add_parser("allowed-env", help="print the closed list of a step's environment, one name per line (CI-J13)")
