@@ -1580,8 +1580,28 @@ fn a_systemd_run_with_no_session_to_talk_to_builds_without_the_cap_and_one_with_
         "the release build has to run exactly once, outside any scope: {calls:?}\n{text}"
     );
     assert!(
-        calls[0].contains("build --release --features cuda") && calls[0].ends_with("scope=0"),
+        calls[0].starts_with("build --release ") && calls[0].ends_with("scope=0"),
         "the one cargo call was not the uncapped release build: {calls:?}\n{text}"
+    );
+    // CI-K8 (D-K8e): the release build is the set publish.yml publishes on Linux x64, read from there and not typed here.
+    let asked = features_asked_for(
+        &calls[0]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+    );
+    let published = published_features(
+        &read(".github/workflows/publish.yml"),
+        "x86_64-unknown-linux-gnu",
+    )
+    .expect("publish.yml has no matrix element with target x86_64-unknown-linux-gnu and a features: line");
+    assert!(
+        !published.is_empty(),
+        "publish.yml publishes x86_64-unknown-linux-gnu with no features: the comparison below would be vacuous"
+    );
+    assert_eq!(
+        asked, published,
+        "the uncapped release build asks for {asked:?} and publish.yml publishes {published:?}: {calls:?}\n{text}"
     );
     assert!(
         text.contains("without a memory cap"),
@@ -2583,15 +2603,17 @@ fn every_gate_entry_point_is_executable_in_the_index() {
 }
 
 /// The lines of `body` that point into a Windows drive as WSL mounts it
-/// (`/mnt/c/`, `/mnt/d/`, whatever the case), as `<name>:<line>: <text>`.
+/// (`/mnt/c/`, `/mnt/d/`, whatever the case), as `<name>:<line>: <text>`. The
+/// fixtures of a self-test are made-up data (CI-K9 feeds the gate a `PATH` with
+/// `/mnt/c/k9a-windows` on purpose), so only the code outside it is judged.
 fn windows_drive_refs(name: &str, body: &str) -> Vec<String> {
-    body.lines()
-        .enumerate()
+    outside_self_test(body)
+        .into_iter()
         .filter(|(_, line)| {
             let line = line.to_ascii_lowercase();
             line.contains("/mnt/c/") || line.contains("/mnt/d/")
         })
-        .map(|(n, line)| format!("{name}:{}: {}", n + 1, line.trim()))
+        .map(|(n, line)| format!("{name}:{n}: {}", line.trim()))
         .collect()
 }
 
@@ -2614,6 +2636,22 @@ fn no_gate_script_points_into_a_windows_drive() {
         3,
         "the scan must flag /mnt/c/ and /mnt/d/ in any case and nothing that only looks like \
          them. It flagged {strays:?}"
+    );
+    let with_fixtures = windows_drive_refs(
+        "fixture.sh",
+        "ls /mnt/c/stray\n# --- self-test begin ---\nPATH=/mnt/c/k9a-windows:/mnt/d/k9a/bin\n\
+         # --- self-test end ---\ncd /mnt/d/after\n",
+    );
+    assert_eq!(
+        with_fixtures,
+        vec![
+            "fixture.sh:1: ls /mnt/c/stray".to_string(),
+            "fixture.sh:5: cd /mnt/d/after".to_string()
+        ],
+        "the scan must flag a path into a Windows drive before and after the self-test, with the \
+         line it is on, and leave alone the fixtures between the markers. A scan that skipped \
+         the whole script, or none of the self-test, would be the one that passes or fails by \
+         accident"
     );
 
     let mut read_files = 0;

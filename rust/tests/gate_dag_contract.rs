@@ -1187,7 +1187,7 @@ fn a_finished_block_is_written_before_the_next_step_starts() {
 #[test]
 fn a_step_under_the_gate_lock_gets_a_one_use_ticket_in_the_lock() {
     let mut fx = Fixture::new("lane-ticket", CPU_FOUR, MEM_OPEN);
-    fx.table(&[(10, "P", "-", "0", "")]);
+    fx.table(&[(10, "P", "-", "0.1", "")]);
     let lock = fx.base.join("lock");
     let owner = "pid=1 start=1 where=test since=test token=test";
     let run = fx.run_env(
@@ -3452,15 +3452,15 @@ fn in_auto_no_more_rows_are_inside_than_the_lanes_and_in_maximo_they_all_are() {
     let rows = [
         StepRow {
             script: script.clone(),
-            ..fx.row(10, "a", "", "1")
+            ..fx.row(10, "a", "-", "1")
         },
         StepRow {
             script: script.clone(),
-            ..fx.row(20, "b", "", "1")
+            ..fx.row(20, "b", "-", "1")
         },
         StepRow {
             script,
-            ..fx.row(30, "c", "", "1")
+            ..fx.row(30, "c", "-", "1")
         },
     ];
     table_of(&mut fx, &rows);
@@ -3734,13 +3734,16 @@ fn in_series_nothing_overlaps_and_each_row_gets_its_line_after_the_summary() {
     }
 }
 
+/// (tag, the power supply the root holds as (type, status), the `battery=` the plan has to say), per case of the battery.
+type BatteryCase<'a> = (&'a str, Option<(&'a str, &'a str)>, &'a str);
+
 /// Spec K4-B, D-K4p: the battery and the disk are measured, printed and saved, and change nothing. A battery that
 /// discharges says `discharging`, one that does not says `ac`, a root with no battery or none at all says `none`, a
 /// `type` that cannot be read says `unknown`. In every case the jobs, the lanes and the mode are those of the machine
 /// without a battery, and the plan has no `failed=`.
 #[test]
 fn the_battery_is_measured_and_changes_nothing() {
-    let cases: [(&str, Option<(&str, &str)>, &str); 5] = [
+    let cases: [BatteryCase; 5] = [
         ("sin-ninguna", None, "none"),
         (
             "descargando",
