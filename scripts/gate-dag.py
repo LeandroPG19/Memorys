@@ -544,31 +544,51 @@ def plan_lines(text: str) -> list[str]:
     return [line for line in text.splitlines() if line.lstrip().startswith("{") and '"message":"resource plan"' in line]
 
 
-def plan_text(line: str) -> str | None:
-    """The `plan` field of a resource plan line, nested in `fields` as tracing writes it or at the top; None if unreadable."""
+def plan_fields(line: str) -> dict[str, Any] | None:
+    """The fields of a resource plan line, nested in `fields` as tracing writes them or at the top; None if unreadable."""
     try:
         obj = json.loads(line)
     except ValueError:
         return None
     fields = obj.get("fields", obj) if isinstance(obj, dict) else None
-    plan = fields.get("plan") if isinstance(fields, dict) else None
-    return plan if isinstance(plan, str) else None
+    return fields if isinstance(fields, dict) else None
+
+
+def planned_pool(ceiling: int, cores: int | None) -> int:
+    """CI-E13 (D-E13a): what the plan of production gives a pool on a machine of `cores` logical cores: half of them, at
+    least 1, at most the ceiling the rows with models name (rust/src/resources.rs: `half_cores.min(MAX_*_INTRA_THREADS)`). The
+    rows name the pools of a machine big enough for every ceiling; a line that says no cores is compared with the ceiling."""
+    return ceiling if cores is None else min(ceiling, max(1, cores // 2))
+
+
+def pool_problem(pool: str, value: int, ceiling: int, cores: int | None) -> str | None:
+    want = planned_pool(ceiling, cores)
+    if value == want:
+        return None
+    more = f" and {cores} CPUs give {want}" if want != ceiling else ""
+    return f"resource plan {pool}={value}, the rows with models set {ceiling}{more}"
 
 
 def plan_problem(line: str, reference: dict[str, int]) -> str | None:
-    """D-F34b: why this plan line is not the judge's: below the full tier, or other pools than the rows set (the
-    reranker's only when the plan keeps it off the GPU, where the pool of the CPU does not do the work)."""
-    plan = plan_text(line)
-    threads = PLAN_THREADS_RE.search(plan or "")
-    tier = PLAN_TIER_RE.search(plan or "")
-    if plan is None or threads is None or tier is None:
+    """D-F34b, D-E13a: why this plan line is not the judge's: below the full tier, or other pools than the rows set for the
+    cores the plan saw (the reranker's only when the plan keeps it off the GPU, where the pool of the CPU does not do the
+    work). The verdict is the same under a cgroup of 12 CPUs as under one of 24: the plan gives each pool half the cores."""
+    fields = plan_fields(line) or {}
+    plan = fields.get("plan") if isinstance(fields.get("plan"), str) else ""
+    threads = PLAN_THREADS_RE.search(plan)
+    tier = PLAN_TIER_RE.search(plan)
+    if threads is None or tier is None:
         return f"unreadable resource plan line: {line}"
     if tier.group(1) != "full":
         return f"resource plan tier {tier.group(1)}, the judge needs full"
+    cores = fields.get("cores_logical")
+    cores = cores if isinstance(cores, int) and not isinstance(cores, bool) and cores > 0 else None
     on_gpu = PLAN_GPU_RE.search(plan) is not None
     for pool, value in zip(("embed", "rerank", "nli"), threads.groups()):
-        if pool in reference and int(value) != reference[pool] and not (pool == "rerank" and on_gpu):
-            return f"resource plan {pool}={value}, the rows with models set {reference[pool]}"
+        if pool in reference and not (pool == "rerank" and on_gpu):
+            problem = pool_problem(pool, int(value), reference[pool], cores)
+            if problem:
+                return problem
     return None
 
 
