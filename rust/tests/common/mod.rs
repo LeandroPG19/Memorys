@@ -8,6 +8,7 @@
 // that clippy `-D warnings` turns into a failed gate.
 
 use std::future::Future;
+use std::time::{Duration, Instant};
 
 use memory_industry::db;
 use sha2::{Digest, Sha384};
@@ -20,6 +21,12 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// `OnceCell` does not belong to a runtime. A panic in the init leaves it empty, so the next test
 /// tries again.
 static TEMPLATE: OnceCell<String> = OnceCell::const_new();
+
+/// How long the template under construction gets to lose its last session before it is renamed.
+/// A run where nobody lingers pays nothing; one where a backend is slow to die (the judge's
+/// server competes for the CPU with a release build, the mutation and every other lane) waits
+/// for it instead of failing the 5 s RENAME gives it.
+const SESSIONS_LEAVE_WITHIN: Duration = Duration::from_secs(60);
 
 /// Re-rolls every id a migration seeded with a random default, in the tables the clone holds rows
 /// of. 33 columns in `public` default to `gen_random_uuid()`, 3 of them in tables with rows
@@ -104,9 +111,13 @@ fn template_key() -> String {
 
 /// A sealed `test_tpl_<key>` is a clone source nobody can connect to. A clone from a template with
 /// a session on it waits 5 s and fails with 55006 (measured), and RENAME has the same requirement,
-/// so the builder closes its only pool, seals with ALLOW_CONNECTIONS false (which keeps out
-/// autovacuum too) and only then publishes under the final name. STRATEGY FILE_COPY is not used:
-/// it forces a checkpoint, 0.86-3.4 s per clone against 0.11-0.37 s with the default WAL_LOG.
+/// so the builder closes its only pool, seals with ALLOW_CONNECTIONS false (which keeps new
+/// sessions out), waits until `pg_stat_activity` shows nobody on it and only then publishes under
+/// the final name. `pool.close()` returns once the Terminate message is sent, not once the backend
+/// has exited: 10-nov-2026 two builds in a row failed their RENAME with 55006 on a judge at 14
+/// cores of 24, and the server's log of that run was lost, so who stayed connected is not known
+/// (the wait names it if it happens again). STRATEGY FILE_COPY is not used: it
+/// forces a checkpoint, 0.86-3.4 s per clone against 0.11-0.37 s with the default WAL_LOG.
 async fn the_template(url: &str) -> &'static str {
     TEMPLATE.get_or_init(|| build_the_template(url)).await
 }
@@ -164,6 +175,11 @@ async fn build_the_template(url: &str) -> String {
         "sealing the template",
     )
     .await;
+    if let Err(who) =
+        wait_until_no_session_is_left(&mut admin, &building, SESSIONS_LEAVE_WITHIN).await
+    {
+        panic!("emptying the template before publishing it: {who}");
+    }
     match admin
         .execute(format!("ALTER DATABASE {building} RENAME TO {name}").as_str())
         .await
@@ -181,6 +197,51 @@ async fn build_the_template(url: &str) -> String {
         Err(why) => refuse("publishing the template", &why),
     }
     name
+}
+
+/// Polls `pg_stat_activity` over `admin` (a session on another database) until nobody is connected
+/// to `database`, which is what RENAME and `CREATE DATABASE ... TEMPLATE` demand of it. The caller
+/// has to have closed its own sessions and kept new ones out; what is left is a backend still on
+/// its way out or someone else's. When `within` runs out the error says who is still there (pid,
+/// backend type, application name, state and the start of the last query), so the next failure
+/// diagnoses itself.
+pub async fn wait_until_no_session_is_left(
+    admin: &mut PgConnection,
+    database: &str,
+    within: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + within;
+    loop {
+        let left: Vec<(i32, String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT pid, backend_type::text, application_name::text, state::text, \
+                    coalesce(left(query, 60), '') \
+             FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid() ORDER BY pid",
+        )
+        .bind(database)
+        .fetch_all(&mut *admin)
+        .await
+        .map_err(|why| format!("reading pg_stat_activity: {why}"))?;
+        if left.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let who: Vec<String> = left
+                .iter()
+                .map(|(pid, kind, application, state, query)| {
+                    format!(
+                        "pid {pid} ({kind}, application_name '{application}', state {}): {query}",
+                        state.as_deref().unwrap_or("none")
+                    )
+                })
+                .collect();
+            return Err(format!(
+                "{database} still has {} session(s) after waiting {within:?}: {}",
+                left.len(),
+                who.join("; ")
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Runs `body` against a database created for it, on the server `DATABASE_URL`
