@@ -1086,12 +1086,25 @@ FAKE
   fake_tree c1 "$lane_body"
   run_copy_as unset c1 ""
   (( rc == 0 )) || self_fail "C1: the gate without DATABASE_URL on Linux exited $rc: $(cat "$tmp/c1.out")"
-  # CI-F3.3b-1 (D-F3b, spec §4 F3.3b): the chains of the step table, in idx order, one process and one
-  # cluster each: dbg (CL..D3), b3 (B3), rel (R), e2e (E). Then the build without docs (CI-K8): it opens no cluster.
+  # CI-F3.3b-1 (D-F3b, spec §4 F3.3b) and CI-E11 (E11-10, D-E11b): the chains of the step table, in idx order, one process
+  # and one cluster each: b1 (CL, B1: the lint and the build of T_dbg), then its readers dbg (D1), ct (CT), d2 (D2), d3 (D3)
+  # and nli (NLI), b3 (B3), rel (R), e2e (E). Then the build without docs (CI-K8): it opens no cluster.
   lane_order='run-all-tests --check-models
+up b1
+run-all-tests --lane CL --lane B1
+down b1
 up dbg
-run-all-tests --lane CL --lane D1 --lane D2 --lane D3
+run-all-tests --lane D1
 down dbg
+up ct
+run-all-tests --lane CT
+down ct
+up d2
+run-all-tests --lane D2
+down d2
+up d3
+run-all-tests --lane D3
+down d3
 up nli
 run-all-tests --lane NLI
 down nli
@@ -1185,7 +1198,7 @@ down mut'
   run_copy_as unset d1 ""
   (( rc == 1 )) || self_fail "D1: the gate whose run-all-tests failed exited $rc, not 1: $(cat "$tmp/d1.out")"
   [[ "$(exit_file d1)" == 1 ]] || self_fail "D1: the exit file says '$(exit_file d1)', not 1"
-  grep -qx 'down dbg' "$tmp/d1/home/steps" || self_fail "D1: lane dbg was not taken down after its failed step: $(cat "$tmp/d1/home/steps")"
+  grep -qx 'down b1' "$tmp/d1/home/steps" || self_fail "D1: lane b1 was not taken down after its failed step: $(cat "$tmp/d1/home/steps")"
   grep -q -- '--no-default-features' "$tmp/d1/home/steps" && self_fail "D1: the build without docs ran after the failed run-all-tests: $(cat "$tmp/d1/home/steps")"
   # D2: a gate stopped by TERM, HUP or INT, during its first lane, takes that lane down (down-all) and
   # leaves 2 in its exit file.
@@ -1803,7 +1816,7 @@ exit 0'
   [[ -n "$plan_asked" ]] || self_fail "planner: the gate printed no plan line with what it asked for: $(cat "$tmp/planner.out")"
   echo "gate default: GATE_DAG unset asks for $plan_asked"
   dag_order="$(sed -n 's/^dag: \([A-Za-z0-9]*\) env:.*/\1/p' "$tmp/planner.out" | tr '\n' ' ')"
-  [[ "$dag_order" == "P DBG NLI B3 REL E2E DC CV M " ]] \
+  [[ "$dag_order" == "P B1 DBG CT D2 D3 NLI B3 REL E2E DC CV M " ]] \
     || self_fail "planner: the planner did not start the rows of gate-dag.txt in idx order (it started: '$dag_order')"
   # The boundary line is printed by the planner before the first untimed row (CV), after the block of DC (the build
   # without docs) and before the block of crap-gate: the judge of the test times reads up to it, so CV and M are not
@@ -1830,6 +1843,26 @@ exit 0'
     || self_fail "planner red: the planner does not name the red row CV: $(cat "$tmp/planner_red.out")"
   [[ "$(exit_file planner_red)" == 1 ]] \
     || self_fail "planner red: the exit file says '$(exit_file planner_red)', not 1"
+  # E11-11 (CI-E11, D-E11b): a reader of T_dbg that is red is the red of the judge, with its row. The stand-in of run-all-tests
+  # exits 1 on `--lane CT`: the gate exits 1, names CT, prints no MERGE GATE PASSED and leaves no verdict green, and the rows
+  # after CT in the serial order (D2, D3, NLI, B3, REL, E2E, DC, CV, M) do not start; B1 and DBG, which come first, did.
+  ct_body='case "${1:-}" in --check-models) echo "run-all-tests --check-models" >>"$HOME/steps"; exit 0 ;; esac
+echo "run-all-tests${*:+ $*}" >>"$HOME/steps"
+case " $* " in *" --lane CT "*) exit 1 ;; esac
+exit 0'
+  fake_tree ctred "$ct_body"
+  run_copy_as "$judge_test_url" ctred ""
+  (( rc == 1 )) || self_fail "E11-11: the lane CT exited 1 and the gate exited $rc, not 1: $(cat "$tmp/ctred.out")"
+  grep -qF 'FAIL: CT exited 1' "$tmp/ctred.out" \
+    || self_fail "E11-11: the gate does not name the red row CT: $(cat "$tmp/ctred.out")"
+  grep -q 'MERGE GATE PASSED' "$tmp/ctred.out" \
+    && self_fail "E11-11: row CT failed and the judge said PASSED: $(cat "$tmp/ctred.out")"
+  [[ "$(exit_file ctred)" == 1 ]] || self_fail "E11-11: the exit file says '$(exit_file ctred)', not 1"
+  grep -qxF 'run-all-tests --lane D1' "$tmp/ctred/home/steps" \
+    || self_fail "E11-11: the rows before CT did not run (no 'run-all-tests --lane D1'): $(steps_of ctred)"
+  if grep -qE '^(up (d2|d3|nli|b3|rel|e2e)|run-all-tests --lane (D2|D3|NLI|B3|R|E)$|crap-gate|mutants-gate|cargo clippy .*--no-default-features)' "$tmp/ctred/home/steps"; then
+    self_fail "E11-11: a row after the red CT started: $(steps_of ctred)"
+  fi
   # CI-F3.3b-2 (spec F3.3b-1b-iii): the rows that are not timed are CV and M, the rows after DC. The judge of
   # the test times reads this gate's log only up to the boundary line the planner prints before the first of them, so a
   # crap-gate whose output carries a timed `finished in` line does not change the judgement, and the boundary is not the
@@ -1876,7 +1909,7 @@ exit 0'
     CUBA_GATE_LOCK_OWNER="$step_owner_before" CUBA_GATE_LANE_TOKEN=tok-planted \
     "$BASH" "$tmp/step_ok/scripts/merge-gate.sh" --step DBG >"$tmp/step_ok.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 0 )) || self_fail "--step with its ticket exited $step_rc, not 0: $(cat "$tmp/step_ok.out")"
-  [[ "$(grep -E '^(up |down |run-all-tests)' "$tmp/step_ok/home/steps")" == "$(printf '%s\n' 'up dbg' 'run-all-tests --lane CL --lane D1 --lane D2 --lane D3 token=tok-planted' 'down dbg')" ]] \
+  [[ "$(grep -E '^(up |down |run-all-tests)' "$tmp/step_ok/home/steps")" == "$(printf '%s\n' 'up dbg' 'run-all-tests --lane D1 token=tok-planted' 'down dbg')" ]] \
     || self_fail "--step with its ticket did not run the lane of DBG with the token in its environment: $(steps_of step_ok)"
   [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-planted ]] \
     || self_fail "--step spent the ticket its lane has to spend"

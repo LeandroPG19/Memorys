@@ -175,6 +175,15 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --timings' > "$tmp/gate6.sh"
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate6.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
   [[ "$got" == "0" ]] || { echo "FAIL self-test: the plain cargo test counted by run_counted (CI-E1) was not taken as the run of the marked files (got $got)" >&2; exit 1; }
+  # CI-E11 (D-E11e) took the contracts and the doctests out of the plain pass: it is the library and PLAIN_TESTS, the files of
+  # tests/ that are not contracts of the judge, and it is still the run of the marked files, which are never contracts.
+  printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --lib "${PLAIN_TESTS[@]}" --timings' > "$tmp/gate7.sh"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate7.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "0" ]] || { echo "FAIL self-test: the plain pass of CI-E11 (the library and PLAIN_TESTS) was not taken as the run of the marked files (got $got)" >&2; exit 1; }
+  # A selection of the plain pass that names no PLAIN_TESTS runs none of the marked files, and is still caught.
+  printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" run_counted plain 0 cargo test --lib --timings' > "$tmp/gate8.sh"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate8.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "2" ]] || { echo "FAIL self-test: a plain pass that is the library alone, with no PLAIN_TESTS, was taken as the run of the marked files (got $got)" >&2; exit 1; }
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-23 2>/dev/null | tail -1)"
   [[ "$got" == "1" ]] || { echo "FAIL self-test: a CI exclusion past its date was not caught (got $got)" >&2; exit 1; }
   printf '%s\n' '// needs-a-server:   ' 'mod common;' > "$tmp/tests/unexplained.rs"

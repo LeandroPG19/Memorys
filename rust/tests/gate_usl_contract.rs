@@ -79,15 +79,18 @@ const C_NUCLEOS: u32 = 24;
 const PSI_QUIETA: &str = "some avg10=1.00 avg60=0.00 avg300=0.00 total=0\n";
 const PSI_OCUPADA: &str = "some avg10=40.00 avg60=0.00 avg300=0.00 total=0\n";
 
-/// The judge's table with the figures that matter here (DBG at `{DBG}` jobs, B3 at 12 cores) and the profile tokens that
-/// CI-K4 put on the rows that compile in the dev profile (DBG, its reader NLI and DC).
+/// The judge's table with the figures that matter here (B1 at `{B1}` jobs, B3 at 12 cores) and the profile tokens that
+/// CI-K4 put on the rows that compile in the dev profile (B1, its reader NLI and DC). CI-E11: the row that compiles T_dbg
+/// is B1 (it was DBG), and the scenarios below that measured or simulated "the debug row" do it on B1; the figures of the 19th
+/// run that were DBG's (391.036 s) are B1's here, because only the shape of the table matters to these scenarios. The
+/// readers of T_dbg that CI-E11 added are not in this fixture: the real table is read by `u22`.
 const TABLA: &str = "\
 10 P - - normal 2 2 20 bash scripts/merge-gate.sh --step P
-20 DBG P target:T_dbg,cluster:C_dbg,models normal 8 8 421 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS={DBG} CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step DBG
-25 NLI DBG target:T_dbg,cluster:C_nli,models,reader exclusive 8 8 60 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step NLI
+20 B1 P target:T_dbg,cluster:C_dbg,models normal 8 8 421 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS={B1} CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step B1
+25 NLI B1 target:T_dbg,cluster:C_nli,models,reader exclusive 8 8 60 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step NLI
 30 B3 P target:T_rel normal 12 16 150 CARGO_BUILD_JOBS=12 bash scripts/merge-gate.sh --step B3
 40 REL B3 target:T_rel,cluster:C_relh,models,reader normal 8 12 221 CARGO_BUILD_JOBS=2 CUBA_EMBED_INTRA_THREADS=4 CUBA_NLI_INTRA_THREADS=4 CUBA_RERANK_INTRA_THREADS=8 bash scripts/merge-gate.sh --step REL
-50 E2E B3,DBG target:T_rel,cluster:C_e2e,models,reader normal 8 12 113 CARGO_BUILD_JOBS=2 bash scripts/merge-gate.sh --step E2E
+50 E2E B3,B1 target:T_rel,cluster:C_e2e,models,reader normal 8 12 113 CARGO_BUILD_JOBS=2 bash scripts/merge-gate.sh --step E2E
 60 DC P target:T_docs normal 8 8 325 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_BUILD_JOBS=8 bash scripts/merge-gate.sh --step DC
 70 CV P target:T_cov,cluster:C_cov untimed 4 4 45 CARGO_BUILD_JOBS=4 bash scripts/merge-gate.sh --step CV
 80 M P target:T_mut,cluster:C_mut untimed 8 8 136 CARGO_BUILD_JOBS=8 MUTANTS_JOBS=6 bash scripts/merge-gate.sh --step M
@@ -226,7 +229,7 @@ impl Fx {
         write(&fx.tree.join("rust/src/lib.rs"), "pub fn f() {}\n");
         write(
             &fx.tree.join("scripts/gate-dag.txt"),
-            &TABLA.replace("{DBG}", "8"),
+            &TABLA.replace("{B1}", "8"),
         );
         write(&fx.psi, PSI_QUIETA);
         write(&fx.sin_cgroup, "");
@@ -589,7 +592,7 @@ fn ajustar(fx: &Fx, perfil: &str, puntos: &[Value]) -> (Salida, Value) {
 #[test]
 fn u1_recupera_los_parametros_de_una_curva_conocida() {
     let fx = Fx::new("u1");
-    let (salida, v) = ajustar(&fx, "debug", &exacta("debug", "DBG", CURVA_A, &NIVELES_A));
+    let (salida, v) = ajustar(&fx, "debug", &exacta("debug", "B1", CURVA_A, &NIVELES_A));
     assert_eq!(salida.code, Some(0), "{}", salida.text());
     assert_eq!(v["fiable"], json!(true), "{}", salida.text());
     assert_eq!(v["puntos"], json!(14));
@@ -618,7 +621,7 @@ fn u1_recupera_los_parametros_de_una_curva_conocida() {
 #[test]
 fn u2_con_ruido_de_medio_por_ciento_sigue_fiable_y_la_rodilla_apenas_se_mueve() {
     let fx = Fx::new("u2");
-    let ruidosa = puntos_de("debug", "DBG", CURVA_A, &NIVELES_A, 2, |i, rep, _, t| {
+    let ruidosa = puntos_de("debug", "B1", CURVA_A, &NIVELES_A, 2, |i, rep, _, t| {
         let signo = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
         let por_replica = if rep == 0 { 1.0 } else { -1.0 };
         t * (1.0 + 0.005 * signo * por_replica)
@@ -631,7 +634,7 @@ fn u2_con_ruido_de_medio_por_ciento_sigue_fiable_y_la_rodilla_apenas_se_mueve() 
     cerca(num(&v["sigma"]), 0.06, 0.03, "sigma");
 
     // One point of J_min 4 % off must not drag the fit: lambda is profiled, not read off a single point.
-    let atipica = puntos_de("debug", "DBG", CURVA_A, &NIVELES_A, 2, |i, rep, _, t| {
+    let atipica = puntos_de("debug", "B1", CURVA_A, &NIVELES_A, 2, |i, rep, _, t| {
         if i == 0 && rep == 0 { t * 1.04 } else { t }
     });
     let (salida, v) = ajustar(&fx, "debug", &atipica);
@@ -669,7 +672,7 @@ fn u3_la_rodilla_y_n_estrella_salen_de_sus_formulas() {
     let (_, v) = ajustar(
         &fx,
         "debug",
-        &exacta("debug", "DBG", sin_coherencia, &niveles),
+        &exacta("debug", "B1", sin_coherencia, &niveles),
     );
     assert!(
         v["N_estrella"].is_null(),
@@ -685,13 +688,13 @@ fn u4_no_fiable_por_cada_criterio_con_su_motivo_y_exit_3() {
     let casos: Vec<(&str, Vec<Value>, &str)> = vec![
         (
             "levels",
-            exacta("debug", "DBG", CURVA_A, &[2, 4, 8, 16]),
+            exacta("debug", "B1", CURVA_A, &[2, 4, 8, 16]),
             "4 J levels, need 5",
         ),
         (
             "spread",
             // 22.2 % slower makes the spread (max - min) / median of the two replicas exactly 20 %.
-            puntos_de("debug", "DBG", CURVA_A, &NIVELES_A, 2, |_, rep, j, t| {
+            puntos_de("debug", "B1", CURVA_A, &NIVELES_A, 2, |_, rep, j, t| {
                 if rep == 1 && j == 8 {
                     t * 11.0 / 9.0
                 } else {
@@ -702,14 +705,14 @@ fn u4_no_fiable_por_cada_criterio_con_su_motivo_y_exit_3() {
         ),
         (
             "rmse",
-            puntos_de("debug", "DBG", CURVA_A, &NIVELES_A, 2, |i, _, _, t| {
+            puntos_de("debug", "B1", CURVA_A, &NIVELES_A, 2, |i, _, _, t| {
                 t * (1.0 + 0.15 * if i.is_multiple_of(2) { 1.0 } else { -1.0 })
             }),
             "rmse_rel",
         ),
         (
             "domain",
-            puntos_de("debug", "DBG", CURVA_A, &NIVELES_A, 2, |_, _, j, _| {
+            puntos_de("debug", "B1", CURVA_A, &NIVELES_A, 2, |_, _, j, _| {
                 100.0 * f64::from(j)
             }),
             "domain",
@@ -717,7 +720,7 @@ fn u4_no_fiable_por_cada_criterio_con_su_motivo_y_exit_3() {
         (
             "unstable",
             // J = 24 slower by 30 %: the fit with it and the fit without it put the knee far apart.
-            puntos_de("debug", "DBG", CURVA_A, &NIVELES_A, 2, |_, _, j, t| {
+            puntos_de("debug", "B1", CURVA_A, &NIVELES_A, 2, |_, _, j, t| {
                 if j == 24 { t * 1.3 } else { t }
             }),
             "unstable",
@@ -738,10 +741,10 @@ fn u4_no_fiable_por_cada_criterio_con_su_motivo_y_exit_3() {
 #[test]
 fn u5_los_puntos_rojos_o_cargados_no_entran() {
     let fx = Fx::new("u5");
-    let mut puntos = exacta("debug", "DBG", CURVA_A, &NIVELES_A);
-    let mut rojo = punto("debug", "DBG", 4, 2, 999.0);
+    let mut puntos = exacta("debug", "B1", CURVA_A, &NIVELES_A);
+    let mut rojo = punto("debug", "B1", 4, 2, 999.0);
     rojo["rc"] = json!(101);
-    let mut cargado = punto("debug", "DBG", 12, 2, 1.0);
+    let mut cargado = punto("debug", "B1", 12, 2, 1.0);
     cargado["cargado"] = json!(true);
     puntos.push(rojo);
     puntos.push(cargado);
@@ -758,7 +761,7 @@ fn u5_los_puntos_rojos_o_cargados_no_entran() {
 fn u6_la_recta_de_ram() {
     let fx = Fx::new("u6");
     let gib: u64 = 1 << 30;
-    let mut puntos = exacta("debug", "DBG", CURVA_A, &NIVELES_A);
+    let mut puntos = exacta("debug", "B1", CURVA_A, &NIVELES_A);
     con_rss(&mut puntos, 2 * gib, gib / 2);
     let (salida, v) = ajustar(&fx, "debug", &puntos);
     assert_eq!(salida.code, Some(0), "{}", salida.text());
@@ -807,11 +810,11 @@ fn u7_un_punto_por_j_y_replica_en_el_orden_fijado_con_su_j_sin_incremental_y_con
     let fx = Fx::new("u7");
     let tabla =
         fs::read_to_string(fx.tree.join("scripts/gate-dag.txt")).expect("the fixture's table");
-    let perfil_dbg = perfil_de_fila(&tabla, "DBG");
+    let perfil_dbg = perfil_de_fila(&tabla, "B1");
     assert!(
         perfil_dbg.contains("CARGO_PROFILE_DEV_DEBUG=0")
             && perfil_dbg.contains("CARGO_PROFILE_DEV_STRIP=symbols"),
-        "anchor: the DBG row of the fixture carries the profile of CI-K4, or this test proves nothing: {perfil_dbg:?}"
+        "anchor: the B1 row of the fixture carries the profile of CI-K4, or this test proves nothing: {perfil_dbg:?}"
     );
     let salida = fx.run(&[
         "barrido",
@@ -833,7 +836,7 @@ fn u7_un_punto_por_j_y_replica_en_el_orden_fijado_con_su_j_sin_incremental_y_con
         );
         assert_eq!(
             llamada.perfil, perfil_dbg,
-            "call {i} ({}): the sweep builds with the profile of the DBG row of the table",
+            "call {i} ({}): the sweep builds with the profile of the B1 row of the table",
             llamada.args
         );
     }
@@ -846,7 +849,7 @@ fn u7_un_punto_por_j_y_replica_en_el_orden_fijado_con_su_j_sin_incremental_y_con
     for linea in &lineas {
         assert_eq!(linea["repo"], json!("memory-industry"));
         assert_eq!(linea["perfil"], json!("debug"));
-        assert_eq!(linea["fila"], json!("DBG"));
+        assert_eq!(linea["fila"], json!("B1"));
         for campo in CAMPOS_PUNTO {
             assert!(
                 linea.get(campo).is_some(),
@@ -892,7 +895,7 @@ fn u7_un_punto_por_j_y_replica_en_el_orden_fijado_con_su_j_sin_incremental_y_con
             assert_eq!(
                 Path::new(&llamada.target),
                 destino,
-                "the target of the DBG row"
+                "the target of the B1 row"
             );
         }
     }
@@ -1138,13 +1141,13 @@ fn u18_un_cargo_colgado_se_corta_en_su_plazo() {
 fn u20_el_barrido_toma_el_perfil_de_la_fila_de_la_tabla_del_arbol() {
     // The tokens are not a copy in the tool: another profile in the table of the tree is another profile in the sweep.
     let fx = Fx::new("u20");
-    let otra = TABLA.replace("{DBG}", "8").replace(
+    let otra = TABLA.replace("{B1}", "8").replace(
         "CARGO_PROFILE_DEV_STRIP=symbols",
         "CARGO_PROFILE_DEV_STRIP=none",
     );
     write(&fx.tree.join("scripts/gate-dag.txt"), &otra);
     fx.commit("another profile for the dev rows");
-    let esperado = perfil_de_fila(&otra, "DBG");
+    let esperado = perfil_de_fila(&otra, "B1");
     assert!(
         esperado.contains("CARGO_PROFILE_DEV_STRIP=none"),
         "{esperado:?}"
@@ -1194,7 +1197,7 @@ fn u21_el_barrido_construye_en_el_target_de_su_fila_de_la_tabla_del_arbol() {
         ("release", "target:T_rel", "target:T_rel2", "4"),
     ] {
         let fx = Fx::new(&format!("u21-{perfil}"));
-        let otra = TABLA.replace("{DBG}", "8").replace(fila_vieja, nuevo);
+        let otra = TABLA.replace("{B1}", "8").replace(fila_vieja, nuevo);
         assert!(otra.contains(nuevo), "anchor: the table names {nuevo}");
         write(&fx.tree.join("scripts/gate-dag.txt"), &otra);
         fx.commit("another target for the rows of the profile");
@@ -1227,7 +1230,7 @@ type PasosDeCorrida = Vec<(&'static str, u32, f64)>;
 fn pasos_19(b3: f64, dbg: f64) -> PasosDeCorrida {
     vec![
         ("P", 10, 4.201),
-        ("DBG", 20, dbg),
+        ("B1", 20, dbg),
         ("NLI", 25, 37.508),
         ("B3", 30, b3),
         ("REL", 40, 102.530),
@@ -1239,12 +1242,12 @@ fn pasos_19(b3: f64, dbg: f64) -> PasosDeCorrida {
 }
 
 /// The 19th run with the rows that do not matter to U14-U16 short (REL 30 s, DC 20 s, CV 10 s, M 20 s). With
-/// the 19th's own DC, M and REL (8 cores each) the 24 cores are the bottleneck of the whole table and no J of DBG
-/// moves the simulated clock: the scenario is about DBG against B3, so the rest of the table has to fit around them.
+/// the 19th's own DC, M and REL (8 cores each) the 24 cores are the bottleneck of the whole table and no J of B1
+/// moves the simulated clock: the scenario is about B1 against B3, so the rest of the table has to fit around them.
 fn pasos_cortos(b3: f64, dbg: f64) -> PasosDeCorrida {
     vec![
         ("P", 10, 4.201),
-        ("DBG", 20, dbg),
+        ("B1", 20, dbg),
         ("NLI", 25, 37.508),
         ("B3", 30, b3),
         ("REL", 40, 30.0),
@@ -1313,12 +1316,12 @@ fn anadir(fichero: &Path, lineas: &[Value]) {
     write(fichero, &cuerpo);
 }
 
-/// The table of the judge with DBG at `dbg_jobs` jobs, committed in the fixture repo; returns the key of the history
+/// The table of the judge with B1 at `dbg_jobs` jobs, committed in the fixture repo; returns the key of the history
 /// that the planner writes for it in `tabla` (K9c: `clave_de_tabla`, not the sha256 of the bytes of the file).
 fn tabla_en_arbol(fx: &Fx, dbg_jobs: u32) -> String {
-    let texto = TABLA.replace("{DBG}", &dbg_jobs.to_string());
+    let texto = TABLA.replace("{B1}", &dbg_jobs.to_string());
     write(&fx.tree.join("scripts/gate-dag.txt"), &texto);
-    fx.commit(&format!("table with DBG at {dbg_jobs} jobs"));
+    fx.commit(&format!("table with B1 at {dbg_jobs} jobs"));
     clave_de_tabla(&texto)
 }
 
@@ -1350,14 +1353,14 @@ const NIVELES_RELEASE: [u32; 5] = [4, 6, 8, 12, 16];
 fn barridos_buenos(fx: &Fx) {
     let viejo = puntos_de(
         "debug",
-        "DBG",
+        "B1",
         CURVA_DEBUG,
         &NIVELES_DEBUG,
         2,
         |_, _, j, _| 100.0 * f64::from(j),
     );
     sembrar_barrido(fx, "20261103", "debug-viejo", &viejo);
-    let mut debug = exacta("debug", "DBG", CURVA_DEBUG, &NIVELES_DEBUG);
+    let mut debug = exacta("debug", "B1", CURVA_DEBUG, &NIVELES_DEBUG);
     con_rss(&mut debug, 2 << 30, (1 << 30) / 10);
     sembrar_barrido(fx, "20261104", "debug-bueno", &debug);
 }
@@ -1375,7 +1378,7 @@ fn u12_holguras_y_veredicto_de_juez_cuda_con_el_historial_de_la_19() {
     historial_de(&fx, &tabla, 391.036, pasos_19);
     let (salida, v) = recomendar(&fx);
     cerca(num(&v["L"]), 575.917, 0.001, "L");
-    for id in ["DBG", "E2E", "P"] {
+    for id in ["B1", "E2E", "P"] {
         assert_eq!(
             v["filas"][id]["estado"],
             json!("critica"),
@@ -1447,12 +1450,12 @@ fn u14_la_simulacion_elige_el_j_que_cabe_no_la_rodilla_y_solo_propone_si_gana_lo
     let antes = fs::read(fx.tree.join("scripts/gate-dag.txt")).expect("table");
     let (salida, v) = recomendar(&fx);
     assert_eq!(salida.code, Some(0), "{}", salida.text());
-    let dbg = &v["calibradas"]["DBG"];
+    let dbg = &v["calibradas"]["B1"];
     assert_eq!(dbg["J_actual"], json!(8), "{}", salida.text());
     assert_eq!(
         dbg["J_propuesto"],
         json!(12),
-        "not the knee (20) nor 16 or 24: DBG and B3 would stop fitting together\n{}",
+        "not the knee (20) nor 16 or 24: B1 and B3 would stop fitting together\n{}",
         salida.text()
     );
     assert_eq!(dbg["propone"], json!(true));
@@ -1472,7 +1475,7 @@ fn u14_la_simulacion_elige_el_j_que_cabe_no_la_rodilla_y_solo_propone_si_gana_lo
     );
     let antes_campos: Vec<&str> = quitan[0][1..].split_whitespace().collect();
     let despues_campos: Vec<&str> = ponen[0][1..].split_whitespace().collect();
-    assert_eq!(antes_campos[1], "DBG", "{diff}");
+    assert_eq!(antes_campos[1], "B1", "{diff}");
     assert_eq!(
         (antes_campos[5], despues_campos[5]),
         ("8", "12"),
@@ -1481,7 +1484,7 @@ fn u14_la_simulacion_elige_el_j_que_cabe_no_la_rodilla_y_solo_propone_si_gana_lo
     assert!(despues_campos.contains(&"CARGO_BUILD_JOBS=12"), "{diff}");
     for (i, (a, b)) in antes_campos.iter().zip(&despues_campos).enumerate() {
         if i != 5 && !a.starts_with("CARGO_BUILD_JOBS=") {
-            assert_eq!(a, b, "only the cpu and the jobs of DBG change:\n{diff}");
+            assert_eq!(a, b, "only the cpu and the jobs of B1 change:\n{diff}");
         }
     }
     assert!(
@@ -1503,28 +1506,28 @@ fn u14_la_simulacion_elige_el_j_que_cabe_no_la_rodilla_y_solo_propone_si_gana_lo
 
 #[test]
 fn u14b_una_fila_critica_con_una_curva_plana_se_conserva_y_con_umbral_cero_cambiaria() {
-    // DBG at 2 jobs on a shallow curve: some J is faster (gain > 0), none buys the threshold (spec U14, sabotage
-    // "threshold 0"). The gain has to be on a row that is critical and calibrated: since CI-F3.4 that is DBG alone.
+    // B1 at 2 jobs on a shallow curve: some J is faster (gain > 0), none buys the threshold (spec U14, sabotage
+    // "threshold 0"). The gain has to be on a row that is critical and calibrated: since CI-F3.4 that is B1 alone.
     let fx = Fx::new("u14b");
     let tabla = tabla_en_arbol(&fx, 2);
     historial_de(&fx, &tabla, 391.036, pasos_cortos);
-    let viejo = exacta("debug", "DBG", CURVA_PLANA, &NIVELES_PLANOS);
+    let viejo = exacta("debug", "B1", CURVA_PLANA, &NIVELES_PLANOS);
     sembrar_barrido(&fx, "20261104", "debug-plano", &viejo);
     let (salida, v) = recomendar(&fx);
     assert_eq!(salida.code, Some(0), "{}", salida.text());
-    let dbg = &v["calibradas"]["DBG"];
+    let dbg = &v["calibradas"]["B1"];
     assert_eq!(dbg["J_actual"], json!(2), "{}", salida.text());
     assert_eq!(dbg["propone"], json!(false), "{}", salida.text());
     assert_eq!(dbg["J_propuesto"], dbg["J_actual"]);
     let umbral = (0.02 * num(&v["L"])).max(10.0);
     assert!(
         num(&dbg["ganancia_s"]) > 0.0,
-        "the DBG row has a gain, under the threshold: {}",
+        "the B1 row has a gain, under the threshold: {}",
         dbg["ganancia_s"]
     );
     assert!(
         num(&dbg["ganancia_s"]) < umbral,
-        "DBG gain {} has to be under the threshold {umbral}",
+        "B1 gain {} has to be under the threshold {umbral}",
         dbg["ganancia_s"]
     );
     assert!(
@@ -1537,7 +1540,7 @@ fn u14b_una_fila_critica_con_una_curva_plana_se_conserva_y_con_umbral_cero_cambi
         texto
             .out
             .lines()
-            .any(|l| l.contains("DBG") && l.contains("se conserva")),
+            .any(|l| l.contains("B1") && l.contains("se conserva")),
         "{}",
         texto.text()
     );
@@ -1545,7 +1548,7 @@ fn u14b_una_fila_critica_con_una_curva_plana_se_conserva_y_con_umbral_cero_cambi
 
 #[test]
 fn u15_sin_ajuste_fiable_para_una_fila_critica_sale_3_con_la_orden_que_falta() {
-    // DBG and B3 as long as each other: both are on the critical path, and only DBG has a sweep.
+    // B1 and B3 as long as each other: both are on the critical path, and only B1 has a sweep.
     let fx = Fx::new("u15");
     let tabla = tabla_en_arbol(&fx, 8);
     historial_de(&fx, &tabla, 206.174, pasos_cortos);
@@ -1587,7 +1590,7 @@ fn u15_sin_ajuste_fiable_para_una_fila_critica_sale_3_con_la_orden_que_falta() {
         &fx,
         "20261105",
         "debug-ancho",
-        &exacta("debug", "DBG", ancha, &[4, 8, 16, 24, 32, 48]),
+        &exacta("debug", "B1", ancha, &[4, 8, 16, 24, 32, 48]),
     );
     sembrar_barrido(
         &fx,
@@ -1598,7 +1601,7 @@ fn u15_sin_ajuste_fiable_para_una_fila_critica_sale_3_con_la_orden_que_falta() {
     let (salida, v) = recomendar(&fx);
     assert_eq!(salida.code, Some(0), "{}", salida.text());
     let tope = u64::from(C_NUCLEOS);
-    for fila in ["DBG", "B3"] {
+    for fila in ["B1", "B3"] {
         let j = v["calibradas"][fila]["J_propuesto"]
             .as_u64()
             .expect("J_propuesto");
@@ -1649,7 +1652,7 @@ fn u16_el_j_de_las_corridas_sale_de_git_no_de_la_tabla_de_hoy() {
     );
     barridos_buenos(&fx);
     let (salida, v) = recomendar(&fx);
-    let dbg = &v["calibradas"]["DBG"];
+    let dbg = &v["calibradas"]["B1"];
     assert_eq!(dbg["J_hist"], json!([4]), "{}", salida.text());
     assert_eq!(
         dbg["runs"],
@@ -1922,6 +1925,46 @@ fn u17_las_ordenes_de_cada_perfil_existen_tal_cual_en_los_carriles_de_su_fila() 
 
 /// The two ways of `u17` are judged on lines that are not the judge's: a flag added to a call, a call the profile does not
 /// name, and the calls that are only a selection of what the profile compiles.
+/// CI-E11 (D-E11i, E11-13): the debug profile of the sweep is the row that COMPILES T_dbg, which is B1. DBG is a reader of
+/// it and compiles nothing: a sweep that took the profile, the jobs and the target from DBG would calibrate a row that does
+/// not build. The row is read where the tool holds it (`PERFILES` in scripts/gate_usl.py) and judged in the real table.
+#[test]
+fn u22_el_perfil_debug_del_barrido_es_la_fila_que_compila_t_dbg() {
+    let fuente = fs::read_to_string(scripts().join("gate_usl.py")).expect("gate_usl.py");
+    let desde = fuente
+        .find("\"debug\": {")
+        .expect("PERFILES has a profile `debug`");
+    let fila = fuente[desde..]
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("\"fila\": \""))
+        .and_then(|resto| resto.split('"').next())
+        .expect("the profile `debug` names its row")
+        .to_string();
+    let tabla = fs::read_to_string(scripts().join("gate-dag.txt")).expect("gate-dag.txt");
+    let linea = tabla
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .find(|l| l.split_whitespace().nth(1) == Some(fila.as_str()))
+        .unwrap_or_else(|| {
+            panic!("the debug profile is row {fila}, which is not a row of gate-dag.txt")
+        });
+    let recursos: Vec<&str> = linea
+        .split_whitespace()
+        .nth(3)
+        .unwrap_or("")
+        .split(',')
+        .collect();
+    assert!(
+        !recursos.contains(&"reader"),
+        "the debug profile is row {fila}, which is a reader: it compiles nothing, so its jobs and its time are not those of the build of T_dbg: {linea}"
+    );
+    assert!(
+        recursos.contains(&"target:T_dbg"),
+        "the debug profile is row {fila}, which does not name target:T_dbg: {linea}"
+    );
+    assert_eq!(fila, "B1", "the row that compiles T_dbg is B1");
+}
+
 #[test]
 fn u17b_las_fichas_de_una_llamada_distinguen_lo_que_compila_de_lo_que_solo_informa_o_selecciona() {
     let llamadas = llamadas_de_cargo(
@@ -2084,7 +2127,7 @@ fn u19_recomendar_encuentra_las_corridas_aunque_la_tabla_cambie_de_comentarios_y
     // is keyed by the rows, so both are the same table, and the bytes of the two files are not.
     let antes = format!(
         "# the table of 9-nov\n\n{}",
-        TABLA.replace("{DBG}", "8").replace(' ', "  ")
+        TABLA.replace("{B1}", "8").replace(' ', "  ")
     );
     write(&fx.tree.join("scripts/gate-dag.txt"), &antes);
     fx.commit("table with comments");
@@ -2097,7 +2140,7 @@ fn u19_recomendar_encuentra_las_corridas_aunque_la_tabla_cambie_de_comentarios_y
     historial_de(&fx, &clave, 391.036, pasos_cortos);
     barridos_buenos(&fx);
     let (salida, v) = recomendar(&fx);
-    let dbg = &v["calibradas"]["DBG"];
+    let dbg = &v["calibradas"]["B1"];
     assert_eq!(dbg["J_hist"], json!([8]), "{}", salida.text());
     assert!(
         dbg["runs"]
@@ -2213,7 +2256,7 @@ print(json.dumps({"casos": 1000, "malos": malos[:5]}))
 /// 19th run, simulated with C = 24, R = 28 GiB and J_m = 24; the starts are read back to count what is alive at each one.
 const CUERPO_TABLA_19: &str = r#"
 import os
-dur = {"P": 4.201, "DBG": 391.036, "NLI": 37.508, "B3": 206.174, "REL": 102.530, "E2E": 180.680,
+dur = {"P": 4.201, "B1": 391.036, "NLI": 37.508, "B3": 206.174, "REL": 102.530, "E2E": 180.680,
        "DC": 224.391, "CV": 68.583, "M": 146.363}
 pasos = {p.id: p for p in d.parse_table(os.path.join(sys.argv[1], "gate-dag.txt"))}
 filas = [{"id": p.id, "idx": p.idx, "deps": p.deps, "recursos": p.recursos, "clase": p.clase, "d": dur[p.id],
@@ -2277,16 +2320,16 @@ fn e7a_p5_el_camino_critico_es_uno_en_holguras_en_ranks_y_en_el_historial() {
 fn e7a9_simular_respeta_los_modelos_y_los_jobs_como_el_planificador() {
     // The table of the fixture (the cpu, ram and jobs of the judge's rows), the durations of the 19th run, C = 24,
     // R = 28 GiB, J_m = 24. Worked by hand, with the ranks (rank = d + the largest rank of a successor: M 146.363,
-    // CV 68.583, DC 224.391, E2E 180.680, REL 102.530, NLI 37.508, B3 206.174 + 180.680 = 386.854, DBG 391.036 + 180.680 =
+    // CV 68.583, DC 224.391, E2E 180.680, REL 102.530, NLI 37.508, B3 206.174 + 180.680 = 386.854, B1 391.036 + 180.680 =
     // 571.716, P 4.201 + 571.716 = 575.917) and the admission of the planner:
     //   t = 0        P starts.
-    //   t = 4.201    ready by rank: DBG, B3, DC, M, CV. DBG starts (nobody alive). B3: cpu 8 + 12 = 20 <= 24, jobs 8 + 12 = 20 <= 24,
+    //   t = 4.201    ready by rank: B1, B3, DC, M, CV. B1 starts (nobody alive). B3: cpu 8 + 12 = 20 <= 24, jobs 8 + 12 = 20 <= 24,
     //                ram 8 + 16 = 24 <= 28 GiB: starts. DC and M: cpu 20 + 8 = 28 > 24: wait. CV: cpu 20 + 4 = 24, jobs 24 and
     //                ram 24 + 4 = 28 GiB, all three at the limit and none over it: starts (it ends at 72.784).
     //   t = 210.375  B3 ends (4.201 + 206.174). Ready by rank: DC, M, REL. DC: cpu 8 + 8 = 16: starts. M: cpu 24, jobs 24, ram
-    //                24 GiB: starts. REL (models; one alive, DBG): mem_free = 28 - 24 = 4 GiB < 4 GiB + 12 GiB: waits for RAM.
+    //                24 GiB: starts. REL (models; one alive, B1): mem_free = 28 - 24 = 4 GiB < 4 GiB + 12 GiB: waits for RAM.
     //   t = 356.738  M ends. REL: mem_free = 28 - (8 + 8) = 12 GiB < 16 GiB: waits. (Without the floor it would start here.)
-    //   t = 395.237  DBG ends (4.201 + 391.036). Ready: E2E, REL, NLI. E2E (models, none alive): mem_free = 28 - 8 = 20 >= 16,
+    //   t = 395.237  B1 ends (4.201 + 391.036). Ready: E2E, REL, NLI. E2E (models, none alive): mem_free = 28 - 8 = 20 >= 16,
     //                cpu 16, jobs 8 + 2, ram 8 + 12 = 20: starts. REL: mem_free = 28 - 20 = 8 < 16: waits. NLI is exclusive: waits.
     //   t = 434.766  DC ends (210.375 + 224.391). REL: models alive 1 (E2E), mem_free = 28 - 12 = 16, not below 16: starts.
     //                (it ends at 537.296; NLI still waits: E2E is alive).
@@ -2299,7 +2342,7 @@ fn e7a9_simular_respeta_los_modelos_y_los_jobs_como_el_planificador() {
     let v = salida.json();
     let esperados = [
         ("P", 0.0),
-        ("DBG", 4.201),
+        ("B1", 4.201),
         ("B3", 4.201),
         ("CV", 4.201),
         ("DC", 210.375),
@@ -2338,7 +2381,7 @@ fn e7a9_simular_respeta_los_modelos_y_los_jobs_como_el_planificador() {
 
 #[test]
 fn e7a7_la_curva_usa_el_j_que_la_fila_recibio_en_cada_corrida() {
-    // Three cold runs of the table (DBG names 8): the first got 4 jobs from its machine, the other two 24. What each one gave
+    // Three cold runs of the table (B1 names 8): the first got 4 jobs from its machine, the other two 24. What each one gave
     // the row is row_jobs(8, plan.jobs): 4 and 8, not 8 three times.
     let fx = Fx::new("e7a7");
     let tabla = tabla_en_arbol(&fx, 8);
@@ -2353,7 +2396,7 @@ fn e7a7_la_curva_usa_el_j_que_la_fila_recibio_en_cada_corrida() {
     barridos_buenos(&fx);
     let (salida, v) = recomendar(&fx);
     assert_eq!(salida.code, Some(0), "{}", salida.text());
-    let dbg = &v["calibradas"]["DBG"];
+    let dbg = &v["calibradas"]["B1"];
     assert_eq!(dbg["J_hist"], json!([4, 8]), "{}", salida.text());
     assert_eq!(
         dbg["runs"],
@@ -2377,7 +2420,7 @@ fn e7a7_la_curva_usa_el_j_que_la_fila_recibio_en_cada_corrida() {
     let (salida, v) = recomendar(&sin);
     assert_eq!(salida.code, Some(0), "{}", salida.text());
     assert_eq!(
-        v["calibradas"]["DBG"]["J_hist"],
+        v["calibradas"]["B1"]["J_hist"],
         json!([8]),
         "{}",
         salida.text()
@@ -2407,7 +2450,7 @@ fn e7a8_recomendar_no_propone_mas_jobs_de_los_que_tiene_la_maquina_y_dice_lo_que
     assert_eq!(salida.code, Some(0), "{}", salida.text());
     assert_eq!(v["supone"], json!("dag"), "{}", salida.text());
     assert_eq!(v["J_maquina"], json!(12), "{}", salida.text());
-    let dbg = &v["calibradas"]["DBG"];
+    let dbg = &v["calibradas"]["B1"];
     let candidatos: Vec<u64> = dbg["d_por_J"]
         .as_object()
         .expect("d_por_J")
@@ -2443,7 +2486,7 @@ fn e7a8_recomendar_no_propone_mas_jobs_de_los_que_tiene_la_maquina_y_dice_lo_que
         );
     }
 
-    // A table that asks for more than the machine gives (DBG at 16, the machine 12): it is the 12 that counts.
+    // A table that asks for more than the machine gives (B1 at 16, the machine 12): it is the 12 that counts.
     let alta = Fx::new("e7a8-alta");
     let tabla = tabla_en_arbol(&alta, 16);
     for (dia, run, jobs) in [
@@ -2457,7 +2500,7 @@ fn e7a8_recomendar_no_propone_mas_jobs_de_los_que_tiene_la_maquina_y_dice_lo_que
     barridos_buenos(&alta);
     let (salida, v) = recomendar(&alta);
     assert_eq!(salida.code, Some(0), "{}", salida.text());
-    let dbg = &v["calibradas"]["DBG"];
+    let dbg = &v["calibradas"]["B1"];
     assert_eq!(dbg["J_actual"], json!(16), "{}", salida.text());
     let candidatos: Vec<u64> = dbg["d_por_J"]
         .as_object()

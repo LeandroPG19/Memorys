@@ -809,6 +809,12 @@ FAKE
     [[ -z "${calib_file:-}" ]] || cp "$calib_file" "$t/scripts/test-section-counts.txt"
     cp "$ROOT/rust/eval-datasets/smoke.jsonl" "$t/rust/eval-datasets/"
     : >"$t/rust/tests/t1.rs"
+    # CI-E11 (D-E11e): the files of tests/ that the judge calls contracts, as the script under test names them, so that
+    # lanes D1 and CT find every name of JUDGE_CONTRACTS as a file. A script with no such line yet gets the spec's eight, and
+    # the rows that read the partition are red for their own reason.
+    e11_contracts="$(sed -n 's/^JUDGE_CONTRACTS=(\(.*\))$/\1/p' "$ROOT/scripts/run-all-tests.sh")"
+    [[ -n "$e11_contracts" ]] || e11_contracts="ci_contract gate_dag_contract gate_history_contract gate_usl_contract group_no_server local_gate_contract packaging_contract v047_without_a_database_url_the_judge_reaches_no_default"
+    for e11_name in $e11_contracts; do : >"$t/rust/tests/$e11_name.rs"; done
     : >"$t/nli-model"
     : >"$t/models/model_quantized.onnx"
     : >"$t/reranker/model.onnx"
@@ -841,19 +847,31 @@ FAKE
       '[ -z "${FAKE_CHANGE_RELEASE_ON:-}" ] || case "$*" in *"$FAKE_CHANGE_RELEASE_ON"*) echo changed >"$CARGO_TARGET_DIR/release/memory-industry" ;; esac' \
       'if [ "$1" = build ]; then' \
       '  [ -e "$CARGO_TARGET_DIR/debug/memory-industry" ] || cp "$(cat "$HOME/standin.path")" "$CARGO_TARGET_DIR/debug/memory-industry"' \
-      '  case "$*" in *--message-format=*) printf "%s\n" "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"memory-industry\"},\"fresh\":${FAKE_CARGO_FRESH:-true},\"executable\":\"${FAKE_CARGO_BUILD_EXE:-$CARGO_TARGET_DIR/debug/memory-industry}\"}" ;; esac' \
+      '  case "$*" in *--release*) fresh="${FAKE_CARGO_FRESH:-true}" ;; *) fresh="${FAKE_CARGO_FRESH_DEBUG:-true}" ;; esac' \
+      '  case "$*" in *--message-format=*) printf "%s\n" "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"memory-industry\"},\"fresh\":$fresh,\"executable\":\"${FAKE_CARGO_BUILD_EXE:-$CARGO_TARGET_DIR/debug/memory-industry}\"}" ;; esac' \
       'fi' \
       'if [ "$1" = test ]; then' \
       '  n="${FAKE_CARGO_TEST_COUNT:-3}"' \
-      '  names=""; prev=""' \
-      '  for a in "$@"; do [ "$prev" = --test ] && names="$names $a"; prev="$a"; done' \
-      '  [ -n "$names" ] || names=fixture' \
+      '  names=""; prev=""; lib=""; doc=""' \
+      '  for a in "$@"; do [ "$prev" = --test ] && names="$names $a"; case "$a" in --lib) lib=1 ;; --doc) doc=1 ;; esac; prev="$a"; done' \
+      '  [ -n "$names$lib$doc" ] || names=fixture' \
+      '  case "$*" in *--no-run*) ;; *) [ -z "${FAKE_CARGO_COMPILING:-}" ] || echo "   Compiling memory-industry v0.31.0 ($PWD)" >&2 ;; esac' \
+      '  if [ -n "$lib" ]; then' \
+      '    echo "     Running unittests src/lib.rs (target/debug/deps/memory_industry-0123456789abcdef)"' \
+      '    echo "running $n tests"' \
+      '    echo "test result: ok. $n passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"' \
+      '  fi' \
       '  for t in $names; do' \
       '    m="$n"; [ "$t" = "${FAKE_CARGO_ZERO_TEST-}" ] && m=0' \
       '    echo "     Running tests/$t.rs (target/debug/deps/$t-0000)"' \
       '    echo "running $m tests"' \
       '    echo "test result: ok. $m passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"' \
       '  done' \
+      '  if [ -n "$doc" ]; then' \
+      '    echo "   Doc-tests memory_industry"' \
+      '    echo "running 0 tests"' \
+      '    echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"' \
+      '  fi' \
       'fi' \
       'exit 0' >"$t/bin/cargo"
     printf '%s\n' '#!/bin/sh' \
@@ -866,6 +884,7 @@ FAKE
       '  *atttypmod*) echo 384 ;;' \
       '  *information_schema.tables*) echo 20 ;;' \
       '  *shobj_description*) echo "" ;;' \
+      '  *"count(*) FROM pg_database"*) if grep -q "CREATE DATABASE brain_gate -c" "$HOME/psql.calls"; then echo 1; else echo 0; fi ;;' \
       '  *brain_observations*) echo "${FAKE_SEEDED-${FAKE_OBS-5}}" ;;' \
       'esac' \
       'exit 0' >"$t/bin/psql"
@@ -1299,8 +1318,10 @@ FAKE
   full_run f31
   (( rc == 0 )) || self_fail "F3.1: a full run whose every step passed exited $rc: $(cat "$tmp/f31.out")"
   [[ ! -e "$tmp/f31/home/gpu.calls" ]] || self_fail "F3.1: the gate ran build-gpu.sh: $(cat "$tmp/f31/home/gpu.calls")"
-  noRun="$(grep -- '--no-run' "$tmp/f31/home/cargo.calls" 2>/dev/null || true)"
-  [[ "$(grep -c -- '--no-run' "$tmp/f31/home/cargo.calls" 2>/dev/null || true)" == 1 ]] \
+  # CI-E11: lane B1 compiles the debug tests of T_dbg with its own `--no-run` call, so the release one is the --no-run call
+  # with --release in it.
+  noRun="$(grep -- '--no-run' "$tmp/f31/home/cargo.calls" 2>/dev/null | grep -- '--release' || true)"
+  [[ "$(grep -- '--no-run' "$tmp/f31/home/cargo.calls" 2>/dev/null | grep -c -- '--release' || true)" == 1 ]] \
     || self_fail "F3.1: expected exactly one --no-run release call, found: '$noRun'"
   [[ "$noRun" == *' --release '* && "$noRun" == *' --lib '* && "$noRun" == *'--test v017_rerank_gpu'* && "$noRun" != *'--bins'* ]] \
     || self_fail "F3.1: the --no-run call must be --release with --lib and --test v017_rerank_gpu and no --bins: $noRun"
@@ -1414,7 +1435,7 @@ FAKE
   release_run lane_pair --lane CL --lane D1
   (( rc == 0 )) || self_fail "F3.3b-1: --lane CL --lane D1 exits $rc, not 0: $(cat "$tmp/lane_pair.out")"
   pair_clippy="$(grep -n -m1 'clippy' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
-  pair_test="$(grep -n -m1 '^test --timings$' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
+  pair_test="$(grep -n -m1 '^test --lib .*--timings$' "$tmp/lane_pair/home/cargo.calls" 2>/dev/null | cut -d: -f1 || true)"
   [[ -n "$pair_clippy" && -n "$pair_test" && "$pair_clippy" -lt "$pair_test" ]] \
     || self_fail "F3.3b-1: --lane CL --lane D1 did not run CL and then D1 in that order (clippy at ${pair_clippy:-none}, test at ${pair_test:-none}): $(cat "$tmp/lane_pair/home/cargo.calls" 2>/dev/null)"
   [[ "$(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_pair/home/psql.calls" 2>/dev/null || true)" == 1 ]] \
@@ -1547,8 +1568,9 @@ FAKE
     || self_fail "J14i: gemini -p is not run under timeout 60: $(cat "$tmp/j14i_gemini_ok/home/timeout.args" 2>/dev/null)"
 
   # CI-E1 (D-E1a, D-E1b, D-E1e, D-E1f): the plain pass is the section `plain`, counted per binary in both directions.
-  # The two lane rows run `--lane D1` in a tree whose counts file has no `plain` total and says
-  # `plain/<os>/fixture N e1`; the fake cargo prints the binary `fixture` with 3 tests, so N=3 is green and N=4 is -1.
+  # The two lane rows run `--lane D1` in a tree whose counts file has no `plain` total and says `plain/<os>/<binary> N e1`;
+  # CI-E11: the call is the library and the files of tests/ that are not contracts of the judge (the tree has one, t1), and the
+  # fake cargo prints each with 3 tests, so N=3 is green and N=4 on t1 is -1.
   # The rows of `--check-counts SECTION LOG` judge a cargo log written here, in the form of Linux, with the same
   # function run_counted uses: nothing here compiles, and the tree they run in is a tree of this self-test (a script
   # that does not know the mode starts the whole fake judge there, and the row is red).
@@ -1561,19 +1583,19 @@ FAKE
   e1_os=linux
   # The line is written with the system in a variable on purpose: a chain of lanes calls a line an orphan when its name is
   # nowhere in this script, and this very file is a script that would say it, so the literal must not be written out.
-  e1_counts e1ok "plain/$e1_os/fixture 3 e1"
+  e1_counts e1ok "plain/$e1_os/lib:memory_industry 3 e1" "plain/$e1_os/t1 3 e1"
   run_args e1ok --lane D1
-  (( rc == 0 )) || self_fail "E1: --lane D1 with a line of 3 for the 3 tests it runs exited $rc, not 0: $(cat "$tmp/e1ok.out")"
-  grep -qF 'OK  section plain: 3 tests in 1 test binaries' "$tmp/e1ok.out" \
-    || self_fail "E1: the plain pass is not counted by run_counted (no 'OK  section plain: 3 tests in 1 test binaries'): $(cat "$tmp/e1ok.out")"
+  (( rc == 0 )) || self_fail "E1: --lane D1 with a line of 3 for each of the 6 tests it runs exited $rc, not 0: $(cat "$tmp/e1ok.out")"
+  grep -qF 'OK  section plain: 6 tests in 2 test binaries' "$tmp/e1ok.out" \
+    || self_fail "E1: the plain pass is not counted by run_counted (no 'OK  section plain: 6 tests in 2 test binaries'): $(cat "$tmp/e1ok.out")"
   { [[ "$(grep -c '^test' "$tmp/e1ok/home/cargo.calls" 2>/dev/null || true)" == 1 ]] \
-    && grep -qx 'test --timings' "$tmp/e1ok/home/cargo.calls"; } \
-    || self_fail "E1: the plain pass did not run cargo test once, as 'test --timings': $(cat "$tmp/e1ok/home/cargo.calls" 2>/dev/null)"
+    && grep -qx 'test --lib --test t1 --timings' "$tmp/e1ok/home/cargo.calls"; } \
+    || self_fail "E1: the plain pass did not run cargo test once, as 'test --lib --test t1 --timings' (CI-E11): $(cat "$tmp/e1ok/home/cargo.calls" 2>/dev/null)"
   full_tree e1off
-  e1_counts e1off "plain/$e1_os/fixture 4 e1"
+  e1_counts e1off "plain/$e1_os/lib:memory_industry 3 e1" "plain/$e1_os/t1 4 e1"
   run_args e1off --lane D1
   (( rc == 1 )) || self_fail "E1: a line of 4 against 3 tests run exited $rc, not 1: $(cat "$tmp/e1off.out")"
-  grep -qF 'section plain on linux: fixture: expected 4, ran 3 (-1)' "$tmp/e1off.out" \
+  grep -qF 'section plain on linux: t1: expected 4, ran 3 (-1)' "$tmp/e1off.out" \
     || self_fail "E1: the binary that differs is not named with both numbers and the difference: $(cat "$tmp/e1off.out")"
 
   # e1_log FILE KEY=TESTS...: a cargo log in the form of Linux, one block per binary. KEY is the judge's name for it:
@@ -1661,6 +1683,155 @@ FAKE
   # A log that is not there cannot be read: 2, not the verdict of a count of nothing.
   run_args e1c --check-counts plain "$tmp/e1c/no-such.log"
   (( rc == 2 )) || self_fail "E1: --check-counts over a log that is not there exited $rc, not 2: $(cat "$tmp/e1c.out")"
+
+
+  # CI-E11 (D-E11d, D-E11e, D-E11f, D-E11h, spec §4 E11-2 and E11-5 to E11-9). The plain pass is the library and the files of
+  # tests/ that are not contracts of the judge (lane D1, the row DBG); the contracts and the doctests run in lane CT, which
+  # opens no database; D2 and D3 provision their database if it is missing; a lane that runs tests compiles nothing.
+  # e11_run NAME [VAR=value ...] -- ARG...: the script with ARG... in NAME's tree, under the environment run_args gives it and
+  # the VAR=value given, which win over it ($rc and $tmp/NAME.out as run_args leaves them).
+  e11_run() {
+    local name="$1" t="$tmp/$1"
+    local -a vars=()
+    shift
+    while (( $# > 0 )) && [[ "$1" != -- ]]; do vars+=("$1"); shift; done
+    shift
+    rc=0
+    env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT HOME="$t/home" \
+      PATH="$t/bin:/usr/bin:/bin" DATABASE_URL="$rat_url" CARGO_TARGET_DIR="$t/target" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      ONNX_MODEL_PATH="$t/models" CUBA_RERANKER_PATH="$t/reranker" CUBA_NLI_PATH="$t/nli-model" \
+      MEMORY_INDUSTRY_LLM_PROVIDER=ollama ${vars[@]+"${vars[@]}"} \
+      "$BASH" "$t/scripts/run-all-tests.sh" "$@" >"$tmp/$name.out" 2>&1 || rc=$?
+  }
+  # e11_counts NAME: the counts file of NAME's tree, one line per binary of each section of D-E11e, with the 3 tests the
+  # stand-in cargo prints for each (the doctests have none). It is written from the files of the tree and from
+  # $e11_contracts, the names of the contracts, so the expected partition is not read from the script under test.
+  e11_counts() {
+    local t="$tmp/$1" f k
+    {
+      awk '$1 != "plain" && $1 != "contracts" && $1 != "doc"' "$calib_file"
+      printf '%s\n' 'plain/linux/lib:memory_industry 3 e11'
+      for f in "$t"/rust/tests/*.rs; do
+        k="$(basename "$f" .rs)"
+        if [[ " $e11_contracts " == *" $k "* ]]; then printf 'contracts/linux/%s 3 e11\n' "$k"; else printf 'plain/linux/%s 3 e11\n' "$k"; fi
+      done
+      printf '%s\n' 'doc/linux/doc:memory_industry 0 e11'
+    } >"$t/scripts/test-section-counts.txt"
+  }
+  # e11_tests_of FILE: the names given to --test by the cargo calls in FILE (cargo.calls), one per line, sorted.
+  e11_tests_of() { grep -o -- '--test [A-Za-z0-9_]*' "$1" 2>/dev/null | cut -d' ' -f2 | sort || true; }
+
+  # E11-2: each file of tests/ runs without --ignored in exactly one of the two lanes, D1 or CT, each in its own process; the
+  # library only in D1 and the doctests only in CT. The tree has two files besides the contracts and t1.
+  full_tree e11p
+  for e11_name in smoke_test nli_entailment; do : >"$tmp/e11p/rust/tests/$e11_name.rs"; done
+  e11_counts e11p
+  e11_run e11p -- --lane D1
+  (( rc == 0 )) || self_fail "E11-2: --lane D1 exits $rc, not 0: $(cat "$tmp/e11p.out")"
+  cp "$tmp/e11p/home/cargo.calls" "$tmp/e11p.d1.calls"
+  : >"$tmp/e11p/home/cargo.calls"
+  e11_run e11p -- --lane CT
+  (( rc == 0 )) || self_fail "E11-2: --lane CT exits $rc, not 0: $(cat "$tmp/e11p.out")"
+  cp "$tmp/e11p/home/cargo.calls" "$tmp/e11p.ct.calls"
+  [[ "$(grep -c -- '--lib' "$tmp/e11p.d1.calls" || true)" == 1 && "$(grep -c -- '--lib' "$tmp/e11p.ct.calls" || true)" == 0 ]] \
+    || self_fail "E11-2: --lib is not in D1 alone: D1 $(grep -c -- '--lib' "$tmp/e11p.d1.calls" || true), CT $(grep -c -- '--lib' "$tmp/e11p.ct.calls" || true)"
+  [[ "$(grep -c -- '--doc' "$tmp/e11p.ct.calls" || true)" == 1 && "$(grep -c -- '--doc' "$tmp/e11p.d1.calls" || true)" == 0 ]] \
+    || self_fail "E11-2: --doc is not in CT alone: CT $(grep -c -- '--doc' "$tmp/e11p.ct.calls" || true), D1 $(grep -c -- '--doc' "$tmp/e11p.d1.calls" || true)"
+  e11_d1="$(e11_tests_of "$tmp/e11p.d1.calls")"
+  e11_ct="$(e11_tests_of "$tmp/e11p.ct.calls")"
+  for e11_file in "$tmp"/e11p/rust/tests/*.rs; do
+    e11_name="$(basename "$e11_file" .rs)"
+    e11_in_d1="$(grep -cx "$e11_name" <<<"$e11_d1" || true)"
+    e11_in_ct="$(grep -cx "$e11_name" <<<"$e11_ct" || true)"
+    (( e11_in_d1 + e11_in_ct > 0 )) \
+      || self_fail "E11-2: $e11_name runs in no row (D1: $(tr '\n' ' ' <<<"$e11_d1")| CT: $(tr '\n' ' ' <<<"$e11_ct"))"
+    (( e11_in_d1 == 0 || e11_in_ct == 0 )) \
+      || self_fail "E11-2: $e11_name runs in D1 and CT"
+    (( e11_in_d1 + e11_in_ct == 1 )) \
+      || self_fail "E11-2: $e11_name runs $(( e11_in_d1 + e11_in_ct )) times in one row"
+  done
+  read -ra e11_names <<<"$e11_contracts"
+  [[ "$e11_ct" == "$(printf '%s\n' "${e11_names[@]}" | sort)" ]] \
+    || self_fail "E11-2: CT does not run the files of JUDGE_CONTRACTS and nothing else: $(tr '\n' ' ' <<<"$e11_ct")"
+  # A name of JUDGE_CONTRACTS that is not a file of tests/ is red in both lanes and says which one, before any test runs.
+  for e11_lane in D1 CT; do
+    full_tree "e11bad$e11_lane"
+    rm -f "$tmp/e11bad$e11_lane/rust/tests/local_gate_contract.rs"
+    e11_run "e11bad$e11_lane" -- --lane "$e11_lane"
+    (( rc == 1 )) || self_fail "E11-2: JUDGE_CONTRACTS names local_gate_contract, which is no file, and --lane $e11_lane exited $rc, not 1: $(cat "$tmp/e11bad$e11_lane.out")"
+    grep -q 'JUDGE_CONTRACTS.*local_gate_contract\|local_gate_contract.*JUDGE_CONTRACTS' "$tmp/e11bad$e11_lane.out" \
+      || self_fail "E11-2: the refusal of --lane $e11_lane does not say which name of JUDGE_CONTRACTS is no file: $(cat "$tmp/e11bad$e11_lane.out")"
+    grep -q '^test' "$tmp/e11bad$e11_lane/home/cargo.calls" 2>/dev/null \
+      && self_fail "E11-2: --lane $e11_lane ran tests after it found a name of JUDGE_CONTRACTS that is no file: $(cat "$tmp/e11bad$e11_lane/home/cargo.calls")"
+  done
+
+  # E11-5 (D-E11d): a section that runs tests and compiled is red and says what it compiled; without the line, green.
+  full_tree e11c5
+  e11_run e11c5 FAKE_CARGO_COMPILING=1 -- --lane D2
+  (( rc == 1 )) || self_fail "E11-5: --lane D2 whose cargo compiled memory-industry exited $rc, not 1: $(cat "$tmp/e11c5.out")"
+  grep -qF 'cargo compiled memory-industry in a section that runs tests' "$tmp/e11c5.out" \
+    || self_fail "E11-5: a section that compiled is not refused with 'cargo compiled memory-industry in a section that runs tests': $(cat "$tmp/e11c5.out")"
+  full_tree e11c5ok
+  e11_run e11c5ok -- --lane D2
+  (( rc == 0 )) || self_fail "E11-5: --lane D2 whose cargo compiled nothing exited $rc, not 0: $(cat "$tmp/e11c5ok.out")"
+
+  # E11-6 (D-E11d): the provision of a lane that reads (D3 alone) does not compile the binary: a unit of the build that is not
+  # fresh is exit 1 before the database is made, and says which. The lanes of B1 compile, so they are green with the same cargo.
+  full_tree e11c6
+  e11_run e11c6 FAKE_CARGO_FRESH_DEBUG=false -- --lane D3
+  (( rc == 1 )) || self_fail "E11-6: --lane D3 with a build that was not fresh exited $rc, not 1: $(cat "$tmp/e11c6.out")"
+  grep -qF 'cargo compiled memory-industry' "$tmp/e11c6.out" \
+    || self_fail "E11-6: the unit that was not fresh is not named ('cargo compiled memory-industry'): $(cat "$tmp/e11c6.out")"
+  grep -q 'CREATE DATABASE' "$tmp/e11c6/home/psql.calls" 2>/dev/null \
+    && self_fail "E11-6: the database was made after the build of a reader was not fresh: $(cat "$tmp/e11c6/home/psql.calls")"
+  full_tree e11c6b
+  e11_run e11c6b FAKE_CARGO_FRESH_DEBUG=false -- --lane CL --lane B1
+  (( rc == 0 )) || self_fail "E11-6: --lane CL --lane B1, which compile, exited $rc, not 0, with a build that was not fresh: $(cat "$tmp/e11c6b.out")"
+
+  # E11-7 (D-E11f): D2 and D3 make brain_gate if it is missing, once per process: alone, and after D1 in one call.
+  e11_made() { grep -c 'CREATE DATABASE brain_gate -c' "$tmp/$1/home/psql.calls" 2>/dev/null || true; }
+  full_tree e11d2
+  e11_run e11d2 -- --lane D2
+  (( rc == 0 )) || self_fail "E11-7: --lane D2 alone exits $rc, not 0: $(cat "$tmp/e11d2.out")"
+  [[ "$(e11_made e11d2)" == 1 ]] || self_fail "E11-7: D2 alone did not provision brain_gate (made $(e11_made e11d2) times): $(cat "$tmp/e11d2/home/psql.calls" 2>/dev/null)"
+  full_tree e11d3
+  e11_run e11d3 -- --lane D3
+  (( rc == 0 )) || self_fail "E11-7: --lane D3 alone exits $rc, not 0: $(cat "$tmp/e11d3.out")"
+  [[ "$(e11_made e11d3)" == 1 ]] || self_fail "E11-7: D3 alone did not provision brain_gate (made $(e11_made e11d3) times): $(cat "$tmp/e11d3/home/psql.calls" 2>/dev/null)"
+  full_tree e11d12
+  e11_run e11d12 -- --lane D1 --lane D2
+  (( rc == 0 )) || self_fail "E11-7: --lane D1 --lane D2 exits $rc, not 0: $(cat "$tmp/e11d12.out")"
+  [[ "$(e11_made e11d12)" == 1 ]] || self_fail "E11-7: D1 and D2 in one process made brain_gate $(e11_made e11d12) times, not once: $(cat "$tmp/e11d12/home/psql.calls" 2>/dev/null)"
+
+  # E11-8 (D-E11e, D-E11f): CT opens no database and builds no binary: its cargo calls are the eight contracts, then the doctests.
+  full_tree e11ct
+  e11_run e11ct -- --lane CT
+  (( rc == 0 )) || self_fail "E11-8: --lane CT alone exits $rc, not 0: $(cat "$tmp/e11ct.out")"
+  grep -q 'CREATE DATABASE' "$tmp/e11ct/home/psql.calls" 2>/dev/null \
+    && self_fail "E11-8: CT made a database: $(cat "$tmp/e11ct/home/psql.calls")"
+  grep -q '^build' "$tmp/e11ct/home/cargo.calls" 2>/dev/null \
+    && self_fail "E11-8: CT built the binary of the database: $(cat "$tmp/e11ct/home/cargo.calls")"
+  [[ "$(grep -c '^test' "$tmp/e11ct/home/cargo.calls" || true)" == 2 ]] \
+    || self_fail "E11-8: CT did not call cargo test twice (the contracts, then the doctests): $(cat "$tmp/e11ct/home/cargo.calls")"
+  { [[ "$(sed -n 1p "$tmp/e11ct/home/cargo.calls" | grep -o -- '--test ' | wc -l | tr -d ' ')" == "${#e11_names[@]}" ]] \
+    && sed -n 2p "$tmp/e11ct/home/cargo.calls" | grep -qx 'test --doc --timings'; } \
+    || self_fail "E11-8: cargo test is not called with the eight --test and then with --doc: $(cat "$tmp/e11ct/home/cargo.calls")"
+
+  # E11-9 (D-E11h): only a call that compiles (no --lane, or CL, B1 or B3 in the list) sweeps the artifacts of more than 7 days
+  # of the target when the disk is below CUBA_GATE_SWEEP_BELOW_GB: another lane may be running a binary that old.
+  full_tree e11sw
+  mkdir -p "$tmp/e11sw/target/debug/deps"
+  : >"$tmp/e11sw/target/debug/deps/old-artifact"
+  touch -d '10 days ago' "$tmp/e11sw/target/debug/deps/old-artifact"
+  e11_run e11sw FAKE_DF_GB=10 CUBA_GATE_SWEEP_BELOW_GB=20 -- --lane D2
+  (( rc == 0 )) || self_fail "E11-9: --lane D2 with the disk below the sweep threshold exits $rc, not 0: $(cat "$tmp/e11sw.out")"
+  [[ -e "$tmp/e11sw/target/debug/deps/old-artifact" ]] \
+    || self_fail "E11-9: --lane D2, which compiles nothing, swept an artifact of 10 days: another lane may be running it: $(cat "$tmp/e11sw.out")"
+  e11_run e11sw FAKE_DF_GB=10 CUBA_GATE_SWEEP_BELOW_GB=20 -- --lane CL --lane B1
+  (( rc == 0 )) || self_fail "E11-9: --lane CL --lane B1 with the disk below the sweep threshold exits $rc, not 0: $(cat "$tmp/e11sw.out")"
+  [[ ! -e "$tmp/e11sw/target/debug/deps/old-artifact" ]] \
+    || self_fail "E11-9: --lane CL --lane B1, which compile, did not sweep the artifact of 10 days: $(cat "$tmp/e11sw.out")"
 
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
