@@ -3490,7 +3490,7 @@ fn a_self_test_of_the_judge_leaves_the_home_it_is_given_as_it_found_it() {
 /// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
 /// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
 /// self-test that takes it as its own fixture's identity is red under any other value.
-const JUDGE_ENVIRONMENT: [(&str, &str); 31] = [
+const JUDGE_ENVIRONMENT: [(&str, &str); 32] = [
     ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
     // CI-F3.3b-1b-i (D-F3k): merge-gate.sh exports the lock's directory so that the planner can write the
     // lane tickets under it. gate-lock.sh assigns GATE_LOCK itself, so no self-test reads what it inherits.
@@ -3540,6 +3540,11 @@ const JUDGE_ENVIRONMENT: [(&str, &str); 31] = [
     // CI-K9b: gate_linux_env exports the channel of rust-toolchain.toml for the cargo that runs outside the tree. A
     // self-test that reads what it inherits would take this one as the channel of its fixture.
     ("RUSTUP_TOOLCHAIN", "1.0.0-ajeno"),
+    // T-DBURL: merge-gate.sh and run-all-tests.sh export the switch (any non-empty value turns it on) so that a process the
+    // judge starts with no DATABASE_URL refuses with exit 2. It reaches the steps of the planner through the environment
+    // the planner inherits, not through ALLOWED_ENV, which only lists what a row may change. A self-test gets a foreign
+    // value of it, and neither "1" nor "0" says anything a self-test could take for its own: it must pass with the switch on.
+    ("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "ajeno"),
 ];
 
 /// The names the judge's scripts export that no self-test is handed, each with its reason, its owner and the
@@ -4011,6 +4016,7 @@ fn the_python_clients_refuse_without_database_url() {
         let out = Command::new("python3")
             .arg(repo_root().join(client))
             .env_remove("DATABASE_URL")
+            .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
             .env("CUBA_BINARY_PATH", &binary)
             .current_dir(&dir)
             .output()
@@ -8881,6 +8887,7 @@ fn path_after_start(probe_dir: &Path, script: &str, ostype: Option<&str>) -> Opt
         .arg("--self-test")
         .current_dir(repo_root())
         .env_clear()
+        .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
         .env(
             "PATH",
             format!(

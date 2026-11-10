@@ -295,6 +295,11 @@ FAKE
   git config --global init.defaultBranch main
   git config --global core.autocrlf false
   judge_test_url='postgresql://gate:pw0@127.0.0.1:5489/brain'
+  # No wait without a deadline: a gate or a step that waits for something that never comes (a stand-in that reads its stdin,
+  # a lane that does not answer) is red at the deadline of its row and says which one, not a self-test that never ends.
+  # `timeout` is looked up here, in the PATH of the self-test, and not in the PATH the row is given.
+  row_s="${GATE_SELFTEST_ROW_S:-240}"
+  row_bound=(timeout -k 5 "$row_s")
   run_copy() { run_copy_as "$judge_test_url" "$@"; }
   run_copy_as() {
     local base="$1" name="$2" fail_at="${3:-}"
@@ -304,9 +309,10 @@ FAKE
     rc=0
     # CI-F3.3c (the judge's names): a row takes the target root of the gate from its own HOME, not from the judge's
     # CARGO_TARGET_DIR, which is a foreign directory no user can make. A row that needs one passes it in "$@".
-    { env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS -u CARGO_TARGET_DIR HOME="$tmp/$name/home" \
+    { "${row_bound[@]}" env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS -u CARGO_TARGET_DIR HOME="$tmp/$name/home" \
         PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT="$fail_at" ${start[@]+"${start[@]}"} "$@" \
-        "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 || rc=$?; } 2>/dev/null
+        "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 </dev/null || rc=$?; } 2>/dev/null
+    (( rc != 124 )) || self_fail "$name: the gate was still running after $row_s s, so it is waiting for something that does not come: $(tail -n 5 "$tmp/$name.out" 2>/dev/null)"
   }
   exit_file() { cat "$tmp/$1/home/.cache/cuba-gate/run.exit" 2>/dev/null || true; }
   # git_tree NAME RUN_ALL_TESTS_BODY: a fake_tree committed whole, its home
@@ -1832,8 +1838,8 @@ exit 0'
   # hands it (D-F3k). Without one it exits 2 before any step, and says what it needs.
   fake_tree step_alone "$run_all_steps"
   step_rc=0
-  env -i PATH="$tmp/step_alone/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_alone/home" \
-    "$BASH" "$tmp/step_alone/scripts/merge-gate.sh" --step DBG >"$tmp/step_alone.out" 2>&1 || step_rc=$?
+  "${row_bound[@]}" env -i PATH="$tmp/step_alone/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_alone/home" \
+    "$BASH" "$tmp/step_alone/scripts/merge-gate.sh" --step DBG >"$tmp/step_alone.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 2 )) || self_fail "--step without a ticket exited $step_rc, not 2: $(cat "$tmp/step_alone.out")"
   grep -qF -- '--step' "$tmp/step_alone.out" \
     || self_fail "--step without a ticket does not say what it needs: $(cat "$tmp/step_alone.out")"
@@ -1852,9 +1858,9 @@ exit 0'
   printf '%s' tok-planted >"$step_lock/lanes/20-DBG"
   step_owner_before="$(cat "$step_lock/owner")"
   step_rc=0
-  env -i PATH="$tmp/step_ok/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_ok/home" GATE_LOCK="$step_lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_ok/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_ok/home" GATE_LOCK="$step_lock" \
     CUBA_GATE_LOCK_OWNER="$step_owner_before" CUBA_GATE_LANE_TOKEN=tok-planted \
-    "$BASH" "$tmp/step_ok/scripts/merge-gate.sh" --step DBG >"$tmp/step_ok.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_ok/scripts/merge-gate.sh" --step DBG >"$tmp/step_ok.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 0 )) || self_fail "--step with its ticket exited $step_rc, not 0: $(cat "$tmp/step_ok.out")"
   [[ "$(grep -E '^(up |down |run-all-tests)' "$tmp/step_ok/home/steps")" == "$(printf '%s\n' 'up dbg' 'run-all-tests --lane CL --lane D1 --lane D2 --lane D3 token=tok-planted' 'down dbg')" ]] \
     || self_fail "--step with its ticket did not run the lane of DBG with the token in its environment: $(steps_of step_ok)"
@@ -1874,9 +1880,9 @@ exit 0'
   printf '%s' tok-owner >"$step_lock/lanes/20-DBG"
   step_owner_record="$(cat "$step_lock/owner")"
   step_rc=0
-  env -i PATH="$tmp/step_owner/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_owner/home" GATE_LOCK="$step_lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_owner/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_owner/home" GATE_LOCK="$step_lock" \
     CUBA_GATE_LOCK_OWNER="$step_owner_record" CUBA_GATE_LANE_TOKEN=tok-owner \
-    "$BASH" "$tmp/step_owner/scripts/merge-gate.sh" --step DBG >"$tmp/step_owner.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_owner/scripts/merge-gate.sh" --step DBG >"$tmp/step_owner.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 0 )) || self_fail "--step with its ticket and no GATE_OWNER exited $step_rc, not 0: $(cat "$tmp/step_owner.out")"
   [[ "$(cat "$tmp/step_owner/home/lane.owners" 2>/dev/null)" == "dbg $step_owner_record" ]] \
     || self_fail "--step made its lane under '$(cat "$tmp/step_owner/home/lane.owners" 2>/dev/null)', not under the owner of the lock ('dbg $step_owner_record'): $(cat "$tmp/step_owner.out")"
@@ -1887,9 +1893,9 @@ exit 0'
   owner_record 2147483646 dead-owner >"$step_lock/owner"
   printf '%s' tok-dead >"$step_lock/lanes/20-DBG"
   step_rc=0
-  env -i PATH="$tmp/step_dead/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_dead/home" GATE_LOCK="$step_lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_dead/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_dead/home" GATE_LOCK="$step_lock" \
     CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-dead \
-    "$BASH" "$tmp/step_dead/scripts/merge-gate.sh" --step DBG >"$tmp/step_dead.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_dead/scripts/merge-gate.sh" --step DBG >"$tmp/step_dead.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 2 )) || self_fail "--step with the owner of a gate that is not running exited $step_rc, not 2: $(cat "$tmp/step_dead.out")"
   [[ -z "$(steps_of step_dead)" && ! -e "$tmp/step_dead/home/lane.owners" ]] \
     || self_fail "--step with the owner of a gate that is not running made a lane or ran a step: $(steps_of step_dead)"
@@ -1902,9 +1908,9 @@ exit 0'
   owner_record "$$" fixture-owner >"$step_lock/owner"
   printf '%s' tok-judge >"$step_lock/lanes/20-DBG"
   step_rc=0
-  env -i PATH="$tmp/step_judge/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_judge/home" GATE_LOCK="$step_lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_judge/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_judge/home" GATE_LOCK="$step_lock" \
     CUBA_GATE_LOCK_OWNER=ajeno-0000 CUBA_GATE_LANE_TOKEN=tok-judge \
-    "$BASH" "$tmp/step_judge/scripts/merge-gate.sh" --step DBG >"$tmp/step_judge.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_judge/scripts/merge-gate.sh" --step DBG >"$tmp/step_judge.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 2 )) || self_fail "--step with the judge's owner exited $step_rc, not 2: $(cat "$tmp/step_judge.out")"
   [[ -z "$(steps_of step_judge)" ]] || self_fail "--step with the judge's owner ran a step: $(steps_of step_judge)"
   [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-judge ]] || self_fail "--step with the judge's owner spent the ticket"
@@ -1915,9 +1921,9 @@ exit 0'
   owner_record "$$" fixture-owner >"$step_lock/owner"
   printf '%s' tok-planted >"$step_lock/lanes/20-DBG"
   step_rc=0
-  env -i PATH="$tmp/step_foreign/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_foreign/home" GATE_LOCK="$step_lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_foreign/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_foreign/home" GATE_LOCK="$step_lock" \
     CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-other \
-    "$BASH" "$tmp/step_foreign/scripts/merge-gate.sh" --step DBG >"$tmp/step_foreign.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_foreign/scripts/merge-gate.sh" --step DBG >"$tmp/step_foreign.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 2 )) || self_fail "--step with a foreign ticket exited $step_rc, not 2: $(cat "$tmp/step_foreign.out")"
   grep -qF 'lane token refused' "$tmp/step_foreign.out" \
     || self_fail "--step with a foreign ticket does not say it was refused: $(cat "$tmp/step_foreign.out")"
@@ -1939,9 +1945,9 @@ exit 0'
   printf '%s' tok-new >"$step_lock/lanes/20-DBG"
   step_new_run() { # <id>: step_rc and $tmp/step_new.out
     step_rc=0
-    env -i PATH="$tmp/step_new/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_new/home" GATE_LOCK="$step_lock" \
+    "${row_bound[@]}" env -i PATH="$tmp/step_new/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_new/home" GATE_LOCK="$step_lock" \
       CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-new \
-      "$BASH" "$tmp/step_new/scripts/merge-gate.sh" --step "$1" >"$tmp/step_new.out" 2>&1 || step_rc=$?
+      "$BASH" "$tmp/step_new/scripts/merge-gate.sh" --step "$1" >"$tmp/step_new.out" 2>&1 </dev/null || step_rc=$?
   }
   step_new_run Q
   (( step_rc == 0 )) || self_fail "J15e dispatch: --step Q, a function step_Q with no case arm, exited $step_rc, not 0: $(cat "$tmp/step_new.out")"
@@ -1967,9 +1973,9 @@ exit 0'
   owner_record "$$" fixture-owner >"$step_lock/owner"
   printf '%s' tok-lock >"$step_lock/lanes/20-DBG"
   step_rc=0
-  env -i PATH="$tmp/step_lock/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_lock/home" GATE_LOCK="$tmp/step_lock/elsewhere/lock" \
+  "${row_bound[@]}" env -i PATH="$tmp/step_lock/bin:$gitdir:/usr/bin:/bin" HOME="$tmp/step_lock/home" GATE_LOCK="$tmp/step_lock/elsewhere/lock" \
     CUBA_GATE_LOCK_OWNER="$(cat "$step_lock/owner")" CUBA_GATE_LANE_TOKEN=tok-lock \
-    "$BASH" "$tmp/step_lock/scripts/merge-gate.sh" --step DBG >"$tmp/step_lock.out" 2>&1 || step_rc=$?
+    "$BASH" "$tmp/step_lock/scripts/merge-gate.sh" --step DBG >"$tmp/step_lock.out" 2>&1 </dev/null || step_rc=$?
   (( step_rc == 2 )) || self_fail "J15d: --step with an inherited GATE_LOCK that is not its HOME's exited $step_rc, not 2: $(cat "$tmp/step_lock.out")"
   grep -qF 'GATE_LOCK' "$tmp/step_lock.out" \
     || self_fail "J15d: the refusal of a different GATE_LOCK does not name it: $(cat "$tmp/step_lock.out")"

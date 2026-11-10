@@ -165,6 +165,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" cargo test --lib' > "$tmp/gate4.sh"
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate4.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
   [[ "$got" == "2" ]] || { echo "FAIL self-test: the two marked files with no plain cargo test left to run them were not both caught, or the one marked below the first line was (got $got)" >&2; exit 1; }
+  # CI-K4 put --timings on every cargo call of the judge: it is a report flag, so the plain cargo test is still plain.
+  printf '%s\n' 'DATABASE_URL="$GATE_DATABASE_URL" cargo test --timings' > "$tmp/gate5.sh"
+  got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate5.sh" "$tmp/tests" 2026-09-22 2>/dev/null | tail -1)"
+  [[ "$got" == "0" ]] || { echo "FAIL self-test: the plain cargo test with the --timings report flag of CI-K4 was not taken as the run of the marked files (got $got)" >&2; exit 1; }
   got="$(check_server_only_tests_run_locally "$tmp/ci3.yml" "$tmp/gate3.sh" "$tmp/tests" 2026-09-23 2>/dev/null | tail -1)"
   [[ "$got" == "1" ]] || { echo "FAIL self-test: a CI exclusion past its date was not caught (got $got)" >&2; exit 1; }
   printf '%s\n' '// needs-a-server:   ' 'mod common;' > "$tmp/tests/unexplained.rs"

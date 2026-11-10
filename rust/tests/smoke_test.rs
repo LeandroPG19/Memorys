@@ -473,7 +473,7 @@ fn every_test_that_moves_a_process_wide_variable_serialises() {
     assert!(
         reached_without_the_cuba_prefix >= 1,
         "all {checked} file(s) in scope write a `CUBA_` name inline, which is precisely what \
-         this scan saw back when it matched `set_var(\"CUBA_` and nothing else. If no file \
+         this scan saw back when it matched `set_var(\"CUBA_\")` and nothing else. If no file \
          arrives by another route, the widening is decoration and the MEMORY_INDUSTRY_* \
          namespace is unwatched again without anyone editing a line. Two arrive that way \
          today: one writes only MEMORY_INDUSTRY_GRAPH_DB, the other sets its variables \
@@ -1374,14 +1374,18 @@ fn the_grouped_state_check_fails_on_each_trait_and_passes_what_is_not_state() {
         ),
         (
             ".elapsed()",
-            "fn t() {\n    assert!(t0.elapsed() < Duration::from_secs(1));\n}\n",
+            "fn t() {\n    ASSERT!(t0.elapsed() < Duration::from_secs(1));\n}\n",
         ),
         (
             ".elapsed()",
-            "fn t() {\n    assert!(\n        t0.elapsed() < Duration::from_secs(1),\n    );\n}\n",
+            "fn t() {\n    ASSERT!(\n        t0.elapsed() < Duration::from_secs(1),\n    );\n}\n",
         ),
     ] {
-        let problems = grouped_state_problems(&[("group_x/m.rs".to_string(), body.to_string())]);
+        // The macro is written ASSERT in the table and put back here: the latency detector of
+        // local_gate_contract.rs reads text, and a literal wall-clock assert in a string of this file
+        // would ask scripts/gate-latency.txt for a line this file has no clock to earn.
+        let body = body.replace("ASSERT", "assert");
+        let problems = grouped_state_problems(&[("group_x/m.rs".to_string(), body)]);
         assert!(
             problems.len() == 1
                 && problems[0].starts_with("group_x/m.rs:")

@@ -1489,7 +1489,11 @@ fn aparece(script: &str, orden: &str) -> bool {
 
 #[test]
 fn u17_las_ordenes_de_cada_perfil_existen_tal_cual_en_run_all_tests() {
-    let script = fs::read_to_string(scripts().join("run-all-tests.sh")).expect("run-all-tests.sh");
+    // `--timings` (CI-K4) is a report flag on every cargo call of the judge: it changes no input of the build, and the sweep
+    // does not ask for it, so an order matches the script with the flag taken out of it.
+    let script = fs::read_to_string(scripts().join("run-all-tests.sh"))
+        .expect("run-all-tests.sh")
+        .replace(" --timings", "");
     for perfil in ["debug", "bin", "release"] {
         let fx = Fx::new(&format!("u17-{perfil}"));
         let salida = fx.run(&["barrido", "--perfil", perfil, "--j", "2", "--reps", "1"]);
@@ -1546,6 +1550,7 @@ fn u18_la_clave_de_la_tabla_es_la_que_escribe_el_planificador() {
         .arg(&tabla)
         .current_dir(&fx.tree)
         .env_clear()
+        .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
         .env("PATH", "/usr/bin:/bin")
         .env("GATE_DAG", "0")
         .env("CI_TIEMPOS_DIR", &historial)
