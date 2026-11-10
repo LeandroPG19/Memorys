@@ -1839,6 +1839,81 @@ fn the_two_pass_guard_can_actually_fail() {
     );
 }
 
+/// How many handoffs came before CI-E6 and are judged by the hash of their content instead of by the cost
+/// they do not state: the ones that `scripts/handoffs-sin-coste.txt` lists. Frozen on 2026-11-10 over the handoffs of
+/// `Memorys-ci` and `Memorys-ci-integ`: only those the cost guard refuses on their merits (the ones whose spec has no
+/// table or whose evidence has no `segundos:`). The list does not grow: a new handoff meets the rule or is refused.
+const HANDOFFS_SIN_COSTE: usize = 14;
+
+/// The last day any of those exceptions may run, as `AAAA-MM-DD` (compared as text, which orders dates).
+const HANDOFFS_SIN_COSTE_EXPIRY: &str = "2026-12-31";
+
+/// What is wrong with the list of historic handoffs `body`: its data lines (not `#`, not blank) are not
+/// `expected` in number, or one expires after `HANDOFFS_SIN_COSTE_EXPIRY` (or has no third field).
+fn handoffs_without_cost_problems(body: &str, expected: usize) -> Vec<String> {
+    let data: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let mut problems = Vec::new();
+    if data.len() != expected {
+        problems.push(format!(
+            "{} lines, the contract says {expected}. A new line is a new exception: it needs its reason, \
+             its owner and its expiry, and it is the orchestrator who decides it, by editing this \
+             number. One fewer is an exception that is gone: lower the number with it",
+            data.len()
+        ));
+    }
+    for line in data {
+        match line.split_whitespace().nth(2) {
+            Some(expiry) if expiry <= HANDOFFS_SIN_COSTE_EXPIRY => {}
+            Some(expiry) => problems.push(format!(
+                "{line:?} expires after {HANDOFFS_SIN_COSTE_EXPIRY} ({expiry})"
+            )),
+            None => problems.push(format!("{line:?} has no expiry (third field)")),
+        }
+    }
+    problems
+}
+
+/// CI-E6 (D-E6f, D-E6g): the list of handoffs that the cost guard of `validar-handoff.sh` lets by is closed.
+///
+/// `.cursor/handoffs/*` is not versioned, so the only identity a historic handoff keeps is the hash of its
+/// content, and `scripts/handoffs-sin-coste.txt` is the list of those hashes. It is a production file with no
+/// region of test: `written` and `frozen` do not see it. Without this contract the green pass could add the hash
+/// of its own handoff and be let by. With it, a line more or less is an edit of a test, which `frozen` does see.
+/// The shape of each line is not repeated here: the script judges it whenever it reads the list.
+#[test]
+fn the_handoffs_without_cost_are_a_closed_list() {
+    // The check has to be able to fail before a clean answer from it means anything.
+    let honest = "# header\n\nabc one.yml 2026-12-31 owner reason\n";
+    assert!(
+        handoffs_without_cost_problems(honest, 1).is_empty(),
+        "the check refused a list with the number of lines it expects and an expiry in time"
+    );
+    assert!(
+        !handoffs_without_cost_problems(honest, 2).is_empty(),
+        "the check let one line fewer than the contract says through"
+    );
+    assert!(
+        !handoffs_without_cost_problems(honest, 0).is_empty(),
+        "the check let one line more than the contract says through"
+    );
+    let late = "abc one.yml 2027-01-31 owner reason\n";
+    assert!(
+        !handoffs_without_cost_problems(late, 1).is_empty(),
+        "the check let an exception that expires after {HANDOFFS_SIN_COSTE_EXPIRY} through"
+    );
+
+    let body = read("scripts/handoffs-sin-coste.txt").replace("\r\n", "\n");
+    let problems = handoffs_without_cost_problems(&body, HANDOFFS_SIN_COSTE);
+    assert!(
+        problems.is_empty(),
+        "scripts/handoffs-sin-coste.txt is not the closed list the contract describes: {problems:#?}"
+    );
+}
+
 const SELF_TEST_BEGIN: &str = "# --- self-test begin ---";
 const SELF_TEST_END: &str = "# --- self-test end ---";
 

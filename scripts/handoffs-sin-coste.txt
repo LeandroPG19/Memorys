@@ -1,0 +1,31 @@
+# scripts/handoffs-sin-coste.txt: los traspasos anteriores a CI-E6, que validar-handoff.sh deja pasar sin tabla de coste
+# ni segundos medidos (ci-rapido-E6.spec.md, D-E6f). Lista CERRADA: un contrato de rust/tests/local_gate_contract.rs
+# (the_handoffs_without_cost_are_a_closed_list) fija cuantas lineas de datos tiene y que ninguna caduca despues del
+# 2026-12-31. Una linea nueva es una excepcion nueva: la decide el orquestador, con su motivo, su dueño y su caducidad.
+#
+# Una linea por handoff, separada por espacios; las que empiezan por # y las vacias se ignoran:
+#   <sha256 del contenido sin CR> <nombre> <caducidad AAAA-MM-DD> <dueño> <motivo...>
+# La exencion la da el HASH, no el nombre: editar un historico lo vuelve nuevo. Una linea con menos de cinco campos, un
+# hash que no tiene 64 hex o una fecha que no es AAAA-MM-DD deja rojo todo juicio que consulte la lista, y nombra la
+# linea. Pasada la caducidad la linea deja de eximir y el juicio es rojo.
+#
+# Congelada el 2026-11-10 con los handoffs de Memorys-ci y Memorys-ci-integ (los .cursor/handoffs/ no se versionan): por cada .yml
+# (menos handoff.example.yml) de especificador a implementador, o de implementador con type git_handoff y commit distinto de
+# none, su sha256sum de `sed 's/\r$//'`, ordenado y sin repetidos por hash. Solo quedan los que el guion nuevo rechaza por
+# su coste (spec sin tabla, o sin `segundos:`): ci-rapido-E1, E6 y J18 ya cumplen la regla y no tienen linea. A partir de aqui
+# la lista NO crece: un traspaso nuevo cumple la regla o da rojo. Que una linea ya no se use no se puede comprobar (los
+# handoffs no se versionan): se quita a mano, bajando el numero del contrato.
+040d8a00752ba14007d4ba7e0aefaae00fe57a27c0221b757e292500640445be 0.29.0-lan-persistence.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+09f481fdc9d4202e6a25e386e2f9d314f8f8a6489c1e787a3f6a32663de0c011 ci-rapido-J-pasada1c.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+0a36c4439e07dae9cde80cd47ba7396095f19c1567aa2d63eb6386be5e5997e7 ci-rapido-F2.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+23cb79b9f5c39943df7c3a8f293f1ae8a6ce828baadf7322cd87c90a431b9326 ci-rapido-J-pasada1e.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+558b23b2f6c57545e46333d22750dec5a34b07306ddc62fcf6b18375c7f86e5b ci-rapido-J-pasada1b.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+575fd8f15b630e087250f304adf70bc089317d8cf25a52f3431947cf00b01fba 0.29.0-accounts-bridge.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+63e8b1de86b5fe5a512eb6c31bb7ae0761f261c64f1619e51e821d5c0deafd1f ci-rapido-J-F1.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+8288a90e2be4f89a83c2ba7ace679e201bd571c66e57d74be0367b859b097048 ci-rapido-E4.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+a1769e4d5716d9c5e61d3b48d9ef502c3ef34f7f0e29b6bdda6e41214f9a060d ci-rapido-F3.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+b717a33eb64e2eaec457c911406bc2a8614e72fe4d215c915a1326fff613d489 ci-rapido-J-pasada1d.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+c4423415a562079273bce6588e504f288afc293cbea1502174c6676b0af18a20 ci-rapido-F4d.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+c5f6df374e03b75d07855e60d1a3d63832c173bc66e9801e891a187300304f79 ci-rapido-F4.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+db497e2b6f2dc690145e01f5341b0fc35bbba5134b212e1de8c8ccbceb7aaf45 ci-rapido-J-pasada2.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos
+fc12225d704d1d5502564f276a0f5f4390a027e94b49750ddffdb07476d9fcec ci-rapido-J-pasada1.yml 2026-12-31 orquestador anterior a CI-E6: sin tabla de coste ni segundos medidos

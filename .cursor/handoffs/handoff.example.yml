@@ -1,7 +1,7 @@
 from: especificador
 to: implementador
 type: git_handoff
-task: "una línea: qué se entrega"
+task: "una línea: qué se entrega; la spec es .cursor/handoffs/handoff.example.spec.md"
 commit: none
 evidence: none
 
@@ -51,3 +51,23 @@ evidence: none
 #     - rust/tests/local_gate_contract.rs
 #     - scripts/merge-gate.sh
 #   evidence: "qué tiene que correr el orquestador, y qué se pone rojo sin esto"
+#
+# Coste de los tests (CI-E6, 10-nov-2026). No es un campo nuevo:
+#
+#   - El traspaso del especificador nombra su spec (`.cursor/handoffs/<nombre>.spec.md`, junto a este
+#     fichero) en `task` o en `evidence`, y la spec lleva la tabla
+#     `| Escenario | Nivel | Segundos | Carril | Por qué no el barato |`, una fila por escenario.
+#     Ejemplo: handoff.example.spec.md.
+#
+#   - El traspaso del implementador (git_handoff con commit) lleva, dentro de `evidence: |`, sangradas:
+#
+#       evidence: |
+#         segundos: 0.84 s; cargo test --workspace --test x; test result: ok. 1 passed; … finished in 0.84s
+#         carril: DBG; comparte: target:T_dbg,cluster:C_dbg
+#
+#     `segundos:` son los segundos medidos de sus tests nuevos con la orden que los midió; si la línea trae
+#     el `finished in Xs` de cargo, X tiene que ser el mismo número. `carril:` solo hace falta si la tajada
+#     toca `scripts/`: una fila de scripts/gate-dag.txt y el recurso que comparte.
+#
+#   - Los traspasos anteriores a esta regla están exentos por el sha256 de su contenido en
+#     scripts/handoffs-sin-coste.txt, con caducidad. Esa lista no crece.
