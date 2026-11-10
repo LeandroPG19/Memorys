@@ -8,12 +8,14 @@ of the history (D-F5r).
 - `barrido --perfil {debug,release}`: compiles what a row of the judge compiles, at several
   CARGO_BUILD_JOBS (J), crate cold and without incremental, with the profile tokens of the row in
   scripts/gate-dag.txt (CI-K4), and writes one point per J and replica to `usl.jsonl` through
-  gate_history.usl_point. Exit 2 when the machine is busy or the table cannot be read.
+  gate_history.usl_point. The J are fractions of J_m, the jobs of the machine as the planner counts them (E7a-2).
+  Exit 2 when the machine is busy, the table cannot be read, or the grid has fewer than five levels.
 - `ajustar --perfil P`: fits X(J) = lambda*J / (1 + sigma*(J-1) + kappa*J*(J-1)) to the points by
   least squares on the relative error, lambda profiled, over a fixed grid (no randomness). Exit 3
   when the fit is not reliable (five criteria, the first one that fails is the reason).
 - `recomendar`: slack of each row, the `juez-cuda` verdict, and the J that a simulation of the DAG
-  (the admission of gate-dag.py) likes best. Exit 3 when an adjustment or a cold run is missing.
+  (the admission, the order and the jobs of gate-dag.py, up to J_m) likes best. Exit 3 when an adjustment or a cold run
+  is missing.
 
 Standard library only. The cargo orders of each profile have to appear in scripts/run-all-tests.sh
 (guarded by gate_usl_contract).
@@ -75,12 +77,12 @@ GANANCIA_MIN_REL = 0.02
 EMPATE_S = 5.0
 EMPATE_REL = 0.01
 BORDE = 1 - 1e-9
-EXCLUSIVAS = frozenset({"exclusive", "boundary"})
 
 # Mapa fijo perfil -> fila (spec 3). The orders are the compilations of that row in run-all-tests.sh, in
 # its order (D-F5f); `cargo test --no-run` is the compile-only form of the judge's `cargo test`. There is no
 # profile of the E2E row: since CI-F3.4 it is a reader that runs the release binary B3 built and compiles
-# nothing, and the release binary is compiled by B3, which `release` measures.
+# nothing, and the release binary is compiled by B3, which `release` measures. `fracciones` are the (numerator,
+# denominator) of J_m that the sweep measures (D-E7j): with 24 jobs they are the grids that the first sweeps used.
 PERFILES: dict[str, dict[str, Any]] = {
     "debug": {
         "fila": "DBG",
@@ -89,7 +91,7 @@ PERFILES: dict[str, dict[str, Any]] = {
             ["build", "--bin", "memory-industry"],
             ["test", "--no-run"],
         ],
-        "rejilla": [2, 4, 8, 12, 16, 24],
+        "fracciones": ((1, 12), (1, 6), (1, 3), (1, 2), (2, 3), (1, 1)),
     },
     "release": {
         "fila": "B3",
@@ -97,7 +99,7 @@ PERFILES: dict[str, dict[str, Any]] = {
             ["test", "--release", "--features", "docs,cuda", "--no-run", "--lib", "--test", "v017_rerank_gpu"],
             ["build", "--release", "--features", "docs,cuda", "--bins"],
         ],
-        "rejilla": [4, 6, 8, 12, 16],
+        "fracciones": ((1, 6), (1, 4), (1, 3), (1, 2), (2, 3)),
     },
 }
 FILAS_EN_FRIO = frozenset(p["fila"] for p in PERFILES.values())
@@ -455,6 +457,12 @@ def _correr(orden: list[str], entorno: dict[str, str], cwd: str, plazo_s: float)
     return rc, pico
 
 
+def rejilla_de(perfil: dict[str, Any], j_m: int) -> list[int]:
+    """D-E7j: the J of a sweep, J_m times each fraction of the profile rounded half up (integer arithmetic), at least 1,
+    with no repeats."""
+    return sorted({max(1, (2 * j_m * num + den) // (2 * den)) for num, den in perfil["fracciones"]})
+
+
 def _zigzag(rejilla: list[int]) -> list[int]:
     """[J0, Jk, J1, Jk-1, ...] over the sorted grid: neighbours in J are far apart in time."""
     ordenada = sorted(rejilla)
@@ -539,7 +547,7 @@ def cmd_barrido(args: argparse.Namespace) -> int:
         fallar(f"unknown profile {args.perfil!r}: one of {', '.join(PERFILES)}")
     if not os.environ.get("CARGO_TARGET_DIR"):
         fallar("CARGO_TARGET_DIR is not set: the sweep builds in the target of the judge's row (D-F5h)")
-    rejilla = _parse_j(args.j) if args.j else perfil["rejilla"]
+    pedida = _parse_j(args.j) if args.j else None
     if args.reps < 1:
         fallar("--reps has to be 1 or more")
     plazo_s = _plazo_orden()
@@ -551,11 +559,19 @@ def cmd_barrido(args: argparse.Namespace) -> int:
         fallar(f"the pressure cannot be read from {psi_archivo}: the machine cannot be called quiet")
     if psi > PSI_MAX:
         fallar(f"busy: some avg10 of {psi_archivo} is {psi:.2f} %, above {PSI_MAX:.0f} %; nothing was run")
+    medida = dag.measure_machine()
+    rejilla = pedida or rejilla_de(perfil, medida.jobs)
+    if pedida is None and len(rejilla) < NIVELES_MIN:
+        razon = f" ({medida.why})" if medida.why else ""
+        fallar(
+            f"J_m={medida.jobs}{razon}: the grid of {args.perfil} has {len(rejilla)} levels ({','.join(map(str, rejilla))}), "
+            f"need {NIVELES_MIN}; nothing was run"
+        )
     destino = dag.target_dir(dag.target_of(fila))
     cwd = os.path.join(raiz(), "rust")
     sha, sucio = dag.git_state(raiz())
     huella_ini = gate_history.huella(raiz())
-    cores = dag.capacities()[0]
+    cores = dag.capacities(medida)[0]
     # The profile of the row is in the hash of every unit (D-K4f): without its tokens the sweep would measure another build
     # and leave a second set of artifacts in the target of the judge.
     # CARGO_INCREMENTAL=0 stays a literal: DBG, NLI and DC carry it in their rows, B3 and REL (release) do not, and the sweep of
@@ -705,33 +721,48 @@ def holguras(filas: list[dict[str, Any]], duraciones: dict[str, float]) -> dict[
     return {"L": largo, "filas": resultado}
 
 
-def _rangos(filas: list[dict[str, Any]]) -> dict[str, float]:
-    rango: dict[str, float] = {}
-    for f in sorted(filas, key=lambda f: -f["idx"]):
-        sucesores = [s for s in filas if f["id"] in s["deps"]]
-        rango[f["id"]] = f["d"] + max((rango[s["id"]] for s in sucesores), default=0.0)
-    return rango
+def _paso(f: dict[str, Any]) -> Any:
+    """The step of the planner that a row of the simulation stands for: what `dag.admission` reads of it."""
+    dag = gate_dag()
+    env = {"CARGO_BUILD_JOBS": str(f["jobs"])} if f["jobs"] else {}
+    paso = dag.Step(f["idx"], f["id"], f["deps"], f["recursos"], f["clase"], f["c"], 0.0, f["d"], env, [])
+    paso.r = f["r"]
+    return paso
 
 
-def simular(filas: list[dict[str, Any]], cpu_cap: float, ram: float) -> float:
-    """The clock of the DAG by list scheduling, with the admission of gate-dag.py (spec 2.5): a row starts when its
-    dependencies finished and sum(c) <= cpu_cap and sum(r) <= R among the live ones, or when none is alive;
-    exclusive rows run alone after every lower idx. Contention is not modelled."""
-    rango = _rangos(filas)
-    pendientes = {f["id"]: f for f in filas}
+def simular(
+    filas: list[dict[str, Any]],
+    cpu_cap: float,
+    ram: float,
+    jobs_cap: int,
+    arranques: list[tuple[float, str]] | None = None,
+) -> float:
+    """The clock of the DAG by list scheduling with the planner's own admission and order (D-E7f, D-E7g): the ready rows by
+    (-rank, idx) of `dag.ranks`, each one started when `dag.admission` lets it in with the RAM the live rows leave. A row
+    is a dict with id, idx, deps, clase, recursos, d, c, r (bytes) and jobs (the CARGO_BUILD_JOBS it names, 0 for none).
+    Contention is not modelled. Each start is appended to `arranques` as (instant, id) when a list is given."""
+    dag = gate_dag()
+    pasos = {f["id"]: _paso(f) for f in filas}
+    duracion = {f["id"]: f["d"] for f in filas}
+    rango = dag.ranks(list(pasos.values()), duracion)[0]
+    pendientes = set(pasos)
     vivas: dict[str, float] = {}
     hechas: set[str] = set()
-    por_id = {f["id"]: f for f in filas}
     ahora = fin = 0.0
     while pendientes or vivas:
         listas = sorted(
-            (f for f in pendientes.values() if all(d in hechas for d in f["deps"])),
-            key=lambda f: (-rango[f["id"]], f["idx"]),
+            (pasos[i] for i in pendientes if all(d in hechas for d in pasos[i].deps)),
+            key=lambda p: (-rango[p.id], p.idx),
         )
-        for f in listas:
-            if _cabe(f, vivas, pendientes, por_id, cpu_cap, ram):
-                vivas[f["id"]] = ahora + f["d"]
-                del pendientes[f["id"]]
+        for p in listas:
+            en_marcha = [pasos[i] for i in vivas]
+            antes = any(pasos[i].idx < p.idx for i in pendientes if i != p.id)
+            libre = ram - sum(o.r for o in en_marcha)
+            if dag.admission(p, en_marcha, antes, cpu_cap, ram, jobs_cap, libre) is None:
+                vivas[p.id] = ahora + duracion[p.id]
+                pendientes.discard(p.id)
+                if arranques is not None:
+                    arranques.append((ahora, p.id))
         if not vivas:
             break
         ahora = min(vivas.values())
@@ -740,24 +771,6 @@ def simular(filas: list[dict[str, Any]], cpu_cap: float, ram: float) -> float:
             del vivas[id_]
         fin = max(fin, ahora)
     return fin
-
-
-def _cabe(
-    f: dict[str, Any],
-    vivas: dict[str, float],
-    pendientes: dict[str, Any],
-    por_id: dict[str, Any],
-    cpu_cap: float,
-    ram: float,
-) -> bool:
-    if f["clase"] in EXCLUSIVAS:
-        if vivas or any(o["idx"] < f["idx"] for o in pendientes.values() if o["id"] != f["id"]):
-            return False
-    elif any(por_id[i]["clase"] in EXCLUSIVAS for i in vivas):
-        return False
-    if not vivas:
-        return True
-    return sum(por_id[i]["c"] for i in vivas) + f["c"] <= cpu_cap and sum(por_id[i]["r"] for i in vivas) + f["r"] <= ram
 
 
 # --- the recommendation -------------------------------------------------------
@@ -795,17 +808,38 @@ class Historial:
             c["run"] for c in self.corridas if self.pasos.get(c["run"], {}).get(b3, {}).get("seg", 0) >= FRIO_B3_S
         ]
 
-    def capacidades(self) -> tuple[int, int]:
+    def _de_la_maquina(self) -> dict[str, Any]:
+        """The last green serial run with C and R: the machine the simulation counts with."""
         for c in reversed(self.corridas):
             if isinstance(c.get("C"), int) and isinstance(c.get("R"), int):
-                return c["C"], c["R"]
+                return c
         fallar("the history has no green serial run with C and R: R is missing")
+
+    def capacidades(self) -> tuple[int, int]:
+        corrida = self._de_la_maquina()
+        return corrida["C"], corrida["R"]
+
+    def jobs_de_la_maquina(self, notas: list[str]) -> int:
+        """D-E7h: J_m, the `plan.jobs` of the run that C and R come from; C when that run has no plan."""
+        corrida = self._de_la_maquina()
+        jobs = _jobs_del_plan(corrida)
+        if jobs is None:
+            notas.append(f"the last green serial run has no plan: J_m is C ({corrida['C']})")
+            return int(corrida["C"])
+        return jobs
 
     def corrida(self, run: str) -> dict[str, Any]:
         return next(c for c in self.corridas if c["run"] == run)
 
     def muestras(self, fila: str, runs: list[str]) -> list[dict[str, Any]]:
         return [self.pasos[r][fila] for r in runs if fila in self.pasos.get(r, {})][-VENTANA:]
+
+
+def _jobs_del_plan(corrida: dict[str, Any]) -> int | None:
+    """The jobs the machine gave a run (`plan.jobs`, D-K4q); None when the run has no plan or a plan with no jobs."""
+    plan = corrida.get("plan")
+    jobs = plan.get("jobs") if isinstance(plan, dict) else None
+    return jobs if isinstance(jobs, int) and not isinstance(jobs, bool) and jobs > 0 else None
 
 
 def _jobs_de(contenido: bytes, fila: str) -> int | None:
@@ -853,6 +887,7 @@ def _p95(valores: list[float]) -> float:
 
 def _base_filas(pasos: list[Any], hist: Historial) -> list[dict[str, Any]]:
     """Rows with the duration, cores and RAM of the history: the cold-sensitive rows only from the cold runs."""
+    dag = gate_dag()
     todas = [c["run"] for c in hist.corridas]
     filas: list[dict[str, Any]] = []
     for p in pasos:
@@ -866,6 +901,8 @@ def _base_filas(pasos: list[Any], hist: Historial) -> list[dict[str, Any]]:
             "idx": p.idx,
             "deps": p.deps,
             "clase": p.clase,
+            "recursos": p.recursos,
+            "jobs": dag.named_jobs(p),
             "d": float(d),
             "c": _p95(nucleos) if nucleos else p.cpu_tab,
             "r": _p95(anon) * SEGURIDAD_RAM if anon else p.ram_tab * GIB,
@@ -888,11 +925,15 @@ def _veredicto_juez_cuda(hist: Historial, holgura: dict[str, Any]) -> str:
 class Calibrada:
     """A row with a reliable fit: its candidate J, and the duration each one would have (D-F5s, 2.5)."""
 
-    def __init__(self, fila: str, perfil: str, ajuste: dict[str, Any], actual: int, pool: int, cpu_hist: int) -> None:
+    def __init__(self, fila: str, perfil: str, ajuste: dict[str, Any], actual: int, pool: int, j_maquina: int) -> None:
         self.fila, self.perfil, self.ajuste = fila, perfil, ajuste
-        self.actual, self.pool = actual, pool
-        self.tope_j = min(cpu_hist, ajuste["J_rodilla"])
+        self.actual, self.pool, self.j_maquina = actual, pool, j_maquina
+        self.tope_j = min(j_maquina, ajuste["J_rodilla"])
         self.usadas: list[tuple[str, int, float]] = []
+
+    def efectivo(self, j: int) -> int:
+        """The jobs a row that names `j` gets on this machine (D-E7d)."""
+        return gate_dag().row_jobs(j, self.j_maquina)
 
     def t(self, j: int) -> float:
         a = self.ajuste
@@ -908,11 +949,12 @@ class Calibrada:
     def candidatos(self, ram_max: float) -> list[int]:
         medidos = {j for j in self.ajuste["niveles"] if j <= self.tope_j}
         cabe = [j for j in medidos if self.ram(j) is None or self.ram(j) <= ram_max]
-        return sorted(set(cabe) | {self.actual})
+        return sorted(set(cabe) | {self.efectivo(self.actual)})
 
 
 def _usar_corridas(cal: Calibrada, hist: Historial, conocidas: dict[str, bytes], notas: list[str]) -> None:
-    """The cold runs of a table that git knows, each with the J its table gave the row (U16)."""
+    """The cold runs of a table that git knows, each with the J its table gave the row and its machine gave the run: the
+    row got row_jobs(J of the table, plan.jobs of the run) (U16, D-E7h). A run with no plan counts the J of the table."""
     avisadas: set[str] = set()
     jobs: dict[str, int | None] = {}
     for run in hist.frias:
@@ -925,7 +967,14 @@ def _usar_corridas(cal: Calibrada, hist: Historial, conocidas: dict[str, bytes],
         if tabla not in jobs:
             jobs[tabla] = _jobs_de(conocidas[tabla], cal.fila)
         if jobs[tabla] is not None and cal.fila in hist.pasos.get(run, {}):
-            cal.usadas.append((run, int(jobs[tabla] or 0), float(hist.pasos[run][cal.fila]["seg"])))
+            j_tabla = int(jobs[tabla] or 0)
+            j_corrida = _jobs_del_plan(hist.corrida(run))
+            if j_corrida is None:
+                notas.append(f"run {run} has no plan: the J of the table ({j_tabla}) is used for {cal.fila}")
+                recibido = j_tabla
+            else:
+                recibido = gate_dag().row_jobs(j_tabla, j_corrida)
+            cal.usadas.append((run, recibido, float(hist.pasos[run][cal.fila]["seg"])))
     cal.usadas = cal.usadas[-VENTANA:]
 
 
@@ -939,10 +988,12 @@ def _estado_de(
         cal = cals.get(f["id"])
         if cal is not None:
             j = eleccion[f["id"]]
-            nueva["d"] = cal.duracion(j)
+            efectivo = cal.efectivo(j)
+            nueva["d"] = cal.duracion(efectivo)
+            nueva["jobs"] = efectivo
             if j != cal.actual:
-                nueva["c"] = float(max(j, cal.pool))
-            ram = cal.ram(j)
+                nueva["c"] = float(max(efectivo, cal.pool))
+            ram = cal.ram(efectivo)
             if ram is not None:
                 nueva["r"] = max(f["r"], ram)
         filas.append(nueva)
@@ -950,19 +1001,19 @@ def _estado_de(
 
 
 def _elegir(
-    base: list[dict[str, Any]], cals: dict[str, Calibrada], cpu_cap: float, ram: float
+    base: list[dict[str, Any]], cals: dict[str, Calibrada], cpu_cap: float, ram: float, j_m: int
 ) -> tuple[dict[str, int], dict[str, int], float, float]:
     """The combination of J with the shortest simulated clock; a tie (< 5 s or < 1 %) goes to the smaller J."""
     ids = sorted(cals, key=lambda i: next(f["idx"] for f in base if f["id"] == i))
     listas = [cals[i].candidatos(ram) for i in ids]
     reloj: dict[tuple[int, ...], float] = {}
     for combo in itertools.product(*listas):
-        reloj[combo] = simular(_estado_de(base, cals, dict(zip(ids, combo))), cpu_cap, ram)
+        reloj[combo] = simular(_estado_de(base, cals, dict(zip(ids, combo))), cpu_cap, ram, j_m)
     mejor = min(reloj.values())
     margen = max(EMPATE_S, EMPATE_REL * mejor)
     elegido = min((c for c, t in reloj.items() if t < mejor + margen), key=lambda c: (sum(c), c))
     actual = {i: cals[i].actual for i in ids}
-    return dict(zip(ids, elegido)), actual, reloj[elegido], simular(_estado_de(base, cals, actual), cpu_cap, ram)
+    return dict(zip(ids, elegido)), actual, reloj[elegido], simular(_estado_de(base, cals, actual), cpu_cap, ram, j_m)
 
 
 def _fila_nueva(linea: str, j: int, cpu: int, ram_gb: int | None) -> str:
@@ -1005,6 +1056,7 @@ def recomendar(args: argparse.Namespace) -> dict[str, Any]:
     hist = Historial()
     c, ram = hist.capacidades()
     notas: list[str] = []
+    j_m = hist.jobs_de_la_maquina(notas)
     faltan: list[str] = []
     if not hist.frias:
         faltan.append("a green serial run after a code change (B3 of 60 s or more): none in the history")
@@ -1015,12 +1067,14 @@ def recomendar(args: argparse.Namespace) -> dict[str, Any]:
         "frias": len(hist.frias),
         "C": c,
         "R": ram,
+        "J_maquina": j_m,
+        "supone": "dag",
         "L": plana["L"],
         "filas": plana["filas"],
         "juez_cuda": _veredicto_juez_cuda(hist, plana),
         "faltan": faltan,
         "calibradas": {},
-        "T_sim_actual": simular(base, c, ram),
+        "T_sim_actual": simular(base, c, ram, j_m),
         "T_sim_propuesto": None,
         "cpu_cap": {"C": c, "N_estrella": None, "propuesto": c},
         "diff": None,
@@ -1053,7 +1107,7 @@ def _calibrar(
     tabla: str,
     notas: list[str],
 ) -> None:
-    c, ram = res["C"], res["R"]
+    c, ram, j_m = res["C"], res["R"], res["J_maquina"]
     conocidas = _tablas_conocidas(tabla)
     por_paso = {p.id: p for p in pasos}
     cals: dict[str, Calibrada] = {}
@@ -1064,7 +1118,7 @@ def _calibrar(
         if not actual.isdigit():
             fallar(f"the row {fila} of the table has no CARGO_BUILD_JOBS to calibrate")
         pool = max((int(v) for k, v in paso.env.items() if k.endswith("_INTRA_THREADS") and v.isdigit()), default=0)
-        cal = Calibrada(fila, nombre, ajuste, int(actual), pool, c)
+        cal = Calibrada(fila, nombre, ajuste, int(actual), pool, j_m)
         _usar_corridas(cal, hist, conocidas, notas)
         if not cal.usadas:
             res["faltan"].append(f"a cold green serial run of a table that git knows, for {fila}")
@@ -1074,9 +1128,9 @@ def _calibrar(
     L = res["L"]
     umbral = max(GANANCIA_MIN_S, GANANCIA_MIN_REL * L)
     if cals:
-        eleccion, _, _, t_actual = _elegir(base, cals, c, ram)
-        ganancias = _revertir(base, cals, eleccion, c, ram, umbral)
-        final = simular(_estado_de(base, cals, eleccion), c, ram)
+        eleccion, _, _, t_actual = _elegir(base, cals, c, ram, j_m)
+        ganancias = _revertir(base, cals, eleccion, c, ram, j_m, umbral)
+        final = simular(_estado_de(base, cals, eleccion), c, ram, j_m)
         res["T_sim_actual"], res["T_sim_propuesto"] = t_actual, final
     else:
         eleccion, ganancias = {}, {}
@@ -1091,13 +1145,14 @@ def _calibrar(
             "perfil": cal.perfil,
             "J_actual": cal.actual,
             "J_propuesto": j,
+            "J_efectivo": cal.efectivo(j),
             "propone": propone,
             "ganancia_s": ganancias[fila],
             "umbral_s": umbral,
             "J_hist": sorted({j_hist for _, j_hist, _ in cal.usadas}),
             "runs": [r for r, _, _ in cal.usadas],
             "d_hist": statistics.median(seg for _, _, seg in cal.usadas),
-            "d_por_J": {str(x): cal.duracion(x) for x in cal.candidatos(ram)},
+            "d_por_J": {str(x): cal.duracion(cal.efectivo(x)) for x in cal.candidatos(ram)},
         }
     debug = ajustes.get("debug")
     n = None if debug is None else debug["N_estrella"]
@@ -1114,6 +1169,7 @@ def _revertir(
     eleccion: dict[str, int],
     c: float,
     ram: float,
+    j_m: int,
     umbral: float,
 ) -> dict[str, float]:
     """A row keeps its new J only if putting the old one back costs the simulated clock the threshold (D-F5q).
@@ -1123,8 +1179,8 @@ def _revertir(
         cal = cals[fila]
         if eleccion[fila] == cal.actual:
             continue
-        con = simular(_estado_de(base, cals, eleccion), c, ram)
-        sin = simular(_estado_de(base, cals, {**eleccion, fila: cal.actual}), c, ram)
+        con = simular(_estado_de(base, cals, eleccion), c, ram, j_m)
+        sin = simular(_estado_de(base, cals, {**eleccion, fila: cal.actual}), c, ram, j_m)
         ganancias[fila] = sin - con
         if sin - con < umbral:
             eleccion[fila] = cal.actual
@@ -1134,6 +1190,10 @@ def _revertir(
 def _imprimir_recomendacion(res: dict[str, Any]) -> None:
     print(
         f"corridas verdes en serie: {res['corridas']} ({res['frias']} en frío); C = {res['C']}, R = {res['R'] / GIB:.1f} GiB"
+    )
+    print(
+        f"supone: DAG con la admisión del planificador (exclusividad, modelos, CPU, RAM, jobs <= J={res['J_maquina']}), "
+        "sin contención; en serie el reloj es la suma de las filas (no calibrado: E7b)"
     )
     print(f"holgura por fila (L = {res['L']:.3f} s):")
     for id_, f in res["filas"].items():
@@ -1172,7 +1232,7 @@ def main(argv: list[str] | None = None) -> int:
     ordenes = parser.add_subparsers(dest="orden", required=True)
     b = ordenes.add_parser("barrido", help="measure a profile at several CARGO_BUILD_JOBS")
     b.add_argument("--perfil", required=True)
-    b.add_argument("--j", default=None, help="comma separated jobs; default: the profile's grid")
+    b.add_argument("--j", default=None, help="comma separated jobs; default: the profile's fractions of J_m")
     b.add_argument("--reps", type=int, default=2)
     b.set_defaults(func=cmd_barrido)
     a = ordenes.add_parser("ajustar", help="fit the USL curve to the points of a profile")
