@@ -25,7 +25,7 @@
 //!   field it covers); the run has `mem_muestra`, `serie_final_s` and `serie_cola_s`; stdout has `dag: resources:` after
 //!   `dag: T=` and `note: not measured (...)` lines, and a scope that is not delegated is neither measured nor written.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
@@ -4728,6 +4728,7 @@ print("row_jobs pairs=1024")
 ///    each axis (CPU, RAM, jobs, the free memory of the models rule), one axis at a time and all of them together;
 /// 2. admitting one by one with `admission`, the jobs of the rows alive never add up past the jobs cap once two are alive;
 /// 3. a candidate with nobody alive and no exclusive row pending is admitted, whatever the caps.
+///
 /// Then the answers of a few states with the reason by hand, which also fix the order of the reasons: exclusive, models
 /// (count, then free memory), CPU, jobs, RAM.
 const BODY_ADMISSION: &str = r#"
