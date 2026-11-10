@@ -291,6 +291,9 @@ gate_cluster_sweep() {
 #   ./scripts/gate-cluster.sh --self-test
 # --- self-test begin ---
 if [[ "${1:-}" == "--self-test" && "${BASH_SOURCE[0]}" == "$0" ]]; then
+  # CI-J3: the judge hands its children GATE_SERVER_SYSTEM_ID, the identity of its real server. The J15c rows ask
+  # gate_require_judge_server with a stand-in psql that answers its own identity, so this self-test starts without the judge's.
+  unset GATE_SERVER_SYSTEM_ID
   SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-cluster.sh"
   hermetic="$(mktemp -d)"
   mkdir -p "$hermetic/home" "$hermetic/cache"
