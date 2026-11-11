@@ -225,11 +225,21 @@ import sys as _s; _s.stdout.reconfigure(encoding="utf-8", errors="replace")
 import json, sys
 
 text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-line = next((l for l in text.splitlines() if l.startswith('{"healthy"')), None)
-if line is None:
+# The report is the one line that parses as JSON and carries "checks": its first key is not fixed (2026-11-11, Windows).
+report = None
+for l in text.splitlines():
+    if l.startswith("{") and '"checks"' in l:
+        try:
+            report = json.loads(l)
+        except ValueError:
+            continue
+        if isinstance(report.get("checks"), list):
+            break
+        report = None
+if report is None:
     print("")
     sys.exit(0)
-checks = {c["name"]: c for c in json.loads(line)["checks"]}
+checks = {c["name"]: c for c in report["checks"]}
 print((checks.get(sys.argv[2]) or {}).get(sys.argv[3]) or "")
 PY
 
