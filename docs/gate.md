@@ -381,7 +381,9 @@ contracts) and `lane_E` (the E2E, the doctor, the MCP live session and the eval 
   (a contract holds that), and none loads a model. So the row names no `models`, its lane makes no
   `brain_gate`, and it does not wait behind the rows that load models. It still names a cluster, for the
   reason `NLI` does. The split is made by name and never with `--skip`: every file of `tests/` runs without
-  `--ignored` in exactly one of `D1` and `CT`.
+  `--ignored` in exactly one of `D1` and `CT`. Membership in `JUDGE_CONTRACTS` and in `RUN_ELSEWHERE` is decided
+  without a pipe: under `pipefail`, `printf … | grep -q` is false whenever `grep` leaves before the writer is
+  done (CI-E33).
 - `NLI` is an `exclusive` row: it asserts a clock (`nli_entailment` under 500 ms), so the planner starts it
   after every row of lower idx and runs nothing next to it. It is a reader of `B1` like the other four. Its
   tests open no database, but `run-all-tests.sh` runs only against a judge's server, so the row has its own

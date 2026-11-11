@@ -2123,7 +2123,7 @@ run_counted() {
   fi
   # CI-E11 (D-E11d): a section that runs tests compiles nothing. B1 (T_dbg) and B3 (T_rel) built what it runs; a unit it
   # compiles again is written over a binary that a lane beside it may be running.
-  unit="$(sed -n 's/^[[:space:]]*Compiling \([^ ]*\) .*/\1/p' "$log" | head -n 1)"
+  unit="$(sed -n '/^[[:space:]]*Compiling [^ ]* /{s/^[[:space:]]*Compiling \([^ ]*\) .*/\1/p;q;}' "$log")"
   if [[ -n "$unit" ]]; then
     say_compiled "section $section" "$unit"
     rm -f "$log"
@@ -2395,7 +2395,7 @@ JUDGE_CONTRACTS=(ci_contract gate_dag_contract gate_history_contract gate_usl_co
 # split_tests: PLAIN_TESTS and CONTRACT_TESTS, each a list of `--test <name>` pairs, from tests/*.rs and JUDGE_CONTRACTS. A name of
 # JUDGE_CONTRACTS that is no file is refused by name before any test runs: it would be a contract that runs nowhere.
 split_tests() {
-  local name file
+  local name file contracts=" ${JUDGE_CONTRACTS[*]} "
   for name in "${JUDGE_CONTRACTS[@]}"; do
     [[ -f "tests/$name.rs" ]] \
       || { echo "FAIL: JUDGE_CONTRACTS names $name and rust/tests/$name.rs is not a file (CI-E11, D-E11e)." >&2; exit 1; }
@@ -2404,7 +2404,7 @@ split_tests() {
   CONTRACT_TESTS=()
   for file in tests/*.rs; do
     name="$(basename "$file" .rs)"
-    if printf '%s\n' "${JUDGE_CONTRACTS[@]}" | grep -qx "$name"; then
+    if [[ "$contracts" == *" $name "* ]]; then
       CONTRACT_TESTS+=(--test "$name")
     else
       PLAIN_TESTS+=(--test "$name")
@@ -2465,9 +2465,10 @@ RUN_ELSEWHERE=(v020_audit_update_applies v020_role_separation v016_chunking nli_
                v016_extract_without_sampling v017_relation_scan v017_rerank_gpu)
 DISCOVERED=()
 DEFERRED_SECTIONS=()
+local elsewhere=" ${RUN_ELSEWHERE[*]} "
 for file in tests/*.rs; do
   name="$(basename "$file" .rs)"
-  if printf '%s\n' "${RUN_ELSEWHERE[@]}" | grep -qx "$name"; then
+  if [[ "$elsewhere" == *" $name "* ]]; then
     DEFERRED_SECTIONS+=("$name")
   else
     DISCOVERED+=(--test "$name")
