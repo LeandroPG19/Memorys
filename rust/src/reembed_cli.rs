@@ -36,7 +36,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         }
     }
 
-    if !crate::embeddings::onnx::is_model_loaded() {
+    if !crate::embeddings::onnx::model_loaded().await {
         anyhow::bail!(
             "no hay modelo ONNX cargado. Reembeber con el fallback de hash reemplazaría \
              los vectores por ruido sin que nada lo avise.\n\

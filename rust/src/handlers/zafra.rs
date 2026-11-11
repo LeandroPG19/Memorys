@@ -393,7 +393,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             }))
         }
         "reembed" => {
-            if !crate::embeddings::onnx::is_model_loaded() {
+            if !crate::embeddings::onnx::model_loaded().await {
                 return Ok(serde_json::json!({
                     "action": "reembed",
                     "updated": 0,

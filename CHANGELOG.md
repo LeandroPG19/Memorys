@@ -29,6 +29,8 @@ The real machine and a judge that does not lose the hour. 0.30.0 was proved and 
 
 ### Changed
 
+- **The embedding model loads on its first use instead of at start-up.** A stdio process that never embeds (`tools/list`, most tool calls) no longer reads the model: about 0.6–1.1 s and ~435 MB less per process. The first call that embeds pays the load once; concurrent first calls share that one load and none of them falls back to the hash embedder while it runs. A model whose session will not open is reported on that first use, not at start-up. The dimension guard now runs whenever a model is configured, so a configured model that fails to open no longer starts against columns of another width. `serve` binds its port before loading, as its warm-up always intended.
+
 - **`ort` builds without its downloader: `default-features = false`.** Under `load-dynamic` its build script returns before downloading, yet `ureq`, `native-tls` and a vendored OpenSSL were compiled for it on every clean build; 20 crates leave `Cargo.lock` and none is added or moves. `Cargo.lock` is guarded: it fails if `openssl-sys`, `openssl-src` or `ureq` come back.
 
 - **`tokenizers` keeps only `onig`, its regex engine.** The progress bar and the C++ suffix array served training, which this crate never does. `number_prefix` (RUSTSEC-2025-0119, unmaintained) leaves `Cargo.lock` and its exception is gone from `scripts/advisory-exceptions.txt`, `.cargo/audit.toml` and `deny.toml`.

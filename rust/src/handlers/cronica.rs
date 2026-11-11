@@ -38,7 +38,10 @@ async fn persist_searchable(
     project_id: Option<uuid::Uuid>,
     precomputed: Option<Vec<f32>>,
 ) -> (String, usize) {
-    let loaded = crate::embeddings::onnx::is_model_loaded();
+    // Outside `work` and so outside the timeout below: the 2 s are for the
+    // embed and the store, and the first call of a process also opens the
+    // model. Inside, a slow load would answer `pending` to the first write.
+    let loaded = crate::embeddings::onnx::model_loaded().await;
     if !loaded {
         return (embedding_status(false, false).to_string(), 0);
     }
@@ -705,7 +708,7 @@ async fn check_dedup(
     .await?;
 
     if dupes.is_empty() {
-        if crate::embeddings::onnx::is_model_loaded()
+        if crate::embeddings::onnx::model_loaded().await
             && let Ok(emb) =
                 crate::embeddings::onnx::embed_passage_contextual(content, entity_type, entity_name)
                     .await
@@ -886,41 +889,45 @@ async fn episode_add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<V
 
     let ep_id = row.0;
 
-    let embed_pool = pool.clone();
-    let content_owned = content.to_string();
-    let entity_name_owned = entity_name.to_string();
-    crate::tasks::spawn(async move {
-        let entity_type: String =
-            sqlx::query_scalar("SELECT entity_type FROM brain_entities WHERE name = $1")
-                .bind(&entity_name_owned)
-                .fetch_optional(&embed_pool)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "concept".to_string());
+    // Resolved here, in the request, and not inside the task: a first use that
+    // opened the model in the background would pay the load against the drain
+    // that closes the process, and a vector lost there is not recovered.
+    if crate::embeddings::onnx::model_loaded().await {
+        let embed_pool = pool.clone();
+        let content_owned = content.to_string();
+        let entity_name_owned = entity_name.to_string();
+        crate::tasks::spawn(async move {
+            let entity_type: String =
+                sqlx::query_scalar("SELECT entity_type FROM brain_entities WHERE name = $1")
+                    .bind(&entity_name_owned)
+                    .fetch_optional(&embed_pool)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "concept".to_string());
 
-        if crate::embeddings::onnx::is_model_loaded()
-            && let Ok(emb) = crate::embeddings::onnx::embed_passage_contextual(
+            if let Ok(emb) = crate::embeddings::onnx::embed_passage_contextual(
                 &content_owned,
                 &entity_type,
                 &entity_name_owned,
             )
             .await
-        {
-            let model = crate::embeddings::onnx::current_model();
-            let stored = sqlx::query(
-                "UPDATE brain_episodes SET embedding = $1::vector, embedding_model = $2 WHERE id = $3",
-            )
-            .bind(pgvector::Vector::from(emb))
-            .bind(model)
-            .bind(ep_id)
-            .execute(&embed_pool)
-            .await;
-            if let Err(e) = stored {
-                tracing::warn!(episode_id = %ep_id, error = %e, "failed to store embedding — episode stays invisible to vector search");
+            {
+                let model = crate::embeddings::onnx::current_model();
+                let stored = sqlx::query(
+                    "UPDATE brain_episodes SET embedding = $1::vector, embedding_model = $2 WHERE id = $3",
+                )
+                .bind(pgvector::Vector::from(emb))
+                .bind(model)
+                .bind(ep_id)
+                .execute(&embed_pool)
+                .await;
+                if let Err(e) = stored {
+                    tracing::warn!(episode_id = %ep_id, error = %e, "failed to store embedding — episode stays invisible to vector search");
+                }
             }
-        }
-    });
+        });
+    }
 
     tracing::info!(
         entity = %entity_name,

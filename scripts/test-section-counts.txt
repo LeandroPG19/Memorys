@@ -19,7 +19,7 @@
 # (motivo: `<tajada> <±Δ> <tests>`). Nunca se copia el número de un rojo: una diferencia que el diff no explica es un test
 # perdido o de más. La base inicial se midió sobre un log del juez; se vuelve a comprobar sin correr nada con
 #   bash scripts/run-all-tests.sh --check-counts plain <log de cargo del pase llano>
-discovered-ignored 106 cargo test --test <todos los tests/*.rs salvo RUN_ELSEWHERE> -- --ignored (F0 corrida 2)
+discovered-ignored 107 cargo test --test <todos los tests/*.rs salvo RUN_ELSEWHERE> -- --ignored (F0 corrida 2) y CI-E16 +1 test (an_episode_has_its_vector_when_the_drain_returns, #[ignore] de v040_write_ahead)
 lib-ignored 18 cargo test --lib -- --ignored (F0 corrida 2)
 admin-role 3 v020_audit_update_applies + v020_role_separation con CUBA_APP_ROLE=0 (F0 corrida 2)
 embedding-model 2 v016_chunking (F0 corrida 2)
@@ -31,7 +31,7 @@ reranker-model 2 v017_rerank_gpu --ignored, con cuda y release (F0 corrida 2: "r
 # CI-E1, CI-E11 (D-E11e): las 100 líneas del pase llano, una por binario y con los prefijos de E11 (91 `plain`, 8 `contracts`,
 # 1 `doc`), medidas una sola vez por la pasada llana del 10-nov sobre b51e027 (pasada-llana-20261110-124505 de
 # ~/.cache/memory-industry-gate/ci-rapido, `test-section-counts.medido.txt`): Σ(passed + failed) de cada binario.
-plain/linux/lib:memory_industry 1220 pasada llana del 10-nov sobre b51e027
+plain/linux/lib:memory_industry 1225 pasada llana del 10-nov sobre b51e027 y CI-E16 +5 tests (the_guard_and_the_loader_read_one_rule_for_configured, two_waits_for_an_unloaded_model_share_one_load, the_load_never_runs_on_the_executor_thread, a_wait_that_is_dropped_does_not_load_again, a_load_that_panics_answers_no_model)
 plain/linux/group_scratch_db 40 pasada llana del 10-nov sobre b51e027
 plain/linux/integration 0 pasada llana del 10-nov sobre b51e027
 plain/linux/nli_cell_looks_once 1 pasada llana del 10-nov sobre b51e027

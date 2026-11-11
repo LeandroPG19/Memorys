@@ -258,3 +258,70 @@ async fn contexto_recall_includes_entity_from_this_session_write() {
     memory_industry::session::clear();
     cleanup(&pool, &entity).await;
 }
+
+/// An episode is embedded by a background task, and the drain that closes the process has to find it
+/// finished: the vector is there when `drain` comes back, not "soon". `is_model_loaded()` is asked after
+/// the `episode_add`, so that this test is not the one that opens the model: the handler is.
+#[tokio::test]
+#[ignore]
+async fn an_episode_has_its_vector_when_the_drain_returns() {
+    let _graph_db = own_the_environment().await;
+    let pool = pool().await;
+    let entity = unique_name("episode_vector");
+
+    let added = memory_industry::handlers::cronica::handle(
+        &pool,
+        json!({
+            "action": "episode_add",
+            "entity_name": entity,
+            "content": format!("episode probe {entity}: el motor de busqueda embebe los episodios")
+        }),
+    )
+    .await
+    .expect("episode_add");
+    let id = Uuid::parse_str(
+        added
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("episode_add returns id"),
+    )
+    .expect("uuid");
+
+    let still_running = memory_industry::tasks::drain(std::time::Duration::from_secs(10)).await;
+    assert_eq!(
+        still_running, 0,
+        "the background tasks did not finish inside the drain, so whatever they were writing is lost"
+    );
+
+    let (has_vector, model): (bool, Option<String>) = sqlx::query_as(
+        "SELECT embedding IS NOT NULL, embedding_model FROM brain_episodes WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the episode back");
+
+    if memory_industry::embeddings::onnx::is_model_loaded() {
+        assert!(
+            has_vector,
+            "the model is loaded and the drain came back: the episode has to carry its vector by now"
+        );
+        assert_eq!(
+            model.as_deref(),
+            Some(memory_industry::embeddings::onnx::current_model().as_str()),
+            "a vector was written, so its label must name the model that produced it"
+        );
+    } else {
+        assert!(
+            !has_vector,
+            "without a model there is no vector to write: the hash fallback must not be stored \
+             as if it were one"
+        );
+    }
+
+    let _ = sqlx::query("DELETE FROM brain_episodes WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await;
+    cleanup(&pool, &entity).await;
+}

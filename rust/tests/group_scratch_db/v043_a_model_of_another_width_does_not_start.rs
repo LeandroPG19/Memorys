@@ -8,7 +8,7 @@ async fn the_daemon_refuses_a_vector_column_of_another_width_and_names_both() {
         memory_industry::embeddings::onnx::is_model_loaded(),
         "this test needs the ONNX embedder loaded (ONNX_MODEL_PATH and ORT_DYLIB_PATH, installed \
          by `memory-industry models all`). assert_embedding_dim returns Ok without reading a \
-         single column when no model is loaded, so without one the guard and its replacement by \
+         single column when no model is configured, so without one the guard and its replacement by \
          Ok(()) are indistinguishable here"
     );
     let runtime = memory_industry::embeddings::onnx::embedding_dim();
