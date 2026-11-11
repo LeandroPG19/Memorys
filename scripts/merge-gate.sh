@@ -2552,19 +2552,6 @@ on_exit() {
   release_gate_lock
 }
 
-# The rows parcial runs and the ones it leaves out, read from the planner so that this file keeps no second list of the table
-# (CI-J18): said at the top, because a green parcial is not the judge. It also fills what the planner is asked for.
-parcial_header() {
-  local row left_out=()
-  mapfile -t GATE_TABLE_ROWS < <(python3 -I -B "$ROOT/scripts/gate-dag.py" rows --table "$ROOT/scripts/gate-dag.txt" | awk '$1 == "row" { print $2 }')
-  for row in "${GATE_TABLE_ROWS[@]}"; do
-    [[ " ${PARCIAL_ROWS[*]} " == *" $row "* ]] || left_out+=("$row")
-  done
-  GATE_PLANNER_ROWS=(--rows "$(IFS=,; echo "${PARCIAL_ROWS[*]}")")
-  echo "parcial: NOT a verdict. It runs ${PARCIAL_ROWS[*]} and does not run ${left_out[*]}: no receipt, no mark, no test times. The judge is ./scripts/como-el-ci.sh todo"
-  echo ""
-}
-
 gate_main() {
 acquire_gate_lock "$GATE_LOCK" || exit 1
 exit_file_running
@@ -2835,6 +2822,21 @@ echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  MERGE GATE PASSED — safe to merge (local CI 100%)       ║"
 echo "╚══════════════════════════════════════════════════════════╝"
+}
+
+# The rows parcial runs and the ones it leaves out, read from the planner so that this file keeps no second list of the table
+# (CI-J18): said at the top, because a green parcial is not the judge. It also fills what the planner is asked for.
+# It sits after gate_main, which calls it, and not before: its call of the planner is a step for the contract of the export of
+# MEMORY_INDUSTRY_REQUIRE_DATABASE_URL (local_gate_contract.rs), so no line of it may come before that export in gate_main.
+parcial_header() {
+  local row left_out=()
+  mapfile -t GATE_TABLE_ROWS < <(python3 -I -B "$ROOT/scripts/gate-dag.py" rows --table "$ROOT/scripts/gate-dag.txt" | awk '$1 == "row" { print $2 }')
+  for row in "${GATE_TABLE_ROWS[@]}"; do
+    [[ " ${PARCIAL_ROWS[*]} " == *" $row "* ]] || left_out+=("$row")
+  done
+  GATE_PLANNER_ROWS=(--rows "$(IFS=,; echo "${PARCIAL_ROWS[*]}")")
+  echo "parcial: NOT a verdict. It runs ${PARCIAL_ROWS[*]} and does not run ${left_out[*]}: no receipt, no mark, no test times. The judge is ./scripts/como-el-ci.sh todo"
+  echo ""
 }
 
 # One lane per step (D-F2c): the step's server is made here, and its URL, GATE_LANE and
