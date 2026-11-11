@@ -642,18 +642,71 @@ def move_pid(destination: str, pid: int) -> None:
 DELEGATED = "juez"
 
 
-def delegate(scope: str | None) -> str | None:
-    """Moves the planner and its scope's processes to scope/juez, then enables controllers. None when it delegated, and the
-    reason when it did not (D-E4c). A scope that is already a `juez` is another planner's: it has processes of its own, so the
-    kernel does not let it enable controllers for children, and a second `juez` inside it would go one level down for each
-    planner that starts there (CI-J17). That planner is not delegated: it runs in series, and the planner outside keeps its DAG."""
+CONTROLLERS = ("cpu", "memory", "pids")
+
+
+def live_planner(pid: int) -> bool:
+    """D-E35c: `pid` is a `gate-dag.py run` that is alive: its `argv[0]` has a base name that starts with `python` and an
+    argument with the base name `gate-dag.py` is followed, later on, by `run`. The `bash` of the entry, the `tee` of the judge
+    and the meter of `pesado` live in a `juez` and are not planners. A process that ended between listing it and reading it is
+    not alive; one whose cmdline cannot be read while `/proc/<pid>` is there is, so that the `juez` is not reused under it."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except OSError:
+        return os.path.isdir(f"/proc/{pid}")
+    argv = [os.path.basename(a.decode("utf-8", "replace")) for a in raw.split(b"\0")]
+    if not argv[0].startswith("python"):
+        return False
+    return any(a == "gate-dag.py" and "run" in argv[i + 1 :] for i, a in enumerate(argv[1:], start=1))
+
+
+def juez_refusal(juez: str) -> str | None:
+    """D-E35b, D-E35e: None when a planner that was born in `juez` may reuse it, and why not otherwise. The shell that ran an
+    earlier judge stays in the `juez` its planner made, so a `juez` is not another planner's by its name; it is when a
+    `gate-dag.py run` is alive in it (CI-J17). Besides: its parent is not a `juez` too, it still has `cpu`, `memory` and `pids`
+    for its children, and no `paso-*` of it holds processes (a planner killed with rows alive leaves them, and the rows of the
+    next run would carry the same names)."""
+    for pid in sorted(read_pids(juez) - {os.getpid()}):
+        if live_planner(pid):
+            return f"{juez} is a `{DELEGATED}` of another planner (CI-J17): pid {pid} runs gate-dag.py run"
+    parent = os.path.dirname(juez)
+    control = os.path.join(parent, "cgroup.subtree_control")
+    why = ""
+    if os.path.basename(parent) == DELEGATED:
+        why = f"{parent} is a `{DELEGATED}` too"
+    elif not os.access(control, os.W_OK):
+        why = f"{control} cannot be written"
+    else:
+        enabled = {name.lstrip("+") for name in (read_text(control) or "").split()}
+        missing = [name for name in CONTROLLERS if name not in enabled]
+        steps = sorted(glob.glob(os.path.join(glob.escape(parent), "paso-*")))
+        held = [os.path.basename(path) for path in steps if populated(path)]
+        if missing:
+            why = f"{control} does not name {' '.join(missing)}"
+        elif held:
+            why = f"{', '.join(held)} still has processes"
+    return f"{juez} is a `{DELEGATED}` that is not reused: {why} (CI-J17, CI-E35)" if why else None
+
+
+def delegate(scope: str | None) -> tuple[str | None, str | None]:
+    """The scope the planner uses and why it did not delegate it (D-E4c, D-E35d): `(scope, None)` when it moved the planner
+    and the processes of its scope to scope/juez and enabled the controllers. A scope that is already a `juez` is another
+    planner's: it has processes of its own, so the kernel does not let it enable controllers for children, and a second
+    `juez` inside it would go one level down for each planner that starts there (CI-J17). When no live planner is in it and its
+    parent still has the controllers on, the planner that was born there reuses it (CI-E35): its scope is the parent, and
+    nothing is created, moved or written. Otherwise it is not delegated: it runs in series, and the planner outside keeps
+    its DAG."""
     if scope is None:
-        return "there is no `0::` line in /proc/self/cgroup"
+        return None, "there is no `0::` line in /proc/self/cgroup"
     if os.path.basename(scope) == DELEGATED:
-        return f"{scope} is a `{DELEGATED}` of another planner (CI-J17)"
+        why = juez_refusal(scope)
+        return (os.path.dirname(scope), None) if why is None else (scope, why)
     control = os.path.join(scope, "cgroup.subtree_control")
     if not os.access(control, os.W_OK):
-        return f"{control} cannot be written"
+        return scope, f"{control} cannot be written"
     juez = os.path.join(scope, DELEGATED)
     try:
         os.makedirs(juez, exist_ok=True)
@@ -662,8 +715,8 @@ def delegate(scope: str | None) -> str | None:
         with open(control, "w", encoding="utf-8") as fh:
             fh.write("+cpu +memory +pids")
     except OSError as err:
-        return f"the processes of {scope} could not be moved or its controllers enabled ({err})"
-    return None
+        return scope, f"the processes of {scope} could not be moved or its controllers enabled ({err})"
+    return scope, None
 
 
 SAMPLE_FIELDS = ("anon", "file", "shmem", "kernel")
@@ -1021,6 +1074,7 @@ class Planner:
     run_dir: str | None = None
     # CI-E4: class defaults too, so that such a planner measures nothing in the scope and writes nothing in it.
     delegate_why: str | None = None
+    reused: str | None = None
     peak_fd: int | None = None
     peak_why: str | None = None
     peak_run: int | None = None
@@ -1040,9 +1094,10 @@ class Planner:
         self.run_dir = make_run_dir()
         self.run_id = os.path.basename(self.run_dir)
         self.hist_steps, self.hist_runs = load_history(tabla)
-        self.scope = scope_dir()
-        self.delegate_why = delegate(self.scope)
+        own = scope_dir()
+        self.scope, self.delegate_why = delegate(own)
         self.delegado = self.delegate_why is None
+        self.reused = own if self.delegado and self.scope != own else None
         self.open_memory()
         # CI-J14d: a DATABASE_URL of the operator is one server for every row, and sqlx drops databases by name.
         self.shared_server = bool(os.environ.get("DATABASE_URL"))
@@ -1147,6 +1202,8 @@ class Planner:
         return f"not delegated ({self.delegate_why or 'no reason given'})"
 
     def notes(self) -> None:
+        if self.reused:
+            print(f"dag: scope: reusing {self.reused}, which no live planner holds (CI-E35)")
         if not self.delegado:
             print(f"note: the scope is not delegated ({self.delegate_why}): nothing is measured or killed per step, so the planner runs in series")
         elif self.dag and not self.hist_runs:

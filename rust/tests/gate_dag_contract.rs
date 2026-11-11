@@ -5743,6 +5743,206 @@ fn two_planners_one_inside_the_other_leave_no_juez_inside_a_juez() {
     );
 }
 
+// --- CI-E35: a planner that starts in the `juez` a finished one left reuses it ------------------------------------------------
+// The planner moves every process of its scope to `<scope>/juez` and leaves them there when it ends, so the shell of the
+// judge that started it is still in `juez` when the next judge of the same entry starts its own planner there. J17 refused
+// that planner by the name of the cgroup alone, and the second run of a verdict ran in series. What the fake tree can show
+// is what the planner reads (`/proc/self/cgroup`, `subtree_control`, the `cgroup.procs` of `juez`, the `cgroup.events` of the
+// `paso-*`) and what it writes; where the kernel really puts the processes is the QA row E35.4, not this file.
+
+/// A live process whose `/proc/<pid>/cmdline` is that of a planner (`argv[0]` is `python3`, then `gate-dag.py` and later
+/// `run`, here as arguments after the code of `-c`), killed and waited for when the test ends, green or not.
+struct LivePlanner(std::process::Child);
+
+impl LivePlanner {
+    fn start() -> LivePlanner {
+        let child = Command::new("python3")
+            .args(["-c", "import time; time.sleep(60)", "gate-dag.py", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the stand-in of a live planner");
+        LivePlanner(child)
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for LivePlanner {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A fixture whose planner starts in `scope/juez` of a scope a planner already delegated, in the form the kernel writes
+/// `cgroup.subtree_control` (`cpu memory pids`, with no `+`), with the shell of the earlier judge (this test) in `juez`.
+fn fixture_in_a_left_juez(name: &str) -> Fixture {
+    let mut fx = Fixture::new(name, CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "s10", "-", "0.1", "")]);
+    let scope = fx.cgroups.join("scope");
+    write(&scope.join("cgroup.subtree_control"), "cpu memory pids\n");
+    let juez = scope.join("juez");
+    make_fake_cgroup(&juez);
+    write(
+        &juez.join("cgroup.procs"),
+        &format!("{}\n", std::process::id()),
+    );
+    write(&fx.proc_self, "0::/scope/juez\n");
+    fx
+}
+
+/// E35.1: the second run of a table under one entry of `pesado` is born in the `juez` the first one left (the series that
+/// seeds the history delegated the scope). Nothing of another planner is alive there, so it reuses it: it runs in DAG, its
+/// rows go to `paso-*` beside `juez`, and it writes nothing in `juez`.
+#[test]
+fn a_second_planner_in_the_juez_the_first_one_left_runs_in_dag() {
+    let mut fx = Fixture::new("e35-reuso", CPU_FOUR, MEM_OPEN);
+    fx.table(&[(10, "p", "-", "0.4", ""), (20, "q", "-", "0.4", "")]);
+    fx.seed();
+    let scope = fx.cgroups.join("scope");
+    let juez = scope.join("juez");
+    assert!(
+        juez.is_dir(),
+        "the series that seeds the history did not delegate the scope, so there is no `juez` to reuse"
+    );
+    let controllers = read(&scope.join("cgroup.subtree_control"));
+    for name in ["cpu", "memory", "pids"] {
+        assert!(
+            controllers.contains(name),
+            "the delegation left no `{name}` in cgroup.subtree_control: {controllers:?}"
+        );
+    }
+    let own = format!("{}\n", std::process::id());
+    write(&juez.join("cgroup.procs"), &own);
+    write(&fx.proc_self, "0::/scope/juez\n");
+    let before = snapshot(&fx.history, "corridas.jsonl");
+    let run = fx.run("1");
+    assert_green(&run, "the second planner of an entry");
+    let plan = plan_line_of(&run);
+    assert!(
+        plan.contains(" runs=dag"),
+        "the second planner did not run in DAG: {plan}\n{}",
+        run.out
+    );
+    assert!(
+        run.out
+            .lines()
+            .any(|line| line.starts_with("dag: scope: reusing")),
+        "the planner did not say it reused the `juez`: {}",
+        run.out
+    );
+    assert!(
+        !run.out.contains("the scope is not delegated"),
+        "the planner said the scope is not delegated: {}",
+        run.out
+    );
+    assert!(
+        !juez.join("juez").exists(),
+        "the planner made a `juez` inside the `juez` it reused"
+    );
+    assert!(
+        !juez.join("paso-10-p").exists(),
+        "the rows went to `paso-*` inside `juez` and not beside it"
+    );
+    assert_eq!(
+        read(&juez.join("cgroup.procs")),
+        own,
+        "the planner moved processes into or out of the `juez` it reused"
+    );
+    let corridas = appended(&fx.history, "corridas.jsonl", &before);
+    assert_eq!(
+        corridas.last().map(|record| record["modo"].clone()),
+        Some(json!("dag")),
+        "the run was not recorded as a DAG: {corridas:?}"
+    );
+}
+
+/// E35.2: a `juez` that holds another `gate-dag.py run` alive is not reused, as in J17: the planner says the scope is not
+/// delegated, runs in series and touches nothing. The stand-in is a real process because the planner reads its
+/// `/proc/<pid>/cmdline`; its pid is in the `cgroup.procs` of the fake `juez`, next to the one of this test, which is not a
+/// planner and does not count.
+#[test]
+fn a_juez_with_a_live_planner_in_it_is_not_reused() {
+    let fx = fixture_in_a_left_juez("e35-vivo");
+    let other = LivePlanner::start();
+    let scope = fx.cgroups.join("scope");
+    let juez = scope.join("juez");
+    let procs = format!("{}\n{}\n", std::process::id(), other.pid());
+    write(&juez.join("cgroup.procs"), &procs);
+    let run = fx.run("1");
+    assert_green(&run, "a planner next to a live one");
+    assert!(
+        run.out.contains("note: the scope is not delegated")
+            && run.out.contains("of another planner (CI-J17)"),
+        "the planner did not refuse a `juez` with a live planner in it: {}",
+        run.out
+    );
+    let pid_note = format!("of another planner (CI-J17): pid {}", other.pid());
+    assert!(
+        run.out.contains(&pid_note),
+        "the note does not name the pid of the live planner (`{pid_note}`): {}",
+        run.out
+    );
+    assert!(
+        !run.out.contains("dag: scope: reusing"),
+        "the planner reused a `juez` with a live planner in it: {}",
+        run.out
+    );
+    assert!(
+        !juez.join("juez").exists(),
+        "the planner made a `juez` inside a `juez`"
+    );
+    assert_eq!(
+        read(&juez.join("cgroup.procs")),
+        procs,
+        "the planner moved processes of the `juez` it refused"
+    );
+    assert_eq!(
+        read(&scope.join("cgroup.subtree_control")),
+        "cpu memory pids\n",
+        "the planner wrote in the controllers of the scope it refused"
+    );
+}
+
+/// E35.3: the planner that left the `juez` was killed with a row alive: its `paso-99-huerfano` still holds processes
+/// (`populated 1`), and the `paso-*` of the next run would carry names it cannot tell apart. Not reused.
+#[test]
+fn a_juez_whose_planner_left_steps_alive_is_not_reused() {
+    let fx = fixture_in_a_left_juez("e35-huerfano");
+    let scope = fx.cgroups.join("scope");
+    let orphan = scope.join("paso-99-huerfano");
+    fs::create_dir_all(&orphan).expect("the cgroup of the orphan row");
+    write(&orphan.join("cgroup.events"), "populated 1\nfrozen 0\n");
+    let run = fx.run("1");
+    assert_green(&run, "a planner next to an orphan row");
+    assert!(
+        run.out.contains("note: the scope is not delegated"),
+        "the planner did not refuse a `juez` whose planner left a row alive: {}",
+        run.out
+    );
+    assert!(
+        run.out
+            .lines()
+            .any(|line| line.starts_with("note: the scope is not delegated")
+                && line.contains("paso-99-huerfano")),
+        "the note does not name the row that is still alive (`paso-99-huerfano`): {}",
+        run.out
+    );
+    assert!(
+        !run.out.contains("dag: scope: reusing"),
+        "the planner reused a `juez` whose planner left a row alive: {}",
+        run.out
+    );
+    assert!(
+        !scope.join("juez").join("juez").exists(),
+        "the planner made a `juez` inside a `juez`"
+    );
+}
+
 // --- CI-E9 (D-E9a): E2E waits for B3 and not for DBG --------------------------------------------------------------------
 
 /// The step of the rows of CI-E9: it marks that it started (`started-<id>`). DBG does not end until E2E has started or
