@@ -40,3 +40,5 @@ mod v029_bridge_cli;
 mod v042_placement_is_a_decision_not_a_hope;
 #[path = "group_no_server/v045_a_git_merge_of_two_exports.rs"]
 mod v045_a_git_merge_of_two_exports;
+#[path = "group_no_server/v048_the_start_opens_one_pool.rs"]
+mod v048_the_start_opens_one_pool;

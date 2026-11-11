@@ -347,21 +347,24 @@ async fn async_main() {
         "MemoryIndustry starting"
     );
 
-    {
-        let url = memory_industry::setup::resolve_database_url().await;
-        match memory_industry::db::create_pool(&url).await {
-            Ok(pool) => {
-                if let Err(e) = memory_industry::db::assert_embedding_dim(&pool).await {
-                    tracing::error!(error = %format!("{e:#}"), "arranque abortado");
-                    eprintln!("\nMemoryIndustry NO puede arrancar:\n\n{e:#}\n");
-                    std::process::exit(1);
-                }
+    let database_url = memory_industry::setup::resolve_database_url().await;
+    let (pool, connected) = match memory_industry::db::create_pool(&database_url).await {
+        Ok(pool) => {
+            if let Err(e) = memory_industry::db::assert_embedding_dim(&pool).await {
+                tracing::error!(error = %format!("{e:#}"), "arranque abortado");
+                eprintln!("\nMemoryIndustry NO puede arrancar:\n\n{e:#}\n");
+                std::process::exit(1);
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "no se pudo verificar la dimensión del embedding al arrancar");
-            }
+            (pool, true)
         }
-    }
+        Err(why) => {
+            tracing::warn!(
+                error = %format!("{why:#}"),
+                "starting without PostgreSQL — tools will fail until it is reachable"
+            );
+            (memory_industry::db::create_lazy_pool(&database_url), false)
+        }
+    };
 
     let shutdown = async {
         let ctrl_c = tokio::signal::ctrl_c();
@@ -382,7 +385,7 @@ async fn async_main() {
     };
 
     tokio::select! {
-        result = memory_industry::protocol::run_mcp() => {
+        result = memory_industry::protocol::run_mcp(database_url, pool, connected) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "MCP protocol error");
                 drain_background_tasks().await;

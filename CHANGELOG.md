@@ -33,6 +33,8 @@ The real machine and a judge that does not lose the hour. 0.30.0 was proved and 
 
 ### Changed
 
+- **The stdio server opens one database pool at start-up, not two.** `main` opened a pool only to check the embedding width and `run_mcp` opened another to serve, so every start connected, migrated, wrote `cuba_app`'s password and stepped down twice (about 40 ms per process); with the database down it tried twice and logged two different warnings. One pool now does both: the width check still refuses to start before «MCP protocol ready», and a database that is down is tried once and reported once, in the daemon's words: «starting without PostgreSQL — tools will fail until it is reachable». The exit codes do not change.
+
 - **The embedding model loads on its first use instead of at start-up.** A stdio process that never embeds (`tools/list`, most tool calls) no longer reads the model: about 0.6–1.1 s and ~435 MB less per process. The first call that embeds pays the load once; concurrent first calls share that one load and none of them falls back to the hash embedder while it runs. A model whose session will not open is reported on that first use, not at start-up. The dimension guard now runs whenever a model is configured, so a configured model that fails to open no longer starts against columns of another width. `serve` binds its port before loading, as its warm-up always intended.
 
 - **`ort` builds without its downloader: `default-features = false`.** Under `load-dynamic` its build script returns before downloading, yet `ureq`, `native-tls` and a vendored OpenSSL were compiled for it on every clean build; 20 crates leave `Cargo.lock` and none is added or moves. `Cargo.lock` is guarded: it fails if `openssl-sys`, `openssl-src` or `ureq` come back.

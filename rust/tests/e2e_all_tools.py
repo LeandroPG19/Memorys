@@ -96,6 +96,12 @@ MODEL_LOADED = "ONNX model loaded successfully"
 MODEL_FAILED = "Failed to load ONNX model"
 PROTOCOL_READY = "MCP protocol ready"
 BACKGROUND_LOST = "background tasks did not finish before shutdown"
+CONNECTED = "connected to PostgreSQL"
+# What one pool does when the start-up opens it (db.rs). The stdio start opens exactly one, so each of the first three
+# is logged once per process, and the two that depend on the role being set up or stepped down at most once, all of
+# them before "MCP protocol ready".
+STARTUP_ONCE = (CONNECTED, "sqlx migrations applied", "schema initialized")
+STARTUP_AT_MOST_ONCE = ("application role provisioned", "runtime downgraded")
 
 
 def log_messages(stderr: str) -> List[Tuple[int, str]]:
@@ -124,6 +130,24 @@ def message_index(stderr: str, prefix: str) -> Optional[int]:
 
 def ready_index(stderr: str) -> Optional[int]:
     return message_index(stderr, PROTOCOL_READY)
+
+
+def startup_problem(stderr: str) -> Optional[str]:
+    """
+    None when the process opened one pool: each of STARTUP_ONCE is logged exactly once, each of STARTUP_AT_MOST_ONCE at
+    most once, and all of them before "MCP protocol ready". Otherwise what it did instead, as "<message> x<n>".
+    """
+    ready = ready_index(stderr)
+    if ready is None:
+        return f"stderr has no «{PROTOCOL_READY}» line"
+    messages = log_messages(stderr)
+    for prefix in STARTUP_ONCE + STARTUP_AT_MOST_ONCE:
+        seen = [i for i, m in messages if m.startswith(prefix)]
+        if len(seen) > 1 or (len(seen) == 0 and prefix in STARTUP_ONCE):
+            return f"{prefix} x{len(seen)}"
+        if seen and seen[0] > ready:
+            return f"{prefix} after «{PROTOCOL_READY}»"
+    return None
 
 
 def resolved_before_ready(stderr: str) -> Optional[str]:
@@ -1452,6 +1476,33 @@ def test_model_opens_on_first_use():
     check("E16b.2 every process opens the model at most once, and not all do", each_process_opens_at_most_once)
 
 
+ONE_POOL_SUMMARY = ""
+
+
+def test_one_pool_at_start():
+    """E17a.1, read from the processes the calls above already ran: no process of its own."""
+    print("\n" + "=" * 60)
+    print("START-UP: one pool, one connection, one migrator")
+    print("=" * 60)
+
+    def every_process_connects_once() -> Optional[str]:
+        global ONE_POOL_SUMMARY
+        total, once, first = len(PROCESSES), 0, None
+        for process in PROCESSES:
+            problem = startup_problem(process["stderr"])
+            if problem is None:
+                once += 1
+            elif first is None:
+                first = f"{process['test_id']}: {problem}"
+        ONE_POOL_SUMMARY = f"connected once in {once} of {total} processes"
+        print(f"  {ONE_POOL_SUMMARY}")
+        if total == 0:
+            return "no process was recorded"
+        return first
+
+    check("E17a.1 every process connects, migrates and provisions once, before ready", every_process_connects_once)
+
+
 def embedding_model_problem() -> Optional[str]:
     model_dir = os.environ.get("ONNX_MODEL_PATH", "").strip()
     if model_dir and any(
@@ -1516,7 +1567,16 @@ def refuses_to_start(proc: "subprocess.CompletedProcess[str]", width: int) -> Op
         or (None if "NO puede arrancar" in stderr else "stderr does not say «NO puede arrancar»")
         or (None if f"vector({width})" in stderr else f"stderr does not name vector({width})")
         or opened_nothing(proc)
+        or refused_before_ready(stderr)
     )
+
+
+def refused_before_ready(stderr: str) -> Optional[str]:
+    """E17a.2: a refused start never gets to «MCP protocol ready», and it connected exactly once (one pool, the guard's)."""
+    if ready_index(stderr) is not None:
+        return f"stderr has «{PROTOCOL_READY}»: a start that is refused must not get that far"
+    connected = sum(1 for _, m in log_messages(stderr) if m.startswith(CONNECTED))
+    return None if connected == 1 else f"{CONNECTED} x{connected}, expected exactly one"
 
 
 def test_lazy_embedder():
@@ -1688,6 +1748,7 @@ def main():
         test_refusals,
         test_cuba_receta_tools_call,
         test_model_opens_on_first_use,
+        test_one_pool_at_start,
         test_lazy_embedder,
     ):
         run_phase(phase)
@@ -1704,6 +1765,8 @@ def main():
     print(f"Failed:              {tests_failed}")
     if MODEL_OPENED_SUMMARY:
         print(MODEL_OPENED_SUMMARY)
+    if ONE_POOL_SUMMARY:
+        print(ONE_POOL_SUMMARY)
 
     if failed_tests:
         print("\nFailed Tests:")
