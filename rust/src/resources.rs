@@ -1125,8 +1125,11 @@ mod tests {
     /// CI-D5c (A.8). `nvidia-smi` runs at the start of every command of a build
     /// with `cuda`, `models runtime --if-installed` from `npm install` included:
     /// one that hangs (a driver in a bad state, WSL after a suspend) hung them
-    /// all. The children are `sh`, as in `service.rs`: the one that waits is the
-    /// child, not the test, and the 20 seconds only pass if the limit is gone.
+    /// all. The children are `sh`, as in `service.rs`. No clock is asserted: the
+    /// call runs on a thread the test waits on with a generous bound (the child
+    /// sleeps 30 s, so without the limit the bound is what ends the wait), and what
+    /// proves the child was cut is its pid, which must be gone and reaped (`kill -0`
+    /// succeeds on a zombie) once the call has returned.
     #[cfg(unix)]
     #[test]
     fn an_nvidia_smi_that_does_not_answer_is_cut_and_reads_as_no_vram() {
@@ -1142,21 +1145,42 @@ mod tests {
             "an answer inside the limit is the number it printed"
         );
 
-        let started = std::time::Instant::now();
-        let silent = vram_free_from(
-            shell("exec sleep 30"),
-            std::time::Duration::from_millis(200),
-        );
-        let waited = started.elapsed();
+        let dir = crate::envs::scratch_root("nvidia-smi-hangs");
+        std::fs::create_dir_all(&dir).expect("the test owns this directory");
+        let pid_file = dir.join("pid");
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", &script]);
+            let _ = sender.send(vram_free_from(command, std::time::Duration::from_secs(1)));
+        });
+
+        let silent = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect(
+                "vram_free_from is still waiting for a child that sleeps 30 seconds: the limit \
+                 it was given was not applied",
+            );
         assert_eq!(
             silent, None,
             "a process that never answers reads as no VRAM measured, and the plan does what it \
              does without `nvidia-smi`"
         );
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the child wrote its pid before it was cut")
+            .trim()
+            .to_string();
+        let alive = std::process::Command::new("sh")
+            .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+            .status()
+            .expect("sh runs")
+            .success();
         assert!(
-            waited < std::time::Duration::from_secs(20),
-            "it took {waited:?} to give up on a child that sleeps 30 seconds: the limit of \
-             200 ms was not applied"
+            !alive,
+            "the child {pid} is still there, running or not reaped: a hung `nvidia-smi` would \
+             outlive the command that asked"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
