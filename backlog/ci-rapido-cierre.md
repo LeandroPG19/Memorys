@@ -71,8 +71,8 @@
   - **EN CURSO (10-nov 18:05):** commits `2cc9606`/`d2292cc`, fusionados (`ebbc710`). Falta el juez.
 - [ ] **7.** **CI-J19** · `validar-handoff.sh` (`filas_dag`) usa el lector único de la tabla. B:1123. 20 / 1.
   - **EN CURSO (10-nov 18:05):** commits `2cc9606`/`d2292cc`, fusionados (`ebbc710`). Falta el juez.
-- [ ] **8.** **CI-E22** · bug de producto: un episodio sin vector no lo recupera `reembed` (H1 de E16). B:1160. O `reembed` cubre `brain_episodes`, o el mensaje de `main.rs:84-90` deja de prometerlo. 30–60 / 5.
-- [ ] **9.** **CI-E17** · dos pools al arrancar (`main.rs:354-369`, `protocol.rs:434`). B:1161. Va después de medir E16; hay que decidir qué mensaje gana con la base caída. 45 / 5.
+- [ ] **8.** **CI-E22** · bug de producto: un episodio sin vector no lo recupera `reembed` (H1 de E16). B:1160. O `reembed` cubre `brain_episodes`, o el mensaje de `main.rs:84-90` deja de prometerlo. 30–60 / 5. — **EN CURSO 10-nov 18:37:** CI-E22 especificada (ci-rapido-E22.spec.md, 11 escenarios, 18 sabotajes, sin migración: brain_episodes.embedding existe desde 0002): reembed (cuba_zafra y la CLI) y el backfill cubren los episodios con la misma regla que las observaciones; faro sí busca episodios por vector y filtra los que no lo tienen, así que el arreglo no puede ser solo de texto. Pasada 1 en curso en feat/ci-e22.
+- [ ] **9.** **CI-E17** · dos pools al arrancar (`main.rs:354-369`, `protocol.rs:434`). B:1161. Va después de medir E16; hay que decidir qué mensaje gana con la base caída. 45 / 5. — **EN CURSO 10-nov 18:37:** CI-E17 especificada (ci-rapido-E17.spec.md): main abre el pool una vez y lo pasa a run_mcp; con la base caída un solo aviso («starting without PostgreSQL…»); va en serie tras CI-E22 (las dos tocan main.rs).
 - [ ] **10.** **CI-E25** · `os.getuid` y `os.kill(pid, 0)` de CI-E15 son solo POSIX. B:1186. Depende de la medida en Windows (punto 84). 20 / —.
   - **EN CURSO (10-nov 18:05):** commits `2cc9606`/`d2292cc`, fusionados (`ebbc710`). Falta el juez. Ver también CI-E25b en «Añadidos después de la foto».
 - [ ] **11.** **(H)** `unidades.jsonl` y `flaky.jsonl` no se escriben nunca. Es el huérfano que más bloquea. 30–45 / 2.
