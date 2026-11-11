@@ -22,6 +22,9 @@
 //!     renames it (CI-E21: on 10-nov-2026 two builds in a row failed their RENAME with 55006
 //!     under load): `common::wait_until_no_session_is_left` outlasts a session that leaves late
 //!     and, when one never leaves, names it;
+//!   - a pool closed while one of its connections is being returned leaves no session on the
+//!     sealed database (CI-E32: sqlx 0.8.6's `Pool::close()` returns with that connection open in
+//!     the idle queue, and the builder's wait ran out on it twice on 10-nov-2026);
 //!   - `empty_db::in_an_empty_database` still hands out a database with no schema at all, which
 //!     v045_databases_of_one_server_migrate_at_once, v044_* and v043_a_model_of_another_width need.
 //!
@@ -37,7 +40,9 @@ use std::time::{Duration, Instant};
 
 use common::in_a_scratch_database;
 use empty_db::in_an_empty_database;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgConnection, PgPool};
+use tokio::sync::Notify;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -462,6 +467,85 @@ async fn a_session_that_never_leaves_is_named_when_the_time_runs_out() {
             .close()
             .await
             .expect("closing the session that stays");
+    })
+    .await;
+}
+
+/// CI-E32. A connection that is being returned when the pool closes is the one sqlx 0.8.6's
+/// `Pool::close()` leaves behind: the connection goes into the idle queue just before it releases
+/// its permit, that permit is what lets `close()` finish, and `close()` does not empty the queue
+/// again. The connection then stays open for as long as the `Pool` lives. This test builds that
+/// order with two `Notify`: the pool's `after_release` says it entered and waits, the test closes
+/// the pool, and only when the pool says it is closed (`close_event`) does it let the hook go.
+/// No clock orders anything (the 30 s is only how long a failure waits before it is named), and
+/// the pool is not cloned to watch it: a clone alive would hold the session open with the fix too.
+#[tokio::test]
+async fn a_pool_closed_while_a_connection_returns_leaves_no_session_on_the_sealed_database() {
+    in_an_empty_database("brain_tpl_returning", |url| async move {
+        let database = database_of(&url);
+        let mut admin = PgConnection::connect(&sibling_url(&url, "postgres"))
+            .await
+            .expect("connecting the admin");
+
+        let entered = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
+        let (hook_entered, hook_gate) = (Arc::clone(&entered), Arc::clone(&gate));
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .after_release(move |_conn, _meta| {
+                let (entered, gate) = (Arc::clone(&hook_entered), Arc::clone(&hook_gate));
+                Box::pin(async move {
+                    entered.notify_one();
+                    gate.notified().await;
+                    Ok(true)
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("opening the pool");
+
+        drop(pool.acquire().await.expect("taking the only connection"));
+        tokio::time::timeout(Duration::from_secs(30), entered.notified())
+            .await
+            .expect("the returned connection never reached after_release");
+        let on_the_database: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = $1")
+                .bind(&database)
+                .fetch_one(&mut admin)
+                .await
+                .expect("counting the sessions on the database");
+        assert_eq!(
+            on_the_database, 1,
+            "the connection that is being returned is the one session on the database; without \
+             it the test is not holding the race it exists to hold"
+        );
+
+        let closed = pool.close_event();
+        let sealing = common::close_and_seal(pool, &mut admin, &database, Duration::from_secs(30));
+        let let_the_hook_go = async {
+            closed.await;
+            gate.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(sealing, let_the_hook_go);
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "closing the pool while a connection was being returned left a session on the sealed \
+             database, so the template could not be published: sqlx 0.8.6's `Pool::close()` \
+             returns with that connection open in the idle queue, and it lives until the last \
+             `Pool` is dropped"
+        );
+
+        let accepts: bool =
+            sqlx::query_scalar("SELECT datallowconn FROM pg_database WHERE datname = $1")
+                .bind(&database)
+                .fetch_one(&mut admin)
+                .await
+                .expect("reading datallowconn");
+        assert!(
+            !accepts,
+            "{database} was left accepting connections: close_and_seal has to seal it"
+        );
     })
     .await;
 }

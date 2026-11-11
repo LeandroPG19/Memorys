@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use memory_industry::db;
 use sha2::{Digest, Sha384};
-use sqlx::{Connection, Executor, PgConnection};
+use sqlx::{Connection, Executor, PgConnection, PgPool};
 use tokio::sync::OnceCell;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -114,9 +114,10 @@ fn template_key() -> String {
 /// so the builder closes its only pool, seals with ALLOW_CONNECTIONS false (which keeps new
 /// sessions out), waits until `pg_stat_activity` shows nobody on it and only then publishes under
 /// the final name. `pool.close()` returns once the Terminate message is sent, not once the backend
-/// has exited: 10-nov-2026 two builds in a row failed their RENAME with 55006 on a judge at 14
-/// cores of 24, and the server's log of that run was lost, so who stayed connected is not known
-/// (the wait names it if it happens again). STRATEGY FILE_COPY is not used: it
+/// has exited, and it can return with a connection still open in the pool's idle queue (see
+/// `close_and_seal`): 10-nov-2026 two builds in a row failed their RENAME with 55006 on a judge at
+/// 14 cores of 24, and the session the wait named was that connection's last `after_release`
+/// query. STRATEGY FILE_COPY is not used: it
 /// forces a checkpoint, 0.86-3.4 s per clone against 0.11-0.37 s with the default WAL_LOG.
 async fn the_template(url: &str) -> &'static str {
     TEMPLATE.get_or_init(|| build_the_template(url)).await
@@ -168,16 +169,7 @@ async fn build_the_template(url: &str) -> String {
     let pool = db::create_admin_pool(&sibling_url(url, &building))
         .await
         .expect("migrating the template");
-    pool.close().await;
-    run(
-        &mut admin,
-        &format!("ALTER DATABASE {building} WITH ALLOW_CONNECTIONS false"),
-        "sealing the template",
-    )
-    .await;
-    if let Err(who) =
-        wait_until_no_session_is_left(&mut admin, &building, SESSIONS_LEAVE_WITHIN).await
-    {
+    if let Err(who) = close_and_seal(pool, &mut admin, &building, SESSIONS_LEAVE_WITHIN).await {
         panic!("emptying the template before publishing it: {who}");
     }
     match admin
@@ -197,6 +189,34 @@ async fn build_the_template(url: &str) -> String {
         Err(why) => refuse("publishing the template", &why),
     }
     name
+}
+
+/// Closes `pool`, seals `database` with ALLOW_CONNECTIONS false over `admin` and waits, up to
+/// `within`, until `pg_stat_activity` shows nobody on it: what the template needs before its
+/// RENAME. The pool comes by value because nothing of the caller may stay alive on the database
+/// while it waits; `Err` names who is still connected when `within` runs out. Taking `within`
+/// lets a test that provokes the failure pay for a short wait instead of
+/// `SESSIONS_LEAVE_WITHIN`.
+pub async fn close_and_seal(
+    pool: PgPool,
+    admin: &mut PgConnection,
+    database: &str,
+    within: Duration,
+) -> Result<(), String> {
+    pool.close().await;
+    // sqlx-core 0.8.6 (`pool/inner.rs:97-115`): `close()` empties the idle queue once per permit
+    // and never after the last wait, so a connection that was being returned (its `after_release`
+    // still running) lands in the queue just as it releases the permit `close()` waits for, and
+    // stays open for as long as a `Pool` lives. Dropping the last handle drops `PoolInner` with
+    // its queue and closes that socket.
+    drop(pool);
+    run(
+        admin,
+        &format!("ALTER DATABASE {database} WITH ALLOW_CONNECTIONS false"),
+        "sealing the template",
+    )
+    .await;
+    wait_until_no_session_is_left(admin, database, within).await
 }
 
 /// Polls `pg_stat_activity` over `admin` (a session on another database) until nobody is connected
