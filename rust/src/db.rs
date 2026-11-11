@@ -275,6 +275,17 @@ pub async fn create_pool(database_url: &str) -> Result<PgPool> {
     }
 }
 
+/// A pool of its own, lazy and of at most `max` connections, with the options of `of`: the same
+/// role, the same session setup and the same resting scope. For work that holds a connection for
+/// minutes (the re-embed the service starts by itself keeps one for its lock the whole time), which
+/// would take two of the four the pool of the daemon has and leave its requests waiting for the
+/// `acquire_timeout`.
+pub fn side_pool(of: &PgPool, max: u32) -> PgPool {
+    pool_options()
+        .max_connections(max)
+        .connect_lazy_with((*of.connect_options()).clone())
+}
+
 /// The connection `database_url` names, migrated, and never stepped down to
 /// the application role. `secure` needs it: it creates and alters that role,
 /// so it has to stay superuser, and create_pool hands back cuba_app's pool as

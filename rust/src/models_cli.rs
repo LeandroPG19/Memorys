@@ -1095,10 +1095,8 @@ async fn install_runtime(dir: &Path, flavor: Flavor) -> Result<()> {
         "  listo. MemoryIndustry lo encuentra en {} (o ORT_DYLIB_PATH=<ruta>)",
         dir.join(lib_name).display()
     );
-    if cfg!(not(windows)) {
-        println!(
-            "  un daemon que ya estaba corriendo sigue con el runtime anterior hasta que lo reinicies."
-        );
+    for line in after_switch_lines() {
+        println!("{line}");
     }
     if flavor.is_gpu() {
         println!(
@@ -1109,6 +1107,23 @@ async fn install_runtime(dir: &Path, flavor: Flavor) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// What the operator is told once the runtime is switched: a daemon that was running keeps the one
+/// it loaded until it restarts, the stored vectors were made by the previous one, and the service
+/// re-embeds them by itself when it starts again. The estimate is 5-15 ms a row on a CPU.
+fn after_switch_lines() -> Vec<String> {
+    [
+        "  un daemon que ya estaba corriendo sigue con el runtime anterior hasta que lo reinicies.",
+        "  Al reiniciar, el servicio reembebe solo, en segundo plano, los vectores guardados con el runtime \
+         anterior: la búsqueda sigue respondiendo mientras tanto, y en CPU tarda del orden de minutos \
+         por cada diez mil vectores.",
+        "  Progreso: `memory-industry doctor` o /health (runtime.vectors.auto).",
+        "  Para hacerlo a mano: MEMORY_INDUSTRY_AUTO_REEMBED=0 en el entorno del servicio y \
+         `memory-industry reembed`.",
+    ]
+    .map(str::to_string)
+    .to_vec()
 }
 
 fn wanted_runtime_lib(base: &str, lib_name: &str, stem: &str, gpu: bool) -> bool {

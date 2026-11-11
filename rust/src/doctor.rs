@@ -822,7 +822,47 @@ async fn embedding_coverage_rows(pool: &PgPool) -> Vec<Check> {
         None
     };
     let age = snapshot_age_days(pool).await;
-    embedding_coverage_checks(&coverage, old_label.as_deref(), age)
+    let auto = auto_reembed_state(pool).await;
+    embedding_coverage_checks(&coverage, old_label.as_deref(), age, auto)
+}
+
+/// What the service does about the vectors of another generation, as far as `doctor` can tell
+/// without asking it: a re-embed holding the lock right now (the automatic one, the command or
+/// `cuba_zafra`: the lock is the same and Postgres knows who has it) is `Running`; otherwise it is
+/// `On` unless `MEMORY_INDUSTRY_AUTO_REEMBED` says no, read from the env file of the installed
+/// service and, where there is none, from the environment of `doctor` itself.
+async fn auto_reembed_state(pool: &PgPool) -> AutoReembed {
+    if reembed_is_running(pool).await {
+        return AutoReembed::Running;
+    }
+    let raw = match crate::service::installed_env(crate::service::Target::host())
+        .ok()
+        .flatten()
+    {
+        Some(text) => env_value(&text, AUTO_REEMBED_KEY),
+        None => std::env::var(AUTO_REEMBED_KEY).ok(),
+    };
+    if crate::reembed_cli::auto_reembed_enabled_from(raw.as_deref()) {
+        AutoReembed::On
+    } else {
+        AutoReembed::Off
+    }
+}
+
+/// An advisory lock is in `pg_locks` as two halves of its key. A query that fails reads as «not
+/// running»: it only removes a sentence from the warning.
+async fn reembed_is_running(pool: &PgPool) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_locks
+             WHERE locktype = 'advisory' AND granted AND objsubid = 1
+               AND classid::bigint = ($1::bigint >> 32)
+               AND objid::bigint = ($1::bigint & 4294967295))",
+    )
+    .bind(crate::reembed_cli::REEMBED_LOCK)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
 }
 
 /// The label most of the vectors of another generation carry, to say what they were made with.
@@ -854,14 +894,42 @@ async fn snapshot_age_days(pool: &PgPool) -> Option<u64> {
     crate::reembed_cli::oldest_snapshot_age_days(&root)
 }
 
+/// Whether the automatic re-embed of the service is going to deal with the vectors of another
+/// generation, is doing it now, or is turned off and the operator has to run the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoReembed {
+    Off,
+    On,
+    Running,
+}
+
+const AUTO_REEMBED_KEY: &str = "MEMORY_INDUSTRY_AUTO_REEMBED";
+
+const HINT_COMMAND: &str = "memory-industry reembed (reanudable; guarda antes los vectores actuales; --rollback los devuelve)";
+
+/// The way out of a database of another generation, by what the service does about it.
+fn pending_vectors_hint(auto: AutoReembed) -> String {
+    match auto {
+        AutoReembed::Off => HINT_COMMAND.to_string(),
+        AutoReembed::On => format!(
+            "el servicio los reembebe solo al arrancar (progreso en /health runtime.vectors.auto; \
+             {AUTO_REEMBED_KEY}=0 lo apaga); a mano: {HINT_COMMAND}"
+        ),
+        AutoReembed::Running => {
+            "esperá a que termine: repetí doctor o mirá /health (runtime.vectors.auto)".to_string()
+        }
+    }
+}
+
 /// Pure: what `doctor` says about the vectors. A warning and never a failure, because a database
 /// of another generation still answers searches (the score is off by a few thousandths), and the
-/// way out is one command. The row of the snapshot appears only when it is old enough to be
-/// forgotten.
+/// way out is one command, or the service doing it by itself. The row of the snapshot appears only
+/// when it is old enough to be forgotten.
 fn embedding_coverage_checks(
     coverage: &crate::embeddings::backfill::VectorCoverage,
     old_label: Option<&str>,
     snapshot_age_days: Option<u64>,
+    auto: AutoReembed,
 ) -> Vec<Check> {
     let (stale, missing) = (coverage.stale(), coverage.missing());
     let mut checks = vec![if stale == 0 && missing == 0 {
@@ -875,16 +943,20 @@ fn embedding_coverage_checks(
         )
     } else {
         let from = old_label.map_or(String::new(), |label| format!(" (de {label})"));
+        let running = if auto == AutoReembed::Running {
+            "; reembebido en curso"
+        } else {
+            ""
+        };
         Check::warn(
             "embedding_coverage",
             format!(
                 "{} filas: {missing} sin vector y {stale} vectores de otra generación{from}; \
-                 la actual es {}",
+                 la actual es {}{running}",
                 coverage.total(),
                 coverage.tag
             ),
-            "memory-industry reembed (reanudable; guarda antes los vectores actuales; \
-             --rollback los devuelve)",
+            pending_vectors_hint(auto),
         )
     }];
     if let Some(days) = snapshot_age_days.filter(|days| *days > SNAPSHOT_REMINDER_DAYS) {

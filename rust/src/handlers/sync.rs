@@ -2665,6 +2665,7 @@ async fn import(
     }
 
     let mut embeddings_restored = 0u32;
+    let mut embeddings_kept_newer = 0u32;
     let blob_path = root.join("embeddings.bin.zst");
     if manifest.with_embeddings && blob_path.exists() {
         let compressed = std::fs::read(&blob_path)?;
@@ -2674,6 +2675,8 @@ async fn import(
             .unwrap_or(crate::embeddings::onnx::embedding_dim());
         let rec_size = embedding_record_size(dim).filter(|size| raw.len() % size == 0);
         if let Some(rec_size) = rec_size {
+            let package_ids: Vec<Uuid> = embedding_labels.keys().copied().collect();
+            let held = vectors_held_here(&mut tx, &package_ids).await?;
             for chunk in raw.chunks_exact(rec_size) {
                 let id_bytes: [u8; 16] = chunk[..16]
                     .try_into()
@@ -2683,6 +2686,14 @@ async fn import(
                 for f_chunk in chunk[16..].as_chunks::<4>().0 {
                     floats.push(f32::from_le_bytes(*f_chunk));
                 }
+                let incoming = embedding_labels.get(&id).cloned().flatten();
+                let wins = held.get(&id).is_none_or(|(label, has_vector)| {
+                    incoming_vector_wins(label.as_deref(), *has_vector, incoming.as_deref())
+                });
+                if !wins {
+                    embeddings_kept_newer += 1;
+                    continue;
+                }
                 let v = pgvector::Vector::from(floats);
                 let r = sqlx::query(
                     "UPDATE brain_observations
@@ -2691,7 +2702,7 @@ async fn import(
                 )
                 .bind(v)
                 .bind(id)
-                .bind(embedding_labels.get(&id).cloned().flatten())
+                .bind(incoming)
                 .execute(&mut *tx)
                 .await?;
                 embeddings_restored += r.rows_affected() as u32;
@@ -2768,6 +2779,7 @@ async fn import(
         "tombstones_withheld": tombstones.withheld,
         "divergence_note": divergence_note,
         "embeddings_restored": embeddings_restored,
+        "embeddings_kept_newer": embeddings_kept_newer,
         "quarantined": quarantined,
         "quarantine_reasons": quarantine_reasons,
         "quarantine_note": quarantine_note,
@@ -2899,6 +2911,40 @@ async fn status(pool: &PgPool, dir_arg: Option<&str>) -> Result<Value> {
         "recent_imports": imported_json,
         "peer_notices": notices,
     }))
+}
+
+/// Whether the vector a package carries for a row replaces the one the row has. It does unless
+/// the row has a vector that is not older than the incoming one: the generation of a row only
+/// moves forward. A package from a machine on an older runtime does not hand back to a row what
+/// this machine re-embedded, and so two machines that sync on different runtimes do not
+/// re-embed each other for ever (the service re-embeds by itself, and only what is older). A row
+/// whose text changed arrives here with its vector cleared by the upsert, and takes the package's.
+pub fn incoming_vector_wins(
+    local: Option<&str>,
+    local_has_vector: bool,
+    incoming: Option<&str>,
+) -> bool {
+    !local_has_vector
+        || local.is_none_or(|label| !crate::embeddings::onnx::is_older_generation(incoming, label))
+}
+
+/// The label and whether it has a vector, for each observation of the package that is already in
+/// the database, read in the transaction of the import: after its upserts and before its vectors.
+async fn vectors_held_here(
+    tx: &mut sqlx::PgConnection,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, (Option<String>, bool)>> {
+    let rows: Vec<(Uuid, Option<String>, bool)> = sqlx::query_as(
+        "SELECT id, embedding_model, embedding IS NOT NULL
+         FROM brain_observations WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .fetch_all(tx)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, label, has_vector)| (id, (label, has_vector)))
+        .collect())
 }
 
 #[cfg(test)]

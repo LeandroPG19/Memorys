@@ -120,7 +120,8 @@ function runBinary(bin, args, timeoutMs = REFRESH_TIMEOUT_MS) {
 
 function refreshRuntime(bin, run = runBinary, log = (m) => process.stderr.write(m + "\n")) {
   const manual =
-    "run `memory-industry models runtime` when you can (on Windows, with the daemon stopped)";
+    "run `memory-industry models runtime` when you can (on Windows, with the daemon stopped); once the runtime is " +
+    "switched the daemon re-embeds the stored vectors by itself when it restarts (MEMORY_INDUSTRY_AUTO_REEMBED=0 turns it off)";
   let status;
   try {
     status = run(bin, ["models", "runtime", "--if-installed"]);

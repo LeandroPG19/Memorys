@@ -43,19 +43,54 @@ pub fn current_model() -> String {
 /// alone, which no loaded process writes: a vector is only written after one embedded.
 pub fn vector_tag_of(model: &str, runtime: Option<&str>) -> String {
     match runtime {
-        Some(runtime) => format!("{model}@onnxruntime-{runtime}"),
+        Some(runtime) => format!("{model}{RUNTIME_MARK}{runtime}"),
         None => model.to_string(),
     }
 }
+
+/// What sits between the model and the runtime version in the label of a vector.
+pub const RUNTIME_MARK: &str = "@onnxruntime-";
 
 /// The label of a vector this process writes now.
 pub fn vector_tag() -> String {
     vector_tag_of(&current_model(), loaded_runtime_version().as_deref())
 }
 
+/// Whether a vector labelled `label` is of an earlier generation than the one `than` names, which
+/// is what the automatic re-embed and a sync import are allowed to move forward and never back.
+/// It is older when it has no label (it is from before the labels), when it is of the model alone
+/// (every database written before 0.31) or when it is of the same model under an earlier runtime,
+/// compared as numbers, component by component: `1.9.0` is before `1.31.1`. It is not older when
+/// it is of the same generation or a newer one, of another model (another space, which only
+/// `reembed --all` changes) or of a version that cannot be read whole as numbers. Against a label
+/// that names no runtime there is no generation to be older than.
+pub fn is_older_generation(label: Option<&str>, than: &str) -> bool {
+    let Some((model, loaded)) = than.split_once(RUNTIME_MARK) else {
+        return false;
+    };
+    let Some(label) = label else {
+        return true;
+    };
+    match label.split_once(RUNTIME_MARK) {
+        None => label == model,
+        Some((made_by, version)) => made_by == model && version_is_before(version, loaded),
+    }
+}
+
+fn version_is_before(version: &str, loaded: &str) -> bool {
+    match (numbers_of(version), numbers_of(loaded)) {
+        (Some(version), Some(loaded)) => version < loaded,
+        _ => false,
+    }
+}
+
+fn numbers_of(version: &str) -> Option<Vec<u64>> {
+    version.split('.').map(|part| part.parse().ok()).collect()
+}
+
 static CACHE: OnceLock<std::sync::Mutex<TtlLruCache<Vec<f32>>>> = OnceLock::new();
 
-static ONNX_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+static GATE: OnceLock<EmbedGate> = OnceLock::new();
 
 const ONNX_DEFAULT_CONCURRENCY: usize = 1;
 
@@ -67,8 +102,98 @@ pub fn embed_concurrency() -> usize {
         .unwrap_or(ONNX_DEFAULT_CONCURRENCY)
 }
 
-fn get_semaphore() -> &'static tokio::sync::Semaphore {
-    ONNX_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(embed_concurrency()))
+fn gate() -> &'static EmbedGate {
+    GATE.get_or_init(|| EmbedGate::new(embed_concurrency()))
+}
+
+/// The permits of the embedder, in two kinds of caller. Whoever is waited for (a search, a write,
+/// the REM cycle, `reembed` by hand) is the foreground; the re-embed the service starts by itself
+/// is the background, and it does not start a row while a foreground embed is waiting or running,
+/// even with a permit free. The permits are one semaphore and the semaphore is fair, so a search
+/// that arrives in the middle of the background waits for the row in hand and not for the batch.
+/// Between the background looking and asking a search can slip in: the semaphore orders them, and
+/// the worst case is still one row (512 tokens at most).
+pub struct EmbedGate {
+    permits: tokio::sync::Semaphore,
+    in_flight: std::sync::atomic::AtomicUsize,
+    quiet: tokio::sync::Notify,
+}
+
+/// A foreground embed that is waiting for a permit or holds one. It counts from the moment it
+/// asks, and stops counting when it is dropped: a request that was cut while it waited must not
+/// leave the background waiting for ever.
+struct InFlight<'a>(&'a EmbedGate);
+
+impl<'a> InFlight<'a> {
+    fn enter(gate: &'a EmbedGate) -> Self {
+        gate.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(gate)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let before = self
+            .0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if before == 1 {
+            self.0.quiet.notify_waiters();
+        }
+    }
+}
+
+/// The permit of a foreground embed. The permit goes back before the count does, so the
+/// background that was waiting for the quiet finds the permit free.
+pub struct ForegroundPermit<'a> {
+    _permit: tokio::sync::SemaphorePermit<'a>,
+    _counted: InFlight<'a>,
+}
+
+impl EmbedGate {
+    pub fn new(permits: usize) -> Self {
+        Self {
+            permits: tokio::sync::Semaphore::new(permits),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            quiet: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub async fn foreground(&self) -> Result<ForegroundPermit<'_>> {
+        let counted = InFlight::enter(self);
+        let permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("ONNX semaphore closed"))?;
+        Ok(ForegroundPermit {
+            _permit: permit,
+            _counted: counted,
+        })
+    }
+
+    pub async fn background(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        loop {
+            let quiet = self.quiet.notified();
+            tokio::pin!(quiet);
+            // Enabled before the count is read: a foreground that ends between the two would
+            // otherwise notify nobody and leave this waiting for the next one.
+            quiet.as_mut().enable();
+            if self.in_flight() == 0 {
+                break;
+            }
+            quiet.await;
+        }
+        self.permits
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("ONNX semaphore closed"))
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 static MODEL_STATUS: OnceLock<ModelStatus> = OnceLock::new();
@@ -514,21 +639,43 @@ async fn embed_with_prefix(text: &str, prefix: &str) -> Result<Vec<f32>> {
         return Ok(cached);
     }
 
-    let _permit = get_semaphore()
-        .acquire()
-        .await
-        .map_err(|_| anyhow::anyhow!("ONNX semaphore closed"))?;
+    let _permit = gate().foreground().await?;
 
-    let prefixed = format!("{}{}", prefix, text);
-    let embedding = tokio::task::spawn_blocking(move || compute_embedding(&prefixed))
-        .await
-        .context("embedding task panicked")??;
+    let embedding = compute_off_the_executor(format!("{}{}", prefix, text)).await?;
 
     if let Ok(mut cache) = get_cache().lock() {
         cache.put(cache_key, embedding.clone());
     }
 
     Ok(embedding)
+}
+
+async fn compute_off_the_executor(prefixed: String) -> Result<Vec<f32>> {
+    tokio::task::spawn_blocking(move || compute_embedding(&prefixed))
+        .await
+        .context("embedding task panicked")?
+}
+
+/// `embed_passage`, for the re-embed that the service runs by itself: the same prefix and the same
+/// vector, but it gives way to every foreground embed, and it neither reads nor writes the cache
+/// of 256 entries (thousands of passages that are never asked twice would empty it of queries).
+pub async fn embed_passage_background(text: &str) -> Result<Vec<f32>> {
+    embed_in_background(text, &passage_prefix()).await
+}
+
+/// `embed_passage_contextual`, for the re-embed that the service runs by itself.
+pub async fn embed_passage_contextual_background(
+    text: &str,
+    entity_type: &str,
+    entity_name: &str,
+) -> Result<Vec<f32>> {
+    let contextualized = format!("[{}:{}] {}", entity_type, entity_name, text);
+    embed_in_background(&contextualized, &passage_prefix()).await
+}
+
+async fn embed_in_background(text: &str, prefix: &str) -> Result<Vec<f32>> {
+    let _permit = gate().background().await?;
+    compute_off_the_executor(format!("{}{}", prefix, text)).await
 }
 
 fn compute_embedding(text: &str) -> Result<Vec<f32>> {
