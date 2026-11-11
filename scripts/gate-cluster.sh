@@ -803,6 +803,26 @@ D2EOF
     || self_fail "K7 logs: the log of a lane is not under XDG_CACHE_HOME/memory-industry-gate/clusters"
   [[ ! -e "$tmp/home-row/.cache" ]] || self_fail "K7 logs: a lane's log went under HOME/.cache"
 
+  # CI-E23: a lane that goes down inside a run of the planner also leaves its log in the run directory, which is two levels
+  # above the TMPDIR of the row (<run>/tmp/<row>) and holds the planner.pid: <run>/clusters/<lane>.log. A red run keeps the
+  # directory and a green one deletes it, so the postgres log of the run that failed is not lost to the next one, which
+  # overwrites the fixed name under GATE_CLUSTER_LOGS (that one is still written, with the same bytes). A TMPDIR that is not
+  # the row of a planner (no planner.pid two levels up) leaves nothing beside it.
+  mkdir -p "$tmp/e23/run/tmp/row" "$tmp/e23/xdg" "$tmp/e23/home" "$tmp/e23/other/tmp/row"
+  echo 1 >"$tmp/e23/run/planner.pid"
+  lib e23 stay "gate_cluster_up dbg >/dev/null || exit 3; gate_cluster_down dbg >/dev/null" \
+    XDG_CACHE_HOME="$tmp/e23/xdg" HOME="$tmp/e23/home" TMPDIR="$tmp/e23/run/tmp/row"
+  [[ "$rc" == 0 ]] || self_fail "E23: a lane that comes up and goes down inside a run of the planner exits $rc: $out"
+  [[ -s "$tmp/e23/run/clusters/dbg.log" ]] \
+    || self_fail "E23: the log of the lane is not in the run directory ($tmp/e23/run/clusters/dbg.log): $(ls -A "$tmp/e23/run" "$tmp/e23/run/tmp/row")"
+  cmp -s "$tmp/e23/run/clusters/dbg.log" "$tmp/e23/xdg/memory-industry-gate/clusters/dbg.log" \
+    || self_fail "E23: the log in the run directory is not the one under GATE_CLUSTER_LOGS, which has to stay as it was"
+  lib e23o stay "gate_cluster_up dbg >/dev/null || exit 3; gate_cluster_down dbg >/dev/null" \
+    XDG_CACHE_HOME="$tmp/e23/xdg" HOME="$tmp/e23/home" TMPDIR="$tmp/e23/other/tmp/row"
+  [[ "$rc" == 0 ]] || self_fail "E23: a lane outside a run of the planner exits $rc: $out"
+  [[ ! -e "$tmp/e23/other/clusters" && ! -e "$tmp/e23/other/tmp/clusters" && ! -e "$tmp/e23/other/tmp/row/clusters" ]] \
+    || self_fail "E23: a TMPDIR with no planner.pid two levels up got a clusters directory: $(find "$tmp/e23/other" -name 'clusters*')"
+
   # K10: each rule of the library has its row. A lane name that is not [a-z0-9][a-z0-9-]*, a GATE_OWNER that is
   # empty, and a mktemp that fails are exit 2 before a lane directory exists.
   lib badlane stay "gate_cluster_up Dbg_1"
@@ -873,7 +893,7 @@ KL
   [[ "$default_after" == "$default_before" ]] \
     || self_fail "D6: the default cluster root $default_root changed while the rows ran: $(diff <(printf '%s\n' "$default_before") <(printf '%s\n' "$default_after") | tr '\n' ' ')"
 
-  echo "OK  self-test: gate-cluster refuses a missing initdb, psql, a postgres 18.7, a pgvector 0.8.1, a locale without en_US.utf8, a root on disk, a root with a space, a relative root, a root that is a link, a chmod that fails, a socket path over 107 bytes; a postgres that dies at its start or never answers is exit 2 at the wall-clock timeout, without the password, and a postgres that takes 3 s a try does not stretch it; the whole output of a lane that comes up has no password; a lane does not inherit PGPORT or PGHOSTADDR, and it is on port 5432; down ends a lane by QUIT in under 3 s and keeps its log per run; TERM takes every lane down; a pid that is not the lane's postgres is never signalled; an empty pid is not alive; the sweep does not signal an owner of another pid namespace, judges each directory by its identity (exe and -D) with its own refusal, and goes on past a note and a refusal; a lane name, an empty GATE_OWNER and a failing mktemp are exit 2; the default cluster root, computed from GATE_CLUSTER_TMP and never created, is listed the same before and after the rows; a lane's log goes under XDG_CACHE_HOME; a lane's URL is a socket under its directory on port 5432; a lane named a-b is made and passes the judge guard, which refuses a mark the lane grammar cannot make; a second load of the library keeps ROOT, SELF and the lock of its caller; the major is the first number of the version"
+  echo "OK  self-test: gate-cluster refuses a missing initdb, psql, a postgres 18.7, a pgvector 0.8.1, a locale without en_US.utf8, a root on disk, a root with a space, a relative root, a root that is a link, a chmod that fails, a socket path over 107 bytes; a postgres that dies at its start or never answers is exit 2 at the wall-clock timeout, without the password, and a postgres that takes 3 s a try does not stretch it; the whole output of a lane that comes up has no password; a lane does not inherit PGPORT or PGHOSTADDR, and it is on port 5432; down ends a lane by QUIT in under 3 s and keeps its log per run; TERM takes every lane down; a pid that is not the lane's postgres is never signalled; an empty pid is not alive; the sweep does not signal an owner of another pid namespace, judges each directory by its identity (exe and -D) with its own refusal, and goes on past a note and a refusal; a lane name, an empty GATE_OWNER and a failing mktemp are exit 2; the default cluster root, computed from GATE_CLUSTER_TMP and never created, is listed the same before and after the rows; a lane's log goes under XDG_CACHE_HOME and, inside a planner's run, into its run directory too; a lane's URL is a socket under its directory on port 5432; a lane named a-b is made and passes the judge guard, which refuses a mark the lane grammar cannot make; a second load of the library keeps ROOT, SELF and the lock of its caller; the major is the first number of the version"
   exit 0
 fi
 # --- self-test end ---

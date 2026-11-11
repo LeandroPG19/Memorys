@@ -747,6 +747,8 @@ mk_repo() { # <dir> <autocrlf true|false> -> imprime el sha base
   mkdir -p "$d/rust/src" "$d/rust/tests" "$d/scripts" "$d/.cursor/handoffs"
   cp "$SELF" "$d/scripts/validar-handoff.sh"
   chmod +x "$d/scripts/validar-handoff.sh"
+  # CI-J19: la tabla del juez tiene un solo lector, el planificador, y el guardia lo pide del arbol que juzga.
+  cp "$(dirname "$SELF")/gate-dag.py" "$(dirname "$SELF")/gate_history.py" "$d/scripts/"
   git -C "$d" init -q
   git -C "$d" config user.email "self-test@example.invalid"
   git -C "$d" config user.name "validar-handoff self-test"
@@ -832,7 +834,7 @@ SH
   # Rutas explicitas: `git add -A` arrastra CRLF fantasma y ficheros ajenos, y
   # en este repo lo bloquea la guardia de comandos.
   git -C "$d" add rust/src/cosa.rs rust/tests/contrato.rs scripts/validar-handoff.sh \
-    scripts/juez.sh scripts/juez-fn.sh scripts/plano.sh scripts/gate-dag.txt >/dev/null 2>&1
+    scripts/juez.sh scripts/juez-fn.sh scripts/plano.sh scripts/gate-dag.txt scripts/gate-dag.py scripts/gate_history.py >/dev/null 2>&1
   git -C "$d" commit -q -m "base" >/dev/null 2>&1
 
   # El arbol se convierte a CRLF DESPUES del commit, que es como pasa de verdad:
@@ -1225,6 +1227,23 @@ self_test() {
     "XYZ no es una fila de scripts/gate-dag.txt" "P DBG" || bad=1
   mk_yml "$h/c7.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque "$seg" 'carril: DBG')" frozen
   must_fail_saying_all "E6: un carril sin comparte" "$d" "$h/c7.yml" "comparte" || bad=1
+
+  # CI-J19: las filas del carril son las que dice el lector de la tabla (`gate-dag.py rows`), no las que saca otro awk. La
+  # tabla del planificador va en el orden de idx (aqui DBG y X estan escritas antes que P y la lista sale P DBG X; DBG y X se
+  # solapan, y un solape no es una fila). Una tabla que el planificador rechaza (un id con guion) no da ninguna fila, ni la P
+  # que esta bien escrita, y su FAIL sale en la respuesta. Una tabla que no existe sigue sin dar filas.
+  printf '%s\n' '20 DBG P target:T_dbg normal 1 1 1 true' '30 X P - normal 1 1 1 true' '10 P - - normal 1 1 1 true' > "$d/scripts/gate-dag.txt"
+  mk_yml "$h/c12.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque "$seg" 'carril: XYZ; comparte: nada')" frozen
+  must_fail_saying_all "E6: las filas del carril salen en el orden de idx, como las dice el planificador" "$d" "$h/c12.yml" \
+    "XYZ no es una fila de scripts/gate-dag.txt" "(filas: P DBG X)" || bad=1
+  printf '%s\n' '10 P - - normal 1 1 1 true' '20 D-B P - normal 1 1 1 true' > "$d/scripts/gate-dag.txt"
+  mk_yml "$h/c13.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque "$seg" 'carril: P; comparte: nada')" frozen
+  must_fail_saying_all "E6: una tabla que el planificador rechaza no da filas" "$d" "$h/c13.yml" \
+    "FAIL:" "P no es una fila de scripts/gate-dag.txt" || bad=1
+  rm -f "$d/scripts/gate-dag.txt"
+  mk_yml "$h/c14.yml" implementador mejorador git_handoff "$base" "fixture" "$(ev_bloque "$seg" "$carril")" frozen
+  must_fail_saying_all "E6: sin tabla no hay filas" "$d" "$h/c14.yml" "DBG no es una fila de scripts/gate-dag.txt" "ninguna" || bad=1
+  cp "$st_tmp/pristino-e6/gate-dag.txt" "$d/scripts/gate-dag.txt"
 
   # Implementador que solo toca la tabla del juez: no es .rs ni .sh, y ningun
   # test se mueve. Con la lista de candidatos de written/frozen esto pasaria.
