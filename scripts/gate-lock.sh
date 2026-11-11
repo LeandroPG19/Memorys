@@ -972,3 +972,128 @@ gate_cargo_jobs() {
   fi
   (( GATE_RELEASE_JOBS >= 1 )) || GATE_RELEASE_JOBS=1
 }
+
+# --- the card of the Linux judge (CI-G1) ------------------------------------------------------------------------
+# gate_gpu_probe says whether the reranker of lane R may run on the card, and why not when it may not. It sets shell variables
+# and exports nothing (the planner asks it in a bash of its own, and every name the judge exports is in JUDGE_ENVIRONMENT):
+#   GATE_GPU_DECISION   candidate (a card, two runtimes of one version and the libraries of CUDA), cpu, or unmanaged (not Linux:
+#                       the runtime gate_model_env chose decides, as before)
+#   GATE_GPU_WHY        the reason, in words an operator can act on
+#   GATE_GPU_VRAM_FREE_MB, GATE_GPU_ORT, GATE_GPU_LIBS   what a candidate found: the free memory of the card, the library of the
+#                       GPU runtime of the judge and the directories of the libraries of CUDA, for `ORT_DYLIB_PATH` and
+#                       `LD_LIBRARY_PATH` of the one call that uses them
+# GATE_GPU is auto (the default, and empty), cpu (no nvidia-smi is run) or gpu (the same decision as auto; lane R turns a card
+# that was not admitted into a red). The judge's own GPU runtime lives in GATE_GPU_HOME, laid out as a HOME in which
+# `memory-industry models runtime --gpu` was run, with the libraries of CUDA in <flavor>/nvidia/*/lib beside it. The CPU runtime
+# is the one of gate_model_env (GATE_RUNTIME_HOME), and the GPU runtime has to be of the same version: the rows of CPU load the
+# same bytes as before CI-G1, and only the call that uses the card loads the other.
+# The libraries a provider needs are the ones ldd reads from the provider itself, so there is no list to keep in step with a
+# version of ONNX Runtime. A refusal of the value of GATE_GPU is exit 2 (the planner says it before it asks this).
+gate_gpu_json_field() {
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" 2>/dev/null | head -n 1
+}
+
+# The nvidia-smi to ask: the one on the PATH, and then the one of the directory of WSL (GATE_WSL_LIB_DIR, /usr/lib/wsl/lib), which a
+# WSL PATH may not have. Prints its path; status 1 and nothing when there is none.
+gate_nvidia_smi() {
+  local wsl_dir="${GATE_WSL_LIB_DIR:-/usr/lib/wsl/lib}" smi
+  smi="$(command -v nvidia-smi 2>/dev/null || true)"
+  if [[ -z "$smi" && -x "$wsl_dir/nvidia-smi" ]]; then smi="$wsl_dir/nvidia-smi"; fi
+  [[ -n "$smi" ]] || return 1
+  printf '%s' "$smi"
+}
+
+# The free memory of the card right now, in MiB, or `unknown` (lane R says it next to the one at its admission when the call on the
+# card goes red, so a red for lack of memory is told from one of the product).
+gate_gpu_free_now() {
+  local smi out name free
+  smi="$(gate_nvidia_smi)" || { echo unknown; return 0; }
+  out="$(timeout 5 "$smi" --query-gpu=name,memory.free,compute_cap --format=csv,noheader,nounits 2>/dev/null)" || { echo unknown; return 0; }
+  IFS=, read -r name free _ <<<"${out%%$'\n'*}"
+  free="${free//[[:space:]]/}"
+  if [[ "$free" =~ ^[0-9]+$ ]]; then echo "$free"; else echo unknown; fi
+}
+
+# shellcheck disable=SC2034 # read by the scripts that source this one
+gate_gpu_probe() {
+  local asked="${GATE_GPU:-auto}" wsl_dir="${GATE_WSL_LIB_DIR:-/usr/lib/wsl/lib}" system smi out="" rc=0 name free cap
+  local cpu_home="${GATE_RUNTIME_HOME:-$HOME/.cache/memory-industry-gate/runtime-home}" gpu_home="${GATE_GPU_HOME:-$HOME/.cache/memory-industry-gate/gpu-home}"
+  local cpu_dir gpu_dir cpu_version gpu_version flavor libs="" dir missing
+  GATE_GPU_DECISION=cpu GATE_GPU_WHY="" GATE_GPU_VRAM_FREE_MB="" GATE_GPU_ORT="" GATE_GPU_LIBS=""
+  case "$asked" in
+    cpu) GATE_GPU_WHY="GATE_GPU=cpu"; return 0 ;;
+    auto | gpu) ;;
+    *) gate_refuse "GATE_GPU=$asked takes auto, cpu or gpu" ;;
+  esac
+  system="$(uname -s)"
+  if [[ "$system" != Linux ]]; then
+    GATE_GPU_DECISION=unmanaged
+    GATE_GPU_WHY="$system: the runtime gate_model_env chose decides, as before CI-G1"
+    return 0
+  fi
+  if ! smi="$(gate_nvidia_smi)"; then
+    GATE_GPU_WHY="no NVIDIA card: no nvidia-smi on PATH or in $wsl_dir"
+    return 0
+  fi
+  # 5 s is a bound against a hung driver, not a measure: the answer takes under half a second.
+  out="$(timeout 5 "$smi" --query-gpu=name,memory.free,compute_cap --format=csv,noheader,nounits 2>/dev/null)" || rc=$?
+  if (( rc != 0 )); then
+    if (( rc == 124 )); then GATE_GPU_WHY="nvidia-smi failed: it took more than 5 s"; else GATE_GPU_WHY="nvidia-smi failed: exit $rc"; fi
+    return 0
+  fi
+  IFS=, read -r name free cap <<<"${out%%$'\n'*}"
+  name="${name%"${name##*[![:space:]]}"}"
+  name="${name#"${name%%[![:space:]]*}"}"
+  free="${free//[[:space:]]/}"
+  cap="${cap//[[:space:]]/}"
+  if [[ -z "$name" || ! "$free" =~ ^[0-9]+$ || -z "$cap" ]]; then
+    GATE_GPU_WHY="nvidia-smi failed: it did not answer name, memory.free and compute_cap ('$out')"
+    return 0
+  fi
+  cpu_dir="$cpu_home/.cache/memory-industry/onnxruntime"
+  if [[ ! -f "$cpu_dir/runtime.json" ]]; then
+    GATE_GPU_WHY="the CPU runtime has no runtime.json at $cpu_dir: CI-D5b is not in"
+    return 0
+  fi
+  gpu_dir="$gpu_home/.cache/memory-industry/onnxruntime"
+  if [[ ! -f "$gpu_dir/libonnxruntime.so" ]]; then
+    GATE_GPU_WHY="no GPU runtime for the judge at $gpu_dir: HOME=$gpu_home memory-industry models runtime --gpu"
+    return 0
+  fi
+  flavor="$(gate_gpu_json_field "$gpu_dir/runtime.json" flavor)"
+  if [[ "$flavor" != cuda12 && "$flavor" != cuda13 ]]; then
+    GATE_GPU_WHY="$gpu_dir is a ${flavor:-unrecorded} runtime, not cuda12 or cuda13: HOME=$gpu_home memory-industry models runtime --gpu"
+    return 0
+  fi
+  cpu_version="$(gate_gpu_json_field "$cpu_dir/runtime.json" version)"
+  gpu_version="$(gate_gpu_json_field "$gpu_dir/runtime.json" version)"
+  if [[ -z "$gpu_version" || "$gpu_version" != "$cpu_version" ]]; then
+    GATE_GPU_WHY="GPU runtime ${gpu_version:-unrecorded} and CPU runtime ${cpu_version:-unrecorded} differ"
+    return 0
+  fi
+  if [[ ! -f "$gpu_dir/libonnxruntime_providers_cuda.so" ]]; then
+    GATE_GPU_WHY="no libonnxruntime_providers_cuda.so in $gpu_dir: it is not a CUDA runtime"
+    return 0
+  fi
+  for dir in "$gpu_home/$flavor"/nvidia/*/lib; do
+    if [[ -d "$dir" ]]; then libs+="${libs:+:}$dir"; fi
+  done
+  rc=0
+  out="$(LD_LIBRARY_PATH="$libs" ldd "$gpu_dir/libonnxruntime_providers_cuda.so" 2>&1)" || rc=$?
+  missing="$(sed -n 's/^[[:space:]]*\([^[:space:]]*\)[[:space:]]*=>[[:space:]]*not found.*/\1/p' <<<"$out" | tr '\n' ' ')"
+  missing="${missing% }"
+  if [[ -n "$missing" ]]; then
+    GATE_GPU_WHY="missing $missing for $flavor under $gpu_home/$flavor: P1 of ci-rapido-G1 (docs/gate.md, The GPU in the Linux judge)"
+    return 0
+  fi
+  if (( rc != 0 )); then
+    GATE_GPU_WHY="ldd failed on the CUDA provider of $gpu_dir: exit $rc"
+    return 0
+  fi
+  if [[ -d "$wsl_dir" ]]; then libs+="${libs:+:}$wsl_dir"; fi
+  GATE_GPU_DECISION=candidate
+  GATE_GPU_WHY="$name, $free MiB free, onnxruntime $gpu_version $flavor"
+  GATE_GPU_VRAM_FREE_MB="$free"
+  GATE_GPU_ORT="$gpu_dir/libonnxruntime.so"
+  GATE_GPU_LIBS="$libs"
+}

@@ -5,8 +5,14 @@
 # the --features docs pass is gone (docs is a default feature, the build without it is
 # only linted), so a binary is no longer summed over two passes.
 #
-# A line: <os> <binary> <floor_s> <ceiling_s> <owner> <expires> <reason>
-#   os         windows (Git Bash) or linux. A host is judged by its own lines only.
+# A line: <os>[/gpu] <binary> <floor_s> <ceiling_s> <owner> <expires> <reason>
+#   os         windows (Git Bash) or linux. A host is judged by its own lines only. `<os>/gpu` is the line of a binary that
+#              ran on the card (CI-G1): lane R prints `=== models device: gpu for <binary> (...) ===` in the log before the
+#              block of a binary it ran there, and test-times.sh judges THAT binary with its `<os>/gpu` line, or with the
+#              default of 10 s and no floor when it has none, and never with the line `<os> <binary>` of the CPU. A binary with
+#              no marker, or with a `cpu` or `unmanaged` one, is judged with `<os> <binary>`. Each device has the numbers
+#              measured on it; a line of one device whose binary ran on the other is not red for having been left unused,
+#              but it expires like any other.
 #   binary     <name> for rust/tests/<name>.rs (which has to exist), lib:<crate>
 #              and bin:<crate> for unittests, doc:<crate> for doc-tests.
 #   floor_s    whole seconds, at least 1. A run under it is red: the line no

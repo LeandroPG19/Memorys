@@ -470,6 +470,91 @@ if [[ "${1:-}" == "--self-test" ]]; then
   cmp -s "$tmp/K4count.clean" "$tmp/K4count.timed" \
     || self_fail "K4h: --count counts other binaries or tests with the timing lines in the log"
 
+  # G1.8 (CI-G1, D-G1e): a binary is judged with the ceiling of the device where it ran. The log says it with
+  # `=== models device: gpu for <binary> (<card>, <n> MiB free, onnxruntime <v> <flavor>) ===` before the block of the
+  # binary. The line `<os>/gpu <binary>` judges it; without that line the default of 10 s judges it and never the line
+  # `<os> <binary>` of the CPU, whose floor (37 s) a run on the card would always be under. A binary with no marker, or with a
+  # `cpu` or `unmanaged` one, is judged as ever. A marker for a binary that is not in the log would be a lie, and is red. Here
+  # the card is the fixture's: a made-up line of the log, nothing asks a real one.
+  : >"$tmp/tests/v017_rerank_gpu.rs"
+  g1_gpu_marker='=== models device: gpu for v017_rerank_gpu (NVIDIA GeForce RTX 4070 Ti, 10692 MiB free, onnxruntime 1.31.1 cuda13) ==='
+  # g1_log FILE SECONDS [MARKER]: slow and the lib as in the base log, the reranker with SECONDS, and fast; MARKER (a whole
+  # line, or none) comes right before the block of the reranker, where the judge prints it.
+  g1_log() {
+    {
+      bin_block linux slow 40.00
+      bin_block linux lib:memory_industry 21.51
+      [[ -z "${3:-}" ]] || emit linux "$3"
+      bin_block linux v017_rerank_gpu "$2"
+      bin_block linux fast 0.31
+      emit linux "$BOUND"
+    } >"$1"
+  }
+  # g1_ceilings FILE [LINE...]: the base ceilings, and the CPU line of the reranker (37 to 127 s), then LINE...
+  g1_ceilings() {
+    local file="$1"
+    shift
+    c1 linux windows 'linux v017_rerank_gpu 37 127 owner-a 2026-12-31 the reranker on the CPU' "$@" >"$file"
+  }
+  g1_ceilings "$tmp/G1.both.txt" 'linux/gpu v017_rerank_gpu 3 15 owner-a 2026-12-31 the reranker on the card'
+  g1_ceilings "$tmp/G1.cpu-only.txt"
+
+  g1_log "$tmp/G1a.log" 8.00 "$g1_gpu_marker"
+  tt G1a linux "$tmp/G1a.log" "$tmp/G1.both.txt"
+  want_rc G1a 0
+  has G1a 'OK  test times on linux'
+  lacks G1a 'did not run' FAIL
+
+  g1_log "$tmp/G1b.log" 20.00 "$g1_gpu_marker"
+  tt G1b linux "$tmp/G1b.log" "$tmp/G1.both.txt"
+  want_rc G1b 1
+  fail_with G1b v017_rerank_gpu 20.00 '15 s'
+
+  g1_log "$tmp/G1c.log" 8.00 "$g1_gpu_marker"
+  tt G1c linux "$tmp/G1c.log" "$tmp/G1.cpu-only.txt"
+  want_rc G1c 0
+  lacks G1c 'did not run' FAIL
+  g1_log "$tmp/G1c2.log" 12.00 "$g1_gpu_marker"
+  tt G1c2 linux "$tmp/G1c2.log" "$tmp/G1.cpu-only.txt"
+  want_rc G1c2 1
+  fail_with G1c2 v017_rerank_gpu 12.00 default
+  g1_reds="$(grep '^FAIL: ' "$tmp/G1c2.out" || true)"
+  [[ "$g1_reds" != *'37 s'* ]] \
+    || self_fail "G1.8: a reranker that ran on the card with no linux/gpu line was judged against the floor of the CPU line (37 s): $g1_reds"
+
+  g1_log "$tmp/G1d.log" 8.00
+  tt G1d linux "$tmp/G1d.log" "$tmp/G1.both.txt"
+  want_rc G1d 1
+  fail_with G1d v017_rerank_gpu 8.00 floor '37 s'
+  lacks G1d 'did not run'
+  g1_log "$tmp/G1d2.log" 8.00 '=== models device: cpu for v017_rerank_gpu (GATE_GPU=cpu) ==='
+  tt G1d2 linux "$tmp/G1d2.log" "$tmp/G1.both.txt"
+  want_rc G1d2 1
+  fail_with G1d2 v017_rerank_gpu 8.00 floor '37 s'
+  g1_log "$tmp/G1d3.log" 60.00 '=== models device: unmanaged for v017_rerank_gpu (MINGW64_NT: the runtime gate_model_env chose decides) ==='
+  tt G1d3 linux "$tmp/G1d3.log" "$tmp/G1.both.txt"
+  want_rc G1d3 0
+
+  tt9 G1e "not '" 'linux/cuda v017_rerank_gpu 3 15 owner-a 2026-12-31 r' drop
+
+  g1_log "$tmp/G1f.log" 60.00 '=== models device: gpu for ghost_binary (NVIDIA GeForce RTX 4070 Ti, 10692 MiB free, onnxruntime 1.31.1 cuda13) ==='
+  tt G1f linux "$tmp/G1f.log" "$tmp/G1.both.txt"
+  want_rc G1f 1
+  fail_with G1f ghost_binary
+
+  g1_log "$tmp/G1g.log" 8.00 "$g1_gpu_marker"
+  rc=0
+  bash "$SELF" --units "$tmp/G1g.log" >"$tmp/G1g.out" 2>&1 || rc=$?
+  want_rc G1g 0
+  [[ "$(cat "$tmp/G1g.out")" == "$(printf '%s\n' 'slow 4000 1 0' 'lib:memory_industry 2151 1 0' 'v017_rerank_gpu@gpu 800 1 0' 'fast 31 1 0')" ]] \
+    || self_fail "G1.8: --units printed '$(cat "$tmp/G1g.out")' for a log whose marker says the reranker ran on the card, not 'v017_rerank_gpu@gpu 800 1 0' for it and the plain key and time of the others"
+  g1_log "$tmp/G1g2.log" 8.00 '=== models device: cpu for v017_rerank_gpu (GATE_GPU=cpu) ==='
+  rc=0
+  bash "$SELF" --units "$tmp/G1g2.log" >"$tmp/G1g2.out" 2>&1 || rc=$?
+  want_rc G1g2 0
+  grep -qxF 'v017_rerank_gpu 800 1 0' "$tmp/G1g2.out" \
+    || self_fail "G1.8: --units gave '$(cat "$tmp/G1g2.out")' for a binary whose marker says cpu, not its plain key 'v017_rerank_gpu 800 1 0'"
+
   echo "OK  self-test: test-times sums each binary's finished-in over both cargo shapes up to the boundary, prints the 10 slowest, and is red for a ceiling passed, the default passed, a floor undercut, a dead or expired line and a malformed one, all in one run; a log it cannot read is exit 2"
   exit 0
 fi
@@ -496,6 +581,13 @@ fi
 #   exit 0 green, 1 a time or a ceilings line is red, 2 it could not judge.
 #   test-times.sh --count LOG   the tests each binary ran (below, with its format)
 #   test-times.sh --units LOG   per binary: time, tests and failed (F3.1, below)
+#
+# CI-G1: a binary is judged with the ceiling of the device where it ran. Lane R of run-all-tests.sh says it in the log, before the
+# block of the binary: `=== models device: gpu for <binary> (<card>, <n> MiB free, onnxruntime <v> <flavor>) ===`. That binary is
+# judged with the line `<os>/gpu <binary>` of the ceilings, or, with no such line, with the default ceiling and no floor: never
+# with the line `<os> <binary>`, whose floor is the time of the CPU. A binary with no marker, or with a `cpu` or `unmanaged` one,
+# is judged as ever. A marker for a binary that is not in the log would be a lie about where something ran, and is red. The history
+# keeps the units of a run on the card under `<binary>@gpu` (--units), so the two series do not mix.
 
 # 10 s: every regression 0.30 fixed measured more than that on both hosts (the
 # smallest, 10.13 s), and the slowest binary with no line measures 6.7 s on
@@ -504,6 +596,11 @@ DEFAULT_CEILING_S=10
 SLOWEST_N=10
 
 die2() { echo "FAIL: $*" >&2; exit 2; }
+
+# gpu_marked LOG: the binaries the log says ran on the card (CI-G1), one per line.
+gpu_marked() {
+  tr -d '\r' <"$1" | sed -n 's/^=== models device: gpu for \([^ ]*\) (.*$/\1/p'
+}
 
 # fmt_cs CENTISECONDS: 5250 -> 52.50. Times are summed as whole centiseconds so a
 # ceiling is compared exactly, with no float on the edge of a line.
@@ -650,6 +747,11 @@ if [[ "${1:-}" == "--judge" ]]; then
     die2 "$LOG:${unpaired%% *}: ${unpaired#* } has no 'test result' line before the next binary or the boundary; the log is cut or interleaved, and the judge will not guess"
   fi
   (( ${#KEYS[@]} > 0 )) || die2 "no test binary was timed in $LOG before '$UNTIL': nothing timed is not a pass"
+  declare -A ON_GPU=()
+  GPU_LIST=()
+  while IFS= read -r marked; do
+    if [[ -n "$marked" && -z "${ON_GPU[$marked]:-}" ]]; then ON_GPU["$marked"]=1; GPU_LIST+=("$marked"); fi
+  done < <(gpu_marked "$LOG")
 
   # Slowest first, ties by name: what the table shows and the order of the reds.
   total=0
@@ -666,13 +768,13 @@ if [[ "${1:-}" == "--judge" ]]; then
   n=0
   host_lines=0
   blank_or_comment='^[[:space:]]*(#|$)'
-  shape='<os> <binary> <floor_s> <ceiling_s> <owner> <expires YYYY-MM-DD> <reason>'
+  shape='<os>[/gpu] <binary> <floor_s> <ceiling_s> <owner> <expires YYYY-MM-DD> <reason>'
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1))
     line="${line%$'\r'}"
     [[ "$line" =~ $blank_or_comment ]] && continue
     read -r l_os l_bin l_floor l_ceil l_owner l_exp l_reason <<<"$line"
-    if [[ ! "$l_os" =~ ^(windows|linux)$ || ! "$l_bin" =~ ^(lib:|bin:|doc:)?[A-Za-z0-9_-]+$ \
+    if [[ ! "$l_os" =~ ^(windows|linux)(/gpu)?$ || ! "$l_bin" =~ ^(lib:|bin:|doc:)?[A-Za-z0-9_-]+$ \
       || ! "$l_floor" =~ ^[0-9]+$ || ! "$l_ceil" =~ ^[0-9]+$ || -z "$l_owner" \
       || ! "$l_exp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ || -z "$l_reason" ]]; then
       red "$CEILINGS:$n: not '$shape': $line"
@@ -692,17 +794,22 @@ if [[ "${1:-}" == "--judge" ]]; then
       continue
     fi
     LINE_AT["$l_os $l_bin"]="$n"; LINE_FLOOR["$l_os $l_bin"]="$f"; LINE_CEIL["$l_os $l_bin"]="$c"
-    [[ "$l_os" == "$OS" ]] && host_lines=$((host_lines + 1))
+    [[ "$l_os" == "$OS" || "$l_os" == "$OS/gpu" ]] && host_lines=$((host_lines + 1))
     if [[ "$l_exp" < "$TODAY" ]]; then
       red "$CEILINGS:$n: the line of $l_bin on $l_os expired on $l_exp. Renew it with a reason that is still true, or remove it."
     fi
     if [[ "$l_bin" != *:* && ! -f "$TESTS_DIR/$l_bin.rs" ]]; then
       red "$CEILINGS:$n: $l_bin names $TESTS_DIR/$l_bin.rs, which does not exist. Remove the line."
     fi
-    if [[ "$l_os" == "$OS" && -z "${MEAS[$l_bin]:-}" ]]; then
+    if [[ ( "$l_os" == "$OS" || "$l_os" == "$OS/gpu" ) && -z "${MEAS[$l_bin]:-}" ]]; then
       red "$CEILINGS:$n: $l_bin has a line for $OS and this run did not run it. Remove the line."
     fi
   done <"$CEILINGS"
+
+  for marked in ${GPU_LIST[@]+"${GPU_LIST[@]}"}; do
+    [[ -n "${MEAS[$marked]:-}" ]] \
+      || red "$LOG says $marked ran on the GPU ('=== models device: gpu for $marked'), and no test binary of that name was timed in it: the marker would say where something ran that did not run"
+  done
 
   shown=$SLOWEST_N
   (( ${#sorted[@]} < shown )) && shown=${#sorted[@]}
@@ -711,25 +818,30 @@ if [[ "${1:-}" == "--judge" ]]; then
   for key in "${sorted[@]}"; do
     rank=$((rank + 1))
     (( rank > SLOWEST_N )) && break
-    at="${LINE_AT[$OS $key]:-}"
-    if [[ -n "$at" ]]; then note="ceiling ${LINE_CEIL[$OS $key]} s, floor ${LINE_FLOOR[$OS $key]} s"
+    dev="$OS"
+    [[ -z "${ON_GPU[$key]:-}" ]] || dev="$OS/gpu"
+    at="${LINE_AT[$dev $key]:-}"
+    if [[ -n "$at" ]]; then note="ceiling ${LINE_CEIL[$dev $key]} s, floor ${LINE_FLOOR[$dev $key]} s"
     else note="default ceiling $DEFAULT_CEILING_S s"; fi
+    [[ "$dev" == "$OS" ]] || note="$note (on the GPU)"
     printf '  %9s s  %-52s %s\n' "$(fmt_cs "${MEAS[$key]}")" "$key" "$note"
   done
 
   # The judgement of the run: every binary measured, not only the ten shown.
   for key in "${sorted[@]}"; do
     cs="${MEAS[$key]}"
-    at="${LINE_AT[$OS $key]:-}"
+    dev="$OS"
+    [[ -z "${ON_GPU[$key]:-}" ]] || dev="$OS/gpu"
+    at="${LINE_AT[$dev $key]:-}"
     if [[ -n "$at" ]]; then
-      ceil_s="${LINE_CEIL[$OS $key]}"; floor_s="${LINE_FLOOR[$OS $key]}"
+      ceil_s="${LINE_CEIL[$dev $key]}"; floor_s="${LINE_FLOOR[$dev $key]}"
       if (( cs > ceil_s * 100 )); then
-        red "$key took $(fmt_cs "$cs") s on $OS, over its ceiling of $ceil_s s ($CEILINGS:$at). Bring it back under, or raise the line with the run that measured it; first check that this run was alone on the machine."
+        red "$key took $(fmt_cs "$cs") s on $dev, over its ceiling of $ceil_s s ($CEILINGS:$at). Bring it back under, or raise the line with the run that measured it; first check that this run was alone on the machine."
       elif (( cs < floor_s * 100 )); then
-        red "$key took $(fmt_cs "$cs") s on $OS, under the floor of $floor_s s of its line ($CEILINGS:$at): the ceiling of $ceil_s s no longer describes it. Lower the line (floor = half the fastest run, ceiling = 1.3 x the slowest), or remove it if the binary is under $DEFAULT_CEILING_S s now."
+        red "$key took $(fmt_cs "$cs") s on $dev, under the floor of $floor_s s of its line ($CEILINGS:$at): the ceiling of $ceil_s s no longer describes it. Lower the line (floor = half the fastest run, ceiling = 1.3 x the slowest), or remove it if the binary is under $DEFAULT_CEILING_S s now."
       fi
     elif (( cs > DEFAULT_CEILING_S * 100 )); then
-      red "$key took $(fmt_cs "$cs") s on $OS, over the default ceiling of $DEFAULT_CEILING_S s, and has no line in $CEILINGS. Bring it back under, or add a line: $OS $key <floor> <ceiling> <owner> <expires> <reason>."
+      red "$key took $(fmt_cs "$cs") s on $dev, over the default ceiling of $DEFAULT_CEILING_S s, and has no line in $CEILINGS. Bring it back under, or add a line: $dev $key <floor> <ceiling> <owner> <expires> <reason>."
     fi
   done
 
@@ -802,11 +914,15 @@ if [[ "${1:-}" == "--units" ]]; then
   done <<<"$parsed"
   [[ -z "$problem" ]] || die2 "$problem"
   (( nbin > 0 )) || die2 "no test binary was run in $LOG: a section that ran nothing is not a pass"
+  declare -A units_gpu=()
+  while IFS= read -r marked; do
+    [[ -z "$marked" ]] || units_gpu["$marked"]=1
+  done < <(gpu_marked "$LOG")
   for k in "${units_order[@]}"; do
-    printf '%s %s %s %s\n' "$k" "${units_cs[$k]}" "${units_n[$k]}" "${units_f[$k]}"
+    printf '%s %s %s %s\n' "${k}${units_gpu[$k]:+@gpu}" "${units_cs[$k]}" "${units_n[$k]}" "${units_f[$k]}"
   done
   for k in "${units_kill_order[@]}"; do
-    printf '%s - - -%s\n' "$k" "${units_kill[$k]}"
+    printf '%s - - -%s\n' "${k}${units_gpu[$k]:+@gpu}" "${units_kill[$k]}"
   done
   exit 0
 fi

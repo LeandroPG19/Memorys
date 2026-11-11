@@ -3459,6 +3459,8 @@ fn run_self_test(
         .env("GATE_CLUSTER_TMP", &cluster_tmp)
         .env("GATE_CGROUP_ROOT", &cgroup_root)
         .env("GATE_PROC_SELF_CGROUP", &cgroup_own)
+        // CI-G1: a self-test that starts the planner (merge-gate.sh) does not ask the card of whoever runs the test.
+        .env("GATE_GPU", "cpu")
         .env_remove("TMPDIR");
     for (name, _) in JUDGE_ENVIRONMENT {
         command.env_remove(name);
@@ -11120,4 +11122,410 @@ fn the_docs_list_never_names_a_file_the_judge_reads() {
         "scripts/recibo-lista-blanca.txt calls documentation files that the judge reads by name, so a commit that edits them would \
          leave the receipt valid over a verdict that never saw them. Negate each with a `!` line: {documentation:#?}"
     );
+}
+
+/// CI-G1. A machine for `gate_gpu_probe` (gate-lock.sh), made of files and stand-in scripts under a directory of its
+/// own: the nvidia-smi is a script that answers a card and notes its calls, the `ldd` resolves the three libraries of
+/// CUDA 13 from the `LD_LIBRARY_PATH` it is given and says `not found` for the ones that are not there, and the runtimes
+/// are two empty libraries with the `runtime.json` the installer of CI-D5b writes. Nothing here asks the real card,
+/// the real `ldd` or the network, and nothing sleeps: "slower than 5 s" is a `timeout` that answers 124 at once.
+struct GpuMachine {
+    dir: std::path::PathBuf,
+    home: std::path::PathBuf,
+    gpu_home: std::path::PathBuf,
+    wsl_lib: std::path::PathBuf,
+    fakes: std::path::PathBuf,
+    tools: std::path::PathBuf,
+}
+
+/// What a probe left in the shell that ran it (`gate_gpu_probe` sets variables and exports nothing).
+struct Probed {
+    decision: String,
+    why: String,
+    vram_free_mb: String,
+    ort: String,
+    libs: String,
+    exports_changed: bool,
+    transcript: String,
+}
+
+const GPU_CARD: &str = "NVIDIA GeForce RTX 4070 Ti";
+const CUDA13_LIBS: [&str; 3] = ["libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"];
+
+/// Every command of the PATH of this process, as a link in one directory, except the nvidia-smi of whoever runs the
+/// test: the probe finds the card the machine gives it and never the real one (a WSL PATH has the nvidia-smi of
+/// /usr/lib/wsl/lib in it).
+fn tools_without_nvidia_smi(tools: &Path) {
+    std::fs::create_dir_all(tools).expect("the directory of the tools");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == "nvidia-smi" {
+                continue;
+            }
+            #[cfg(unix)]
+            let _ = std::os::unix::fs::symlink(entry.path(), tools.join(&name));
+        }
+    }
+}
+
+impl GpuMachine {
+    /// The machine of G1.1: a card with 10692 MiB free, a CPU runtime and a GPU runtime of the judge, both 1.31.1 and the
+    /// second one cuda13, and the libraries of CUDA 13 under `gpu-home/cuda13/nvidia/*/lib`.
+    fn new(root: &Path, tools: &Path, tag: &str) -> GpuMachine {
+        let dir = root.join(tag);
+        let machine = GpuMachine {
+            home: dir.join("home"),
+            gpu_home: dir.join("gpu-home"),
+            wsl_lib: dir.join("wsl-lib"),
+            fakes: dir.join("fakes"),
+            tools: tools.to_path_buf(),
+            dir,
+        };
+        for sub in [&machine.wsl_lib, &machine.fakes] {
+            std::fs::create_dir_all(sub).expect("a directory of the machine");
+        }
+        write_stand_in(
+            &machine.wsl_lib,
+            "nvidia-smi",
+            &format!(
+                "#!/bin/sh\necho \"$*\" >>\"{}\"\necho \"{GPU_CARD}, 10692, 8.9\"\n",
+                machine.nvidia_calls().display()
+            ),
+        );
+        write_stand_in(
+            &machine.fakes,
+            "ldd",
+            &format!(
+                "#!/bin/sh\necho \"LD=$LD_LIBRARY_PATH ARG=$1\" >>\"{}\"\n\
+                 echo '\tlinux-vdso.so.1 (0x00007ffc0)'\n\
+                 for lib in {}; do\n\
+                   found=''\n\
+                   old=$IFS; IFS=:\n\
+                   for d in $LD_LIBRARY_PATH; do [ -e \"$d/$lib\" ] && found=\"$d/$lib\"; done\n\
+                   IFS=$old\n\
+                   if [ -n \"$found\" ]; then echo \"\t$lib => $found (0x00007f00)\"; else echo \"\t$lib => not found\"; fi\n\
+                 done\n\
+                 echo '\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f01)'\n",
+                machine.dir.join("ldd.calls").display(),
+                CUDA13_LIBS.join(" ")
+            ),
+        );
+        machine.runtime(&machine.cpu_runtime_dir(), "cpu", "1.31.1", &[]);
+        machine.runtime(
+            &machine.gpu_runtime_dir(),
+            "cuda13",
+            "1.31.1",
+            &["libonnxruntime_providers_cuda.so"],
+        );
+        for (package, lib) in [
+            ("cuda_runtime", "libcudart.so.13"),
+            ("cublas", "libcublas.so.13"),
+            ("cublas", "libcublasLt.so.13"),
+        ] {
+            let libs = machine.cuda13_libs(package);
+            std::fs::create_dir_all(&libs).expect("a directory of CUDA libraries");
+            std::fs::write(libs.join(lib), "").expect("a CUDA library");
+        }
+        machine
+    }
+
+    fn nvidia_calls(&self) -> std::path::PathBuf {
+        self.dir.join("nvidia-smi.calls")
+    }
+
+    /// Where the judge keeps the ONNX Runtime of the CPU since CI-D5c-B: the `.cache/memory-industry/onnxruntime` of a HOME of its
+    /// own, `GATE_RUNTIME_HOME` (its default is under the HOME of the judge), and never the cache of the live service.
+    fn cpu_runtime_dir(&self) -> std::path::PathBuf {
+        self.home
+            .join(".cache/memory-industry-gate/runtime-home/.cache/memory-industry/onnxruntime")
+    }
+
+    fn gpu_runtime_dir(&self) -> std::path::PathBuf {
+        self.gpu_home.join(".cache/memory-industry/onnxruntime")
+    }
+
+    fn cuda13_libs(&self, package: &str) -> std::path::PathBuf {
+        self.gpu_home
+            .join("cuda13/nvidia")
+            .join(package)
+            .join("lib")
+    }
+
+    /// A runtime directory the way `memory-industry models runtime` leaves it: the library, what else the flavor
+    /// carries, and the record of its version and flavor.
+    fn runtime(&self, dir: &Path, flavor: &str, version: &str, more: &[&str]) {
+        std::fs::create_dir_all(dir).expect("a runtime directory");
+        for lib in std::iter::once(&"libonnxruntime.so").chain(more) {
+            std::fs::write(dir.join(lib), "").expect("a runtime library");
+        }
+        std::fs::write(
+            dir.join("runtime.json"),
+            format!(
+                "{{\"version\":\"{version}\",\"flavor\":\"{flavor}\",\"archive\":\"fixture.tgz\",\"sha256\":\"00\"}}"
+            ),
+        )
+        .expect("the record of a runtime");
+    }
+
+    /// The row `index` of the table of G1.2: what is taken away from the machine of G1.1, in the order of the table.
+    fn break_it(&self, index: usize) {
+        match index {
+            0 => std::fs::remove_file(self.wsl_lib.join("nvidia-smi")).expect("remove nvidia-smi"),
+            1 => write_stand_in(&self.fakes, "timeout", "#!/bin/sh\nexit 124\n"),
+            2 => std::fs::remove_file(self.cpu_runtime_dir().join("runtime.json"))
+                .expect("remove the record of the CPU runtime"),
+            3 => std::fs::remove_dir_all(self.gpu_runtime_dir()).expect("remove the GPU runtime"),
+            4 => self.runtime(&self.gpu_runtime_dir(), "cpu", "1.31.1", &[]),
+            5 => self.runtime(&self.cpu_runtime_dir(), "cpu", "1.30.0", &[]),
+            6 => std::fs::remove_file(self.cuda13_libs("cublas").join("libcublasLt.so.13"))
+                .expect("remove libcublasLt"),
+            other => panic!("the table of G1.2 has no row {other}"),
+        }
+    }
+
+    /// Runs `gate_gpu_probe` in a bash that sourced gate-lock.sh, with the PATH of the machine (its stand-ins first, then
+    /// the tools) and `GATE_GPU` as given (`None` leaves it unset). `before_probe` is shell run just before the probe.
+    fn probe(&self, gate_gpu: Option<&str>, before_probe: &str) -> Probed {
+        let script = format!(
+            "source '{lock}'\n\
+             PATH='{fakes}:{tools}'\n\
+             {before_probe}\n\
+             before=\"$(export -p)\"\n\
+             gate_gpu_probe\n\
+             after=\"$(export -p)\"\n\
+             [[ \"$before\" == \"$after\" ]] && changed=no || changed=yes\n\
+             printf 'DECISION=%s\\nWHY=%s\\nVRAM=%s\\nORT=%s\\nLIBS=%s\\nCHANGED=%s\\n' \
+               \"${{GATE_GPU_DECISION-}}\" \"${{GATE_GPU_WHY-}}\" \"${{GATE_GPU_VRAM_FREE_MB-}}\" \
+               \"${{GATE_GPU_ORT-}}\" \"${{GATE_GPU_LIBS-}}\" \"$changed\"\n",
+            lock = repo_root().join("scripts/gate-lock.sh").display(),
+            fakes = self.fakes.display(),
+            tools = self.tools.display(),
+        );
+        let mut command = std::process::Command::new(git_bash());
+        command
+            .arg("-c")
+            .arg(&script)
+            .current_dir(&self.dir)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &self.home)
+            .env("GATE_GPU_HOME", &self.gpu_home)
+            .env("GATE_WSL_LIB_DIR", &self.wsl_lib);
+        if let Some(value) = gate_gpu {
+            command.env("GATE_GPU", value);
+        }
+        let out = command.output().expect("bash runs the probe");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let transcript = format!(
+            "stdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let field = |name: &str| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .unwrap_or("")
+                .to_string()
+        };
+        Probed {
+            decision: field("DECISION"),
+            why: field("WHY"),
+            vram_free_mb: field("VRAM"),
+            ort: field("ORT"),
+            libs: field("LIBS"),
+            exports_changed: field("CHANGED") == "yes",
+            transcript,
+        }
+    }
+}
+
+/// A scratch directory for one test, with the tools of its machines already linked.
+fn gpu_lab(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!("mi-g1-{name}-{}", uuid::Uuid::new_v4()));
+    let tools = root.join("tools");
+    tools_without_nvidia_smi(&tools);
+    (root, tools)
+}
+
+/// CI-G1, G1.1. A machine with a card, a CPU runtime and a GPU runtime of the judge of the same version, and a provider
+/// whose libraries `ldd` resolves from the CUDA directories of `GATE_GPU_HOME`: the probe says `candidate`, names the card,
+/// its free memory, the version and the flavor, hands the library and the directories it found in two variables, and
+/// exports nothing (CI-J3 and CI-J9 want every exported name in JUDGE_ENVIRONMENT, and the probe runs inside the planner).
+/// It asks the card with an nvidia-smi that is not on the PATH: the one of /usr/lib/wsl/lib, found through GATE_WSL_LIB_DIR.
+#[test]
+fn the_gpu_probe_sees_a_usable_card_and_exports_nothing() {
+    let (root, tools) = gpu_lab("candidate");
+    let machine = GpuMachine::new(&root, &tools, "usable");
+    let probed = machine.probe(None, "");
+    assert_eq!(
+        probed.decision, "candidate",
+        "a card, two runtimes of one version and the libraries of CUDA 13 are a machine the judge can use, and gate_gpu_probe \
+         decided `{}` ({}). gate_gpu_probe has to be in scripts/gate-lock.sh: bash says `command not found` when it is not. {}",
+        probed.decision, probed.why, probed.transcript
+    );
+    for word in [GPU_CARD, "10692", "1.31.1", "cuda13"] {
+        assert!(
+            probed.why.contains(word),
+            "the reason of a candidate says the card, its free MiB, the version and the flavor, and it lacks `{word}`: {}",
+            probed.why
+        );
+    }
+    assert_eq!(
+        probed.vram_free_mb, "10692",
+        "GATE_GPU_VRAM_FREE_MB is the memory.free the card reported: {}",
+        probed.transcript
+    );
+    assert_eq!(
+        probed.ort,
+        machine
+            .gpu_runtime_dir()
+            .join("libonnxruntime.so")
+            .display()
+            .to_string(),
+        "GATE_GPU_ORT is the library of the runtime of the judge, not the one of the CPU: {}",
+        probed.transcript
+    );
+    for package in ["cublas", "cuda_runtime"] {
+        let dir = machine.cuda13_libs(package).display().to_string();
+        assert!(
+            probed.libs.split(':').any(|part| part == dir),
+            "GATE_GPU_LIBS holds `{dir}`, one of the nvidia/*/lib of GATE_GPU_HOME/cuda13: {:?}",
+            probed.libs
+        );
+    }
+    assert!(
+        !probed.exports_changed,
+        "the probe changed what the shell exports: it sets variables and exports nothing. {}",
+        probed.transcript
+    );
+    let asked = std::fs::read_to_string(machine.nvidia_calls()).unwrap_or_default();
+    assert!(
+        asked.contains("memory.free"),
+        "the probe did not ask nvidia-smi for the free memory (its calls: {asked:?}): the stand-in is on GATE_WSL_LIB_DIR \
+         and not on the PATH, so the probe has to look there"
+    );
+    let resolved = std::fs::read_to_string(machine.dir.join("ldd.calls")).unwrap_or_default();
+    assert!(
+        resolved.contains("libonnxruntime_providers_cuda.so")
+            && resolved.contains(&machine.cuda13_libs("cublas").display().to_string()),
+        "the probe did not ask ldd about the CUDA provider with the libraries of GATE_GPU_HOME/cuda13 on LD_LIBRARY_PATH \
+         (what ldd saw: {resolved:?})"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// CI-G1, G1.2. Each way the machine of G1.1 can fail to be usable is `cpu` with the reason in words an operator can act
+/// on: the table names the row that broke, so a red says which condition no longer decides. The first run is the anchor:
+/// a probe that always answers `cpu` passes every row below and none of them proves anything.
+#[test]
+fn the_gpu_probe_falls_to_the_cpu_and_says_why() {
+    let (root, tools) = gpu_lab("cpu-why");
+    let anchor = GpuMachine::new(&root, &tools, "anchor").probe(None, "");
+    assert_eq!(
+        anchor.decision, "candidate",
+        "the machine the rows below break is not usable before they break it, so they prove nothing: {}",
+        anchor.transcript
+    );
+
+    let rows: [(&str, &[&str]); 7] = [
+        (
+            "no nvidia-smi on the PATH or in the directory of WSL",
+            &["no NVIDIA card"],
+        ),
+        (
+            "an nvidia-smi that takes more than 5 s (a timeout that answers 124)",
+            &["nvidia-smi failed"],
+        ),
+        ("a CPU runtime with no runtime.json", &["CI-D5b"]),
+        ("no GPU runtime of the judge", &["models runtime --gpu"]),
+        ("a GPU runtime of flavor cpu", &["is a cpu runtime"]),
+        (
+            "a GPU runtime 1.31.1 and a CPU runtime 1.30.0",
+            &["1.31.1", "1.30.0"],
+        ),
+        (
+            "no libcublasLt in GATE_GPU_HOME/cuda13",
+            &["libcublasLt", "P1"],
+        ),
+    ];
+    for (index, (change, words)) in rows.iter().enumerate() {
+        let machine = GpuMachine::new(&root, &tools, &format!("row{index}"));
+        machine.break_it(index);
+        let probed = machine.probe(None, "");
+        assert_eq!(
+            probed.decision, "cpu",
+            "row `{change}`: the decision is `{}` ({}), not `cpu`. {}",
+            probed.decision, probed.why, probed.transcript
+        );
+        for word in *words {
+            assert!(
+                probed.why.contains(word),
+                "row `{change}`: the reason does not say `{word}`: `{}`",
+                probed.why
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// CI-G1, G1.3. `GATE_GPU=cpu` is `cpu` without asking the card (the nvidia-smi of the machine notes every call, and
+/// there is none), `auto`, empty and `gpu` go on to look at the machine, and a system that is not Linux is `unmanaged`:
+/// Windows keeps the runtime that gate_model_env chose, as before G1, and its card is not asked either.
+#[test]
+fn gate_gpu_cpu_never_asks_the_card_and_another_system_is_not_managed() {
+    let (root, tools) = gpu_lab("forced");
+    let machine = GpuMachine::new(&root, &tools, "forced-cpu");
+    let forced = machine.probe(Some("cpu"), "");
+    assert_eq!(
+        forced.decision, "cpu",
+        "GATE_GPU=cpu is the CPU: {}",
+        forced.transcript
+    );
+    assert!(
+        forced.why.contains("GATE_GPU=cpu"),
+        "the reason of a forced CPU says what forced it, `GATE_GPU=cpu`: `{}`",
+        forced.why
+    );
+    assert!(
+        !machine.nvidia_calls().exists(),
+        "GATE_GPU=cpu asked nvidia-smi ({:?}): it is a switch that does not look at the card",
+        std::fs::read_to_string(machine.nvidia_calls()).unwrap_or_default()
+    );
+
+    for asked in [Some("auto"), Some(""), Some("gpu"), None] {
+        let machine = GpuMachine::new(
+            &root,
+            &tools,
+            &format!("asked-{}", asked.unwrap_or("unset")),
+        );
+        let probed = machine.probe(asked, "");
+        assert_eq!(
+            probed.decision, "candidate",
+            "GATE_GPU={asked:?} goes on to look at the machine, and the machine of G1.1 is a candidate: `{}` ({})",
+            probed.decision, probed.why
+        );
+    }
+
+    let machine = GpuMachine::new(&root, &tools, "windows");
+    write_stand_in(
+        &machine.fakes,
+        "uname",
+        "#!/bin/sh\necho MINGW64_NT-10.0-26100\n",
+    );
+    let windows = machine.probe(None, "OSTYPE=msys");
+    assert_eq!(
+        windows.decision, "unmanaged",
+        "a system that is not Linux is `unmanaged`, and the judge of Windows runs as before: `{}` ({}). {}",
+        windows.decision, windows.why, windows.transcript
+    );
+    assert!(
+        !machine.nvidia_calls().exists(),
+        "an unmanaged system asked nvidia-smi: the probe decides by the system before it looks at a card"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
