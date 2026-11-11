@@ -957,11 +957,16 @@ async fn run_rem_consolidation_locked(pool: &PgPool) -> Result<()> {
     }
 
     match crate::embeddings::backfill::refresh_coverage(pool).await {
-        Ok(Some(coverage)) => tracing::info!(
-            stale = coverage.stale(),
-            missing = coverage.missing(),
-            "vectors of another generation counted"
-        ),
+        Ok(Some(coverage)) => {
+            tracing::info!(
+                stale = coverage.stale(),
+                missing = coverage.missing(),
+                "vectors of another generation counted"
+            );
+            tokio::spawn(crate::reembed_cli::resume_the_automatic_reembed(
+                pool.clone(),
+            ));
+        }
         Ok(None) => {}
         Err(e) => tracing::warn!(error = %e, "could not count the vectors of another generation"),
     }

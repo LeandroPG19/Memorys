@@ -102,9 +102,14 @@ pub fn embed_concurrency() -> usize {
         .unwrap_or(ONNX_DEFAULT_CONCURRENCY)
 }
 
-fn gate() -> &'static EmbedGate {
+/// The gate of this process, with `CUBA_EMBED_CONCURRENCY` permits.
+pub fn embed_gate() -> &'static EmbedGate {
     GATE.get_or_init(|| EmbedGate::new(embed_concurrency()))
 }
+
+/// The computation of one vector, as a function so that a test can hand the background embed one
+/// that needs no model.
+pub type Compute = fn(&str) -> Result<Vec<f32>>;
 
 /// The permits of the embedder, in two kinds of caller. Whoever is waited for (a search, a write,
 /// the REM cycle, `reembed` by hand) is the foreground; the re-embed the service starts by itself
@@ -639,7 +644,7 @@ async fn embed_with_prefix(text: &str, prefix: &str) -> Result<Vec<f32>> {
         return Ok(cached);
     }
 
-    let _permit = gate().foreground().await?;
+    let _permit = embed_gate().foreground().await?;
 
     let embedding = compute_off_the_executor(format!("{}{}", prefix, text)).await?;
 
@@ -660,7 +665,7 @@ async fn compute_off_the_executor(prefixed: String) -> Result<Vec<f32>> {
 /// vector, but it gives way to every foreground embed, and it neither reads nor writes the cache
 /// of 256 entries (thousands of passages that are never asked twice would empty it of queries).
 pub async fn embed_passage_background(text: &str) -> Result<Vec<f32>> {
-    embed_in_background(text, &passage_prefix()).await
+    embed_passage_background_with(embed_gate(), compute_embedding, text).await
 }
 
 /// `embed_passage_contextual`, for the re-embed that the service runs by itself.
@@ -669,16 +674,50 @@ pub async fn embed_passage_contextual_background(
     entity_type: &str,
     entity_name: &str,
 ) -> Result<Vec<f32>> {
+    embed_passage_contextual_background_with(
+        embed_gate(),
+        compute_embedding,
+        text,
+        entity_type,
+        entity_name,
+    )
+    .await
+}
+
+/// `embed_passage_background` with its gate and its computation as arguments: the seam where a
+/// test puts a gate it holds and a computation that needs no model.
+pub async fn embed_passage_background_with(
+    gate: &EmbedGate,
+    compute: Compute,
+    text: &str,
+) -> Result<Vec<f32>> {
+    embed_background_with(gate, compute, format!("{}{}", passage_prefix(), text)).await
+}
+
+/// `embed_passage_contextual_background` with its gate and its computation as arguments.
+pub async fn embed_passage_contextual_background_with(
+    gate: &EmbedGate,
+    compute: Compute,
+    text: &str,
+    entity_type: &str,
+    entity_name: &str,
+) -> Result<Vec<f32>> {
     let contextualized = format!("[{}:{}] {}", entity_type, entity_name, text);
-    embed_in_background(&contextualized, &passage_prefix()).await
+    embed_passage_background_with(gate, compute, &contextualized).await
 }
 
-async fn embed_in_background(text: &str, prefix: &str) -> Result<Vec<f32>> {
-    let _permit = gate().background().await?;
-    compute_off_the_executor(format!("{}{}", prefix, text)).await
+async fn embed_background_with(
+    gate: &EmbedGate,
+    compute: Compute,
+    prefixed: String,
+) -> Result<Vec<f32>> {
+    let _permit = gate.background().await?;
+    tokio::task::spawn_blocking(move || compute(&prefixed))
+        .await
+        .context("embedding task panicked")?
 }
 
-fn compute_embedding(text: &str) -> Result<Vec<f32>> {
+pub fn compute_embedding(text: &str) -> Result<Vec<f32>> {
     compute_embedding_with(get_model_status(), text)
 }
 

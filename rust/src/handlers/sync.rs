@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use futures::future::BoxFuture;
 use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgPool};
 use std::collections::{HashMap, HashSet};
@@ -2664,8 +2665,7 @@ async fn import(
         }
     }
 
-    let mut embeddings_restored = 0u32;
-    let mut embeddings_kept_newer = 0u32;
+    let mut vectors = VectorsRestored::default();
     let blob_path = root.join("embeddings.bin.zst");
     if manifest.with_embeddings && blob_path.exists() {
         let compressed = std::fs::read(&blob_path)?;
@@ -2673,48 +2673,17 @@ async fn import(
         let dim = manifest
             .embedding_dim
             .unwrap_or(crate::embeddings::onnx::embedding_dim());
-        let rec_size = embedding_record_size(dim).filter(|size| raw.len() % size == 0);
-        if let Some(rec_size) = rec_size {
-            let package_ids: Vec<Uuid> = embedding_labels.keys().copied().collect();
-            let held = vectors_held_here(&mut tx, &package_ids).await?;
-            for chunk in raw.chunks_exact(rec_size) {
-                let id_bytes: [u8; 16] = chunk[..16]
-                    .try_into()
-                    .expect("embedding_record_size rejects any dim whose record is not longer than the 16-byte uuid");
-                let id = Uuid::from_bytes(id_bytes);
-                let mut floats = Vec::with_capacity(dim);
-                for f_chunk in chunk[16..].as_chunks::<4>().0 {
-                    floats.push(f32::from_le_bytes(*f_chunk));
-                }
-                let incoming = embedding_labels.get(&id).cloned().flatten();
-                let wins = held.get(&id).is_none_or(|(label, has_vector)| {
-                    incoming_vector_wins(label.as_deref(), *has_vector, incoming.as_deref())
-                });
-                if !wins {
-                    embeddings_kept_newer += 1;
-                    continue;
-                }
-                let v = pgvector::Vector::from(floats);
-                let r = sqlx::query(
-                    "UPDATE brain_observations
-                     SET embedding = $1::vector, embedding_half = NULL, embedding_model = $3
-                     WHERE id = $2",
-                )
-                .bind(v)
-                .bind(id)
-                .bind(incoming)
-                .execute(&mut *tx)
-                .await?;
-                embeddings_restored += r.rows_affected() as u32;
-            }
-        } else {
-            tracing::warn!(
-                "embeddings blob of {} bytes declares dim {} — skipping",
-                raw.len(),
-                dim
-            );
-        }
+        vectors = restore_vectors(
+            &mut tx,
+            &raw,
+            dim,
+            &embedding_labels,
+            &|| -> BoxFuture<'static, ()> { Box::pin(async {}) },
+        )
+        .await?;
     }
+    let embeddings_restored = vectors.restored;
+    let embeddings_kept_newer = vectors.kept_newer;
 
     if tombstones.withheld.is_empty() {
         sqlx::query(
@@ -2926,6 +2895,80 @@ pub fn incoming_vector_wins(
 ) -> bool {
     !local_has_vector
         || local.is_none_or(|label| !crate::embeddings::onnx::is_older_generation(incoming, label))
+}
+
+/// What `restore_vectors` did: the vectors it wrote and the ones it left because the row has
+/// another that is not older, or because the row changed after it was read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VectorsRestored {
+    pub restored: u32,
+    pub kept_newer: u32,
+}
+
+/// Writes the vectors of a package (`raw`: for each one the 16 bytes of the id and `dim` floats)
+/// into the observations that are already there, in the transaction of the import. A row takes the
+/// incoming vector and its label only if `incoming_vector_wins` against what the row had when it
+/// was read; and the write repeats what the read saw (the label, and whether it had a vector), so a
+/// row that another writer changed in between, such as the automatic re-embed, no longer matches
+/// and is kept as it is. `between_read_and_write` runs after the read and before the first write:
+/// nothing in production, and in a test a second connection that changes a row at exactly that
+/// point.
+pub async fn restore_vectors(
+    tx: &mut sqlx::PgConnection,
+    raw: &[u8],
+    dim: usize,
+    labels: &HashMap<Uuid, Option<String>>,
+    between_read_and_write: &(dyn Fn() -> BoxFuture<'static, ()> + Send + Sync),
+) -> Result<VectorsRestored> {
+    let Some(rec_size) = embedding_record_size(dim).filter(|size| raw.len() % size == 0) else {
+        tracing::warn!(
+            "embeddings blob of {} bytes declares dim {} — skipping",
+            raw.len(),
+            dim
+        );
+        return Ok(VectorsRestored::default());
+    };
+    let package_ids: Vec<Uuid> = labels.keys().copied().collect();
+    let held = vectors_held_here(&mut *tx, &package_ids).await?;
+    between_read_and_write().await;
+    let mut done = VectorsRestored::default();
+    for chunk in raw.chunks_exact(rec_size) {
+        let id_bytes: [u8; 16] = chunk[..16]
+            .try_into()
+            .expect("embedding_record_size rejects any dim whose record is not longer than the 16-byte uuid");
+        let id = Uuid::from_bytes(id_bytes);
+        let Some((local, had_vector)) = held.get(&id) else {
+            continue;
+        };
+        let incoming = labels.get(&id).cloned().flatten();
+        if !incoming_vector_wins(local.as_deref(), *had_vector, incoming.as_deref()) {
+            done.kept_newer += 1;
+            continue;
+        }
+        let mut floats = Vec::with_capacity(dim);
+        for f_chunk in chunk[16..].as_chunks::<4>().0 {
+            floats.push(f32::from_le_bytes(*f_chunk));
+        }
+        let written = sqlx::query(
+            "UPDATE brain_observations
+             SET embedding = $1::vector, embedding_half = NULL, embedding_model = $3
+             WHERE id = $2 AND embedding_model IS NOT DISTINCT FROM $4
+               AND (embedding IS NULL) = $5",
+        )
+        .bind(pgvector::Vector::from(floats))
+        .bind(id)
+        .bind(incoming)
+        .bind(local.as_deref())
+        .bind(!*had_vector)
+        .execute(&mut *tx)
+        .await?;
+        if written.rows_affected() == 1 {
+            done.restored += 1;
+        } else {
+            done.kept_newer += 1;
+        }
+    }
+    Ok(done)
 }
 
 /// The label and whether it has a vector, for each observation of the package that is already in

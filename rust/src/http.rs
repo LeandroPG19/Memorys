@@ -3089,6 +3089,7 @@ fn vectors_json() -> Option<Value> {
             "last_error": auto.last_error,
             "started_at": auto.started_at,
             "finished_at": auto.finished_at,
+            "last_row_at": auto.last_row_at,
         },
     }))
 }

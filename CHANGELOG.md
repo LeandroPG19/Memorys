@@ -20,8 +20,8 @@ re-embeds the older vectors by itself, in the background**: search keeps answeri
 a few thousandths until it ends), it takes on the order of minutes per ten thousand vectors on a CPU, and its progress is
 in `memory-industry doctor` and in `/health` (`runtime.vectors.auto`). Before it rewrites a row it keeps the old vector
 in a snapshot on disk (it refuses to rewrite without one), it resumes where it stopped after a restart, and
-`memory-industry reembed --rollback` brings the old vectors back. It only moves a row forward: it never rewrites a vector
-of a newer runtime or of another model, and a sync import never replaces a newer vector of the same text with an older
+`memory-industry reembed --rollback` brings the old vectors back. It only moves a vector forward: it never rewrites a vector
+of a newer runtime or of another model, and a row with no vector at all is filled by the REM cycle, not by this one, and a sync import never replaces a newer vector of the same text with an older
 one, so machines that sync on different runtimes do not re-embed each other. `MEMORY_INDUSTRY_AUTO_REEMBED=0` turns it
 off (then: `memory-industry reembed`). The stdio mode does not re-embed by itself. No migration: 0.30 still starts on a
 0.31 database. (CI-D5c)

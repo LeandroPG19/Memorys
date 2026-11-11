@@ -822,47 +822,45 @@ async fn embedding_coverage_rows(pool: &PgPool) -> Vec<Check> {
         None
     };
     let age = snapshot_age_days(pool).await;
-    let auto = auto_reembed_state(pool).await;
+    let older = if coverage.stale() > 0 {
+        crate::reembed_cli::forward_counts(pool, &coverage.tag)
+            .await
+            .map_or(
+                usize::try_from(coverage.stale()).unwrap_or_default(),
+                |counts| counts.older,
+            )
+    } else {
+        0
+    };
+    let service_env = crate::service::installed_env(crate::service::Target::host())
+        .ok()
+        .flatten();
+    let running = crate::reembed_cli::reembed_is_running(pool).await;
+    let auto = auto_reembed_mode(running, service_env.as_deref(), older);
     embedding_coverage_checks(&coverage, old_label.as_deref(), age, auto)
 }
 
 /// What the service does about the vectors of another generation, as far as `doctor` can tell
-/// without asking it: a re-embed holding the lock right now (the automatic one, the command or
-/// `cuba_zafra`: the lock is the same and Postgres knows who has it) is `Running`; otherwise it is
-/// `On` unless `MEMORY_INDUSTRY_AUTO_REEMBED` says no, read from the env file of the installed
-/// service and, where there is none, from the environment of `doctor` itself.
-async fn auto_reembed_state(pool: &PgPool) -> AutoReembed {
-    if reembed_is_running(pool).await {
+/// without asking it. A re-embed holding the lock right now (the automatic one, the command or
+/// `cuba_zafra`) is `Running`. The service «reembebe solo» only if there is a service (an env file
+/// of the installed service: the stdio mode alone has none and nobody re-embeds), the operator did
+/// not turn it off there with `MEMORY_INDUSTRY_AUTO_REEMBED`, and there is something it will
+/// rewrite: `older` counts the vectors of an earlier generation, and a database whose only other
+/// vectors are of a newer runtime or of another model has nothing for it to do.
+fn auto_reembed_mode(running: bool, service_env: Option<&str>, older: usize) -> AutoReembed {
+    if running {
         return AutoReembed::Running;
     }
-    let raw = match crate::service::installed_env(crate::service::Target::host())
-        .ok()
-        .flatten()
-    {
-        Some(text) => env_value(&text, AUTO_REEMBED_KEY),
-        None => std::env::var(AUTO_REEMBED_KEY).ok(),
+    let Some(text) = service_env else {
+        return AutoReembed::Off;
     };
-    if crate::reembed_cli::auto_reembed_enabled_from(raw.as_deref()) {
+    let enabled =
+        crate::reembed_cli::auto_reembed_enabled_from(env_value(text, AUTO_REEMBED_KEY).as_deref());
+    if enabled && older > 0 {
         AutoReembed::On
     } else {
         AutoReembed::Off
     }
-}
-
-/// An advisory lock is in `pg_locks` as two halves of its key. A query that fails reads as «not
-/// running»: it only removes a sentence from the warning.
-async fn reembed_is_running(pool: &PgPool) -> bool {
-    sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM pg_locks
-             WHERE locktype = 'advisory' AND granted AND objsubid = 1
-               AND classid::bigint = ($1::bigint >> 32)
-               AND objid::bigint = ($1::bigint & 4294967295))",
-    )
-    .bind(crate::reembed_cli::REEMBED_LOCK)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(false)
 }
 
 /// The label most of the vectors of another generation carry, to say what they were made with.
