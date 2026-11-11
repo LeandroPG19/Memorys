@@ -80,7 +80,7 @@
   - Tras 12 corridas del 10-nov no existe el fichero en `~/.cache/ci-tiempos/memory-industry/20261110/`.
   - B:1025 decía «nace con CI-E4» y no nació.
   - Bloquea CI-E2 (punto 12), la marca de intermitente y D-F5e.
-- [ ] **12.** **CI-E2** · coste por test y cuota de los 10 más caros. B:1009, 1025. Depende del punto 11. Lleva la decisión de los números en el recibo (punto 92). 60 / 2. — **NOTA 10-nov 20:10:** CI-E2 especificada 20:25; pasada 1 en curso (Memorys-ci-e2). Decisión 92a: el coste no va en el recibo del tag (D-E2i)
+- [ ] **12.** **CI-E2** · coste por test y cuota de los 10 más caros. B:1009, 1025. Depende del punto 11. Lleva la decisión de los números en el recibo (punto 92). 60 / 2. — **NOTA 10-nov 20:10:** CI-E2 especificada 20:07; pasada 1 en curso (Memorys-ci-e2). Decisión 92a: el coste no va en el recibo del tag (D-E2i)
 - [ ] **13.** **CI-E3 y L1–L3** · segundos por autotest con techo; paralelizar los casos del autotest de `merge-gate.sh` (62 → 71 s tras CI-E15). B:1009, 1025, 1076. Los datos ya están medidos. 60–90 / 3. — **NOTA 10-nov 20:09:** CI-E3 especificada; E3c en curso (Memorys-ci-e3); no hay autotest duplicado que quitar
 - [x] **14.** **CI-E5** · regresión por punto de cambio. B:1009, 1025. Necesita historial (10 corridas por modo). Después. — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
 - [ ] **15.** **(H)** `mutants_seed_prune` no borra los `<clave>.tmp-<pid>` de un pid muerto (`scripts/mutants-gate.sh:690-693`). Anotado en B:875 («después de F6»), nunca abierto. 20–40 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: mutants_seed_prune borra los <clave>.tmp-<pid> de pid muerto del mismo usuario; autotest verde; falta el juez.
