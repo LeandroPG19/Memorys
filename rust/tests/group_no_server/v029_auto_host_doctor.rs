@@ -67,29 +67,31 @@ fn a_lan_auto_install_with_a_short_token_fails_naming_the_floor() {
     );
 }
 
-/// A loopback port nothing listens on, reserved with a socket that is bound and never listens.
-/// A listener opened and dropped here is in LISTEN while it lives, and a child process another
-/// test of this binary forks in that window keeps the LISTEN socket until its `execve`: the
-/// check would then find «something already listening» on a port this test had just freed. A
-/// socket that never listened leaves nothing that blocks the check's bind, even as a leftover
-/// copy, because the check's `std` bind and this one both set SO_REUSEADDR.
-fn free_port() -> u16 {
+/// A loopback port nothing listens on, and the socket that keeps it reserved until the test ends:
+/// bound, never listening, with SO_REUSEADDR (see `free_port` in `v029_auto_host_follows_its_ip`
+/// for the why). While it lives no other test of this binary can be given the port, and neither
+/// it nor a copy a child process keeps between `fork` and `execve` blocks the check's bind: the
+/// check binds with `std`, which sets SO_REUSEADDR on Unix, and a socket that does not listen
+/// coexists with it. A listener opened and dropped here was in LISTEN for as long as it lived, and
+/// a copy of it in a child made the check find «something already listening» on a free port.
+fn free_port() -> (u16, tokio::net::TcpSocket) {
     let reserved = tokio::net::TcpSocket::new_v4().expect("a socket to reserve a port with");
     reserved.set_reuseaddr(true).expect("SO_REUSEADDR");
     reserved
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("a free loopback port");
-    reserved.local_addr().expect("the reserved address").port()
+    let port = reserved.local_addr().expect("the reserved address").port();
+    (port, reserved)
 }
 
 #[test]
 fn the_port_check_of_lan_auto_looks_at_loopback() {
-    let free = free_port();
+    let (free, _reserved) = free_port();
     let check = doctor::http_port_check(Some(&format!("lan:{free}")));
     assert_eq!(
         check.status,
         Status::Ok,
-        "nothing holds 127.0.0.1:{free}, and `lan:` is not a host name to resolve: {check:?}"
+        "nothing listens on 127.0.0.1:{free}, and `lan:` is not a host name to resolve: {check:?}"
     );
     assert!(says(&check, &format!("127.0.0.1:{free}")), "{check:?}");
 
