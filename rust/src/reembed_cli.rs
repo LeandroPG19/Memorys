@@ -1038,3 +1038,136 @@ async fn check_column_width(pool: &PgPool, dim: usize) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embeddings::onnx::is_older_generation;
+    use crate::handlers::sync::incoming_vector_wins;
+    use std::collections::HashMap;
+
+    const MODEL: &str = "multilingual-e5-small";
+    const RUNTIME_1_31: &str = "multilingual-e5-small@onnxruntime-1.31.1";
+    const RUNTIME_1_26: &str = "multilingual-e5-small@onnxruntime-1.26.0";
+
+    /// One machine of the simulation: the runtime it has loaded and the label of the vector of
+    /// each of its rows. `None` is a vector from before the labels. Every row has a vector: what is
+    /// being counted is how many times a vector is rewritten, and a row without one is rewritten
+    /// once by whoever finds it.
+    struct Machine {
+        tag: &'static str,
+        rows: HashMap<&'static str, Option<String>>,
+    }
+
+    impl Machine {
+        fn new(tag: &'static str, rows: &[(&'static str, Option<&str>)]) -> Self {
+            Self {
+                tag,
+                rows: rows
+                    .iter()
+                    .map(|(id, label)| (*id, label.map(str::to_string)))
+                    .collect(),
+            }
+        }
+
+        /// What the service does when it starts: the rows that the production rule calls older are
+        /// rewritten with the label of the runtime loaded. It returns how many.
+        fn starts(&mut self) -> usize {
+            let tag = self.tag;
+            let mut rewritten = 0;
+            for label in self.rows.values_mut() {
+                if is_older_generation(label.as_deref(), tag) {
+                    *label = Some(tag.to_string());
+                    rewritten += 1;
+                }
+            }
+            rewritten
+        }
+
+        /// What a sync import does with the vectors of a package that has every row of the other
+        /// machine: a row that was not here arrives with its vector and its label, and one that was
+        /// takes the incoming vector only if the production rule says it wins.
+        fn imports_from(&mut self, other: &Machine) {
+            for (id, incoming) in &other.rows {
+                match self.rows.get_mut(id) {
+                    None => {
+                        self.rows.insert(*id, incoming.clone());
+                    }
+                    Some(local) => {
+                        if incoming_vector_wins(local.as_deref(), true, incoming.as_deref()) {
+                            *local = incoming.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// CI-D5c (C.4). Two machines that sync, one on ONNX Runtime 1.31.1 and one on 1.26.0, must
+    /// not re-embed each other for ever. `cuba_sync` exports every observation of an entity and the
+    /// import rewrites the vector of every row of the package, so without a rule the second import
+    /// of A from B hands back to 1.26.0 what A had just re-embedded, and the next start of A does it
+    /// all again. With the two halves of the rule (the service only rewrites what is older than its
+    /// runtime, the import only takes a vector that is not older than the one it would replace) A
+    /// rewrites each row once, B never rewrites a row that came from A, and both end on 1.31.1.
+    /// The numbers were worked out on paper, round by round: A rewrites r1, r2 and the new row of B
+    /// (3), then nothing (0); in each of the next two rounds the one new row (1), then nothing (0);
+    /// B has nothing older than 1.26.0 at any start. A start is made after each import.
+    #[test]
+    fn two_machines_on_different_runtimes_stop_rewriting_each_other_after_the_first_round() {
+        let mut a = Machine::new(RUNTIME_1_31, &[("r1", Some(MODEL))]);
+        let mut b = Machine::new(
+            RUNTIME_1_26,
+            &[("r1", Some(MODEL)), ("r2", Some(RUNTIME_1_26))],
+        );
+        let (mut a_starts, mut b_starts) = (Vec::new(), Vec::new());
+        for new_row in ["n1", "n2", "n3"] {
+            b.rows.insert(new_row, Some(RUNTIME_1_26.to_string()));
+            a.imports_from(&b);
+            a_starts.push(a.starts());
+            a.imports_from(&b);
+            a_starts.push(a.starts());
+            b.imports_from(&a);
+            b_starts.push(b.starts());
+        }
+        assert_eq!(
+            a_starts,
+            [3, 0, 1, 0, 1, 0],
+            "rows A re-embedded at each of its six starts"
+        );
+        assert_eq!(
+            b_starts,
+            [0, 0, 0],
+            "B never rewrites what came from A: it is of a newer runtime than B has"
+        );
+        for (name, machine) in [("A", &a), ("B", &b)] {
+            assert_eq!(machine.rows.len(), 5, "{name} has the five rows");
+            for (id, label) in &machine.rows {
+                assert_eq!(
+                    label.as_deref(),
+                    Some(RUNTIME_1_31),
+                    "{name}: {id} ends on the newest runtime"
+                );
+            }
+        }
+    }
+
+    /// CI-D5c (C.5). The service re-embeds by itself unless the operator says no: only `0`, `off`,
+    /// `false` and `no` turn it off, in any case and with spaces around, and nothing else does
+    /// (an unset variable, `1`, `on`, `yes` or a typo leave it on).
+    #[test]
+    fn the_automatic_reembed_is_on_unless_the_variable_turns_it_off() {
+        for on in [None, Some("1"), Some("on"), Some("yes"), Some("whatever")] {
+            assert!(auto_reembed_enabled_from(on), "{on:?} leaves it on");
+        }
+        for off in [
+            Some("0"),
+            Some("off"),
+            Some("OFF"),
+            Some(" false "),
+            Some("no"),
+        ] {
+            assert!(!auto_reembed_enabled_from(off), "{off:?} turns it off");
+        }
+    }
+}

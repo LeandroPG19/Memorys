@@ -1362,6 +1362,145 @@ mod tests {
         );
     }
 
+    /// CI-D5c (C.1). The service re-embeds on its own, so what it may rewrite is decided by a rule
+    /// that only moves forward: a vector is older than the generation loaded when it was made
+    /// before the labels existed, by the model alone (every database of today) or by an earlier
+    /// runtime of the same model. Nothing else is older: not the same generation, not a newer
+    /// runtime, not another model (another space, which only `reembed --all` changes) and not a
+    /// version that cannot be read whole as numbers (a development build is not known to be
+    /// earlier). Versions compare as numbers, component by component: `1.9.0` is before `1.31.1`,
+    /// and as text it is not. Every label is written by hand.
+    #[test]
+    fn the_generation_of_a_vector_only_moves_forward() {
+        const LOADED: &str = "multilingual-e5-small@onnxruntime-1.31.1";
+        let labels: [(Option<&str>, bool); 8] = [
+            (Some("multilingual-e5-small"), true),
+            (Some("multilingual-e5-small@onnxruntime-1.26.0"), true),
+            (Some("multilingual-e5-small@onnxruntime-1.9.0"), true),
+            (None, true),
+            (Some("multilingual-e5-small@onnxruntime-1.31.1"), false),
+            (Some("multilingual-e5-small@onnxruntime-1.40.0"), false),
+            (Some("e5-small@onnxruntime-1.26.0"), false),
+            (Some("multilingual-e5-small@onnxruntime-1.31.1-dev"), false),
+        ];
+        for (label, older) in labels {
+            assert_eq!(
+                is_older_generation(label, LOADED),
+                older,
+                "{label:?} against {LOADED}"
+            );
+        }
+        for (label, _) in labels {
+            assert!(
+                !is_older_generation(label, "multilingual-e5-small"),
+                "{label:?} against a label that names no runtime: there is no generation to be older than"
+            );
+        }
+    }
+
+    /// CI-D5c (C.2). While the service re-embeds, a search that arrives goes in before the next row
+    /// of the background, not after the whole batch. The gate has one permit here, held by a row of
+    /// the background; a search and a second row ask in that order. Nothing sleeps and nothing is
+    /// timed: each future is polled once at each step and the test says whether it is ready, so the
+    /// order is the thing under test, not a clock. The permit goes to the search, and the second row
+    /// does not start until the search has let go of it.
+    #[tokio::test]
+    async fn a_search_that_arrives_while_the_service_reembeds_goes_before_its_next_row() {
+        use std::task::Poll;
+        let gate = EmbedGate::new(1);
+
+        let first_row = gate
+            .background()
+            .await
+            .expect("with nothing searching, the first row of the background starts");
+        let mut search = std::pin::pin!(gate.foreground());
+        assert!(
+            futures::poll!(search.as_mut()).is_pending(),
+            "the only permit is in use: the search waits for it"
+        );
+        let mut second_row = std::pin::pin!(gate.background());
+        assert!(
+            futures::poll!(second_row.as_mut()).is_pending(),
+            "the second row asks after the search and waits"
+        );
+        assert_eq!(
+            gate.in_flight(),
+            1,
+            "a search that is waiting counts as in flight: it is what the background gives way to"
+        );
+
+        drop(first_row);
+        let search_permit = match futures::poll!(search.as_mut()) {
+            Poll::Ready(permit) => permit.expect("the gate is not closed"),
+            Poll::Pending => panic!(
+                "the first row ended and the permit did not go to the search, which asked first"
+            ),
+        };
+        assert!(
+            futures::poll!(second_row.as_mut()).is_pending(),
+            "the second row of the background starts after the search, never before it"
+        );
+
+        drop(search_permit);
+        assert_eq!(gate.in_flight(), 0, "the search is over");
+        match futures::poll!(second_row.as_mut()) {
+            Poll::Ready(permit) => drop(permit.expect("the gate is not closed")),
+            Poll::Pending => panic!("with the search done the second row of the background starts"),
+        }
+    }
+
+    /// CI-D5c (C.3). With two permits, one held by a search, the background has a free permit and
+    /// still does not take it: a search that is embedding is not made to share the cores with a row
+    /// of the re-embed, and the row starts again the moment the search lets go. A search that gives
+    /// up while it waits (a request that was cut) stops counting: if it did not, the background
+    /// would wait for ever behind a search that no longer exists.
+    #[tokio::test]
+    async fn the_background_does_not_start_a_row_while_a_search_is_embedding() {
+        use std::task::Poll;
+        let gate = EmbedGate::new(2);
+
+        let search = gate
+            .foreground()
+            .await
+            .expect("an idle gate lets a search in");
+        let mut row = std::pin::pin!(gate.background());
+        assert!(
+            futures::poll!(row.as_mut()).is_pending(),
+            "a permit is free and the row still waits, because a search is embedding"
+        );
+        assert_eq!(gate.in_flight(), 1);
+
+        drop(search);
+        match futures::poll!(row.as_mut()) {
+            Poll::Ready(permit) => drop(permit.expect("the gate is not closed")),
+            Poll::Pending => panic!("the search let go and the row of the background still waits"),
+        }
+        assert_eq!(gate.in_flight(), 0);
+
+        let held = [
+            gate.background().await.expect("the first permit"),
+            gate.background().await.expect("the second permit"),
+        ];
+        let mut waiting_search = Box::pin(gate.foreground());
+        assert!(
+            futures::poll!(waiting_search.as_mut()).is_pending(),
+            "both permits are in use: a search waits"
+        );
+        assert_eq!(gate.in_flight(), 1);
+        drop(waiting_search);
+        assert_eq!(
+            gate.in_flight(),
+            0,
+            "a search that gave up while it waited is not in flight any more"
+        );
+        drop(held);
+        let mut later_row = std::pin::pin!(gate.background());
+        assert!(
+            futures::poll!(later_row.as_mut()).is_ready(),
+            "and the background is not left waiting for it"
+        );
+    }
+
     /// The file name `locate_onnxruntime` searches for, written once for the
     /// fixtures instead of once per test.
     ///

@@ -126,6 +126,41 @@ test("refreshRuntime that fails says how to do it by hand and does not throw", (
   }
 });
 
+// CI-D5c (C.10). The refresh that fails leaves the runtime of the machine as it was, and the day it is switched by
+// hand the daemon re-embeds the stored vectors by itself when it restarts: the message says so, so that nobody reads
+// «could not update» as «the vectors will be wrong for ever», and says how to turn that off.
+test("refreshRuntime that fails says the daemon re-embeds by itself once the runtime is switched", () => {
+  for (const [what, run] of [
+    ["an exit code", () => 1],
+    [
+      "a binary that cannot be started",
+      () => {
+        throw new Error("spawn ENOENT");
+      },
+    ],
+  ]) {
+    const logged = [];
+    let ok;
+    assert.doesNotThrow(() => {
+      ok = mod.refreshRuntime("/x/cuba-memorys", run, (m) => logged.push(m));
+    }, `${what} must not make npm install fail`);
+    assert.strictEqual(ok, false, `${what} is not a refreshed runtime`);
+    const said = logged.join("\n");
+    assert.ok(
+      said.includes("memory-industry models runtime"),
+      `${what}: the message still names the command to run later: ${said}`
+    );
+    assert.ok(
+      /re-embeds\b[^\n]*\bby itself/.test(said),
+      `${what}: the message says the daemon re-embeds the stored vectors by itself: ${said}`
+    );
+    assert.ok(
+      said.includes("MEMORY_INDUSTRY_AUTO_REEMBED=0"),
+      `${what}: and how to turn that off: ${said}`
+    );
+  }
+});
+
 test("postinstall fetches the binary first and refreshes the runtime with it, and not when the fetch fails", () => {
   const order = [];
   const done = mod

@@ -3411,8 +3411,12 @@ mod embedding_coverage_tests {
     /// reminds that the snapshot `reembed` keeps is not meant to stay forever.
     #[test]
     fn the_coverage_check_names_the_generation_and_the_order() {
-        let clean =
-            embedding_coverage_checks(&with_observations_of_another_generation(0), None, None);
+        let clean = embedding_coverage_checks(
+            &with_observations_of_another_generation(0),
+            None,
+            None,
+            AutoReembed::Off,
+        );
         assert_eq!(clean.len(), 1, "nothing pending and no snapshot: one row");
         assert_eq!(clean[0].name, "embedding_coverage");
         assert_eq!(clean[0].status, Status::Ok);
@@ -3426,6 +3430,7 @@ mod embedding_coverage_tests {
             &with_observations_of_another_generation(7),
             Some("multilingual-e5-small"),
             None,
+            AutoReembed::Off,
         );
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "embedding_coverage");
@@ -3450,8 +3455,12 @@ mod embedding_coverage_tests {
             pending[0].hint
         );
 
-        let kept =
-            embedding_coverage_checks(&with_observations_of_another_generation(0), None, Some(40));
+        let kept = embedding_coverage_checks(
+            &with_observations_of_another_generation(0),
+            None,
+            Some(40),
+            AutoReembed::Off,
+        );
         assert_eq!(kept.len(), 2, "a snapshot of 40 days adds its own row");
         assert_eq!(
             kept[0].status,
@@ -3474,12 +3483,84 @@ mod embedding_coverage_tests {
             kept[1].hint
         );
 
-        let recent =
-            embedding_coverage_checks(&with_observations_of_another_generation(0), None, Some(3));
+        let recent = embedding_coverage_checks(
+            &with_observations_of_another_generation(0),
+            None,
+            Some(3),
+            AutoReembed::Off,
+        );
         assert_eq!(
             recent.len(),
             1,
             "a snapshot of three days is the safety net doing its job, not something to warn about"
+        );
+    }
+
+    /// CI-D5c (C.8). With seven vectors of another generation `doctor` tells what the service is
+    /// going to do about them. If the service re-embeds by itself, the warning says so and says
+    /// where to watch it and how to turn it off; if a re-embed is running at this moment, it says
+    /// to wait for it and look again; if the operator turned the automatic re-embed off, it is
+    /// the command of CI-D5c-B, which is what B.4 judges and does not change.
+    #[test]
+    fn the_coverage_check_says_the_service_reembeds_by_itself_or_names_the_command_when_it_is_off()
+    {
+        let seven = |auto| {
+            embedding_coverage_checks(
+                &with_observations_of_another_generation(7),
+                Some("multilingual-e5-small"),
+                None,
+                auto,
+            )
+        };
+        let hint_of = |checks: &[Check]| checks[0].hint.clone().unwrap_or_default();
+
+        let on = seven(AutoReembed::On);
+        assert_eq!(on.len(), 1);
+        assert_eq!(on[0].name, "embedding_coverage");
+        assert_eq!(on[0].status, Status::Warn, "pending vectors are a warning");
+        for wanted in [
+            "el servicio los reembebe solo",
+            "MEMORY_INDUSTRY_AUTO_REEMBED=0",
+        ] {
+            assert!(
+                hint_of(&on).contains(wanted),
+                "the hint of an automatic re-embed that is on has to carry {wanted:?}: {:?}",
+                on[0].hint
+            );
+        }
+        assert!(
+            !on[0].detail.contains("en curso"),
+            "nothing is running yet: {}",
+            on[0].detail
+        );
+
+        let running = seven(AutoReembed::Running);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].status, Status::Warn);
+        assert!(
+            running[0].detail.contains("reembebido en curso"),
+            "the detail says a re-embed is running: {}",
+            running[0].detail
+        );
+        assert!(
+            hint_of(&running).contains("esperá a que termine"),
+            "and the hint is to wait and look again, not to start another one: {:?}",
+            running[0].hint
+        );
+
+        let off = seven(AutoReembed::Off);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].status, Status::Warn);
+        assert!(
+            hint_of(&off).contains("memory-industry reembed"),
+            "with the automatic re-embed off the hint is the command: {:?}",
+            off[0].hint
+        );
+        assert!(
+            !hint_of(&off).contains("reembebe solo") && !off[0].detail.contains("en curso"),
+            "and it does not promise what nobody is going to do: {:?} / {}",
+            off[0].hint,
+            off[0].detail
         );
     }
 }

@@ -3890,6 +3890,80 @@ mod tests {
         );
     }
 
+    /// CI-D5c (C.9, the branch of P-B1 that Leandro chose on 11 Nov: switch, and the service
+    /// re-embeds by itself). `npm install` runs `models runtime --if-installed`, and a runtime of
+    /// another version is replaced, not only prepared: the machine that installs is the one that
+    /// ends on the runtime the package pins. The fixture is the one of the staging test with
+    /// `if_installed` on: no request (the package is already extracted), and the swap is attempted,
+    /// which is what an `Ok` without a swap (a runtime that is prepared and left) would not do; the
+    /// library of the fixture is not one, so the old runtime comes back as it was. What the
+    /// operator is told after a switch is judged on the words of the lines, in lower case so that
+    /// the capital of a sentence does not matter: at the next start the service re-embeds by
+    /// itself, where the progress is, and how to turn it off.
+    #[tokio::test]
+    async fn with_if_installed_a_runtime_of_another_version_is_switched_and_the_daemon_reembeds_on_restart()
+     {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = Home::new("runtime-switch-reembeds");
+        let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
+        let proxy = DeadProxy::start().await;
+        let (archive, lib_name) = host_cpu_runtime();
+        let leaf = home.roots.preferred.join("onnxruntime");
+        put(&leaf.join(lib_name), b"old core");
+        put(
+            &leaf.join("runtime.json"),
+            record_json("1.26.0", "cpu", &archive).as_bytes(),
+        );
+        let staging = sibling(&leaf, "downloading");
+        put(&staging.join(lib_name), b"not a library");
+        put(
+            &staging.join("runtime.json"),
+            record_json(ORT_VERSION, "cpu", &archive).as_bytes(),
+        );
+        let old = snapshot(&leaf);
+
+        let result = download_runtime(&RuntimeArgs {
+            if_installed: true,
+            ..RuntimeArgs::default()
+        })
+        .await;
+
+        assert_eq!(
+            proxy.hits(),
+            0,
+            "the staging directory holds the package of this version: nothing is requested"
+        );
+        assert!(
+            result.is_err(),
+            "a runtime of another version is switched, so the swap was attempted and refused (the \
+             library of the fixture is not one); a runtime that is only prepared would answer Ok: {result:?}"
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            old,
+            "and the runtime that was there is back as it was"
+        );
+
+        let said = after_switch_lines().join("\n");
+        let lower = said.to_lowercase();
+        for wanted in [
+            "reembebe solo",
+            "al reiniciar",
+            "memory-industry doctor",
+            "/health",
+        ] {
+            assert!(
+                lower.contains(wanted),
+                "after a switch the operator is told {wanted:?}: {said}"
+            );
+        }
+        assert!(
+            said.contains("MEMORY_INDUSTRY_AUTO_REEMBED=0"),
+            "and how to turn the automatic re-embed off: {said}"
+        );
+    }
+
     /// CI-D5b. `--cuda` is the one flag that takes a value, so the reading of
     /// the arguments is judged on its own: a typo of `--gpu` that downloads the
     /// CPU package in silence is the failure.
