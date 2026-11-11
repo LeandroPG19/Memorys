@@ -265,13 +265,13 @@ pub fn tool_definitions() -> &'static Vec<Value> {
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["decay", "prune", "merge", "summarize", "stats", "pagerank", "find_duplicates", "export", "reembed", "decay_episodes"], "description": "decay: stratified exponential decay by type. prune: deletes low-importance observations, dry-run unless confirm=true. merge: deduplicates similar entities. summarize: replaces an entity's observations with compressed_summary. stats: counts. pagerank: personalized importance ranking. find_duplicates: lists near-duplicate pairs. export: writes a JSON dump. reembed: re-encodes with the current model. decay_episodes: power-law decay on brain_episodes."},
+                    "action": {"type": "string", "enum": ["decay", "prune", "merge", "summarize", "stats", "pagerank", "find_duplicates", "export", "reembed", "decay_episodes"], "description": "decay: stratified exponential decay by type. prune: deletes low-importance observations, dry-run unless confirm=true. merge: deduplicates similar entities. summarize: replaces an entity's observations with compressed_summary. stats: counts. pagerank: personalized importance ranking. find_duplicates: lists near-duplicate pairs. export: writes a JSON dump. reembed: re-encodes observations and episodes with the current model. decay_episodes: power-law decay on brain_episodes."},
                     "confirm": {"type": "boolean", "description": "prune only: actually delete. Without it, prune returns a dry-run plan (would_prune, by_project) and deletes nothing — read the plan first, the default threshold reaches a large share of a mature corpus."},
                     "entity_name": {"type": "string", "description": "Entity to summarize (for summarize action)"},
                     "compressed_summary": {"type": "string", "description": "Compressed text replacing observations (for summarize)"},
                     "threshold": {"type": "number", "description": "Importance threshold for prune (default 0.1)"},
                     "similarity_threshold": {"type": "number", "description": "Similarity threshold for merge (default 0.8)"},
-                    "batch_size": {"type": "integer", "description": "Max observations to re-encode in reembed (default 500)"},
+                    "batch_size": {"type": "integer", "description": "Max observations, and max episodes, to re-encode in reembed (default 500)"},
                     "halflife_days": {"type": "number", "description": "Global halflife override for decay (overrides per-type stratification)"},
                     "c": {"type": "number", "description": "Power-law c parameter for decay_episodes (default 0.1)"},
                     "beta": {"type": "number", "description": "Power-law β exponent for decay_episodes (default 0.5)"},

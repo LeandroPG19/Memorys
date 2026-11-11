@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
 
+use crate::embeddings::backfill::VectorTable;
+use crate::handlers::zafra::StaleRow;
+
 pub async fn run_cli(args: &[String]) -> Result<()> {
     let mut batch: i64 = 500;
     let mut all = false;
@@ -10,11 +13,11 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: memory-industry reembed [--all] [--batch N]\n\n\
-                     Re-encodes the observations that need it: missing a vector, or tagged\n\
+                     Re-encodes the observations and episodes that need it: missing a vector, or tagged\n\
                      with a model other than the one currently loaded. Run it after changing\n\
                      CUBA_EMBED_MODEL / CUBA_EMBEDDING_DIM / ONNX_MODEL_PATH — and after\n\
                      scripts/migrate-embedding-dim.sh has retyped the column.\n\n\
-                     --all       re-encode every observation, stale or not\n\
+                     --all       re-encode every observation and episode, stale or not\n\
                      --batch N   rows per progress report (default 500)\n\n\
                      Refuses to run without a real ONNX model: re-embedding with the hash\n\
                      fallback would overwrite meaningful vectors with noise."
@@ -68,7 +71,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         );
     }
 
-    let rows: Vec<crate::handlers::zafra::StaleObservation> = if all {
+    let observations: Vec<StaleRow> = if all {
         sqlx::query_as(
             "SELECT o.id, o.content, e.entity_type, e.name AS entity_name
              FROM brain_observations o
@@ -91,25 +94,64 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     }
     .context("reading observations")?;
 
-    let total = rows.len();
+    let episodes: Vec<StaleRow> = if all {
+        sqlx::query_as(
+            "SELECT ep.id, ep.content, e.entity_type, e.name AS entity_name
+             FROM brain_episodes ep
+             JOIN brain_entities e ON e.id = ep.entity_id
+             ORDER BY ep.id",
+        )
+        .fetch_all(&pool)
+        .await
+    } else {
+        sqlx::query_as(
+            "SELECT ep.id, ep.content, e.entity_type, e.name AS entity_name
+             FROM brain_episodes ep
+             JOIN brain_entities e ON e.id = ep.entity_id
+             WHERE ep.embedding IS NULL OR ep.embedding_model IS DISTINCT FROM $1
+             ORDER BY ep.id",
+        )
+        .bind(&model)
+        .fetch_all(&pool)
+        .await
+    }
+    .context("reading episodes")?;
+
+    let total_observations = observations.len();
+    let total_episodes = episodes.len();
+    let total = total_observations + total_episodes;
     if total == 0 {
         println!("Nada que reembeber: todo el corpus ya está en {model} ({dim}-d).");
         return Ok(());
     }
 
     let scope = if all { "todas" } else { "pendientes" };
-    eprintln!("reembed: {total} observaciones ({scope})");
+    eprintln!("reembed: {total_observations} observaciones y {total_episodes} episodios ({scope})");
 
-    let mut done = 0usize;
+    let batch = batch.clamp(1, 5000) as usize;
+    let mut done_observations = 0usize;
+    let mut done_episodes = 0usize;
     let mut failed = 0usize;
-    for chunk in rows.chunks(batch.clamp(1, 5000) as usize) {
-        let (ok, bad) = crate::handlers::zafra::reembed_batch(&pool, chunk, &model).await;
-        done += ok;
-        failed += bad;
-        eprintln!("  {done}/{total}");
+    for (table, rows) in [
+        (VectorTable::Observations, &observations),
+        (VectorTable::Episodes, &episodes),
+    ] {
+        for chunk in rows.chunks(batch) {
+            let (ok, bad) =
+                crate::handlers::zafra::reembed_batch(&pool, table, chunk, &model).await;
+            match table {
+                VectorTable::Observations => done_observations += ok,
+                VectorTable::Episodes => done_episodes += ok,
+            }
+            failed += bad;
+            eprintln!("  {}/{total}", done_observations + done_episodes);
+        }
     }
 
-    println!("Reembebidas {done} de {total} observaciones con {model} ({dim}-d).");
+    println!(
+        "Reembebidas {done_observations} de {total_observations} observaciones y \
+         {done_episodes} de {total_episodes} episodios con {model} ({dim}-d)."
+    );
     if failed > 0 {
         println!("{failed} fallaron (ver los warnings).");
     }

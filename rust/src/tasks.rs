@@ -6,6 +6,9 @@ use tokio_util::task::TaskTracker;
 
 static TRACKER: LazyLock<TaskTracker> = LazyLock::new(TaskTracker::new);
 
+/// What the shutdown logs when `drain` gives up. The prefix is the one `e2e_all_tools.py` reads.
+pub const LOST_AT_SHUTDOWN: &str = "background tasks did not finish before shutdown — an episode may be left without its vector until `memory-industry reembed` (cuba_zafra action=reembed) or the next REM cycle fills it, and a near-duplicate consolidation runs again on the next add to that entity";
+
 pub fn spawn<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
