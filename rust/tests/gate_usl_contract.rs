@@ -2379,6 +2379,83 @@ fn e7a9_simular_respeta_los_modelos_y_los_jobs_como_el_planificador() {
     );
 }
 
+/// CI-E26b (D-E26a): what `recomendar` simulates is what the planner does with that table and that turn. A candidate is a J of
+/// the table; the rows go to `simular` with it as it is, and the admission (`dag.share_jobs`, the one owner of the scaling)
+/// gives the row its share; the duration, the cores and the RAM of the row are those of the jobs it gets, not of the number it
+/// names. B1 names 8, B3 12 and M 4, ready together after P, with 12 jobs: 4, 6 and 2, which add up to the turn, so the three
+/// start together at 5 s. By hand with T(J) = 1 / (lambda x J / (1 + sigma (J - 1) + kappa J (J - 1))) of the module, the
+/// durations of a row are 200 s less T of the jobs that its history got (8 and 12, from the serial runs, which are alone)
+/// plus T of the jobs it gets now: B1 at 4, B3 at 6 and at 12 (the table's 24). With 24 jobs (and 32) nothing moves: the J
+/// is the jobs, and the candidates are the sweep levels.
+const CUERPO_E26B: &str = r#"
+GIB = 1 << 30
+LAM, SIGMA, KAPPA = 0.00067, 0.04, 0.0008
+NIVELES = [1, 2, 3, 4, 6, 8, 12]
+
+
+def fila(id_, idx, deps, jobs, dur):
+    return {"id": id_, "idx": idx, "deps": deps, "clase": "normal", "recursos": [], "d": dur, "c": 1.0, "r": GIB, "jobs": jobs}
+
+
+base = [fila("P", 10, [], 0, 5.0), fila("B1", 20, ["P"], 8, 100.0), fila("B3", 30, ["P"], 12, 100.0), fila("M", 40, ["P"], 4, 100.0)]
+
+
+def calibradas(jm):
+    out = {}
+    for id_, actual in (("B1", 8), ("B3", 12)):
+        ajuste = {"lambda": LAM, "sigma": SIGMA, "kappa": KAPPA, "ram": None, "niveles": NIVELES, "J_rodilla": 12}
+        cal = g.Calibrada(id_, "debug", ajuste, actual, 0, jm)
+        cal.usadas = [("run-1", actual, 200.0), ("run-2", actual, 200.0)]
+        out[id_] = cal
+    return out
+
+
+def duracion(j_hist, j):
+    return 200.0 - g.tiempo(j_hist, LAM, SIGMA, KAPPA) + g.tiempo(j, LAM, SIGMA, KAPPA)
+
+
+def estado(filas, id_):
+    return next(f for f in filas if f["id"] == id_)
+
+
+cals = calibradas(12)
+filas = g._estado_de(base, cals, {"B1": 8, "B3": 12})
+for id_, named, jobs, j_hist in (("B1", 8, 4, 8), ("B3", 12, 6, 12)):
+    f = estado(filas, id_)
+    assert f["jobs"] == named, f"{id_} goes to the simulation with the J of the table ({named}), not with {f['jobs']}: the admission scales it once"
+    assert abs(f["d"] - duracion(j_hist, jobs)) < 1e-6, f"{id_} in a turn of 12 gets {jobs} jobs and lasts {duracion(j_hist, jobs):.3f} s, the row says {f['d']:.3f}"
+arranques = []
+g.simular(filas, 12.0, 100.0 * GIB, 12, arranques)
+juntas = sorted(i for t, i in arranques if abs(t - 5.0) < 1e-9)
+assert juntas == ["B1", "B3", "M"], f"B1, B3 and M start together at 5 s with 4 + 6 + 2 = 12 jobs: {arranques}"
+todo = g._estado_de(base, cals, {"B1": 8, "B3": 24})
+assert estado(todo, "B3")["jobs"] == 24 and abs(estado(todo, "B3")["d"] - duracion(12, 12)) < 1e-6, "the 24 of the table is the whole turn: 12 jobs"
+candidatos = cals["B3"].candidatos(100.0 * GIB)
+assert 24 in candidatos and max(candidatos) <= 24, f"a turn of 12 reaches its 12 jobs with the 24 of the table, and no J goes past 24: {candidatos}"
+assert 12 in candidatos, f"the J that is in the table stays a candidate: {candidatos}"
+ajuste = {"lambda": LAM, "sigma": SIGMA, "kappa": KAPPA, "ram": None, "niveles": NIVELES, "J_rodilla": 12}
+assert 10 in g.Calibrada("B1", "debug", ajuste, 10, 0, 12).candidatos(100.0 * GIB), "a 10 in the table (5 jobs, no sweep level) stays a candidate"
+sobra = g.Calibrada("B1", "debug", ajuste, 30, 0, 24).candidatos(100.0 * GIB)
+assert 24 in sobra and 30 not in sobra, f"a 30 in the table of a machine of 24 is held at 24, as the planner gives it: {sobra}"
+
+for jm in (24, 32):
+    cals = calibradas(jm)
+    for id_, cal in cals.items():
+        assert cal.candidatos(100.0 * GIB) == NIVELES, f"with {jm} jobs the candidates are the sweep levels: {cal.candidatos(100.0 * GIB)}"
+        for j in NIVELES:
+            f = estado(g._estado_de(base, cals, {"B1": j, "B3": j}), id_)
+            assert f["jobs"] == j and abs(f["d"] - duracion(cal.actual, j)) < 1e-6, f"{id_} with {jm} jobs and J={j}: {f['jobs']} jobs, {f['d']:.3f} s"
+print(json.dumps({"ok": True}))
+"#;
+
+#[test]
+fn e26b_recomendar_simula_con_los_jobs_que_da_el_planificador_en_un_turno_de_12() {
+    let fx = Fx::new("e26b");
+    let salida = biblioteca(&fx, CUERPO_E26B);
+    assert_eq!(salida.code, Some(0), "{}", salida.text());
+    assert_eq!(salida.json()["ok"], json!(true), "{}", salida.text());
+}
+
 #[test]
 fn e7a7_la_curva_usa_el_j_que_la_fila_recibio_en_cada_corrida() {
     // Three cold runs of the table (B1 names 8): the first got 4 jobs from its machine, the other two 24. What each one gave
@@ -2458,15 +2535,15 @@ fn e7a8_recomendar_no_propone_mas_jobs_de_los_que_tiene_la_maquina_y_dice_lo_que
         .map(|j| j.parse().expect("a J"))
         .collect();
     assert!(
-        candidatos.contains(&12) && candidatos.iter().all(|&j| j <= 12),
-        "the candidates stop at the J of the machine: {candidatos:?}\n{}",
+        candidatos.contains(&24) && candidatos.iter().all(|&j| j <= 24),
+        "the candidates are J of the table, and 24 is the one that gives this turn of 12 its 12 jobs; none is above the 24 the table is written for: {candidatos:?}\n{}",
         salida.text()
     );
     let propuesto = dbg["J_propuesto"].as_u64().expect("J_propuesto");
     assert_eq!(
         dbg["J_efectivo"],
-        json!(propuesto.min(12)),
-        "{}",
+        json!((propuesto * 12 / 24).max(1)),
+        "the jobs a J of the table gets in a turn of 12 are its share (CI-E26): {}",
         salida.text()
     );
     let texto = fx.run(&["recomendar"]);
@@ -2509,14 +2586,14 @@ fn e7a8_recomendar_no_propone_mas_jobs_de_los_que_tiene_la_maquina_y_dice_lo_que
         .map(|j| j.parse().expect("a J"))
         .collect();
     assert!(
-        candidatos.iter().all(|&j| j <= 12),
-        "a row at 16 of a machine of 12 is a candidate at 12, not at 16: {candidatos:?}\n{}",
+        candidatos.contains(&16) && candidatos.iter().all(|&j| j <= 24),
+        "the 16 of the table stays a candidate (it is 8 jobs in a turn of 12) and none is above 24: {candidatos:?}\n{}",
         salida.text()
     );
     let propuesto = dbg["J_propuesto"].as_u64().expect("J_propuesto");
     assert_eq!(
         dbg["J_efectivo"],
-        json!(propuesto.min(12)),
+        json!((propuesto * 12 / 24).max(1)),
         "{}",
         salida.text()
     );
