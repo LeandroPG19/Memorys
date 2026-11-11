@@ -44,9 +44,10 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use memory_industry::embeddings::backfill::vector_coverage;
 use memory_industry::embeddings::onnx::embedding_dim;
+use memory_industry::handlers::sync::{VectorsRestored, restore_vectors};
 use memory_industry::reembed_cli::{
-    AutoSettings, AutoState, EmbedInput, Plan, auto_progress, drop_snapshot, reembed, rollback,
-    run_automatic_reembed,
+    AutoSettings, AutoState, EmbedInput, Plan, auto_progress, drop_snapshot, forward_counts,
+    reembed, reembed_is_running, rollback, run_automatic_reembed,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -1153,13 +1154,15 @@ async fn sync_keeps_the_label(url: String) {
 // C.11
 // ---------------------------------------------------------------------------------------------
 
-/// CI-D5c (C.11). The automatic re-embed uses the core of `reembed` with `forward_only`: it
-/// rewrites the rows without a vector and the ones of an earlier generation than the runtime
-/// loaded, and nothing else. Five rows in each of the four tables: the model alone (what every
-/// database of today holds), the old runtime, no vector, a newer runtime (1.40.0) and another
-/// model. The first three end with the vector of the encoder and the new label; the last two are
-/// not rewritten (`xmin` does not move) and are not in the snapshot either: it keeps the old vector
-/// of what it rewrites, and these are not going to be rewritten. The snapshot can then be dropped
+/// CI-D5c (C.11, as C2-S3 changed it). The automatic re-embed uses the core of `reembed` with
+/// `forward_only`: it rewrites the rows that have a vector of an earlier generation than the
+/// runtime loaded, and nothing else. A row with no vector at all is filled by the REM cycle, which
+/// has its own limit and its own way to be turned off, and is not this one's. Five rows in each of
+/// the four tables: the model alone (what every database of today holds), the old runtime, no
+/// vector, a newer runtime (1.40.0) and another model. The first two end with the vector of the
+/// encoder and the new label; the last three are not rewritten (`xmin` does not move) and are not
+/// in the snapshot either: it keeps the old vector of what it rewrites, and these are not going to
+/// be rewritten. The snapshot can then be dropped
 /// while they remain, because it holds nothing that they need, and it cannot while a row that is
 /// older than the generation is left.
 #[tokio::test]
@@ -1189,7 +1192,7 @@ async fn rewrites_only_what_is_older(url: String) {
     }
     let left_alone: Vec<(Table, Uuid)> = kinds
         .iter()
-        .flat_map(|(table, ids)| [(*table, ids[3]), (*table, ids[4])])
+        .flat_map(|(table, ids)| [(*table, ids[2]), (*table, ids[3]), (*table, ids[4])])
         .collect();
     let xmins_before = xmins_of(&admin, &left_alone).await;
     let coverage = vector_coverage(&admin, NEW)
@@ -1213,22 +1216,22 @@ async fn rewrites_only_what_is_older(url: String) {
         .expect("the automatic re-embed of a database of mixed generations");
     assert_eq!(
         (report.total().fetched, report.total().rewritten),
-        (12, 12),
-        "three of the five kinds, in each of the four tables: {report:?}"
+        (8, 8),
+        "two of the five kinds, in each of the four tables: {report:?}"
     );
     assert_eq!(
         calls.seen().len(),
-        12,
+        8,
         "and the encoder was asked for no more"
     );
 
     for (table, ids) in &kinds {
-        for id in &ids[..3] {
+        for id in &ids[..2] {
             let now = stored(&admin, *table, *id).await;
             assert_eq!(
                 now.vector.as_deref(),
                 Some(flat(0.5).as_slice()),
-                "{}: the model alone, the old runtime and no vector get the vector of the encoder",
+                "{}: the model alone and the old runtime get the vector of the encoder",
                 table.name()
             );
             assert_eq!(now.label.as_deref(), Some(NEW), "{}", table.name());
@@ -1237,7 +1240,7 @@ async fn rewrites_only_what_is_older(url: String) {
     assert_eq!(
         xmins_of(&admin, &left_alone).await,
         xmins_before,
-        "a vector of a newer runtime or of another model was written: the service only moves a row forward"
+        "a row with no vector, or with a vector of a newer runtime or of another model, was written: the service only moves a vector forward"
     );
     let (_, saved_rows) = saved(&report.snapshot);
     assert_eq!(
@@ -1258,8 +1261,8 @@ async fn rewrites_only_what_is_older(url: String) {
         .expect("counting the vectors");
     assert_eq!(
         (after.stale(), after.missing()),
-        (8, 0),
-        "what is left is the two rows of the other generations in each table"
+        (8, 4),
+        "what is left is the two rows of the other generations in each table, and the row with no vector"
     );
 
     // A row of the old generation that turns up while the snapshot is there keeps it.
@@ -1694,4 +1697,348 @@ async fn sees_every_project(url: String) {
     }
     app.close().await;
     admin.close().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// C2: what the review of the first round found
+// ---------------------------------------------------------------------------------------------
+
+/// A real re-embed that holds the lock from inside its first encoder call and writes nothing (its
+/// encoder fails every row). The barrier is the encoder, so there is no timing and no lock of the
+/// test: `entered` says the lock is taken, `release` lets it end.
+struct Holder {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    task: tokio::task::JoinHandle<Result<memory_industry::reembed_cli::Report>>,
+}
+
+fn a_reembed_that_holds_the_lock(pool: &PgPool, root: &Path) -> Holder {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let holding = {
+        let (entered, release, stopped) = (entered.clone(), release.clone(), stopped.clone());
+        move |_input: EmbedInput| -> BoxFuture<'static, Result<Vec<f32>>> {
+            let (entered, release, stopped) = (entered.clone(), release.clone(), stopped.clone());
+            async move {
+                if !stopped.swap(true, Ordering::SeqCst) {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                Err(anyhow::anyhow!(
+                    "the one that holds the lock writes nothing"
+                ))
+            }
+            .boxed()
+        }
+    };
+    let task = tokio::spawn({
+        let (pool, plan) = (pool.clone(), plan(root));
+        async move { reembed(&pool, &plan, &holding).await }
+    });
+    Holder {
+        entered,
+        release,
+        task,
+    }
+}
+
+// C2-A4 --------------------------------------------------------------------------------------
+
+/// CI-D5c-C2 (A4). The import reads the label and the vector a row has, and writes the incoming
+/// vector afterwards, with nobody holding the row between the two. The automatic re-embed can
+/// rewrite that row in between, and the import would put over it the older vector it had decided
+/// to take. The write repeats what the read saw (`WHERE` the label and the presence of a vector are
+/// still those) and a row that no longer matches is counted as kept. The seam is the argument of
+/// `restore_vectors` that runs between the read and the first write: here it is a second connection
+/// that rewrites the contested row and commits, so the interleaving is the test's and not a
+/// matter of timing. The other row is the control: nobody touches it and it takes the vector.
+#[tokio::test]
+async fn an_incoming_vector_never_overwrites_what_another_writer_changed_after_it_was_read() {
+    in_a_scratch_database("v051_race_in", import_loses_the_race_cleanly).await;
+}
+
+async fn import_loses_the_race_cleanly(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let entity = an_entity(&admin, "v051_race_in").await;
+    let contested = an_observation(&admin, entity, "la fila que otro reescribe").await;
+    let control = an_observation(&admin, entity, "la fila que nadie toca").await;
+    stamp(&admin, Table::Observations, contested, 0.125, OLD).await;
+    stamp(&admin, Table::Observations, control, 0.125, OLD).await;
+
+    let mut raw = Vec::new();
+    let mut labels = std::collections::HashMap::new();
+    for id in [contested, control] {
+        raw.extend_from_slice(id.as_bytes());
+        for value in flat(0.5) {
+            raw.extend_from_slice(&value.to_le_bytes());
+        }
+        labels.insert(id, Some(OLD.to_string()));
+    }
+    let other = admin.clone();
+    let between = move || -> BoxFuture<'static, ()> {
+        let other = other.clone();
+        async move { stamp(&other, Table::Observations, contested, 0.875, NEW).await }.boxed()
+    };
+
+    let mut tx = admin.begin().await.expect("the transaction of the import");
+    let done = restore_vectors(&mut tx, &raw, embedding_dim(), &labels, &between)
+        .await
+        .expect("restoring the vectors of a package");
+    tx.commit().await.expect("committing the import");
+
+    assert_eq!(
+        done,
+        VectorsRestored {
+            restored: 1,
+            kept_newer: 1
+        },
+        "the control took the vector; the contested row changed after it was read and is kept"
+    );
+    let kept = stored(&admin, Table::Observations, contested).await;
+    assert_eq!(
+        (kept.vector.as_deref(), kept.label.as_deref()),
+        (Some(flat(0.875).as_slice()), Some(NEW)),
+        "what the other writer put is still there: the import did not put the older vector over it"
+    );
+    let taken = stored(&admin, Table::Observations, control).await;
+    assert_eq!(
+        (taken.vector.as_deref(), taken.label.as_deref()),
+        (Some(flat(0.5).as_slice()), Some(OLD)),
+        "control: a row nobody touched takes the vector of the package, so the one above was kept for a reason"
+    );
+    admin.close().await;
+}
+
+// C2-S1 --------------------------------------------------------------------------------------
+
+/// CI-D5c-C2 (S1). `doctor` says «reembebido en curso» from the advisory lock in `pg_locks`, and
+/// `pg_locks` shows the locks of every database of the cluster. A re-embed that runs in another
+/// database (a second install on the same server, or another test of the judge) is not this
+/// database's: the question is asked about the current one. A real re-embed stopped inside its
+/// encoder holds the lock here; the database where it runs sees it, a second scratch database of
+/// the same cluster does not, and once it ends nobody does.
+#[tokio::test]
+async fn a_running_reembed_is_seen_in_its_own_database_and_not_in_another_of_the_cluster() {
+    in_a_scratch_database("v051_running", sees_it_only_at_home).await;
+}
+
+async fn sees_it_only_at_home(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let _world = a_world_of_the_old_runtime(&admin).await;
+    let root = Scratch::new();
+    assert!(
+        !reembed_is_running(&admin).await,
+        "control: nothing holds the lock yet"
+    );
+
+    let holder = a_reembed_that_holds_the_lock(&admin, &root.0);
+    holder.entered.notified().await;
+    assert!(
+        reembed_is_running(&admin).await,
+        "a re-embed holds the lock of this database"
+    );
+    in_a_scratch_database("v051_elsewhere", |other_url| async move {
+        let other = connect_as_admin(&other_url).await;
+        assert!(
+            !reembed_is_running(&other).await,
+            "the lock is held in another database of the cluster, and pg_locks shows it: it is not this one's"
+        );
+        other.close().await;
+    })
+    .await;
+
+    holder.release.notify_one();
+    holder
+        .task
+        .await
+        .expect("the re-embed was not cut")
+        .expect("and ends well once its encoder answers");
+    assert!(
+        !reembed_is_running(&admin).await,
+        "it ended and let go of the lock"
+    );
+    admin.close().await;
+}
+
+// C2-S4 --------------------------------------------------------------------------------------
+
+/// CI-D5c-C2 (S4). The count of what the automatic re-embed has to rewrite and the pages it reads
+/// are the same rows: a row the pages never return (an episode whose entity is gone, which the
+/// foreign key forbids and a restore or an import with checks off can leave) would count as older
+/// forever and the run would end `done` with fewer rewritten than counted, and the REM cycle
+/// would start it again each time. The orphan is made on a connection with the foreign keys
+/// switched off, which is how one is made.
+#[tokio::test]
+async fn a_row_the_pages_cannot_read_is_not_counted_as_older() {
+    in_a_scratch_database("v051_orphan", counts_what_the_pages_read).await;
+}
+
+async fn counts_what_the_pages_read(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let _world = a_world_of_the_old_runtime(&admin).await;
+    let orphan = {
+        let mut conn = admin.acquire().await.expect("a connection");
+        sqlx::query("SET session_replication_role = replica")
+            .execute(&mut *conn)
+            .await
+            .expect("switching the foreign keys off for this connection");
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO brain_episodes (entity_id, content, importance) VALUES ($1, $2, 0.5)
+             RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind("un episodio sin entidad")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("seeding an episode whose entity does not exist");
+        sqlx::query("RESET session_replication_role")
+            .execute(&mut *conn)
+            .await
+            .expect("switching them back on");
+        id
+    };
+    stamp(&admin, Table::Episodes, orphan, 0.125, OLD).await;
+    assert_eq!(
+        vector_coverage(&admin, NEW)
+            .await
+            .expect("counting")
+            .stale(),
+        5,
+        "control: five rows have an old vector, the orphan among them"
+    );
+
+    let counts = forward_counts(&admin, NEW)
+        .await
+        .expect("counting by generation");
+    assert_eq!(
+        (counts.older, counts.ahead),
+        (4, 0),
+        "the four rows of the world: the orphan is not read by any page, so it is not counted"
+    );
+
+    let root = Scratch::new();
+    let calls = Calls::default();
+    let encode = calls.encoder();
+    let run = run_automatic_reembed(&admin, &settings(root.0.join("auto")), &encode).await;
+    assert_eq!(run.state, AutoState::Done, "{run:?}");
+    assert_eq!(
+        (run.older, run.rewritten),
+        (4, 4),
+        "what it counted is what it rewrote: {run:?}"
+    );
+    admin.close().await;
+}
+
+// C2-A1 --------------------------------------------------------------------------------------
+
+/// CI-D5c-C2 (A1). A write that cannot reach the database ends the batch. The encoder closes the
+/// pool on its first call (the call that marks it closed does not wait: the connection that holds
+/// the lock is still out), so the write of that row finds a closed pool, and every other row would
+/// find it too and ask the encoder first. The run ends with an error that says the connection was
+/// lost and the encoder was asked once, not four times; nothing is counted on a clock.
+#[tokio::test]
+async fn a_write_that_cannot_reach_the_database_ends_the_batch_instead_of_trying_every_row() {
+    in_a_scratch_database("v051_gone", ends_the_batch).await;
+}
+
+async fn ends_the_batch(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let world = a_world_of_the_old_runtime(&admin).await;
+    let rows: Vec<(Table, Uuid)> = world
+        .rows()
+        .into_iter()
+        .map(|(table, id, ..)| (table, id))
+        .collect();
+    let checker = connect_as_admin(&url).await;
+    let xmins_before = xmins_of(&checker, &rows).await;
+    let asked = Arc::new(AtomicUsize::new(0));
+    let closing = {
+        let (pool, asked) = (admin.clone(), asked.clone());
+        move |_input: EmbedInput| -> BoxFuture<'static, Result<Vec<f32>>> {
+            let (pool, asked) = (pool.clone(), asked.clone());
+            async move {
+                asked.fetch_add(1, Ordering::SeqCst);
+                // `close()` marks the pool closed when it is called; polling its future once is
+                // enough, and the rest of it waits for the connection of the lock, which is ours.
+                let _waiting = futures::poll!(std::pin::pin!(pool.close()));
+                anyhow::Ok(flat(0.5))
+            }
+            .boxed()
+        }
+    };
+    let root = Scratch::new();
+
+    let lost = reembed(&admin, &plan(&root.0), &closing)
+        .await
+        .expect_err("a write that cannot reach the database ends the run");
+    let said = format!("{lost:#}");
+    assert!(
+        said.contains("se perdió la conexión"),
+        "it says what happened: {said}"
+    );
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the encoder was asked once: the other three rows were not tried"
+    );
+    assert_eq!(
+        xmins_of(&checker, &rows).await,
+        xmins_before,
+        "and no row was written"
+    );
+    checker.close().await;
+    admin.close().await;
+}
+
+// C2-A3 --------------------------------------------------------------------------------------
+
+/// CI-D5c-C2 (A3). The automatic re-embed does its work through `side_pool(&pool, 2)` so that the
+/// connections of the daemon stay for its requests. The pool that has none left is the case that
+/// matters: a main pool of one connection, held, and a side pool that has to answer anyway, with
+/// two connections of its own, none of them the main one's. The proof is the backend each one is:
+/// if the side pool were the main one, its first connection would be the held one or none, and the
+/// 2 seconds of the acquire timeout of the main pool are only the end of a failure.
+#[tokio::test]
+async fn the_side_pool_has_connections_of_its_own_when_the_main_one_has_none_left() {
+    in_a_scratch_database("v051_side", side_pool_is_independent).await;
+}
+
+async fn side_pool_is_independent(url: String) {
+    let main = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect(&url)
+        .await
+        .expect("a main pool of one connection");
+    let mut held = main.acquire().await.expect("its only connection");
+    let held_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *held)
+        .await
+        .expect("the backend of the held connection");
+
+    let side = memory_industry::db::side_pool(&main, 2);
+    let mut first = side
+        .acquire()
+        .await
+        .expect("the side pool answers with the main one exhausted");
+    let mut second = side
+        .acquire()
+        .await
+        .expect("and has a second connection of its own");
+    let first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *first)
+        .await
+        .expect("the backend of the first");
+    let second_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *second)
+        .await
+        .expect("the backend of the second");
+    assert!(
+        held_pid != first_pid && held_pid != second_pid && first_pid != second_pid,
+        "three connections, three backends: {held_pid} (main), {first_pid} and {second_pid} (side)"
+    );
+    drop((first, second, held));
+    side.close().await;
+    main.close().await;
 }

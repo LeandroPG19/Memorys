@@ -3840,6 +3840,7 @@ mod tests {
             older: 40,
             ahead: 1,
             encoded: 12,
+            last_row_at: Some("2026-11-11T18:00:00+00:00".to_string()),
             ..AutoProgress::default()
         });
         let full = health_body(state.clone(), full_scope()).await;
@@ -3854,6 +3855,10 @@ mod tests {
         assert_eq!(
             auto["ahead"], 1,
             "the one of a newer runtime that it leaves alone"
+        );
+        assert_eq!(
+            auto["last_row_at"], "2026-11-11T18:00:00+00:00",
+            "the time of the last row tells a re-embed that gives way to the searches from one that hung"
         );
         assert!(
             auto.get("last_error").is_some_and(|error| error.is_null()),

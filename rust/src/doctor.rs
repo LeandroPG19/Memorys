@@ -3635,4 +3635,30 @@ mod embedding_coverage_tests {
             off[0].detail
         );
     }
+
+    /// CI-D5c-C2 (A2). `doctor` promises «el servicio los reembebe solo» only when there is a service
+    /// to do it and something it will rewrite. A machine with the stdio mode alone has no installed
+    /// service (no env file), and a database whose only vectors of another generation are of a newer
+    /// runtime or of another model has nothing for the automatic re-embed to do: in both the hint is
+    /// the command. A running re-embed is running whatever the rest says, and the operator's
+    /// `MEMORY_INDUSTRY_AUTO_REEMBED=0` in the env file of the service turns it off.
+    #[test]
+    fn doctor_promises_the_service_only_when_there_is_one_and_something_for_it_to_rewrite() {
+        let off_in_the_file = "CUBA_HTTP_ADDR=127.0.0.1:8788\nMEMORY_INDUSTRY_AUTO_REEMBED=0\n";
+        let on_in_the_file = "CUBA_HTTP_ADDR=127.0.0.1:8788\n";
+        for (running, env_file, older, expected) in [
+            (false, Some(on_in_the_file), 5, AutoReembed::On),
+            (false, None, 5, AutoReembed::Off),
+            (false, Some(on_in_the_file), 0, AutoReembed::Off),
+            (false, Some(off_in_the_file), 5, AutoReembed::Off),
+            (true, Some(on_in_the_file), 5, AutoReembed::Running),
+            (true, None, 0, AutoReembed::Running),
+        ] {
+            assert_eq!(
+                auto_reembed_mode(running, env_file, older),
+                expected,
+                "running {running}, service env {env_file:?}, {older} older"
+            );
+        }
+    }
 }

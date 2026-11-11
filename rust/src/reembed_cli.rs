@@ -1578,4 +1578,124 @@ mod tests {
             assert!(!auto_reembed_enabled_from(off), "{off:?} turns it off");
         }
     }
+
+    /// CI-D5c-C2 (A1). The service re-embeds once at start, and again when the REM cycle finds that
+    /// there is something older and nothing running: a start that found the database down must not
+    /// leave the automatic re-embed idle for the life of the daemon. The decision is pure: it is
+    /// started from `idle`, `failed` (the count or a run failed) or `busy` (another re-embed held the
+    /// lock, which is gone by now) when there is something older, and never while one is running, nor
+    /// when it is `done` (what it could not do waits for the next start) or turned `off`.
+    #[test]
+    fn the_rem_cycle_starts_the_automatic_reembed_only_when_it_is_stopped_and_something_is_older() {
+        for (state, older, starts) in [
+            (AutoState::Idle, 5, true),
+            (AutoState::Failed, 1, true),
+            (AutoState::Busy, 3, true),
+            (AutoState::Idle, 0, false),
+            (AutoState::Failed, 0, false),
+            (AutoState::Running, 9, false),
+            (AutoState::Done, 9, false),
+            (AutoState::Off, 9, false),
+        ] {
+            assert_eq!(
+                should_start_auto(state, older),
+                starts,
+                "{state:?} with {older} older"
+            );
+        }
+    }
+
+    /// CI-D5c-C2 (A1). A count that fails at start (the database does not answer) used to leave the
+    /// progress in `idle`, which reads as «nothing to do». It is `failed`, with the text, so that
+    /// `/health` says what happened and the REM cycle can try again.
+    #[tokio::test]
+    async fn a_count_that_fails_at_start_leaves_failed_with_its_text_and_not_idle() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        set_auto_progress(AutoProgress::default());
+
+        let shown = counting_failed(&anyhow::anyhow!("connection refused by the database"));
+
+        assert_eq!(shown.state, AutoState::Failed, "{shown:?}");
+        assert!(
+            shown
+                .last_error
+                .as_deref()
+                .is_some_and(|why| why.contains("connection refused by the database")),
+            "it says why: {:?}",
+            shown.last_error
+        );
+        assert_eq!(
+            auto_progress().state,
+            AutoState::Failed,
+            "and leaves it where /health reads it"
+        );
+        set_auto_progress(AutoProgress::default());
+    }
+
+    /// CI-D5c-C2 (A1). A write that cannot reach the database ends the batch: every other row would
+    /// wait the 5 seconds of the acquire timeout for a connection that is not coming. An error of the
+    /// connection (the pool timed out or is closed, the socket broke) is that; an error of one row
+    /// (a missing column, a row that is not there) is not.
+    #[test]
+    fn only_an_error_of_the_connection_ends_the_batch() {
+        for (error, connection) in [
+            (sqlx::Error::PoolTimedOut, true),
+            (sqlx::Error::PoolClosed, true),
+            (
+                sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+                true,
+            ),
+            (sqlx::Error::RowNotFound, false),
+            (sqlx::Error::ColumnNotFound("embedding".to_string()), false),
+        ] {
+            assert_eq!(is_connection_error(&error), connection, "{error:?}");
+        }
+    }
+
+    fn a_constant_vector(_prefixed: &str) -> Result<Vec<f32>> {
+        Ok(vec![0.5, 0.25])
+    }
+
+    /// CI-D5c-C2 (A3). The real encoder of the background, without ONNX: the computation is a
+    /// function that answers at once and the gate has two permits, one held by a search. The row
+    /// waits for the search even with a permit free (a row that took the gate as a foreground embed
+    /// would count as in flight and would not wait), it is counted in the progress `/health` shows,
+    /// and its time is the one of the last row. Nothing sleeps: the search lets go and the row is
+    /// awaited.
+    #[tokio::test]
+    async fn the_encoder_of_the_background_waits_for_the_searches_and_counts_its_rows() {
+        use crate::embeddings::onnx::EmbedGate;
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        set_auto_progress(AutoProgress::default());
+        let gate: &'static EmbedGate = Box::leak(Box::new(EmbedGate::new(2)));
+
+        let search = gate
+            .foreground()
+            .await
+            .expect("an idle gate lets a search in");
+        let mut row = std::pin::pin!(background_encoder_with(
+            gate,
+            a_constant_vector,
+            EmbedInput::Bare {
+                text: "una fila".to_string()
+            }
+        ));
+        assert!(
+            futures::poll!(row.as_mut()).is_pending(),
+            "the row of the background waits while a search is embedding"
+        );
+        assert_eq!(
+            gate.in_flight(),
+            1,
+            "and it is not itself an embed somebody waits for: only the search is in flight"
+        );
+
+        drop(search);
+        let vector = row.await.expect("the search let go: the row is encoded");
+        assert_eq!(vector, vec![0.5, 0.25]);
+        let shown = auto_progress();
+        set_auto_progress(AutoProgress::default());
+        assert_eq!(shown.encoded, 1, "one row went through the encoder");
+        assert!(shown.last_row_at.is_some(), "and says when: {shown:?}");
+    }
 }
