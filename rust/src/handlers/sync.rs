@@ -2920,7 +2920,8 @@ pub async fn restore_vectors(
     labels: &HashMap<Uuid, Option<String>>,
     between_read_and_write: &(dyn Fn() -> BoxFuture<'static, ()> + Send + Sync),
 ) -> Result<VectorsRestored> {
-    let Some(rec_size) = embedding_record_size(dim).filter(|size| raw.len() % size == 0) else {
+    let Some(rec_size) = embedding_record_size(dim).filter(|size| raw.len().is_multiple_of(*size))
+    else {
         tracing::warn!(
             "embeddings blob of {} bytes declares dim {} — skipping",
             raw.len(),
