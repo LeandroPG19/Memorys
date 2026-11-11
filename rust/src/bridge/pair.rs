@@ -645,10 +645,12 @@ mod tests {
         ]);
         // `identity` is ten times `probe_total` so that only the sweep budget can cut the
         // tarpit: the clock then tells "stopped at probe_total" from "waited for the
-        // candidate's own identity limit" by seconds, not by the load of the machine.
+        // candidate's own identity limit" by seconds, not by the load of the machine. The
+        // budget is a second, not a few hundred ms, because the real host has to answer
+        // inside it for the pairing to succeed: the tarpit holds the test for all of it.
         let timing = Timing {
-            probe_total: ms(300),
-            identity: ms(3000),
+            probe_total: ms(1000),
+            identity: ms(10_000),
             ..tiny_timing()
         };
 

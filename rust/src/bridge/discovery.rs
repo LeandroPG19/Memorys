@@ -644,9 +644,15 @@ mod tests {
         ))
     }
 
+    /// The limit of a question that must be answered: long, because a quiet machine never
+    /// pays for it and a stalled one is not a red.
     async fn check(id: &Identity, at: SocketAddr) -> Verdict {
+        check_within(id, at, ms(5000)).await
+    }
+
+    async fn check_within(id: &Identity, at: SocketAddr, limit: Duration) -> Verdict {
         let state = id.state(at.port(), vec![at], Some(at));
-        check_identity(&client(), at, &state, [7u8; 16], ms(300)).await
+        check_identity(&client(), at, &state, [7u8; 16], limit).await
     }
 
     /// H13
@@ -907,7 +913,7 @@ mod tests {
 
         let dead = check(&id, closer.addr()).await;
         let started = Instant::now();
-        let silent = check(&id, tarpit.addr()).await;
+        let silent = check_within(&id, tarpit.addr(), ms(300)).await;
 
         assert!(
             matches!(dead, Verdict::NoAnswer(_)),
@@ -918,8 +924,9 @@ mod tests {
             "accept-and-hold: {silent:?}"
         );
         assert!(
-            started.elapsed() < ms(1500),
-            "the 300 ms limit bounds a candidate that never answers; took {:?}",
+            started.elapsed() < ms(3000),
+            "the 300 ms limit bounds a candidate that never answers (ten times that is the \
+             clock's ceiling); took {:?}",
             started.elapsed()
         );
     }

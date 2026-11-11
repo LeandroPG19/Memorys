@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use sqlx::Connection;
+
 #[tokio::test]
 #[ignore]
 async fn an_export_waits_instead_of_racing_a_concurrent_one() {
@@ -23,22 +25,46 @@ async fn an_export_waits_instead_of_racing_a_concurrent_one() {
         .await
         .expect("take the sync lock the way a concurrent export would");
 
-    let racing = memory_industry::handlers::dispatch(
+    let mut racing = Box::pin(memory_industry::handlers::dispatch(
         &pool,
         "cuba_sync",
         serde_json::json!({"action": "export", "scope": "all", "dir": bundle.display().to_string()}),
-    );
-    let blocked = tokio::time::timeout(Duration::from_secs(3), racing).await;
-
-    assert!(
-        blocked.is_err(),
-        "the export ran to completion while another holder had the sync lock. Without \
-         serialisation, one export prunes the files the other just wrote — 480 race windows \
-         per import on this corpus — and the worst outcome is not a crash: it is an import \
-         that reads a torn directory, happens to parse, commits, and records the manifest \
-         hash, after which that hash is skipped forever and the rows that never arrived \
-         never will"
-    );
+    ));
+    // The wait is seen, not timed: the export is known to be queued behind the holder when
+    // Postgres lists an advisory lock on the sync key that has not been granted, whatever the
+    // speed of the machine. If the export finishes instead, nothing ever waited for the lock.
+    let mut observer = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("a connection to watch the lock from");
+    let queued = async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks
+                  WHERE locktype = 'advisory' AND NOT granted
+                    AND ((classid::bigint << 32) | objid::bigint) = $1",
+            )
+            .bind(memory_industry::handlers::sync::SYNC_LOCK)
+            .fetch_one(&mut observer)
+            .await
+            .expect("reading pg_locks");
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        done = &mut racing => panic!(
+            "the export ran to completion while another holder had the sync lock ({done:?}). \
+             Without serialisation, one export prunes the files the other just wrote — 480 race \
+             windows per import on this corpus — and the worst outcome is not a crash: it is an \
+             import that reads a torn directory, happens to parse, commits, and records the \
+             manifest hash, after which that hash is skipped forever and the rows that never \
+             arrived never will"
+        ),
+        () = queued => {}
+    }
+    drop(racing);
 
     sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(memory_industry::handlers::sync::SYNC_LOCK)

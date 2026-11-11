@@ -27,8 +27,11 @@ use serde_json::json;
 use tokio::net::UdpSocket;
 use uuid::Uuid;
 
-/// Long enough for a loopback round trip on a loaded machine, short enough for the suite.
-const WAIT: Duration = Duration::from_millis(400);
+/// `beacon::probe` always listens for the whole window (it cannot know how many replies are
+/// coming), so this is paid in full by each test of the file and is the only fixed wait of a
+/// green run. Two seconds is what a loopback round trip needs after the machine stalled for
+/// the better part of one; a window of 400 ms was lost to a stall of that size.
+const WAIT: Duration = Duration::from_secs(2);
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -231,9 +234,9 @@ impl Network for LoopbackBeacon {
 fn timing() -> Timing {
     Timing {
         resolve: Duration::from_millis(200),
-        identity: Duration::from_secs(1),
-        probe_total: Duration::from_millis(500),
-        discovery_total: Duration::from_secs(5),
+        identity: Duration::from_secs(5),
+        probe_total: Duration::from_secs(5),
+        discovery_total: Duration::from_secs(20),
         beacon_wait: WAIT,
         ..Timing::production()
     }
