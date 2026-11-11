@@ -3314,7 +3314,8 @@ def corrida(run, binarios, tests=1):
     return gh.coste_de([u(run, "A", k, s, tests) for k, s in binarios], {"A"})
 "#;
 
-/// E2.1: the example of the spec by hand. The row `U` is not timed, so `w` and its 100 s are nowhere.
+/// E2.1: the example of the spec by hand. The row `U` is not timed, so `w` and its 100 s are nowhere. The second case has 12
+/// binaries in the timed row `A`: ten of 9.00 s and two of 5.00 s, so only the ten take part in the share.
 const BODY_E2_1: &str = r#"
 unidades = [
     u("r", "A", "x", 4.00, 10),
@@ -3322,7 +3323,8 @@ unidades = [
     u("r", "B", "z", 5.00, 10),
     u("r", "U", "w", 100.00, 1000),
 ]
-print(json.dumps(gh.coste_de(unidades, {"A", "B"})))
+doce = [u("r", "A", "d%02d" % k, 9.00, 4) for k in range(1, 11)] + [u("r", "A", "e%02d" % k, 5.00, 5) for k in (1, 2)]
+print(json.dumps({"ejemplo": gh.coste_de(unidades, {"A", "B"}), "doce": gh.coste_de(doce, {"A"})}))
 "#;
 
 /// E2.2: `lib:memory_industry` runs in two timed rows, `smoke` in one.
@@ -3386,6 +3388,7 @@ def ok(i, cond, que):
 def sin_top(c):
     return {**c, "top10": [t["seg"] for t in c["top10"]]}
 
+con_mas_de_diez = 0
 for i in range(200):
     cron, unidades, total, tests, por_clave, por_fila = generar()
     c = gh.coste_de(unidades, cron)
@@ -3404,6 +3407,9 @@ for i in range(200):
     ok(i, all(abs(t["seg"] - por_clave.get(t["clave"], -1) / 100) < 1e-9 for t in top), f"top10 seconds {top}")
     ok(i, all(cs / 100 <= top[-1]["seg"] + 1e-9 for k, cs in por_clave.items() if k not in nombres), f"a key out of {top}")
     ok(i, -1e-9 <= c["cuota_top10"] <= 1 + 1e-9, f"cuota_top10 {c['cuota_top10']}")
+    suma10 = sum(sorted(por_clave.values(), reverse=True)[:10])
+    ok(i, abs(c["cuota_top10"] - suma10 / total) < 1e-9, f"cuota_top10 {c['cuota_top10']}, want {suma10}/{total} cs")
+    con_mas_de_diez += len(por_clave) > 10
     solo_lo_que_cuenta = [x for x in unidades if x["id"] in cron and not x["clave"].startswith("self-test:")]
     barajadas = list(unidades)
     rng.shuffle(barajadas)
@@ -3412,7 +3418,8 @@ for i in range(200):
         d = gh.coste_de(otra, cron)
         ok(i, mismo(sin_top(c), sin_top(d)), f"{que} changes the result: {c} and {d}")
         ok(i, not sin_empates or nombres == [t["clave"] for t in d["top10"]], f"{que} changes the top10")
-print("e2p runs=200")
+assert con_mas_de_diez >= 1, f"seed={SEED}: no run had more than 10 keys, so the share never left a binary out of the top"
+print(f"e2p runs=200 over10={con_mas_de_diez}")
 "#;
 
 /// E2.4: the history on disk, in the order it was written. The units of `v01` went to the folder of the day before its
@@ -3558,7 +3565,8 @@ fn with_text<'a>(lines: &'a [String], part: &str) -> Vec<&'a String> {
 /// E2.1: the cost per test, per row and the share of the top, from the example of the spec worked out by hand.
 #[test]
 fn e2_1_coste_de_da_el_coste_por_test_por_fila_y_la_cuota_del_ejemplo_a_mano() {
-    let c = e2_json("e2-1", BODY_E2_1);
+    let v = e2_json("e2-1", BODY_E2_1);
+    let c = v["ejemplo"].clone();
     assert_eq!(c["tests"].as_u64(), Some(20), "{c}");
     near(&c["seg"], 10.0, "seg");
     near(&c["por_test"], 0.5, "por_test");
@@ -3569,6 +3577,23 @@ fn e2_1_coste_de_da_el_coste_por_test_por_fila_y_la_cuota_del_ejemplo_a_mano() {
     near(&c["filas"]["B"]["por_test"], 0.5, "por_test of B");
     assert_top(&c, &[("z", 5.0), ("x", 4.0), ("y", 1.0)]);
     assert!(c["filas"].get("U").is_none(), "row U is not timed: {c}");
+
+    // 12 binaries: the top keeps the ten of 9.00 s, and the share is 90.00 of 100.00 s (10 x 9.00 + 2 x 5.00), not 1.
+    let d = &v["doce"];
+    assert_eq!(d["tests"].as_u64(), Some(50), "{d}");
+    near(&d["seg"], 100.0, "seg of 12 binaries");
+    near(&d["por_test"], 2.0, "por_test of 12 binaries");
+    near(&d["cuota_top10"], 0.9, "cuota_top10 of 12 binaries");
+    let top = top_of(d);
+    assert_eq!(top.len(), 10, "the top of 12 binaries has 10: {d}");
+    assert!(
+        top.iter().all(|(_, seg)| (seg - 9.0).abs() < 1e-9),
+        "{top:?}"
+    );
+    let mut names: Vec<String> = top.into_iter().map(|(k, _)| k).collect();
+    names.sort();
+    let want: Vec<String> = (1..=10).map(|k| format!("d{k:02}")).collect();
+    assert_eq!(names, want, "the two of 5.00 s are out of the top: {d}");
 }
 
 /// E2.2: a binary in two timed rows adds up in the top and counts in each row.
@@ -3623,6 +3648,9 @@ fn e2_4_coste_base_toma_las_10_ultimas_verdes_del_mismo_modo_y_tabla() {
         "the median of the base is 0.5000: {}",
         run[0]
     );
+    // 0.2 / 0.5 = 0.40; every run of the base has one binary, so the median of their shares is 1.000.
+    let want = "cost: run mode=serie tests=10 seg=2.00 per_test=0.2000 median=0.5000 ratio=0.40 top10_share=1.000 median_share=1.000 baseline=10/10";
+    assert_eq!(run[0], want, "the line of the run against a base of 10");
 }
 
 /// E2.5: with 9 runs in the base there is no median and no alarm, however far the current run is.
@@ -3651,10 +3679,21 @@ fn e2_6_sobre_1_10_veces_la_mediana_alarma_y_en_1_10_justo_no() {
     assert!(lineas.contains(&run), "no `{run}` in {lineas:?}");
     assert!(lineas.contains(&row), "no `{row}` in {lineas:?}");
     assert_eq!(alarmas, [run, row], "the alarms apart, the run first");
+    // 0.551 / 0.5 = 1.102, which prints as 1.10; the median of the row is the one of its 10 runs, 0.5000.
+    let fila = "cost: row A tests=10 seg=5.51 per_test=0.5510 median=0.5000 ratio=1.10";
+    assert!(
+        lineas.iter().any(|l| l == fila),
+        "no `{fila}` in {lineas:?}"
+    );
     let (lineas, alarmas) = comparar_of(&v["justo"]);
     let con_alarma = with_text(&lineas, "ALARM");
     assert!(con_alarma.is_empty(), "0.55 does not alarm: {con_alarma:?}");
     assert!(alarmas.is_empty(), "{alarmas:?}");
+    let fila = "cost: row A tests=10 seg=5.50 per_test=0.5500 median=0.5000 ratio=1.10";
+    assert!(
+        lineas.iter().any(|l| l == fila),
+        "no `{fila}` in {lineas:?}"
+    );
 }
 
 const E2_7_ALARM: &str = "cost: ALARM top 1 b12 entered the 10 slowest: it was in none of the 10 slowest of the last 10 green serie runs of this table; the verdict does not change";
@@ -3719,10 +3758,20 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 running 1 test
 "#;
 
-/// What the planner prints after its last `dag: step` for the table of `e2_table` with the log `LOG_DOS`.
+/// What the planner prints after its last `dag: step` for the table of `e2_table` with the log `LOG_DOS`, with no history.
 const E2_LINES: [&str; 5] = [
     "cost: run mode=serie tests=3 seg=21.82 per_test=7.2733 median=n/a ratio=n/a top10_share=1.000 median_share=n/a baseline=0/10",
     "cost: no median yet: 0 of 10 green serie runs of this table",
+    "cost: row tests tests=3 seg=21.82 per_test=7.2733 median=n/a ratio=n/a",
+    "cost: top 1 lib:memory_industry seg=21.51 share=0.986 median=n/a ratio=n/a",
+    "cost: top 2 smoke seg=0.31 share=0.014 median=n/a ratio=n/a",
+];
+
+/// The same run after a first green run of the same mode and table: a base of 1, so still no median and no alarm. Only the
+/// base counts (`baseline=1/10` and `1 of 10`); the medians stay `n/a` with fewer than 10 runs, and no top line is ` new`.
+const E2_LINES_BASE_1: [&str; 5] = [
+    "cost: run mode=serie tests=3 seg=21.82 per_test=7.2733 median=n/a ratio=n/a top10_share=1.000 median_share=n/a baseline=1/10",
+    "cost: no median yet: 1 of 10 green serie runs of this table",
     "cost: row tests tests=3 seg=21.82 per_test=7.2733 median=n/a ratio=n/a",
     "cost: top 1 lib:memory_industry seg=21.51 share=0.986 median=n/a ratio=n/a",
     "cost: top 2 smoke seg=0.31 share=0.014 median=n/a ratio=n/a",
@@ -3756,22 +3805,27 @@ fn cost_lines(out: &str) -> Vec<&str> {
     out.lines().filter(|l| l.starts_with("cost:")).collect()
 }
 
-/// The five lines of `E2_LINES` follow the last `dag: step`, and there are no others.
-fn assert_cost_after_the_steps(p: &Plan) {
+/// The lines of `want` follow the last `dag: step`, and there are no others.
+fn assert_cost_after_the_steps(p: &Plan, want: &[&str]) {
     let lines: Vec<&str> = p.out.lines().collect();
     let last = lines
         .iter()
         .rposition(|l| l.starts_with("dag: step"))
         .unwrap_or_else(|| panic!("no `dag: step` line: {}", p.out));
-    let after: Vec<&str> = lines.iter().skip(last + 1).take(5).copied().collect();
+    let after: Vec<&str> = lines
+        .iter()
+        .skip(last + 1)
+        .take(want.len())
+        .copied()
+        .collect();
     assert_eq!(
-        after, E2_LINES,
+        after, want,
         "the lines after the last `dag: step`:\n{}",
         p.out
     );
     let all = cost_lines(&p.out);
     assert_eq!(
-        all, E2_LINES,
+        all, want,
         "every `cost:` line, and none before the steps:\n{}",
         p.out
     );
@@ -3794,7 +3848,7 @@ fn e2_9_una_corrida_verde_imprime_el_coste_tras_las_dag_step_y_lo_deja_en_su_reg
     let p = plan(&base, &table, &root, &scripts(), &[]);
     assert_eq!(p.code, Some(0), "two green rows: {}{}", p.out, p.err);
     assert_eq!(history_lines(&p.err), 0, "{}", p.err);
-    assert_cost_after_the_steps(&p);
+    assert_cost_after_the_steps(&p, &E2_LINES);
     let corridas = records(&root, "corridas.jsonl");
     assert_eq!(corridas.len(), 1, "one run line: {corridas:?}");
     let coste = &corridas[0]["coste"];
@@ -3867,8 +3921,9 @@ fn e2_11_unas_unidades_ilegibles_dejan_el_coste_sin_calcular() {
     assert!(coste.is_some_and(Value::is_null), "coste: {coste:?}");
 }
 
-/// E2.12: a failure inside the cost does not change the verdict. A history with a byte that is not UTF-8 and a line that is not
-/// JSON gives the same lines as a clean one; a `coste_base` that raises is one `history:` line and no cost line.
+/// E2.12: a failure inside the cost does not change the verdict. A first green run seeds the base; two broken lines (a byte
+/// that is not UTF-8 and a line that is not JSON) are appended to the very `unidades.jsonl` the base reads, so the second run
+/// has to read them and still gives the lines of a base of 1; a `coste_base` that raises is one `history:` line and no cost line.
 #[test]
 fn e2_12_un_fallo_dentro_del_calculo_no_cambia_el_veredicto() {
     let base = scratch("e2-12-corrupto");
@@ -3876,12 +3931,30 @@ fn e2_12_un_fallo_dentro_del_calculo_no_cambia_el_veredicto() {
     write(&log, LOG_DOS);
     let table = e2_table(&base, &format!("/bin/cat {}", path_str(&log)));
     let root = base.join("historial");
-    let dia = root.join(REPO).join("19700101");
-    fs::create_dir_all(&dia).expect("day folder");
-    fs::write(dia.join("unidades.jsonl"), b"\xff\nno es json\n").expect("corrupt unidades");
+    let primera = plan(&base, &table, &root, &scripts(), &[]);
+    assert_eq!(
+        primera.code,
+        Some(0),
+        "the seed: {}{}",
+        primera.out,
+        primera.err
+    );
+    assert_cost_after_the_steps(&primera, &E2_LINES);
+    let files = files_named(&root, "unidades.jsonl");
+    assert_eq!(files.len(), 1, "one day folder with units: {files:?}");
+    let mut fh = fs::OpenOptions::new()
+        .append(true)
+        .open(&files[0])
+        .expect("unidades.jsonl to append to");
+    fh.write_all(b"\xff\nno es json\n")
+        .expect("the broken lines");
+    drop(fh);
     let p = plan(&base, &table, &root, &scripts(), &[]);
     assert_eq!(p.code, Some(0), "a corrupt history: {}{}", p.out, p.err);
-    assert_cost_after_the_steps(&p);
+    assert_eq!(history_lines(&p.err), 0, "no `history:` line: {}", p.err);
+    let corridas = records(&root, "corridas.jsonl");
+    assert_eq!(corridas.len(), 2, "the seed and this run: {corridas:?}");
+    assert_cost_after_the_steps(&p, &E2_LINES_BASE_1);
 
     let base = scratch("e2-12-lanza");
     let log = base.join("dos-binarios.log");
