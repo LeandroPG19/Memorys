@@ -1652,6 +1652,12 @@ def usage(why):
     sys.exit(1)
 if not args or args[0] != "mutants":
     usage("the first argument of cargo-mutants is `mutants`")
+# 27.1.0 puts --copy-target, --gitignore and --no-copy-target in one clap group (`copy_opts`): two of them in one
+# call is a usage error, and the real one said so on 2026-11-11 to a lab call that carried --copy-target=true
+# and --gitignore=false. Only what comes before the `--` of the test arguments is cargo-mutants' own.
+copy_opts = [x for x in (args[:args.index("--")] if "--" in args else args) if x.split("=")[0] in ("--copy-target", "--gitignore", "--no-copy-target")]
+if len(copy_opts) > 1:
+    usage(f"the argument '{copy_opts[0]}' cannot be used with '{copy_opts[1]}'")
 def value(flag):
     return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
 for flag in ("--jobs", "--jobserver-tasks"):
@@ -1935,12 +1941,18 @@ FAKE
     echo "FAIL self-test: F6a.1: cargo-mutants did not get --file twice: $q_line" >&2
     exit 1
   fi
-  for want in ' --in-diff ' ' --exclude-re ' ' --timeout 90 ' ' --gitignore=false' ' --cargo-arg=--lib' ' --dir ' ' --copy-target=true'; do
+  for want in ' --in-diff ' ' --exclude-re ' ' --timeout 90 ' ' --cargo-arg=--lib' ' --dir ' ' --copy-target=true'; do
     if [[ "$q_line" != *"$want"* ]]; then
       echo "FAIL self-test: F6a.1: cargo-mutants did not get '$want' from the full step: $q_line" >&2
       exit 1
     fi
   done
+  # --copy-target=true is the lab's, and 27.1.0 refuses it next to --gitignore (one clap group): gitignore is false
+  # by default there, so the lab call carries no --gitignore at all.
+  if [[ "$q_line" == *'--gitignore'* ]]; then
+    echo "FAIL self-test: F6a.1: the lab call carries --gitignore next to --copy-target=true, which cargo-mutants 27.1.0 refuses: $q_line" >&2
+    exit 1
+  fi
   if [[ "$q_line" != *' --jobserver-tasks 7 '* ]]; then
     echo "FAIL self-test: F6a.1: no --jobserver-tasks 7 (the cargo jobs of this run) in the call: $q_line" >&2
     exit 1
@@ -2282,6 +2294,10 @@ def values(flag):
 
 if not args or args[0] != "mutants":
     usage("the first argument of cargo-mutants is `mutants`")
+# The same refusal as the stand-in above: --copy-target, --gitignore and --no-copy-target are one clap group.
+copy_opts = [x for x in (args[:args.index("--")] if "--" in args else args) if x.split("=")[0] in ("--copy-target", "--gitignore", "--no-copy-target")]
+if len(copy_opts) > 1:
+    usage(f"the argument '{copy_opts[0]}' cannot be used with '{copy_opts[1]}'")
 listed = json.load(open(os.environ["FAKE_LIST_JSON"], encoding="utf-8"))
 if "--list" in args:
     note("list", " ".join(args))
