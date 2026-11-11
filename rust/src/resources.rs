@@ -1014,6 +1014,36 @@ mod tests {
         assert!(p.worker_threads >= 1, "{}", p.describe());
     }
 
+    #[cfg(target_os = "linux")]
+    fn meminfo_kib(field: &str) -> u64 {
+        std::fs::read_to_string("/proc/meminfo")
+            .expect("/proc/meminfo is how this test knows the machine's memory apart from sysinfo")
+            .lines()
+            .find_map(|line| {
+                let rest = line.strip_prefix(field)?.strip_prefix(':')?;
+                rest.split_whitespace().next()?.parse().ok()
+            })
+            .unwrap_or_else(|| panic!("/proc/meminfo has no `{field}` line"))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_reads_ram_and_swap_in_mib_as_the_kernel_reports_them() {
+        let m = probe();
+
+        assert_eq!(
+            m.ram_total_mb,
+            meminfo_kib("MemTotal") / 1024,
+            "ram_total_mb has to be MemTotal in MiB: {m:?}. A unit slip here (kB, bytes, MB of 10^6) \
+             changes the budget every model and every worker is sized from, on every install"
+        );
+        assert_eq!(
+            m.swap_total_mb,
+            meminfo_kib("SwapTotal") / 1024,
+            "swap_total_mb has to be SwapTotal in MiB: {m:?}"
+        );
+    }
+
     #[test]
     fn a_model_the_plan_left_out_is_pointed_at_the_disable_sentinel() {
         let starved = plan(&container_512mb());
