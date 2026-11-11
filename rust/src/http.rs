@@ -2312,7 +2312,10 @@ async fn dispatch_one(
     }
 
     let served = async move {
-        crate::session::with_scope(scope, protocol::handle_request(&pool, request)).await
+        // In a box so that the `with_*` wrappers around it carry a pointer, not the future by
+        // value: each one doubles it, sqlx 0.9.0 made `mcp_endpoint` 121152 bytes, and a
+        // worker (or a debug test thread) has a 2 MiB stack.
+        crate::session::with_scope(scope, Box::pin(protocol::handle_request(&pool, request))).await
     };
     let work = async {
         let rooted = crate::session::with_root_project(
