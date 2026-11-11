@@ -3738,7 +3738,7 @@ fn the_self_tests_do_not_move_the_cgroup_of_the_test() {
 /// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
 /// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
 /// self-test that takes it as its own fixture's identity is red under any other value.
-const JUDGE_ENVIRONMENT: [(&str, &str); 33] = [
+const JUDGE_ENVIRONMENT: [(&str, &str); 34] = [
     ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
     // CI-F3.3b-1b-i (D-F3k): merge-gate.sh exports the lock's directory so that the planner can write the
     // lane tickets under it. gate-lock.sh assigns GATE_LOCK itself, so no self-test reads what it inherits.
@@ -3768,6 +3768,10 @@ const JUDGE_ENVIRONMENT: [(&str, &str); 33] = [
     ("CUBA_EMBEDDING_DIM", "7"),
     ("CUBA_EMBED_MODEL", "ajeno"),
     ("CUBA_POOLING", "ajeno"),
+    // CI-D5b (D-D5b-f): gate_model_env exports it on 1 when nobody set it, so the processes of a test run (the official
+    // builds of ONNX Runtime 1.31 send telemetry by default) open no connection. A foreign value, so a self-test that
+    // reads it fails here and not under the judge.
+    ("ORT_DISABLE_TELEMETRY", "ajeno"),
     // CI-J9: the planner hands a step the token of its lane ticket (gate-dag.py, D-F3j). A self-test
     // that inherits it spends or refuses a ticket of a gate it is not part of.
     ("CUBA_GATE_LANE_TOKEN", "ajena-0000"),
@@ -4209,6 +4213,64 @@ fn the_model_environment_is_set_in_one_place() {
             .any(|(_, line)| line.trim() == "gate_model_env"),
         "scripts/merge-gate.sh calls gate_model_env: the only step that did (the build with docs) runs no test now, and a \
          call here is a second place that chooses the models (CI-K8)"
+    );
+}
+
+/// CI-D5b (D5b.8). The official builds of ONNX Runtime 1.31 send telemetry to Microsoft unless
+/// `ORT_DISABLE_TELEMETRY` is set before the library starts, and a test must not wait on the network or open a
+/// connection of its own (`ci-rapido`). `gate_model_env` is where the judge sets the environment of every process that
+/// loads the runtime, so it sets this one too: on 1 when the caller did not decide, and never over a value the caller
+/// set. The function is sourced and called in a bash with an empty HOME, so what is read is what it exports and not
+/// what the machine that runs the test had in its cache.
+#[test]
+fn the_judge_turns_onnx_runtime_telemetry_off_unless_the_caller_decided() {
+    let home = std::env::temp_dir().join(format!("gate-model-env-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("creating the empty home of the check");
+    let script = [
+        "source scripts/gate-lock.sh",
+        "( unset ORT_DISABLE_TELEMETRY; gate_model_env; echo \"NOTHING_SET=${ORT_DISABLE_TELEMETRY-unset}\" )",
+        "( export ORT_DISABLE_TELEMETRY=0; gate_model_env; echo \"OPERATOR_SET=${ORT_DISABLE_TELEMETRY-unset}\" )",
+        "",
+    ]
+    .join("\n");
+
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(git_bash())
+        .arg("-s")
+        .current_dir(repo_root())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    child
+        .stdin
+        .take()
+        .expect("bash was given a pipe for its script")
+        .write_all(script.as_bytes())
+        .expect("hand the script to bash");
+    let out = child.wait_with_output().expect("bash finishes");
+    let _ = std::fs::remove_dir_all(&home);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "the script that sources gate-lock.sh and calls gate_model_env did not run to its end, so the lines below \
+         prove nothing. stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "NOTHING_SET=1"),
+        "gate_model_env has to export ORT_DISABLE_TELEMETRY=1 when the caller did not set it, or every process of a \
+         test run that loads ONNX Runtime 1.31 tries to reach Microsoft. stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "OPERATOR_SET=0"),
+        "gate_model_env has to leave a value the caller set as it is: the operator who exported 0 asked for \
+         telemetry on. stdout: {stdout}\nstderr: {stderr}"
     );
 }
 

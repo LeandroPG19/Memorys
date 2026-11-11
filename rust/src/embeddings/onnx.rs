@@ -1874,4 +1874,36 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&empty_home);
     }
+
+    /// CI-D5b (D5b.8). From 1.31 the official builds of ONNX Runtime send
+    /// telemetry to Microsoft unless `ORT_DISABLE_TELEMETRY` is set before the
+    /// library starts, and the only place that runs ahead of it in the daemon is
+    /// `main`, which calls this. An operator who set the variable keeps their
+    /// value, whatever it is: it is theirs to decide, and `set_var` over it
+    /// would be a second opinion nobody asked for. The environment is only
+    /// written under the global guard: `set_var` is unsound next to a reader.
+    #[tokio::test]
+    async fn the_daemon_turns_onnx_runtime_telemetry_off_and_leaves_the_operators_word_alone() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        {
+            let _unset = ScopedEnv::cleared("ORT_DISABLE_TELEMETRY");
+            keep_onnx_runtime_telemetry_off();
+            assert_eq!(
+                std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref(),
+                Some("1"),
+                "nobody decided, so telemetry is off: the variable is the only thing that stops \
+                 the first event and the persistent device identifier"
+            );
+        }
+        {
+            let _operator = ScopedEnv::set("ORT_DISABLE_TELEMETRY", "0");
+            keep_onnx_runtime_telemetry_off();
+            assert_eq!(
+                std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref(),
+                Some("0"),
+                "an operator who set it to \"0\" asked for telemetry on, and the daemon respects it"
+            );
+        }
+    }
 }

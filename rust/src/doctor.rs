@@ -3147,3 +3147,88 @@ mod account_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod onnx_runtime_tests {
+    use super::*;
+
+    /// CI-D5b (D5b.7). What `doctor` says about the ONNX Runtime the process
+    /// loaded, against the version `models runtime` installs. A runtime older
+    /// than the pinned one still works (`ort` takes 1.24 on), so it is a
+    /// warning and never a failure: `doctor` exits 1 on a failure. The origin
+    /// is named and not its path, because the output is pasted into chats.
+    #[test]
+    fn doctor_says_which_onnx_runtime_it_loaded_and_warns_when_it_is_older_than_the_pinned_one() {
+        let pinned = "1.31.1";
+
+        let same = runtime_version_check("1.31.1", pinned, Some("cuda13"), false);
+        assert_eq!(same.name, "onnx_runtime");
+        assert_eq!(
+            same.status,
+            Status::Ok,
+            "the pinned version is the healthy case"
+        );
+        assert!(
+            same.detail.contains("1.31.1") && same.detail.contains("cuda13"),
+            "the version and the flavor that were loaded: {}",
+            same.detail
+        );
+
+        let newer = runtime_version_check("1.32.0", pinned, None, false);
+        assert_eq!(
+            newer.status,
+            Status::Ok,
+            "a newer runtime works: `ort` takes any minor from 24 on"
+        );
+        assert!(
+            newer.detail.contains("1.32.0") && newer.detail.contains("no probada"),
+            "but it says it was not tried with this version: {}",
+            newer.detail
+        );
+
+        let older = runtime_version_check("1.26.0", pinned, None, false);
+        assert_eq!(
+            older.status,
+            Status::Warn,
+            "a runtime older than the one this version installs is a warning, not a failure"
+        );
+        assert!(
+            older.detail.contains("1.26.0") && older.detail.contains("más vieja"),
+            "it names the version it loaded and says it is older: {}",
+            older.detail
+        );
+        assert!(
+            older
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("memory-industry models runtime")),
+            "the way out of a runtime from the cache is the command that replaces it: {:?}",
+            older.hint
+        );
+
+        let by_variable = runtime_version_check("1.24.4", pinned, None, true);
+        assert_eq!(
+            by_variable.status,
+            Status::Warn,
+            "the only official DirectML build is 1.24.4 and an operator may point at it on \
+             purpose: it is still older than the pinned one, and `doctor` says so"
+        );
+        assert!(
+            by_variable
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("ORT_DYLIB_PATH")),
+            "a runtime the operator pointed at is changed in the variable and not by \
+             `models runtime`, which would install one the process does not read: {:?}",
+            by_variable.hint
+        );
+
+        for check in [&same, &newer, &older, &by_variable] {
+            assert!(
+                !check.detail.contains('/') && !check.detail.contains('\\'),
+                "no path in the detail, only where it came from: {}",
+                check.detail
+            );
+        }
+    }
+}

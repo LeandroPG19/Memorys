@@ -564,3 +564,39 @@ async fn the_embedder_vectors_through_the_product_path_stay_within_the_noise_of_
 
     judge_vectors(&vectors, expected::EMBEDDER_ENV, expected::VECTORS);
 }
+
+/// CI-D5b (D5b.11). This file measures the vectors of the embedder with the ONNX Runtime the judge loads, and
+/// `models runtime` installs the one `ORT_VERSION` pins. If the two differ the guard above is judging a runtime
+/// nobody installs: the vectors would stay green against 1.26.0 for as long as the judge kept it, and the day an
+/// install got 1.31.1 they would move without a test saying so. Read here and not in `gate_model_env`, because
+/// what is loaded is only known by loading it.
+#[tokio::test]
+async fn the_judge_measures_the_runtime_the_installer_downloads() {
+    use memory_industry::embeddings::onnx;
+
+    assert!(
+        onnx::model_loaded().await,
+        "the embedder did not load, so no runtime was loaded either (ONNX_MODEL_PATH = {:?}, ORT_DYLIB_PATH = {:?}). \
+         {WITHOUT_THE_MODELS}",
+        std::env::var("ONNX_MODEL_PATH").ok(),
+        std::env::var("ORT_DYLIB_PATH").ok()
+    );
+    assert_eq!(
+        onnx::failure_reason(),
+        None,
+        "the embedder found its files and the session did not open"
+    );
+
+    let pinned = memory_industry::models_cli::ORT_VERSION;
+    let loaded = onnx::loaded_runtime_version().expect(
+        "the embedder is loaded, so the process holds the runtime it loaded and knows its version",
+    );
+    assert_eq!(
+        loaded,
+        pinned,
+        "this judge loads ONNX Runtime {loaded} (ORT_DYLIB_PATH = {:?}) and `memory-industry models runtime` installs \
+         {pinned}: the vectors above are measured on a runtime nobody installs. Install the pinned one with \
+         `memory-industry models runtime` and run again, or point ORT_DYLIB_PATH at a {pinned} library",
+        std::env::var("ORT_DYLIB_PATH").ok()
+    );
+}
