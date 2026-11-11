@@ -2133,6 +2133,51 @@ fn the_exit_file_holds_the_whole_gates_verdict_and_says_running_until_then() {
     );
 }
 
+/// Whether `line` is the line the `part`-th of `parts` parts of a self-test prints when it ends:
+/// `self-test part <part> of <parts>: OK in <S.SS> s`, the seconds with two decimals.
+fn is_part_ok_line(line: &str, part: usize, parts: usize) -> bool {
+    let head = format!("self-test part {part} of {parts}: OK in ");
+    let Some(rest) = line.strip_prefix(head.as_str()) else {
+        return false;
+    };
+    let Some((whole, cents)) = rest.strip_suffix(" s").and_then(|s| s.split_once('.')) else {
+        return false;
+    };
+    !whole.is_empty()
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && cents.len() == 2
+        && cents.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// CI-E3c (E3c.3). `merge-gate.sh --self-test` runs its rows in three parts at once, and each part
+/// says it ended with a line of its own. That line is how the script knows that a part did not stop
+/// halfway with an exit 0, and how this test knows that no part was left out of the run. The
+/// sentence of the readiness rows is still in the verdict: cutting the rows into parts lost none.
+#[test]
+fn the_self_test_of_merge_gate_runs_in_three_parts_and_each_says_its_ok() {
+    let run = judge_env_self_test("merge-gate.sh");
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    for part in 1..=3 {
+        let said = stdout
+            .lines()
+            .filter(|line| is_part_ok_line(line, part, 3))
+            .count();
+        assert_eq!(
+            said,
+            1,
+            "merge-gate.sh --self-test has {said} lines `self-test part {part} of 3: OK in \
+             <S.SS> s` and has to have exactly one: its rows are not run in three parts, or a \
+             part did not say it ended. exit {:?}, stdout: {stdout}",
+            run.output.status.code()
+        );
+    }
+    assert!(
+        stdout.contains("the readiness check hands DATABASE_URL to pg_isready -d as it is"),
+        "the self-test in three parts lost the sentence of its rows for the readiness check, so \
+         nothing shows that those rows still run. stdout: {stdout}"
+    );
+}
+
 /// What `gate_require_database_url` has to say to each URL: the URL, the exit
 /// code, and the words its refusal must contain. `run-all-tests.sh` derives
 /// `brain_gate`, `brain_gate_peer` and `postgres` by replacing what follows the
