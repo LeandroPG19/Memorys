@@ -6501,8 +6501,8 @@ fn rows_keep_a_history_apart_from_the_whole_table_and_the_first_run_is_in_series
 // --- CI-G1: the card the planner looks at, in its plan and in its record -------------------------------------------------
 // The planner asks `gate_gpu_probe` (gate-lock.sh) at its start, prints what it decided at the end of the `plan:` line and keeps it
 // in the plan of the run. The machine is the test's: a directory first on the PATH with an nvidia-smi that answers a card (or
-// fails) and an `ldd` that resolves the libraries of CUDA 13 from the LD_LIBRARY_PATH it is given, a CPU runtime in the HOME of
-// the planner and a GPU runtime of the judge in a GATE_GPU_HOME of the test. Nothing here asks the real card.
+// fails) and an `ldd` that resolves the libraries of CUDA 13 from the LD_LIBRARY_PATH it is given, a CPU runtime in the GATE_RUNTIME_HOME of
+// the test and a GPU runtime of the judge in a GATE_GPU_HOME of the test. Nothing here asks the real card.
 
 const PLANNER_CARD: &str = "NVIDIA GeForce RTX 4070 Ti";
 const NVIDIA_SMI_CARD: &str = "#!/bin/sh\necho \"NVIDIA GeForce RTX 4070 Ti, 10692, 8.9\"\n";
@@ -6555,7 +6555,10 @@ fn gpu_world(fx: &Fixture, host: &Machine, tag: &str, nvidia_smi: &str) -> GpuWo
             "{{\"version\":\"1.31.1\",\"flavor\":\"{flavor}\",\"archive\":\"fixture.tgz\",\"sha256\":\"00\"}}"
         )
     };
-    let cpu_runtime = fx.home.join(".cache/memory-industry/onnxruntime");
+    // CI-D5c-B: the CPU runtime of the judge lives in a HOME of its own, GATE_RUNTIME_HOME, and the test names it so that the
+    // GATE_RUNTIME_HOME of whoever runs `cargo test` is not the one the planner reads.
+    let runtime_home = fx.base.join(format!("runtime-home-{tag}"));
+    let cpu_runtime = runtime_home.join(".cache/memory-industry/onnxruntime");
     let gpu_runtime = gpu_home.join(".cache/memory-industry/onnxruntime");
     for (dir, flavor, libs) in [
         (&cpu_runtime, "cpu", vec!["libonnxruntime.so"]),
@@ -6586,6 +6589,7 @@ fn gpu_world(fx: &Fixture, host: &Machine, tag: &str, nvidia_smi: &str) -> GpuWo
             ("GATE_PROC_MEMINFO", host.meminfo.clone()),
             ("GATE_POWER_SUPPLY_ROOT", host.power.clone()),
             ("GATE_GPU", "auto".to_string()),
+            ("GATE_RUNTIME_HOME", runtime_home.display().to_string()),
             ("GATE_GPU_HOME", gpu_home.display().to_string()),
             (
                 "GATE_WSL_LIB_DIR",

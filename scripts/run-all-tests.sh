@@ -1556,7 +1556,8 @@ FAKE
   g1_run() {
     local name="$1" t="$tmp/$1" held="" holder="" hold=""
     local gpu_home="$tmp/$1/gpu-home"
-    local cpu_rt="$tmp/$1/home/.cache/memory-industry/onnxruntime" gpu_rt="$tmp/$1/gpu-home/.cache/memory-industry/onnxruntime"
+    local runtime_home="$tmp/$1/runtime-home"
+    local cpu_rt="$runtime_home/.cache/memory-industry/onnxruntime" gpu_rt="$tmp/$1/gpu-home/.cache/memory-industry/onnxruntime"
     local -a lanes=(--lane R) extra=()
     shift
     while (( $# )); do
@@ -1657,7 +1658,7 @@ FAKE
       CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
       ONNX_MODEL_PATH="$t/models" CUBA_RERANKER_PATH="$t/reranker" CUBA_NLI_PATH="$t/nli-model" \
       MEMORY_INDUSTRY_LLM_PROVIDER=ollama \
-      GATE_GPU_HOME="$gpu_home" GATE_GPU_LOCK="$t/gpu-juez.lock" GATE_WSL_LIB_DIR="$t/sin-wsl" \
+      GATE_RUNTIME_HOME="$runtime_home" GATE_GPU_HOME="$gpu_home" GATE_GPU_LOCK="$t/gpu-juez.lock" GATE_WSL_LIB_DIR="$t/sin-wsl" \
       ${extra[@]+"${extra[@]}"} \
       /usr/bin/timeout 30 "$BASH" "$t/scripts/run-all-tests.sh" "${lanes[@]}" >"$tmp/$name.out" 2>&1 || rc=$?
     if [[ -n "$holder" ]]; then
@@ -1682,7 +1683,7 @@ FAKE
     line="$(g1_rerank_call "$1")"
     [[ -n "$line" ]] || self_fail "G1.6 ($2): the call of the real reranker was not made: $(tail -n 30 "$tmp/$1.out")"
     g1_fields "$line"
-    [[ "$g1_ort" == "$tmp/$1/home/.cache/memory-industry/onnxruntime/libonnxruntime.so" && "$g1_ld" == unset && "$g1_intra" == unset ]] \
+    [[ "$g1_ort" == "$tmp/$1/runtime-home/.cache/memory-industry/onnxruntime/libonnxruntime.so" && "$g1_ld" == unset && "$g1_intra" == unset ]] \
       || self_fail "G1.6 ($2): the call of the real reranker is not the one of today (ORT=$g1_ort LD=$g1_ld INTRA=$g1_intra): $line"
     if grep -q -- '--ignored' "$tmp/$1/home/timeout.args" 2>/dev/null; then
       self_fail "G1.6 ($2): the call of the real reranker on the CPU runs inside a timeout: $(cat "$tmp/$1/home/timeout.args")"
@@ -1695,7 +1696,7 @@ FAKE
   g1_run g1_ok -- --lane D1 --lane D2 --lane NLI --lane R --lane E
   (( rc == 0 )) || self_fail "G1.5: the chain D1, D2, NLI, R and E on a machine with a card exited $rc, not 0: $(tail -n 30 "$tmp/g1_ok.out")"
   g1_gpu_ort="$tmp/g1_ok/gpu-home/.cache/memory-industry/onnxruntime/libonnxruntime.so"
-  g1_cpu_ort="$tmp/g1_ok/home/.cache/memory-industry/onnxruntime/libonnxruntime.so"
+  g1_cpu_ort="$tmp/g1_ok/runtime-home/.cache/memory-industry/onnxruntime/libonnxruntime.so"
   g1_line="$(g1_marker g1_ok)"
   [[ "$g1_line" == '=== models device: gpu for v017_rerank_gpu ('* ]] \
     || self_fail "G1.5: no line '=== models device: gpu for v017_rerank_gpu (' in the log of an admitted row (the marker was '${g1_line:-none}'): $(tail -n 30 "$tmp/g1_ok.out")"

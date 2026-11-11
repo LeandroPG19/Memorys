@@ -11238,8 +11238,11 @@ impl GpuMachine {
         self.dir.join("nvidia-smi.calls")
     }
 
+    /// Where the judge keeps the ONNX Runtime of the CPU since CI-D5c-B: the `.cache/memory-industry/onnxruntime` of a HOME of its
+    /// own, `GATE_RUNTIME_HOME` (its default is under the HOME of the judge), and never the cache of the live service.
     fn cpu_runtime_dir(&self) -> std::path::PathBuf {
-        self.home.join(".cache/memory-industry/onnxruntime")
+        self.home
+            .join(".cache/memory-industry-gate/runtime-home/.cache/memory-industry/onnxruntime")
     }
 
     fn gpu_runtime_dir(&self) -> std::path::PathBuf {
