@@ -84,6 +84,12 @@ tree-sitter = "0.27.2"
 tree-sitter-rust = "0.24.2"
 tree-sitter-python = "0.25.0"
 
+# Only for the TLS server on loopback of tests/group_no_server/outbound_http_contract.rs, which makes its own certificates so that no key sits in the repository.
+# Both are named without their defaults on purpose: rcgen's default is ring today and tokio-rustls's is aws-lc-rs, and `cargo tree -i aws-lc-rs` has to stay empty.
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+
 [features]
 default = ["docs"]
 cuda = ["ort/cuda"]
