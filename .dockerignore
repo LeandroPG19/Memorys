@@ -1,0 +1,11 @@
+# Both Dockerfiles build from the repo root and need only the Rust crate, its toolchain and the Python metadata.
+# Everything else (rust/target is tens of GB, .git, backlog, docs) stays out of the build context.
+*
+!rust-toolchain.toml
+!pyproject.toml
+!README.md
+!rust/Cargo.toml
+!rust/Cargo.lock
+!rust/src
+!rust/migrations
+!rust/embed

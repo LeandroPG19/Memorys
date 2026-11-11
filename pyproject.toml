@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.8,<2.0"]
+requires = ["maturin>=1.16,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -8,7 +8,7 @@ version = "1.33.0"
 description = "MemoryIndustry — Persistent memory MCP server for AI agents. 31 tools, self-growing graph without MCP sampling, poisoning quarantine: bitemporal facts, sqlx-migrate, BM25+MMR+OOD hybrid retrieval, graph metrics, conformal prediction, Hebbian/BCM, project scoping, tamper-evident audit chain (21 CFR Part 11-oriented), tree-sitter codegraph, git-native sync hooks. Rust + PostgreSQL + pgvector."
 readme = "README.md"
 license = { text = "Apache-2.0" }
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 keywords = [
     "mcp",
     "memory",
