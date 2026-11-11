@@ -50,6 +50,21 @@ SHA="$(cat "$HERE/SHA.txt" 2>/dev/null || git -C "$ROOT" rev-parse --short HEAD 
 
 # Telemetría de ONNX Runtime apagada en todo lo que arranca esta prueba: los ejemplos y los tests no pasan por main.
 export ORT_DISABLE_TELEMETRY=1
+# cargo is also called from outside the tree (--manifest-path): without a default toolchain rustup cannot choose one.
+RUSTUP_TOOLCHAIN="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml" 2>/dev/null | head -1)"
+[[ -n "$RUSTUP_TOOLCHAIN" ]] && export RUSTUP_TOOLCHAIN || unset RUSTUP_TOOLCHAIN
+# doctor opens the database before any check: it gets a throwaway one (the judge's container), never the user's.
+if [[ -z "${GPU_QA_DATABASE_URL:-}" && -r "$HERE/../juez-win-031/base-del-juez.env" ]]; then
+  GPU_QA_DATABASE_URL="$(sed -n 's/^DATABASE_URL=//p' "$HERE/../juez-win-031/base-del-juez.env" | head -1)"
+fi
+case "${GPU_QA_DATABASE_URL:-}" in
+  *:5488/* | *:5488) echo "GUARDA: GPU_QA_DATABASE_URL apunta al puerto 5488 (la base del usuario)" >&2; exit 2 ;;
+esac
+if [[ -n "${GPU_QA_DATABASE_URL:-}" ]]; then
+  DBENV=("DATABASE_URL=$GPU_QA_DATABASE_URL" MEMORY_INDUSTRY_REQUIRE_DATABASE_URL=1)
+else
+  DBENV=(-u DATABASE_URL)
+fi
 
 # ----------------------------------------------------------------------------- registro de pasos
 R_ID=() R_STATE=() R_WHY=()
@@ -72,7 +87,19 @@ runenv() {
     shift
   done
   shift
-  env "${vars[@]}" "$@"
+  # env wants its options before the assignments: `env A=1 -u B cmd` takes `-u` for the command (Git Bash, 2026-11-11).
+  local -a opts=() sets=()
+  local i=0
+  while ((i < ${#vars[@]})); do
+    if [[ "${vars[i]}" == -u ]]; then
+      opts+=(-u "${vars[i + 1]}")
+      i=$((i + 2))
+    else
+      sets+=("${vars[i]}")
+      i=$((i + 1))
+    fi
+  done
+  env "${opts[@]}" "${sets[@]}" "$@"
 }
 
 # La ruta tal como la ve un programa nativo: en Windows, la de Windows.
@@ -117,6 +144,7 @@ models_env() {
 
 # ----------------------------------------------------------------------------- el comparador (no es código del producto)
 cat >"$T/comparar.py" <<'PY'
+import sys as _s; _s.stdout.reconfigure(encoding="utf-8", errors="replace")
 import re, sys
 
 def ranking(path):
@@ -171,6 +199,7 @@ sys.exit(main())
 PY
 
 cat >"$T/nli.py" <<'PY'
+import sys as _s; _s.stdout.reconfigure(encoding="utf-8", errors="replace")
 import re, sys
 
 def rows(path):
@@ -192,6 +221,7 @@ sys.exit(1 if bad else 0)
 PY
 
 cat >"$T/doctor.py" <<'PY'
+import sys as _s; _s.stdout.reconfigure(encoding="utf-8", errors="replace")
 import json, sys
 
 text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
@@ -367,7 +397,7 @@ with_cuda() {
 doctor_of() {
   local home_dir="$1" dirs="$2" out="$3"
   with_cuda "$dirs" HOME="$(nat "$home_dir")" USERPROFILE="$(nat "$home_dir")" \
-    ORT_DYLIB_PATH="$(nat "$(runtime_lib "$home_dir")")" "${MODELS_ENV[@]}" -u DATABASE_URL -- \
+    ORT_DYLIB_PATH="$(nat "$(runtime_lib "$home_dir")")" "${MODELS_ENV[@]}" "${DBENV[@]}" -- \
     "$BIN" doctor --json --deep >"$out" 2>>"$LOG"
   true
 }
@@ -567,7 +597,12 @@ if ((WIN)); then
   before="$(record_of "$HV7")"
   if models_runtime "$HV7" --gpu --cuda 12; then
     kill "$holder" 2>/dev/null
-    fail V7 "el reemplazo con la DLL en uso salió bien: no debería poder"
+    # Since CI-D5c-A the swap moves the old directory aside and leaves it for the next run when a file is in use.
+    if grep -q "no pude borrar el runtime anterior, en uso" "$HV7.out" && [[ "$(record_of "$HV7")" == *'"flavor":"cuda12"'* ]]; then
+      ok V7 "con la DLL en uso el runtime nuevo quedó puesto y el anterior apartado para borrarlo en la siguiente corrida (lo dice)"
+    else
+      fail V7 "el reemplazo con la DLL en uso salió 0 sin decir que el anterior sigue en uso: $(tail -3 "$HV7.out" | tr '\n' ' ')"
+    fi
   elif grep -q "en uso: para el daemon y vuelve a correr" "$HV7.out" \
     && [[ "$(record_of "$HV7")" == "$before" && -f "$HV7/.cache/memory-industry/onnxruntime.downloading/runtime.json" ]]; then
     kill "$holder" 2>/dev/null
@@ -607,7 +642,7 @@ with zipfile.ZipFile(d + "/dml.zip") as z:
             open(d + "/DirectML.dll", "wb").write(z.read(n))
 ' "$HD" >>"$LOG" 2>&1
       fi
-      with_cuda "$CU13" HOME="$(nat "$H13")" USERPROFILE="$(nat "$H13")" ORT_DYLIB_PATH="$(nat "$HD/onnxruntime.dll")" CUBA_RERANK_DEVICE=gpu "${MODELS_ENV[@]}" -u DATABASE_URL -- \
+      with_cuda "$CU13" HOME="$(nat "$H13")" USERPROFILE="$(nat "$H13")" ORT_DYLIB_PATH="$(nat "$HD/onnxruntime.dll")" CUBA_RERANK_DEVICE=gpu "${MODELS_ENV[@]}" "${DBENV[@]}" -- \
         "$BIN" doctor --json --deep >"$T/doctor-dml.json" 2>>"$LOG"
       ok V8 "DirectML 1.24.4 (se anota, sin veredicto de producto): onnx_runtime=$(field "$T/doctor-dml.json" onnx_runtime status) «$(field "$T/doctor-dml.json" onnx_runtime detail)»; pista «$(field "$T/doctor-dml.json" onnx_runtime hint)»; gpu «$(field "$T/doctor-dml.json" gpu detail)»"
     else
