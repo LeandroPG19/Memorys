@@ -14,6 +14,9 @@ history of this table or with a DATABASE_URL in the environment runs in series, 
 planner: TERM and HUP stop it, and its exit stops every step and every `paso-*` cgroup of the scope (J14b).
 The planner measures the machine before it starts (cores, RAM free, disk, battery) and prints its plan in one line,
 `plan: ...` (CI-K4, D-K4q); a measure that cannot be read is a series with one job and the line says what (D-K4o).
+CI-G1: the same measure asks `gate_gpu_probe` (gate-lock.sh) whether lane R can use the card, and the line ends in
+`gpu=<candidate|cpu|unmanaged> (<why>)`; the plan of the run keeps it as `gpu` (pedido, decision, motivo, vram_libre_mb). The
+decision is informative (lane R asks again when it starts); a GATE_GPU that is not auto, cpu or gpu is exit 2 before any step.
 CI-E4: each step and the run leave their CPU, their mean cores (CPU over seconds) and the seconds spent in series
 (gate_history.serie_final) in the history, and the run its peak: `memory.peak` of the scope through a descriptor of its own,
 zeroed when the planner starts and read when it closes, and the memory.stat of the highest `memory.current` it sampled (at
@@ -101,6 +104,8 @@ POOLS = {
 PLAN_THREADS_RE = re.compile(r"hilos: embed=(\d+) rerank=(\d+) nli=(\d+)")
 PLAN_TIER_RE = re.compile(r"nivel=(\S+)")
 PLAN_GPU_RE = re.compile(r"reranker=\S+ \(GPU\)")
+# CI-G1: what GATE_GPU takes (empty is `auto`); lane R of run-all-tests.sh reads the same variable.
+GPU_ASKED = frozenset({"", "auto", "cpu", "gpu"})
 MEM_AVAILABLE_RE = re.compile(r"^MemAvailable:\s+(\d+) kB", re.MULTILINE)
 # CI-F3.3b-2 (spec F3.3b-1b-iii): `untimed` schedules as `normal`; its block is past the judge's boundary line.
 CLASSES = frozenset({"normal", "exclusive", "untimed"})
@@ -793,14 +798,20 @@ class Measure:
         self.free_ram_kb: int | None = None
         self.jobs: int = 1
         self.why: str = ""
+        # CI-G1: what `gate_gpu_probe` of gate-lock.sh decided about the card; `vram_mb` is the text it printed ("" without a card).
+        self.gpu_decision: str = "cpu"
+        self.gpu_why: str = "the machine was not probed"
+        self.gpu_vram_mb: str = ""
 
 
 # One bash does the counting of gate-lock.sh, so the jobs of `gate_cargo_jobs` and the jobs of the plan are one number:
-# its fields, in the order of MEASURE_FIELDS, NUL separated.
+# its fields, in the order of MEASURE_FIELDS, NUL separated. The last three are the card (CI-G1, `gate_gpu_probe`): a probe that
+# fails is a `cpu` with its reason, never a measure that failed, so it does not put the planner in series.
+MEASURE_FIELDS = 9
 MEASURE_ORDER = (
-    'source "$1"; gate_cargo_jobs >/dev/null; '
-    'printf "%s\\0%s\\0%s\\0%s\\0%s\\0%s" "$GATE_NPROC" "$GATE_CG_CPUS" "$GATE_CG_MEM_KB" "$GATE_FREE_RAM_KB" '
-    '"$GATE_CARGO_JOBS" "$GATE_RESOURCE_WHY"'
+    'source "$1"; gate_cargo_jobs >/dev/null; gate_gpu_probe || true; '
+    'printf "%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s" "$GATE_NPROC" "$GATE_CG_CPUS" "$GATE_CG_MEM_KB" "$GATE_FREE_RAM_KB" '
+    '"$GATE_CARGO_JOBS" "$GATE_RESOURCE_WHY" "${GATE_GPU_DECISION:-cpu}" "${GATE_GPU_WHY:-gate_gpu_probe gave no answer}" "${GATE_GPU_VRAM_FREE_MB-}"'
 )
 
 
@@ -811,10 +822,10 @@ def measure_machine() -> Measure:
     lock = os.path.join(repo_root(), "scripts", "gate-lock.sh")
     res = subprocess.run(["bash", "-c", MEASURE_ORDER, "gate-dag", lock], capture_output=True, text=True, check=False)
     fields = res.stdout.split("\0")
-    if res.returncode != 0 or len(fields) != 6:
+    if res.returncode != 0 or len(fields) != MEASURE_FIELDS:
         measure.why = "the resource measure of gate-lock.sh failed: " + (res.stderr.strip() or f"exit {res.returncode}")
         return measure
-    nproc, cpus, mem_kb, free_kb, jobs, why = fields
+    nproc, cpus, mem_kb, free_kb, jobs, why, measure.gpu_decision, measure.gpu_why, measure.gpu_vram_mb = fields
     measure.cgroup_cpu = int(cpus) if cpus.isdigit() else None
     measure.cgroup_mem_kb = mem_kb.strip()
     measure.nproc = int(nproc) if nproc.isdigit() else None
@@ -1147,7 +1158,8 @@ class Planner:
         return "failed" if self.machine.why else "gate"
 
     def make_plan(self) -> dict[str, Any]:
-        """D-K4q: what the planner measured of the machine and decided of it, with None for what it could not measure."""
+        """D-K4q: what the planner measured of the machine and decided of it, with None for what it could not measure. `gpu` is
+        what the card said (CI-G1)."""
         machine = self.machine
         free = machine.free_ram_kb
         return {
@@ -1161,6 +1173,18 @@ class Planner:
             "pedido": self.asked,
             "corre": self.modo,
             "fallo": machine.why or None,
+            "gpu": self.gpu_plan(),
+        }
+
+    def gpu_plan(self) -> dict[str, Any]:
+        """CI-G1: what was asked of the card (GATE_GPU, `auto` when empty), what gate_gpu_probe decided and why, and the memory
+        it saw free. The decision is informative: lane R asks again when it starts, and that is the one that counts."""
+        machine = self.machine
+        return {
+            "pedido": os.environ.get("GATE_GPU") or "auto",
+            "decision": machine.gpu_decision,
+            "motivo": machine.gpu_why,
+            "vram_libre_mb": int(machine.gpu_vram_mb) if machine.gpu_vram_mb.isdigit() else None,
         }
 
     def runs_reason(self) -> str:
@@ -1190,6 +1214,8 @@ class Planner:
             line += f" ({reason})"
         if plan["fallo"]:
             line += f" failed={plan['fallo']}"
+        # CI-G1: at the end, because the contracts and merge-gate.sh read the start of the line.
+        line += f" gpu={plan['gpu']['decision']} ({plan['gpu']['motivo']})"
         print(line)
 
     def estimated_ranks(self) -> tuple[dict[str, float], dict[str, Step | None]]:
@@ -2040,6 +2066,10 @@ def run_table(path: str, timed_end: str | None = None, rows: str | None = None) 
     mode = os.environ.get("GATE_DAG", "auto")
     if mode not in ASKED:
         die(f"GATE_DAG is {mode!r}; it has to be 0 or serie (series), or 1, maximo or auto (DAG)")
+    # CI-G1: before the first step, in the series and in the DAG, the same refusal lane R and gate_gpu_probe give.
+    gpu = os.environ.get("GATE_GPU", "")
+    if gpu not in GPU_ASKED:
+        die(f"GATE_GPU={gpu} takes auto, cpu or gpu")
     for signum in STOP_SIGNALS:
         signal.signal(signum, stop_on_signal)
     steps = parse_table(path)

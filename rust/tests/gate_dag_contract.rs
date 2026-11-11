@@ -87,7 +87,9 @@ fn without_judge_env(command: &mut Command) -> &mut Command {
     for name in JUDGE_LANE_ENV {
         command.env_remove(name);
     }
-    command
+    // CI-G1: the planner asks the card at its start unless GATE_GPU says `cpu`, and a contract that does not talk about the GPU
+    // asks no card: the real nvidia-smi of whoever runs `cargo test` is not part of any test. A test of the GPU gives its own.
+    command.env("GATE_GPU", "cpu")
 }
 
 /// `python3` for the planner, with the environment of `without_judge_env`.
@@ -961,6 +963,9 @@ fn a_step_environment_differs_only_by_the_closed_list() {
                 "GATE_PROC_MEMINFO",
                 "GATE_CGROUP_ROOT",
                 "GATE_PROC_SELF_CGROUP",
+                // CI-G1: `without_judge_env` gives every planner of this file GATE_GPU=cpu. Like GATE_PROC_MEMINFO it is a name the
+                // test hands the planner, which passes it on unchanged: the closed list is for what the planner itself changes.
+                "GATE_GPU",
                 "PWD",
                 "OLDPWD",
                 "SHLVL",
@@ -4980,7 +4985,9 @@ fn the_battery_is_measured_and_changes_nothing() {
             !line.contains(" failed="),
             "{tag}: a battery that cannot be read is not a failed measure: {line}"
         );
-        tails.push((tag, line.split(" jobs=").nth(1).unwrap_or("").to_string()));
+        // CI-G1: the line ends in ` gpu=<decision> (<why>)`, and what this test compares is the jobs and the mode.
+        let tail = line.split(" jobs=").nth(1).unwrap_or("");
+        tails.push((tag, tail.split(" gpu=").next().unwrap_or("").to_string()));
     }
     let (first_tag, first) = &tails[0];
     for (tag, tail) in &tails {
@@ -6494,4 +6501,219 @@ fn rows_keep_a_history_apart_from_the_whole_table_and_the_first_run_is_in_series
             .any(|record| record["tabla"].as_str() == Some(expected.as_str())),
         "no record of the run carries the key {expected}: {runs:?}"
     );
+}
+
+// --- CI-G1: the card the planner looks at, in its plan and in its record -------------------------------------------------
+// The planner asks `gate_gpu_probe` (gate-lock.sh) at its start, prints what it decided at the end of the `plan:` line and keeps it
+// in the plan of the run. The machine is the test's: a directory first on the PATH with an nvidia-smi that answers a card (or
+// fails) and an `ldd` that resolves the libraries of CUDA 13 from the LD_LIBRARY_PATH it is given, a CPU runtime in the GATE_RUNTIME_HOME of
+// the test and a GPU runtime of the judge in a GATE_GPU_HOME of the test. Nothing here asks the real card.
+
+const PLANNER_CARD: &str = "NVIDIA GeForce RTX 4070 Ti";
+const NVIDIA_SMI_CARD: &str = "#!/bin/sh\necho \"NVIDIA GeForce RTX 4070 Ti, 10692, 8.9\"\n";
+const NVIDIA_SMI_BROKEN: &str = "#!/bin/sh\nexit 9\n";
+const LDD_CUDA13: &str = "#!/bin/sh
+echo '\tlinux-vdso.so.1 (0x00007ffc0)'
+for lib in libcudart.so.13 libcublas.so.13 libcublasLt.so.13; do
+  found=''
+  old=$IFS; IFS=:
+  for d in $LD_LIBRARY_PATH; do [ -e \"$d/$lib\" ] && found=\"$d/$lib\"; done
+  IFS=$old
+  if [ -n \"$found\" ]; then echo \"\t$lib => $found (0x00007f00)\"; else echo \"\t$lib => not found\"; fi
+done
+";
+
+/// What the planner of a test is given to see a card: its environment, as (name, value) pairs owned by the test.
+struct GpuWorld {
+    entries: Vec<(&'static str, String)>,
+}
+
+impl GpuWorld {
+    fn env(&self) -> Vec<(&str, &str)> {
+        self.entries
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect()
+    }
+
+    /// The same world with one name given another value (the last one given wins in the environment of a process).
+    fn with(mut self, name: &'static str, value: &str) -> GpuWorld {
+        self.entries.push((name, value.to_string()));
+        self
+    }
+}
+
+/// The machine of `host` with `nvidia_smi` as the only nvidia-smi it can find (the directory of the stand-ins is first on the
+/// PATH and GATE_WSL_LIB_DIR is a directory that does not exist), a CPU runtime and a GPU runtime of the judge, both 1.31.1 and
+/// the second cuda13, and the libraries of CUDA 13 where `GATE_GPU_HOME/cuda13/nvidia/*/lib` has them. `GATE_GPU` is `auto`.
+fn gpu_world(fx: &Fixture, host: &Machine, tag: &str, nvidia_smi: &str) -> GpuWorld {
+    let fakes = fx.base.join(format!("gpu-fakes-{tag}"));
+    let gpu_home = fx.base.join(format!("gpu-home-{tag}"));
+    fs::create_dir_all(&fakes).expect("the stand-ins of the card");
+    for (name, body) in [("nvidia-smi", nvidia_smi), ("ldd", LDD_CUDA13)] {
+        let path = fakes.join(name);
+        write(&path, body);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("stand-in executable");
+    }
+    let record = |flavor: &str| {
+        format!(
+            "{{\"version\":\"1.31.1\",\"flavor\":\"{flavor}\",\"archive\":\"fixture.tgz\",\"sha256\":\"00\"}}"
+        )
+    };
+    // CI-D5c-B: the CPU runtime of the judge lives in a HOME of its own, GATE_RUNTIME_HOME, and the test names it so that the
+    // GATE_RUNTIME_HOME of whoever runs `cargo test` is not the one the planner reads.
+    let runtime_home = fx.base.join(format!("runtime-home-{tag}"));
+    let cpu_runtime = runtime_home.join(".cache/memory-industry/onnxruntime");
+    let gpu_runtime = gpu_home.join(".cache/memory-industry/onnxruntime");
+    for (dir, flavor, libs) in [
+        (&cpu_runtime, "cpu", vec!["libonnxruntime.so"]),
+        (
+            &gpu_runtime,
+            "cuda13",
+            vec!["libonnxruntime.so", "libonnxruntime_providers_cuda.so"],
+        ),
+    ] {
+        fs::create_dir_all(dir).expect("a runtime directory");
+        for lib in libs {
+            write(&dir.join(lib), "");
+        }
+        write(&dir.join("runtime.json"), &record(flavor));
+    }
+    for (package, lib) in [
+        ("cuda_runtime", "libcudart.so.13"),
+        ("cublas", "libcublas.so.13"),
+        ("cublas", "libcublasLt.so.13"),
+    ] {
+        let dir = gpu_home.join("cuda13/nvidia").join(package).join("lib");
+        fs::create_dir_all(&dir).expect("a directory of CUDA libraries");
+        write(&dir.join(lib), "");
+    }
+    GpuWorld {
+        entries: vec![
+            ("PATH", format!("{}:{}", fakes.display(), host.path)),
+            ("GATE_PROC_MEMINFO", host.meminfo.clone()),
+            ("GATE_POWER_SUPPLY_ROOT", host.power.clone()),
+            ("GATE_GPU", "auto".to_string()),
+            ("GATE_RUNTIME_HOME", runtime_home.display().to_string()),
+            ("GATE_GPU_HOME", gpu_home.display().to_string()),
+            (
+                "GATE_WSL_LIB_DIR",
+                fx.base.join("sin-wsl").display().to_string(),
+            ),
+        ],
+    }
+}
+
+/// CI-G1, G1.3 (the half of the planner): a GATE_GPU that is not `auto`, `cpu` or `gpu` is exit 2 before the first step, in the
+/// series and in the DAG, with a line that says what it takes. The values that are are no refusal (the anchor: a planner that
+/// refused every value would pass the rest of the test), and the machine they see has a card that fails, so no real one is asked.
+#[test]
+fn a_gate_gpu_the_planner_does_not_know_is_refused_before_the_first_step() {
+    for gate_dag in ["0", "auto"] {
+        let mut fx = Fixture::new("g1-valor-malo", CPU_FOUR, MEM_OPEN);
+        fx.table(&[(10, "s10", "-", "0.1", "")]);
+        let host = machine(&fx, "malo", "24", 40 * KIB_PER_GIB);
+        let world = gpu_world(&fx, &host, "malo", NVIDIA_SMI_BROKEN).with("GATE_GPU", "gpuu");
+        let run = fx.run_env(gate_dag, &world.env());
+        assert_eq!(
+            run.code,
+            Some(2),
+            "GATE_GPU=gpuu with GATE_DAG={gate_dag}: exit {:?}, want 2\n{}{}",
+            run.code,
+            run.out,
+            run.err
+        );
+        for word in ["FAIL:", "GATE_GPU=gpuu", "takes auto, cpu or gpu"] {
+            assert!(
+                run.err.contains(word),
+                "GATE_GPU=gpuu with GATE_DAG={gate_dag}: the refusal does not say `{word}`: {}",
+                run.err
+            );
+        }
+        assert!(
+            fx.started().is_empty(),
+            "GATE_GPU=gpuu with GATE_DAG={gate_dag}: a step started: {:?}",
+            fx.started()
+        );
+    }
+    for good in ["auto", "gpu"] {
+        let mut fx = Fixture::new("g1-valor-bueno", CPU_FOUR, MEM_OPEN);
+        fx.table(&[(10, "s10", "-", "0.1", "")]);
+        let host = machine(&fx, "bueno", "24", 40 * KIB_PER_GIB);
+        let world = gpu_world(&fx, &host, "bueno", NVIDIA_SMI_BROKEN).with("GATE_GPU", good);
+        let run = fx.run_env("0", &world.env());
+        assert_green(&run, &format!("GATE_GPU={good}"));
+    }
+}
+
+/// CI-G1, G1.4. The line `plan:` starts as it did and ends in `gpu=<decision> (<reason>)`, because the contracts above read
+/// the start of it, and the plan of the line of the run in corridas.jsonl has `gpu` with what was asked, what was decided, why
+/// and the free memory of the card. A card that answers is `candidate`, one that fails is `cpu` with the reason, and `GATE_GPU=cpu`
+/// is `cpu` and says what was asked.
+#[test]
+fn the_plan_line_and_the_record_keep_the_decision_of_the_gpu() {
+    let cases = [
+        ("auto", NVIDIA_SMI_CARD, "candidate", Some(PLANNER_CARD)),
+        ("auto", NVIDIA_SMI_BROKEN, "cpu", Some("nvidia-smi failed")),
+        ("cpu", NVIDIA_SMI_CARD, "cpu", Some("GATE_GPU=cpu")),
+    ];
+    for (asked, nvidia_smi, decision, reason) in cases {
+        let mut fx = Fixture::new("g1-plan", CPU_FOUR, MEM_OPEN);
+        fx.table(&[(10, "a", "-", "0.1", "")]);
+        let host = machine(&fx, "gpu", "24", 40 * KIB_PER_GIB);
+        let world = gpu_world(&fx, &host, "gpu", nvidia_smi).with("GATE_GPU", asked);
+        let before = snapshot(&fx.history, "corridas.jsonl");
+        let run = fx.run_env("0", &world.env());
+        assert_green(&run, &format!("GATE_GPU={asked} with {decision}"));
+        let line = plan_line_of(&run);
+        assert!(
+            line.starts_with("plan: nproc=24 ") && line.contains(" asked=serie runs=serie"),
+            "the plan line does not start as it did: {line}"
+        );
+        let tail = format!(" gpu={decision} (");
+        let at = line.find(&tail).unwrap_or_else(|| {
+            panic!(
+                "GATE_GPU={asked}, {decision}: the plan line has no `{tail}`:\n{line}\n{}",
+                run.err
+            )
+        });
+        assert!(
+            at > line.find(" runs=serie").unwrap_or(usize::MAX) && line.ends_with(')'),
+            "the decision of the GPU goes at the end of the plan line, after what the contracts read: {line}"
+        );
+        if let Some(reason) = reason {
+            assert!(
+                line[at..].contains(reason),
+                "GATE_GPU={asked}, {decision}: the plan line does not say `{reason}`: {line}"
+            );
+        }
+        let runs = appended(&fx.history, "corridas.jsonl", &before);
+        let gpu = &runs
+            .first()
+            .unwrap_or_else(|| panic!("no run line: {}{}", run.out, run.err))["plan"]["gpu"];
+        for key in ["pedido", "decision", "motivo", "vram_libre_mb"] {
+            assert!(
+                gpu.as_object()
+                    .is_some_and(|fields| fields.contains_key(key)),
+                "GATE_GPU={asked}, {decision}: the plan of the record has no gpu.{key}: {gpu}"
+            );
+        }
+        assert_eq!(gpu["pedido"].as_str(), Some(asked), "{gpu}");
+        assert_eq!(gpu["decision"].as_str(), Some(decision), "{gpu}");
+        if let Some(reason) = reason {
+            assert!(
+                gpu["motivo"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(reason)),
+                "GATE_GPU={asked}, {decision}: gpu.motivo does not say `{reason}`: {gpu}"
+            );
+        }
+        if decision == "candidate" {
+            assert_eq!(
+                gpu["vram_libre_mb"].as_u64(),
+                Some(10692),
+                "the free memory of the card is the one nvidia-smi said: {gpu}"
+            );
+        }
+    }
 }

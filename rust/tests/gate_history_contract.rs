@@ -72,12 +72,14 @@ const PLANNER_INPUTS_OF_THE_JUDGE: [&str; 7] = [
     "GATE_CARGO_JOBS_FROM_GATE",
 ];
 
-/// `cmd` for a planner without the names of PLANNER_INPUTS_OF_THE_JUDGE: what a test gives it afterwards stays.
+/// `cmd` for a planner without the names of PLANNER_INPUTS_OF_THE_JUDGE: what a test gives it afterwards stays. CI-G1: and with
+/// `GATE_GPU=cpu`, because the planner asks the card at its start unless it says `cpu`, and no contract of the history asks the
+/// real nvidia-smi of whoever runs `cargo test`.
 fn without_planner_inputs(cmd: &mut Command) -> &mut Command {
     for name in PLANNER_INPUTS_OF_THE_JUDGE {
         cmd.env_remove(name);
     }
-    cmd
+    cmd.env("GATE_GPU", "cpu")
 }
 const SHA: &str = "4f1c0a9b2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f70";
 const HUELLA: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";

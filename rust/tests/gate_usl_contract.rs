@@ -265,6 +265,8 @@ impl Fx {
             .env("HOME", &self.home)
             .env("TMPDIR", &self.base)
             .env("PATH", path)
+            // CI-G1: gate_usl.py measures the machine with the planner's `measure_machine`, which asks the card unless GATE_GPU is `cpu`.
+            .env("GATE_GPU", "cpu")
             .env("CI_TIEMPOS_DIR", &self.hist)
             .env("CARGO_TARGET_DIR", &self.destinos)
             .env("GATE_USL_PSI", &self.psi)
@@ -2081,6 +2083,8 @@ fn u18_la_clave_de_la_tabla_es_la_que_escribe_el_planificador() {
         .env_clear()
         .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
         .env("PATH", "/usr/bin:/bin")
+        // CI-G1: the planner asks the card at its start unless GATE_GPU is `cpu`.
+        .env("GATE_GPU", "cpu")
         .env("GATE_DAG", "0")
         .env("CI_TIEMPOS_DIR", &historial)
         .env("HOME", &fx.home)
