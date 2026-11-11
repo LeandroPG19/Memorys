@@ -71,7 +71,6 @@ pub async fn store_chunks(
         .execute(pool)
         .await?;
 
-    let model = crate::embeddings::onnx::current_model();
     let mut stored = 0usize;
     for (idx, piece) in pieces.iter().enumerate() {
         let Ok(vector) =
@@ -80,6 +79,8 @@ pub async fn store_chunks(
         else {
             continue;
         };
+        // After the first embed: until then the runtime may not be loaded and has no version to name.
+        let tag = crate::embeddings::onnx::vector_tag();
         let done = sqlx::query(
             "INSERT INTO brain_observation_chunks
                 (observation_id, chunk_index, content, embedding, embedding_model, project_id)
@@ -93,7 +94,7 @@ pub async fn store_chunks(
         .bind(idx as i32)
         .bind(piece)
         .bind(pgvector::Vector::from(vector))
-        .bind(&model)
+        .bind(&tag)
         .bind(project_id)
         .execute(pool)
         .await;
@@ -183,7 +184,7 @@ pub async fn backfill_missing(pool: &PgPool, limit: i64) -> Result<BackfillRepor
         return Ok(BackfillReport::default());
     }
 
-    let model = crate::embeddings::onnx::current_model();
+    let model = crate::embeddings::onnx::vector_tag();
     let mut report = BackfillReport::default();
     for table in [VectorTable::Observations, VectorTable::Episodes] {
         let rows: Vec<(uuid::Uuid, String, String, String)> = sqlx::query_as(table.missing_sql())
@@ -218,6 +219,116 @@ pub async fn backfill_missing(pool: &PgPool, limit: i64) -> Result<BackfillRepor
         }
     }
     Ok(report)
+}
+
+/// The vectors of one table against a label: its rows, the ones with no vector at all and the ones
+/// whose vector carries another label (another model, or the same model under another runtime).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TableCoverage {
+    pub total: i64,
+    pub missing: i64,
+    pub stale: i64,
+}
+
+/// `TableCoverage` of the four tables that hold a vector, against `tag`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VectorCoverage {
+    pub tag: String,
+    pub observations: TableCoverage,
+    pub episodes: TableCoverage,
+    pub chunks: TableCoverage,
+    pub procedures: TableCoverage,
+}
+
+impl VectorCoverage {
+    fn tables(&self) -> [TableCoverage; 4] {
+        [
+            self.observations,
+            self.episodes,
+            self.chunks,
+            self.procedures,
+        ]
+    }
+
+    pub fn total(&self) -> i64 {
+        self.tables().iter().map(|table| table.total).sum()
+    }
+
+    pub fn missing(&self) -> i64 {
+        self.tables().iter().map(|table| table.missing).sum()
+    }
+
+    pub fn stale(&self) -> i64 {
+        self.tables().iter().map(|table| table.stale).sum()
+    }
+}
+
+/// One literal statement per table, in the order of `VectorCoverage`: the table name is never spliced into SQL.
+const COVERAGE_SQL: [&str; 4] = [
+    "SELECT count(*)::bigint,
+            count(*) FILTER (WHERE embedding IS NULL)::bigint,
+            count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1)::bigint
+     FROM brain_observations",
+    "SELECT count(*)::bigint,
+            count(*) FILTER (WHERE embedding IS NULL)::bigint,
+            count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1)::bigint
+     FROM brain_episodes",
+    "SELECT count(*)::bigint,
+            count(*) FILTER (WHERE embedding IS NULL)::bigint,
+            count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1)::bigint
+     FROM brain_observation_chunks",
+    "SELECT count(*)::bigint,
+            count(*) FILTER (WHERE embedding IS NULL)::bigint,
+            count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1)::bigint
+     FROM brain_procedures",
+];
+
+pub async fn vector_coverage(pool: &PgPool, tag: &str) -> Result<VectorCoverage> {
+    let mut counted = [TableCoverage::default(); 4];
+    for (slot, sql) in counted.iter_mut().zip(COVERAGE_SQL) {
+        let (total, missing, stale): (i64, i64, i64) =
+            sqlx::query_as(sql).bind(tag).fetch_one(pool).await?;
+        *slot = TableCoverage {
+            total,
+            missing,
+            stale,
+        };
+    }
+    let [observations, episodes, chunks, procedures] = counted;
+    Ok(VectorCoverage {
+        tag: tag.to_string(),
+        observations,
+        episodes,
+        chunks,
+        procedures,
+    })
+}
+
+/// The last count this process made, for `/health`: a `count(*)` per request would be a scan of
+/// four tables in an endpoint a monitor polls every few seconds. The daemon counts when it has
+/// warmed the embedder and after every REM cycle.
+static LAST_COVERAGE: std::sync::Mutex<Option<VectorCoverage>> = std::sync::Mutex::new(None);
+
+pub fn set_last_coverage(coverage: Option<VectorCoverage>) {
+    if let Ok(mut slot) = LAST_COVERAGE.lock() {
+        *slot = coverage;
+    }
+}
+
+pub fn last_coverage() -> Option<VectorCoverage> {
+    LAST_COVERAGE.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// Counts against the label this process writes and remembers the answer. `None` while no model
+/// is loaded: without a runtime the label names no generation, and every vector would read as
+/// stale for a reason that is not true.
+pub async fn refresh_coverage(pool: &PgPool) -> Result<Option<VectorCoverage>> {
+    if !crate::embeddings::onnx::model_loaded().await {
+        return Ok(None);
+    }
+    let coverage = vector_coverage(pool, &crate::embeddings::onnx::vector_tag()).await?;
+    set_last_coverage(Some(coverage.clone()));
+    Ok(Some(coverage))
 }
 
 #[cfg(test)]

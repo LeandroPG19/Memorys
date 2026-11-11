@@ -1939,6 +1939,9 @@ async fn import(
     let mut superseded_facts = 0u32;
     let mut quarantined = 0u32;
     let mut quarantine_reasons: HashMap<&'static str, u32> = HashMap::new();
+    // The label each observation of the bundle was embedded under. A vector that arrives in
+    // `embeddings.bin.zst` is the one made under THAT label, whatever this machine runs.
+    let mut embedding_labels: HashMap<Uuid, Option<String>> = HashMap::new();
 
     let projects_path = root.join("projects.json");
     if projects_path.exists() {
@@ -2057,6 +2060,7 @@ async fn import(
                 if tombstones.buried.contains(&obs.id) || !seen_obs.insert(obs.id) {
                     continue;
                 }
+                embedding_labels.insert(obs.id, obs.embedding_model.clone());
                 let (trust, reason) = trust_for_imported(&obs.content, obs.trust.as_deref());
                 if let Some(pattern) = reason {
                     reasons.insert(obs.id, pattern);
@@ -2682,11 +2686,12 @@ async fn import(
                 let v = pgvector::Vector::from(floats);
                 let r = sqlx::query(
                     "UPDATE brain_observations
-                     SET embedding = $1::vector, embedding_half = NULL
+                     SET embedding = $1::vector, embedding_half = NULL, embedding_model = $3
                      WHERE id = $2",
                 )
                 .bind(v)
                 .bind(id)
+                .bind(embedding_labels.get(&id).cloned().flatten())
                 .execute(&mut *tx)
                 .await?;
                 embeddings_restored += r.rows_affected() as u32;

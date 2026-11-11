@@ -790,6 +790,113 @@ fn runtime_version_check(
     }
 }
 
+/// A snapshot of old vectors older than this is a reminder, not a failure: it is the way back
+/// of a reembed, and a reembed that has been stable for a month does not need it.
+const SNAPSHOT_REMINDER_DAYS: u64 = 30;
+
+/// The vectors of the four tables against the label this process writes (the model and the ONNX
+/// Runtime loaded). Without a runtime loaded there is no label to compare with: `onnx_model` and
+/// `onnx_runtime` already say why, and counting would call every vector stale for no reason.
+async fn embedding_coverage_rows(pool: &PgPool) -> Vec<Check> {
+    if onnx::loaded_runtime_version().is_none() {
+        return vec![Check::warn(
+            "embedding_coverage",
+            "no verificable: no hay un ONNX Runtime cargado, y sin él no hay generación con la que comparar",
+            "memory-industry models runtime",
+        )];
+    }
+    let coverage =
+        match crate::embeddings::backfill::vector_coverage(pool, &onnx::vector_tag()).await {
+            Ok(coverage) => coverage,
+            Err(e) => {
+                return vec![Check::warn(
+                    "embedding_coverage",
+                    format!("no verificable: {e}"),
+                    "revisar esquema",
+                )];
+            }
+        };
+    let old_label = if coverage.stale() > 0 {
+        most_common_old_label(pool, &coverage.tag).await
+    } else {
+        None
+    };
+    let age = snapshot_age_days(pool).await;
+    embedding_coverage_checks(&coverage, old_label.as_deref(), age)
+}
+
+/// The label most of the vectors of another generation carry, to say what they were made with.
+async fn most_common_old_label(pool: &PgPool, current: &str) -> Option<String> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT label FROM (
+             SELECT embedding_model AS label FROM brain_observations
+              WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1
+             UNION ALL SELECT embedding_model FROM brain_episodes
+              WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1
+             UNION ALL SELECT embedding_model FROM brain_observation_chunks
+              WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1
+             UNION ALL SELECT embedding_model FROM brain_procedures
+              WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1
+         ) stale
+         GROUP BY label ORDER BY count(*) DESC, label LIMIT 1",
+    )
+    .bind(current)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    row.and_then(|(label,)| label)
+}
+
+async fn snapshot_age_days(pool: &PgPool) -> Option<u64> {
+    let node_id = crate::db::node_id(pool).await.ok()?.to_string();
+    let root = crate::reembed_cli::snapshot_root(&node_id).ok()?;
+    crate::reembed_cli::oldest_snapshot_age_days(&root)
+}
+
+/// Pure: what `doctor` says about the vectors. A warning and never a failure, because a database
+/// of another generation still answers searches (the score is off by a few thousandths), and the
+/// way out is one command. The row of the snapshot appears only when it is old enough to be
+/// forgotten.
+fn embedding_coverage_checks(
+    coverage: &crate::embeddings::backfill::VectorCoverage,
+    old_label: Option<&str>,
+    snapshot_age_days: Option<u64>,
+) -> Vec<Check> {
+    let (stale, missing) = (coverage.stale(), coverage.missing());
+    let mut checks = vec![if stale == 0 && missing == 0 {
+        Check::ok(
+            "embedding_coverage",
+            format!(
+                "{} filas, todas con vector de {}",
+                coverage.total(),
+                coverage.tag
+            ),
+        )
+    } else {
+        let from = old_label.map_or(String::new(), |label| format!(" (de {label})"));
+        Check::warn(
+            "embedding_coverage",
+            format!(
+                "{} filas: {missing} sin vector y {stale} vectores de otra generación{from}; \
+                 la actual es {}",
+                coverage.total(),
+                coverage.tag
+            ),
+            "memory-industry reembed (reanudable; guarda antes los vectores actuales; \
+             --rollback los devuelve)",
+        )
+    }];
+    if let Some(days) = snapshot_age_days.filter(|days| *days > SNAPSHOT_REMINDER_DAYS) {
+        checks.push(Check::warn(
+            "reembed_snapshot",
+            format!("hay una instantánea de vectores anteriores de hace {days} días"),
+            "memory-industry reembed --drop-snapshot <etiqueta> cuando la base lleve estable el tiempo que quieras",
+        ));
+    }
+    checks
+}
+
 fn legacy_cache_check(legacy: &std::path::Path) -> Check {
     let entries = std::fs::read_dir(legacy).map_or(0, |dir| dir.flatten().count());
     if entries == 0 {
@@ -1443,35 +1550,7 @@ pub async fn run_checks_with(
         )),
     }
 
-    match sqlx::query(
-        "SELECT count(*)::bigint AS total,
-                count(*) FILTER (WHERE embedding IS NULL)::bigint AS missing,
-                count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1)::bigint AS stale
-         FROM brain_observations",
-    )
-    .bind(&model)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(row) => {
-            let total: i64 = row.try_get("total").unwrap_or(0);
-            let missing: i64 = row.try_get("missing").unwrap_or(0);
-            let stale: i64 = row.try_get("stale").unwrap_or(0);
-            if missing == 0 && stale == 0 {
-                checks.push(Check::ok(
-                    "embedding_coverage",
-                    format!("{total} observaciones, todas con vector del modelo actual"),
-                ));
-            } else {
-                checks.push(Check::warn(
-                    "embedding_coverage",
-                    format!("{total} observaciones: {missing} sin vector, {stale} de otro modelo"),
-                    "cuba_zafra action=reembed",
-                ));
-            }
-        }
-        Err(e) => checks.push(Check::warn("embedding_coverage", format!("no verificable: {e}"), "revisar esquema")),
-    }
+    checks.extend(embedding_coverage_rows(pool).await);
 
     match sqlx::query(
         "SELECT count(*)::bigint FROM brain_facts
@@ -3303,5 +3382,104 @@ mod onnx_runtime_tests {
                 check.detail
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod embedding_coverage_tests {
+    use super::*;
+    use crate::embeddings::backfill::{TableCoverage, VectorCoverage};
+
+    const CURRENT: &str = "multilingual-e5-small@onnxruntime-1.31.1";
+
+    fn with_observations_of_another_generation(stale: i64) -> VectorCoverage {
+        VectorCoverage {
+            tag: CURRENT.to_string(),
+            observations: TableCoverage {
+                total: 10,
+                missing: 0,
+                stale,
+            },
+            ..VectorCoverage::default()
+        }
+    }
+
+    /// CI-D5c (B.4). A vector counts as current only when its label is the model and the runtime
+    /// loaded now, so after the runtime changes every stored vector is «of another generation»
+    /// until `reembed` rewrites it. `doctor` says how many, what they were made with and the one
+    /// command that fixes it, as a warning (the search still answers, see the spec's §2.3), and
+    /// reminds that the snapshot `reembed` keeps is not meant to stay forever.
+    #[test]
+    fn the_coverage_check_names_the_generation_and_the_order() {
+        let clean =
+            embedding_coverage_checks(&with_observations_of_another_generation(0), None, None);
+        assert_eq!(clean.len(), 1, "nothing pending and no snapshot: one row");
+        assert_eq!(clean[0].name, "embedding_coverage");
+        assert_eq!(clean[0].status, Status::Ok);
+        assert!(
+            clean[0].detail.contains(CURRENT),
+            "the healthy row says which generation every vector belongs to: {}",
+            clean[0].detail
+        );
+
+        let pending = embedding_coverage_checks(
+            &with_observations_of_another_generation(7),
+            Some("multilingual-e5-small"),
+            None,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "embedding_coverage");
+        assert_eq!(
+            pending[0].status,
+            Status::Warn,
+            "a database of another generation still answers searches: a warning, never a failure"
+        );
+        for wanted in ["7", CURRENT, "multilingual-e5-small"] {
+            assert!(
+                pending[0].detail.contains(wanted),
+                "the detail has to carry {wanted:?}: {}",
+                pending[0].detail
+            );
+        }
+        assert!(
+            pending[0]
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("memory-industry reembed")),
+            "and the hint is the command that rewrites them: {:?}",
+            pending[0].hint
+        );
+
+        let kept =
+            embedding_coverage_checks(&with_observations_of_another_generation(0), None, Some(40));
+        assert_eq!(kept.len(), 2, "a snapshot of 40 days adds its own row");
+        assert_eq!(
+            kept[0].status,
+            Status::Ok,
+            "and does not touch the coverage row"
+        );
+        assert_eq!(kept[1].name, "reembed_snapshot");
+        assert_eq!(kept[1].status, Status::Warn);
+        assert!(
+            kept[1].detail.contains("40"),
+            "it says how old it is: {}",
+            kept[1].detail
+        );
+        assert!(
+            kept[1]
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("memory-industry reembed --drop-snapshot")),
+            "and how it is dropped: {:?}",
+            kept[1].hint
+        );
+
+        let recent =
+            embedding_coverage_checks(&with_observations_of_another_generation(0), None, Some(3));
+        assert_eq!(
+            recent.len(),
+            1,
+            "a snapshot of three days is the safety net doing its job, not something to warn about"
+        );
     }
 }

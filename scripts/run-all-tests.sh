@@ -398,6 +398,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
   hermetic="$(mktemp -d)"
   mkdir -p "$hermetic/home" "$hermetic/cache"
   export HOME="$hermetic/home" XDG_CACHE_HOME="$hermetic/cache"
+  # CI-D5c: the judge refuses to load an ONNX Runtime that is not its own (gate_refuse_the_users_runtime), and the rows below run the real
+  # script under a HOME of their own with no runtime in it. This one is made here, once, in the place gate_model_env looks for it.
+  export GATE_RUNTIME_HOME="$hermetic/runtime-home"
+  mkdir -p "$GATE_RUNTIME_HOME/.cache/memory-industry/onnxruntime"
+  : >"$GATE_RUNTIME_HOME/.cache/memory-industry/onnxruntime/libonnxruntime.so"
+  : >"$GATE_RUNTIME_HOME/.cache/memory-industry/onnxruntime/onnxruntime.dll"
   # CI-K10 (H1): the rows below launch a copy of merge-gate.sh, which runs the planner (gate-dag.py) for real, and a planner
   # delegates the cgroup it runs in (CI-J17): read from the real /proc/self/cgroup it would make a `juez` inside the scope of
   # whoever launched this self-test and move that scope's processes into it. This self-test gets a cgroup tree of its own with
@@ -2018,6 +2024,7 @@ fi
 
 # The model paths are chosen once, in gate_model_env (gate-lock.sh, CI-J5); merge-gate.sh calls it too.
 gate_model_env
+gate_refuse_the_users_runtime
 
 # D-F2b (CI-F1): merge-gate.sh asks for the models before its first compile, with the paths
 # exported above, so a missing model is seconds and not the first section. Nothing compiles.

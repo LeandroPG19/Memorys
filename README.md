@@ -34,6 +34,8 @@ claude mcp add memory-industry -- memory-industry
 
 That is the whole setup. On first run it provisions a PostgreSQL 18 + pgvector container via Docker and initializes the schema. **[Docker](https://docs.docker.com/get-docker/) must be running.** The `cuba-memorys` command remains a binary alias.
 
+**Upgrading to 0.31 (a new ONNX Runtime).** 1.31.1 computes slightly different embeddings than the 1.26.0 of 0.30 (up to 1.4e-3 in `1 - cos`), so every stored vector records the model and the runtime that made it, and the ones made before count as «another generation». Search keeps working while a database is mixed (scores off by a few thousandths). To bring it to the new runtime: stop the daemon, `memory-industry models runtime`, start it, `memory-industry reembed`. `reembed` saves the old vectors to a snapshot on disk before it rewrites any row, resumes where it stopped, refuses a second run at once, and `memory-industry reembed --rollback` (with the previous runtime loaded) gives them back; `--drop-snapshot <label>` deletes the snapshot when you no longer want that way back. `doctor` and the daemon's start-up say how many vectors are still of another generation. There is no migration: 0.30 still starts on a 0.31 database. **Upgrade together the machines that sync with each other:** two machines on different runtimes would rewrite what the other one brings.
+
 <details>
 <summary><b>Cursor / Windsurf / VS Code / Zed</b></summary>
 

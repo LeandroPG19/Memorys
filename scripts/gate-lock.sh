@@ -648,19 +648,19 @@ gate_model_env() {
   fi
   # Paths must match `memory-industry models all` (see rust/src/models_cli.rs).
   export ONNX_MODEL_PATH="${ONNX_MODEL_PATH:-$CACHE/models}"
+  # CI-D5c (D-D5c-6, R1): ONNX Runtime comes from a cache of the judge's own, laid out as a HOME in which `memory-industry models
+  # runtime` was run once (the orchestrator does it, outside the judge: it is network). Never from the cache of the live service: from
+  # there, a `models runtime` run by mistake replaces the runtime of a daemon whose memory must not stop. The models above are still
+  # read from the user's cache, read-only. Not exported: it is where to look for the runtime, and ORT_DYLIB_PATH is what the tests read.
+  GATE_RUNTIME_HOME="${GATE_RUNTIME_HOME:-$HOME/.cache/memory-industry-gate/runtime-home}"
   if [[ -z "${ORT_DYLIB_PATH:-}" ]]; then
-    if [[ -f "$CACHE/onnxruntime/libonnxruntime.so" ]]; then
-      export ORT_DYLIB_PATH="$CACHE/onnxruntime/libonnxruntime.so"
-    elif [[ -f "$CACHE/onnxruntime/onnxruntime.dll" ]]; then
-      export ORT_DYLIB_PATH="$CACHE/onnxruntime/onnxruntime.dll"
-    elif [[ -f "$CACHE_OLD/onnxruntime/onnxruntime.dll" ]]; then
-      export ORT_DYLIB_PATH="$CACHE_OLD/onnxruntime/onnxruntime.dll"
-    elif [[ -f "$CACHE_OLD/onnxruntime/libonnxruntime.so" ]]; then
-      export ORT_DYLIB_PATH="$CACHE_OLD/onnxruntime/libonnxruntime.so"
-    else
-      export ORT_DYLIB_PATH="$CACHE/onnxruntime/libonnxruntime.so"
-    fi
+    local ort_library=libonnxruntime.so
+    case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) ort_library=onnxruntime.dll ;; esac
+    export ORT_DYLIB_PATH="$GATE_RUNTIME_HOME/.cache/memory-industry/onnxruntime/$ort_library"
   fi
+  # CI-D5c: where `reembed` keeps the snapshot of the vectors it rewrites, when nobody chose. The tests that run it (v048) would
+  # otherwise write it under ~/.cache/memory-industry, which belongs to the live service.
+  export MEMORY_INDUSTRY_REEMBED_DIR="${MEMORY_INDUSTRY_REEMBED_DIR:-${TMPDIR:-/tmp}/memory-industry-gate-reembed}"
   export CUBA_RERANKER_PATH="${CUBA_RERANKER_PATH:-$CACHE/reranker}"
   export CUBA_NLI_PATH="${CUBA_NLI_PATH:-$CACHE/models-nli}"
   export CUBA_EMBEDDING_DIM="${CUBA_EMBEDDING_DIM:-384}"
@@ -669,6 +669,24 @@ gate_model_env() {
   # CI-D5b: the official builds of ONNX Runtime 1.31 send telemetry to Microsoft by default, and a process of a test must open no
   # connection. Not a model name (CI-J5), and a value the caller set stays: the variable is read before the library starts.
   export ORT_DISABLE_TELEMETRY="${ORT_DISABLE_TELEMETRY:-1}"
+}
+
+# CI-D5c (D-D5c-6, R1): the judge stops, with exit 2, when the ONNX Runtime it would load is not its own: a path that resolves (also through
+# a link) into the cache of the live service, or nothing at all. The answer is the command that fills the judge's cache. Called right
+# after gate_model_env, so no step starts between choosing the runtime and looking at it.
+gate_refuse_the_users_runtime() {
+  local runtime_home="${GATE_RUNTIME_HOME:-$HOME/.cache/memory-industry-gate/runtime-home}"
+  local ort="${ORT_DYLIB_PATH:-}" resolved root
+  local fill="mkdir -p $runtime_home && HOME=$runtime_home memory-industry models runtime"
+  resolved="$(realpath -m "$ort" 2>/dev/null || printf '%s' "$ort")"
+  for root in "$HOME/.cache/memory-industry" "$HOME/.cache/cuba-memorys"; do
+    root="$(realpath -m "$root" 2>/dev/null || printf '%s' "$root")"
+    if [[ "$resolved/" == "$root/"* ]]; then
+      gate_refuse "the judge would load ONNX Runtime from the cache of the live service ($resolved). Fill its own, once, outside the judge: $fill"
+    fi
+  done
+  [[ -n "$ort" && -f "$resolved" ]] \
+    || gate_refuse "there is no ONNX Runtime at '$ort'. Fill the judge's own cache, once, outside the judge (it is network): $fill"
 }
 
 # --- the judge's server (CI-J, D-J1a) ----------------------------------------

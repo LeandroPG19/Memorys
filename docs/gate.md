@@ -110,7 +110,7 @@ Two gates on one machine share `brain_gate`, the ports and cargo's lock, and eac
 
 Missing any of these is **FAIL**, never `SKIPPED`:
 
-- ONNX embed + ORT (`memory-industry models all`)
+- ONNX embed (`memory-industry models embed`) and, for ONNX Runtime, **the judge's own cache** (CI-D5c, below)
 - NLI + reranker
 - Generative LLM: `memory-industry llm set …` or `MEMORY_INDUSTRY_LLM_BASE_URL` or authenticated `claude`/`gemini` or MCP sampling
 - `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`, `cargo-audit`
@@ -118,6 +118,19 @@ Missing any of these is **FAIL**, never `SKIPPED`:
 - Network to `github.com`: the audit step fetches `https://github.com/RustSec/advisory-db` first. Without it the gate stops with exit 2 in seconds.
 - `timeout` from GNU coreutils (`/usr/bin/timeout` in Git Bash and on Linux), not `C:\Windows\System32\timeout.exe`, which takes `/t` and turns the audit step red
 - `node` on `PATH`, at least the major in `engines.node` of `package.json` (see below)
+
+### The judge's own ONNX Runtime (CI-D5c)
+
+The judge loads ONNX Runtime from `GATE_RUNTIME_HOME` (default `~/.cache/memory-industry-gate/runtime-home`), a directory laid out as a HOME in which `memory-industry models runtime` was run once: the library is `$GATE_RUNTIME_HOME/.cache/memory-industry/onnxruntime/libonnxruntime.so` (`onnxruntime.dll` on Windows). It **never** loads the runtime of `~/.cache/memory-industry` (or `~/.cache/cuba-memorys`), which belongs to the daemon that holds the memory of the machine: `gate_refuse_the_users_runtime` (gate-lock.sh), called by `run-all-tests.sh` on the line after `gate_model_env`, stops the judge with exit 2 when `ORT_DYLIB_PATH` resolves into either cache (also through a link) or points at nothing, and prints the command that fills the judge's cache. The models (`ONNX_MODEL_PATH`, `CUBA_RERANKER_PATH`, `CUBA_NLI_PATH`) are still read from the user's cache, read-only; nothing the judge runs writes there.
+
+It is filled once per `ORT_VERSION`, outside the judge (it is network), with a HOME that has no `pgpass` and no `DATABASE_URL`, so the binary opens no database:
+
+```bash
+mkdir -p ~/.cache/memory-industry-gate/runtime-home
+HOME=~/.cache/memory-industry-gate/runtime-home rust/target/release/memory-industry models runtime
+```
+
+`gate_model_env` also gives `reembed` a directory for its snapshots of old vectors (`MEMORY_INDUSTRY_REEMBED_DIR`, default `${TMPDIR:-/tmp}/memory-industry-gate-reembed`), so the tests that run it leave nothing under the user's cache. Run a command by hand against a database with the **HOME of the judge or a scratch one**, never your own: with your `HOME` and no `DATABASE_URL`, the binary reads `~/.cache/memory-industry/pgpass` and opens the live database.
 
 ## Running the gate on Linux
 

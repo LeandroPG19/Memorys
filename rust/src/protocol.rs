@@ -956,6 +956,16 @@ async fn run_rem_consolidation_locked(pool: &PgPool) -> Result<()> {
         tracing::info!(rows = quantized, "embeddings quantized to halfvec");
     }
 
+    match crate::embeddings::backfill::refresh_coverage(pool).await {
+        Ok(Some(coverage)) => tracing::info!(
+            stale = coverage.stale(),
+            missing = coverage.missing(),
+            "vectors of another generation counted"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "could not count the vectors of another generation"),
+    }
+
     let analyzed = rem_refresh_planner_stats(pool).await;
     tracing::info!(tables_analyzed = analyzed, "planner statistics refreshed");
 
