@@ -106,3 +106,27 @@ Las que solo él puede tomar o autorizar. Ninguna se resuelve por el agente.
 | D. Herramientas de la máquina | 1 | 1 |
 | E. Decisiones de Leandro | 2 | 2 |
 | **Total** | **21** | **27** |
+
+## F. Para la 0.32, por orden de Leandro (11-nov-2026: «esos fallos que salieron quiero que en la v 32 se corrijan»)
+
+Son los fallos que destaparon las pruebas del 11-nov (GPU en WSL y en Windows, ensayo de actualización, despliegue en esta PC, primer quality-gate) y que la 0.31 no corrige. Cada uno entra por el especificador; ninguno bloquea la 0.31.
+
+**Producto**
+- [ ] **F1. `nli::available()` ignora `CUBA_NLI_PATH`.** `rust/src/cognitive/nli.rs:87-104` decide si hay modelo mirando la ruta fija, y la carga sí respeta la variable. Efecto: `nli_probe` no corrió ni en CPU ni en GPU en WSL (W8) ni en Windows (V5n); **el NLI en GPU no está verificado en ningún sistema**. Cierre: `nli_probe` corre con `CUBA_NLI_PATH` en un HOME de prueba, y V5n/W8 pasan.
+- [ ] **F2. El servicio tarda 2 min 45 s en contestar tras un reinicio.** Medido en el despliegue de esta PC (14:55:45 → 14:58:30): calienta el reranker en CPU antes de abrir el puerto (`bind < warm < announce < serve`). Decidir con Leandro qué se prefiere (abrir antes y decir «calentando» en `/health`, o calentar en segundo plano); hoy una actualización deja a todas las sesiones sin memoria ese rato.
+- [ ] **F3. `doctor` abre la base antes de cualquier chequeo** (`doctor.rs:1762`): sin base no dice nada de GPU ni de runtime. Una orden que diga la colocación y el runtime sin base (o `doctor` degradando esos chequeos) habría evitado W5/V3.
+- [ ] **F4. En `doctor`, `http_port` avisa «something is already listening» cuando quien escucha es el propio servicio.** Ruido en cada instalación con el servicio en marcha.
+- [ ] **F5. El reintento del reembebido automático desde el ciclo REM (A1 de la revisión) no tiene prueba de extremo a extremo**; ni que `run_in_background` use el pool lateral y el codificador de fondo (A3). El ensayo Q7 lo cubre de forma indirecta (0 esperas de pool, latencia ×1,13).
+- [ ] **F6. `principal_grants` no cubre `brain_observation_chunks` ni `brain_procedures`** y el código nunca fija `app.current_principal` (H-C3; anterior al lote).
+- [ ] **F7. La importación en modo `merge` con texto divergente deja la fila y luego le escribe el vector del paquete**, hecho para otro texto (anterior al lote; hallazgo del implementador de CI-D5c-C).
+- [ ] **F8. Un Linux sin `ca-certificates` no puede construir ningún cliente HTTP**, ni los de loopback (reqwest 0.13 con el almacén del sistema). Decidir si avisa y sigue con una lista empaquetada.
+
+**Guiones de prueba y juez**
+- [ ] **F9. `probar-gpu.sh`: una tercera corrida limpia en los dos sistemas** con las correcciones del 11-nov (opciones de `env`, toolchain, UTF-8, lector del informe, base desechable para `doctor`), y en WSL darle una base del juez (`GPU_QA_DATABASE_URL`) para W5.
+- [ ] **F10. El `cargo-mutants` de pega de los autotests de `quality-gate.sh` y `mutants-gate.sh` es una lista a mano** de lo que el real rechaza: el modo «lab» nunca había corrido de verdad y murió en la primera corrida (`--copy-target` con `--gitignore`). Un paso barato que pase la línea real por `cargo mutants --list`.
+- [ ] **F11. 23 funciones Python del juez, del e2e y del ayudante de QA por encima de CC 8** con línea en `lizard-baseline.txt` (revisar antes del 2027-02-28); `run_rem_consolidation_locked` sigue en 15.
+- [ ] **F12. lizard 1.24 no cierra un literal `char` no ASCII en Rust** y mide de más (un CC 19 falso); guarda o nota en el gate.
+- [ ] **F13. El juez de Windows:** el planificador puede no importarse con el Python de Windows (`fcntl`, `SIGHUP`: CI-E25b) y `run_counted` para en la primera sección sin línea de Windows, lo que obliga a varias corridas para reunir recuentos; un modo de medida que siga tras un recuento que falta.
+- [ ] **F14. Una dev-dependency no puede pedir features que el build normal no pide** (`tokio-rustls/ring` partió el binario release en dos; lo cazó B3g, tarde): contrato barato sobre `cargo tree -e features` con y sin aristas `dev`.
+- [ ] **F15. Una tajada que añade tests a `gpu::` mueve dos líneas base** (`lib` y `placement-table`): que el juez lo diga en `rapido`, no en la fila REL.
+- [ ] **F16. `v046_migrations_apply_over_an_existing_schema` llegó al 93 % de su techo** en la corrida más lenta del veredicto (14,83 s de 16).
