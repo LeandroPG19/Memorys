@@ -67,13 +67,24 @@ fn a_lan_auto_install_with_a_short_token_fails_naming_the_floor() {
     );
 }
 
+/// A loopback port nothing listens on, reserved with a socket that is bound and never listens.
+/// A listener opened and dropped here is in LISTEN while it lives, and a child process another
+/// test of this binary forks in that window keeps the LISTEN socket until its `execve`: the
+/// check would then find «something already listening» on a port this test had just freed. A
+/// socket that never listened leaves nothing that blocks the check's bind, even as a leftover
+/// copy, because the check's `std` bind and this one both set SO_REUSEADDR.
+fn free_port() -> u16 {
+    let reserved = tokio::net::TcpSocket::new_v4().expect("a socket to reserve a port with");
+    reserved.set_reuseaddr(true).expect("SO_REUSEADDR");
+    reserved
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("a free loopback port");
+    reserved.local_addr().expect("the reserved address").port()
+}
+
 #[test]
 fn the_port_check_of_lan_auto_looks_at_loopback() {
-    let free = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let free = free_port();
     let check = doctor::http_port_check(Some(&format!("lan:{free}")));
     assert_eq!(
         check.status,
