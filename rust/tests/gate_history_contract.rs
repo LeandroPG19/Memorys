@@ -3657,8 +3657,7 @@ fn e2_6_sobre_1_10_veces_la_mediana_alarma_y_en_1_10_justo_no() {
     assert!(alarmas.is_empty(), "{alarmas:?}");
 }
 
-const E2_7_ALARM: &str =
-    "cost: ALARM top 1 b12 entered the 10 slowest: it was in none of the 10 slowest of the last 10 green serie runs of this table; the verdict does not change";
+const E2_7_ALARM: &str = "cost: ALARM top 1 b12 entered the 10 slowest: it was in none of the 10 slowest of the last 10 green serie runs of this table; the verdict does not change";
 
 /// E2.7: b12 was in no top of the base and alarms; b11 was in the top of the oldest run, so it does not, though it was not
 /// in the one of the last.
@@ -3668,7 +3667,10 @@ fn e2_7_un_binario_que_entra_en_los_10_mas_caros_alarma() {
     let (lineas, alarmas) = comparar_of(&v);
     let top_alarms = with_text(&lineas, "ALARM top");
     assert_eq!(top_alarms, [E2_7_ALARM], "only b12 alarms: {lineas:?}");
-    assert!(alarmas.iter().any(|l| l == E2_7_ALARM), "apart: {alarmas:?}");
+    assert!(
+        alarmas.iter().any(|l| l == E2_7_ALARM),
+        "apart: {alarmas:?}"
+    );
     let new: Vec<&String> = lineas.iter().filter(|l| l.ends_with(" new")).collect();
     assert_eq!(new.len(), 1, "one line ends in ` new`: {lineas:?}");
     assert!(
@@ -3763,20 +3765,19 @@ fn assert_cost_after_the_steps(p: &Plan) {
         .unwrap_or_else(|| panic!("no `dag: step` line: {}", p.out));
     let after: Vec<&str> = lines.iter().skip(last + 1).take(5).copied().collect();
     assert_eq!(
-        after,
-        E2_LINES,
+        after, E2_LINES,
         "the lines after the last `dag: step`:\n{}",
         p.out
     );
     let all = cost_lines(&p.out);
     assert_eq!(
-        all,
-        E2_LINES,
+        all, E2_LINES,
         "every `cost:` line, and none before the steps:\n{}",
         p.out
     );
     assert!(
-        all.iter().all(|l| !l.contains("cov") && !l.contains("50.00")),
+        all.iter()
+            .all(|l| !l.contains("cov") && !l.contains("50.00")),
         "the untimed row `cov` is not cost: {all:?}"
     );
 }
@@ -3904,7 +3905,9 @@ fn e2_12_un_fallo_dentro_del_calculo_no_cambia_el_veredicto() {
         p.err
     );
     assert!(
-        cost_lines(&p.out).iter().all(|l| !l.starts_with("cost: run")),
+        cost_lines(&p.out)
+            .iter()
+            .all(|l| !l.starts_with("cost: run")),
         "a cost line after the failure: {}",
         p.out
     );
