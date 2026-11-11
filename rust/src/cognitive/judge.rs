@@ -597,7 +597,7 @@ impl OpenAiCompatJudge {
     /// Cheap readiness probe for the merge gate (`require_generative_llm`).
     /// Tries GET /models, then a minimal chat/completions (some Chinese APIs omit /models).
     pub async fn probe_health(&self) -> Result<()> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .timeout(Duration::from_secs(8))
             .build()
             .context("building HTTP client for LLM probe")?;
@@ -658,7 +658,7 @@ impl ContradictionJudge for OpenAiCompatJudge {
     }
     async fn run_prompt(&self, prompt: &str) -> Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .timeout(self.timeout)
             .build()
             .context("building HTTP client for OpenAI-compat LLM")?;

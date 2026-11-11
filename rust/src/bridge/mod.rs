@@ -573,7 +573,7 @@ pub async fn run(deps: BridgeDeps, port: Option<u16>) -> Result<proxy::BridgeHan
 
 fn system_deps(state_path: PathBuf) -> Result<BridgeDeps> {
     let timing = Timing::production();
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .no_proxy()
         .connect_timeout(timing.identity)
         .build()
@@ -840,7 +840,7 @@ async fn cli_status() -> Result<()> {
 
 /// What the bridge on this PC's port says about itself, or that nothing answers there.
 async fn running_bridge(port: u16) -> Result<String> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(3))
         .build()

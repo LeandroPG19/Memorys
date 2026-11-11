@@ -82,7 +82,7 @@ async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
 /// waiting on it would fail a daemon that was working.
 async fn wait_until_it_serves(port: u16, daemon: &tokio::task::JoinHandle<()>) {
     let url = format!("http://127.0.0.1:{port}/health");
-    let client = reqwest::Client::builder()
+    let client = memory_industry::http_client::builder()
         .timeout(PROBE_BUDGET)
         .build()
         .expect("a probe client with a bounded attempt");
@@ -165,7 +165,9 @@ async fn daemon() -> (sqlx::PgPool, u16) {
 }
 
 async fn open_a_session(port: u16, header: Option<&str>, name: &str) -> serde_json::Value {
-    let client = reqwest::Client::new();
+    let client = memory_industry::http_client::builder()
+        .build()
+        .expect("the HTTP client builds");
     let mut request = client
         .post(format!("http://127.0.0.1:{port}/mcp"))
         .bearer_auth(ADMIN);
@@ -194,7 +196,9 @@ async fn open_a_session(port: u16, header: Option<&str>, name: &str) -> serde_js
 }
 
 async fn whose_session(port: u16, header: Option<&str>) -> Option<String> {
-    let client = reqwest::Client::new();
+    let client = memory_industry::http_client::builder()
+        .build()
+        .expect("the HTTP client builds");
     let mut request = client
         .post(format!("http://127.0.0.1:{port}/mcp"))
         .bearer_auth(ADMIN);

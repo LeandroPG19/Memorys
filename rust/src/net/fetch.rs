@@ -20,7 +20,7 @@ pub async fn get(raw: &str) -> Result<String> {
             .context("URL sin host tras la validación")?
             .to_string();
 
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .timeout(TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .resolve(&host, safe.addr)

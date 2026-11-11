@@ -123,7 +123,7 @@ impl Drop for Daemon {
 /// fixed number: any number is right on an idle machine and wrong on the busy one that failed.
 async fn wait_until_it_serves(port: u16, daemon: &JoinHandle<()>) {
     let url = format!("http://127.0.0.1:{port}/health");
-    let client = reqwest::Client::builder()
+    let client = memory_industry::http_client::builder()
         .no_proxy()
         .timeout(PROBE_BUDGET)
         .build()
@@ -300,7 +300,7 @@ fn timing() -> Timing {
 }
 
 fn bridge_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    memory_industry::http_client::builder()
         .no_proxy()
         .pool_max_idle_per_host(0)
         .connect_timeout(Duration::from_secs(2))
@@ -422,7 +422,7 @@ impl Reply {
 }
 
 fn http() -> reqwest::Client {
-    reqwest::Client::builder()
+    memory_industry::http_client::builder()
         .no_proxy()
         .timeout(CALL_BUDGET)
         .build()

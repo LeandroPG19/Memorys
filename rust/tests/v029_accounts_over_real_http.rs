@@ -126,7 +126,7 @@ async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
 /// fixed number: any number is right on an idle machine and wrong on the busy one that failed.
 async fn wait_until_it_serves(port: u16, daemon: &tokio::task::JoinHandle<()>) {
     let url = format!("http://127.0.0.1:{port}/health");
-    let client = reqwest::Client::builder()
+    let client = memory_industry::http_client::builder()
         .timeout(PROBE_BUDGET)
         .build()
         .expect("a probe client with a bounded attempt");
@@ -282,7 +282,11 @@ fn url(port: u16, path: &str) -> String {
 }
 
 async fn mcp(port: u16, bearer: Option<&str>, body: Value) -> Reply {
-    let mut request = reqwest::Client::new().post(url(port, "/mcp")).json(&body);
+    let mut request = memory_industry::http_client::builder()
+        .build()
+        .expect("the HTTP client builds")
+        .post(url(port, "/mcp"))
+        .json(&body);
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
@@ -317,7 +321,13 @@ async fn whoami(port: u16, bearer: &str) -> Value {
 }
 
 async fn identity(port: u16, query: &str) -> Reply {
-    send(reqwest::Client::new().get(url(port, &format!("/identity{query}")))).await
+    send(
+        memory_industry::http_client::builder()
+            .build()
+            .expect("the HTTP client builds")
+            .get(url(port, &format!("/identity{query}"))),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -419,7 +429,9 @@ impl Ask {
 
 async fn pair(port: u16, request: &PairRequest) -> Reply {
     send(
-        reqwest::Client::new()
+        memory_industry::http_client::builder()
+            .build()
+            .expect("the HTTP client builds")
             .post(url(port, "/pair"))
             .json(request),
     )
@@ -978,7 +990,9 @@ async fn g5_malformed_requests_are_a_400_that_is_not_a_pairing_failure() {
         let code = issue(&pool, "ana", None, Utc::now()).await;
         let good = ask(&code, "pc").request;
 
-        let client = reqwest::Client::new();
+        let client = memory_industry::http_client::builder()
+            .build()
+            .expect("the HTTP client builds");
         let mut short_nonce = good.clone();
         short_nonce.nc = good.nc[..30].to_string();
         let mut hash_not_hex = good.clone();
@@ -1327,7 +1341,9 @@ async fn g8_identity_and_pair_refuse_proxies_foreign_pages_and_big_bodies() {
         let port = start(&pool).await;
         let code = issue(&pool, "ana", None, Utc::now()).await;
         let asked = ask(&code, "pc");
-        let client = reqwest::Client::new();
+        let client = memory_industry::http_client::builder()
+            .build()
+            .expect("the HTTP client builds");
 
         for header in memory_industry::http::FORWARDING_HEADERS {
             let identity_through = send(
@@ -1463,7 +1479,9 @@ async fn g9_an_account_credential_is_a_full_scope_caller_who_is_named_in_whoami(
              leaving the keys out: {legacy}"
         );
 
-        let client = reqwest::Client::new();
+        let client = memory_industry::http_client::builder()
+            .build()
+            .expect("the HTTP client builds");
         let ticket = send(
             client
                 .post(url(port, "/events/ticket"))

@@ -28,6 +28,7 @@ pub mod graph_db;
 pub mod handlers;
 pub mod hooks_cli;
 pub mod http;
+pub mod http_client;
 pub mod link_cli;
 pub mod llm_cli;
 pub mod mode;

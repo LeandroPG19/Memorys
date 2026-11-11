@@ -400,7 +400,7 @@ async fn project_cypher(cypher: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .timeout(Duration::from_secs(3))
         .build()?;
     let body = serde_json::json!({ "query": cypher });

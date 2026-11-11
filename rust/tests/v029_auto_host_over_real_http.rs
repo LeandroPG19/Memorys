@@ -109,7 +109,7 @@ fn free_port() -> u16 {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+    memory_industry::http_client::builder()
         .timeout(PROBE_BUDGET)
         .no_proxy()
         .build()
@@ -145,7 +145,7 @@ async fn lan_block(port: u16) -> Value {
     // Above HEALTH_DB_TIMEOUT (5 s) on purpose: a dead database that answers at once leaves this
     // far under it, so a regression of the fixture shows up slow here and red in the guardian
     // of v042_health_says_what_degraded.
-    let body: Value = reqwest::Client::builder()
+    let body: Value = memory_industry::http_client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .no_proxy()
         .build()

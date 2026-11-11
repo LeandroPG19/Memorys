@@ -465,7 +465,7 @@ fn extract_runtime(
 }
 
 async fn download_to(url: &str, dest: &Path) -> Result<()> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .user_agent(concat!("memory-industry/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let resp = client.get(url).send().await?.error_for_status()?;

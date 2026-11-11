@@ -24,6 +24,8 @@ mod e2e_tool_matrix_contract;
 mod gate_lane_token_contract;
 #[path = "group_no_server/migrations_contract.rs"]
 mod migrations_contract;
+#[path = "group_no_server/outbound_http_contract.rs"]
+mod outbound_http_contract;
 #[path = "group_no_server/scram_verifier_contract.rs"]
 mod scram_verifier_contract;
 #[path = "group_no_server/sql_safe_contract.rs"]

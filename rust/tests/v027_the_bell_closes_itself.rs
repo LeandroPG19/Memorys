@@ -118,7 +118,7 @@ async fn wait_until_the_peer_serves(
     peer_addr: &str,
 ) -> String {
     let url = format!("http://{peer_addr}/health");
-    let client = reqwest::Client::builder()
+    let client = memory_industry::http_client::builder()
         .timeout(PROBE_BUDGET)
         .build()
         .expect("a probe client with a bounded attempt");

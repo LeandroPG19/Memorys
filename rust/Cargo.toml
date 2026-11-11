@@ -66,7 +66,13 @@ lru = "0.19"
 
 zstd = "0.14.3"
 
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# reqwest 0.13's `rustls` feature brings aws-lc-rs (C, a second crypto provider next to the ring that sqlx uses); `rustls-no-provider` leaves the provider to
+# the program, and `http_client::builder` installs ring once. Certificates are checked by the operating system's verifier (rustls-platform-verifier:
+# the system store, which on Linux needs `ca-certificates`), not by a bundle compiled in. Default features off because `default-tls` is the aws-lc-rs one;
+# `charset`, `http2` and `system-proxy` stay off, as they were with 0.12.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
+# Direct only so that `http_client` can install ring. Default features off: rustls's default is aws-lc-rs, and `cargo tree -i aws-lc-rs` has to stay empty.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 
@@ -83,6 +89,12 @@ sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 tree-sitter = "0.27.2"
 tree-sitter-rust = "0.24.2"
 tree-sitter-python = "0.25.0"
+
+# Only for the TLS server on loopback of tests/group_no_server/outbound_http_contract.rs, which makes its own certificates so that no key sits in the repository.
+# Both are named without their defaults on purpose: rcgen's default is ring today and tokio-rustls's is aws-lc-rs, and `cargo tree -i aws-lc-rs` has to stay empty.
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [features]
 default = ["docs"]
