@@ -172,8 +172,7 @@ src/llm_cli.rs::set_provider#1 28
 # next increase too. Owner: implementador 0.29.
 src/main.rs::async_main#1 26
 src/models_cli.rs::download_model#1 10
-src/models_cli.rs::download_runtime#1 13
-src/models_cli.rs::download_to#1 13
+src/models_cli.rs::download_to_with#1 13
 src/models_cli.rs::extract_runtime#1 29
 src/models_cli.rs::wanted_runtime_lib#1 9
 src/net/fetch.rs::get#1 13
