@@ -6952,6 +6952,35 @@ mod admission_tests {
         assert_eq!(by_query.status(), StatusCode::OK, "/events by query");
     }
 
+    /// The future of `/mcp` is built and never polled: the size is the type's, so nothing can
+    /// overflow here and the test fails on the number instead of aborting the binary.
+    ///
+    /// The ceiling is one-way and not a measurement of this machine: a future's size depends on
+    /// the compiler and the target, not on the load. 16 384 bytes is the default threshold of
+    /// `clippy::large_futures`. A worker, and the stack of a test thread, has 2 MiB, and in a
+    /// debug build every `poll` of the chain keeps several copies of the future in its frame.
+    #[tokio::test]
+    async fn the_mcp_route_future_stays_small_enough_for_a_two_mib_stack() {
+        const CEILING: usize = 16_384;
+        let state = state_with_policy(false);
+
+        let fut = mcp_endpoint(
+            State(state),
+            axum::extract::ConnectInfo(lan()),
+            bearer(SHARED),
+            ping(),
+        );
+        let size = std::mem::size_of_val(&fut);
+
+        assert!(
+            size <= CEILING,
+            "the future of mcp_endpoint is {size} bytes, over the {CEILING} it may take. Each of \
+             the `with_*` wrappers (scope, root project, identity) takes the request's future by \
+             value and doubles it, and a worker has a 2 MiB stack: with sqlx 0.9.0 it grew to \
+             121152 bytes and five tests of this file aborted the binary on a stack overflow"
+        );
+    }
+
     #[tokio::test]
     async fn health_gives_the_shared_token_the_full_view_whatever_the_knob_says() {
         for knob in [false, true] {
