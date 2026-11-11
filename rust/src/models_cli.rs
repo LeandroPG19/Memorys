@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The ONNX Runtime `models runtime` installs. Public because `tests/model_parity.rs`
 /// compares it with the runtime the judge loads: the vectors it pins are measured on
@@ -373,10 +374,11 @@ fn runtime_archive(
 
 /// What the CUDA driver says about this machine, read the way `nvidia-smi` does
 /// but through `libcuda`: `cuDriverGetVersion` (12080 is CUDA 12.8) and the
-/// compute capability of card 0.
+/// compute capability of card 0. The version is read first and stands alone: a
+/// card that does not answer (`compute: None`) is still a driver with a version.
 struct CudaProbe {
     driver: i32,
-    compute: (i32, i32),
+    compute: Option<(i32, i32)>,
 }
 
 /// Turing, SM 7.5: the oldest card the CUDA 13 packages are built for.
@@ -387,49 +389,84 @@ fn cuda_version(driver: i32) -> String {
 }
 
 /// Which GPU package to fetch: the flag when there is one, and otherwise what the
-/// driver and the card can run. Pure, so every row of the table is judged on a
-/// machine with no card. CUDA 12 is deprecated by Microsoft since 1.27, so the
+/// driver and the card can run. Every row of the table is judged on a machine with
+/// no card because the reading comes in as `probe`, and it is called only when its
+/// answer decides: `--cuda 12` never reads the driver, and `cuInit` on a machine
+/// with a card is not free. CUDA 12 is deprecated by Microsoft since 1.27, so the
 /// answer is 13 unless the driver or the card cannot take it. No driver at all is
 /// 13 with a line that says so: an install made ahead of the card is the common
 /// case, and the line tells how to ask for 12.
-fn choose_cuda(forced: Option<u8>, probe: Option<CudaProbe>) -> Result<(Flavor, Option<String>)> {
-    match (forced, probe) {
-        (Some(12), _) => Ok((Flavor::Cuda12, None)),
-        (Some(_), None) => Ok((Flavor::Cuda13, None)),
-        (Some(_), Some(card)) if card.compute < OLDEST_CARD_OF_CUDA_13 => bail!(
+fn choose_cuda(
+    forced: Option<u8>,
+    probe: &dyn Fn() -> Option<CudaProbe>,
+) -> Result<(Flavor, Option<String>)> {
+    match forced {
+        Some(12) => Ok((Flavor::Cuda12, None)),
+        Some(_) => forced_cuda_13(probe()),
+        None => cuda_the_driver_can_run(probe()),
+    }
+}
+
+/// `--cuda 13` holds against everything but a card that cannot run it.
+fn forced_cuda_13(probe: Option<CudaProbe>) -> Result<(Flavor, Option<String>)> {
+    match probe.and_then(|card| card.compute) {
+        Some(compute) if compute < OLDEST_CARD_OF_CUDA_13 => bail!(
             "CUDA 13 no soporta la tarjeta 0 (capacidad de cómputo {}.{}, anterior a Turing): \
              usá --cuda 12",
-            card.compute.0,
-            card.compute.1
+            compute.0,
+            compute.1
         ),
-        (Some(_), Some(_)) => Ok((Flavor::Cuda13, None)),
-        (None, None) => Ok((
+        _ => Ok((Flavor::Cuda13, None)),
+    }
+}
+
+/// The version of the driver decides below 13 without looking at the card; from 13 up
+/// the card decides, and a card that did not answer is CUDA 13 with a line that says so.
+fn cuda_the_driver_can_run(probe: Option<CudaProbe>) -> Result<(Flavor, Option<String>)> {
+    let Some(card) = probe else {
+        return Ok((
             Flavor::Cuda13,
             Some(
                 "no veo driver NVIDIA: bajo CUDA 13; con un driver de CUDA 12 o una tarjeta \
                  anterior a Turing (SM < 7.5) usá --cuda 12"
                     .to_string(),
             ),
-        )),
-        (None, Some(card)) if card.driver < 12000 => bail!(
+        ));
+    };
+    if card.driver < 12000 {
+        bail!(
             "el driver soporta CUDA {}; el runtime GPU necesita 12 o 13: actualizá el driver o \
              bajá el de CPU sin --gpu",
             cuda_version(card.driver)
+        );
+    }
+    if card.driver < 13000 {
+        return Ok((Flavor::Cuda12, None));
+    }
+    Ok(match card.compute {
+        None => (
+            Flavor::Cuda13,
+            Some(
+                "no pude leer la tarjeta 0: bajo CUDA 13; con una tarjeta anterior a Turing \
+                 (SM < 7.5) usá --cuda 12"
+                    .to_string(),
+            ),
         ),
-        (None, Some(card)) if card.driver < 13000 => Ok((Flavor::Cuda12, None)),
-        (None, Some(card)) if card.compute < OLDEST_CARD_OF_CUDA_13 => Ok((
+        Some(compute) if compute < OLDEST_CARD_OF_CUDA_13 => (
             Flavor::Cuda12,
             Some(format!(
                 "CUDA 13 no soporta SM {}.{}: bajo CUDA 12",
-                card.compute.0, card.compute.1
+                compute.0, compute.1
             )),
-        )),
-        (None, Some(_)) => Ok((Flavor::Cuda13, None)),
-    }
+        ),
+        Some(_) => (Flavor::Cuda13, None),
+    })
 }
 
-/// `libcuda`, loaded and asked, or `None` when there is no driver or no card 0.
-/// `cuDriverGetVersion` needs no `cuInit`; the capability does.
+/// `libcuda`, loaded and asked, or `None` when there is no driver. The card is
+/// asked after the version and may not answer: that is a driver with no capability,
+/// not a machine with no driver. `cuDriverGetVersion` needs no `cuInit`; the
+/// capability does.
 fn probe_cuda() -> Option<CudaProbe> {
     let name = if cfg!(windows) {
         "nvcuda.dll"
@@ -467,14 +504,16 @@ fn read_cuda(library: &libloading::Library) -> Option<CudaProbe> {
         let device_get = library.get::<DeviceGet>(b"cuDeviceGet").ok()?;
         let attribute = library.get::<Attribute>(b"cuDeviceGetAttribute").ok()?;
         let (mut driver, mut device, mut major, mut minor) = (0, 0, 0, 0);
-        let answered = version(&mut driver) == 0
-            && init(0) == 0
+        if version(&mut driver) != 0 {
+            return None;
+        }
+        let card_answered = init(0) == 0
             && device_get(&mut device, 0) == 0
             && attribute(&mut major, COMPUTE_CAPABILITY_MAJOR, device) == 0
             && attribute(&mut minor, COMPUTE_CAPABILITY_MINOR, device) == 0;
-        answered.then_some(CudaProbe {
+        Some(CudaProbe {
             driver,
-            compute: (major, minor),
+            compute: card_answered.then_some((major, minor)),
         })
     }
 }
@@ -722,6 +761,18 @@ async fn fetch_runtime(
 ///
 /// `rename` is handed in, as in `relocate_with`: on Linux a directory with a library
 /// mapped renames without complaint, and «in use» is something only Windows says.
+///
+/// A process can die between the two renames, so what each directory holds on
+/// entry is read before anything is deleted (`<leaf>` is the leaf, `.previous` the
+/// old runtime aside, `.failed` a package that did not load):
+/// - no leaf and a `.previous`: the cut. The old runtime is the only copy there is
+///   and it comes back (`recover_cut_swap`); nothing is deleted before that;
+/// - a leaf and a `.previous`: a swap that went through and did not finish retiring
+///   the old one. What the operator put in it moves to the leaf, and the swap does
+///   not go on while something stays (`retire_previous`);
+/// - a leaf and a `.failed`: deleted, nothing reads it;
+/// - no leaf, no `.previous`: a first install, and a `.failed` is left alone.
+///
 /// What stays on each failure:
 /// - the leaf is in use: nothing moved, the staging stays whole for the next run;
 /// - the new one does not load (`verify`): it is kept as `<leaf>.failed` and the old
@@ -734,20 +785,8 @@ fn swap_runtime(
 ) -> Result<()> {
     let previous = sibling(leaf, "previous");
     let failed = sibling(leaf, "failed");
-    for leftover in [&previous, &failed] {
-        if std::fs::symlink_metadata(leftover).is_ok() {
-            remove_entry(leftover).map_err(in_use_or_itself)?;
-        }
-    }
-    if leaf.exists() {
-        rename(leaf, &previous).map_err(|e| {
-            in_use_or_itself(anyhow::Error::new(e).context(format!(
-                "apartando {} como {}",
-                leaf.display(),
-                previous.display()
-            )))
-        })?;
-    }
+    recover_cut_swap(leaf, rename)?;
+    set_aside(leaf, &previous, &failed, rename)?;
     if let Err(e) = rename(staging, leaf) {
         let cause = in_use_or_itself(anyhow::Error::new(e).context(format!(
             "moviendo {} a {}",
@@ -763,15 +802,117 @@ fn swap_runtime(
         let cause = cause.context("el runtime nuevo no pasó la comprobación y quedó el anterior");
         return Err(restored(cause, &previous, leaf, rename));
     }
-    if std::fs::symlink_metadata(&previous).is_ok()
-        && let Err(e) = remove_entry(&previous)
-    {
-        println!(
-            "  (no pude borrar el runtime anterior, {}: la siguiente corrida lo borra)",
-            skip_reason(&e)
-        );
+    if let Some(notice) = retire_previous(&previous, leaf) {
+        println!("  ({notice})");
     }
     Ok(())
+}
+
+/// A swap cut between its two renames leaves no leaf and the old runtime as
+/// `<leaf>.previous`, the only copy there is: it goes back to its place, and the
+/// line says so. With a leaf, or with nothing aside, there is nothing to undo.
+fn recover_cut_swap(
+    leaf: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let previous = sibling(leaf, "previous");
+    if std::fs::symlink_metadata(leaf).is_ok() || std::fs::symlink_metadata(&previous).is_err() {
+        return Ok(());
+    }
+    rename(&previous, leaf).map_err(|e| {
+        in_use_or_itself(anyhow::Error::new(e).context(format!(
+            "devolviendo {} a {}",
+            previous.display(),
+            leaf.display()
+        )))
+    })?;
+    println!(
+        "→ runtime: el runtime anterior vuelve a su sitio ({}): un reemplazo se cortó a medias",
+        leaf.display()
+    );
+    Ok(())
+}
+
+/// The first rename of the swap: the leaf, if there is one, goes aside as
+/// `.previous`, after the leftovers of an earlier swap are dealt with (a failed
+/// package is deleted, and an old runtime aside is retired, which can refuse).
+fn set_aside(
+    leaf: &Path,
+    previous: &Path,
+    failed: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    if std::fs::symlink_metadata(leaf).is_err() {
+        return Ok(());
+    }
+    if std::fs::symlink_metadata(failed).is_ok() {
+        remove_entry(failed).map_err(in_use_or_itself)?;
+    }
+    if let Some(notice) = retire_previous(previous, leaf) {
+        bail!("un reemplazo anterior dejó el runtime viejo aparte: {notice}");
+    }
+    rename(leaf, previous).map_err(|e| {
+        in_use_or_itself(anyhow::Error::new(e).context(format!(
+            "apartando {} como {}",
+            leaf.display(),
+            previous.display()
+        )))
+    })
+}
+
+/// What is not of the package (`runtime.json`, `onnxruntime*`, `libonnxruntime*`:
+/// the core and the providers of every system) is not the old runtime's to take
+/// with it: the hint of a provider that would not start tells the operator to put
+/// the CUDA libraries beside the runtime, and `models runtime` must not undo that.
+fn belongs_to_the_package(name: &str) -> bool {
+    name == RUNTIME_RECORD || name.starts_with("onnxruntime") || name.starts_with("libonnxruntime")
+}
+
+/// What of `previous` is not of the package, moved into `leaf`; the names that
+/// could not go (one with that name is already there, or the rename failed).
+fn carry_over(previous: &Path, leaf: &Path) -> std::io::Result<Vec<String>> {
+    let mut stayed = Vec::new();
+    for entry in std::fs::read_dir(previous)? {
+        let name = entry?.file_name();
+        let text = name.to_string_lossy().into_owned();
+        if belongs_to_the_package(&text) {
+            continue;
+        }
+        let to = leaf.join(&name);
+        if std::fs::symlink_metadata(&to).is_ok()
+            || std::fs::rename(previous.join(&name), &to).is_err()
+        {
+            stayed.push(text);
+        }
+    }
+    Ok(stayed)
+}
+
+/// The old runtime goes once the new one loaded, with what the operator put beside
+/// it moved to the new one first. `None` when `previous` is gone (or was never
+/// there); otherwise what remains and where, because a file of the operator is never
+/// deleted with the old package and the next run tries again.
+fn retire_previous(previous: &Path, leaf: &Path) -> Option<String> {
+    std::fs::symlink_metadata(previous).ok()?;
+    match carry_over(previous, leaf) {
+        Err(e) => Some(format!(
+            "no pude leer {}: {e}; la siguiente corrida lo vuelve a intentar",
+            previous.display()
+        )),
+        Ok(stayed) if !stayed.is_empty() => Some(format!(
+            "quedan en {}: {}. La siguiente corrida los vuelve a intentar; si siguen ahí, \
+             llevalos a mano a {} o borrá esa carpeta",
+            previous.display(),
+            stayed.join(", "),
+            leaf.display()
+        )),
+        Ok(_) => remove_entry(previous).err().map(|e| {
+            format!(
+                "no pude borrar el runtime anterior, {}: la siguiente corrida lo vuelve a intentar",
+                skip_reason(&e)
+            )
+        }),
+    }
 }
 
 fn in_use_or_itself(error: anyhow::Error) -> anyhow::Error {
@@ -816,35 +957,100 @@ fn loads_the_pinned_runtime(leaf: &Path, lib_name: &str) -> Result<()> {
 
 /// `--gpu` resolves to a flavor, and so does an install that has no record and a
 /// CUDA provider beside the library, which is a GPU runtime the CPU package would
-/// silently replace.
-fn resolve_gpu(ask: &RuntimeArgs, installed: &Installed) -> Result<Option<Flavor>> {
-    let holds_a_provider = matches!(installed, Installed::Unrecorded { gpu_provider: true });
-    if !ask.gpu && !holds_a_provider {
-        return Ok(None);
+/// silently replace. That one stays on CUDA 12 without asking the driver: every
+/// install without a record is older than the record, the installer of then only
+/// fetched `…-gpu-<v>`, which is CUDA 12, and the libraries beside it are the
+/// ones of 12. Moving it to 13 is what `--gpu` is for.
+fn resolve_gpu(
+    ask: &RuntimeArgs,
+    installed: &Installed,
+    probe: &dyn Fn() -> Option<CudaProbe>,
+) -> Result<Option<Flavor>> {
+    if ask.gpu {
+        let (flavor, note) = choose_cuda(ask.cuda, probe)?;
+        if let Some(note) = note {
+            println!("  {note}");
+        }
+        return Ok(Some(flavor));
     }
-    let (flavor, note) = choose_cuda(ask.cuda, probe_cuda())?;
-    if let Some(note) = note {
-        println!("  {note}");
+    if matches!(installed, Installed::Unrecorded { gpu_provider: true }) {
+        println!(
+            "  runtime GPU sin registro (de antes de la 0.31): sigue en CUDA 12; \
+             `models runtime --gpu` elige por el driver"
+        );
+        return Ok(Some(Flavor::Cuda12));
     }
-    Ok(Some(flavor))
+    Ok(None)
+}
+
+/// Two `models runtime` at once share one staging directory and one leaf, and
+/// the second would delete what the first is filling. One lock file in the cache
+/// root, taken without waiting: an `npm install` does not hang behind another run.
+const RUNTIME_LOCK: &str = "onnxruntime.lock";
+
+/// The lock, held for as long as the returned file lives, or `None` for a cache
+/// root that is not there when all that was asked is to update what exists: it
+/// has no runtime and no `.previous`, and creating it would change which root
+/// `gpu::runtime_dir` and `locate_onnxruntime` choose.
+fn lock_runtime(root: &Path, if_installed: bool) -> Result<Option<std::fs::File>> {
+    if !root.exists() {
+        if if_installed {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(root).with_context(|| format!("creando {}", root.display()))?;
+    }
+    take_lock(&root.join(RUNTIME_LOCK)).map(Some)
+}
+
+fn take_lock(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("abriendo {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "otro `memory-industry models runtime` está cambiando el runtime (candado {}): \
+             esperá a que termine y volvé a correr",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("tomando el candado {}", path.display()))
+        }
+    }
+}
+
+fn nothing_to_update() {
+    println!(
+        "→ runtime: no hay ninguno instalado; `memory-industry models runtime` baja el primero"
+    );
 }
 
 async fn download_runtime(ask: &RuntimeArgs) -> Result<()> {
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
     let (_, _, lib_name) = runtime_archive(os, arch, Flavor::Cpu)?;
-    let dir = cache_root()?.join("onnxruntime");
-    let installed = installed_runtime(&dir, lib_name);
+    let root = cache_root()?;
+    let Some(_lock) = lock_runtime(&root, ask.if_installed)? else {
+        nothing_to_update();
+        return Ok(());
+    };
+    let dir = root.join("onnxruntime");
+    let installed = installed_after_a_cut_swap(&dir, lib_name)?;
 
     if ask.if_installed && matches!(installed, Installed::Nothing) {
-        println!(
-            "→ runtime: no hay ninguno instalado; `memory-industry models runtime` baja el primero"
-        );
+        nothing_to_update();
         return Ok(());
     }
-    let gpu = resolve_gpu(ask, &installed)?;
-    match runtime_action(&installed, ORT_VERSION, gpu) {
+    let gpu = resolve_gpu(ask, &installed, &probe_cuda)?;
+    act_on_runtime(&dir, &installed, gpu).await
+}
+
+async fn act_on_runtime(dir: &Path, installed: &Installed, gpu: Option<Flavor>) -> Result<()> {
+    match runtime_action(installed, ORT_VERSION, gpu) {
         RuntimeAction::Keep => {
-            if let Installed::Recorded { flavor, .. } = &installed {
+            if let Installed::Recorded { flavor, .. } = installed {
                 println!(
                     "→ runtime: ya está ({ORT_VERSION}, {}) en {}",
                     flavor.as_str(),
@@ -853,8 +1059,15 @@ async fn download_runtime(ask: &RuntimeArgs) -> Result<()> {
             }
             Ok(())
         }
-        RuntimeAction::Install(flavor) => install_runtime(&dir, flavor).await,
+        RuntimeAction::Install(flavor) => install_runtime(dir, flavor).await,
     }
+}
+
+/// What the directory holds once a swap that was cut has been finished or undone:
+/// «no hay ninguno» is only true after `.previous` had its chance to come back.
+fn installed_after_a_cut_swap(dir: &Path, lib_name: &str) -> Result<Installed> {
+    recover_cut_swap(dir, &|from, to| std::fs::rename(from, to))?;
+    Ok(installed_runtime(dir, lib_name))
 }
 
 async fn install_runtime(dir: &Path, flavor: Flavor) -> Result<()> {
@@ -1001,9 +1214,31 @@ fn extract_runtime(
     }
 }
 
+/// How long a download waits for a peer that goes quiet. No limit on the whole: the
+/// GPU packages are up to 450 MB and a slow line is not a stalled one.
+#[derive(Clone, Copy)]
+struct Timeouts {
+    connect: Duration,
+    /// Between two reads, the wait for the headers included (reqwest's `read_timeout`).
+    read: Duration,
+}
+
+impl Timeouts {
+    const DOWNLOAD: Self = Self {
+        connect: Duration::from_secs(30),
+        read: Duration::from_secs(120),
+    };
+}
+
 async fn download_to(url: &str, dest: &Path) -> Result<()> {
+    download_to_with(url, dest, Timeouts::DOWNLOAD).await
+}
+
+async fn download_to_with(url: &str, dest: &Path, timeouts: Timeouts) -> Result<()> {
     let client = crate::http_client::builder()
         .user_agent(concat!("memory-industry/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
         .build()?;
     let resp = client.get(url).send().await?.error_for_status()?;
     let expected = resp.content_length();

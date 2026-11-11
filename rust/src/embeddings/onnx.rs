@@ -748,7 +748,9 @@ pub fn loaded_runtime_version() -> Option<String> {
 }
 
 /// Turns the telemetry of ONNX Runtime off for a process that has not loaded it yet,
-/// unless the operator decided: a value already set stays, whatever it is.
+/// unless the operator decided: a value already set stays, whatever it is, except an
+/// empty one, which is no decision and counts as unset (the judge reads it the same
+/// way, `gate-lock.sh`: `${ORT_DISABLE_TELEMETRY:-1}`).
 ///
 /// From 1.31 the official builds send telemetry to Microsoft over HTTPS by default, with
 /// a persistent device identifier. `Environment::with_telemetry(false)` (`load_onnxruntime_once`)
@@ -758,7 +760,7 @@ pub fn loaded_runtime_version() -> Option<String> {
 /// the tokio runtime exists, because `set_var` is only sound while one thread reads
 /// the environment.
 pub fn keep_onnx_runtime_telemetry_off() {
-    if std::env::var_os("ORT_DISABLE_TELEMETRY").is_none() {
+    if std::env::var_os("ORT_DISABLE_TELEMETRY").is_none_or(|value| value.is_empty()) {
         // SAFETY: called from `main` before the runtime and any thread of ours; the
         // test that exercises it holds `GLOBAL_STATE_GUARD`.
         unsafe { std::env::set_var("ORT_DISABLE_TELEMETRY", "1") };
