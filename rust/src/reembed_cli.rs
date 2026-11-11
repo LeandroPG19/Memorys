@@ -9,14 +9,20 @@ use sqlx::PgPool;
 use sqlx::pool::PoolConnection;
 use uuid::Uuid;
 
+use crate::embeddings::onnx::{RUNTIME_MARK, is_older_generation};
+
 /// The advisory lock two reembeds (the command and `cuba_zafra action=reembed`) take, so that only
 /// one rewrites vectors in a database at a time. A different number from `REM_LOCK` and
 /// `SYNC_LOCK`: a REM cycle runs while a reembed does.
 pub const REEMBED_LOCK: i64 = 0x0CBA_A0D1_7106_0051;
 
 const SNAPSHOT_FORMAT: &str = "memory-industry-vectors/1";
-const RUNTIME_MARK: &str = "@onnxruntime-";
 const UNLABELLED: &str = "(sin etiqueta)";
+const NO_SNAPSHOT: &str = "sin instantánea no reescribo";
+
+/// Rows per part of the snapshot in the automatic re-embed: a part of 100 rows is about 0.45 MB
+/// with 384 dimensions, so a cut loses little and the `fsync` of each part is short.
+const AUTO_CHUNK: usize = 100;
 
 /// What the encoder is asked for. The text of an observation, an episode or a chunk is embedded
 /// with the entity it hangs from, as the write path does it; a procedure is `name. trigger` alone.
@@ -56,6 +62,10 @@ pub fn onnx_encoder(input: EmbedInput) -> BoxFuture<'static, Result<Vec<f32>>> {
 /// generation gets its own directory, and `node_id` is written in the header of each part.
 /// `limit` caps the rows taken per table (the tool's `batch_size`), `chunk` is how many go into one
 /// part of the snapshot, and `progress` prints to stderr where the snapshot is and how far it got.
+/// With `forward_only` a row that has a vector is rewritten only if it is of an earlier generation
+/// than `tag` (`is_older_generation`), so a vector of a newer runtime or of another model is never
+/// put back: that is what the automatic re-embed does, and what the command and `cuba_zafra` do not
+/// (what is asked for by hand rewrites everything that differs).
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub tag: String,
@@ -65,6 +75,7 @@ pub struct Plan {
     pub node_id: String,
     pub snapshot_root: PathBuf,
     pub progress: bool,
+    pub forward_only: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +91,7 @@ impl TableReport {
         match outcome {
             Outcome::Rewritten => self.rewritten += 1,
             Outcome::Changed => self.changed += 1,
-            Outcome::Failed => self.failed += 1,
+            Outcome::Failed | Outcome::Lost => self.failed += 1,
         }
     }
 }
@@ -128,6 +139,8 @@ enum Outcome {
     Rewritten,
     Changed,
     Failed,
+    /// The write could not reach the database: the rows that follow would not either.
+    Lost,
 }
 
 /// The four tables that carry a vector. Every statement is a literal: a table name is never
@@ -504,8 +517,24 @@ impl Snapshot {
 }
 
 fn without_a_snapshot(why: anyhow::Error) -> anyhow::Error {
-    anyhow::anyhow!("sin instantánea no reescribo: {why:#}")
+    anyhow::anyhow!("{NO_SNAPSHOT}: {why:#}")
 }
+
+/// The refusal of a second re-embed. A type of its own so that the automatic one can tell «another
+/// holds the lock» from every other failure without reading the words of the message.
+#[derive(Debug)]
+struct AnotherReembed;
+
+impl std::fmt::Display for AnotherReembed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "otro reembebido está en curso en esta base: esperá a que termine \
+             (memory-industry reembed, cuba_zafra action=reembed, o el reembebido automático del servicio)",
+        )
+    }
+}
+
+impl std::error::Error for AnotherReembed {}
 
 async fn hold_the_lock(pool: &PgPool) -> Result<PoolConnection<sqlx::Postgres>> {
     let mut conn = pool
@@ -517,11 +546,9 @@ async fn hold_the_lock(pool: &PgPool) -> Result<PoolConnection<sqlx::Postgres>> 
         .fetch_one(&mut *conn)
         .await
         .context("checking the reembed lock")?;
-    anyhow::ensure!(
-        taken,
-        "otro reembebido está en curso en esta base: esperá a que termine \
-         (memory-industry reembed, o cuba_zafra action=reembed)"
-    );
+    if !taken {
+        return Err(AnotherReembed.into());
+    }
     Ok(conn)
 }
 
@@ -557,12 +584,8 @@ pub async fn reembed(pool: &PgPool, plan: &Plan, encode: &Encoder) -> Result<Rep
 
 async fn rewrite_all(pool: &PgPool, plan: &Plan, encode: &Encoder) -> Result<Report> {
     let dir = snapshot_dir(&plan.snapshot_root, &plan.tag)?;
-    std::fs::create_dir_all(&dir).map_err(|why| {
-        anyhow::anyhow!(
-            "sin instantánea no reescribo: no pude crear {}: {why}",
-            dir.display()
-        )
-    })?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|why| anyhow::anyhow!("{NO_SNAPSHOT}: no pude crear {}: {why}", dir.display()))?;
     let mut snapshot = Snapshot::open(&dir).map_err(without_a_snapshot)?;
     if plan.progress {
         eprintln!(
@@ -602,6 +625,16 @@ async fn fetch_pending(
         })
 }
 
+/// Whether a row the page returned is one this run rewrites: not already done by an earlier run of
+/// `--all`, and, when the plan only moves forward, one that has a vector of an earlier generation.
+/// A row with no vector is not moved forward: filling it is the REM cycle's, which has its own
+/// limit and its own way to be turned off.
+fn is_to_rewrite(plan: &Plan, snapshot: &Snapshot, table: Table, row: &PendingRow) -> bool {
+    let moves_forward = !plan.forward_only
+        || (row.vector.is_some() && is_older_generation(row.label.as_deref(), &plan.tag));
+    moves_forward && (!plan.all || !snapshot.is_done(table, row, &plan.tag))
+}
+
 async fn rewrite_table(
     pool: &PgPool,
     plan: &Plan,
@@ -627,7 +660,7 @@ async fn rewrite_table(
         let exhausted = page.len() < want;
         let rows: Vec<PendingRow> = page
             .into_iter()
-            .filter(|row| !plan.all || !snapshot.is_done(table, row, &plan.tag))
+            .filter(|row| is_to_rewrite(plan, snapshot, table, row))
             .collect();
         taken += rows.len();
         report.table_mut(table).fetched += rows.len();
@@ -636,7 +669,12 @@ async fn rewrite_table(
             .map_err(without_a_snapshot)?;
         for row in &rows {
             let outcome = rewrite_row(pool, table, plan, encode, row).await;
+            let lost = matches!(outcome, Outcome::Lost);
             report.table_mut(table).record(outcome);
+            anyhow::ensure!(
+                !lost,
+                "se perdió la conexión con la base: se corta el reembebido (lo hecho queda hecho, y la misma orden sigue donde quedó)"
+            );
         }
         if plan.progress {
             let done = report.table_mut(table).rewritten;
@@ -646,6 +684,15 @@ async fn rewrite_table(
             return Ok(());
         }
     }
+}
+
+/// An error of the connection and not of the row: the pool timed out or is closed, or the socket
+/// broke. Each row that is still to be written would wait the acquire timeout for the same answer.
+fn is_connection_error(why: &sqlx::Error) -> bool {
+    matches!(
+        why,
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_)
+    )
 }
 
 async fn rewrite_row(
@@ -676,7 +723,11 @@ async fn rewrite_row(
         Ok(_) => Outcome::Changed,
         Err(why) => {
             tracing::warn!(row_id = %row.id, table = table.name(), error = %why, "reembed: could not persist the vector of a row");
-            Outcome::Failed
+            if is_connection_error(&why) {
+                Outcome::Lost
+            } else {
+                Outcome::Failed
+            }
         }
     }
 }
@@ -781,17 +832,19 @@ pub async fn rollback(
     })
 }
 
-/// Deletes a snapshot, once nothing needs it: refused while rows of another generation are left,
-/// because the reembed that would finish them is the one that keeps adding to it.
+/// Deletes a snapshot, once nothing needs it: refused while rows of an earlier generation than the
+/// one it was made for are left, because the reembed that would finish them is the one that keeps
+/// adding to it. A row of a newer runtime or of another model does not hold it: the automatic
+/// re-embed does not rewrite it, so its old vector is not in the snapshot.
 pub async fn drop_snapshot(pool: &PgPool, root: &Path, tag: &str) -> Result<PathBuf> {
     let dir = find_snapshot(root, Some(tag))?;
     let (target, _) = read_snapshot(&dir)?;
-    let coverage = crate::embeddings::backfill::vector_coverage(pool, &target).await?;
+    let counts = forward_counts(pool, &target).await?;
     anyhow::ensure!(
-        coverage.stale() == 0,
-        "quedan {} vectores de otra generación: el reembebido hacia {target} no terminó, y la instantánea es \
+        counts.older == 0,
+        "quedan {} vectores anteriores a {target}: el reembebido no terminó, y la instantánea es \
          lo único que guarda sus vectores anteriores. Terminalo con `memory-industry reembed`",
-        coverage.stale()
+        counts.older
     );
     for entry in std::fs::read_dir(&dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1001,6 +1054,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         node_id,
         snapshot_root: root,
         progress: true,
+        forward_only: false,
     };
     let report = reembed(&pool, &plan, &onnx_encoder).await?;
     if report.total().fetched == 0 {
@@ -1037,4 +1091,756 @@ async fn check_column_width(pool: &PgPool, dim: usize) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// How the rows that have a vector of another label divide for the automatic re-embed: `older` are
+/// the ones it rewrites (of an earlier generation than the label asked about) and `ahead` the ones
+/// it leaves alone (of a newer runtime, or of another model). A row with no vector is in neither.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardCounts {
+    pub older: usize,
+    pub ahead: usize,
+}
+
+impl Table {
+    /// The label and how many, for the rows that have a vector of a label other than `$1`: the same
+    /// rows `pending_sql` reads for a re-embed that only moves forward, with the same joins (a row
+    /// that no page returns, such as an episode whose entity is gone, must not be counted), sorted
+    /// by the Rust rule into older and ahead.
+    const fn forward_sql(self) -> &'static str {
+        match self {
+            Self::Observations => {
+                "SELECT o.embedding_model, count(*)::bigint
+                 FROM brain_observations o
+                 JOIN brain_entities e ON e.id = o.entity_id
+                 WHERE o.embedding IS NOT NULL AND o.embedding_model IS DISTINCT FROM $1
+                 GROUP BY 1"
+            }
+            Self::Episodes => {
+                "SELECT ep.embedding_model, count(*)::bigint
+                 FROM brain_episodes ep
+                 JOIN brain_entities e ON e.id = ep.entity_id
+                 WHERE ep.embedding IS NOT NULL AND ep.embedding_model IS DISTINCT FROM $1
+                 GROUP BY 1"
+            }
+            Self::Chunks => {
+                "SELECT c.embedding_model, count(*)::bigint
+                 FROM brain_observation_chunks c
+                 JOIN brain_observations o ON o.id = c.observation_id
+                 JOIN brain_entities e ON e.id = o.entity_id
+                 WHERE c.embedding IS NOT NULL AND c.embedding_model IS DISTINCT FROM $1
+                 GROUP BY 1"
+            }
+            Self::Procedures => {
+                "SELECT p.embedding_model, count(*)::bigint
+                 FROM brain_procedures p
+                 WHERE p.embedding IS NOT NULL AND p.embedding_model IS DISTINCT FROM $1
+                 GROUP BY 1"
+            }
+        }
+    }
+}
+
+/// The rows of the four tables that have a vector of another label than `tag`, split into the ones
+/// the automatic re-embed rewrites and the ones it does not.
+pub async fn forward_counts(pool: &PgPool, tag: &str) -> Result<ForwardCounts> {
+    let mut counts = ForwardCounts::default();
+    for table in TABLES {
+        let rows: Vec<(Option<String>, i64)> = sqlx::query_as(table.forward_sql())
+            .bind(tag)
+            .fetch_all(pool)
+            .await
+            .with_context(|| format!("counting the vectors of {} by generation", table.name()))?;
+        for (label, count) in rows {
+            let count = usize::try_from(count).unwrap_or_default();
+            if is_older_generation(label.as_deref(), tag) {
+                counts.older += count;
+            } else {
+                counts.ahead += count;
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// `false` only for `0`, `off`, `false` or `no`, in any case and with spaces around: the
+/// automatic re-embed is on unless the operator turned it off.
+pub fn auto_reembed_enabled_from(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|raw| raw.trim().to_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+}
+
+fn auto_reembed_enabled() -> bool {
+    auto_reembed_enabled_from(
+        std::env::var("MEMORY_INDUSTRY_AUTO_REEMBED")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AutoState {
+    Off,
+    #[default]
+    Idle,
+    Running,
+    Done,
+    Busy,
+    Failed,
+}
+
+impl AutoState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Busy => "busy",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Where the automatic re-embed of this process is, for `/health`. `older` and `ahead` are what
+/// it counted when it started, `encoded` rows sent to the encoder (it grows while it runs),
+/// `rewritten`, `changed` and `failed` what `reembed` reports when it ends.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AutoProgress {
+    pub state: AutoState,
+    pub older: usize,
+    pub ahead: usize,
+    pub encoded: usize,
+    pub rewritten: usize,
+    pub changed: usize,
+    pub failed: usize,
+    pub last_error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    /// When the encoder last gave a row back: it tells a re-embed that gives way to the searches
+    /// from one that hung.
+    pub last_row_at: Option<String>,
+    pub snapshot: Option<PathBuf>,
+}
+
+static AUTO: std::sync::Mutex<AutoProgress> = std::sync::Mutex::new(AutoProgress {
+    state: AutoState::Idle,
+    older: 0,
+    ahead: 0,
+    encoded: 0,
+    rewritten: 0,
+    changed: 0,
+    failed: 0,
+    last_error: None,
+    started_at: None,
+    finished_at: None,
+    last_row_at: None,
+    snapshot: None,
+});
+
+pub fn set_auto_progress(progress: AutoProgress) {
+    if let Ok(mut slot) = AUTO.lock() {
+        *slot = progress;
+    }
+}
+
+pub fn auto_progress() -> AutoProgress {
+    AUTO.lock().map(|slot| (*slot).clone()).unwrap_or_default()
+}
+
+/// What the automatic re-embed needs besides the pool: where the snapshots go, the id of this
+/// database, the label the new vectors get and how many rows go into one part of the snapshot.
+#[derive(Debug, Clone)]
+pub struct AutoSettings {
+    pub snapshot_root: PathBuf,
+    pub node_id: String,
+    pub tag: String,
+    pub chunk: usize,
+}
+
+/// `onnx_encoder` for the re-embed that nobody waits for: it gives way to the searches, leaves the
+/// cache of queries alone and counts each row it is asked for in the progress `/health` shows.
+pub fn background_encoder(input: EmbedInput) -> BoxFuture<'static, Result<Vec<f32>>> {
+    background_encoder_with(
+        crate::embeddings::onnx::embed_gate(),
+        crate::embeddings::onnx::compute_embedding,
+        input,
+    )
+}
+
+/// `background_encoder` with its gate and its computation as arguments, which is the seam a test
+/// uses to hold the gate and to need no model.
+fn background_encoder_with(
+    gate: &'static crate::embeddings::onnx::EmbedGate,
+    compute: crate::embeddings::onnx::Compute,
+    input: EmbedInput,
+) -> BoxFuture<'static, Result<Vec<f32>>> {
+    Box::pin(async move {
+        if let Ok(mut slot) = AUTO.lock() {
+            slot.encoded += 1;
+        }
+        let vector = match input {
+            EmbedInput::Contextual {
+                text,
+                entity_type,
+                entity_name,
+            } => {
+                crate::embeddings::onnx::embed_passage_contextual_background_with(
+                    gate,
+                    compute,
+                    &text,
+                    &entity_type,
+                    &entity_name,
+                )
+                .await?
+            }
+            EmbedInput::Bare { text } => {
+                crate::embeddings::onnx::embed_passage_background_with(gate, compute, &text).await?
+            }
+        };
+        if let Ok(mut slot) = AUTO.lock() {
+            slot.last_row_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        Ok(vector)
+    })
+}
+
+/// Whether a re-embed holds the lock of this database right now: the automatic one, the command
+/// or `cuba_zafra`, which take the same lock. An advisory lock is in `pg_locks` as two halves of
+/// its key and with the oid of the database it is taken in, and `pg_locks` shows every database
+/// of the cluster: a re-embed that runs in another one is not this one's. A query that fails reads
+/// as «not running».
+pub async fn reembed_is_running(pool: &PgPool) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_locks
+             WHERE locktype = 'advisory' AND granted AND objsubid = 1
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+               AND classid::bigint = ($1::bigint >> 32)
+               AND objid::bigint = ($1::bigint & 4294967295))",
+    )
+    .bind(REEMBED_LOCK)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
+
+/// Whether the REM cycle may start the automatic re-embed again: it is stopped (`idle`, or `failed`
+/// by the count or by a run, or `busy` because another re-embed held the lock, which may be gone
+/// by now) and there is something older. Never while one is running, nor when it is `done` (what
+/// it could not do waits for the next start) or turned `off`.
+pub fn should_start_auto(state: AutoState, older: usize) -> bool {
+    can_restart(state) && older > 0
+}
+
+fn can_restart(state: AutoState) -> bool {
+    matches!(state, AutoState::Idle | AutoState::Failed | AutoState::Busy)
+}
+
+/// A count that failed at start leaves `failed` with its text, not `idle`: `idle` reads as
+/// «nothing to do», and the REM cycle tries again from `failed`.
+fn counting_failed(why: &anyhow::Error) -> AutoProgress {
+    finish(
+        auto_progress(),
+        AutoState::Failed,
+        Some(format!(
+            "no pude contar los vectores de otra generación: {why:#}"
+        )),
+    )
+}
+
+/// Set when the daemon starts the automatic re-embed: the REM cycle runs in the stdio mode too,
+/// and that mode does not re-embed by itself.
+static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Publishes how the run ended. `encoded` is read back from the published progress because the
+/// encoder, not this function, is what counts it.
+fn finish(
+    mut progress: AutoProgress,
+    state: AutoState,
+    last_error: Option<String>,
+) -> AutoProgress {
+    progress.encoded = auto_progress().encoded;
+    progress.state = state;
+    progress.last_error = last_error;
+    progress.finished_at = Some(chrono::Utc::now().to_rfc3339());
+    set_auto_progress(progress.clone());
+    progress
+}
+
+/// The figure the operator needs when there is no room for the snapshot: a part is a JSON line of
+/// about `dim · 11 + 200` bytes per vector.
+fn room_for(rows: usize, root: &Path) -> String {
+    let bytes = rows as f64 * (crate::embeddings::onnx::embedding_dim() as f64 * 11.0 + 200.0);
+    format!(
+        "hacen falta ≈ {:.1} MB para {rows} vectores en {}",
+        (bytes / 1e6).max(0.1),
+        root.display()
+    )
+}
+
+/// The state a failed run leaves and what it says: another re-embed holding the lock is `busy` and
+/// the rest is `failed`, and a snapshot that could not be written says how much room it needed.
+fn why_it_stopped(
+    why: &anyhow::Error,
+    settings: &AutoSettings,
+    older: usize,
+) -> (AutoState, String) {
+    let said = format!("{why:#}");
+    if why.downcast_ref::<AnotherReembed>().is_some() {
+        return (AutoState::Busy, said);
+    }
+    if said.starts_with(NO_SNAPSHOT) {
+        let room = room_for(older, &settings.snapshot_root);
+        return (AutoState::Failed, format!("{said}; {room}"));
+    }
+    (AutoState::Failed, said)
+}
+
+/// One run of the re-embed the service does by itself, and where it ended, which is also what
+/// `auto_progress()` says afterwards. It counts what is older and what is ahead; with nothing
+/// older it is `idle`. Otherwise it is `reembed` with `forward_only`: with the lock taken by
+/// another it is `busy` and touches nothing, with no place for the snapshot it is `failed` before
+/// the first row is written, and a row the encoder could not do is counted and left for the next
+/// start. It never tries again: the next start is the retry, and the command is always there.
+pub async fn run_automatic_reembed(
+    pool: &PgPool,
+    settings: &AutoSettings,
+    encode: &Encoder,
+) -> AutoProgress {
+    let mut progress = AutoProgress {
+        state: AutoState::Running,
+        started_at: Some(chrono::Utc::now().to_rfc3339()),
+        ..AutoProgress::default()
+    };
+    set_auto_progress(progress.clone());
+    match forward_counts(pool, &settings.tag).await {
+        Ok(counts) => {
+            progress.older = counts.older;
+            progress.ahead = counts.ahead;
+        }
+        Err(why) => return finish(progress, AutoState::Failed, Some(format!("{why:#}"))),
+    }
+    if progress.older == 0 {
+        return finish(progress, AutoState::Idle, None);
+    }
+    set_auto_progress(progress.clone());
+    let plan = Plan {
+        tag: settings.tag.clone(),
+        all: false,
+        chunk: settings.chunk,
+        limit: None,
+        node_id: settings.node_id.clone(),
+        snapshot_root: settings.snapshot_root.clone(),
+        progress: false,
+        forward_only: true,
+    };
+    match reembed(pool, &plan, encode).await {
+        Ok(report) => {
+            let total = report.total();
+            progress.rewritten = total.rewritten;
+            progress.changed = total.changed;
+            progress.failed = total.failed;
+            progress.snapshot = Some(report.snapshot);
+            finish(progress, AutoState::Done, None)
+        }
+        Err(why) => {
+            let (state, said) = why_it_stopped(&why, settings, progress.older);
+            finish(progress, state, Some(said))
+        }
+    }
+}
+
+async fn auto_settings(pool: &PgPool, tag: String) -> Result<AutoSettings> {
+    let node_id = crate::db::node_id(pool)
+        .await
+        .context("reading the id of this database")?
+        .to_string();
+    let snapshot_root = snapshot_root(&node_id)?;
+    Ok(AutoSettings {
+        snapshot_root,
+        node_id,
+        tag,
+        chunk: AUTO_CHUNK,
+    })
+}
+
+/// The label of the runtime loaded, if there is a runtime to name: without a model loaded, or
+/// without a runtime in the label, there is no generation to write.
+async fn loaded_generation() -> Option<String> {
+    if !crate::embeddings::onnx::model_loaded().await {
+        return None;
+    }
+    let tag = crate::embeddings::onnx::vector_tag();
+    tag.contains(RUNTIME_MARK).then_some(tag)
+}
+
+/// What the daemon does once it listens: counts the vectors of another generation and says so
+/// and, unless `MEMORY_INDUSTRY_AUTO_REEMBED` turned it off, re-embeds the ones of an earlier
+/// generation in the background, through a pool of its own so that the connections of the daemon
+/// stay for its requests. It does nothing without a runtime loaded (there is no generation to
+/// write), and nothing that happens in it stops the daemon: an error or a panic is left in the
+/// progress `/health` shows. If the database does not answer, that is `failed` with the text, and
+/// the REM cycle tries again (`resume_the_automatic_reembed`).
+pub async fn start_the_automatic_reembed(pool: PgPool) {
+    ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let enabled = auto_reembed_enabled();
+    if !enabled {
+        set_auto_progress(AutoProgress {
+            state: AutoState::Off,
+            ..AutoProgress::default()
+        });
+    }
+    let coverage = match crate::embeddings::backfill::refresh_coverage(&pool).await {
+        Ok(Some(coverage)) => coverage,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "could not count the vectors of another generation");
+            if enabled {
+                counting_failed(&e);
+            }
+            return;
+        }
+    };
+    if coverage.stale() > 0 {
+        tracing::warn!(
+            stale = coverage.stale(),
+            missing = coverage.missing(),
+            current = %coverage.tag,
+            automatic = enabled,
+            "hay vectores de otra generación: el servicio reembebe solo los anteriores al runtime cargado \
+             (MEMORY_INDUSTRY_AUTO_REEMBED=0 lo apaga); `memory-industry reembed` los rehace a mano \
+             (reanudable; guarda antes los actuales; `--rollback` los devuelve)"
+        );
+    }
+    if enabled && coverage.tag.contains(RUNTIME_MARK) {
+        run_in_background(&pool, coverage.tag).await;
+    }
+}
+
+/// What the REM cycle does after it counts: starts the automatic re-embed again if the daemon
+/// started it once, it is on, it is stopped and something is older (`should_start_auto`). A start
+/// that found the database down, or a run that failed, is retried at the next cycle and not never.
+/// One at a time: not while one is running, and the lock of the re-embed refuses the rest.
+pub async fn resume_the_automatic_reembed(pool: PgPool) {
+    if !ARMED.load(std::sync::atomic::Ordering::SeqCst) || !auto_reembed_enabled() {
+        return;
+    }
+    let state = auto_progress().state;
+    if !can_restart(state) {
+        return;
+    }
+    let Some(tag) = loaded_generation().await else {
+        return;
+    };
+    let older = match forward_counts(&pool, &tag).await {
+        Ok(counts) => counts.older,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "could not count the vectors the automatic re-embed would rewrite");
+            return;
+        }
+    };
+    if should_start_auto(state, older) {
+        run_in_background(&pool, tag).await;
+    }
+}
+
+/// One run of the automatic re-embed through a pool of its own, in a task of its own so that a
+/// panic is left in the progress, and the log of how it ended.
+async fn run_in_background(pool: &PgPool, tag: String) {
+    let settings = match auto_settings(pool, tag).await {
+        Ok(settings) => settings,
+        Err(e) => {
+            finish(auto_progress(), AutoState::Failed, Some(format!("{e:#}")));
+            return;
+        }
+    };
+    let side = crate::db::side_pool(pool, 2);
+    let task = tokio::spawn({
+        let (side, settings) = (side.clone(), settings.clone());
+        async move { run_automatic_reembed(&side, &settings, &background_encoder).await }
+    });
+    let progress = match task.await {
+        Ok(progress) => progress,
+        Err(e) => finish(
+            auto_progress(),
+            AutoState::Failed,
+            Some(format!("la tarea de fondo terminó sin avisar: {e}")),
+        ),
+    };
+    side.close().await;
+    if let Err(e) = crate::embeddings::backfill::refresh_coverage(pool).await {
+        tracing::warn!(error = %format!("{e:#}"), "could not count the vectors after the automatic re-embed");
+    }
+    match progress.state {
+        AutoState::Busy | AutoState::Failed => tracing::warn!(
+            state = progress.state.as_str(),
+            error = progress.last_error.as_deref().unwrap_or_default(),
+            "el reembebido automático se detuvo: `memory-industry reembed` lo termina a mano"
+        ),
+        AutoState::Done => tracing::info!(
+            rewritten = progress.rewritten,
+            changed = progress.changed,
+            failed = progress.failed,
+            ahead = progress.ahead,
+            snapshot = ?progress.snapshot,
+            "reembebido automático terminado"
+        ),
+        AutoState::Off | AutoState::Idle | AutoState::Running => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embeddings::onnx::is_older_generation;
+    use crate::handlers::sync::incoming_vector_wins;
+    use std::collections::HashMap;
+
+    const MODEL: &str = "multilingual-e5-small";
+    const RUNTIME_1_31: &str = "multilingual-e5-small@onnxruntime-1.31.1";
+    const RUNTIME_1_26: &str = "multilingual-e5-small@onnxruntime-1.26.0";
+
+    /// One machine of the simulation: the runtime it has loaded and the label of the vector of
+    /// each of its rows. `None` is a vector from before the labels. Every row has a vector: what is
+    /// being counted is how many times a vector is rewritten, and a row without one is rewritten
+    /// once by whoever finds it.
+    struct Machine {
+        tag: &'static str,
+        rows: HashMap<&'static str, Option<String>>,
+    }
+
+    impl Machine {
+        fn new(tag: &'static str, rows: &[(&'static str, Option<&str>)]) -> Self {
+            Self {
+                tag,
+                rows: rows
+                    .iter()
+                    .map(|(id, label)| (*id, label.map(str::to_string)))
+                    .collect(),
+            }
+        }
+
+        /// What the service does when it starts: the rows that the production rule calls older are
+        /// rewritten with the label of the runtime loaded. It returns how many.
+        fn starts(&mut self) -> usize {
+            let tag = self.tag;
+            let mut rewritten = 0;
+            for label in self.rows.values_mut() {
+                if is_older_generation(label.as_deref(), tag) {
+                    *label = Some(tag.to_string());
+                    rewritten += 1;
+                }
+            }
+            rewritten
+        }
+
+        /// What a sync import does with the vectors of a package that has every row of the other
+        /// machine: a row that was not here arrives with its vector and its label, and one that was
+        /// takes the incoming vector only if the production rule says it wins.
+        fn imports_from(&mut self, other: &Machine) {
+            for (id, incoming) in &other.rows {
+                match self.rows.get_mut(id) {
+                    None => {
+                        self.rows.insert(*id, incoming.clone());
+                    }
+                    Some(local) => {
+                        if incoming_vector_wins(local.as_deref(), true, incoming.as_deref()) {
+                            *local = incoming.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// CI-D5c (C.4). Two machines that sync, one on ONNX Runtime 1.31.1 and one on 1.26.0, must
+    /// not re-embed each other for ever. `cuba_sync` exports every observation of an entity and the
+    /// import rewrites the vector of every row of the package, so without a rule the second import
+    /// of A from B hands back to 1.26.0 what A had just re-embedded, and the next start of A does it
+    /// all again. With the two halves of the rule (the service only rewrites what is older than its
+    /// runtime, the import only takes a vector that is not older than the one it would replace) A
+    /// rewrites each row once, B never rewrites a row that came from A, and both end on 1.31.1.
+    /// The numbers were worked out on paper, round by round: A rewrites r1, r2 and the new row of B
+    /// (3), then nothing (0); in each of the next two rounds the one new row (1), then nothing (0);
+    /// B has nothing older than 1.26.0 at any start. A start is made after each import.
+    #[test]
+    fn two_machines_on_different_runtimes_stop_rewriting_each_other_after_the_first_round() {
+        let mut a = Machine::new(RUNTIME_1_31, &[("r1", Some(MODEL))]);
+        let mut b = Machine::new(
+            RUNTIME_1_26,
+            &[("r1", Some(MODEL)), ("r2", Some(RUNTIME_1_26))],
+        );
+        let (mut a_starts, mut b_starts) = (Vec::new(), Vec::new());
+        for new_row in ["n1", "n2", "n3"] {
+            b.rows.insert(new_row, Some(RUNTIME_1_26.to_string()));
+            a.imports_from(&b);
+            a_starts.push(a.starts());
+            a.imports_from(&b);
+            a_starts.push(a.starts());
+            b.imports_from(&a);
+            b_starts.push(b.starts());
+        }
+        assert_eq!(
+            a_starts,
+            [3, 0, 1, 0, 1, 0],
+            "rows A re-embedded at each of its six starts"
+        );
+        assert_eq!(
+            b_starts,
+            [0, 0, 0],
+            "B never rewrites what came from A: it is of a newer runtime than B has"
+        );
+        for (name, machine) in [("A", &a), ("B", &b)] {
+            assert_eq!(machine.rows.len(), 5, "{name} has the five rows");
+            for (id, label) in &machine.rows {
+                assert_eq!(
+                    label.as_deref(),
+                    Some(RUNTIME_1_31),
+                    "{name}: {id} ends on the newest runtime"
+                );
+            }
+        }
+    }
+
+    /// CI-D5c (C.5). The service re-embeds by itself unless the operator says no: only `0`, `off`,
+    /// `false` and `no` turn it off, in any case and with spaces around, and nothing else does
+    /// (an unset variable, `1`, `on`, `yes` or a typo leave it on).
+    #[test]
+    fn the_automatic_reembed_is_on_unless_the_variable_turns_it_off() {
+        for on in [None, Some("1"), Some("on"), Some("yes"), Some("whatever")] {
+            assert!(auto_reembed_enabled_from(on), "{on:?} leaves it on");
+        }
+        for off in [
+            Some("0"),
+            Some("off"),
+            Some("OFF"),
+            Some(" false "),
+            Some("no"),
+        ] {
+            assert!(!auto_reembed_enabled_from(off), "{off:?} turns it off");
+        }
+    }
+
+    /// CI-D5c-C2 (A1). The service re-embeds once at start, and again when the REM cycle finds that
+    /// there is something older and nothing running: a start that found the database down must not
+    /// leave the automatic re-embed idle for the life of the daemon. The decision is pure: it is
+    /// started from `idle`, `failed` (the count or a run failed) or `busy` (another re-embed held the
+    /// lock, which is gone by now) when there is something older, and never while one is running, nor
+    /// when it is `done` (what it could not do waits for the next start) or turned `off`.
+    #[test]
+    fn the_rem_cycle_starts_the_automatic_reembed_only_when_it_is_stopped_and_something_is_older() {
+        for (state, older, starts) in [
+            (AutoState::Idle, 5, true),
+            (AutoState::Failed, 1, true),
+            (AutoState::Busy, 3, true),
+            (AutoState::Idle, 0, false),
+            (AutoState::Failed, 0, false),
+            (AutoState::Running, 9, false),
+            (AutoState::Done, 9, false),
+            (AutoState::Off, 9, false),
+        ] {
+            assert_eq!(
+                should_start_auto(state, older),
+                starts,
+                "{state:?} with {older} older"
+            );
+        }
+    }
+
+    /// CI-D5c-C2 (A1). A count that fails at start (the database does not answer) used to leave the
+    /// progress in `idle`, which reads as «nothing to do». It is `failed`, with the text, so that
+    /// `/health` says what happened and the REM cycle can try again.
+    #[tokio::test]
+    async fn a_count_that_fails_at_start_leaves_failed_with_its_text_and_not_idle() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        set_auto_progress(AutoProgress::default());
+
+        let shown = counting_failed(&anyhow::anyhow!("connection refused by the database"));
+
+        assert_eq!(shown.state, AutoState::Failed, "{shown:?}");
+        assert!(
+            shown
+                .last_error
+                .as_deref()
+                .is_some_and(|why| why.contains("connection refused by the database")),
+            "it says why: {:?}",
+            shown.last_error
+        );
+        assert_eq!(
+            auto_progress().state,
+            AutoState::Failed,
+            "and leaves it where /health reads it"
+        );
+        set_auto_progress(AutoProgress::default());
+    }
+
+    /// CI-D5c-C2 (A1). A write that cannot reach the database ends the batch: every other row would
+    /// wait the 5 seconds of the acquire timeout for a connection that is not coming. An error of the
+    /// connection (the pool timed out or is closed, the socket broke) is that; an error of one row
+    /// (a missing column, a row that is not there) is not.
+    #[test]
+    fn only_an_error_of_the_connection_ends_the_batch() {
+        for (error, connection) in [
+            (sqlx::Error::PoolTimedOut, true),
+            (sqlx::Error::PoolClosed, true),
+            (
+                sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+                true,
+            ),
+            (sqlx::Error::RowNotFound, false),
+            (sqlx::Error::ColumnNotFound("embedding".to_string()), false),
+        ] {
+            assert_eq!(is_connection_error(&error), connection, "{error:?}");
+        }
+    }
+
+    fn a_constant_vector(_prefixed: &str) -> Result<Vec<f32>> {
+        Ok(vec![0.5, 0.25])
+    }
+
+    /// CI-D5c-C2 (A3). The real encoder of the background, without ONNX: the computation is a
+    /// function that answers at once and the gate has two permits, one held by a search. The row
+    /// waits for the search even with a permit free (a row that took the gate as a foreground embed
+    /// would count as in flight and would not wait), it is counted in the progress `/health` shows,
+    /// and its time is the one of the last row. Nothing sleeps: the search lets go and the row is
+    /// awaited.
+    #[tokio::test]
+    async fn the_encoder_of_the_background_waits_for_the_searches_and_counts_its_rows() {
+        use crate::embeddings::onnx::EmbedGate;
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        set_auto_progress(AutoProgress::default());
+        let gate: &'static EmbedGate = Box::leak(Box::new(EmbedGate::new(2)));
+
+        let search = gate
+            .foreground()
+            .await
+            .expect("an idle gate lets a search in");
+        let mut row = std::pin::pin!(background_encoder_with(
+            gate,
+            a_constant_vector,
+            EmbedInput::Bare {
+                text: "una fila".to_string()
+            }
+        ));
+        assert!(
+            futures::poll!(row.as_mut()).is_pending(),
+            "the row of the background waits while a search is embedding"
+        );
+        assert_eq!(
+            gate.in_flight(),
+            1,
+            "and it is not itself an embed somebody waits for: only the search is in flight"
+        );
+
+        drop(search);
+        let vector = row.await.expect("the search let go: the row is encoded");
+        assert_eq!(vector, vec![0.5, 0.25]);
+        let shown = auto_progress();
+        set_auto_progress(AutoProgress::default());
+        assert_eq!(shown.encoded, 1, "one row went through the encoder");
+        assert!(shown.last_row_at.is_some(), "and says when: {shown:?}");
+    }
 }

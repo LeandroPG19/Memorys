@@ -1095,10 +1095,8 @@ async fn install_runtime(dir: &Path, flavor: Flavor) -> Result<()> {
         "  listo. MemoryIndustry lo encuentra en {} (o ORT_DYLIB_PATH=<ruta>)",
         dir.join(lib_name).display()
     );
-    if cfg!(not(windows)) {
-        println!(
-            "  un daemon que ya estaba corriendo sigue con el runtime anterior hasta que lo reinicies."
-        );
+    for line in after_switch_lines() {
+        println!("{line}");
     }
     if flavor.is_gpu() {
         println!(
@@ -1109,6 +1107,23 @@ async fn install_runtime(dir: &Path, flavor: Flavor) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// What the operator is told once the runtime is switched: a daemon that was running keeps the one
+/// it loaded until it restarts, the stored vectors were made by the previous one, and the service
+/// re-embeds them by itself when it starts again. The estimate is 5-15 ms a row on a CPU.
+fn after_switch_lines() -> Vec<String> {
+    [
+        "  un daemon que ya estaba corriendo sigue con el runtime anterior hasta que lo reinicies.",
+        "  Al reiniciar, el servicio reembebe solo, en segundo plano, los vectores guardados con el runtime \
+         anterior: la búsqueda sigue respondiendo mientras tanto, y en CPU tarda del orden de minutos \
+         por cada diez mil vectores.",
+        "  Progreso: `memory-industry doctor` o /health (runtime.vectors.auto).",
+        "  Para hacerlo a mano: MEMORY_INDUSTRY_AUTO_REEMBED=0 en el entorno del servicio y \
+         `memory-industry reembed`.",
+    ]
+    .map(str::to_string)
+    .to_vec()
 }
 
 fn wanted_runtime_lib(base: &str, lib_name: &str, stem: &str, gpu: bool) -> bool {
@@ -3887,6 +3902,80 @@ mod tests {
         assert!(
             updating.is_err() && proxy.hits() >= 1,
             "with a runtime of unknown version in place the update is attempted: {updating:?}"
+        );
+    }
+
+    /// CI-D5c (C.9, the branch of P-B1 that Leandro chose on 11 Nov: switch, and the service
+    /// re-embeds by itself). `npm install` runs `models runtime --if-installed`, and a runtime of
+    /// another version is replaced, not only prepared: the machine that installs is the one that
+    /// ends on the runtime the package pins. The fixture is the one of the staging test with
+    /// `if_installed` on: no request (the package is already extracted), and the swap is attempted,
+    /// which is what an `Ok` without a swap (a runtime that is prepared and left) would not do; the
+    /// library of the fixture is not one, so the old runtime comes back as it was. What the
+    /// operator is told after a switch is judged on the words of the lines, in lower case so that
+    /// the capital of a sentence does not matter: at the next start the service re-embeds by
+    /// itself, where the progress is, and how to turn it off.
+    #[tokio::test]
+    async fn with_if_installed_a_runtime_of_another_version_is_switched_and_the_daemon_reembeds_on_restart()
+     {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = Home::new("runtime-switch-reembeds");
+        let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
+        let proxy = DeadProxy::start().await;
+        let (archive, lib_name) = host_cpu_runtime();
+        let leaf = home.roots.preferred.join("onnxruntime");
+        put(&leaf.join(lib_name), b"old core");
+        put(
+            &leaf.join("runtime.json"),
+            record_json("1.26.0", "cpu", &archive).as_bytes(),
+        );
+        let staging = sibling(&leaf, "downloading");
+        put(&staging.join(lib_name), b"not a library");
+        put(
+            &staging.join("runtime.json"),
+            record_json(ORT_VERSION, "cpu", &archive).as_bytes(),
+        );
+        let old = snapshot(&leaf);
+
+        let result = download_runtime(&RuntimeArgs {
+            if_installed: true,
+            ..RuntimeArgs::default()
+        })
+        .await;
+
+        assert_eq!(
+            proxy.hits(),
+            0,
+            "the staging directory holds the package of this version: nothing is requested"
+        );
+        assert!(
+            result.is_err(),
+            "a runtime of another version is switched, so the swap was attempted and refused (the \
+             library of the fixture is not one); a runtime that is only prepared would answer Ok: {result:?}"
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            old,
+            "and the runtime that was there is back as it was"
+        );
+
+        let said = after_switch_lines().join("\n");
+        let lower = said.to_lowercase();
+        for wanted in [
+            "reembebe solo",
+            "al reiniciar",
+            "memory-industry doctor",
+            "/health",
+        ] {
+            assert!(
+                lower.contains(wanted),
+                "after a switch the operator is told {wanted:?}: {said}"
+            );
+        }
+        assert!(
+            said.contains("MEMORY_INDUSTRY_AUTO_REEMBED=0"),
+            "and how to turn the automatic re-embed off: {said}"
         );
     }
 

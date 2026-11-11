@@ -14,6 +14,18 @@
 //!   (B.11);
 //! - a vector that arrives by sync keeps the label of the row it came with (B.12).
 //!
+//! CI-D5c, part C: the service re-embeds by itself when it starts, so what it rewrites and what a
+//! sync import may overwrite are the same rule, «the generation of a row only moves forward»:
+//!
+//! - the automatic re-embed rewrites the rows that have no vector or that are of an earlier
+//!   generation than the runtime loaded, and does not touch a newer runtime or another model, nor
+//!   put them in the snapshot (C.11);
+//! - it runs once, and says why it stopped: another re-embed holds the lock, or there is no place
+//!   to keep the old vectors (C.12);
+//! - an older vector that arrives by sync does not replace a newer one of the same text (C.13);
+//! - as the role of the application and with the resting scope it sees every project in the four
+//!   tables (C.14).
+//!
 //! The encoder is injected: a function that returns a flat vector (`0.5` in every dimension) and
 //! writes down what it was asked, so nothing here loads ONNX and the expected values are literals
 //! of this file. The old vectors are flat too, each of a value that is exact in binary (`0.125`,
@@ -32,9 +44,14 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use memory_industry::embeddings::backfill::vector_coverage;
 use memory_industry::embeddings::onnx::embedding_dim;
-use memory_industry::reembed_cli::{EmbedInput, Plan, reembed, rollback};
+use memory_industry::handlers::sync::{VectorsRestored, restore_vectors};
+use memory_industry::reembed_cli::{
+    AutoSettings, AutoState, EmbedInput, Plan, auto_progress, drop_snapshot, forward_counts,
+    reembed, reembed_is_running, rollback, run_automatic_reembed,
+};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -43,6 +60,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_memory-industry");
 const OLD: &str = "multilingual-e5-small";
 const OLD_RUNTIME: &str = "multilingual-e5-small@onnxruntime-1.26.0";
 const NEW: &str = "multilingual-e5-small@onnxruntime-1.31.1";
+const AHEAD: &str = "multilingual-e5-small@onnxruntime-1.40.0";
+const OTHER_MODEL: &str = "e5-small@onnxruntime-1.26.0";
 const NODE: &str = "00000000-0000-4000-8000-000000000051";
 
 const OBSERVATION_TEXT: &str = "texto de la observacion";
@@ -79,6 +98,7 @@ fn plan(root: &Path) -> Plan {
         node_id: NODE.to_string(),
         snapshot_root: root.to_path_buf(),
         progress: false,
+        forward_only: false,
     }
 }
 
@@ -139,6 +159,15 @@ impl Table {
             Table::Procedures => {
                 "SELECT embedding, embedding_model, xmin::text FROM brain_procedures WHERE id = $1"
             }
+        }
+    }
+
+    fn count_sql(self) -> &'static str {
+        match self {
+            Table::Observations => "SELECT count(*) FROM brain_observations WHERE id = $1",
+            Table::Episodes => "SELECT count(*) FROM brain_episodes WHERE id = $1",
+            Table::Chunks => "SELECT count(*) FROM brain_observation_chunks WHERE id = $1",
+            Table::Procedures => "SELECT count(*) FROM brain_procedures WHERE id = $1",
         }
     }
 }
@@ -377,6 +406,35 @@ async fn connect_as_admin(url: &str) -> PgPool {
     PgPool::connect(url)
         .await
         .expect("connecting to the scratch database as its administrator")
+}
+
+/// `xmin` of each row: it moves with every write, so equal means nobody wrote the row.
+async fn xmins_of(pool: &PgPool, rows: &[(Table, Uuid)]) -> Vec<String> {
+    let mut xmins = Vec::new();
+    for (table, id) in rows {
+        xmins.push(stored(pool, *table, *id).await.xmin);
+    }
+    xmins
+}
+
+/// Five rows of one table, none with a vector yet, for the five kinds the automatic re-embed has
+/// to tell apart (`give_each_kind`). A chunk hangs from `parent`, which is one of the observations
+/// of the world, so the count of rows per table stays five.
+async fn five_rows(pool: &PgPool, table: Table, entity: Uuid, parent: Option<Uuid>) -> [Uuid; 5] {
+    let mut ids = Vec::new();
+    for n in 0..5 {
+        let text = format!("fila {n} de {}", table.name());
+        ids.push(match table {
+            Table::Observations => an_observation(pool, entity, &text).await,
+            Table::Episodes => an_episode(pool, entity, &text).await,
+            Table::Chunks => {
+                let parent = parent.expect("a chunk hangs from an observation");
+                a_chunk(pool, parent, n, &text).await
+            }
+            Table::Procedures => a_procedure(pool, &text, "cuando haga falta").await,
+        });
+    }
+    ids.try_into().expect("five rows were made")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -962,14 +1020,20 @@ async fn rolls_back(url: String) {
 // B.12
 // ---------------------------------------------------------------------------------------------
 
+/// CI-D5c (B.12, as C changed it). A vector that arrives by sync carries the label it was made
+/// with: under another one it would be a vector of one runtime that nothing could tell from a good
+/// one. The world is the one the rule of C allows to move: the row here is of the old runtime
+/// (1.26.0), the package comes from a machine on the new one (1.31.1), and the package wins and
+/// keeps its label. (Before C the world was the other way round, and a package of an older runtime
+/// won over a row of a newer one: that is the regression C.13 judges now.)
 #[tokio::test]
 async fn a_vector_that_arrives_by_sync_keeps_the_label_of_its_row() {
     in_a_scratch_database("v051_sync", sync_keeps_the_label).await;
 }
 
-/// The bundle of a machine on the old runtime: the observation with the label it had there and
-/// its vector in `embeddings.bin.zst`, made by hand the way `v024_embedding_guard` makes one.
-fn write_a_bundle(dir: &Path, entity: (Uuid, &str), observation: (Uuid, &str)) {
+/// The bundle of a machine: each observation with the `label` it has there and its vector (flat,
+/// `0.5`) in `embeddings.bin.zst`, made by hand the way `v024_embedding_guard` makes one.
+fn write_a_bundle(dir: &Path, entity: (Uuid, &str), observations: &[(Uuid, &str)], label: &str) {
     let dim = embedding_dim();
     std::fs::create_dir_all(dir.join("entities")).expect("the entities directory of the bundle");
     std::fs::write(
@@ -979,7 +1043,7 @@ fn write_a_bundle(dir: &Path, entity: (Uuid, &str), observation: (Uuid, &str)) {
             "manifest_hash": "irrelevant, the import recomputes it",
             "project_id": null, "project_name": null,
             "exported_at": "2026-08-01T00:00:00Z",
-            "counts": {"entities": 1, "observations": 1, "episodes": 0, "decisions": 0, "errors": 0, "relations": 0},
+            "counts": {"entities": 1, "observations": observations.len(), "episodes": 0, "decisions": 0, "errors": 0, "relations": 0},
             "with_embeddings": true,
             "embedding_dim": dim,
             "embedding_model": memory_industry::embeddings::onnx::model_fingerprint()
@@ -987,26 +1051,35 @@ fn write_a_bundle(dir: &Path, entity: (Uuid, &str), observation: (Uuid, &str)) {
         .expect("serialising the manifest"),
     )
     .expect("writing the manifest");
+    let listed: Vec<Value> = observations
+        .iter()
+        .map(|(id, content)| {
+            json!({
+                "id": id, "content": content,
+                "observation_type": "fact", "source": "agent", "importance": 0.5,
+                "tags": [], "project_id": null, "session_id": null,
+                "created_at": "2026-08-01T00:00:00Z",
+                "embedding_model": label
+            })
+        })
+        .collect();
     std::fs::write(
         dir.join("entities").join("v051.json"),
         serde_json::to_vec_pretty(&json!({
             "id": entity.0, "name": entity.1, "entity_type": "technology",
             "importance": 0.5, "access_count": 0, "project_id": null,
             "created_at": "2026-08-01T00:00:00Z",
-            "observations": [{
-                "id": observation.0, "content": observation.1,
-                "observation_type": "fact", "source": "agent", "importance": 0.5,
-                "tags": [], "project_id": null, "session_id": null,
-                "created_at": "2026-08-01T00:00:00Z",
-                "embedding_model": OLD
-            }]
+            "observations": listed
         }))
         .expect("serialising the entity"),
     )
     .expect("writing the entity");
-    let mut blob = observation.0.as_bytes().to_vec();
-    for value in flat(0.5) {
-        blob.extend_from_slice(&value.to_le_bytes());
+    let mut blob = Vec::new();
+    for (id, _) in observations {
+        blob.extend_from_slice(id.as_bytes());
+        for value in flat(0.5) {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
     }
     std::fs::write(
         dir.join("embeddings.bin.zst"),
@@ -1015,26 +1088,15 @@ fn write_a_bundle(dir: &Path, entity: (Uuid, &str), observation: (Uuid, &str)) {
     .expect("writing the vectors");
 }
 
-async fn sync_keeps_the_label(url: String) {
-    let admin = connect_as_admin(&url).await;
-    let name = format!("v051_sync_{}", &Uuid::new_v4().to_string()[..8]);
-    let entity = an_entity(&admin, &name).await;
-    let observation = an_observation(&admin, entity, OBSERVATION_TEXT).await;
-    // Here the observation is already of the new generation, with its own vector.
-    stamp(&admin, Table::Observations, observation, 0.25, NEW).await;
-
-    let bundle = Scratch::new();
-    write_a_bundle(
-        &bundle.0,
-        (entity, name.as_str()),
-        (observation, OBSERVATION_TEXT),
-    );
+/// `memory-industry sync import --json --conflict <conflict>` of a bundle, on the database of
+/// the test: the report the import printed.
+async fn import_bundle(url: &str, bundle: &Path, conflict: &str) -> Value {
     let output = tokio::process::Command::new(BIN)
-        .args(["sync", "import", "--json", "--dir"])
-        .arg(&bundle.0)
-        .env("DATABASE_URL", &url)
+        .args(["sync", "import", "--json", "--conflict", conflict, "--dir"])
+        .arg(bundle)
+        .env("DATABASE_URL", url)
         .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
-        .env("CUBA_SYNC_DIR", &bundle.0)
+        .env("CUBA_SYNC_DIR", bundle)
         .output()
         .await
         .expect("running `memory-industry sync import`");
@@ -1044,18 +1106,939 @@ async fn sync_keeps_the_label(url: String) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "the import printed no JSON report: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+}
+
+async fn sync_keeps_the_label(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let name = format!("v051_sync_{}", &Uuid::new_v4().to_string()[..8]);
+    let entity = an_entity(&admin, &name).await;
+    let observation = an_observation(&admin, entity, OBSERVATION_TEXT).await;
+    // Here the observation is of the old runtime, with its own vector.
+    stamp(&admin, Table::Observations, observation, 0.25, OLD_RUNTIME).await;
+
+    let bundle = Scratch::new();
+    write_a_bundle(
+        &bundle.0,
+        (entity, name.as_str()),
+        &[(observation, OBSERVATION_TEXT)],
+        NEW,
+    );
+    import_bundle(&url, &bundle.0, "merge").await;
 
     let now = stored(&admin, Table::Observations, observation).await;
     assert_eq!(
         now.vector.as_deref(),
         Some(flat(0.5).as_slice()),
-        "the import writes the vector the bundle carries"
+        "the import writes the vector the bundle carries, which is of a newer runtime than the row"
     );
     assert_eq!(
         now.label.as_deref(),
-        Some(OLD),
-        "and the label of the row it came with: under the new label it would be a vector of the old runtime that no `doctor` \
+        Some(NEW),
+        "and the label of the row it came with: under another label it would be a vector of one runtime that no `doctor` \
          and no `reembed` could tell from a good one"
     );
     admin.close().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// C.11
+// ---------------------------------------------------------------------------------------------
+
+/// CI-D5c (C.11, as C2-S3 changed it). The automatic re-embed uses the core of `reembed` with
+/// `forward_only`: it rewrites the rows that have a vector of an earlier generation than the
+/// runtime loaded, and nothing else. A row with no vector at all is filled by the REM cycle, which
+/// has its own limit and its own way to be turned off, and is not this one's. Five rows in each of
+/// the four tables: the model alone (what every database of today holds), the old runtime, no
+/// vector, a newer runtime (1.40.0) and another model. The first two end with the vector of the
+/// encoder and the new label; the last three are not rewritten (`xmin` does not move) and are not
+/// in the snapshot either: it keeps the old vector of what it rewrites, and these are not going to
+/// be rewritten. The snapshot can then be dropped
+/// while they remain, because it holds nothing that they need, and it cannot while a row that is
+/// older than the generation is left.
+#[tokio::test]
+async fn the_automatic_reembed_rewrites_only_what_is_older_than_the_loaded_runtime() {
+    in_a_scratch_database("v051_forward", rewrites_only_what_is_older).await;
+}
+
+/// The five kinds, in the order of `five_rows`, and the vector each one has (none for the third).
+async fn give_each_kind(pool: &PgPool, table: Table, ids: [Uuid; 5]) {
+    stamp(pool, table, ids[0], 0.125, OLD).await;
+    stamp(pool, table, ids[1], 0.25, OLD_RUNTIME).await;
+    stamp(pool, table, ids[3], 0.375, AHEAD).await;
+    stamp(pool, table, ids[4], 0.625, OTHER_MODEL).await;
+}
+
+async fn rewrites_only_what_is_older(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let entity = an_entity(&admin, "v051_forward").await;
+    let observations = five_rows(&admin, Table::Observations, entity, None).await;
+    let parent = Some(observations[2]);
+    let mut kinds: Vec<(Table, [Uuid; 5])> = vec![(Table::Observations, observations)];
+    for table in [Table::Episodes, Table::Chunks, Table::Procedures] {
+        kinds.push((table, five_rows(&admin, table, entity, parent).await));
+    }
+    for (table, ids) in &kinds {
+        give_each_kind(&admin, *table, *ids).await;
+    }
+    let left_alone: Vec<(Table, Uuid)> = kinds
+        .iter()
+        .flat_map(|(table, ids)| [(*table, ids[2]), (*table, ids[3]), (*table, ids[4])])
+        .collect();
+    let xmins_before = xmins_of(&admin, &left_alone).await;
+    let coverage = vector_coverage(&admin, NEW)
+        .await
+        .expect("counting the vectors");
+    assert_eq!(
+        (coverage.stale(), coverage.missing()),
+        (16, 4),
+        "control: before, every row with a vector but one of the new generation is of another one"
+    );
+
+    let root = Scratch::new();
+    let calls = Calls::default();
+    let encode = calls.encoder();
+    let forward = Plan {
+        forward_only: true,
+        ..plan(&root.0)
+    };
+    let report = reembed(&admin, &forward, &encode)
+        .await
+        .expect("the automatic re-embed of a database of mixed generations");
+    assert_eq!(
+        (report.total().fetched, report.total().rewritten),
+        (8, 8),
+        "two of the five kinds, in each of the four tables: {report:?}"
+    );
+    assert_eq!(
+        calls.seen().len(),
+        8,
+        "and the encoder was asked for no more"
+    );
+
+    for (table, ids) in &kinds {
+        for id in &ids[..2] {
+            let now = stored(&admin, *table, *id).await;
+            assert_eq!(
+                now.vector.as_deref(),
+                Some(flat(0.5).as_slice()),
+                "{}: the model alone and the old runtime get the vector of the encoder",
+                table.name()
+            );
+            assert_eq!(now.label.as_deref(), Some(NEW), "{}", table.name());
+        }
+    }
+    assert_eq!(
+        xmins_of(&admin, &left_alone).await,
+        xmins_before,
+        "a row with no vector, or with a vector of a newer runtime or of another model, was written: the service only moves a vector forward"
+    );
+    let (_, saved_rows) = saved(&report.snapshot);
+    assert_eq!(
+        saved_rows.len(),
+        8,
+        "the snapshot has the old vector of the rows that had one and were rewritten: two per table, \
+         and not the one that had none: {saved_rows:?}"
+    );
+    for (table, id) in &left_alone {
+        assert!(
+            !saved_rows.iter().any(|row| row["id"] == id.to_string()),
+            "{} {id} is not rewritten, so its vector is not in the snapshot",
+            table.name()
+        );
+    }
+    let after = vector_coverage(&admin, NEW)
+        .await
+        .expect("counting the vectors");
+    assert_eq!(
+        (after.stale(), after.missing()),
+        (8, 4),
+        "what is left is the two rows of the other generations in each table, and the row with no vector"
+    );
+
+    // A row of the old generation that turns up while the snapshot is there keeps it.
+    let late = an_observation(&admin, entity, "una fila que llega despues").await;
+    stamp(&admin, Table::Observations, late, 0.125, OLD).await;
+    drop_snapshot(&admin, &root.0, NEW)
+        .await
+        .expect_err("a row older than the generation is left: the snapshot is the only place its vector is kept");
+    assert!(report.snapshot.is_dir(), "and the refusal deleted nothing");
+    let again = reembed(&admin, &forward, &encode)
+        .await
+        .expect("the second run");
+    assert_eq!(
+        again.total().rewritten,
+        1,
+        "the late row, and nothing else: {again:?}"
+    );
+    let dropped = drop_snapshot(&admin, &root.0, NEW).await.expect(
+        "nothing older is left: the rows of a newer runtime and of another model do not need it",
+    );
+    assert!(!dropped.exists(), "the snapshot is gone");
+    assert_eq!(
+        xmins_of(&admin, &left_alone).await,
+        xmins_before,
+        "and the two runs left the rows of the other generations as they were"
+    );
+    admin.close().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// C.12
+// ---------------------------------------------------------------------------------------------
+
+/// CI-D5c (C.12). The automatic re-embed runs once and leaves in `auto_progress()` why it stopped.
+/// Three worlds in one database, and the same four old rows in all of them. With another re-embed
+/// holding the lock (a real one, stopped inside its encoder, which fails every row so that it
+/// writes nothing) it does not compete or wait: `busy`, naming the other re-embed, no encoder call,
+/// no snapshot, no row written. With a snapshot root that cannot be made it is `failed`, and says
+/// the figure that is missing in the words of the error: how much room the snapshot of that many
+/// vectors needs. With a good root it is `done`, with every row rewritten.
+#[tokio::test]
+async fn the_automatic_reembed_runs_once_and_says_why_it_stopped() {
+    in_a_scratch_database("v051_auto", runs_once_and_says_why).await;
+}
+
+fn settings(root: PathBuf) -> AutoSettings {
+    AutoSettings {
+        snapshot_root: root,
+        node_id: NODE.to_string(),
+        tag: NEW.to_string(),
+        chunk: 100,
+    }
+}
+
+async fn runs_once_and_says_why(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let world = a_world_of_the_old_runtime(&admin).await;
+    let rows: Vec<(Table, Uuid)> = world
+        .rows()
+        .into_iter()
+        .map(|(table, id, ..)| (table, id))
+        .collect();
+    let xmins_before = xmins_of(&admin, &rows).await;
+    let root = Scratch::new();
+    let calls = Calls::default();
+    let encode = calls.encoder();
+
+    // «The other re-embed» is a real one and holds the lock from inside its first encoder call. No
+    // timing and no lock of the test: the barrier is the encoder.
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let holding = {
+        let (entered, release, stopped) = (entered.clone(), release.clone(), stopped.clone());
+        move |_input: EmbedInput| -> BoxFuture<'static, Result<Vec<f32>>> {
+            let (entered, release, stopped) = (entered.clone(), release.clone(), stopped.clone());
+            async move {
+                if !stopped.swap(true, Ordering::SeqCst) {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                Err(anyhow::anyhow!(
+                    "the one that holds the lock writes nothing"
+                ))
+            }
+            .boxed()
+        }
+    };
+    let holder = tokio::spawn({
+        let (pool, plan) = (admin.clone(), plan(&root.0.join("holder")));
+        async move { reembed(&pool, &plan, &holding).await }
+    });
+    entered.notified().await;
+
+    let busy = run_automatic_reembed(&admin, &settings(root.0.join("auto")), &encode).await;
+    assert_eq!(busy.state, AutoState::Busy, "{busy:?}");
+    assert!(
+        busy.last_error
+            .as_deref()
+            .is_some_and(|why| why.contains("otro reembebido")),
+        "it says another re-embed holds the lock: {:?}",
+        busy.last_error
+    );
+    assert_eq!(
+        auto_progress().state,
+        AutoState::Busy,
+        "and leaves it where /health reads it"
+    );
+    assert!(calls.seen().is_empty(), "it encoded nothing");
+    assert!(
+        !root.0.join("auto").exists(),
+        "and made no snapshot: it did nothing at all"
+    );
+    assert_eq!(
+        xmins_of(&admin, &rows).await,
+        xmins_before,
+        "no row was written"
+    );
+
+    release.notify_one();
+    let held = holder
+        .await
+        .expect("the re-embed that held the lock was not cut")
+        .expect("and ends well once its encoder answers");
+    assert_eq!(
+        (held.total().rewritten, held.total().failed),
+        (0, 4),
+        "control: it was a re-embed like any other whose encoder failed, so the state above was about the lock: {held:?}"
+    );
+
+    // A root that cannot be made: its parent is a file.
+    let blocker = Scratch::new();
+    std::fs::create_dir_all(&blocker.0).expect("a directory for the blocker");
+    let file = blocker.0.join("not-a-directory");
+    std::fs::write(&file, b"x").expect("a file where the snapshot root should go");
+    let failed = run_automatic_reembed(&admin, &settings(file.join("reembed")), &encode).await;
+    assert_eq!(failed.state, AutoState::Failed, "{failed:?}");
+    let why = failed.last_error.clone().unwrap_or_default();
+    assert!(
+        why.starts_with("sin instantánea no reescribo"),
+        "it says why nothing was written first: {why}"
+    );
+    assert!(
+        why.contains("hacen falta") && why.contains("MB") && why.contains("4 vectores"),
+        "and how much room the snapshot of these four vectors needs: {why}"
+    );
+    assert_eq!(auto_progress().state, AutoState::Failed);
+    assert!(
+        calls.seen().is_empty(),
+        "with no place for the old vectors it encoded nothing"
+    );
+    assert_eq!(
+        xmins_of(&admin, &rows).await,
+        xmins_before,
+        "and wrote no row"
+    );
+
+    let done = run_automatic_reembed(&admin, &settings(root.0.join("good")), &encode).await;
+    assert_eq!(done.state, AutoState::Done, "{done:?}");
+    assert_eq!(
+        (done.rewritten, done.changed, done.failed),
+        (4, 0, 0),
+        "the four old rows: {done:?}"
+    );
+    assert!(done.last_error.is_none(), "{:?}", done.last_error);
+    let published = auto_progress();
+    assert_eq!(
+        (published.state, published.rewritten),
+        (AutoState::Done, 4),
+        "the progress that /health shows says the same"
+    );
+    assert_eq!(calls.seen().len(), 4);
+    for (table, id) in &rows {
+        let now = stored(&admin, *table, *id).await;
+        assert_eq!(now.label.as_deref(), Some(NEW), "{}", table.name());
+        assert_eq!(now.vector.as_deref(), Some(flat(0.5).as_slice()));
+    }
+    admin.close().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// C.13
+// ---------------------------------------------------------------------------------------------
+
+/// CI-D5c (C.13). `cuba_sync` exports every observation of an entity and the import writes the
+/// vector of every one the package carries, so a package from a machine on an older runtime would
+/// hand back to a row what this machine had just re-embedded, and the next start would re-embed it
+/// again for ever. The import takes the incoming vector only if it is not older than the one the row
+/// has. Two observations of the same entity that this machine has on the new runtime: one comes in
+/// the package with the same text and the label of the model alone, and keeps its vector and its
+/// label, and the report counts it; the other comes with another text under `--conflict
+/// overwrite`, which takes the text and clears the vector, so the row has nothing to protect and
+/// takes the vector and the label of the package.
+#[tokio::test]
+async fn an_older_vector_that_arrives_by_sync_does_not_replace_a_newer_one_of_the_same_text() {
+    in_a_scratch_database("v051_newer", sync_keeps_the_newer_vector).await;
+}
+
+async fn sync_keeps_the_newer_vector(url: String) {
+    const BEFORE: &str = "texto de antes de la correccion";
+    const AFTER: &str = "texto de despues de la correccion";
+    let admin = connect_as_admin(&url).await;
+    let name = format!("v051_newer_{}", &Uuid::new_v4().to_string()[..8]);
+    let entity = an_entity(&admin, &name).await;
+    let same = an_observation(&admin, entity, OBSERVATION_TEXT).await;
+    let edited = an_observation(&admin, entity, BEFORE).await;
+    stamp(&admin, Table::Observations, same, 0.25, NEW).await;
+    stamp(&admin, Table::Observations, edited, 0.25, NEW).await;
+
+    let bundle = Scratch::new();
+    write_a_bundle(
+        &bundle.0,
+        (entity, name.as_str()),
+        &[(same, OBSERVATION_TEXT), (edited, AFTER)],
+        OLD,
+    );
+    let report = import_bundle(&url, &bundle.0, "overwrite").await;
+
+    let kept = stored(&admin, Table::Observations, same).await;
+    assert_eq!(
+        kept.vector.as_deref(),
+        Some(flat(0.25).as_slice()),
+        "the package carries a vector of the model alone for a text this machine already has on the new runtime: it keeps its own"
+    );
+    assert_eq!(
+        kept.label.as_deref(),
+        Some(NEW),
+        "and the label that goes with it"
+    );
+    assert_eq!(
+        report["embeddings_kept_newer"], 1,
+        "the report counts what it did not take: {report}"
+    );
+
+    let content: String =
+        sqlx::query_scalar("SELECT content FROM brain_observations WHERE id = $1")
+            .bind(edited)
+            .fetch_one(&admin)
+            .await
+            .expect("reading the text back");
+    assert_eq!(content, AFTER, "control: the overwrite took the other text");
+    let taken = stored(&admin, Table::Observations, edited).await;
+    assert_eq!(
+        taken.vector.as_deref(),
+        Some(flat(0.5).as_slice()),
+        "the vector the row had was of another text and was cleared: the one of the package is the only one that fits"
+    );
+    assert_eq!(
+        taken.label.as_deref(),
+        Some(OLD),
+        "with the label of the package, which the next start of the service is going to move forward"
+    );
+    assert_eq!(
+        report["embeddings_restored"], 1,
+        "and it is the only one the import wrote: {report}"
+    );
+    admin.close().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// C.14
+// ---------------------------------------------------------------------------------------------
+
+/// CI-D5c (C.14). The service re-embeds without a client, so its pool has no project: the resting
+/// scope is the empty one, which the policies of the four tables read as «all of them». And that
+/// has to hold for the role the daemon really runs as, `cuba_app`, which does not bypass the row
+/// policies (the owner of a scratch database does, and a test as the owner would prove nothing).
+/// Two projects, one row of each in the four tables, all of the old runtime. First the anchor: as
+/// `cuba_app` with the scope of one project, the other project's row is not seen in any table, so
+/// the policy is in force here. Then the re-embed through a pool that enters as `cuba_app` and
+/// sets the scope as the production pool does on every acquire, which is the resting one: the eight
+/// rows get the new label.
+#[tokio::test]
+async fn as_the_app_role_the_automatic_reembed_sees_every_project_in_the_four_tables() {
+    in_a_scratch_database("v051_rls", sees_every_project).await;
+}
+
+async fn sees_every_project(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let mut projects: Vec<Uuid> = Vec::new();
+    let mut rows: Vec<[(Table, Uuid); 4]> = Vec::new();
+    for name in ["v051_rls_a", "v051_rls_b"] {
+        let project: Uuid =
+            sqlx::query_scalar("INSERT INTO brain_projects (name) VALUES ($1) RETURNING id")
+                .bind(name)
+                .fetch_one(&admin)
+                .await
+                .expect("seeding a project");
+        let entity: Uuid = sqlx::query_scalar(
+            "INSERT INTO brain_entities (name, entity_type, project_id)
+             VALUES ($1, 'technology', $2) RETURNING id",
+        )
+        .bind(format!("{name}_entity"))
+        .bind(project)
+        .fetch_one(&admin)
+        .await
+        .expect("seeding an entity of the project");
+        let observation: Uuid = sqlx::query_scalar(
+            "INSERT INTO brain_observations
+                 (entity_id, content, observation_type, source, importance, project_id)
+             VALUES ($1, $2, 'fact', 'agent', 0.5, $3) RETURNING id",
+        )
+        .bind(entity)
+        .bind(format!("observacion de {name}"))
+        .bind(project)
+        .fetch_one(&admin)
+        .await
+        .expect("seeding an observation of the project");
+        let episode: Uuid = sqlx::query_scalar(
+            "INSERT INTO brain_episodes (entity_id, content, importance, project_id)
+             VALUES ($1, $2, 0.5, $3) RETURNING id",
+        )
+        .bind(entity)
+        .bind(format!("episodio de {name}"))
+        .bind(project)
+        .fetch_one(&admin)
+        .await
+        .expect("seeding an episode of the project");
+        let chunk: Uuid = sqlx::query_scalar(
+            "INSERT INTO brain_observation_chunks (observation_id, chunk_index, content, project_id)
+             VALUES ($1, 0, $2, $3) RETURNING id",
+        )
+        .bind(observation)
+        .bind(format!("fragmento de {name}"))
+        .bind(project)
+        .fetch_one(&admin)
+        .await
+        .expect("seeding a chunk of the project");
+        let procedure: Uuid = sqlx::query_scalar(
+            "INSERT INTO brain_procedures (name, trigger_context, project_id)
+             VALUES ($1, 'cuando haga falta', $2) RETURNING id",
+        )
+        .bind(format!("procedimiento de {name}"))
+        .bind(project)
+        .fetch_one(&admin)
+        .await
+        .expect("seeding a procedure of the project");
+        let made = [
+            (Table::Observations, observation),
+            (Table::Episodes, episode),
+            (Table::Chunks, chunk),
+            (Table::Procedures, procedure),
+        ];
+        for (table, id) in made {
+            stamp(&admin, table, id, 0.125, OLD).await;
+        }
+        projects.push(project);
+        rows.push(made);
+    }
+
+    // The anchor: with the scope of the first project, `cuba_app` does not see the second one's rows.
+    {
+        let mut conn = admin.acquire().await.expect("a connection");
+        sqlx::query("SET ROLE cuba_app")
+            .execute(&mut *conn)
+            .await
+            .expect("cuba_app exists in a migrated database");
+        sqlx::query("SELECT set_config('app.current_project', $1, false)")
+            .bind(projects[0].to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("declaring the scope of a project");
+        for (&(table, mine), &(_, theirs)) in rows[0].iter().zip(rows[1].iter()) {
+            let seen = |id: Uuid| sqlx::query_scalar::<_, i64>(table.count_sql()).bind(id);
+            let (own, other): (i64, i64) = (
+                seen(mine).fetch_one(&mut *conn).await.expect("counting"),
+                seen(theirs).fetch_one(&mut *conn).await.expect("counting"),
+            );
+            assert_eq!(
+                (own, other),
+                (1, 0),
+                "{}: with the scope of a project the row of the other one is not seen, so the policy is in force for this role",
+                table.name()
+            );
+        }
+        sqlx::query("RESET ROLE")
+            .execute(&mut *conn)
+            .await
+            .expect("leaving the role");
+        sqlx::query("SELECT set_config('app.current_project', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("back to the resting scope");
+    }
+
+    let app = PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE cuba_app").execute(&mut *conn).await?;
+                sqlx::query("SELECT set_config('app.current_project', '', false)")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .before_acquire(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('app.current_project', $1, false)")
+                    .bind(memory_industry::project::rls_scope())
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(true)
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("connecting as the application role");
+    let root = Scratch::new();
+    let calls = Calls::default();
+    let encode = calls.encoder();
+    let forward = Plan {
+        forward_only: true,
+        ..plan(&root.0)
+    };
+    let report = reembed(&app, &forward, &encode)
+        .await
+        .expect("the automatic re-embed as the application role");
+    assert_eq!(
+        report.total().rewritten,
+        8,
+        "two projects, one row in each of the four tables: {report:?}"
+    );
+    for (table, id) in rows.iter().flatten() {
+        let now = stored(&admin, *table, *id).await;
+        assert_eq!(
+            now.label.as_deref(),
+            Some(NEW),
+            "{}: the re-embed has no project and sees them all",
+            table.name()
+        );
+    }
+    app.close().await;
+    admin.close().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// C2: what the review of the first round found
+// ---------------------------------------------------------------------------------------------
+
+/// A real re-embed that holds the lock from inside its first encoder call and writes nothing (its
+/// encoder fails every row). The barrier is the encoder, so there is no timing and no lock of the
+/// test: `entered` says the lock is taken, `release` lets it end.
+struct Holder {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    task: tokio::task::JoinHandle<Result<memory_industry::reembed_cli::Report>>,
+}
+
+fn a_reembed_that_holds_the_lock(pool: &PgPool, root: &Path) -> Holder {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let holding = {
+        let (entered, release, stopped) = (entered.clone(), release.clone(), stopped.clone());
+        move |_input: EmbedInput| -> BoxFuture<'static, Result<Vec<f32>>> {
+            let (entered, release, stopped) = (entered.clone(), release.clone(), stopped.clone());
+            async move {
+                if !stopped.swap(true, Ordering::SeqCst) {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                Err(anyhow::anyhow!(
+                    "the one that holds the lock writes nothing"
+                ))
+            }
+            .boxed()
+        }
+    };
+    let task = tokio::spawn({
+        let (pool, plan) = (pool.clone(), plan(root));
+        async move { reembed(&pool, &plan, &holding).await }
+    });
+    Holder {
+        entered,
+        release,
+        task,
+    }
+}
+
+// C2-A4 --------------------------------------------------------------------------------------
+
+/// CI-D5c-C2 (A4). The import reads the label and the vector a row has, and writes the incoming
+/// vector afterwards, with nobody holding the row between the two. The automatic re-embed can
+/// rewrite that row in between, and the import would put over it the older vector it had decided
+/// to take. The write repeats what the read saw (`WHERE` the label and the presence of a vector are
+/// still those) and a row that no longer matches is counted as kept. The seam is the argument of
+/// `restore_vectors` that runs between the read and the first write: here it is a second connection
+/// that rewrites the contested row and commits, so the interleaving is the test's and not a
+/// matter of timing. The other row is the control: nobody touches it and it takes the vector.
+#[tokio::test]
+async fn an_incoming_vector_never_overwrites_what_another_writer_changed_after_it_was_read() {
+    in_a_scratch_database("v051_race_in", import_loses_the_race_cleanly).await;
+}
+
+async fn import_loses_the_race_cleanly(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let entity = an_entity(&admin, "v051_race_in").await;
+    let contested = an_observation(&admin, entity, "la fila que otro reescribe").await;
+    let control = an_observation(&admin, entity, "la fila que nadie toca").await;
+    stamp(&admin, Table::Observations, contested, 0.125, OLD).await;
+    stamp(&admin, Table::Observations, control, 0.125, OLD).await;
+
+    let mut raw = Vec::new();
+    let mut labels = std::collections::HashMap::new();
+    for id in [contested, control] {
+        raw.extend_from_slice(id.as_bytes());
+        for value in flat(0.5) {
+            raw.extend_from_slice(&value.to_le_bytes());
+        }
+        labels.insert(id, Some(OLD.to_string()));
+    }
+    let other = admin.clone();
+    let between = move || -> BoxFuture<'static, ()> {
+        let other = other.clone();
+        async move { stamp(&other, Table::Observations, contested, 0.875, NEW).await }.boxed()
+    };
+
+    let mut tx = admin.begin().await.expect("the transaction of the import");
+    let done = restore_vectors(&mut tx, &raw, embedding_dim(), &labels, &between)
+        .await
+        .expect("restoring the vectors of a package");
+    tx.commit().await.expect("committing the import");
+
+    assert_eq!(
+        done,
+        VectorsRestored {
+            restored: 1,
+            kept_newer: 1
+        },
+        "the control took the vector; the contested row changed after it was read and is kept"
+    );
+    let kept = stored(&admin, Table::Observations, contested).await;
+    assert_eq!(
+        (kept.vector.as_deref(), kept.label.as_deref()),
+        (Some(flat(0.875).as_slice()), Some(NEW)),
+        "what the other writer put is still there: the import did not put the older vector over it"
+    );
+    let taken = stored(&admin, Table::Observations, control).await;
+    assert_eq!(
+        (taken.vector.as_deref(), taken.label.as_deref()),
+        (Some(flat(0.5).as_slice()), Some(OLD)),
+        "control: a row nobody touched takes the vector of the package, so the one above was kept for a reason"
+    );
+    admin.close().await;
+}
+
+// C2-S1 --------------------------------------------------------------------------------------
+
+/// CI-D5c-C2 (S1). `doctor` says «reembebido en curso» from the advisory lock in `pg_locks`, and
+/// `pg_locks` shows the locks of every database of the cluster. A re-embed that runs in another
+/// database (a second install on the same server, or another test of the judge) is not this
+/// database's: the question is asked about the current one. A real re-embed stopped inside its
+/// encoder holds the lock here; the database where it runs sees it, a second scratch database of
+/// the same cluster does not, and once it ends nobody does.
+#[tokio::test]
+async fn a_running_reembed_is_seen_in_its_own_database_and_not_in_another_of_the_cluster() {
+    in_a_scratch_database("v051_running", sees_it_only_at_home).await;
+}
+
+async fn sees_it_only_at_home(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let _world = a_world_of_the_old_runtime(&admin).await;
+    let root = Scratch::new();
+    assert!(
+        !reembed_is_running(&admin).await,
+        "control: nothing holds the lock yet"
+    );
+
+    let holder = a_reembed_that_holds_the_lock(&admin, &root.0);
+    holder.entered.notified().await;
+    assert!(
+        reembed_is_running(&admin).await,
+        "a re-embed holds the lock of this database"
+    );
+    in_a_scratch_database("v051_elsewhere", |other_url| async move {
+        let other = connect_as_admin(&other_url).await;
+        assert!(
+            !reembed_is_running(&other).await,
+            "the lock is held in another database of the cluster, and pg_locks shows it: it is not this one's"
+        );
+        other.close().await;
+    })
+    .await;
+
+    holder.release.notify_one();
+    holder
+        .task
+        .await
+        .expect("the re-embed was not cut")
+        .expect("and ends well once its encoder answers");
+    assert!(
+        !reembed_is_running(&admin).await,
+        "it ended and let go of the lock"
+    );
+    admin.close().await;
+}
+
+// C2-S4 --------------------------------------------------------------------------------------
+
+/// CI-D5c-C2 (S4). The count of what the automatic re-embed has to rewrite and the pages it reads
+/// are the same rows: a row the pages never return (an episode whose entity is gone, which the
+/// foreign key forbids and a restore or an import with checks off can leave) would count as older
+/// forever and the run would end `done` with fewer rewritten than counted, and the REM cycle
+/// would start it again each time. The orphan is made on a connection with the foreign keys
+/// switched off, which is how one is made.
+#[tokio::test]
+async fn a_row_the_pages_cannot_read_is_not_counted_as_older() {
+    in_a_scratch_database("v051_orphan", counts_what_the_pages_read).await;
+}
+
+async fn counts_what_the_pages_read(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let _world = a_world_of_the_old_runtime(&admin).await;
+    let orphan = {
+        let mut conn = admin.acquire().await.expect("a connection");
+        sqlx::query("SET session_replication_role = replica")
+            .execute(&mut *conn)
+            .await
+            .expect("switching the foreign keys off for this connection");
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO brain_episodes (entity_id, content, importance) VALUES ($1, $2, 0.5)
+             RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind("un episodio sin entidad")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("seeding an episode whose entity does not exist");
+        sqlx::query("RESET session_replication_role")
+            .execute(&mut *conn)
+            .await
+            .expect("switching them back on");
+        id
+    };
+    stamp(&admin, Table::Episodes, orphan, 0.125, OLD).await;
+    assert_eq!(
+        vector_coverage(&admin, NEW)
+            .await
+            .expect("counting")
+            .stale(),
+        5,
+        "control: five rows have an old vector, the orphan among them"
+    );
+
+    let counts = forward_counts(&admin, NEW)
+        .await
+        .expect("counting by generation");
+    assert_eq!(
+        (counts.older, counts.ahead),
+        (4, 0),
+        "the four rows of the world: the orphan is not read by any page, so it is not counted"
+    );
+
+    let root = Scratch::new();
+    let calls = Calls::default();
+    let encode = calls.encoder();
+    let run = run_automatic_reembed(&admin, &settings(root.0.join("auto")), &encode).await;
+    assert_eq!(run.state, AutoState::Done, "{run:?}");
+    assert_eq!(
+        (run.older, run.rewritten),
+        (4, 4),
+        "what it counted is what it rewrote: {run:?}"
+    );
+    admin.close().await;
+}
+
+// C2-A1 --------------------------------------------------------------------------------------
+
+/// CI-D5c-C2 (A1). A write that cannot reach the database ends the batch. The encoder closes the
+/// pool on its first call (the call that marks it closed does not wait: the connection that holds
+/// the lock is still out), so the write of that row finds a closed pool, and every other row would
+/// find it too and ask the encoder first. The run ends with an error that says the connection was
+/// lost and the encoder was asked once, not four times; nothing is counted on a clock.
+#[tokio::test]
+async fn a_write_that_cannot_reach_the_database_ends_the_batch_instead_of_trying_every_row() {
+    in_a_scratch_database("v051_gone", ends_the_batch).await;
+}
+
+async fn ends_the_batch(url: String) {
+    let admin = connect_as_admin(&url).await;
+    let world = a_world_of_the_old_runtime(&admin).await;
+    let rows: Vec<(Table, Uuid)> = world
+        .rows()
+        .into_iter()
+        .map(|(table, id, ..)| (table, id))
+        .collect();
+    let checker = connect_as_admin(&url).await;
+    let xmins_before = xmins_of(&checker, &rows).await;
+    let asked = Arc::new(AtomicUsize::new(0));
+    let closing = {
+        let (pool, asked) = (admin.clone(), asked.clone());
+        move |_input: EmbedInput| -> BoxFuture<'static, Result<Vec<f32>>> {
+            let (pool, asked) = (pool.clone(), asked.clone());
+            async move {
+                asked.fetch_add(1, Ordering::SeqCst);
+                // `close()` marks the pool closed when it is called; polling its future once is
+                // enough, and the rest of it waits for the connection of the lock, which is ours.
+                let _waiting = futures::poll!(std::pin::pin!(pool.close()));
+                anyhow::Ok(flat(0.5))
+            }
+            .boxed()
+        }
+    };
+    let root = Scratch::new();
+
+    let lost = reembed(&admin, &plan(&root.0), &closing)
+        .await
+        .expect_err("a write that cannot reach the database ends the run");
+    let said = format!("{lost:#}");
+    assert!(
+        said.contains("se perdió la conexión"),
+        "it says what happened: {said}"
+    );
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the encoder was asked once: the other three rows were not tried"
+    );
+    assert_eq!(
+        xmins_of(&checker, &rows).await,
+        xmins_before,
+        "and no row was written"
+    );
+    checker.close().await;
+    admin.close().await;
+}
+
+// C2-A3 --------------------------------------------------------------------------------------
+
+/// CI-D5c-C2 (A3). The automatic re-embed does its work through `side_pool(&pool, 2)` so that the
+/// connections of the daemon stay for its requests. The pool that has none left is the case that
+/// matters: a main pool of one connection, held, and a side pool that has to answer anyway, with
+/// two connections of its own, none of them the main one's. The proof is the backend each one is:
+/// if the side pool were the main one, its first connection would be the held one or none, and the
+/// 2 seconds of the acquire timeout of the main pool are only the end of a failure.
+#[tokio::test]
+async fn the_side_pool_has_connections_of_its_own_when_the_main_one_has_none_left() {
+    in_a_scratch_database("v051_side", side_pool_is_independent).await;
+}
+
+async fn side_pool_is_independent(url: String) {
+    let main = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect(&url)
+        .await
+        .expect("a main pool of one connection");
+    let mut held = main.acquire().await.expect("its only connection");
+    let held_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *held)
+        .await
+        .expect("the backend of the held connection");
+
+    let side = memory_industry::db::side_pool(&main, 2);
+    let mut first = side
+        .acquire()
+        .await
+        .expect("the side pool answers with the main one exhausted");
+    let mut second = side
+        .acquire()
+        .await
+        .expect("and has a second connection of its own");
+    let first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *first)
+        .await
+        .expect("the backend of the first");
+    let second_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *second)
+        .await
+        .expect("the backend of the second");
+    assert!(
+        held_pid != first_pid && held_pid != second_pid && first_pid != second_pid,
+        "three connections, three backends: {held_pid} (main), {first_pid} and {second_pid} (side)"
+    );
+    drop((first, second, held));
+    side.close().await;
+    main.close().await;
 }

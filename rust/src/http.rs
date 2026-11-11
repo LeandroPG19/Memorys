@@ -697,7 +697,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         },
     });
     let beacon_pool = pool.clone();
-    let coverage_pool = pool.clone();
+    let reembed_pool = pool.clone();
     let beacon_host = host.clone();
     let state = AppState {
         pool,
@@ -778,7 +778,6 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
     // unreranked ranking in it. In the automatic mode that is the loopback
     // socket; the LAN one opens when the IP is known.
     warm_before_serving(ready.clone()).await;
-    tokio::spawn(tell_about_vectors_of_another_generation(coverage_pool));
 
     tracing::info!(
         %addr,
@@ -792,6 +791,12 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
     if let Listen::Auto(port) = listen {
         announce(port, beacon_pool, beacon_host);
     }
+
+    // After the models are warm and the daemon has said it listens, and before it serves: the port
+    // already answers when the first row is rewritten, and the searches go before each next row.
+    tokio::spawn(crate::reembed_cli::start_the_automatic_reembed(
+        reembed_pool,
+    ));
 
     match listen {
         Listen::Fixed(_) => axum::serve(
@@ -1054,25 +1059,6 @@ async fn warm_models() {
             "embedding model warm"
         ),
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "embedding warm-up failed"),
-    }
-}
-
-/// Once the embedder is warm: how many stored vectors were made by another model or by another ONNX
-/// Runtime than the one this daemon loaded, and the command that rewrites them. The count stays
-/// for `/health` until the next REM cycle counts again.
-async fn tell_about_vectors_of_another_generation(pool: PgPool) {
-    match crate::embeddings::backfill::refresh_coverage(&pool).await {
-        Ok(Some(coverage)) if coverage.stale() > 0 => tracing::warn!(
-            stale = coverage.stale(),
-            missing = coverage.missing(),
-            current = %coverage.tag,
-            "hay vectores de otra generación: `memory-industry reembed` los rehace (reanudable; \
-             guarda antes los actuales; `--rollback` los devuelve)"
-        ),
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "could not count the vectors of another generation")
-        }
     }
 }
 
@@ -3080,16 +3066,31 @@ fn runtime_json(runtime: &RuntimeReport) -> Value {
 }
 
 /// Which generation the stored vectors are and how many are still of another one, as the last
-/// count saw it (`backfill::refresh_coverage`: at start, and after each REM cycle). Absent until
-/// something has been counted. It does not touch `status`: a database of another generation still
-/// answers searches.
+/// count saw it (`backfill::refresh_coverage`: at start, and after each REM cycle), and how far
+/// the re-embed the service does by itself has got. Absent until something has been counted. It
+/// does not touch `status`: a database of another generation, or being re-embedded, still answers
+/// searches.
 fn vectors_json() -> Option<Value> {
     let coverage = crate::embeddings::backfill::last_coverage()?;
+    let auto = crate::reembed_cli::auto_progress();
     Some(serde_json::json!({
         "tag": coverage.tag,
         "stale": coverage.stale(),
         "missing": coverage.missing(),
         "command": "memory-industry reembed",
+        "auto": {
+            "state": auto.state.as_str(),
+            "older": auto.older,
+            "ahead": auto.ahead,
+            "encoded": auto.encoded,
+            "rewritten": auto.rewritten,
+            "changed": auto.changed,
+            "failed": auto.failed,
+            "last_error": auto.last_error,
+            "started_at": auto.started_at,
+            "finished_at": auto.finished_at,
+            "last_row_at": auto.last_row_at,
+        },
     }))
 }
 
@@ -3811,6 +3812,74 @@ mod tests {
         );
     }
 
+    /// CI-D5c (C.7). While the service re-embeds by itself, `/health` says how far it got, to the
+    /// caller that may see the inventory of the machine and to nobody else, and it does not change
+    /// `status`: a database that is being re-embedded answers searches. The progress is a process
+    /// global like the last count, so the test holds the global guard and puts both back.
+    #[tokio::test]
+    async fn health_shows_the_progress_of_the_automatic_reembed_only_to_the_full_scope() {
+        use crate::embeddings::backfill::{TableCoverage, VectorCoverage, set_last_coverage};
+        use crate::reembed_cli::{AutoProgress, AutoState, set_auto_progress};
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let state = state_with_clients(Some("s3cret"), &["editor-a"]);
+        let full_scope = || headers_with("authorization", "Bearer s3cret");
+
+        set_last_coverage(Some(VectorCoverage {
+            tag: "multilingual-e5-small@onnxruntime-1.31.1".to_string(),
+            observations: TableCoverage {
+                total: 60,
+                missing: 0,
+                stale: 41,
+            },
+            ..VectorCoverage::default()
+        }));
+        set_auto_progress(AutoProgress::default());
+        let before = health_body(state.clone(), full_scope()).await;
+
+        set_auto_progress(AutoProgress {
+            state: AutoState::Running,
+            older: 40,
+            ahead: 1,
+            encoded: 12,
+            last_row_at: Some("2026-11-11T18:00:00+00:00".to_string()),
+            ..AutoProgress::default()
+        });
+        let full = health_body(state.clone(), full_scope()).await;
+        let anonymous = health_body(state, HeaderMap::new()).await;
+        set_auto_progress(AutoProgress::default());
+        set_last_coverage(None);
+
+        let auto = &full["runtime"]["vectors"]["auto"];
+        assert_eq!(auto["state"], "running", "{full}");
+        assert_eq!(auto["older"], 40, "the rows it has to rewrite");
+        assert_eq!(auto["encoded"], 12, "the rows already sent to the encoder");
+        assert_eq!(
+            auto["ahead"], 1,
+            "the one of a newer runtime that it leaves alone"
+        );
+        assert_eq!(
+            auto["last_row_at"], "2026-11-11T18:00:00+00:00",
+            "the time of the last row tells a re-embed that gives way to the searches from one that hung"
+        );
+        assert!(
+            auto.get("last_error").is_some_and(|error| error.is_null()),
+            "no error yet, and the field is there for when there is one: {auto}"
+        );
+        assert_eq!(
+            full["status"], before["status"],
+            "a re-embed in progress does not degrade the verdict"
+        );
+
+        assert!(
+            anonymous.get("runtime").is_none(),
+            "the progress is part of the inventory an anonymous caller does not get: {anonymous}"
+        );
+        assert!(
+            !anonymous.to_string().contains("encoded"),
+            "nor does it leak somewhere else: {anonymous}"
+        );
+    }
+
     #[tokio::test]
     async fn health_without_a_configured_token_still_names_them() {
         let state = state_with_clients(None, &["editor-a"]);
@@ -4257,6 +4326,55 @@ mod lan_exposure_tests {
                 && warm_fn.contains("warm_before_serve_budget()")
                 && warm_fn.contains("tokio::time::timeout("),
             "the wait for the models has to be bounded. Warming before the bind was the other obvious order and it is worse: a model that never loads leaves the daemon unbound, so nobody can even ask it what is wrong."
+        );
+    }
+
+    /// CI-D5c (C.6). The service re-embeds the older vectors by itself, and the place where that
+    /// starts is part of the promise: after the models are warm, after the daemon has said it
+    /// listens and announced itself, and before it serves, so the port already answers when the
+    /// first row is rewritten and the search never waits behind it. Only the daemon does it: a
+    /// stdio process is launched by each client and lives as long as its session, and several of
+    /// them would fight for the lock of the re-embed. Structural, like the order test above: the
+    /// work it starts is judged by the tests of the re-embed itself.
+    #[test]
+    fn the_automatic_reembed_starts_after_the_daemon_says_it_is_listening_and_only_in_the_daemon() {
+        let body = include_str!("http.rs")
+            .split_once("pub async fn serve_pool(")
+            .expect("serve_pool is in this file")
+            .1
+            .split_once(
+                "
+}",
+            )
+            .expect("the function ends")
+            .0;
+        let announce = body.find("announce(").expect("the announcement");
+        let start = body
+            .find("start_the_automatic_reembed(")
+            .expect("serve_pool starts the automatic re-embed");
+        let serve = body.find("axum::serve(").expect("the server");
+        assert!(
+            announce < start && start < serve,
+            "the re-embed starts after the daemon announced itself and before it serves: the port answers already, and the models are warm"
+        );
+
+        let run_mcp = include_str!("protocol.rs")
+            .split_once("pub async fn run_mcp(")
+            .expect("run_mcp is in protocol.rs")
+            .1
+            .split_once(
+                "
+}",
+            )
+            .expect("the function ends")
+            .0;
+        assert!(
+            run_mcp.contains("rem_daemon(") && run_mcp.contains("sync_listener("),
+            "control: this is the body of run_mcp, which starts the REM cycle and the sync listener"
+        );
+        assert!(
+            !run_mcp.contains("start_the_automatic_reembed"),
+            "the stdio mode does not re-embed by itself: one process per client would fight for the lock, each dying with its batch half done"
         );
     }
 

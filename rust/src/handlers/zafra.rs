@@ -90,6 +90,7 @@ async fn reembed_a_batch(pool: &PgPool, batch_size: i64) -> Result<Value> {
         snapshot_root: snapshot_root(&node_id)?,
         node_id,
         progress: false,
+        forward_only: false,
     };
     let report = reembed(pool, &plan, &onnx_encoder).await?;
     let table = |t: crate::reembed_cli::TableReport| serde_json::json!({"fetched": t.fetched, "updated": t.rewritten});

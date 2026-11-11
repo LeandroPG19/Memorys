@@ -822,7 +822,45 @@ async fn embedding_coverage_rows(pool: &PgPool) -> Vec<Check> {
         None
     };
     let age = snapshot_age_days(pool).await;
-    embedding_coverage_checks(&coverage, old_label.as_deref(), age)
+    let older = if coverage.stale() > 0 {
+        crate::reembed_cli::forward_counts(pool, &coverage.tag)
+            .await
+            .map_or(
+                usize::try_from(coverage.stale()).unwrap_or_default(),
+                |counts| counts.older,
+            )
+    } else {
+        0
+    };
+    let service_env = crate::service::installed_env(crate::service::Target::host())
+        .ok()
+        .flatten();
+    let running = crate::reembed_cli::reembed_is_running(pool).await;
+    let auto = auto_reembed_mode(running, service_env.as_deref(), older);
+    embedding_coverage_checks(&coverage, old_label.as_deref(), age, auto)
+}
+
+/// What the service does about the vectors of another generation, as far as `doctor` can tell
+/// without asking it. A re-embed holding the lock right now (the automatic one, the command or
+/// `cuba_zafra`) is `Running`. The service «reembebe solo» only if there is a service (an env file
+/// of the installed service: the stdio mode alone has none and nobody re-embeds), the operator did
+/// not turn it off there with `MEMORY_INDUSTRY_AUTO_REEMBED`, and there is something it will
+/// rewrite: `older` counts the vectors of an earlier generation, and a database whose only other
+/// vectors are of a newer runtime or of another model has nothing for it to do.
+fn auto_reembed_mode(running: bool, service_env: Option<&str>, older: usize) -> AutoReembed {
+    if running {
+        return AutoReembed::Running;
+    }
+    let Some(text) = service_env else {
+        return AutoReembed::Off;
+    };
+    let enabled =
+        crate::reembed_cli::auto_reembed_enabled_from(env_value(text, AUTO_REEMBED_KEY).as_deref());
+    if enabled && older > 0 {
+        AutoReembed::On
+    } else {
+        AutoReembed::Off
+    }
 }
 
 /// The label most of the vectors of another generation carry, to say what they were made with.
@@ -854,14 +892,42 @@ async fn snapshot_age_days(pool: &PgPool) -> Option<u64> {
     crate::reembed_cli::oldest_snapshot_age_days(&root)
 }
 
+/// Whether the automatic re-embed of the service is going to deal with the vectors of another
+/// generation, is doing it now, or is turned off and the operator has to run the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoReembed {
+    Off,
+    On,
+    Running,
+}
+
+const AUTO_REEMBED_KEY: &str = "MEMORY_INDUSTRY_AUTO_REEMBED";
+
+const HINT_COMMAND: &str = "memory-industry reembed (reanudable; guarda antes los vectores actuales; --rollback los devuelve)";
+
+/// The way out of a database of another generation, by what the service does about it.
+fn pending_vectors_hint(auto: AutoReembed) -> String {
+    match auto {
+        AutoReembed::Off => HINT_COMMAND.to_string(),
+        AutoReembed::On => format!(
+            "el servicio los reembebe solo al arrancar (progreso en /health runtime.vectors.auto; \
+             {AUTO_REEMBED_KEY}=0 lo apaga); a mano: {HINT_COMMAND}"
+        ),
+        AutoReembed::Running => {
+            "esperá a que termine: repetí doctor o mirá /health (runtime.vectors.auto)".to_string()
+        }
+    }
+}
+
 /// Pure: what `doctor` says about the vectors. A warning and never a failure, because a database
 /// of another generation still answers searches (the score is off by a few thousandths), and the
-/// way out is one command. The row of the snapshot appears only when it is old enough to be
-/// forgotten.
+/// way out is one command, or the service doing it by itself. The row of the snapshot appears only
+/// when it is old enough to be forgotten.
 fn embedding_coverage_checks(
     coverage: &crate::embeddings::backfill::VectorCoverage,
     old_label: Option<&str>,
     snapshot_age_days: Option<u64>,
+    auto: AutoReembed,
 ) -> Vec<Check> {
     let (stale, missing) = (coverage.stale(), coverage.missing());
     let mut checks = vec![if stale == 0 && missing == 0 {
@@ -875,16 +941,20 @@ fn embedding_coverage_checks(
         )
     } else {
         let from = old_label.map_or(String::new(), |label| format!(" (de {label})"));
+        let running = if auto == AutoReembed::Running {
+            "; reembebido en curso"
+        } else {
+            ""
+        };
         Check::warn(
             "embedding_coverage",
             format!(
                 "{} filas: {missing} sin vector y {stale} vectores de otra generación{from}; \
-                 la actual es {}",
+                 la actual es {}{running}",
                 coverage.total(),
                 coverage.tag
             ),
-            "memory-industry reembed (reanudable; guarda antes los vectores actuales; \
-             --rollback los devuelve)",
+            pending_vectors_hint(auto),
         )
     }];
     if let Some(days) = snapshot_age_days.filter(|days| *days > SNAPSHOT_REMINDER_DAYS) {
@@ -3411,8 +3481,12 @@ mod embedding_coverage_tests {
     /// reminds that the snapshot `reembed` keeps is not meant to stay forever.
     #[test]
     fn the_coverage_check_names_the_generation_and_the_order() {
-        let clean =
-            embedding_coverage_checks(&with_observations_of_another_generation(0), None, None);
+        let clean = embedding_coverage_checks(
+            &with_observations_of_another_generation(0),
+            None,
+            None,
+            AutoReembed::Off,
+        );
         assert_eq!(clean.len(), 1, "nothing pending and no snapshot: one row");
         assert_eq!(clean[0].name, "embedding_coverage");
         assert_eq!(clean[0].status, Status::Ok);
@@ -3426,6 +3500,7 @@ mod embedding_coverage_tests {
             &with_observations_of_another_generation(7),
             Some("multilingual-e5-small"),
             None,
+            AutoReembed::Off,
         );
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "embedding_coverage");
@@ -3450,8 +3525,12 @@ mod embedding_coverage_tests {
             pending[0].hint
         );
 
-        let kept =
-            embedding_coverage_checks(&with_observations_of_another_generation(0), None, Some(40));
+        let kept = embedding_coverage_checks(
+            &with_observations_of_another_generation(0),
+            None,
+            Some(40),
+            AutoReembed::Off,
+        );
         assert_eq!(kept.len(), 2, "a snapshot of 40 days adds its own row");
         assert_eq!(
             kept[0].status,
@@ -3474,12 +3553,110 @@ mod embedding_coverage_tests {
             kept[1].hint
         );
 
-        let recent =
-            embedding_coverage_checks(&with_observations_of_another_generation(0), None, Some(3));
+        let recent = embedding_coverage_checks(
+            &with_observations_of_another_generation(0),
+            None,
+            Some(3),
+            AutoReembed::Off,
+        );
         assert_eq!(
             recent.len(),
             1,
             "a snapshot of three days is the safety net doing its job, not something to warn about"
         );
+    }
+
+    /// CI-D5c (C.8). With seven vectors of another generation `doctor` tells what the service is
+    /// going to do about them. If the service re-embeds by itself, the warning says so and says
+    /// where to watch it and how to turn it off; if a re-embed is running at this moment, it says
+    /// to wait for it and look again; if the operator turned the automatic re-embed off, it is
+    /// the command of CI-D5c-B, which is what B.4 judges and does not change.
+    #[test]
+    fn the_coverage_check_says_the_service_reembeds_by_itself_or_names_the_command_when_it_is_off()
+    {
+        let seven = |auto| {
+            embedding_coverage_checks(
+                &with_observations_of_another_generation(7),
+                Some("multilingual-e5-small"),
+                None,
+                auto,
+            )
+        };
+        let hint_of = |checks: &[Check]| checks[0].hint.clone().unwrap_or_default();
+
+        let on = seven(AutoReembed::On);
+        assert_eq!(on.len(), 1);
+        assert_eq!(on[0].name, "embedding_coverage");
+        assert_eq!(on[0].status, Status::Warn, "pending vectors are a warning");
+        for wanted in [
+            "el servicio los reembebe solo",
+            "MEMORY_INDUSTRY_AUTO_REEMBED=0",
+        ] {
+            assert!(
+                hint_of(&on).contains(wanted),
+                "the hint of an automatic re-embed that is on has to carry {wanted:?}: {:?}",
+                on[0].hint
+            );
+        }
+        assert!(
+            !on[0].detail.contains("en curso"),
+            "nothing is running yet: {}",
+            on[0].detail
+        );
+
+        let running = seven(AutoReembed::Running);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].status, Status::Warn);
+        assert!(
+            running[0].detail.contains("reembebido en curso"),
+            "the detail says a re-embed is running: {}",
+            running[0].detail
+        );
+        assert!(
+            hint_of(&running).contains("esperá a que termine"),
+            "and the hint is to wait and look again, not to start another one: {:?}",
+            running[0].hint
+        );
+
+        let off = seven(AutoReembed::Off);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].status, Status::Warn);
+        assert!(
+            hint_of(&off).contains("memory-industry reembed"),
+            "with the automatic re-embed off the hint is the command: {:?}",
+            off[0].hint
+        );
+        assert!(
+            !hint_of(&off).contains("reembebe solo") && !off[0].detail.contains("en curso"),
+            "and it does not promise what nobody is going to do: {:?} / {}",
+            off[0].hint,
+            off[0].detail
+        );
+    }
+
+    /// CI-D5c-C2 (A2). `doctor` promises «el servicio los reembebe solo» only when there is a service
+    /// to do it and something it will rewrite. A machine with the stdio mode alone has no installed
+    /// service (no env file), and a database whose only vectors of another generation are of a newer
+    /// runtime or of another model has nothing for the automatic re-embed to do: in both the hint is
+    /// the command. A running re-embed is running whatever the rest says, and the operator's
+    /// `MEMORY_INDUSTRY_AUTO_REEMBED=0` in the env file of the service turns it off.
+    #[test]
+    fn doctor_promises_the_service_only_when_there_is_one_and_something_for_it_to_rewrite() {
+        let off_in_the_file = "CUBA_HTTP_ADDR=127.0.0.1:8788\nMEMORY_INDUSTRY_AUTO_REEMBED=0\n";
+        let on_in_the_file = "CUBA_HTTP_ADDR=127.0.0.1:8788\n";
+        for (running, env_file, older, expected) in [
+            (false, Some(on_in_the_file), 5, AutoReembed::On),
+            (false, None, 5, AutoReembed::Off),
+            (false, Some(on_in_the_file), 0, AutoReembed::Off),
+            (false, Some(off_in_the_file), 5, AutoReembed::Off),
+            (true, Some(on_in_the_file), 5, AutoReembed::Running),
+            (true, None, 0, AutoReembed::Running),
+        ] {
+            assert_eq!(
+                auto_reembed_mode(running, env_file, older),
+                expected,
+                "running {running}, service env {env_file:?}, {older} older"
+            );
+        }
     }
 }

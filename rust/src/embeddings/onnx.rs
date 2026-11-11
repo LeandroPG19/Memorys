@@ -43,19 +43,54 @@ pub fn current_model() -> String {
 /// alone, which no loaded process writes: a vector is only written after one embedded.
 pub fn vector_tag_of(model: &str, runtime: Option<&str>) -> String {
     match runtime {
-        Some(runtime) => format!("{model}@onnxruntime-{runtime}"),
+        Some(runtime) => format!("{model}{RUNTIME_MARK}{runtime}"),
         None => model.to_string(),
     }
 }
+
+/// What sits between the model and the runtime version in the label of a vector.
+pub const RUNTIME_MARK: &str = "@onnxruntime-";
 
 /// The label of a vector this process writes now.
 pub fn vector_tag() -> String {
     vector_tag_of(&current_model(), loaded_runtime_version().as_deref())
 }
 
+/// Whether a vector labelled `label` is of an earlier generation than the one `than` names, which
+/// is what the automatic re-embed and a sync import are allowed to move forward and never back.
+/// It is older when it has no label (it is from before the labels), when it is of the model alone
+/// (every database written before 0.31) or when it is of the same model under an earlier runtime,
+/// compared as numbers, component by component: `1.9.0` is before `1.31.1`. It is not older when
+/// it is of the same generation or a newer one, of another model (another space, which only
+/// `reembed --all` changes) or of a version that cannot be read whole as numbers. Against a label
+/// that names no runtime there is no generation to be older than.
+pub fn is_older_generation(label: Option<&str>, than: &str) -> bool {
+    let Some((model, loaded)) = than.split_once(RUNTIME_MARK) else {
+        return false;
+    };
+    let Some(label) = label else {
+        return true;
+    };
+    match label.split_once(RUNTIME_MARK) {
+        None => label == model,
+        Some((made_by, version)) => made_by == model && version_is_before(version, loaded),
+    }
+}
+
+fn version_is_before(version: &str, loaded: &str) -> bool {
+    match (numbers_of(version), numbers_of(loaded)) {
+        (Some(version), Some(loaded)) => version < loaded,
+        _ => false,
+    }
+}
+
+fn numbers_of(version: &str) -> Option<Vec<u64>> {
+    version.split('.').map(|part| part.parse().ok()).collect()
+}
+
 static CACHE: OnceLock<std::sync::Mutex<TtlLruCache<Vec<f32>>>> = OnceLock::new();
 
-static ONNX_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+static GATE: OnceLock<EmbedGate> = OnceLock::new();
 
 const ONNX_DEFAULT_CONCURRENCY: usize = 1;
 
@@ -67,8 +102,103 @@ pub fn embed_concurrency() -> usize {
         .unwrap_or(ONNX_DEFAULT_CONCURRENCY)
 }
 
-fn get_semaphore() -> &'static tokio::sync::Semaphore {
-    ONNX_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(embed_concurrency()))
+/// The gate of this process, with `CUBA_EMBED_CONCURRENCY` permits.
+pub fn embed_gate() -> &'static EmbedGate {
+    GATE.get_or_init(|| EmbedGate::new(embed_concurrency()))
+}
+
+/// The computation of one vector, as a function so that a test can hand the background embed one
+/// that needs no model.
+pub type Compute = fn(&str) -> Result<Vec<f32>>;
+
+/// The permits of the embedder, in two kinds of caller. Whoever is waited for (a search, a write,
+/// the REM cycle, `reembed` by hand) is the foreground; the re-embed the service starts by itself
+/// is the background, and it does not start a row while a foreground embed is waiting or running,
+/// even with a permit free. The permits are one semaphore and the semaphore is fair, so a search
+/// that arrives in the middle of the background waits for the row in hand and not for the batch.
+/// Between the background looking and asking a search can slip in: the semaphore orders them, and
+/// the worst case is still one row (512 tokens at most).
+pub struct EmbedGate {
+    permits: tokio::sync::Semaphore,
+    in_flight: std::sync::atomic::AtomicUsize,
+    quiet: tokio::sync::Notify,
+}
+
+/// A foreground embed that is waiting for a permit or holds one. It counts from the moment it
+/// asks, and stops counting when it is dropped: a request that was cut while it waited must not
+/// leave the background waiting for ever.
+struct InFlight<'a>(&'a EmbedGate);
+
+impl<'a> InFlight<'a> {
+    fn enter(gate: &'a EmbedGate) -> Self {
+        gate.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(gate)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let before = self
+            .0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if before == 1 {
+            self.0.quiet.notify_waiters();
+        }
+    }
+}
+
+/// The permit of a foreground embed. The permit goes back before the count does, so the
+/// background that was waiting for the quiet finds the permit free.
+pub struct ForegroundPermit<'a> {
+    _permit: tokio::sync::SemaphorePermit<'a>,
+    _counted: InFlight<'a>,
+}
+
+impl EmbedGate {
+    pub fn new(permits: usize) -> Self {
+        Self {
+            permits: tokio::sync::Semaphore::new(permits),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            quiet: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub async fn foreground(&self) -> Result<ForegroundPermit<'_>> {
+        let counted = InFlight::enter(self);
+        let permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("ONNX semaphore closed"))?;
+        Ok(ForegroundPermit {
+            _permit: permit,
+            _counted: counted,
+        })
+    }
+
+    pub async fn background(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        loop {
+            let quiet = self.quiet.notified();
+            tokio::pin!(quiet);
+            // Enabled before the count is read: a foreground that ends between the two would
+            // otherwise notify nobody and leave this waiting for the next one.
+            quiet.as_mut().enable();
+            if self.in_flight() == 0 {
+                break;
+            }
+            quiet.await;
+        }
+        self.permits
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("ONNX semaphore closed"))
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 static MODEL_STATUS: OnceLock<ModelStatus> = OnceLock::new();
@@ -514,15 +644,9 @@ async fn embed_with_prefix(text: &str, prefix: &str) -> Result<Vec<f32>> {
         return Ok(cached);
     }
 
-    let _permit = get_semaphore()
-        .acquire()
-        .await
-        .map_err(|_| anyhow::anyhow!("ONNX semaphore closed"))?;
+    let _permit = embed_gate().foreground().await?;
 
-    let prefixed = format!("{}{}", prefix, text);
-    let embedding = tokio::task::spawn_blocking(move || compute_embedding(&prefixed))
-        .await
-        .context("embedding task panicked")??;
+    let embedding = compute_off_the_executor(format!("{}{}", prefix, text)).await?;
 
     if let Ok(mut cache) = get_cache().lock() {
         cache.put(cache_key, embedding.clone());
@@ -531,7 +655,69 @@ async fn embed_with_prefix(text: &str, prefix: &str) -> Result<Vec<f32>> {
     Ok(embedding)
 }
 
-fn compute_embedding(text: &str) -> Result<Vec<f32>> {
+async fn compute_off_the_executor(prefixed: String) -> Result<Vec<f32>> {
+    tokio::task::spawn_blocking(move || compute_embedding(&prefixed))
+        .await
+        .context("embedding task panicked")?
+}
+
+/// `embed_passage`, for the re-embed that the service runs by itself: the same prefix and the same
+/// vector, but it gives way to every foreground embed, and it neither reads nor writes the cache
+/// of 256 entries (thousands of passages that are never asked twice would empty it of queries).
+pub async fn embed_passage_background(text: &str) -> Result<Vec<f32>> {
+    embed_passage_background_with(embed_gate(), compute_embedding, text).await
+}
+
+/// `embed_passage_contextual`, for the re-embed that the service runs by itself.
+pub async fn embed_passage_contextual_background(
+    text: &str,
+    entity_type: &str,
+    entity_name: &str,
+) -> Result<Vec<f32>> {
+    embed_passage_contextual_background_with(
+        embed_gate(),
+        compute_embedding,
+        text,
+        entity_type,
+        entity_name,
+    )
+    .await
+}
+
+/// `embed_passage_background` with its gate and its computation as arguments: the seam where a
+/// test puts a gate it holds and a computation that needs no model.
+pub async fn embed_passage_background_with(
+    gate: &EmbedGate,
+    compute: Compute,
+    text: &str,
+) -> Result<Vec<f32>> {
+    embed_background_with(gate, compute, format!("{}{}", passage_prefix(), text)).await
+}
+
+/// `embed_passage_contextual_background` with its gate and its computation as arguments.
+pub async fn embed_passage_contextual_background_with(
+    gate: &EmbedGate,
+    compute: Compute,
+    text: &str,
+    entity_type: &str,
+    entity_name: &str,
+) -> Result<Vec<f32>> {
+    let contextualized = format!("[{}:{}] {}", entity_type, entity_name, text);
+    embed_passage_background_with(gate, compute, &contextualized).await
+}
+
+async fn embed_background_with(
+    gate: &EmbedGate,
+    compute: Compute,
+    prefixed: String,
+) -> Result<Vec<f32>> {
+    let _permit = gate.background().await?;
+    tokio::task::spawn_blocking(move || compute(&prefixed))
+        .await
+        .context("embedding task panicked")?
+}
+
+pub fn compute_embedding(text: &str) -> Result<Vec<f32>> {
     compute_embedding_with(get_model_status(), text)
 }
 
@@ -1359,6 +1545,145 @@ mod tests {
             vector_tag_of("multilingual-e5-small", None),
             "multilingual-e5-small",
             "with no runtime loaded there is nothing to name, and no vector is written either"
+        );
+    }
+
+    /// CI-D5c (C.1). The service re-embeds on its own, so what it may rewrite is decided by a rule
+    /// that only moves forward: a vector is older than the generation loaded when it was made
+    /// before the labels existed, by the model alone (every database of today) or by an earlier
+    /// runtime of the same model. Nothing else is older: not the same generation, not a newer
+    /// runtime, not another model (another space, which only `reembed --all` changes) and not a
+    /// version that cannot be read whole as numbers (a development build is not known to be
+    /// earlier). Versions compare as numbers, component by component: `1.9.0` is before `1.31.1`,
+    /// and as text it is not. Every label is written by hand.
+    #[test]
+    fn the_generation_of_a_vector_only_moves_forward() {
+        const LOADED: &str = "multilingual-e5-small@onnxruntime-1.31.1";
+        let labels: [(Option<&str>, bool); 8] = [
+            (Some("multilingual-e5-small"), true),
+            (Some("multilingual-e5-small@onnxruntime-1.26.0"), true),
+            (Some("multilingual-e5-small@onnxruntime-1.9.0"), true),
+            (None, true),
+            (Some("multilingual-e5-small@onnxruntime-1.31.1"), false),
+            (Some("multilingual-e5-small@onnxruntime-1.40.0"), false),
+            (Some("e5-small@onnxruntime-1.26.0"), false),
+            (Some("multilingual-e5-small@onnxruntime-1.31.1-dev"), false),
+        ];
+        for (label, older) in labels {
+            assert_eq!(
+                is_older_generation(label, LOADED),
+                older,
+                "{label:?} against {LOADED}"
+            );
+        }
+        for (label, _) in labels {
+            assert!(
+                !is_older_generation(label, "multilingual-e5-small"),
+                "{label:?} against a label that names no runtime: there is no generation to be older than"
+            );
+        }
+    }
+
+    /// CI-D5c (C.2). While the service re-embeds, a search that arrives goes in before the next row
+    /// of the background, not after the whole batch. The gate has one permit here, held by a row of
+    /// the background; a search and a second row ask in that order. Nothing sleeps and nothing is
+    /// timed: each future is polled once at each step and the test says whether it is ready, so the
+    /// order is the thing under test, not a clock. The permit goes to the search, and the second row
+    /// does not start until the search has let go of it.
+    #[tokio::test]
+    async fn a_search_that_arrives_while_the_service_reembeds_goes_before_its_next_row() {
+        use std::task::Poll;
+        let gate = EmbedGate::new(1);
+
+        let first_row = gate
+            .background()
+            .await
+            .expect("with nothing searching, the first row of the background starts");
+        let mut search = std::pin::pin!(gate.foreground());
+        assert!(
+            futures::poll!(search.as_mut()).is_pending(),
+            "the only permit is in use: the search waits for it"
+        );
+        let mut second_row = std::pin::pin!(gate.background());
+        assert!(
+            futures::poll!(second_row.as_mut()).is_pending(),
+            "the second row asks after the search and waits"
+        );
+        assert_eq!(
+            gate.in_flight(),
+            1,
+            "a search that is waiting counts as in flight: it is what the background gives way to"
+        );
+
+        drop(first_row);
+        let search_permit = match futures::poll!(search.as_mut()) {
+            Poll::Ready(permit) => permit.expect("the gate is not closed"),
+            Poll::Pending => panic!(
+                "the first row ended and the permit did not go to the search, which asked first"
+            ),
+        };
+        assert!(
+            futures::poll!(second_row.as_mut()).is_pending(),
+            "the second row of the background starts after the search, never before it"
+        );
+
+        drop(search_permit);
+        assert_eq!(gate.in_flight(), 0, "the search is over");
+        match futures::poll!(second_row.as_mut()) {
+            Poll::Ready(permit) => drop(permit.expect("the gate is not closed")),
+            Poll::Pending => panic!("with the search done the second row of the background starts"),
+        }
+    }
+
+    /// CI-D5c (C.3). With two permits, one held by a search, the background has a free permit and
+    /// still does not take it: a search that is embedding is not made to share the cores with a row
+    /// of the re-embed, and the row starts again the moment the search lets go. A search that gives
+    /// up while it waits (a request that was cut) stops counting: if it did not, the background
+    /// would wait for ever behind a search that no longer exists.
+    #[tokio::test]
+    async fn the_background_does_not_start_a_row_while_a_search_is_embedding() {
+        use std::task::Poll;
+        let gate = EmbedGate::new(2);
+
+        let search = gate
+            .foreground()
+            .await
+            .expect("an idle gate lets a search in");
+        let mut row = std::pin::pin!(gate.background());
+        assert!(
+            futures::poll!(row.as_mut()).is_pending(),
+            "a permit is free and the row still waits, because a search is embedding"
+        );
+        assert_eq!(gate.in_flight(), 1);
+
+        drop(search);
+        match futures::poll!(row.as_mut()) {
+            Poll::Ready(permit) => drop(permit.expect("the gate is not closed")),
+            Poll::Pending => panic!("the search let go and the row of the background still waits"),
+        }
+        assert_eq!(gate.in_flight(), 0);
+
+        let held = [
+            gate.background().await.expect("the first permit"),
+            gate.background().await.expect("the second permit"),
+        ];
+        let mut waiting_search = Box::pin(gate.foreground());
+        assert!(
+            futures::poll!(waiting_search.as_mut()).is_pending(),
+            "both permits are in use: a search waits"
+        );
+        assert_eq!(gate.in_flight(), 1);
+        drop(waiting_search);
+        assert_eq!(
+            gate.in_flight(),
+            0,
+            "a search that gave up while it waited is not in flight any more"
+        );
+        drop(held);
+        let mut later_row = std::pin::pin!(gate.background());
+        assert!(
+            futures::poll!(later_row.as_mut()).is_ready(),
+            "and the background is not left waiting for it"
         );
     }
 
