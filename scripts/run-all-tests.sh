@@ -573,8 +573,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # stand-in answers the way a server on the default port does.
   printf '#!/bin/sh\necho "127.0.0.1:5489 - accepting connections"\nexit 0\n' >"$tmp/bin/pg_isready"
   printf '#!/bin/sh\necho "memory-industry-gate|7701731310526959658"\nexit 0\n' >"$tmp/bin/psql"
-  # merge-gate.sh asks for a node as new as package.json says before its first step.
-  printf '#!/bin/sh\necho v20.0.0\n' >"$tmp/bin/node"
+  # merge-gate.sh asks for a node as new as package.json says before its first step, and gate_tree above copies the real
+  # package.json. So the stand-in answers the major that file names, read the way the gate reads it: a literal v20 went
+  # stale the day engines.node moved to >=22 (D7) and every row that launches merge-gate.sh was refused by gate_require_node.
+  node_major="$(GATE_REPO_ROOT="$ROOT" gate_node_required)"
+  [[ "$node_major" =~ ^[0-9]+$ ]] \
+    || self_fail "cannot read engines.node (\">=N\") from $ROOT/package.json, so the stand-in node cannot answer the version the gate asks for"
+  printf '#!/bin/sh\necho v%s.0.0\n' "$node_major" >"$tmp/bin/node"
   # merge-gate.sh runs cargo audit and cargo deny before this script, so those
   # two pass here and the first cargo that fails is still this script's own.
   printf '%s\n' '#!/bin/sh' \
