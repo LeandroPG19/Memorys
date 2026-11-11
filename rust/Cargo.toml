@@ -52,7 +52,7 @@ async-trait = "0.1"
 
 tiktoken-rs = "0.7"
 
-nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+nalgebra = { version = "0.35", default-features = false, features = ["std"] }
 
 sha2 = "0.10"
 hmac = "0.12"
@@ -61,7 +61,7 @@ hex = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-lru = "0.18.2"
+lru = "0.19"
 
 zstd = "0.14.3"
 
@@ -74,12 +74,12 @@ tar = "0.4"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 url = { version = "2", optional = true }
-html2text = { version = "0.12", optional = true }
+html2text = { version = "0.17", optional = true }
 
 
 mimalloc = "0.1"
-sysinfo = { version = "0.37", default-features = false, features = ["system"] }
-tree-sitter = "0.26.11"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+tree-sitter = "0.27.2"
 tree-sitter-rust = "0.24.2"
 tree-sitter-python = "0.25.0"
 

@@ -335,8 +335,17 @@ fn vram_free_mb() -> Option<u64> {
 }
 
 pub fn probe() -> Machine {
-    let mut system = sysinfo::System::new();
-    system.refresh_memory();
+    // sysinfo 0.40 answers `Err` where the OS gives it no system to read: zero memory, as a
+    // /proc/meminfo that cannot be read always gave, and the plan already copes with it.
+    let (ram_total, ram_available, swap_total) =
+        sysinfo::System::new().ok().map_or((0, 0, 0), |mut system| {
+            system.refresh_memory();
+            (
+                system.total_memory(),
+                system.available_memory(),
+                system.total_swap(),
+            )
+        });
 
     let cores_logical = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -346,9 +355,9 @@ pub fn probe() -> Machine {
         .max(1);
 
     Machine {
-        ram_total_mb: system.total_memory() / MIB,
-        ram_available_mb: system.available_memory() / MIB,
-        swap_total_mb: system.total_swap() / MIB,
+        ram_total_mb: ram_total / MIB,
+        ram_available_mb: ram_available / MIB,
+        swap_total_mb: swap_total / MIB,
         cgroup_limit_mb: cgroup_limit_mb(),
         cores_logical,
         cores_physical,
