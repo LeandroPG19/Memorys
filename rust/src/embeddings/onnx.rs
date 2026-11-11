@@ -748,7 +748,9 @@ pub fn loaded_runtime_version() -> Option<String> {
 }
 
 /// Turns the telemetry of ONNX Runtime off for a process that has not loaded it yet,
-/// unless the operator decided: a value already set stays, whatever it is.
+/// unless the operator decided: a value already set stays, whatever it is, except an
+/// empty one, which is no decision and counts as unset (the judge reads it the same
+/// way, `gate-lock.sh`: `${ORT_DISABLE_TELEMETRY:-1}`).
 ///
 /// From 1.31 the official builds send telemetry to Microsoft over HTTPS by default, with
 /// a persistent device identifier. `Environment::with_telemetry(false)` (`load_onnxruntime_once`)
@@ -758,7 +760,7 @@ pub fn loaded_runtime_version() -> Option<String> {
 /// the tokio runtime exists, because `set_var` is only sound while one thread reads
 /// the environment.
 pub fn keep_onnx_runtime_telemetry_off() {
-    if std::env::var_os("ORT_DISABLE_TELEMETRY").is_none() {
+    if std::env::var_os("ORT_DISABLE_TELEMETRY").is_none_or(|value| value.is_empty()) {
         // SAFETY: called from `main` before the runtime and any thread of ours; the
         // test that exercises it holds `GLOBAL_STATE_GUARD`.
         unsafe { std::env::set_var("ORT_DISABLE_TELEMETRY", "1") };
@@ -1915,8 +1917,9 @@ mod tests {
     /// library starts, and the only place that runs ahead of it in the daemon is
     /// `main`, which calls this. An operator who set the variable keeps their
     /// value, whatever it is: it is theirs to decide, and `set_var` over it
-    /// would be a second opinion nobody asked for. The environment is only
-    /// written under the global guard: `set_var` is unsound next to a reader.
+    /// would be a second opinion nobody asked for, except an empty one, which is
+    /// no word at all (the judge reads it that way: CI-D5c, A.7). The environment
+    /// is only written under the global guard: `set_var` is unsound next to a reader.
     #[tokio::test]
     async fn the_daemon_turns_onnx_runtime_telemetry_off_and_leaves_the_operators_word_alone() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
@@ -1938,6 +1941,17 @@ mod tests {
                 std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref(),
                 Some("0"),
                 "an operator who set it to \"0\" asked for telemetry on, and the daemon respects it"
+            );
+        }
+        {
+            let _empty = ScopedEnv::set("ORT_DISABLE_TELEMETRY", "");
+            keep_onnx_runtime_telemetry_off();
+            assert_eq!(
+                std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref(),
+                Some("1"),
+                "set and empty counts as unset, the rule of `gate-lock.sh` (CI-D5c, A.7): two \
+                 rules for one variable leave the daemon with telemetry on where the judge \
+                 measured it off"
             );
         }
     }

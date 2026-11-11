@@ -99,12 +99,22 @@ async function ensureBinary(log = (m) => process.stderr.write(m + "\n")) {
   return dest;
 }
 
+// The download can reach 450 MB (the CUDA 12 package of Linux): 45 minutes hold it at ~200 kB/s, and past them a
+// connection that stays open without data would hold `npm install` for ever. The binary has its own limits for a
+// stalled peer; this one is for the binary itself.
+const REFRESH_TIMEOUT_MS = 45 * 60 * 1000;
+
 // The binary decides whether there is a runtime to update (`--if-installed`): the cache roots, HOME or
-// USERPROFILE and the name of the library per system live in Rust, in one place. The download can reach
-// 450 MB (the CUDA 12 package of Linux), so the binary's own output goes straight to the terminal.
-function runBinary(bin, args) {
-  const result = spawnSync(bin, args, { stdio: "inherit" });
+// USERPROFILE and the name of the library per system live in Rust, in one place. Its own output goes straight
+// to the terminal. A binary that is cut (the time ran out, or a signal stopped it) throws, as one that cannot
+// be started does, and `refreshRuntime` reads both as a refresh that did not happen.
+function runBinary(bin, args, timeoutMs = REFRESH_TIMEOUT_MS) {
+  const result = spawnSync(bin, args, { stdio: "inherit", timeout: timeoutMs });
+  if (result.error && result.error.code === "ETIMEDOUT") {
+    throw new Error(`timed out after ${timeoutMs} ms`);
+  }
   if (result.error) throw result.error;
+  if (result.signal) throw new Error(`stopped by ${result.signal}`);
   return result.status;
 }
 
@@ -129,11 +139,19 @@ function refreshRuntime(bin, run = runBinary, log = (m) => process.stderr.write(
 // that is one version behind, which `doctor` reports and the command above fixes.
 async function postinstall({ ensure = ensureBinary, refresh = refreshRuntime, log } = {}) {
   const bin = await ensure(log);
-  refresh(bin);
+  refresh(bin, undefined, log);
   return bin;
 }
 
-module.exports = { ensureBinary, binPath, artifactName, download, refreshRuntime, postinstall };
+module.exports = {
+  ensureBinary,
+  binPath,
+  artifactName,
+  download,
+  runBinary,
+  refreshRuntime,
+  postinstall,
+};
 
 if (require.main === module) {
   if (process.env.CUBA_MEMORYS_SKIP_INSTALL) {
