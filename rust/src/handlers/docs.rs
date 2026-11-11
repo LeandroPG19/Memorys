@@ -54,6 +54,27 @@ fn resolve(library: &str) -> Result<String> {
     })
 }
 
+/// The text of the page at `url`: the cached copy, or the page fetched, converted and cached.
+async fn page_text(library: &str, url: &str) -> Result<String> {
+    let cached = cache()
+        .lock()
+        .map_err(|e| anyhow::anyhow!("cache envenenada: {e}"))?
+        .get(url);
+    if let Some(text) = cached {
+        return Ok(text);
+    }
+    let html = fetch::get(url)
+        .await
+        .with_context(|| format!("trayendo la documentación de `{library}` desde {url}"))?;
+    let text = fetch::html_to_text(&html, 100)
+        .with_context(|| format!("convirtiendo a texto la página de {url}"))?;
+    cache()
+        .lock()
+        .map_err(|e| anyhow::anyhow!("cache envenenada: {e}"))?
+        .put(url.to_string(), text.clone());
+    Ok(text)
+}
+
 pub async fn handle(args: &Value) -> Result<Value> {
     if !enabled() {
         anyhow::bail!(
@@ -70,26 +91,7 @@ pub async fn handle(args: &Value) -> Result<Value> {
 
     let url = resolve(library)?;
 
-    let cached = cache()
-        .lock()
-        .map_err(|e| anyhow::anyhow!("cache envenenada: {e}"))?
-        .get(&url);
-
-    let text = match cached {
-        Some(t) => t,
-        None => {
-            let html = fetch::get(&url)
-                .await
-                .with_context(|| format!("trayendo la documentación de `{library}` desde {url}"))?;
-            let t = fetch::html_to_text(&html, 100)
-                .with_context(|| format!("convirtiendo a texto la página de {url}"))?;
-            cache()
-                .lock()
-                .map_err(|e| anyhow::anyhow!("cache envenenada: {e}"))?
-                .put(url.clone(), t.clone());
-            t
-        }
-    };
+    let text = page_text(library, &url).await?;
 
     let (body, filtered) = match query.trim() {
         "" => (truncate(&text, 8_000), false),

@@ -131,16 +131,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             download_runtime(&parse_runtime_args(&args[1..])?).await?;
         }
         "all" => {
-            download_runtime(&parse_runtime_args(&args[1..])?).await?;
-            for m in ["embed", "nli", "reranker"] {
-                download_model(&spec(m).unwrap()).await?;
-            }
-            println!(
-                "\nChat model (extract/judge) is separate — set it in one line:\n\
-                   memory-industry llm set ollama\n\
-                   memory-industry llm set deepseek --key YOUR_KEY\n\
-                   memory-industry llm list"
-            );
+            download_all(&args[1..]).await?;
         }
         "llm" => {
             // Discoverability: people already know `models all`.
@@ -156,6 +147,22 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// `models all`: the runtime first, then the three encode models, and the line that says
+/// the chat model is not one of them.
+async fn download_all(runtime_args: &[String]) -> Result<()> {
+    download_runtime(&parse_runtime_args(runtime_args)?).await?;
+    for m in ["embed", "nli", "reranker"] {
+        download_model(&spec(m).unwrap()).await?;
+    }
+    println!(
+        "\nChat model (extract/judge) is separate — set it in one line:\n\
+           memory-industry llm set ollama\n\
+           memory-industry llm set deepseek --key YOUR_KEY\n\
+           memory-industry llm list"
+    );
     Ok(())
 }
 
@@ -705,6 +712,14 @@ fn staged_is_complete(staging: &Path, file: &str, flavor: Flavor, lib_name: &str
         })
 }
 
+/// Leaves `staging` as an empty directory, whatever a run before left in its place.
+fn empty_staging(staging: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(staging).is_ok() {
+        remove_entry(staging)?;
+    }
+    std::fs::create_dir_all(staging).with_context(|| format!("creando {}", staging.display()))
+}
+
 /// Downloads, checks and extracts the package into an empty `staging`, and writes the
 /// record last.
 async fn fetch_runtime(
@@ -714,10 +729,7 @@ async fn fetch_runtime(
     lib_name: &str,
     flavor: Flavor,
 ) -> Result<()> {
-    if std::fs::symlink_metadata(staging).is_ok() {
-        remove_entry(staging)?;
-    }
-    std::fs::create_dir_all(staging).with_context(|| format!("creando {}", staging.display()))?;
+    empty_staging(staging)?;
     let file = format!("{stem}.{ext}");
     let key = format!("onnxruntime/{file}");
     let url =

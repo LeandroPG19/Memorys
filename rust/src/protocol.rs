@@ -956,20 +956,7 @@ async fn run_rem_consolidation_locked(pool: &PgPool) -> Result<()> {
         tracing::info!(rows = quantized, "embeddings quantized to halfvec");
     }
 
-    match crate::embeddings::backfill::refresh_coverage(pool).await {
-        Ok(Some(coverage)) => {
-            tracing::info!(
-                stale = coverage.stale(),
-                missing = coverage.missing(),
-                "vectors of another generation counted"
-            );
-            tokio::spawn(crate::reembed_cli::resume_the_automatic_reembed(
-                pool.clone(),
-            ));
-        }
-        Ok(None) => {}
-        Err(e) => tracing::warn!(error = %e, "could not count the vectors of another generation"),
-    }
+    rem_count_other_generations(pool).await;
 
     let analyzed = rem_refresh_planner_stats(pool).await;
     tracing::info!(tables_analyzed = analyzed, "planner statistics refreshed");
@@ -1019,6 +1006,25 @@ async fn run_rem_consolidation_locked(pool: &PgPool) -> Result<()> {
     tracing::info!("REM consolidation complete");
 
     Ok(())
+}
+
+/// Counts the vectors of another generation again and, when the count is there, lets the
+/// automatic re-embed pick up where it was.
+async fn rem_count_other_generations(pool: &PgPool) {
+    match crate::embeddings::backfill::refresh_coverage(pool).await {
+        Ok(Some(coverage)) => {
+            tracing::info!(
+                stale = coverage.stale(),
+                missing = coverage.missing(),
+                "vectors of another generation counted"
+            );
+            tokio::spawn(crate::reembed_cli::resume_the_automatic_reembed(
+                pool.clone(),
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "could not count the vectors of another generation"),
+    }
 }
 
 struct RemCycleRecord {

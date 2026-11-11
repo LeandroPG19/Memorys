@@ -6405,20 +6405,90 @@ OUT: no hay model.onnx ni model_quantized.onnx en <R>
         );
     }
 
+    /// (name, failure, placement, found no model, state, device)
+    type NliOutcome = (
+        &'static str,
+        Option<String>,
+        Option<crate::gpu::Placement>,
+        bool,
+        &'static str,
+        Option<&'static str>,
+    );
+
+    /// The NLI's row from a poll whose reads cross the resolution of the cell at `flip`.
+    fn nli_row_of_a_poll_that_crosses_the_resolution(
+        outcome: &NliOutcome,
+        flip: usize,
+    ) -> ModelState {
+        let (name, failure, placement, found_no_model, _state, _device) = outcome;
+        let world = FlippingWorld {
+            reads: std::cell::Cell::new(0),
+            flip,
+        };
+        let (resolved, seen_failure, seen_placement) = read_cell_first(
+            || world.resolved(),
+            || world.seen(failure),
+            || world.seen(placement),
+        );
+        let found_none_now = world.resolved() && *found_no_model;
+        assert_eq!(
+            world.reads.get(),
+            4,
+            "{name}, flip={flip}: three reads for the cell and one for whether it found \
+             no model, after them"
+        );
+        nli_state_from(
+            seen_failure,
+            seen_placement.as_ref(),
+            false,
+            true,
+            resolved,
+            found_none_now,
+        )
+    }
+
+    fn assert_the_nli_row_is_what_the_cell_decided_or_the_row_before(
+        row: &ModelState,
+        outcome: &NliOutcome,
+        flip: usize,
+    ) {
+        let (name, _failure, _placement, _found_no_model, state, device) = outcome;
+        let at = format!("{name}, flip={flip}: {row:?}");
+        if row.state == "loaded" {
+            assert!(
+                row.device.is_some() && *state == "loaded",
+                "an NLI that no session opened, or that opened without a device, was \
+                 read as loaded: {at}"
+            );
+        }
+        assert!(
+            row.state == "configured" || row.state == *state,
+            "the row is neither the one before the load nor the one the load produced: \
+             {at}"
+        );
+        if flip == 0 {
+            assert_eq!(
+                (row.state, row.device),
+                (*state, *device),
+                "a poll that starts after the cell resolved has to say exactly what the \
+                 cell decided: {at}"
+            );
+        }
+        if *name == "Unavailable" {
+            let expected = if flip <= 3 { "absent" } else { "configured" };
+            assert_eq!(
+                row.state, expected,
+                "a cell that found no model is `absent` as soon as the poll sees it \
+                 resolved, and `configured` only when the poll ends before it: {at}"
+            );
+        }
+    }
+
     /// K4. The same poll as K3's, with the third fact the NLI row now reads
     /// after the cell. `flip` is the read at which the world becomes resolved.
     #[test]
     fn a_poll_that_crosses_an_nli_resolution_never_reads_loaded_for_what_did_not_load() {
-        // (name, failure, placement, found no model, state, device)
-        type Outcome = (
-            &'static str,
-            Option<String>,
-            Option<crate::gpu::Placement>,
-            bool,
-            &'static str,
-            Option<&'static str>,
-        );
-        let outcomes: [Outcome; 3] = [
+        let outcomes: [NliOutcome; 3] = [
             ("Unavailable", None, None, true, "absent", None),
             (
                 "Loaded on the CPU",
@@ -6438,61 +6508,10 @@ OUT: no hay model.onnx ni model_quantized.onnx en <R>
             ),
         ];
 
-        for (name, failure, placement, found_no_model, state, device) in &outcomes {
+        for outcome in &outcomes {
             for flip in 0..=4usize {
-                let world = FlippingWorld {
-                    reads: std::cell::Cell::new(0),
-                    flip,
-                };
-                let (resolved, seen_failure, seen_placement) = read_cell_first(
-                    || world.resolved(),
-                    || world.seen(failure),
-                    || world.seen(placement),
-                );
-                let found_none_now = world.resolved() && *found_no_model;
-                assert_eq!(
-                    world.reads.get(),
-                    4,
-                    "{name}, flip={flip}: three reads for the cell and one for whether it found \
-                     no model, after them"
-                );
-                let row = nli_state_from(
-                    seen_failure,
-                    seen_placement.as_ref(),
-                    false,
-                    true,
-                    resolved,
-                    found_none_now,
-                );
-                let at = format!("{name}, flip={flip}: {row:?}");
-                if row.state == "loaded" {
-                    assert!(
-                        row.device.is_some() && *state == "loaded",
-                        "an NLI that no session opened, or that opened without a device, was \
-                         read as loaded: {at}"
-                    );
-                }
-                assert!(
-                    row.state == "configured" || row.state == *state,
-                    "the row is neither the one before the load nor the one the load produced: \
-                     {at}"
-                );
-                if flip == 0 {
-                    assert_eq!(
-                        (row.state, row.device),
-                        (*state, *device),
-                        "a poll that starts after the cell resolved has to say exactly what the \
-                         cell decided: {at}"
-                    );
-                }
-                if *name == "Unavailable" {
-                    let expected = if flip <= 3 { "absent" } else { "configured" };
-                    assert_eq!(
-                        row.state, expected,
-                        "a cell that found no model is `absent` as soon as the poll sees it \
-                         resolved, and `configured` only when the poll ends before it: {at}"
-                    );
-                }
+                let row = nli_row_of_a_poll_that_crosses_the_resolution(outcome, flip);
+                assert_the_nli_row_is_what_the_cell_decided_or_the_row_before(&row, outcome, flip);
             }
         }
     }

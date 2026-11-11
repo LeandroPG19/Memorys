@@ -70,16 +70,16 @@ src/cognitive/judge.rs::resolve_judge#1 9
 src/cognitive/judge.rs::run_prompt#4 10
 src/cognitive/judge.rs::which_in_path#1 18
 src/cognitive/nli.rs::classify#1 14
-src/cognitive/nli.rs::init#1 15
+src/cognitive/nli.rs::init#1 14
 src/dashboard.rs::render#1 12
 src/db.rs::init_schema#1 9
 src/dedupe_cli.rs::judge_likely#1 9
 src/dedupe_cli.rs::merge_entity#1 13
 src/dedupe_cli.rs::run_cli#1 30
-src/doctor.rs::run_checks_with#1 43
+src/doctor.rs::run_checks_with#1 40
 src/doctor.rs::run_cli#1 13
 src/embeddings/onnx.rs::compute_onnx_embedding#1 19
-src/embeddings/onnx.rs::init_onnx_session#1 13
+src/embeddings/onnx.rs::init_onnx_session#1 12
 src/eval/datasets.rs::load_jsonl_dataset#1 14
 src/eval/harness.rs::run_faro_eval#1 21
 src/eval/mod.rs::compare_runs#1 15
@@ -114,7 +114,6 @@ src/handlers/cronica.rs::batch_add#1 21
 src/handlers/cronica.rs::check_dedup#1 11
 src/handlers/cronica.rs::episode_add#1 11
 src/handlers/decreto.rs::handle#1 9
-src/handlers/docs.rs::handle#1 12
 src/handlers/eco.rs::correct#1 10
 src/handlers/eco.rs::negative#1 9
 src/handlers/eco.rs::positive#1 9
@@ -146,7 +145,7 @@ src/handlers/sync.rs::diff#1 11
 src/handlers/sync.rs::drain_peer#1 25
 src/handlers/sync.rs::export_into#1 59
 src/handlers/sync.rs::fetch#1 16
-src/handlers/sync.rs::import#1 139
+src/handlers/sync.rs::import#1 137
 src/handlers/sync.rs::prune_stale_episode_files#1 14
 src/handlers/sync.rs::prune_stale_files#1 10
 src/handlers/sync.rs::pull_from_staging#1 10
@@ -154,7 +153,7 @@ src/handlers/sync.rs::recompute_digest#1 11
 src/handlers/sync.rs::resolve_conflict#1 14
 src/handlers/sync.rs::validate_bundle#1 36
 src/handlers/vigia.rs::health#1 12
-src/handlers/zafra.rs::handle#1 35
+src/handlers/zafra.rs::handle#1 31
 src/hooks_cli.rs::merge_episode_file#1 9
 src/hooks_cli.rs::remove_gitattributes_line#1 9
 src/hooks_cli.rs::remove_hook_block#1 9
@@ -181,20 +180,20 @@ src/net/guard.rs::is_forbidden#1 18
 src/protocol.rs::handle_request#1 11
 src/protocol.rs::read_resource#1 30
 src/protocol.rs::request_sampling_max#1 9
-src/protocol.rs::run_mcp#1 27
+src/protocol.rs::run_mcp#1 20
 src/protocol.rs::run_rem_consolidation_locked#1 15
 src/recall_cli.rs::build#1 18
 src/recall_cli.rs::run_cli#1 9
-src/reembed_cli.rs::run_cli#1 19
+src/reembed_cli.rs::run_cli#1 17
 src/resources.rs::plan#1 11
 src/search/bm25.rs::bm25_search#1 10
 src/search/ood.rs::fit#1 17
-src/search/rerank.rs::init_session#1 12
+src/search/rerank.rs::init_session#1 11
 src/search/rerank.rs::score_chunk#1 16
 src/search/rerank.rs::score_pairs#1 10
 src/service.rs::resolve_address#1 11
 src/service.rs::write_one#1 11
-src/setup.rs::resolve_database_url#1 11
+src/setup.rs::resolve_database_url#1 9
 # The four below each went up by the `?` of `envs::home()` returning a Result
 # (run_check by two: it calls both known_targets and project_configs). It used
 # to be `std::env::var("HOME").map_or_else(|_| PathBuf::from("."), ..)`: with

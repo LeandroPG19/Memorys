@@ -3115,8 +3115,11 @@ mod service_tests {
         let tail = read_log_tail(&path, 5).expect(
             "5 bytes of a file of 2-byte characters cuts one in half; the log is still readable",
         );
+        // The pattern is a string on purpose: lizard 1.24 does not close a char literal
+        // that holds a non-ASCII character, and measured this test up to the end of the
+        // file, with every `if` of the module below counted as its own.
         assert!(
-            tail.ends_with('é') && tail.len() <= 8,
+            tail.ends_with("é") && tail.len() <= 8,
             "the cut has to be tolerated (lossy), not turned into «no log»: {tail:?}"
         );
     }

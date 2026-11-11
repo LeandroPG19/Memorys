@@ -1183,6 +1183,35 @@ mod tests {
         );
     }
 
+    /// One entity with one observation in `mine` and one in `other`: the rows scenario 2 counts.
+    async fn one_row_in_each_project(
+        admin: &PgPool,
+        mine: uuid::Uuid,
+        other: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        for (entity, project, content) in [
+            ("gate_rls_mine", mine, "row of the active project"),
+            ("gate_rls_other", other, "row of the other project"),
+        ] {
+            sqlx::query(
+                "WITH entity AS (
+                    INSERT INTO brain_entities (name, entity_type, project_id)
+                    VALUES ($1, 'concept', $2::uuid)
+                    RETURNING id
+                 )
+                 INSERT INTO brain_observations
+                    (entity_id, content, observation_type, source, importance, project_id)
+                 SELECT id, $3::text, 'fact', 'agent', 0.5, $2::uuid FROM entity",
+            )
+            .bind(entity)
+            .bind(project)
+            .bind(content)
+            .execute(admin)
+            .await?;
+        }
+        Ok(())
+    }
+
     /// T-RLS, scenario 2: the rows. Same barrier as scenario 1, as the application role in
     /// a private database that is dropped at the end. The first connection is held, so the
     /// counts run on the second, which the pool opens and after_connect scopes. connect_with
@@ -1217,26 +1246,7 @@ mod tests {
             let admin = crate::db::create_admin_pool(&private).await?;
             let mine = crate::project::upsert_project(&admin, "gate_rls_active").await?;
             let other = crate::project::upsert_project(&admin, "gate_rls_other").await?;
-            for (entity, project, content) in [
-                ("gate_rls_mine", mine, "row of the active project"),
-                ("gate_rls_other", other, "row of the other project"),
-            ] {
-                sqlx::query(
-                    "WITH entity AS (
-                        INSERT INTO brain_entities (name, entity_type, project_id)
-                        VALUES ($1, 'concept', $2::uuid)
-                        RETURNING id
-                     )
-                     INSERT INTO brain_observations
-                        (entity_id, content, observation_type, source, importance, project_id)
-                     SELECT id, $3::text, 'fact', 'agent', 0.5, $2::uuid FROM entity",
-                )
-                .bind(entity)
-                .bind(project)
-                .bind(content)
-                .execute(&admin)
-                .await?;
-            }
+            one_row_in_each_project(&admin, mine, other).await?;
             admin.close().await;
 
             crate::session::set(uuid::Uuid::new_v4(), Some(mine));
