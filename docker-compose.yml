@@ -31,7 +31,8 @@ services:
   # Optional graph projection (Postgres remains source of truth).
   # Enable with: MEMORY_INDUSTRY_GRAPH_DB=falkor MEMORY_INDUSTRY_GRAPH_URL=redis://127.0.0.1:6389
   graph:
-    image: falkordb/falkordb:latest
+    # 6.0.4 (a rewrite in Rust, since 2026-11-05) is pinned, not `latest`; no test exercises the graph projection against it yet (CI-D7, 2026-11-11).
+    image: falkordb/falkordb:6.0.4
     container_name: memory-industry-graph
     profiles: ["graph"]
     restart: unless-stopped
