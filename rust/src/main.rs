@@ -7,6 +7,12 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What is left in the blocking pool when `async_main` returns has no one to wait for it (what has
+/// an owner was drained above under its own ceiling): a model load or an inference. Dropping the
+/// runtime without this waited for it without limit, and a reranker warm-up kept the process alive
+/// after its client had closed stdin.
+const RUNTIME_SHUTDOWN_CEILING: Duration = Duration::from_secs(1);
+
 async fn drain_then_report(result: anyhow::Result<()>, command: &str) {
     drain_background_tasks().await;
     if let Err(e) = result {
@@ -120,6 +126,7 @@ fn main() {
         .expect("building the tokio runtime");
 
     runtime.block_on(async_main());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_CEILING);
 }
 
 async fn async_main() {
