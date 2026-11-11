@@ -853,6 +853,289 @@ mod tests {
         );
     }
 
+    /// «Is there a model to load» has one answer, and the guard of
+    /// `assert_embedding_dim` and the load itself read it from the same place.
+    ///
+    /// The four rows are the four stops of the load that need no session:
+    /// no model directory, a model with no runtime, a runtime with no model
+    /// file, and both. Asking is not loading: the cell that holds the session
+    /// must be exactly as resolved after the question as before it, or the
+    /// guard that runs at start-up opens the model again.
+    #[tokio::test]
+    async fn the_guard_and_the_loader_read_one_rule_for_configured() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let resolved_before = MODEL_STATUS.get().is_some();
+
+        let root = scratch_root("e16_locate");
+        let empty_home = root.join("home");
+        let with_model = root.join("with-model");
+        let without_model = root.join("without-model");
+        for dir in [&empty_home, &with_model, &without_model] {
+            std::fs::create_dir_all(dir).expect("the test owns this directory");
+        }
+        std::fs::write(with_model.join("model.onnx"), b"not a model")
+            .expect("temp dir is writable");
+        let runtime = root.join(runtime_library_filename());
+        std::fs::write(&runtime, b"not a runtime").expect("temp dir is writable");
+        let missing_runtime = root.join("no-such-runtime");
+
+        // HOME moves to an empty directory so that the cache of the machine
+        // running the test cannot be the model the first row looks for.
+        let _home = ScopedEnv::set("HOME", &empty_home.display().to_string());
+
+        {
+            let _model = ScopedEnv::cleared("ONNX_MODEL_PATH");
+            let _runtime = ScopedEnv::cleared("ORT_DYLIB_PATH");
+            assert!(
+                matches!(locate_model(), Located::Absent),
+                "no ONNX_MODEL_PATH and nothing under the home cache is no model at all"
+            );
+            assert!(
+                !model_configured(),
+                "nothing to load, and the guard would read it as a model"
+            );
+        }
+
+        {
+            let _model = ScopedEnv::set("ONNX_MODEL_PATH", &with_model.display().to_string());
+            let _runtime = ScopedEnv::set("ORT_DYLIB_PATH", &missing_runtime.display().to_string());
+            let Located::NoRuntime { model_dir } = locate_model() else {
+                panic!(
+                    "a model directory and a runtime path that is not a file must stop at \
+                     «no runtime»: the load logs it and falls back, so the guard has to agree"
+                );
+            };
+            assert_eq!(model_dir, with_model);
+            assert!(
+                !model_configured(),
+                "without the runtime the load never opens a session, so there is no model to guard"
+            );
+        }
+
+        {
+            let _model = ScopedEnv::set("ONNX_MODEL_PATH", &without_model.display().to_string());
+            let _runtime = ScopedEnv::set("ORT_DYLIB_PATH", &runtime.display().to_string());
+            let Located::NoFile { model_file } = locate_model() else {
+                panic!(
+                    "a runtime and a model directory with neither model.onnx nor \
+                     model_quantized.onnx must stop at «no file»"
+                );
+            };
+            assert_eq!(model_file, without_model.join("model.onnx"));
+            assert!(
+                !model_configured(),
+                "a directory with no model file is not a model"
+            );
+        }
+
+        {
+            let _model = ScopedEnv::set("ONNX_MODEL_PATH", &with_model.display().to_string());
+            let _runtime = ScopedEnv::set("ORT_DYLIB_PATH", &runtime.display().to_string());
+            let Located::Ready {
+                model_file,
+                model_dir,
+            } = locate_model()
+            else {
+                panic!("the runtime and model.onnx are both there: this is the configured machine");
+            };
+            assert_eq!(model_file, with_model.join("model.onnx"));
+            assert_eq!(model_dir, with_model);
+            assert!(model_configured());
+
+            std::fs::write(
+                with_model.join("model_quantized.onnx"),
+                b"not a model either",
+            )
+            .expect("temp dir is writable");
+            let Located::Ready { model_file, .. } = locate_model() else {
+                panic!("adding the quantized file cannot make the machine less configured");
+            };
+            assert_eq!(
+                model_file,
+                with_model.join("model_quantized.onnx"),
+                "the quantized model is the one the load prefers when both are there"
+            );
+        }
+
+        assert_eq!(
+            MODEL_STATUS.get().is_some(),
+            resolved_before,
+            "asking whether a model is configured resolved the cell that opens the session. \
+             That is the guard turning into a load at start-up again"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One poll of a future, without waiting for it: `Pending` is the answer
+    /// that says «it did not finish inside this call».
+    async fn poll_once<F: std::future::Future>(
+        waiting: &mut std::pin::Pin<Box<F>>,
+    ) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx))).await
+    }
+
+    /// A loader that counts itself, says when it is inside, and holds the load
+    /// until the test lets it go.
+    ///
+    /// The wait is `recv_timeout`, not `recv`: a load that nobody releases
+    /// answers `Failed("never released")` after 10 s instead of hanging the
+    /// suite, and the assertion that reads the answer says what went wrong.
+    fn held_loader(
+        loads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (
+        impl FnOnce() -> ModelStatus + Send + 'static,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let loader = move || {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = entered_tx.send(());
+            match release_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(()) => ModelStatus::Loaded,
+                Err(_) => ModelStatus::Failed("never released".to_string()),
+            }
+        };
+        (loader, entered_rx, release_tx)
+    }
+
+    /// The 15 s around each of the four below is the guard against a hang, not
+    /// the verdict: every one of them ends on a count or on `Pending`.
+    const NO_HANG: std::time::Duration = std::time::Duration::from_secs(15);
+
+    #[tokio::test]
+    async fn two_waits_for_an_unloaded_model_share_one_load() {
+        static CELL: OnceLock<ModelStatus> = OnceLock::new();
+        tokio::time::timeout(NO_HANG, async {
+            let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (first_loader, entered, release) = held_loader(loads.clone());
+            let first = tokio::spawn(resolve_off_executor(&CELL, first_loader));
+            entered.await.expect("the first loader never started");
+
+            let second_loads = loads.clone();
+            let mut second = Box::pin(resolve_off_executor(&CELL, move || {
+                second_loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ModelStatus::Failed("second load".to_string())
+            }));
+            let polled = poll_once(&mut second).await;
+            assert!(
+                matches!(polled, std::task::Poll::Pending),
+                "B answered while the load was in progress. A request that arrives while the \
+                 model is loading has to wait for it: answering with the fallback is a hash \
+                 vector written under a model that is about to be there"
+            );
+
+            release.send(()).expect("the first loader is still waiting");
+            let from_first = first.await.expect("the wait of the first caller joined");
+            let from_second = second.await;
+            assert!(
+                matches!(from_first, Some(ModelStatus::Loaded)),
+                "the caller that started the load must get the model it loaded"
+            );
+            assert!(
+                matches!(from_second, Some(ModelStatus::Loaded)),
+                "the caller that arrived during the load must get the same answer, not its own"
+            );
+            assert_eq!(
+                loads.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "two waits on an unresolved cell opened the model twice"
+            );
+        })
+        .await
+        .expect("two waits for one load did not finish in 15 s");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_load_never_runs_on_the_executor_thread() {
+        static CELL: OnceLock<ModelStatus> = OnceLock::new();
+        tokio::time::timeout(NO_HANG, async {
+            let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (loader, _entered, release) = held_loader(loads);
+            let mut waiting = Box::pin(resolve_off_executor(&CELL, loader));
+
+            let polled = poll_once(&mut waiting).await;
+            assert!(
+                matches!(polled, std::task::Poll::Pending),
+                "the load ran on the executor thread: the loader waits for a signal that only \
+                 this thread sends, after the first poll, so a poll that came back Ready is a \
+                 poll that sat inside the loader until it gave up. With 2 to 4 executor threads \
+                 that is how a few first requests stop the runtime, the writer of stdout included"
+            );
+
+            release.send(()).expect("the loader is still waiting");
+            let status = waiting.await;
+            assert!(
+                matches!(status, Some(ModelStatus::Loaded)),
+                "once released the load has to finish and be the answer"
+            );
+        })
+        .await
+        .expect("the wait for the load did not finish in 15 s");
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_is_dropped_does_not_load_again() {
+        static CELL: OnceLock<ModelStatus> = OnceLock::new();
+        tokio::time::timeout(NO_HANG, async {
+            let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (first_loader, entered, release) = held_loader(loads.clone());
+            let first = tokio::spawn(resolve_off_executor(&CELL, first_loader));
+            entered.await.expect("the first loader never started");
+
+            first.abort();
+            let _ = first.await;
+
+            release
+                .send(())
+                .expect("the load must outlive the wait that was dropped");
+            let second_loads = loads.clone();
+            let status = resolve_off_executor(&CELL, move || {
+                second_loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ModelStatus::Failed("second load".to_string())
+            })
+            .await;
+
+            assert!(
+                matches!(status, Some(ModelStatus::Loaded)),
+                "the next caller has to get what the dropped wait started: a handler that times \
+                 out must not leave the model to be opened a second time"
+            );
+            assert_eq!(
+                loads.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the load was repeated after the wait that started it went away. The second \
+                 attempt finds the session already set and the model stays Failed for good"
+            );
+        })
+        .await
+        .expect("the wait after a dropped one did not finish in 15 s");
+    }
+
+    #[tokio::test]
+    async fn a_load_that_panics_answers_no_model() {
+        static CELL: OnceLock<ModelStatus> = OnceLock::new();
+        tokio::time::timeout(NO_HANG, async {
+            let broken = resolve_off_executor(&CELL, || -> ModelStatus { panic!("boom") }).await;
+            assert!(
+                broken.is_none(),
+                "a load that panicked answers «no model» to whoever was waiting, without taking \
+                 the waiter down with it and without calling the model loaded"
+            );
+
+            let again = resolve_off_executor(&CELL, || ModelStatus::Loaded).await;
+            assert!(
+                matches!(again, Some(ModelStatus::Loaded)),
+                "the panic left the cell poisoned or resolved: a later call has to try the \
+                 load again, as the OnceLock does after an initializer that did not finish"
+            );
+        })
+        .await
+        .expect("the panicking load did not finish in 15 s");
+    }
+
     #[test]
     fn embed_concurrency_defaults_to_one_and_is_configurable() {
         unsafe { std::env::remove_var("CUBA_EMBED_CONCURRENCY") };

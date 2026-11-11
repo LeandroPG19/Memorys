@@ -104,6 +104,7 @@ TOOL_CALLS: List[Tuple[str, str, Dict[str, Any]]] = [
 SKIP_LIVE: set[str] = set()  # soft-skips forbidden; every live tool must run
 
 WRITER_CLOSED = "outbound writer closed"
+MODEL_LOADED = "ONNX model loaded successfully"
 BURST = 20
 
 class McpSession:
@@ -126,6 +127,8 @@ class McpSession:
         self._stderr_lines: List[str] = []
         # The writer-closed event, seen on any line: the 200 lines kept above are for the error message, not for this.
         self.writer_closed: Optional[Dict[str, Any]] = None
+        # The «ONNX model loaded successfully» lines, counted on every line for the same reason.
+        self.model_loaded_lines = 0
         self._exit_code: Optional[int] = None
         self._closed = False
         self._lock = threading.Lock()
@@ -153,11 +156,25 @@ class McpSession:
         assert self.proc.stderr is not None
         for line in self.proc.stderr:
             event = self._writer_closed_in(line) if WRITER_CLOSED in line else None
+            loaded = MODEL_LOADED in line and self._message_in(line).startswith(MODEL_LOADED)
             with self._lock:
                 if event is not None:
                     self.writer_closed = event
+                if loaded:
+                    self.model_loaded_lines += 1
                 if len(self._stderr_lines) < 200:
                     self._stderr_lines.append(line.rstrip())
+
+    @staticmethod
+    def _message_in(line: str) -> str:
+        """The `fields.message` of a JSON log line, or "" when the line is something else."""
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return ""
+        fields = event.get("fields") if isinstance(event, dict) else None
+        message = fields.get("message") if isinstance(fields, dict) else None
+        return message if isinstance(message, str) else ""
 
     @staticmethod
     def _writer_closed_in(line: str) -> Optional[Dict[str, Any]]:
@@ -180,6 +197,20 @@ class McpSession:
         assert self.proc.stdin is not None
         self.proc.stdin.write(json.dumps(payload) + "\n")
         self.proc.stdin.flush()
+        return self.answer_to(req_id, method, timeout)
+
+    def request_together(
+        self, calls: List[Tuple[str, str, Dict[str, Any]]], timeout: float = 45.0
+    ) -> List[Dict[str, Any]]:
+        """Writes every (id, method, params) back to back, without reading in between; then reads each answer."""
+        assert self.proc.stdin is not None
+        for req_id, method, params in calls:
+            payload = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+            self.proc.stdin.write(json.dumps(payload) + "\n")
+        self.proc.stdin.flush()
+        return [self.answer_to(req_id, method, timeout) for req_id, method, _ in calls]
+
+    def answer_to(self, req_id: str, method: str, timeout: float) -> Dict[str, Any]:
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self._lock:
@@ -318,6 +349,43 @@ def main() -> int:
         if missing:
             print(f"FAIL tools/list missing: {sorted(missing)}")
             return 1
+
+        # The first use of the model in this process is two writes at once: both have to wait for the one
+        # load and come back with their vector written. The requests are dispatched together and the load
+        # takes at least half a second, so the second one arrives while it is running.
+        suffix = uuid.uuid4().hex[:8]
+        first_use = session.request_together(
+            [
+                (
+                    f"e16-{tag}",
+                    "tools/call",
+                    {
+                        "name": "cuba_cronica",
+                        "arguments": {
+                            "action": "add",
+                            "entity_name": f"_live_e16_{tag}_{suffix}",
+                            "content": f"Live session first use {tag} {uuid.uuid4()}",
+                            "observation_type": "fact",
+                        },
+                    },
+                )
+                for tag in ("a", "b")
+            ]
+        )
+        for answer in first_use:
+            ok, detail = parse_tool_result(answer)
+            embedding = None
+            if ok:
+                try:
+                    embedding = json.loads(answer["result"]["content"][0]["text"]).get("embedding")
+                except (KeyError, IndexError, json.JSONDecodeError, AttributeError):
+                    pass
+            if ok and embedding == "ready":
+                passed += 1
+                print(f"PASS first use {answer.get('id')}: embedding ready")
+            else:
+                failed.append(f"first use {answer.get('id')}: embedding={embedding!r} ({detail})")
+                print(f"FAIL first use {answer.get('id')}: embedding={embedding!r} ({detail})")
 
         error_id: Optional[str] = None
         live_entity = "_mcp_live_test"
@@ -467,6 +535,12 @@ def main() -> int:
         else:
             passed += 1
             print("PASS burst: exit 0 after stdin closed")
+        if session.model_loaded_lines != 1:
+            failed.append(f"first use: {session.model_loaded_lines} «{MODEL_LOADED}» lines, expected exactly one")
+            print(f"FAIL first use: {session.model_loaded_lines} «{MODEL_LOADED}» lines, expected exactly one")
+        else:
+            passed += 1
+            print(f"PASS first use: one «{MODEL_LOADED}» line for the whole session")
         closed = session.writer_closed
         outcome = "missing" if closed is None else str(closed.get("outcome"))
         written = 0 if closed is None else closed.get("written")

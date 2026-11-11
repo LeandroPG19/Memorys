@@ -8,7 +8,8 @@ import json
 import os
 import subprocess
 import sys
-from typing import Any, Dict, Optional
+import tempfile
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 import uuid
 
@@ -81,24 +82,100 @@ def writer_close_problem(stderr: str) -> Optional[str]:
     return None
 
 
-def invoke_mcp(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+# The five lines the embedder load can log (onnx.rs: load_model_status). One of them in stderr means the process
+# resolved the model, and WHEN it did is the observable: a load that a request provokes is logged after
+# "MCP protocol ready", one that start-up provokes is logged before it.
+MODEL_LINES = (
+    "no ONNX embedder found",
+    "encontré el modelo en",
+    "ONNX model file not found",
+    "ONNX model loaded successfully",
+    "Failed to load ONNX model",
+)
+MODEL_LOADED = "ONNX model loaded successfully"
+MODEL_FAILED = "Failed to load ONNX model"
+PROTOCOL_READY = "MCP protocol ready"
+BACKGROUND_LOST = "background tasks did not finish before shutdown"
+
+
+def log_messages(stderr: str) -> List[Tuple[int, str]]:
+    """(line index, fields.message) of every JSON line of stderr; the lines that are not JSON are skipped."""
+    messages = []
+    for index, line in enumerate(stderr.splitlines()):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        fields = event.get("fields") if isinstance(event, dict) else None
+        if isinstance(fields, dict) and isinstance(fields.get("message"), str):
+            messages.append((index, fields["message"]))
+    return messages
+
+
+def model_lines(stderr: str) -> List[Tuple[int, str]]:
+    """(line index, message) of the lines in which the process resolved the embedding model."""
+    return [(i, m) for i, m in log_messages(stderr) if m.startswith(MODEL_LINES)]
+
+
+def message_index(stderr: str, prefix: str) -> Optional[int]:
+    """Index of the first line of stderr whose message starts with `prefix`, or None."""
+    return next((i for i, m in log_messages(stderr) if m.startswith(prefix)), None)
+
+
+def ready_index(stderr: str) -> Optional[int]:
+    return message_index(stderr, PROTOCOL_READY)
+
+
+def resolved_before_ready(stderr: str) -> Optional[str]:
+    """
+    None when the process printed "MCP protocol ready" and resolved no model before it; otherwise what
+    it did instead. The model is loaded by the first request that embeds, never by the start-up.
+    """
+    ready = ready_index(stderr)
+    if ready is None:
+        return "stderr has no «MCP protocol ready» line"
+    early = [m for i, m in model_lines(stderr) if i < ready]
+    if early:
+        return f"the model was resolved before MCP protocol ready: {early[0]}"
+    return None
+
+
+# Every process invoke_mcp started: {"test_id", "stderr", "stdout"}. E16b reads the model lines of all of them.
+PROCESSES: List[Dict[str, str]] = []
+
+
+def run_raw(
+    request: Dict[str, Any], env_extra: Optional[Dict[str, str]] = None
+) -> "subprocess.CompletedProcess[str]":
+    """One process, one request, EOF: the whole CompletedProcess, whatever its exit code."""
+    env = os.environ.copy()
+    env.update(ENV)
+    env.update(env_extra or {})
+    return subprocess.run(
+        [BINARY_PATH],
+        input=json.dumps(request),
+        capture_output=True,
+        text=True,
+        timeout=CALL_TIMEOUT_SECS,
+        env=env,
+    )
+
+
+def invoke_mcp(
+    request: Dict[str, Any], test_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """
     Invoke the MCP server with a JSON-RPC request.
     Returns the parsed response or None on error.
     """
-    payload = json.dumps(request)
+    if test_id is None:
+        params = request.get("params") or {}
+        action = (params.get("arguments") or {}).get("action", "")
+        test_id = f"{params.get('name', request.get('method'))}/{action}"
     try:
-        # Set up environment with all existing env vars plus our overrides
-        env = os.environ.copy()
-        env.update(ENV)
-
-        result = subprocess.run(
-            [BINARY_PATH],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=CALL_TIMEOUT_SECS,
-            env=env,
+        result = run_raw(request)
+        PROCESSES.append(
+            {"test_id": test_id, "stderr": result.stderr or "", "stdout": result.stdout or ""}
         )
         if result.returncode != 0:
             stderr_preview = result.stderr[:300] if result.stderr else "(empty)"
@@ -111,6 +188,12 @@ def invoke_mcp(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if problem is not None:
             tail = "\n".join((result.stderr or "").splitlines()[-8:])
             print(f"  [ERROR] the writer did not drain: {problem}\n{tail}")
+            return None
+
+        problem = resolved_before_ready(result.stderr or "")
+        if problem is not None:
+            tail = "\n".join((result.stderr or "").splitlines()[-8:])
+            print(f"  [ERROR] {problem}\n{tail}")
             return None
 
         if not result.stdout:
@@ -194,7 +277,7 @@ def test(
         },
     }
 
-    response = invoke_mcp(full_request)
+    response = invoke_mcp(full_request, test_id)
     if response is None:
         print("  FAIL: MCP invocation failed")
         tests_failed += 1
@@ -1160,7 +1243,7 @@ def test_refused(
         "params": {"name": tool_name, "arguments": request},
     }
 
-    response = invoke_mcp(full_request)
+    response = invoke_mcp(full_request, test_id)
     if response is None:
         print("  FAIL: MCP invocation failed outright, which is not the same as a refusal")
         tests_failed += 1
@@ -1283,6 +1366,298 @@ def test_cuba_receta_tools_call():
     return True
 
 
+def record(test_id: str, problem: Optional[str]) -> bool:
+    """Count one check that is not a tools/call: it passes when `problem` is None."""
+    global tests_run, tests_passed, tests_failed, failed_tests
+
+    tests_run += 1
+    print(f"\n[TEST {tests_run}] {test_id}")
+    if problem is None:
+        print(f"  PASS: {test_id}")
+        tests_passed += 1
+        return True
+    print(f"  FAIL: {problem}")
+    tests_failed += 1
+    failed_tests.append(test_id)
+    return False
+
+
+def check(test_id: str, probe) -> bool:
+    """`probe` returns the problem it found, or None. A timeout or a malformed answer is a problem, not a crash."""
+    try:
+        problem = probe()
+    except Exception as e:
+        problem = f"{type(e).__name__}: {e}"
+    return record(test_id, problem)
+
+
+def tool_payload(stdout: str) -> Dict[str, Any]:
+    """The JSON a tools/call answered inside its content text."""
+    return json.loads(json.loads(stdout)["result"]["content"][0]["text"])
+
+
+def recorded(test_id: str) -> Optional[Dict[str, str]]:
+    return next((p for p in PROCESSES if p["test_id"] == test_id), None)
+
+
+def lines_named(stderr: str) -> List[str]:
+    return [m for _, m in model_lines(stderr)]
+
+
+MODEL_OPENED_SUMMARY = ""
+
+
+def test_model_opens_on_first_use():
+    """E16b.1 and E16b.2, read from the processes the calls above already ran: no process of their own."""
+    print("\n" + "=" * 60)
+    print("EMBEDDING MODEL: opened by the first use, once")
+    print("=" * 60)
+
+    def first_add_loads_once() -> Optional[str]:
+        call = recorded("cuba_cronica/add")
+        if call is None:
+            return "no process was recorded for cuba_cronica/add"
+        embedding = tool_payload(call["stdout"]).get("embedding")
+        if embedding != "ready":
+            return f'the first add of a process answered embedding={embedding!r}, expected "ready"'
+        stderr = call["stderr"]
+        lines = model_lines(stderr)
+        if len(lines) != 1 or not lines[0][1].startswith(MODEL_LOADED):
+            return f"expected exactly one «{MODEL_LOADED}» line, got {lines_named(stderr)}"
+        ready, closed = ready_index(stderr), message_index(stderr, WRITER_CLOSED)
+        if ready is None or closed is None or not ready < lines[0][0] < closed:
+            return (
+                f"the load must fall after «{PROTOCOL_READY}» (line {ready}) and before "
+                f"«{WRITER_CLOSED}» (line {closed}); it fell on line {lines[0][0]}"
+            )
+        return None
+
+    def each_process_opens_at_most_once() -> Optional[str]:
+        global MODEL_OPENED_SUMMARY
+        total, opened = len(PROCESSES), 0
+        for process in PROCESSES:
+            names = lines_named(process["stderr"])
+            if any(m.startswith(MODEL_FAILED) for m in names):
+                return f"{process['test_id']}: «{MODEL_FAILED}» with the judge's model"
+            if len(names) > 1:
+                return f"{process['test_id']}: {len(names)} model lines {names}, expected at most one"
+            opened += any(m.startswith(MODEL_LOADED) for m in names)
+        MODEL_OPENED_SUMMARY = f"model opened in {opened} of {total} processes"
+        print(f"  {MODEL_OPENED_SUMMARY}")
+        if not 1 <= opened < total:
+            return f"{MODEL_OPENED_SUMMARY}: expected 1 <= n < N"
+        return None
+
+    check("E16b.1 the first add of a process is ready with one load", first_add_loads_once)
+    check("E16b.2 every process opens the model at most once, and not all do", each_process_opens_at_most_once)
+
+
+def embedding_model_problem() -> Optional[str]:
+    model_dir = os.environ.get("ONNX_MODEL_PATH", "").strip()
+    if model_dir and any(
+        (Path(model_dir) / name).is_file() for name in ("model_quantized.onnx", "model.onnx")
+    ):
+        return None
+    return "this check needs the embedding model (ONNX_MODEL_PATH)"
+
+
+def lazy_tools_list() -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+
+
+def lazy_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    }
+
+
+def broken_model_env(scratch: str) -> Dict[str, str]:
+    """A model that is configured (a file, a runtime path that exists) and whose session cannot open: bytes."""
+    model_dir = Path(scratch) / "broken-model"
+    model_dir.mkdir()
+    (model_dir / "model.onnx").write_bytes(b"\x00 not an onnx graph")
+    (model_dir / "tokenizer.json").write_bytes(b"\x00 not a tokenizer")
+    runtime = Path(scratch) / "broken-runtime"
+    runtime.write_bytes(b"\x00 not a runtime")
+    return {"ONNX_MODEL_PATH": str(model_dir), "ORT_DYLIB_PATH": str(runtime)}
+
+
+def absent_model_env(scratch: str) -> Dict[str, str]:
+    """No model: a directory with nothing in it. ONNX_MODEL_PATH="" would fall to the user's cache, where the judge has one."""
+    model_dir = Path(scratch) / "empty-model"
+    model_dir.mkdir()
+    return {"ONNX_MODEL_PATH": str(model_dir)}
+
+
+def exits(proc: "subprocess.CompletedProcess[str]", code: int) -> Optional[str]:
+    if proc.returncode != code:
+        return f"exit {proc.returncode}, expected {code}: {(proc.stderr or '')[:300]}"
+    return None
+
+
+def opened_nothing(proc: "subprocess.CompletedProcess[str]") -> Optional[str]:
+    names = lines_named(proc.stderr or "")
+    return f"{len(names)} model lines {names}, expected none" if names else None
+
+
+def lists_tools(proc: "subprocess.CompletedProcess[str]") -> Optional[str]:
+    tools = json.loads(proc.stdout)["result"]["tools"]
+    return None if tools else "tools/list answered an empty list"
+
+
+def refuses_to_start(proc: "subprocess.CompletedProcess[str]", width: int) -> Optional[str]:
+    stderr = proc.stderr or ""
+    return (
+        exits(proc, 1)
+        or (f"stdout is not empty: {proc.stdout[:200]}" if proc.stdout else None)
+        or (None if "NO puede arrancar" in stderr else "stderr does not say «NO puede arrancar»")
+        or (None if f"vector({width})" in stderr else f"stderr does not name vector({width})")
+        or opened_nothing(proc)
+    )
+
+
+def test_lazy_embedder():
+    """
+    E16a.2, a.4, a.5, c.1, c.2, c.3 and d.1: processes of their own. The start-up never opens the model
+    session; the first request that embeds does, once; a model that will not open says so there.
+    """
+    print("\n" + "=" * 60)
+    print("EMBEDDING MODEL: loaded on first use, not at start-up")
+    print("=" * 60)
+
+    missing = embedding_model_problem()
+    if missing is not None:
+        record("E16 precondition: the embedding model is configured", missing)
+        return
+    width = int(os.environ.get("CUBA_EMBEDDING_DIM", "384"))
+    other = {"CUBA_EMBEDDING_DIM": str(2 * width)}
+
+    with tempfile.TemporaryDirectory(prefix="e16-") as scratch:
+        broken = broken_model_env(scratch)
+        absent = absent_model_env(scratch)
+
+        def listing_does_not_open_the_session() -> Optional[str]:
+            configured = run_raw(lazy_tools_list())
+            without = run_raw(lazy_tools_list(), absent)
+            for label, proc in (("with the model", configured), ("without it", without)):
+                problem = exits(proc, 0) or opened_nothing(proc)
+                if problem:
+                    return f"{label}: {problem}"
+            with_model = json.loads(configured.stdout)["result"]
+            if with_model != json.loads(without.stdout)["result"]:
+                return "tools/list answers differently with the model configured and without it"
+            return lists_tools(configured)
+
+        check(
+            "E16a.2 tools/list with the model configured opens no session",
+            listing_does_not_open_the_session,
+        )
+        check(
+            "E16a.4 a column of another width refuses to start, and nothing opens the session",
+            lambda: refuses_to_start(run_raw(lazy_tools_list(), other), 2 * width),
+        )
+
+        def no_model_does_not_check_the_columns() -> Optional[str]:
+            proc = run_raw(lazy_tools_list(), {**absent, **other})
+            return exits(proc, 0) or lists_tools(proc)
+
+        check(
+            "E16a.5 without a model, a column of another width does not stop the start",
+            no_model_does_not_check_the_columns,
+        )
+
+        def a_broken_model_starts() -> Optional[str]:
+            proc = run_raw(lazy_tools_list(), broken)
+            return exits(proc, 0) or opened_nothing(proc) or lists_tools(proc)
+
+        check("E16c.1 a model that will not open still starts, and tools/list does not name it", a_broken_model_starts)
+
+        def a_broken_model_says_so_once_on_first_use() -> Optional[str]:
+            proc = run_raw(
+                lazy_call(
+                    "cuba_cronica",
+                    {
+                        "action": "add",
+                        "entity_name": "_e2e_e16_broken",
+                        "observation_type": "fact",
+                        "content": "E16 broken model probe",
+                        "source": "agent",
+                    },
+                ),
+                broken,
+            )
+            problem = exits(proc, 0)
+            if problem:
+                return problem
+            embedding = tool_payload(proc.stdout).get("embedding")
+            if embedding != "pending":
+                return f'embedding={embedding!r}, expected "pending"'
+            lines = model_lines(proc.stderr)
+            if len(lines) != 1 or not lines[0][1].startswith(MODEL_FAILED):
+                return f"expected exactly one «{MODEL_FAILED}» line, got {lines_named(proc.stderr)}"
+            ready = ready_index(proc.stderr)
+            if ready is None or lines[0][0] < ready:
+                return f"«{MODEL_FAILED}» fell on line {lines[0][0]}, before «{PROTOCOL_READY}» (line {ready})"
+            return None
+
+        check("E16c.2 the first use of a broken model says so once and degrades", a_broken_model_says_so_once_on_first_use)
+        check(
+            "E16c.3 a broken model with columns of another width refuses to start",
+            lambda: refuses_to_start(run_raw(lazy_tools_list(), {**broken, **other}), 2 * width),
+        )
+
+        def an_episode_loads_in_the_request() -> Optional[str]:
+            proc = run_raw(
+                lazy_call(
+                    "cuba_cronica",
+                    {
+                        "action": "episode_add",
+                        "entity_name": "_e2e_e16_episode",
+                        "content": "E16 episode probe",
+                    },
+                )
+            )
+            problem = exits(proc, 0)
+            if problem:
+                return problem
+            response = json.loads(proc.stdout)
+            if "error" in response or response.get("result", {}).get("isError"):
+                return f"episode_add answered an error: {proc.stdout[:300]}"
+            if "error" in tool_payload(proc.stdout):
+                return f"episode_add answered an error: {proc.stdout[:300]}"
+            stderr = proc.stderr
+            lines = model_lines(stderr)
+            if len(lines) != 1 or not lines[0][1].startswith(MODEL_LOADED):
+                return f"expected exactly one «{MODEL_LOADED}» line, got {lines_named(stderr)}"
+            ready, closed = ready_index(stderr), message_index(stderr, WRITER_CLOSED)
+            if ready is None or closed is None or not ready < lines[0][0] < closed:
+                return (
+                    f"the load must fall after «{PROTOCOL_READY}» (line {ready}) and before "
+                    f"«{WRITER_CLOSED}» (line {closed}), inside the request and not in the background "
+                    f"task; it fell on line {lines[0][0]}"
+                )
+            if BACKGROUND_LOST in stderr:
+                return f"«{BACKGROUND_LOST}»"
+            return None
+
+        check("E16d.1 an episode_add as first use loads in the request, not in the task", an_episode_loads_in_the_request)
+
+
+def run_phase(phase) -> None:
+    """A phase that raises (a fixture it could not get) fails the run, and the phases after it still run."""
+    global tests_failed, failed_tests
+
+    try:
+        phase()
+    except Exception as e:
+        print(f"  FAIL: {phase.__name__} raised {type(e).__name__}: {e}")
+        tests_failed += 1
+        failed_tests.append(phase.__name__)
+
+
 def main():
     """Run all E2E tests."""
     global tests_run, tests_passed, tests_failed
@@ -1295,22 +1670,27 @@ def main():
     print("=" * 60)
 
     # Run all tool tests
-    test_cuba_alma()
-    test_cuba_cronica()
-    test_cuba_faro()
-    test_cuba_puente()
-    test_cuba_eco()
-    test_cuba_alarma()
-    test_cuba_remedio()
-    test_cuba_expediente()
-    test_cuba_jornada()
-    test_cuba_decreto()
-    test_cuba_vigia()
-    test_cuba_zafra()
-    test_cuba_forget()
-    test_v08_v09_tools()
-    test_refusals()
-    test_cuba_receta_tools_call()
+    for phase in (
+        test_cuba_alma,
+        test_cuba_cronica,
+        test_cuba_faro,
+        test_cuba_puente,
+        test_cuba_eco,
+        test_cuba_alarma,
+        test_cuba_remedio,
+        test_cuba_expediente,
+        test_cuba_jornada,
+        test_cuba_decreto,
+        test_cuba_vigia,
+        test_cuba_zafra,
+        test_cuba_forget,
+        test_v08_v09_tools,
+        test_refusals,
+        test_cuba_receta_tools_call,
+        test_model_opens_on_first_use,
+        test_lazy_embedder,
+    ):
+        run_phase(phase)
 
     # Cleanup
     cleanup()
@@ -1322,6 +1702,8 @@ def main():
     print(f"Total Tests Run:     {tests_run}")
     print(f"Passed:              {tests_passed}")
     print(f"Failed:              {tests_failed}")
+    if MODEL_OPENED_SUMMARY:
+        print(MODEL_OPENED_SUMMARY)
 
     if failed_tests:
         print("\nFailed Tests:")
