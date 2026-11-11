@@ -73,9 +73,9 @@ fn compute_hmac(
     payload: &[u8],
     created_at_iso: &str,
 ) -> Vec<u8> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts a key of any length");
     mac.update(prev_hash);
     mac.update(b"|");
     mac.update(action.as_bytes());

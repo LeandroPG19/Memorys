@@ -163,11 +163,28 @@ const KNOWN_DIGESTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// `sha2` 0.11 hashers no longer implement `io::Write` (`digest` 0.11 is `no_std`).
+/// `io::copy` already retries `Interrupted` and handles short reads, so the hasher
+/// is fed through a writer instead of a read loop of our own.
+struct HashWriter<'a>(&'a mut sha2::Sha256);
+
+impl Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn sha256_file(path: &std::path::Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
+    std::io::copy(&mut file, &mut HashWriter(&mut hasher))?;
     Ok(hex::encode(hasher.finalize()))
 }
 
