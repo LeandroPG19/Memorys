@@ -1044,7 +1044,7 @@ FAKE
   full_tree j31
   full_run j31
   grep -q 'brain_gate_eval ' "$tmp/j31/home/eval.calls" 2>/dev/null \
-    || self_fail "J3.1: the eval was not pointed at brain_gate_eval: $(cat "$tmp/j31/home/eval.calls" 2>/dev/null || echo 'no eval call')"
+    || self_fail "J3.1: the eval was not pointed at brain_gate_eval: $(cat "$tmp/j31/home/eval.calls" 2>/dev/null || echo "no eval call; the run exited $rc and ended with: $(tail -n 15 "$tmp/j31.out")")"
   grep -q -- ' --json' "$tmp/j31/home/eval.calls" 2>/dev/null \
     || self_fail "J3.1: the eval was not asked for --json: $(cat "$tmp/j31/home/eval.calls" 2>/dev/null || echo 'no eval call')"
 
