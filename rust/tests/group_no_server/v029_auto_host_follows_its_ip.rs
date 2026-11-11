@@ -29,19 +29,23 @@ const NEW_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
 const WITHOUT_IP: Duration = Duration::from_secs(5);
 const WITH_IP: Duration = Duration::from_secs(10);
 
-/// A loopback port the host can bind. It is reserved with a socket that is bound and never
-/// listens: a listener opened and dropped here is in LISTEN while it lives, and a child process
-/// another test forks in that window keeps the LISTEN socket until its `execve`, so the host's
-/// bind on this port would fail with «address in use». A socket that never listened cannot
-/// block the host's bind, here or in a child's copy, because both ends set SO_REUSEADDR (tokio
-/// does on Unix).
-fn free_port() -> u16 {
+/// A loopback port for the host, and the socket that keeps it reserved until the test ends. The
+/// socket is bound and never listens, with SO_REUSEADDR, and the caller holds it for the whole
+/// test, for two reasons. While it lives the kernel hands the port to no other `bind(0)` or
+/// `connect` of this binary (the ephemeral range is 4096 ports wide and crowded by ~100 tests),
+/// so no other test can take it between this call and the host's bind. And it cannot block that
+/// bind, nor can a copy of it that a child process keeps between `fork` and `execve`: two
+/// sockets bound to one address coexist when both set SO_REUSEADDR and none listens (tokio's
+/// listener sets it on Unix). A listener opened and dropped here was in LISTEN while it lived,
+/// and a copy of that one in a child did block the host's bind with «address in use».
+fn free_port() -> (u16, tokio::net::TcpSocket) {
     let reserved = tokio::net::TcpSocket::new_v4().expect("a socket to reserve a port with");
     reserved.set_reuseaddr(true).expect("SO_REUSEADDR");
     reserved
         .bind(at(Ipv4Addr::LOCALHOST, 0))
         .expect("a free loopback port");
-    reserved.local_addr().expect("the reserved address").port()
+    let port = reserved.local_addr().expect("the reserved address").port();
+    (port, reserved)
 }
 
 fn at(ip: Ipv4Addr, port: u16) -> SocketAddr {
@@ -208,7 +212,7 @@ async fn until(
 
 #[tokio::test]
 async fn the_host_follows_its_ip_and_loopback_never_stops_answering() {
-    let port = free_port();
+    let (port, _reserved) = free_port();
     let loopback = at(Ipv4Addr::LOCALHOST, port);
     let ip = Arc::new(Mutex::new(Some(OLD_IP)));
     let (sleep, mut ticker) = fake_sleep();
@@ -289,7 +293,7 @@ async fn the_host_follows_its_ip_and_loopback_never_stops_answering() {
 
 #[tokio::test]
 async fn without_a_private_ip_it_serves_loopback_and_takes_the_ip_when_it_appears() {
-    let port = free_port();
+    let (port, _reserved) = free_port();
     let ip = Arc::new(Mutex::new(None));
     let (sleep, mut ticker) = fake_sleep();
     let (status_tx, mut status) = watch::channel(placeholder());
