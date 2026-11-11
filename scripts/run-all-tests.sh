@@ -856,6 +856,7 @@ FAKE
       '  for a in "$@"; do [ "$prev" = --test ] && names="$names $a"; case "$a" in --lib) lib=1 ;; --doc) doc=1 ;; esac; prev="$a"; done' \
       '  [ -n "$names$lib$doc" ] || names=fixture' \
       '  case "$*" in *--no-run*) ;; *) [ -z "${FAKE_CARGO_COMPILING:-}" ] || echo "   Compiling memory-industry v0.31.0 ($PWD)" >&2 ;; esac' \
+      '  case "$*" in *--no-run*) ;; *) u=1; while [ "$u" -le "${FAKE_CARGO_COMPILING_UNITS:-0}" ]; do printf "   Compiling e33unit_%04d_%s v0.0.0 (%s)\n" "$u" "${FAKE_CARGO_UNIT_PAD-}" "$PWD" >&2; u=$((u + 1)); done ;; esac' \
       '  if [ -n "$lib" ]; then' \
       '    echo "     Running unittests src/lib.rs (target/debug/deps/memory_industry-0123456789abcdef)"' \
       '    echo "running $n tests"' \
@@ -924,6 +925,37 @@ FAKE
       MEMORY_INDUSTRY_LLM_PROVIDER=ollama "$@" \
       "$BASH" "$t/scripts/run-all-tests.sh" >"$tmp/$name.out" 2>&1 || rc=$?
   }
+  # CI-E33 (D-E33b): what the stand-ins of NAME's tree were asked, for the message of a row that fails on a call it did not
+  # get (J3.1, j16): the first 40 lines of cargo.calls and of bin.calls, each cut to 300 bytes (the call of a lane is a line
+  # of 150 KB when the list is long, and a whole run makes about 25 calls: the first lines are the plain and the contracts
+  # call, the ones that say which `--test` went where). Reads the files directly.
+  e33_calls() {
+    local f line n
+    for f in cargo.calls bin.calls; do
+      if [[ ! -r "$tmp/$1/home/$f" ]]; then
+        printf '%s: none\n' "$f"
+        continue
+      fi
+      printf '%s, first 40 lines:\n' "$f"
+      n=0
+      while (( n < 40 )) && IFS= read -r line; do
+        printf '  %s\n' "${line:0:300}"
+        n=$((n + 1))
+      done <"$tmp/$1/home/$f"
+    done
+  }
+  # e33_out NAME: the first three lines of what NAME's run printed and its first three `FAIL` lines (the verdict is at the end
+  # of the output, not at its start), each cut to 300 bytes: the whole output of a row can be 400 KB.
+  e33_out() {
+    local line n=0 f=0
+    while IFS= read -r line; do
+      if (( n < 3 )) || { [[ "$line" == FAIL* ]] && (( f < 3 )); }; then
+        printf '%s\n' "${line:0:300}"
+        [[ "$line" != FAIL* ]] || f=$((f + 1))
+      fi
+      n=$((n + 1))
+    done <"$tmp/$1.out"
+  }
 
   # CALIBRATION (D-J4e, spec §10 C3). The rows that run the whole script (J2, J3, J6) run
   # on a tree whose scripts/test-section-counts.txt is calibrated, not written by hand. The
@@ -969,7 +1001,7 @@ FAKE
   for form in unset empty; do
     full_tree "j16_$form"
     if [[ "$form" == unset ]]; then d5_run "j16_$form"; else d5_run "j16_$form" DATABASE_URL=; fi
-    (( rc == 0 )) || self_fail "j16_$form: run-all-tests with no DATABASE_URL on Linux exited $rc, not 0: $(cat "$tmp/j16_$form.out")"
+    (( rc == 0 )) || self_fail "j16_$form: run-all-tests with no DATABASE_URL on Linux exited $rc, not 0: $(cat "$tmp/j16_$form.out") $(e33_calls "j16_$form")"
     [[ "$(head -n 1 "$tmp/j16_$form/home/order.log" 2>/dev/null)" == "up dbg" ]] \
       || self_fail "j16_$form: the first thing the judge asked its lane library was not 'up dbg': $(cat "$tmp/j16_$form/home/order.log" 2>/dev/null)"
     [[ "$(tail -n 1 "$tmp/j16_$form/home/order.log" 2>/dev/null)" =~ ^(down\ dbg|down-all)$ ]] \
@@ -1044,7 +1076,7 @@ FAKE
   full_tree j31
   full_run j31
   grep -q 'brain_gate_eval ' "$tmp/j31/home/eval.calls" 2>/dev/null \
-    || self_fail "J3.1: the eval was not pointed at brain_gate_eval: $(cat "$tmp/j31/home/eval.calls" 2>/dev/null || echo "no eval call; the run exited $rc and ended with: $(tail -n 15 "$tmp/j31.out")")"
+    || self_fail "J3.1: the eval was not pointed at brain_gate_eval: $(cat "$tmp/j31/home/eval.calls" 2>/dev/null || echo "no eval call; the run exited $rc and ended with: $(tail -n 15 "$tmp/j31.out") $(e33_calls j31)")"
   grep -q -- ' --json' "$tmp/j31/home/eval.calls" 2>/dev/null \
     || self_fail "J3.1: the eval was not asked for --json: $(cat "$tmp/j31/home/eval.calls" 2>/dev/null || echo 'no eval call')"
 
@@ -1856,6 +1888,69 @@ FAKE
   (( rc == 0 )) || self_fail "E11-9: --lane CL --lane B1 with the disk below the sweep threshold exits $rc, not 0: $(cat "$tmp/e11sw.out")"
   [[ ! -e "$tmp/e11sw/target/debug/deps/old-artifact" ]] \
     || self_fail "E11-9: --lane CL --lane B1, which compile, did not sweep the artifact of 10 days: $(cat "$tmp/e11sw.out")"
+
+  # CI-E33 (D-E33a, D-E33b, D-E33c, spec ci-rapido-E33 §2): a name of the lists of the judge is classified by what the lists say,
+  # never by a pipe. Under pipefail `printf ... | grep -qx name` is false when grep finds the name and leaves before printf has
+  # written the rest (SIGPIPE, 141): a contract ran as a plain test and a deferred file as a discovered one. `grep -q` reads once
+  # (at most 64 KiB, what a pipe holds) and leaves, and the writer can have put at most another 64 KiB in the pipe by then: with
+  # more than 128 KiB the writer is left with something to write in every order the scheduler gives, so the rows are red every
+  # time without the fix and not now and then. 600 names of 249 characters are 150 KB (249 and `.rs` are under the 255 of
+  # NAME_MAX). The lists go into the COPY of the script by files (`sed r`), never as an argument: 150 KB is more than the 128 KiB
+  # that one argument of a command may have. What the stand-in cargo was called with is read as a file (grep -qF ... FILE): its
+  # line of one lane is 150 KB, and a pipe from it into grep -q is the defect this row is about.
+  e33_pad=""
+  printf -v e33_pad '%*s' 240 ''
+  e33_pad="${e33_pad// /x}"
+  printf -v e33_first 'e33_%04d_%s' 1 "$e33_pad"
+  e33_list=""
+  full_tree e33
+  for ((e33_i = 1; e33_i <= 600; e33_i++)); do
+    printf -v e33_name 'e33_%04d_%s' "$e33_i" "$e33_pad"
+    : >"$tmp/e33/rust/tests/$e33_name.rs"
+    e33_list+="${e33_list:+ }$e33_name"
+  done
+  printf 'JUDGE_CONTRACTS=(%s "${JUDGE_CONTRACTS[@]}")\n' "$e33_list" >"$tmp/e33.contracts"
+  printf 'RUN_ELSEWHERE=(%s "${RUN_ELSEWHERE[@]}")\n' "$e33_list" >"$tmp/e33.elsewhere"
+  sed -i -e "/^JUDGE_CONTRACTS=(/r $tmp/e33.contracts" -e "/^DISCOVERED=()\$/r $tmp/e33.elsewhere" "$tmp/e33/scripts/run-all-tests.sh"
+  [[ "$(grep -c '^JUDGE_CONTRACTS=(e33_0001_' "$tmp/e33/scripts/run-all-tests.sh" || true)" == 1 \
+    && "$(grep -c '^RUN_ELSEWHERE=(e33_0001_' "$tmp/e33/scripts/run-all-tests.sh" || true)" == 1 \
+    && "$(wc -c <"$tmp/e33.contracts")" -gt 131072 ]] \
+    || self_fail "E33: the lists were not put into the copy of the script (one JUDGE_CONTRACTS line and one RUN_ELSEWHERE line of the 600 names, each over 128 KiB): the rows below would judge nothing"
+  [[ "$(grep -c '^contracts ' "$tmp/e33/scripts/test-section-counts.txt" || true)" == 1 ]] \
+    || self_fail "E33: the calibrated counts do not have exactly one line for the section contracts: $(cat "$tmp/e33/scripts/test-section-counts.txt")"
+  e33_total=$((3 * (600 + ${#e11_names[@]})))
+  sed -i "s/^contracts .*\$/contracts $e33_total e33/" "$tmp/e33/scripts/test-section-counts.txt"
+
+  # E33.1: the first name of a list longer than two pipe buffers is a contract: it is in the call of CT, and the 608 binaries
+  # the lists name run with the 3 tests of the stand-in each.
+  e11_run e33 -- --lane CT
+  (( rc == 0 )) \
+    || self_fail "E33.1: --lane CT with $((600 + ${#e11_names[@]})) contracts exited $rc, not 0 (the count of the section is $e33_total): $(e33_out e33) $(e33_calls e33)"
+  grep -qF -- "--test $e33_first " "$tmp/e33/home/cargo.calls" \
+    || self_fail "E33.1: the first name of JUDGE_CONTRACTS, $e33_first, is not in the cargo call of CT: $(e33_calls e33)"
+
+  # E33.2: the first name of RUN_ELSEWHERE is deferred in D2: it is not in the call of discovered-ignored, and the call is there
+  # (t1 is, the anchor of presence before the absence).
+  : >"$tmp/e33/home/cargo.calls"
+  e11_run e33 -- --lane D2
+  (( rc == 0 )) \
+    || self_fail "E33.2: --lane D2 with $((600 + 9)) names in RUN_ELSEWHERE exited $rc, not 0: $(e33_out e33) $(e33_calls e33)"
+  grep -qF -- '--test t1 ' "$tmp/e33/home/cargo.calls" \
+    || self_fail "E33.2: the call of discovered-ignored is not in cargo.calls, so the absence below would prove nothing: $(e33_calls e33)"
+  if grep -qF -- "--test $e33_first " "$tmp/e33/home/cargo.calls"; then
+    self_fail "E33.2: the first name of RUN_ELSEWHERE, $e33_first, went to discovered-ignored instead of being deferred: $(e33_calls e33)"
+  fi
+  grep -qF 'deferred 600 file(s) to their own sections:' "$tmp/e33.out" \
+    || self_fail "E33.2: D2 did not defer the 600 files of RUN_ELSEWHERE that are files of tests/: $(e33_out e33)"
+
+  # E33.3: a section that compiled many units says which one first, however many lines "Compiling" its log has. sed | head -n 1
+  # died of SIGPIPE over a log longer than a pipe and the judge left with 141 and no line.
+  full_tree e33c
+  e11_run e33c FAKE_CARGO_COMPILING_UNITS=600 FAKE_CARGO_UNIT_PAD="$e33_pad" -- --lane CT
+  (( rc == 1 )) \
+    || self_fail "E33.3: --lane CT whose cargo compiled 600 units exited $rc, not 1 (141 is the judge killed by SIGPIPE while it looked for the first unit): $(e33_out e33c)"
+  grep -qF "cargo compiled e33unit_0001_${e33_pad} in a section that runs tests" "$tmp/e33c.out" \
+    || self_fail "E33.3: the first of the 600 units compiled is not named ('cargo compiled e33unit_0001_... in a section that runs tests'): $(e33_out e33c)"
 
   echo "OK  self-test: a second gate refuses at once and names the first, merge-gate"
   echo "    included, and the variable its children inherit is no pass for anyone"
