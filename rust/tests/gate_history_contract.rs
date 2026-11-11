@@ -474,6 +474,7 @@ fn una_corrida_deja_una_linea_por_corrida_por_paso_y_por_binario() {
     for paso in &pasos {
         for key in [
             "repo", "run", "idx", "id", "seg", "espera_s", "cpu_s", "mem_peak", "anon_max", "rc",
+            "jobs",
         ] {
             assert!(
                 paso.get(key).is_some(),
@@ -1779,6 +1780,159 @@ gate_dag = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate_dag)
 sys.exit(gate_dag.main(["run", "--table", sys.argv[2]]))
 "#;
+
+// --- CI-E28: the planner writes `unidades.jsonl` itself, and a step carries the jobs it was given.
+
+/// The run id the planner gave its run, from the only line of `corridas.jsonl`.
+fn run_of(root: &Path) -> String {
+    let corridas = records(root, "corridas.jsonl");
+    assert_eq!(corridas.len(), 1, "one run line: {corridas:?}");
+    corridas[0]["run"].as_str().expect("run id").to_string()
+}
+
+/// CI-E28 (D-F3r, D-F3s): `unidades.jsonl` was only ever written by `registrar`, a CLI that nobody calls, so a real run of
+/// the judge left no line per test binary and the cost per test had nothing to read. The planner writes it: one line per
+/// binary of the log of each row that ran tests, with its seconds and its count, and a row that ran none (`fmt`) writes no
+/// line and no `history:` warning. Sabotage: drop the `gate_history.units` call of `Planner.record_step` and the file is
+/// never written (no line for `tests`); drop the `SIN_BINARIOS` branch of `_test_times_units` and `fmt` warns.
+#[test]
+fn el_planificador_escribe_una_unidad_por_binario_de_la_fila_que_corrio_tests_e28() {
+    let base = scratch("e28-unidades");
+    let log = base.join("dos-binarios.log");
+    write(&log, LOG_DOS);
+    let table = table_file(
+        &base,
+        "tabla.txt",
+        &format!(
+            "10 tests - - normal 1 5 0.05 /bin/cat {}\n20 fmt - - normal 1 5 0.05 /bin/true\n",
+            path_str(&log)
+        ),
+    );
+    let root = base.join("historial");
+    let p = plan(&base, &table, &root, &scripts(), &[]);
+    assert_eq!(p.code, Some(0), "two green rows: {}{}", p.out, p.err);
+    assert_eq!(
+        history_lines(&p.err),
+        0,
+        "a row that ran no test is not a warning of the history: {}",
+        p.err
+    );
+
+    let unidades = records(&root, "unidades.jsonl");
+    assert_eq!(
+        unidades.len(),
+        2,
+        "unidades.jsonl: one line per binary of the log of the row `tests`, none of `fmt`: {unidades:?}"
+    );
+    let run = run_of(&root);
+    for unidad in &unidades {
+        assert_eq!(unidad["repo"].as_str(), Some(REPO), "{unidad}");
+        assert_eq!(unidad["run"].as_str(), Some(run.as_str()), "{unidad}");
+        assert_eq!(unidad["id"].as_str(), Some("tests"), "{unidad}");
+        assert_eq!(unidad["idx"].as_i64(), Some(10), "{unidad}");
+        assert_eq!(unidad["rc"].as_i64(), Some(0), "{unidad}");
+    }
+    let lib = unidades
+        .iter()
+        .find(|u| u["clave"].as_str() == Some("lib:memory_industry"))
+        .unwrap_or_else(|| panic!("no unit for the lib: {unidades:?}"));
+    assert_eq!(lib["tests"].as_u64(), Some(2), "{lib}");
+    assert!(
+        (lib["finished_in"].as_f64().unwrap_or(f64::NAN) - 21.51).abs() < 1e-9,
+        "finished_in of the lib, 21.51 s: {lib}"
+    );
+    let smoke = unidades
+        .iter()
+        .find(|u| u["clave"].as_str() == Some("smoke"))
+        .unwrap_or_else(|| panic!("no unit for smoke: {unidades:?}"));
+    assert_eq!(smoke["tests"].as_u64(), Some(1), "{smoke}");
+    assert!(
+        (smoke["finished_in"].as_f64().unwrap_or(f64::NAN) - 0.31).abs() < 1e-9,
+        "finished_in of smoke, 0.31 s: {smoke}"
+    );
+}
+
+/// CI-E28: a row that goes red leaves its units too, with `rc` 1 for the binary that failed: the mark of the flaky ones
+/// (`flaky.jsonl`) reads red units against the green ones of the same tree. The row exits 1 after it prints its log, so the
+/// planner exits 1 with it, and the history changes no verdict.
+#[test]
+fn una_fila_roja_deja_sus_unidades_con_rc_1_e28() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = scratch("e28-unidades-rojas");
+    let log = base.join("rojo.log");
+    write(&log, LOG_RED);
+    let row = base.join("rojo.sh");
+    write(&row, "#!/bin/sh\ncat \"$1\"\nexit 1\n");
+    fs::set_permissions(&row, fs::Permissions::from_mode(0o755)).expect("chmod the row");
+    let table = table_file(
+        &base,
+        "tabla.txt",
+        &format!(
+            "10 tests - - normal 1 5 0.05 {} {}\n",
+            path_str(&row),
+            path_str(&log)
+        ),
+    );
+    let root = base.join("historial");
+    let p = plan(&base, &table, &root, &scripts(), &[]);
+    assert_eq!(p.code, Some(1), "the row exits 1: {}{}", p.out, p.err);
+    assert_eq!(history_lines(&p.err), 0, "{}", p.err);
+    let unidades = records(&root, "unidades.jsonl");
+    let claves: BTreeSet<&str> = unidades
+        .iter()
+        .filter_map(|u| u["clave"].as_str())
+        .collect();
+    assert_eq!(
+        claves,
+        BTreeSet::from(["otra", "smoke", "vieja"]),
+        "the three red binaries of the log: {unidades:?}"
+    );
+    for unidad in &unidades {
+        assert_eq!(unidad["rc"].as_i64(), Some(1), "a red binary: {unidad}");
+    }
+}
+
+/// CI-E28 (D-F3s): a step carries `jobs`, the `CARGO_BUILD_JOBS` it was given (`Planner.cargo_jobs`, the number `step_env`
+/// hands it), and null when its row names none. With the jobs of the operator at 2, a row that names 12 is given 2: the
+/// line holds 2, what the step got, and not the 12 its row asked for. Sabotage: record `named_jobs(step)` and the row `a`
+/// says 12; do not record it and the key is missing from the line.
+#[test]
+fn un_paso_registra_los_jobs_que_recibio_o_null_e28() {
+    let base = scratch("e28-jobs");
+    let table = table_file(
+        &base,
+        "tabla.txt",
+        "10 a - - normal 1 5 0.05 CARGO_BUILD_JOBS=12 /bin/true\n20 b - - normal 1 5 0.05 /bin/true\n",
+    );
+    let root = base.join("historial");
+    let p = plan(
+        &base,
+        &table,
+        &root,
+        &scripts(),
+        &[("CARGO_BUILD_JOBS", "2")],
+    );
+    assert_eq!(p.code, Some(0), "two green rows: {}{}", p.out, p.err);
+    let pasos = records(&root, "pasos.jsonl");
+    let jobs_of = |id: &str| {
+        let paso = pasos
+            .iter()
+            .find(|p| p["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("no step {id}: {pasos:?}"));
+        paso.get("jobs")
+            .unwrap_or_else(|| panic!("the line of {id} has no `jobs`: {paso}"))
+            .clone()
+    };
+    assert_eq!(
+        jobs_of("a").as_u64(),
+        Some(2),
+        "the row names 12 and the machine has 2: the step is given 2"
+    );
+    assert!(
+        jobs_of("b").is_null(),
+        "a row that names no jobs has null, not 0 and not the cap"
+    );
+}
 
 // --- CI-J14: the history keeps a half line apart, one function for the critical path, and the properties of the
 // planner. The properties run in process (`python3 -I -B -c`, like the rest of this file), with `random` seeded with a

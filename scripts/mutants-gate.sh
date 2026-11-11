@@ -690,6 +690,10 @@ mutants_seed_inputs() { # the inputs the key is the hash of (D-F4d)
 mutants_seed_prune() { # keeps the two newest keys under the seed root, and only those
   find "$SEED_ROOT" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9a-f]{64}' -printf '%T@ %p\n' \
     | LC_ALL=C sort -rn | tail -n +3 | cut -d' ' -f2- | while IFS= read -r d; do rm -rf -- "$d"; done
+  # A build killed in the middle leaves its <key>.tmp-<pid> (mutants_seed_ensure) and nothing else ever removes it: gigabytes of
+  # dependencies. Only the ones of this user whose pid is gone; the one a live build is filling stays.
+  find "$SEED_ROOT" -mindepth 1 -maxdepth 1 -type d -user "$(id -u)" -regextype posix-extended -regex '.*/[0-9a-f]{64}\.tmp-[0-9]+' -print \
+    | while IFS= read -r d; do kill -0 "${d##*.tmp-}" 2>/dev/null || rm -rf -- "$d"; done
 }
 mutants_seed_ensure() {
   local key tmpdir pkg start left
@@ -2464,9 +2468,22 @@ PY
   touch -d '2 hours ago' "$seed_root/$old_b"
   mkdir -p "$home/.cache/memory-industry-gate/notes"
   : > "$home/.cache/memory-industry-gate/keep.txt"
+  # CI-E28: the <key>.tmp-<pid> of a build that died is pruned with the old keys; the one of a pid that is alive (this
+  # self-test's) and a name that is not that shape stay.
+  ( exit 0 ) &
+  dead_pid=$!
+  wait "$dead_pid"
+  tmp_dead="$seed_root/$old_b.tmp-$dead_pid"
+  tmp_live="$seed_root/$old_a.tmp-$$"
+  tmp_odd="$seed_root/$old_b.tmp-notapid"
+  mkdir -p "$tmp_dead/target" "$tmp_live/target" "$tmp_odd"
+  : > "$tmp_dead/target/CACHEDIR.TAG"
   f4b_run seedtree
   (( rc == 0 )) || self_fail "F4b.7: the run that builds a third key did not pass (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
   new_key="$(built_key)"
+  [[ ! -e "$tmp_dead" ]] || self_fail "CI-E28: the <key>.tmp-<pid> of a build that died (pid $dead_pid) was not pruned: $tmp_dead"
+  [[ -d "$tmp_live" ]] || self_fail "CI-E28: the <key>.tmp-<pid> of a pid that is alive ($$) was removed: $tmp_live"
+  [[ -d "$tmp_odd" ]] || self_fail "CI-E28: a directory that is not <key>.tmp-<pid> was removed: $tmp_odd"
   [[ ! -e "$seed_root/$old_a" ]] || self_fail "F4b.7: the oldest of three keys was not pruned: $old_a"
   [[ -d "$seed_root/$old_b" && -d "$seed_root/$new_key" ]] \
     || self_fail "F4b.7: the two newest keys were not both kept: $(seed_keys)"

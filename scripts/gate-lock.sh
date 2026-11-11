@@ -537,6 +537,11 @@ gate_sweep_dead_targets() {
 }
 
 gate_tmpdir_on_disk() {
+  # CI-E28: a TMPDIR that is set and is not a directory broke every mktemp of the run, far from here. A refusal that names it
+  # is exit 2 at the start; the judge does not create a directory an operator's typo named.
+  if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then
+    gate_refuse "TMPDIR=$TMPDIR is not a directory, so every temporary file of this run would fail. Create it, or unset TMPDIR."
+  fi
   if [[ -n "${TMPDIR:-}" ]] && ! gate_is_ram_backed "$TMPDIR"; then
     return 0
   fi

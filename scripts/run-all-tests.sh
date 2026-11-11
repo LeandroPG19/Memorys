@@ -1403,6 +1403,30 @@ FAKE
   grep -q 'needs a lane id' "$tmp/lane_bare.out" \
     || self_fail "F3.3a: --lane with no id does not say so: $(cat "$tmp/lane_bare.out")"
   [[ ! -e "$tmp/lane_bare/home/cargo.calls" ]] || self_fail "F3.3a: --lane with no id ran cargo"
+  # CI-E28: an argument that is not one of the modes was ignored and the whole judge started. Now it is exit 2 naming it and
+  # the ones the script takes, before the lock, a lane or cargo; after a list of lanes too.
+  lane_run arg_unknown --lan D2
+  (( rc == 2 )) || self_fail "CI-E28: an unknown first argument exits $rc, not 2: $(cat "$tmp/arg_unknown.out")"
+  grep -q 'unknown argument: --lan ' "$tmp/arg_unknown.out" \
+    || self_fail "CI-E28: an unknown first argument is not named ('unknown argument: --lan'): $(cat "$tmp/arg_unknown.out")"
+  grep -q -- '--lane <id>' "$tmp/arg_unknown.out" \
+    || self_fail "CI-E28: the refusal does not name --lane <id>, which the script takes: $(cat "$tmp/arg_unknown.out")"
+  grep -q -- '--check-models' "$tmp/arg_unknown.out" \
+    || self_fail "CI-E28: the refusal does not name --check-models, which the script takes: $(cat "$tmp/arg_unknown.out")"
+  [[ ! -e "$tmp/arg_unknown/home/cargo.calls" && ! -e "$tmp/arg_unknown/home/order.log" ]] \
+    || self_fail "CI-E28: a refused argument touched cargo or a lane: $(cat "$tmp/arg_unknown/home/cargo.calls" "$tmp/arg_unknown/home/order.log" 2>/dev/null)"
+  lane_run arg_after_lane --lane D2 --bogus
+  (( rc == 2 )) || self_fail "CI-E28: an unknown argument after a lane exits $rc, not 2: $(cat "$tmp/arg_after_lane.out")"
+  grep -q 'unknown argument: --bogus ' "$tmp/arg_after_lane.out" \
+    || self_fail "CI-E28: an unknown argument after a lane is not named: $(cat "$tmp/arg_after_lane.out")"
+  [[ ! -e "$tmp/arg_after_lane/home/cargo.calls" ]] || self_fail "CI-E28: an unknown argument after a lane still ran the lane"
+  # CI-E28: the disk below the floor is the machine, exit 2 and not the 1 of a red of the product.
+  full_tree lowdisk
+  full_run lowdisk FAKE_DF_GB=3 CUBA_GATE_MIN_FREE_GB=8
+  (( rc == 2 )) || self_fail "CI-E28: with 3G free and a floor of 8G the run exits $rc, not 2: $(cat "$tmp/lowdisk.out")"
+  grep -q 'only 3G free' "$tmp/lowdisk.out" \
+    || self_fail "CI-E28: the refusal for the disk does not say 'only 3G free': $(cat "$tmp/lowdisk.out")"
+  [[ ! -e "$tmp/lowdisk/home/cargo.calls" ]] || self_fail "CI-E28: a run with no disk reached cargo"
   lane_run lane_d2 --lane D2
   (( rc == 0 )) || self_fail "F3.3a: --lane D2 exits $rc, not 0: $(cat "$tmp/lane_d2.out")"
   grep -q -- '--ignored' "$tmp/lane_d2/home/cargo.calls" 2>/dev/null \
@@ -1860,6 +1884,13 @@ while [[ "${1:-}" == --lane ]]; do
   esac
   shift 2
 done
+# CI-E28: what is left after the lanes is nothing, or --check-models. Anything else used to start the whole judge, and the
+# argument was ignored: a misspelt --lane ran every lane. The modes with their own arguments (--print-paths, --check-fresh,
+# --check-eval, --check-counts, --self-test) are answered above, before this point.
+if [[ $# -gt 0 && "$1" != --check-models ]]; then
+  echo "FAIL: unknown argument: $1 (this script takes --lane <id> (repeatable, ids: ${DAG_LANES[*]}), --check-models, --print-paths, --check-fresh FILE, --check-eval JSON QUERIES_LINES, --check-counts SECTION LOG, --self-test, or nothing to run every lane)" >&2
+  exit 2
+fi
 
 # CI-F3.3b-1b-i: a lane the planner started presents its token and inherits, or exits 2 (gate-lock.sh).
 inherit_or_acquire_gate_lock "$GATE_LOCK" || exit $?
@@ -1970,7 +2001,8 @@ if [[ "$(free_gb)" -lt "$MIN_FREE_GB" ]]; then
   echo "      target directory currently holds: $(du -sh "$(gate_target_dir)" 2>/dev/null | cut -f1)" >&2
   echo "      Free it with: cargo clean --manifest-path $RUST_DIR/Cargo.toml" >&2
   echo "      (or raise the bar with CUBA_GATE_MIN_FREE_GB if you know what you are doing)" >&2
-  exit 1
+  # 2, like every refusal of the machine of this judge (gate_refuse): it is the environment, not a red of the product (CI-E28).
+  exit 2
 fi
 
 # --- the test counts (CI-J, D-J4b): the judgement is section_count_verdict, above --------
