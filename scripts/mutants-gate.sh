@@ -2464,9 +2464,22 @@ PY
   touch -d '2 hours ago' "$seed_root/$old_b"
   mkdir -p "$home/.cache/memory-industry-gate/notes"
   : > "$home/.cache/memory-industry-gate/keep.txt"
+  # CI-E28: the <key>.tmp-<pid> of a build that died is pruned with the old keys; the one of a pid that is alive (this
+  # self-test's) and a name that is not that shape stay.
+  ( exit 0 ) &
+  dead_pid=$!
+  wait "$dead_pid"
+  tmp_dead="$seed_root/$old_b.tmp-$dead_pid"
+  tmp_live="$seed_root/$old_a.tmp-$$"
+  tmp_odd="$seed_root/$old_b.tmp-notapid"
+  mkdir -p "$tmp_dead/target" "$tmp_live/target" "$tmp_odd"
+  : > "$tmp_dead/target/CACHEDIR.TAG"
   f4b_run seedtree
   (( rc == 0 )) || self_fail "F4b.7: the run that builds a third key did not pass (exit $rc): $(cat "$tmp/run.out" "$tmp/run.err")"
   new_key="$(built_key)"
+  [[ ! -e "$tmp_dead" ]] || self_fail "CI-E28: the <key>.tmp-<pid> of a build that died (pid $dead_pid) was not pruned: $tmp_dead"
+  [[ -d "$tmp_live" ]] || self_fail "CI-E28: the <key>.tmp-<pid> of a pid that is alive ($$) was removed: $tmp_live"
+  [[ -d "$tmp_odd" ]] || self_fail "CI-E28: a directory that is not <key>.tmp-<pid> was removed: $tmp_odd"
   [[ ! -e "$seed_root/$old_a" ]] || self_fail "F4b.7: the oldest of three keys was not pruned: $old_a"
   [[ -d "$seed_root/$old_b" && -d "$seed_root/$new_key" ]] \
     || self_fail "F4b.7: the two newest keys were not both kept: $(seed_keys)"

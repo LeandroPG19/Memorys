@@ -2075,8 +2075,9 @@ fn every_gate_script_with_a_self_test_marks_the_whole_of_it() {
 #[test]
 fn the_exit_file_holds_the_whole_gates_verdict_and_says_running_until_then() {
     // Checked before the script is launched, not after: without the mode,
-    // merge-gate.sh ignores the flag and starts a real gate against the live
-    // cluster, backup included.
+    // merge-gate.sh ignores the flag and starts a real run of the judge: it takes
+    // the lock and makes its own databases for every step, on the machine of
+    // whoever runs this test, for tens of minutes.
     let gate = read("scripts/merge-gate.sh");
     assert!(
         gate.contains("\"--self-test\""),
@@ -3756,10 +3757,11 @@ const JUDGE_ENVIRONMENT: [(&str, &str); 33] = [
 /// without an owner, or past its day, is red (`the_exceptions_of_the_judge_have_an_owner_and_have_not_expired`).
 const NOT_HANDED_DOWN: [(&str, &str, &str, &str); 1] = [(
     "TMPDIR",
-    "gate-lock.sh keeps the TMPDIR it is given when it is on disk, and does not check that it \
-     exists: a missing one breaks every mktemp of every self-test. The judge does not own a foreign \
-     TMPDIR that exists to test with, so there is no value to hand here. Open: whether the judge \
-     should refuse a TMPDIR that does not exist (gate-lock.sh, gate_tmpdir_on_disk)",
+    "gate-lock.sh keeps the TMPDIR it is given when it is a directory on disk, and refuses one that \
+     is not a directory with exit 2 (CI-E28, gate_tmpdir_on_disk). The launcher of the self-tests \
+     leaves TMPDIR unset or gives the run an empty one of its own, and the judge does not own a \
+     foreign one that exists to test with: a foreign value that does not exist would only make every self-test refuse, so there is \
+     no value to hand here",
     "orquestador",
     "2027-02-28",
 )];

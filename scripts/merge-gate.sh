@@ -1595,6 +1595,16 @@ down mut'
   env_run tmp_ram TMPDIR="$tmp/env/ram" FAKE_FS=tmpfs
   [[ "$(env_var tmp_ram TMPDIR)" == "$tmp/env/home/.cache/memory-industry-gate/tmp" ]] \
     || self_fail "a TMPDIR on tmpfs was left as '$(env_var tmp_ram TMPDIR)', which is RAM here"
+  # CI-E28: a TMPDIR that is set and is not a directory (it does not exist, or it is a file) is exit 2 naming it, and the
+  # judge does not create what an operator's typo named. It used to be kept as it came and break every mktemp of the run.
+  env_run tmp_missing TMPDIR="$tmp/env/absent"
+  (( rc == 2 )) || self_fail "CI-E28: gate_linux_env with a TMPDIR that does not exist exited $rc, not 2: $(cat "$tmp/tmp_missing.out")"
+  grep -qF "TMPDIR=$tmp/env/absent is not a directory" "$tmp/tmp_missing.out" \
+    || self_fail "CI-E28: the refusal does not name the TMPDIR that is missing: $(cat "$tmp/tmp_missing.out")"
+  [[ ! -e "$tmp/env/absent" ]] || self_fail "CI-E28: the judge created the TMPDIR it should have refused"
+  : >"$tmp/env/afile"
+  env_run tmp_file TMPDIR="$tmp/env/afile"
+  (( rc == 2 )) || self_fail "CI-E28: gate_linux_env with a TMPDIR that is a file exited $rc, not 2: $(cat "$tmp/tmp_file.out")"
 
   # node: engines.node of package.json is the oldest accepted, and a gate that
   # cannot say which node it ran with refuses with 2 and says how to fix it.

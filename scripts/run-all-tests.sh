@@ -1403,6 +1403,30 @@ FAKE
   grep -q 'needs a lane id' "$tmp/lane_bare.out" \
     || self_fail "F3.3a: --lane with no id does not say so: $(cat "$tmp/lane_bare.out")"
   [[ ! -e "$tmp/lane_bare/home/cargo.calls" ]] || self_fail "F3.3a: --lane with no id ran cargo"
+  # CI-E28: an argument that is not one of the modes was ignored and the whole judge started. Now it is exit 2 naming it and
+  # the ones the script takes, before the lock, a lane or cargo; after a list of lanes too.
+  lane_run arg_unknown --lan D2
+  (( rc == 2 )) || self_fail "CI-E28: an unknown first argument exits $rc, not 2: $(cat "$tmp/arg_unknown.out")"
+  grep -q 'unknown argument: --lan ' "$tmp/arg_unknown.out" \
+    || self_fail "CI-E28: an unknown first argument is not named ('unknown argument: --lan'): $(cat "$tmp/arg_unknown.out")"
+  grep -q -- '--lane <id>' "$tmp/arg_unknown.out" \
+    || self_fail "CI-E28: the refusal does not name --lane <id>, which the script takes: $(cat "$tmp/arg_unknown.out")"
+  grep -q -- '--check-models' "$tmp/arg_unknown.out" \
+    || self_fail "CI-E28: the refusal does not name --check-models, which the script takes: $(cat "$tmp/arg_unknown.out")"
+  [[ ! -e "$tmp/arg_unknown/home/cargo.calls" && ! -e "$tmp/arg_unknown/home/order.log" ]] \
+    || self_fail "CI-E28: a refused argument touched cargo or a lane: $(cat "$tmp/arg_unknown/home/cargo.calls" "$tmp/arg_unknown/home/order.log" 2>/dev/null)"
+  lane_run arg_after_lane --lane D2 --bogus
+  (( rc == 2 )) || self_fail "CI-E28: an unknown argument after a lane exits $rc, not 2: $(cat "$tmp/arg_after_lane.out")"
+  grep -q 'unknown argument: --bogus ' "$tmp/arg_after_lane.out" \
+    || self_fail "CI-E28: an unknown argument after a lane is not named: $(cat "$tmp/arg_after_lane.out")"
+  [[ ! -e "$tmp/arg_after_lane/home/cargo.calls" ]] || self_fail "CI-E28: an unknown argument after a lane still ran the lane"
+  # CI-E28: the disk below the floor is the machine, exit 2 and not the 1 of a red of the product.
+  full_tree lowdisk
+  full_run lowdisk FAKE_DF_GB=3 CUBA_GATE_MIN_FREE_GB=8
+  (( rc == 2 )) || self_fail "CI-E28: with 3G free and a floor of 8G the run exits $rc, not 2: $(cat "$tmp/lowdisk.out")"
+  grep -q 'only 3G free' "$tmp/lowdisk.out" \
+    || self_fail "CI-E28: the refusal for the disk does not say 'only 3G free': $(cat "$tmp/lowdisk.out")"
+  [[ ! -e "$tmp/lowdisk/home/cargo.calls" ]] || self_fail "CI-E28: a run with no disk reached cargo"
   lane_run lane_d2 --lane D2
   (( rc == 0 )) || self_fail "F3.3a: --lane D2 exits $rc, not 0: $(cat "$tmp/lane_d2.out")"
   grep -q -- '--ignored' "$tmp/lane_d2/home/cargo.calls" 2>/dev/null \
