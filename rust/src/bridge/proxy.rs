@@ -786,8 +786,8 @@ mod tests {
         drop(reader);
 
         assert!(
-            w.host.wait_stream_closed(Duration::from_secs(2)).await,
-            "two seconds after the client closed, the host's connection was still open: the \
+            w.host.wait_stream_closed(Duration::from_secs(30)).await,
+            "thirty seconds after the client closed, the host's connection was still open: the \
              bridge kept a long request alive for nobody, and an event stream that never ends \
              would pin a connection on the host for ever"
         );

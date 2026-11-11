@@ -2158,23 +2158,30 @@ mod deep_tests {
         // process, so the first failure would be followed by a cascade of
         // unrelated ones.
         let _budget = crate::envs::ScopedEnv::set("MEMORY_INDUSTRY_DOCTOR_DEEP_SECS", "1");
+        // The load is held for 30 s, thirty times the budget, and the clock below must stay
+        // under ten: a check that gives up at the budget answers in about a second, one that
+        // waits for the load and only then complains answers in 30 s. Holding the load on a
+        // channel and not on a sleep lets the test let it go the moment the answer is in, so
+        // the runtime is not kept alive 30 s waiting for a blocking thread.
+        let (release, held) = std::sync::mpsc::channel::<()>();
         let started = std::time::Instant::now();
 
-        let answer = resolve_under_budget(|| {
-            std::thread::sleep(std::time::Duration::from_secs(4));
+        let answer = resolve_under_budget(move || {
+            let _ = held.recv_timeout(std::time::Duration::from_secs(30));
             true
         })
         .await;
+        let waited = started.elapsed();
+        drop(release);
 
-        let why = answer.expect_err("a 4 s load under a 1 s budget has to give up");
+        let why = answer.expect_err("a 30 s load under a 1 s budget has to give up");
         assert!(
             why.contains("1s"),
             "the message has to name the budget, or an operator on a slow disk cannot tell a corrupt model from one that needed longer: {why}"
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "doctor exists to say what is wrong; a check that hangs says nothing. It waited {:?}",
-            started.elapsed()
+            waited < std::time::Duration::from_secs(10),
+            "doctor exists to say what is wrong; a check that hangs says nothing. It waited {waited:?}"
         );
     }
 

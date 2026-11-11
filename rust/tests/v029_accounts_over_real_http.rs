@@ -1866,17 +1866,48 @@ async fn g15_last_seen_is_written_by_the_first_request_and_not_by_every_one() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
 
+        // The daemon writes after answering, in a task nobody awaits, so there is nothing to
+        // wait on but the database itself: a statement-level trigger counts every UPDATE of the
+        // table, even one that matches no row (the throttled one), and the test waits until it
+        // has seen one per request. Then no write can still be on its way when `last_seen_at`
+        // is read, and a pause that a stalled machine could outlast is not needed.
+        for statement in [
+            "CREATE TABLE touches (at timestamptz NOT NULL DEFAULT now())",
+            "CREATE FUNCTION count_touch() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN INSERT INTO touches DEFAULT VALUES; RETURN NULL; END $$",
+            "CREATE TRIGGER count_touch AFTER UPDATE ON brain_account_credentials \
+             FOR EACH STATEMENT EXECUTE FUNCTION count_touch()",
+        ] {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("a counter of the daemon's writes in the scratch database");
+        }
         for _ in 0..5 {
             assert_eq!(mcp(port, Some(&bearer), ping()).await.status, 200);
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let touches: i64 = sqlx::query_scalar("SELECT count(*) FROM touches")
+                .fetch_one(&pool)
+                .await
+                .expect("counting the daemon's writes");
+            if touches >= 5 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon asked the database to touch last_seen_at {touches} times for five \
+                 requests in 30 s: the write is made once per request and the database is what \
+                 decides it is not due"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_eq!(
             last_seen(&pool, id).await,
             Some(first),
             "five more requests inside the minute did not move it: authenticating is a read, \
-             and writing a row per call would make every tool call a database write. The pause \
-             only lets a write the daemon makes after answering land before this looks; the \
-             assertion cannot be fooled the other way, because the stamp was already set"
+             and writing a row per call would make every tool call a database write"
         );
         pool.close().await;
     })

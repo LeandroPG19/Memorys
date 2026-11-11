@@ -7,6 +7,8 @@
 //! `beacon::answer` directly and the sockets prove the rest.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use memory_industry::beacon::{self, Limiter, Reply};
@@ -14,9 +16,10 @@ use serde_json::Value;
 use tokio::net::UdpSocket;
 use uuid::Uuid;
 
-/// Long enough for a datagram on loopback on a machine running the whole gate; it is a
-/// ceiling on a wait for something that normally takes microseconds.
-const PROBE_WAIT: Duration = Duration::from_millis(500);
+/// `beacon::probe` listens for its whole window (it cannot know how many replies are coming),
+/// so this is paid in full by each probe test and is the only fixed wait of the binary in a
+/// green run. Two seconds, because 500 ms was lost to a stall of the whole machine.
+const PROBE_WAIT: Duration = Duration::from_secs(2);
 
 /// A guard on waits that end as soon as the answer arrives. Reaching it is the failure.
 const GUARD: Duration = Duration::from_secs(5);
@@ -238,15 +241,35 @@ fn the_broadcast_targets_are_the_limited_one_and_the_own_slash_24() {
 async fn responder(
     reply_port: Option<u16>,
 ) -> (SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
+    let (addr, task, _taken) = counting_responder(reply_port).await;
+    (addr, task)
+}
+
+/// `responder`, plus how many acceptable requests it has taken in. The clock is read once per
+/// request that passed `beacon::answer`, before the rate decision and the send, in the same
+/// poll of the responder task: on the test's current-thread runtime, a count of N means the
+/// responder has decided on N requests and every answer it sent is already queued.
+async fn counting_responder(
+    reply_port: Option<u16>,
+) -> (
+    SocketAddr,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    Arc<AtomicUsize>,
+) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
     let frozen = Instant::now();
+    let taken = Arc::new(AtomicUsize::new(0));
+    let counter = taken.clone();
     let task = tokio::spawn(beacon::respond(
         socket,
         me(reply_port.unwrap_or(addr.port())),
-        move || frozen,
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            frozen
+        },
     ));
-    (addr, task)
+    (addr, task, taken)
 }
 
 /// One answer on `socket`, or a failure naming why none came.
@@ -291,12 +314,9 @@ async fn answers(
     got
 }
 
-/// How long a test listens for an answer that must not come, once the expected ones arrived.
-const QUIET: Duration = Duration::from_millis(300);
-
 #[tokio::test]
 async fn one_origin_asking_twenty_times_in_a_second_gets_at_most_four_answers() {
-    let (host, mut task) = responder(None).await;
+    let (host, mut task, taken) = counting_responder(None).await;
     let asker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     for _ in 0..20 {
@@ -311,13 +331,24 @@ async fn one_origin_asking_twenty_times_in_a_second_gets_at_most_four_answers() 
     .await;
 
     // A barrier from a second origin proves nothing here: measured on this kernel, loopback
-    // does not keep the order between different sockets. So the fifth answer gets a quiet window.
-    let mut buf = vec![0u8; 2048];
-    let fifth = tokio::time::timeout(QUIET, asker.recv_from(&mut buf)).await;
+    // does not keep the order between different sockets, and the limit is per IP anyway. The
+    // barrier is the responder's own count: once it has decided on all twenty requests, a
+    // fifth answer would already be queued, so the socket is read without waiting.
+    let deadline = Instant::now() + GUARD;
+    while taken.load(Ordering::SeqCst) < 20 {
+        assert!(
+            Instant::now() < deadline,
+            "the responder decided on {} of 20 requests within {GUARD:?}",
+            taken.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let extra = drain(&asker);
     assert!(
-        fifth.is_err(),
-        "twenty requests from one origin got a fifth answer; the limit is four every ten \
-         seconds, and without it the host is an amplifier"
+        extra.is_empty(),
+        "twenty requests from one origin got {} answers beyond the fourth; the limit is four \
+         every ten seconds, and without it the host is an amplifier",
+        extra.len()
     );
 }
 

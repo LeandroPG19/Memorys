@@ -1218,7 +1218,7 @@ fn the_timed_end_line_is_printed_once_before_the_first_untimed_block() {
 #[test]
 fn a_finished_block_is_written_before_the_next_step_starts() {
     let mut fx = Fixture::new("flush-bloque", CPU_FOUR, MEM_OPEN);
-    fx.table(&[(10, "s10", "-", "0.1", ""), (20, "s20", "-", "4", "")]);
+    fx.table(&[(10, "s10", "-", "0.1", ""), (20, "s20", "-", "30", "")]);
     let out_path = fx.base.join("salida-flush.txt");
     let mut child = python3_for_the_planner()
         .arg("-I")
@@ -1260,7 +1260,15 @@ fn a_finished_block_is_written_before_the_next_step_starts() {
         "the block of s10 reached stdout only when the planner had already ended, so it sat in the buffer \
          and a gate cut between two steps would have shown none of it"
     );
-    let _ = child.wait();
+    // s20 sleeps 30 s so that "the planner is still running" holds with seconds to spare however loaded the machine is;
+    // nobody waits for it: the planner is stopped the way a gate cut between two steps stops it (TERM, J14b).
+    let live = Live {
+        child,
+        out_path,
+        err_path: fx.base.join("error-flush.txt"),
+    };
+    live.signal("TERM");
+    let _ = live.collect(30);
 }
 
 // CI-F3.3b-1b-i (D-F3k): a step the planner starts under the gate's lock gets a one-use ticket in the
@@ -1524,22 +1532,26 @@ grep '^SigIgn' /proc/$PPID/status > "$control/sigign-parent-$id.txt"
 "#;
 
 /// The step of the D2 row seen through the planner: it runs the gate in the foreground, as cargo test runs the
-/// gate copy, and sends that gate INT while it waits. $1 id, $2 the gate, $3 control directory.
+/// gate copy, and sends that gate INT while it waits. The INT goes out when the gate has written its pid (it sets its
+/// trap first, so it is in place by then), not after a pause that a loaded machine could outlast: the 30 s of the
+/// loop only run out if the gate never starts. $1 id, $2 the gate, $3 control directory.
 const STEP_GATE_SH: &str = r#"#!/bin/sh
 id="$1"
 gate="$2"
 control="$3"
-( sleep 1; kill -INT "$(cat "$control/gate-$id.pid")" ) &
+( for _ in $(seq 600); do [ -s "$control/gate-$id.pid" ] && break; sleep 0.05; done
+  kill -INT "$(cat "$control/gate-$id.pid")" ) &
 sh "$gate" "$control" "$id"
 echo "$?" > "$control/gate-rc-$id.txt"
 "#;
 
-/// The gate: a trap that exits 2 on INT, then a wait. Without that INT it reports `survived` and exits 0 (D2).
+/// The gate: a trap that exits 2 on INT, then a wait. Without that INT it reports `survived` and exits 0 (D2). The
+/// trap takes its `sleep` with it, so the planner does not wait for the rest of the 3 s on a pipe the `sleep` holds.
 /// $1 control directory, $2 id.
 const GATE_SH: &str = r#"#!/bin/sh
 control="$1"
 id="$2"
-trap 'echo trapped > "$control/gate-$id.txt"; exit 2' INT
+trap 'echo trapped > "$control/gate-$id.txt"; kill "$!" 2>/dev/null; exit 2' INT
 echo "$$" > "$control/gate-$id.pid"
 sleep 3 &
 wait $!
@@ -2579,15 +2591,15 @@ fn a_hangup_to_the_planner_leaves_no_step_alive() {
     write(&ghost.join("cgroup.kill"), "");
     let live = fx.spawn("0", &[]);
     assert!(
-        within(10, || !processes_with("37.5101").is_empty()),
-        "the step did not start in 10 s"
+        within(30, || !processes_with("37.5101").is_empty()),
+        "the step did not start in 30 s"
     );
     live.signal("HUP");
-    let run = live.collect(10);
-    let left = survivors_of("37.5101", 5);
+    let run = live.collect(30);
+    let left = survivors_of("37.5101", 30);
     assert!(
         !run.timed_out,
-        "the planner did not stop on SIGHUP in 10 s: {}{}",
+        "the planner did not stop on SIGHUP in 30 s: {}{}",
         run.out, run.err
     );
     assert!(
@@ -2620,7 +2632,7 @@ fn a_term_right_after_the_step_starts_leaves_no_step_alive() {
     let mut fx = Fixture::new("j14b-term", CPU_FOUR, MEM_OPEN);
     fx.table(&[(10, "a", "-", "37.5102", "")]);
     let run = fx.run_env("0", &[("GATE_DAG_TEST_TERM_AFTER_POPEN", "1")]);
-    let left = survivors_of("37.5102", 5);
+    let left = survivors_of("37.5102", 30);
     assert!(
         !run.timed_out,
         "the planner did not stop on the TERM it sent itself in 30 s: {}{}",
@@ -3363,7 +3375,7 @@ fn a_row_that_ignores_term_dies_by_kill_when_the_grace_ends() {
     let started = Instant::now();
     let run = fx.run_env("1", &[("GATE_DAG_TERM_GRACE_S", "1")]);
     let took = started.elapsed();
-    let left = survivors_of("34.2718", 5);
+    let left = survivors_of("34.2718", 30);
     assert!(
         !run.timed_out && took < Duration::from_secs(12),
         "the planner waited for a row that ignores TERM ({took:?}): {}{}",

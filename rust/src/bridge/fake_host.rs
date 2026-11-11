@@ -52,15 +52,20 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("a test mutex is never poisoned")
 }
 
-/// Milliseconds for everything, seconds only where a rule is about a window the clock
-/// (not the wall) moves. A test that needs other values overrides fields.
+/// Every limit a test does not set itself is the one of a stalled machine, not of a quick
+/// one: the success path of a test (a host that must be found, a pairing that must work)
+/// waits as long as it takes, and costs nothing when the machine is quiet. A test whose
+/// object is a cut (a silent candidate, a budget) overrides the two timers it needs and puts
+/// them far apart (`identity` ten times `probe_total`), so the clock tells them apart by
+/// seconds. `resolve` and `beacon_wait` are not stalls: the fake network answers at once and
+/// only records the wait it was asked for.
 pub(crate) fn tiny_timing() -> Timing {
     Timing {
         resolve: ms(200),
-        identity: ms(300),
-        probe_connect: ms(150),
-        probe_total: ms(600),
-        discovery_total: Duration::from_secs(3),
+        identity: Duration::from_secs(5),
+        probe_connect: Duration::from_secs(2),
+        probe_total: Duration::from_secs(10),
+        discovery_total: Duration::from_secs(20),
         request_waits: Duration::from_secs(4),
         reverify_after: Duration::from_secs(30),
         revoked_recheck: Duration::from_secs(60),
@@ -98,13 +103,14 @@ pub(crate) fn hex_runs_of_64(bytes: &[u8]) -> Vec<String> {
 }
 
 /// Waits (polling, bounded) for something that happens after the reply, such as a file
-/// written by a background task. Panics naming what never happened.
+/// written by a background task. The bound is long on purpose: a quiet machine never pays
+/// for it, a stalled one is not a red. Panics naming what never happened.
 pub(crate) async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !check() {
         assert!(
             Instant::now() < deadline,
-            "never happened within 3 s: {what}"
+            "never happened within 30 s: {what}"
         );
         tokio::time::sleep(ms(10)).await;
     }
