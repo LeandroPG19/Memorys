@@ -174,6 +174,43 @@ fn is_configured_reports_whether_a_model_is_on_disk_without_loading_it() {
     );
 }
 
+/// CI-D5. Since `ort` rc.14 a session needs an `Environment`, and a process can build only one,
+/// for good: the second `build()` answers «only one environment is allowed per process». So the
+/// sessions of the embedder, the reranker and NLI have to open through the one environment that
+/// lives beside the runtime, and an environment built per call fails on the second session of
+/// the process. Two sessions in a row show it, and they need no model: the commit builds nothing.
+///
+/// It needs the ONNX Runtime the judge exports (`gate_model_env`) and fails saying so without it,
+/// instead of passing on a process that never opened a session. It opens the embedder's slot and
+/// leaves the reranker's and NLI's alone, which the two ignored tests below read as empty.
+#[test]
+fn two_sessions_of_one_process_open_through_the_single_environment() {
+    let embedder = memory_industry::gpu::Workload::Embedder;
+    assert_eq!(
+        memory_industry::gpu::placement(embedder),
+        None,
+        "algo abrió el embedder en este binario: sin el hueco vacío, lo que sigue no prueba nada"
+    );
+    let make_builder = |environment: &ort::environment::Environment| {
+        ort::session::Session::builder(environment)
+            .map_err(|e| anyhow::anyhow!("session builder: {e}"))
+    };
+    for which in ["first", "second"] {
+        memory_industry::gpu::open(make_builder, embedder, |_builder| Ok(())).unwrap_or_else(|e| {
+            panic!(
+                "the {which} session of the process did not open: {e:#}. This test needs ONNX \
+                 Runtime (ORT_DYLIB_PATH, which the judge sets in `gate_model_env`, or \
+                 `memory-industry models runtime`). With the runtime there, a refusal on the \
+                 second session is a second `Environment` built in the process"
+            )
+        });
+    }
+    assert!(
+        memory_industry::gpu::placement(embedder).is_some(),
+        "two sessions opened and `gpu::open` wrote no placement for them"
+    );
+}
+
 #[tokio::test]
 #[ignore]
 async fn warming_up_leaves_the_reranker_ready() {
@@ -231,8 +268,10 @@ async fn warming_up_leaves_the_reranker_ready() {
         None,
         "algo abrió la NLI en este binario: sin el hueco vacío, lo que sigue no prueba nada"
     );
-    let make_builder =
-        || ort::session::Session::builder().map_err(|e| anyhow::anyhow!("session builder: {e}"));
+    let make_builder = |environment: &ort::environment::Environment| {
+        ort::session::Session::builder(environment)
+            .map_err(|e| anyhow::anyhow!("session builder: {e}"))
+    };
     let refused = memory_industry::gpu::open(make_builder, nli, |_builder| {
         Err::<(), _>(anyhow::anyhow!("commit refused k3-4718"))
     });

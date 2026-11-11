@@ -1,4 +1,5 @@
 use anyhow::Result;
+use ort::environment::Environment;
 use ort::session::builder::SessionBuilder;
 use std::path::PathBuf;
 
@@ -138,9 +139,13 @@ fn gpu_availability() -> (bool, bool) {
 /// The registry is written here, once `commit` has an answer, because
 /// `configure` cannot know whether the commit will work: a refusal recorded
 /// for a session that never opened would turn `gpu.degraded` true over nothing.
+///
+/// `make_builder` receives the process's one `Environment`, the one a session
+/// has to be built from since `ort` rc.14 and the only one the process may
+/// have: it is `Session::builder(environment)` and nothing that builds its own.
 pub fn open<F, C, T>(make_builder: F, workload: Workload, commit: C) -> Result<T>
 where
-    F: Fn() -> Result<SessionBuilder>,
+    F: Fn(&Environment) -> Result<SessionBuilder>,
     C: FnOnce(SessionBuilder) -> Result<T>,
 {
     let (builder, placement) = configure(make_builder, workload)?;
@@ -160,19 +165,21 @@ pub(crate) const AND_THEN_ON_THE_CPU: &str = "; then the session did not open on
 /// `SessionBuilder` is consumed by the attempt.
 ///
 /// It is also the one door the embedder, NLI and the reranker all pass
-/// before `Session::builder()`, so the runtime is loaded here, from the path
-/// `locate_onnxruntime` found. Left to `ort`, whichever model opened first
-/// decided: the reranker, which never searched, got the bare
-/// `onnxruntime.dll` — on Windows the Windows ML 1.17 in System32.
+/// before `Session::builder(environment)`, so the runtime is loaded here, from
+/// the path `locate_onnxruntime` found, and the `Environment` that load builds
+/// is what the factory receives: a builder cannot exist before the runtime is
+/// loaded. Left to `ort`, whichever model opened first decided: the reranker,
+/// which never searched, got the bare `onnxruntime.dll` — on Windows the
+/// Windows ML 1.17 in System32.
 ///
 /// Returns where the session is going to open next to the builder and writes
 /// nothing: `open` records it once the commit has worked.
 fn configure<F>(make_builder: F, workload: Workload) -> Result<(SessionBuilder, Placement)>
 where
-    F: Fn() -> Result<SessionBuilder>,
+    F: Fn(&Environment) -> Result<SessionBuilder>,
 {
-    crate::embeddings::onnx::load_located_onnxruntime()?;
-    let builder = make_builder()?;
+    let environment = crate::embeddings::onnx::load_located_onnxruntime()?;
+    let builder = make_builder(environment)?;
     let (runtime_gpu, device_present) = gpu_availability();
 
     if let Some(reason) = cpu_reason(wants_gpu(workload), runtime_gpu, device_present) {
@@ -215,7 +222,7 @@ where
                 error = %e,
                 "el provider GPU no inicializó pese a haber tarjeta y librerías: esta sesión corre en CPU. Revisá que las DLL/so de CUDA estén en PATH/LD_LIBRARY_PATH junto al runtime de ONNX"
             );
-            configure_cpu(make_builder()?, workload)
+            configure_cpu(make_builder(environment)?, workload)
                 .map(|b| (b, Placement::CpuAfterProviderFailed(e.to_string())))
         }
     }
@@ -1215,7 +1222,7 @@ mod placement_tests {
             "a GPU that silently became a CPU is the defect this whole path exists to stop: the fallback has to be logged at error"
         );
         assert!(
-            body[failure..].contains("configure_cpu(make_builder()?"),
+            body[failure..].contains("configure_cpu(make_builder("),
             "and it has to actually keep working. A machine without the CUDA runtime ran on CPU before and must keep doing so; failing the session there turns a slow daemon into a dead one."
         );
         // Structural on purpose, like the two checks above: this arm only runs

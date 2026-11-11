@@ -25,13 +25,13 @@ admin-role 3 v020_audit_update_applies + v020_role_separation con CUBA_APP_ROLE=
 embedding-model 2 v016_chunking (F0 corrida 2)
 nli 10 nli_entailment + nli_cost + nli_probe (F0 corrida 2)
 generative-llm 4 v016_extract_without_sampling + v017_relation_scan (F0 corrida 2)
-reranker-placement 4 v017_rerank_gpu sin --ignored, con cuda y release (F0 corrida 2)
+reranker-placement 5 v017_rerank_gpu sin --ignored, con cuda y release (F0 corrida 2) y CI-D5 +1 test (two_sessions_of_one_process_open_through_the_single_environment)
 placement-table 23 cargo test --release --features docs,cuda --lib gpu:: (F0 corrida 2: 23 passed en release/deps con cuda, log línea ~5479)
 reranker-model 2 v017_rerank_gpu --ignored, con cuda y release (F0 corrida 2: "running 2 tests" en la corrida release de v017_rerank_gpu, log línea ~8700)
 # CI-E1, CI-E11 (D-E11e): las 100 líneas del pase llano, una por binario y con los prefijos de E11 (91 `plain`, 8 `contracts`,
 # 1 `doc`), medidas una sola vez por la pasada llana del 10-nov sobre b51e027 (pasada-llana-20261110-124505 de
 # ~/.cache/memory-industry-gate/ci-rapido, `test-section-counts.medido.txt`): Σ(passed + failed) de cada binario.
-plain/linux/lib:memory_industry 1236 pasada llana del 10-nov sobre b51e027 y CI-E16 +5 tests (the_guard_and_the_loader_read_one_rule_for_configured, two_waits_for_an_unloaded_model_share_one_load, the_load_never_runs_on_the_executor_thread, a_wait_that_is_dropped_does_not_load_again, a_load_that_panics_answers_no_model) y CI-E22 +1 test (the_shutdown_message_names_what_is_lost_and_what_restores_it) y CI-D4 +3 tests (cl100k_gives_the_ids_openai_published_for_its_two_examples, the_fixed_table_counts_what_the_pinned_library_counted, truncate_to_budget_returns_the_pinned_prefix_of_each_fixed_row) y CI-E36 +1 test (the_mcp_route_future_stays_small_enough_for_a_two_mib_stack) y CI-D6 +2 tests (the_probe_reads_ram_and_swap_in_mib_as_the_kernel_reports_them, a_hand_solved_case_gives_the_distance_worked_out_on_paper) y D2 +4 tests (the_audit_chain_reproduces_two_stamps_computed_apart, the_payload_hash_is_the_fips_vector_in_lowercase_hex, the_file_checksum_is_the_fips_vector_whatever_the_reads, the_artifact_hash_is_the_fips_vector_in_lowercase_hex)
+plain/linux/lib:memory_industry 1237 pasada llana del 10-nov sobre b51e027 y CI-E16 +5 tests (the_guard_and_the_loader_read_one_rule_for_configured, two_waits_for_an_unloaded_model_share_one_load, the_load_never_runs_on_the_executor_thread, a_wait_that_is_dropped_does_not_load_again, a_load_that_panics_answers_no_model) y CI-E22 +1 test (the_shutdown_message_names_what_is_lost_and_what_restores_it) y CI-D4 +3 tests (cl100k_gives_the_ids_openai_published_for_its_two_examples, the_fixed_table_counts_what_the_pinned_library_counted, truncate_to_budget_returns_the_pinned_prefix_of_each_fixed_row) y CI-E36 +1 test (the_mcp_route_future_stays_small_enough_for_a_two_mib_stack) y CI-D6 +2 tests (the_probe_reads_ram_and_swap_in_mib_as_the_kernel_reports_them, a_hand_solved_case_gives_the_distance_worked_out_on_paper) y D2 +4 tests (the_audit_chain_reproduces_two_stamps_computed_apart, the_payload_hash_is_the_fips_vector_in_lowercase_hex, the_file_checksum_is_the_fips_vector_whatever_the_reads, the_artifact_hash_is_the_fips_vector_in_lowercase_hex) y CI-D5 +1 test (the_runtime_the_installer_fetches_meets_the_floor_of_ort)
 plain/linux/group_scratch_db 44 pasada llana del 10-nov sobre b51e027 y CI-E22 +4 tests (reembed_gives_an_episode_its_vector_by_the_rule_of_observations, without_a_model_nothing_writes_a_vector, the_reembed_command_repairs_the_episodes, backfill_fills_the_episodes_and_does_not_repeat)
 plain/linux/integration 0 pasada llana del 10-nov sobre b51e027
 plain/linux/model_parity 4 CI-D4 binario nuevo (the_embedder_tokenizer_still_gives_the_pinned_ids, the_reranker_tokenizer_still_gives_the_pinned_ids_for_a_batch_of_pairs, the_nli_tokenizer_still_gives_the_pinned_ids_and_splits_a_long_pair_254_255, the_embedder_vectors_through_the_product_path_stay_within_the_noise_of_f32)
@@ -47,7 +47,7 @@ plain/linux/v016_quarantine 0 pasada llana del 10-nov sobre b51e027
 plain/linux/v016_relation_extraction 0 pasada llana del 10-nov sobre b51e027
 plain/linux/v017_codegraph_hardening 2 pasada llana del 10-nov sobre b51e027
 plain/linux/v017_relation_scan 1 pasada llana del 10-nov sobre b51e027
-plain/linux/v017_rerank_gpu 4 pasada llana del 10-nov sobre b51e027
+plain/linux/v017_rerank_gpu 5 pasada llana del 10-nov sobre b51e027 y CI-D5 +1 test (two_sessions_of_one_process_open_through_the_single_environment)
 plain/linux/v020_audit_hmac 4 pasada llana del 10-nov sobre b51e027
 plain/linux/v020_audit_update_applies 0 pasada llana del 10-nov sobre b51e027
 plain/linux/v020_embed_cache_key 1 pasada llana del 10-nov sobre b51e027

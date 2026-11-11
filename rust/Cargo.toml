@@ -36,10 +36,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # default-features off: the default `download-binaries` builds ureq and OpenSSL for ort-sys's build script, which returns at once under `load-dynamic`.
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "api-24", "load-dynamic", "half"] }
-# Direct only to open ONNX Runtime before `ort` does: rc.12 deadlocks on a
-# library it cannot load (see `embeddings::onnx::load_onnxruntime_once`). The
-# version `ort` already pulls in, so the lock gains an edge and no crate.
+# Pinned with `=`: the API moves between release candidates (rc.14 made the `Environment` mandatory), so a `cargo update` must not take rc.16 by itself.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "api-24", "load-dynamic", "half"] }
+# Direct only to open ONNX Runtime before `ort` does, to check it and answer with
+# our own message (see `embeddings::onnx::load_onnxruntime_once`): rc.12 deadlocked
+# on a library it could not load, rc.13 fixed that, and the check stays for the
+# message. The version `ort` already pulls in, so the lock gains an edge and no crate.
 libloading = "0.9.0"
 # only `from_file` and `encode`: progressbar and esaxx_fast serve training, and onig is the regex engine the default had.
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
