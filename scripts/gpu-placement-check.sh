@@ -177,11 +177,19 @@ provider_lib_present() {
   return 1
 }
 
+# Mirrors nvidia_driver_present() in rust/src/gpu.rs: the driver's own file, an nvidia-smi on the
+# PATH, and the one WSL2 keeps in /usr/lib/wsl/lib, which is on nobody's PATH and is where a card
+# under WSL shows up. The two places are arguments with the real ones as their defaults, so the
+# self-test can put each row in a machine of its own.
 nvidia_device_present() {
-  if [[ -e /proc/driver/nvidia/version ]]; then
+  local wsl_lib="${1:-/usr/lib/wsl/lib}" driver_file="${2:-/proc/driver/nvidia/version}"
+  if [[ -e "$driver_file" ]]; then
     return 0
   fi
   if command -v nvidia-smi >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ -e "$wsl_lib/nvidia-smi" ]]; then
     return 0
   fi
   return 1
@@ -352,6 +360,25 @@ must_resolve() {
   return 0
 }
 
+# must_find_card <what> <yes|no> <wsl-lib-dir> <PATH>
+#
+# Runs nvidia_device_present in a subshell with the PATH it is given and with the
+# driver file of /proc pointed at a file that is not there, so a row says
+# everything it depends on and the card of the machine that runs the self-test
+# decides nothing: a box that has one would otherwise turn the «no card» row red.
+must_find_card() {
+  local what="$1" want="$2" wsl_lib="$3" path_dir="$4" got=no
+  if (PATH="$path_dir"; nvidia_device_present "$wsl_lib" /nonexistent-ajeno/driver-version); then
+    got=yes
+  fi
+  if [[ "$got" != "$want" ]]; then
+    echo "FAIL self-test: $what — this script says card=$got, the binary says card=$want." >&2
+    return 1
+  fi
+  echo "  same answer as the binary: $what"
+  return 0
+}
+
 self_test() {
   local bad=0
   local gpu_live="cuda — runtime GPU y GPU detectados · colocación: embedder=cpu reranker=gpu nli=cpu"
@@ -390,7 +417,11 @@ self_test() {
   scratch="$(mktemp -d)"
   mkdir -p "$scratch/home/.cache/memory-industry/onnxruntime" \
            "$scratch/xdg/memory-industry/onnxruntime" \
-           "$scratch/ld" "$scratch/empty-home"
+           "$scratch/ld" "$scratch/empty-home" \
+           "$scratch/wsl-with" "$scratch/wsl-without" "$scratch/path-empty" "$scratch/path-with"
+  : > "$scratch/wsl-with/nvidia-smi"
+  : > "$scratch/path-with/nvidia-smi"
+  chmod +x "$scratch/path-with/nvidia-smi"
   for name in onnxruntime.dll libonnxruntime.so libonnxruntime.dylib; do
     : > "$scratch/home/.cache/memory-industry/onnxruntime/$name"
     : > "$scratch/xdg/memory-industry/onnxruntime/$name"
@@ -402,6 +433,12 @@ self_test() {
   must_resolve "a runtime found through LD_LIBRARY_PATH has its providers looked for beside it" \
     "$scratch/ld" \
     HOME="$scratch/empty-home" LD_LIBRARY_PATH="$scratch/ld" || bad=1
+  must_find_card "the card of WSL2: no nvidia-smi on the PATH and one in /usr/lib/wsl/lib" \
+    yes "$scratch/wsl-with" "$scratch/path-empty" || bad=1
+  must_find_card "no nvidia-smi on the PATH and none in the directory of WSL: there is no card" \
+    no "$scratch/wsl-without" "$scratch/path-empty" || bad=1
+  must_find_card "an nvidia-smi on the PATH and none in the directory of WSL" \
+    yes "$scratch/wsl-without" "$scratch/path-with" || bad=1
   rm -rf "$scratch"
 
   if [[ "$bad" -ne 0 ]]; then

@@ -74,6 +74,45 @@ pub async fn reembed_batch(
     (updated, failed)
 }
 
+/// `action=reembed`: one batch of the same reembed the command runs (`crate::reembed_cli`), with the
+/// snapshot of the old vectors, the lock and the four tables. Each call advances `batch_size` rows
+/// per table; the snapshot of the generation is taken on the first call and grows with the next.
+async fn reembed_a_batch(pool: &PgPool, batch_size: i64) -> Result<Value> {
+    use crate::reembed_cli::{Plan, onnx_encoder, reembed, snapshot_root};
+
+    let tag = crate::embeddings::onnx::vector_tag();
+    let node_id = crate::db::node_id(pool).await?.to_string();
+    let plan = Plan {
+        tag: tag.clone(),
+        all: false,
+        chunk: batch_size.clamp(1, 5000) as usize,
+        limit: Some(batch_size.max(1) as usize),
+        snapshot_root: snapshot_root(&node_id)?,
+        node_id,
+        progress: false,
+    };
+    let report = reembed(pool, &plan, &onnx_encoder).await?;
+    let table = |t: crate::reembed_cli::TableReport| serde_json::json!({"fetched": t.fetched, "updated": t.rewritten});
+    let total = report.total();
+    Ok(serde_json::json!({
+        "action": "reembed",
+        "observations": table(report.observations),
+        "episodes": table(report.episodes),
+        "chunks": table(report.chunks),
+        "procedures": table(report.procedures),
+        "total_fetched": total.fetched,
+        "updated": total.rewritten,
+        "changed_meanwhile": total.changed,
+        "failed": total.failed,
+        "snapshot_rows_saved": report.saved,
+        "model": crate::embeddings::onnx::current_model(),
+        "tag": tag,
+        "dim": crate::embeddings::onnx::embedding_dim(),
+        "note": "Run after switching embedding models or the ONNX Runtime to ensure vector search consistency; \
+                 `memory-industry reembed --rollback` gives the old vectors back"
+    }))
+}
+
 pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
     let project_id = crate::project::current_project_id(pool).await?;
@@ -401,82 +440,11 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                     "error": "ONNX model not loaded — set ONNX_MODEL_PATH to enable reembed"
                 }));
             }
-
             let batch_size = args
                 .get("batch_size")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(500);
-            let current_model = crate::embeddings::onnx::current_model();
-            let observations: Vec<StaleRow> = sqlx::query_as(
-                "SELECT o.id, o.content, e.entity_type, e.name AS entity_name
-                 FROM brain_observations o
-                 JOIN brain_entities e ON e.id = o.entity_id
-                 WHERE o.observation_type != 'superseded'
-                   AND (o.embedding_model != $2 OR o.embedding_model IS NULL OR o.embedding IS NULL)
-                 ORDER BY o.importance DESC
-                 LIMIT $1",
-            )
-            .bind(batch_size)
-            .bind(&current_model)
-            .fetch_all(pool)
-            .await?;
-            let episodes: Vec<StaleRow> = sqlx::query_as(
-                "SELECT ep.id, ep.content, e.entity_type, e.name AS entity_name
-                 FROM brain_episodes ep
-                 JOIN brain_entities e ON e.id = ep.entity_id
-                 WHERE ep.embedding IS NULL OR ep.embedding_model IS DISTINCT FROM $2
-                 ORDER BY ep.importance DESC
-                 LIMIT $1",
-            )
-            .bind(batch_size)
-            .bind(&current_model)
-            .fetch_all(pool)
-            .await?;
-
-            let total = observations.len() + episodes.len();
-            let mut updated_observations = 0usize;
-            let mut updated_episodes = 0usize;
-
-            let progress_token = args
-                .get("_meta")
-                .and_then(|m| m.get("progressToken"))
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_else(|| format!("zafra_reembed_{}", batch_size));
-            let progress_step = (total / 20).max(1);
-
-            let mut done = 0usize;
-            for (table, rows) in [
-                (VectorTable::Observations, &observations),
-                (VectorTable::Episodes, &episodes),
-            ] {
-                for slice in rows.chunks(progress_step) {
-                    let (ok, _failed) = reembed_batch(pool, table, slice, &current_model).await;
-                    match table {
-                        VectorTable::Observations => updated_observations += ok,
-                        VectorTable::Episodes => updated_episodes += ok,
-                    }
-                    done += slice.len();
-                    if total > 50 {
-                        crate::protocol::notify_progress(
-                            &progress_token,
-                            done as f64,
-                            Some(total as f64),
-                            Some(&format!("re-embedded {}/{}", done, total)),
-                        );
-                    }
-                }
-            }
-
-            Ok(serde_json::json!({
-                "action": "reembed",
-                "observations": {"fetched": observations.len(), "updated": updated_observations},
-                "episodes": {"fetched": episodes.len(), "updated": updated_episodes},
-                "total_fetched": total,
-                "updated": updated_observations + updated_episodes,
-                "model": current_model,
-                "dim": crate::embeddings::onnx::embedding_dim(),
-                "note": "Run after switching embedding models to ensure vector search consistency"
-            }))
+            reembed_a_batch(pool, batch_size).await
         }
         _ => anyhow::bail!("Invalid action: {action}"),
     }

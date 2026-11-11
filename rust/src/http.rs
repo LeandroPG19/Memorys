@@ -697,6 +697,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
         },
     });
     let beacon_pool = pool.clone();
+    let coverage_pool = pool.clone();
     let beacon_host = host.clone();
     let state = AppState {
         pool,
@@ -777,6 +778,7 @@ pub async fn serve_pool(addr: &str, pool: PgPool, connected: bool) -> Result<()>
     // unreranked ranking in it. In the automatic mode that is the loopback
     // socket; the LAN one opens when the IP is known.
     warm_before_serving(ready.clone()).await;
+    tokio::spawn(tell_about_vectors_of_another_generation(coverage_pool));
 
     tracing::info!(
         %addr,
@@ -1052,6 +1054,25 @@ async fn warm_models() {
             "embedding model warm"
         ),
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "embedding warm-up failed"),
+    }
+}
+
+/// Once the embedder is warm: how many stored vectors were made by another model or by another ONNX
+/// Runtime than the one this daemon loaded, and the command that rewrites them. The count stays
+/// for `/health` until the next REM cycle counts again.
+async fn tell_about_vectors_of_another_generation(pool: PgPool) {
+    match crate::embeddings::backfill::refresh_coverage(&pool).await {
+        Ok(Some(coverage)) if coverage.stale() > 0 => tracing::warn!(
+            stale = coverage.stale(),
+            missing = coverage.missing(),
+            current = %coverage.tag,
+            "hay vectores de otra generación: `memory-industry reembed` los rehace (reanudable; \
+             guarda antes los actuales; `--rollback` los devuelve)"
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "could not count the vectors of another generation")
+        }
     }
 }
 
@@ -3058,6 +3079,20 @@ fn runtime_json(runtime: &RuntimeReport) -> Value {
     })
 }
 
+/// Which generation the stored vectors are and how many are still of another one, as the last
+/// count saw it (`backfill::refresh_coverage`: at start, and after each REM cycle). Absent until
+/// something has been counted. It does not touch `status`: a database of another generation still
+/// answers searches.
+fn vectors_json() -> Option<Value> {
+    let coverage = crate::embeddings::backfill::last_coverage()?;
+    Some(serde_json::json!({
+        "tag": coverage.tag,
+        "stale": coverage.stale(),
+        "missing": coverage.missing(),
+        "command": "memory-industry reembed",
+    }))
+}
+
 async fn health(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(_peer): axum::extract::ConnectInfo<SocketAddr>,
@@ -3101,6 +3136,9 @@ async fn health(
         // on which device, talking to which provider — and an anonymous caller
         // gets the verdict in `status` without the list of what to attack.
         body["runtime"] = runtime_json(&runtime);
+        if let Some(vectors) = vectors_json() {
+            body["runtime"]["vectors"] = vectors;
+        }
     } else {
         body["clients_count"] = serde_json::json!(state.seen.read().map(|g| g.len()).unwrap_or(0));
     }
@@ -3715,6 +3753,61 @@ mod tests {
             body["version"],
             env!("CARGO_PKG_VERSION"),
             "liveness must survive the redaction — that is what /health is for"
+        );
+    }
+
+    /// CI-D5c (B.5). Which generation the stored vectors are and how many are still of another one
+    /// is an inventory of the machine, like the models: the full scope sees it, an anonymous
+    /// caller sees the verdict in `status` and nothing else, and `status` itself does not move
+    /// (a database of another generation still answers searches, so it is not «degraded»).
+    #[tokio::test]
+    async fn health_shows_the_vector_generation_only_to_the_full_scope() {
+        use crate::embeddings::backfill::{TableCoverage, VectorCoverage, set_last_coverage};
+        const CURRENT: &str = "multilingual-e5-small@onnxruntime-1.31.1";
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let state = state_with_clients(Some("s3cret"), &["editor-a"]);
+        let full_scope = || headers_with("authorization", "Bearer s3cret");
+
+        set_last_coverage(None);
+        let before = health_body(state.clone(), full_scope()).await;
+        assert!(
+            before["runtime"].get("vectors").is_none(),
+            "nothing has been counted yet, and a number nobody measured is not shown: {before}"
+        );
+
+        set_last_coverage(Some(VectorCoverage {
+            tag: CURRENT.to_string(),
+            observations: TableCoverage {
+                total: 12,
+                missing: 0,
+                stale: 7,
+            },
+            ..VectorCoverage::default()
+        }));
+        let full = health_body(state.clone(), full_scope()).await;
+        let anonymous = health_body(state, HeaderMap::new()).await;
+        set_last_coverage(None);
+
+        let vectors = &full["runtime"]["vectors"];
+        assert_eq!(vectors["tag"], CURRENT);
+        assert_eq!(vectors["stale"], 7);
+        assert_eq!(vectors["missing"], 0);
+        assert_eq!(
+            vectors["command"], "memory-industry reembed",
+            "the block says what to run, not only what is wrong"
+        );
+        assert_eq!(
+            full["status"], before["status"],
+            "vectors of another generation do not degrade the verdict"
+        );
+
+        assert!(
+            anonymous.get("runtime").is_none(),
+            "the runtime block is the inventory an anonymous caller does not get: {anonymous}"
+        );
+        assert!(
+            !anonymous.to_string().contains("onnxruntime-1.31.1"),
+            "nor does the label of the runtime leak somewhere else: {anonymous}"
         );
     }
 

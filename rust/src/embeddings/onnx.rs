@@ -36,6 +36,23 @@ pub fn current_model() -> String {
     std::env::var("CUBA_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
 }
 
+/// What a stored vector says made it: the model and the ONNX Runtime that computed it
+/// (`multilingual-e5-small@onnxruntime-1.31.1`). Two runtimes do not compute the same numbers
+/// (1.26.0 against 1.31.1: up to 1.4e-3 in `1 - cos`, measured), and a vector is only
+/// interchangeable with another of the same label. Without a runtime loaded the label is the model
+/// alone, which no loaded process writes: a vector is only written after one embedded.
+pub fn vector_tag_of(model: &str, runtime: Option<&str>) -> String {
+    match runtime {
+        Some(runtime) => format!("{model}@onnxruntime-{runtime}"),
+        None => model.to_string(),
+    }
+}
+
+/// The label of a vector this process writes now.
+pub fn vector_tag() -> String {
+    vector_tag_of(&current_model(), loaded_runtime_version().as_deref())
+}
+
 static CACHE: OnceLock<std::sync::Mutex<TtlLruCache<Vec<f32>>>> = OnceLock::new();
 
 static ONNX_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
@@ -716,7 +733,7 @@ pub async fn model_loaded() -> bool {
 /// loaded: the type does not let it. It is never dropped, so `ort` does not
 /// release it at exit, as the sessions in the statics beside it are not
 /// either; CI-E31 and the E2E watch that the process still leaves with 0.
-static RUNTIME: OnceLock<std::result::Result<(libloading::Library, Environment), String>> =
+static RUNTIME: OnceLock<std::result::Result<(libloading::Library, Environment, String), String>> =
     OnceLock::new();
 
 /// Loads ONNX Runtime from `path` before any session opens.
@@ -734,8 +751,36 @@ pub(crate) fn load_onnxruntime(path: &std::path::Path) -> Result<&'static Enviro
          unset it and run `memory-industry models runtime`"
     );
     match RUNTIME.get_or_init(|| load_onnxruntime_once(path).map_err(|e| format!("{e:#}"))) {
-        Ok((_library, environment)) => Ok(environment),
+        Ok((_library, environment, _version)) => Ok(environment),
         Err(reason) => Err(anyhow::anyhow!("{reason}")),
+    }
+}
+
+/// The version string the runtime this process loaded gave (`1.31.1`), or `None` while
+/// nothing has loaded one or the load failed. What `doctor` says about the runtime and
+/// what `tests/model_parity.rs` compares with the version `models runtime` installs.
+pub fn loaded_runtime_version() -> Option<String> {
+    let (_library, _environment, version) = RUNTIME.get()?.as_ref().ok()?;
+    Some(version.clone())
+}
+
+/// Turns the telemetry of ONNX Runtime off for a process that has not loaded it yet,
+/// unless the operator decided: a value already set stays, whatever it is, except an
+/// empty one, which is no decision and counts as unset (the judge reads it the same
+/// way, `gate-lock.sh`: `${ORT_DISABLE_TELEMETRY:-1}`).
+///
+/// From 1.31 the official builds send telemetry to Microsoft over HTTPS by default, with
+/// a persistent device identifier. `Environment::with_telemetry(false)` (`load_onnxruntime_once`)
+/// stops what it can, but ONNX Runtime may have emitted its first event by then: only
+/// this variable, set before the library starts, prevents the uploader and the
+/// identifier from being created. `main` calls this next to `resources::apply`, before
+/// the tokio runtime exists, because `set_var` is only sound while one thread reads
+/// the environment.
+pub fn keep_onnx_runtime_telemetry_off() {
+    if std::env::var_os("ORT_DISABLE_TELEMETRY").is_none_or(|value| value.is_empty()) {
+        // SAFETY: called from `main` before the runtime and any thread of ours; the
+        // test that exercises it holds `GLOBAL_STATE_GUARD`.
+        unsafe { std::env::set_var("ORT_DISABLE_TELEMETRY", "1") };
     }
 }
 
@@ -769,24 +814,33 @@ pub(crate) fn load_onnxruntime(path: &std::path::Path) -> Result<&'static Enviro
 /// any other: no session opens, and the answer is kept like the rest. Its
 /// text names the environment and not the path, so `/health` has no second
 /// place to redact.
-fn load_onnxruntime_once(path: &std::path::Path) -> Result<(libloading::Library, Environment)> {
+fn load_onnxruntime_once(
+    path: &std::path::Path,
+) -> Result<(libloading::Library, Environment, String)> {
     let path = std::path::absolute(path)
         .with_context(|| format!("resolving the ONNX Runtime path {}", path.display()))?;
-    let library = open_runtime_library(&path)?;
+    let (library, version) = open_runtime_library(&path)?;
     let environment = ort::init_from(&path)
         .map_err(|e| anyhow::anyhow!("loading ONNX Runtime from {}: {e}", path.display()))?
         .with_telemetry(false)
         .build()
         .map_err(|e| anyhow::anyhow!("creating the ONNX Runtime environment: {e}"))?;
-    Ok((library, environment))
+    Ok((library, environment, version))
 }
 
 /// `OrtGetApiBase` as `ort-sys` declares it.
 type GetApiBase = unsafe extern "system" fn() -> *const ort::sys::OrtApiBase;
 
+/// The version of the ONNX Runtime library at `path`, read the way the daemon reads it
+/// and without calling into `ort`. The library is closed again before this returns,
+/// which on Windows is what lets `models runtime` rename the directory it was read from.
+pub(crate) fn runtime_version(path: &std::path::Path) -> Result<String> {
+    open_runtime_library(path).map(|(_library, version)| version)
+}
+
 /// The library at `path`, opened and checked the way `ort`'s loader is about
-/// to check it, without calling into `ort`.
-fn open_runtime_library(path: &std::path::Path) -> Result<libloading::Library> {
+/// to check it, without calling into `ort`, and the version it reports.
+fn open_runtime_library(path: &std::path::Path) -> Result<(libloading::Library, String)> {
     // SAFETY: the same `Library::new` on the same path that `ort` makes a
     // moment later. Loading runs the library's own initialisation and nothing
     // else of it; a file that is not a library is refused by the platform
@@ -826,7 +880,7 @@ fn open_runtime_library(path: &std::path::Path) -> Result<libloading::Library> {
         path.display(),
         ort::MINOR_VERSION
     );
-    Ok(library)
+    Ok((library, version))
 }
 
 /// The minor number of an ONNX Runtime version, read the way `ort` reads it:
@@ -1284,6 +1338,28 @@ mod tests {
         assert_eq!(embed_concurrency(), 1, "0 must fall through to the default");
 
         unsafe { std::env::remove_var("CUBA_EMBED_CONCURRENCY") };
+    }
+
+    /// CI-D5c (B.1). A stored vector says which model and which ONNX Runtime made it, because
+    /// 1.26.0 and 1.31.1 do not compute the same numbers (measured on 11 Nov: up to 1.4e-3 in
+    /// `1 - cos`) and two vectors under one label have to be interchangeable. The three strings
+    /// are written by hand, not built the way the function under test builds them.
+    #[test]
+    fn the_vector_tag_names_the_model_and_the_runtime_that_made_it() {
+        assert_eq!(
+            vector_tag_of("multilingual-e5-small", Some("1.31.1")),
+            "multilingual-e5-small@onnxruntime-1.31.1"
+        );
+        assert_eq!(
+            vector_tag_of("e5-small", Some("1.26.0")),
+            "e5-small@onnxruntime-1.26.0",
+            "the runtime is part of the label whatever the model is called"
+        );
+        assert_eq!(
+            vector_tag_of("multilingual-e5-small", None),
+            "multilingual-e5-small",
+            "with no runtime loaded there is nothing to name, and no vector is written either"
+        );
     }
 
     /// The file name `locate_onnxruntime` searches for, written once for the
@@ -1873,5 +1949,49 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&empty_home);
+    }
+
+    /// CI-D5b (D5b.8). From 1.31 the official builds of ONNX Runtime send
+    /// telemetry to Microsoft unless `ORT_DISABLE_TELEMETRY` is set before the
+    /// library starts, and the only place that runs ahead of it in the daemon is
+    /// `main`, which calls this. An operator who set the variable keeps their
+    /// value, whatever it is: it is theirs to decide, and `set_var` over it
+    /// would be a second opinion nobody asked for, except an empty one, which is
+    /// no word at all (the judge reads it that way: CI-D5c, A.7). The environment
+    /// is only written under the global guard: `set_var` is unsound next to a reader.
+    #[tokio::test]
+    async fn the_daemon_turns_onnx_runtime_telemetry_off_and_leaves_the_operators_word_alone() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        {
+            let _unset = ScopedEnv::cleared("ORT_DISABLE_TELEMETRY");
+            keep_onnx_runtime_telemetry_off();
+            assert_eq!(
+                std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref(),
+                Some("1"),
+                "nobody decided, so telemetry is off: the variable is the only thing that stops \
+                 the first event and the persistent device identifier"
+            );
+        }
+        {
+            let _operator = ScopedEnv::set("ORT_DISABLE_TELEMETRY", "0");
+            keep_onnx_runtime_telemetry_off();
+            assert_eq!(
+                std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref(),
+                Some("0"),
+                "an operator who set it to \"0\" asked for telemetry on, and the daemon respects it"
+            );
+        }
+        {
+            let _empty = ScopedEnv::set("ORT_DISABLE_TELEMETRY", "");
+            keep_onnx_runtime_telemetry_off();
+            assert_eq!(
+                std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref(),
+                Some("1"),
+                "set and empty counts as unset, the rule of `gate-lock.sh` (CI-D5c, A.7): two \
+                 rules for one variable leave the daemon with telemetry on where the judge \
+                 measured it off"
+            );
+        }
     }
 }

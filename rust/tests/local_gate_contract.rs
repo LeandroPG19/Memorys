@@ -3740,7 +3740,7 @@ fn the_self_tests_do_not_move_the_cgroup_of_the_test() {
 /// name carries a value that is not the judge's, so a self-test that reads what it inherits fails
 /// here and not under the judge alone. GATE_SERVER_SYSTEM_ID is the identity of the real server: a
 /// self-test that takes it as its own fixture's identity is red under any other value.
-const JUDGE_ENVIRONMENT: [(&str, &str); 33] = [
+const JUDGE_ENVIRONMENT: [(&str, &str); 35] = [
     ("DATABASE_URL", "postgresql://ajena:ajena@127.0.0.1:1/ajena"),
     // CI-F3.3b-1b-i (D-F3k): merge-gate.sh exports the lock's directory so that the planner can write the
     // lane tickets under it. gate-lock.sh assigns GATE_LOCK itself, so no self-test reads what it inherits.
@@ -3770,6 +3770,14 @@ const JUDGE_ENVIRONMENT: [(&str, &str); 33] = [
     ("CUBA_EMBEDDING_DIM", "7"),
     ("CUBA_EMBED_MODEL", "ajeno"),
     ("CUBA_POOLING", "ajeno"),
+    // CI-D5b (D-D5b-f): gate_model_env exports it on 1 when nobody set it, so the processes of a test run (the official
+    // builds of ONNX Runtime 1.31 send telemetry by default) open no connection. A foreign value, so a self-test that
+    // reads it fails here and not under the judge.
+    ("ORT_DISABLE_TELEMETRY", "ajeno"),
+    // CI-D5c (D-D5c-6): gate_model_env exports where `reembed` keeps its snapshot of old vectors when nobody chose, outside the
+    // cache of the live service, so the tests that run `reembed` (v048) leave nothing under ~/.cache/memory-industry. A foreign
+    // path, so a self-test that reads it fails here and not under the judge alone.
+    ("MEMORY_INDUSTRY_REEMBED_DIR", "/nonexistent-ajeno/reembed"),
     // CI-J9: the planner hands a step the token of its lane ticket (gate-dag.py, D-F3j). A self-test
     // that inherits it spends or refuses a ticket of a gate it is not part of.
     ("CUBA_GATE_LANE_TOKEN", "ajena-0000"),
@@ -4211,6 +4219,263 @@ fn the_model_environment_is_set_in_one_place() {
             .any(|(_, line)| line.trim() == "gate_model_env"),
         "scripts/merge-gate.sh calls gate_model_env: the only step that did (the build with docs) runs no test now, and a \
          call here is a second place that chooses the models (CI-K8)"
+    );
+}
+
+/// CI-D5b (D5b.8). The official builds of ONNX Runtime 1.31 send telemetry to Microsoft unless
+/// `ORT_DISABLE_TELEMETRY` is set before the library starts, and a test must not wait on the network or open a
+/// connection of its own (`ci-rapido`). `gate_model_env` is where the judge sets the environment of every process that
+/// loads the runtime, so it sets this one too: on 1 when the caller did not decide, and never over a value the caller
+/// set. The function is sourced and called in a bash with an empty HOME, so what is read is what it exports and not
+/// what the machine that runs the test had in its cache.
+#[test]
+fn the_judge_turns_onnx_runtime_telemetry_off_unless_the_caller_decided() {
+    let home = std::env::temp_dir().join(format!("gate-model-env-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("creating the empty home of the check");
+    let script = [
+        "source scripts/gate-lock.sh",
+        "( unset ORT_DISABLE_TELEMETRY; gate_model_env; echo \"NOTHING_SET=${ORT_DISABLE_TELEMETRY-unset}\" )",
+        "( export ORT_DISABLE_TELEMETRY=0; gate_model_env; echo \"OPERATOR_SET=${ORT_DISABLE_TELEMETRY-unset}\" )",
+        "",
+    ]
+    .join("\n");
+
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(git_bash())
+        .arg("-s")
+        .current_dir(repo_root())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    child
+        .stdin
+        .take()
+        .expect("bash was given a pipe for its script")
+        .write_all(script.as_bytes())
+        .expect("hand the script to bash");
+    let out = child.wait_with_output().expect("bash finishes");
+    let _ = std::fs::remove_dir_all(&home);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "the script that sources gate-lock.sh and calls gate_model_env did not run to its end, so the lines below \
+         prove nothing. stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "NOTHING_SET=1"),
+        "gate_model_env has to export ORT_DISABLE_TELEMETRY=1 when the caller did not set it, or every process of a \
+         test run that loads ONNX Runtime 1.31 tries to reach Microsoft. stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "OPERATOR_SET=0"),
+        "gate_model_env has to leave a value the caller set as it is: the operator who exported 0 asked for \
+         telemetry on. stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// CI-D5c (B.13, R1). The judge loads ONNX Runtime from a cache of its own (`GATE_RUNTIME_HOME`, a HOME in which
+/// `memory-industry models runtime` was run once), and never from the cache of the live service: loading it from there is
+/// one `models runtime` away from replacing the runtime of a daemon whose memory must not stop. The models are still read from
+/// the user's cache, read-only. `gate_refuse_the_users_runtime` stops the judge when `ORT_DYLIB_PATH` points into the user's
+/// cache, also through a link, or at nothing, and says the command that fills the judge's. The function is sourced and called
+/// in a bash with a HOME of its own, so what is read is what it exports and not what this machine had in its cache.
+#[test]
+fn the_judge_loads_onnx_runtime_from_its_own_cache_and_never_from_the_users() {
+    let home = std::env::temp_dir().join(format!("gate-own-caches-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let library = if cfg!(windows) {
+        "onnxruntime.dll"
+    } else {
+        "libonnxruntime.so"
+    };
+    let users = home.join(".cache/memory-industry/onnxruntime");
+    let legacy = home.join(".cache/cuba-memorys/onnxruntime");
+    let judges =
+        home.join(".cache/memory-industry-gate/runtime-home/.cache/memory-industry/onnxruntime");
+    let models = home.join(".cache/memory-industry/models");
+    for dir in [&users, &legacy, &judges, &models] {
+        std::fs::create_dir_all(dir).expect("creating a cache directory of the check");
+    }
+    for file in [
+        users.join(library),
+        legacy.join(library),
+        judges.join(library),
+        models.join("model_quantized.onnx"),
+    ] {
+        std::fs::write(&file, b"").expect("creating a file of the check");
+    }
+    let script = [
+        "source scripts/gate-lock.sh",
+        "unset ORT_DYLIB_PATH GATE_RUNTIME_HOME ONNX_MODEL_PATH MEMORY_INDUSTRY_REEMBED_DIR",
+        "( gate_model_env",
+        "  echo \"RUNTIME_HOME=$GATE_RUNTIME_HOME\"",
+        "  echo \"ORT=$ORT_DYLIB_PATH\"",
+        "  echo \"MODEL=$ONNX_MODEL_PATH\"",
+        "  echo \"REEMBED=${MEMORY_INDUSTRY_REEMBED_DIR-unset}\"",
+        "  ( gate_refuse_the_users_runtime ) >/dev/null 2>&1; echo \"OWN_RC=$?\" )",
+        "( export GATE_RUNTIME_HOME=\"$HOME/mine\"; gate_model_env; echo \"ORT_OF_MINE=$ORT_DYLIB_PATH\" )",
+        "( export MEMORY_INDUSTRY_REEMBED_DIR=/somewhere/else; gate_model_env; echo \"REEMBED_OF_THE_OPERATOR=$MEMORY_INDUSTRY_REEMBED_DIR\" )",
+        "refuse() { ( export ORT_DYLIB_PATH=\"$2\"; gate_refuse_the_users_runtime ) >\"$HOME/out.$1\" 2>&1; echo \"RC_$1=$?\"; }",
+        &format!("refuse users \"$HOME/.cache/memory-industry/onnxruntime/{library}\""),
+        &format!("refuse legacy \"$HOME/.cache/cuba-memorys/onnxruntime/{library}\""),
+        "if ln -s \"$HOME/.cache/memory-industry/onnxruntime\" \"$HOME/via-link\" 2>/dev/null && [ -L \"$HOME/via-link\" ]; then",
+        &format!("  refuse link \"$HOME/via-link/{library}\""),
+        "else echo LINK_NOT_POSSIBLE; fi",
+        &format!("refuse missing \"$HOME/nothing/{library}\""),
+        "",
+    ]
+    .join("\n");
+
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(git_bash())
+        .arg("-s")
+        .current_dir(repo_root())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("GATE_RUNTIME_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("a POSIX shell has to be reachable: every gate script here is a shell script");
+    child
+        .stdin
+        .take()
+        .expect("bash was given a pipe for its script")
+        .write_all(script.as_bytes())
+        .expect("hand the script to bash");
+    let out = child.wait_with_output().expect("bash finishes");
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let said = |name: &str| -> String {
+        let prefix = format!("{name}=");
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| {
+                panic!("the script printed no {name}. stdout: {stdout}\nstderr: {stderr}")
+            })
+            .to_string()
+    };
+    let refusal = |name: &str| -> String {
+        std::fs::read_to_string(home.join(format!("out.{name}"))).unwrap_or_default()
+    };
+    let linked = !stdout.lines().any(|line| line == "LINK_NOT_POSSIBLE");
+    let (ort, model, reembed) = (said("ORT"), said("MODEL"), said("REEMBED"));
+    let (own_rc, mine, operator) = (
+        said("OWN_RC"),
+        said("ORT_OF_MINE"),
+        said("REEMBED_OF_THE_OPERATOR"),
+    );
+    let (users_rc, legacy_rc, missing_rc) =
+        (said("RC_users"), said("RC_legacy"), said("RC_missing"));
+    let link_rc = linked.then(|| said("RC_link"));
+    let (users_said, legacy_said, link_said, missing_said) = (
+        refusal("users"),
+        refusal("legacy"),
+        refusal("link"),
+        refusal("missing"),
+    );
+    let _ = std::fs::remove_dir_all(&home);
+
+    assert!(
+        out.status.success(),
+        "the script that sources gate-lock.sh and drives the model environment did not run to its end, so the lines below \
+         prove nothing. stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        ort.contains("runtime-home/.cache/memory-industry/onnxruntime/") && ort.ends_with(library),
+        "with nothing set, ORT_DYLIB_PATH has to be inside GATE_RUNTIME_HOME, laid out as a HOME that `models runtime` \
+         filled, and not in the cache of the live service. ORT_DYLIB_PATH={ort}"
+    );
+    assert!(
+        said("RUNTIME_HOME").ends_with(".cache/memory-industry-gate/runtime-home"),
+        "the default of GATE_RUNTIME_HOME is the directory of the judge, next to ci-rapido/ and clusters/: {}",
+        said("RUNTIME_HOME")
+    );
+    assert!(
+        model.ends_with(".cache/memory-industry/models") && !model.contains("runtime-home"),
+        "the models are still read from the cache of the user (read-only): ONNX_MODEL_PATH={model}"
+    );
+    assert_eq!(
+        own_rc, "0",
+        "the runtime the judge chose for itself is not refused by the guard that refuses the user's"
+    );
+    assert!(
+        mine.contains("/mine/.cache/memory-industry/onnxruntime/"),
+        "an exported GATE_RUNTIME_HOME moves the runtime with it: {mine}"
+    );
+    assert!(
+        !reembed.is_empty() && reembed != "unset" && !reembed.contains(".cache/memory-industry/"),
+        "gate_model_env has to give `reembed` a directory for its snapshots outside the cache of the live service, or the \
+         tests that run `reembed` write there. MEMORY_INDUSTRY_REEMBED_DIR={reembed}"
+    );
+    assert_eq!(
+        operator, "/somewhere/else",
+        "and a directory the operator chose stays as it is"
+    );
+
+    for (what, rc, said) in [
+        (
+            "an ORT_DYLIB_PATH in ~/.cache/memory-industry",
+            &users_rc,
+            &users_said,
+        ),
+        (
+            "an ORT_DYLIB_PATH in ~/.cache/cuba-memorys",
+            &legacy_rc,
+            &legacy_said,
+        ),
+        (
+            "an ORT_DYLIB_PATH that is nothing",
+            &missing_rc,
+            &missing_said,
+        ),
+    ] {
+        assert_eq!(
+            rc, "2",
+            "gate_refuse_the_users_runtime has to refuse {what} with exit 2 (gate_refuse). It said: {said}"
+        );
+        assert!(
+            said.contains("models runtime") && said.contains("runtime-home"),
+            "the refusal for {what} has to say the command that fills the judge's own cache, and where: {said}"
+        );
+    }
+    if let Some(rc) = link_rc {
+        assert_eq!(
+            rc, "2",
+            "a path that only looks like the judge's but is a link into the user's cache is the user's cache. It said: {link_said}"
+        );
+    }
+}
+
+/// CI-D5c (B.14). The guard of the runtime runs on the very next order after the models are chosen: a step, or a `--check-models`,
+/// that starts between the two would load the runtime it was handed without anyone having looked at it. Read like the test of
+/// CI-J5 that asks for the call to `gate_model_env`: by the text of the script, outside its self-test.
+#[test]
+fn run_all_tests_checks_the_runtime_right_after_it_chooses_the_models() {
+    let suite = read("scripts/run-all-tests.sh").replace("\r\n", "\n");
+    let code = outside_self_test(&suite);
+    let chosen = code
+        .iter()
+        .position(|(_, line)| line.trim() == "gate_model_env")
+        .expect("run-all-tests.sh does not call gate_model_env (CI-J5)");
+    let next = code[chosen + 1..]
+        .iter()
+        .map(|(_, line)| line.trim())
+        .find(|line| !line.is_empty() && !line.starts_with('#'));
+    assert_eq!(
+        next,
+        Some("gate_refuse_the_users_runtime"),
+        "the order after gate_model_env in run-all-tests.sh has to be gate_refuse_the_users_runtime (CI-D5c, B.14)"
     );
 }
 

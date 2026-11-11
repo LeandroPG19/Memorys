@@ -2,8 +2,42 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-const ORT_VERSION: &str = "1.26.0";
+/// The ONNX Runtime `models runtime` installs. Public because `tests/model_parity.rs`
+/// compares it with the runtime the judge loads: the vectors it pins are measured on
+/// that one, and a judge on another version would be guarding a runtime nobody installs.
+pub const ORT_VERSION: &str = "1.31.1";
+
+/// Which package of the release an install came from. The CUDA major is part of the
+/// name since 1.27: `gpu_cuda12` and `gpu_cuda13` do not share a cudart or a cuBLAS,
+/// and what `doctor` and the hint of a provider that would not start say depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flavor {
+    Cpu,
+    Cuda12,
+    Cuda13,
+}
+
+impl Flavor {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Flavor::Cpu => "cpu",
+            Flavor::Cuda12 => "cuda12",
+            Flavor::Cuda13 => "cuda13",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        [Flavor::Cpu, Flavor::Cuda12, Flavor::Cuda13]
+            .into_iter()
+            .find(|flavor| flavor.as_str() == text)
+    }
+
+    pub(crate) fn is_gpu(self) -> bool {
+        self != Flavor::Cpu
+    }
+}
 
 struct ModelSpec {
     dir: &'static str,
@@ -89,16 +123,15 @@ fn cache_root() -> Result<PathBuf> {
 
 pub async fn run_cli(args: &[String]) -> Result<()> {
     let what = args.first().map(String::as_str).unwrap_or("");
-    let gpu = args.iter().any(|a| a == "--gpu");
     match what {
         "embed" | "embeddings" | "nli" | "reranker" => {
             download_model(&spec(what).unwrap()).await?;
         }
         "runtime" => {
-            download_runtime(gpu).await?;
+            download_runtime(&parse_runtime_args(&args[1..])?).await?;
         }
         "all" => {
-            download_runtime(gpu).await?;
+            download_runtime(&parse_runtime_args(&args[1..])?).await?;
             for m in ["embed", "nli", "reranker"] {
                 download_model(&spec(m).unwrap()).await?;
             }
@@ -136,7 +169,10 @@ fn print_help() {
            embed      multilingual-e5-small (384-d) — búsqueda semántica. ~113 MB\n\
            nli        mDeBERTa-v3-xnli — verify sin LLM. ~1.1 GB\n\
            reranker   bge-reranker-v2-m3 — reordena candidatos. ~4.5 GB (onnx + onnx_data)\n\
-           runtime    libonnxruntime para tu plataforma. ~15 MB\n\
+           runtime    libonnxruntime para tu plataforma. ~11 MB (CPU), 245-450 MB con --gpu\n\
+                      --gpu          el runtime con CUDA; elige 12 o 13 leyendo el driver y la tarjeta\n\
+                      --cuda 12|13   fuerza la versión de CUDA (solo con --gpu)\n\
+                      --if-installed solo actualiza un runtime que ya está; sin ninguno no baja nada\n\
            all        el runtime + los tres modelos\n\
            llm        chat model for extract/judge — alias of `memory-industry llm`\n\n\
          Chat (DeepSeek/Qwen/Ollama/…):  memory-industry llm set <provider> [--key KEY]\n\
@@ -160,6 +196,41 @@ const KNOWN_DIGESTS: &[(&str, &str)] = &[
     (
         "models-bge-m3/tokenizer.json",
         "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790",
+    ),
+    // ONNX Runtime v1.31.1, the `digest` GitHub shows for each asset of the release
+    // (`gh api repos/microsoft/onnxruntime/releases/tags/v1.31.1`). Checked before an
+    // archive is extracted; a package with no line here is refused, not trusted.
+    (
+        "onnxruntime/onnxruntime-linux-x64-1.31.1.tgz",
+        "c849e36a1ef3e22d4ff217b9d1ce4a3cf5b9467b975610913ae959ad5b16bdc9",
+    ),
+    (
+        "onnxruntime/onnxruntime-linux-x64-gpu_cuda12-1.31.1.tgz",
+        "57cd51f677eca19a269cdba31b0c16c15d73a8feea41f170aa8b750447ab1f70",
+    ),
+    (
+        "onnxruntime/onnxruntime-linux-x64-gpu_cuda13-1.31.1.tgz",
+        "b2146862e691f7e338f5aff9c7a9a5567c2ca57cf01442a1adb3a13bf62d9095",
+    ),
+    (
+        "onnxruntime/onnxruntime-linux-aarch64-1.31.1.tgz",
+        "5317505e2da99be65f8e2775ba3c2afd6d2961fd78aba1bd8f56159f48820c78",
+    ),
+    (
+        "onnxruntime/onnxruntime-osx-arm64-1.31.1.tgz",
+        "2e1344a1926ee50eb25b38153cb6992c3567515aef0e677a1a520a1798896d6f",
+    ),
+    (
+        "onnxruntime/onnxruntime-win-x64-1.31.1.zip",
+        "5869e26bb25314375f2d5ef1877e3ea06b1543d6c710e6e4a1ec2f7177ab4b2c",
+    ),
+    (
+        "onnxruntime/onnxruntime-win-x64-gpu_cuda12-1.31.1.zip",
+        "5cbf65edc93dc7bb3296249b1b6e1b2228e575902af64d6163d0da2103cef9d5",
+    ),
+    (
+        "onnxruntime/onnxruntime-win-x64-gpu_cuda13-1.31.1.zip",
+        "6c64508de9c04f9d938297287e9d81fa47a2fbbb30cc04e6fac0db88f6cb68c1",
     ),
 ];
 
@@ -261,101 +332,780 @@ async fn download_model(spec: &ModelSpec) -> Result<()> {
     Ok(())
 }
 
-fn runtime_target(gpu: bool) -> Result<(String, &'static str, &'static str)> {
+/// The package of the release for a platform and a flavor: its name without the
+/// extension, the extension, and the library the loader looks for.
+///
+/// `os` and `arch` come in as text so one machine can answer for every platform; the
+/// caller hands it `std::env::consts`. The GPU packages exist for x64 Linux and
+/// Windows only, and there is no macOS x86_64 package after 1.23.2: both are an error
+/// that says so, because the alternative was a 404 on a name that looked right and,
+/// for the GPU, a CPU runtime handed over in silence.
+fn runtime_archive(
+    os: &str,
+    arch: &str,
+    flavor: Flavor,
+) -> Result<(String, &'static str, &'static str)> {
     let v = ORT_VERSION;
-    let (archive, ext, lib) = match (std::env::consts::OS, std::env::consts::ARCH, gpu) {
-        ("linux", "x86_64", false) => (
-            format!("onnxruntime-linux-x64-{v}"),
-            "tgz",
-            "libonnxruntime.so",
+    let (platform, ext, lib) = match (os, arch) {
+        ("linux", "x86_64") => ("linux-x64", "tgz", "libonnxruntime.so"),
+        ("linux", "aarch64") => ("linux-aarch64", "tgz", "libonnxruntime.so"),
+        ("macos", "aarch64") => ("osx-arm64", "tgz", "libonnxruntime.dylib"),
+        ("windows", "x86_64") => ("win-x64", "zip", "onnxruntime.dll"),
+        ("macos", "x86_64") => bail!(
+            "no hay paquete de ONNX Runtime para macos/x86_64 desde la 1.24 (el último es la \
+             1.23.2) y este binario pide la 1.24 o más. Compilá uno y apuntá ORT_DYLIB_PATH a la \
+             librería."
         ),
-        ("linux", "x86_64", true) => (
-            format!("onnxruntime-linux-x64-gpu-{v}"),
-            "tgz",
-            "libonnxruntime.so",
-        ),
-        ("linux", "aarch64", _) => (
-            format!("onnxruntime-linux-aarch64-{v}"),
-            "tgz",
-            "libonnxruntime.so",
-        ),
-        ("macos", "x86_64", _) => (
-            format!("onnxruntime-osx-x86_64-{v}"),
-            "tgz",
-            "libonnxruntime.dylib",
-        ),
-        ("macos", "aarch64", _) => (
-            format!("onnxruntime-osx-arm64-{v}"),
-            "tgz",
-            "libonnxruntime.dylib",
-        ),
-        ("windows", "x86_64", false) => {
-            (format!("onnxruntime-win-x64-{v}"), "zip", "onnxruntime.dll")
-        }
-        ("windows", "x86_64", true) => (
-            format!("onnxruntime-win-x64-gpu-{v}"),
-            "zip",
-            "onnxruntime.dll",
-        ),
-        (os, arch, _) => bail!(
+        _ => bail!(
             "no tengo el runtime prearmado para {os}/{arch}. Instalá onnxruntime {v} a mano \
              y apuntá ORT_DYLIB_PATH a la librería."
         ),
     };
-    let ext: &'static str = ext;
-    let lib: &'static str = lib;
-    Ok((archive, ext, lib))
+    let suffix = match flavor {
+        Flavor::Cpu => "",
+        Flavor::Cuda12 | Flavor::Cuda13 if !matches!(platform, "linux-x64" | "win-x64") => bail!(
+            "Microsoft no publica runtime GPU de núcleo para {os}-{arch}; sin --gpu baja el de CPU"
+        ),
+        Flavor::Cuda12 => "-gpu_cuda12",
+        Flavor::Cuda13 => "-gpu_cuda13",
+    };
+    Ok((format!("onnxruntime-{platform}{suffix}-{v}"), ext, lib))
 }
 
-async fn download_runtime(gpu: bool) -> Result<()> {
-    let (archive_stem, ext, lib_name) = runtime_target(gpu)?;
-    let dir = cache_root()?.join("onnxruntime");
-    let lib_dest = dir.join(lib_name);
+/// What the CUDA driver says about this machine, read the way `nvidia-smi` does
+/// but through `libcuda`: `cuDriverGetVersion` (12080 is CUDA 12.8) and the
+/// compute capability of card 0. The version is read first and stands alone: a
+/// card that does not answer (`compute: None`) is still a driver with a version.
+struct CudaProbe {
+    driver: i32,
+    compute: Option<(i32, i32)>,
+}
 
-    if !gpu && has_content(&lib_dest) {
-        println!("→ runtime: {lib_name} ya está en {}", dir.display());
-        return Ok(());
+/// Turing, SM 7.5: the oldest card the CUDA 13 packages are built for.
+const OLDEST_CARD_OF_CUDA_13: (i32, i32) = (7, 5);
+
+fn cuda_version(driver: i32) -> String {
+    format!("{}.{}", driver / 1000, driver % 1000 / 10)
+}
+
+/// Which GPU package to fetch: the flag when there is one, and otherwise what the
+/// driver and the card can run. Every row of the table is judged on a machine with
+/// no card because the reading comes in as `probe`, and it is called only when its
+/// answer decides: `--cuda 12` never reads the driver, and `cuInit` on a machine
+/// with a card is not free. CUDA 12 is deprecated by Microsoft since 1.27, so the
+/// answer is 13 unless the driver or the card cannot take it. No driver at all is
+/// 13 with a line that says so: an install made ahead of the card is the common
+/// case, and the line tells how to ask for 12.
+fn choose_cuda(
+    forced: Option<u8>,
+    probe: &dyn Fn() -> Option<CudaProbe>,
+) -> Result<(Flavor, Option<String>)> {
+    match forced {
+        Some(12) => Ok((Flavor::Cuda12, None)),
+        Some(_) => forced_cuda_13(probe()),
+        None => cuda_the_driver_can_run(probe()),
     }
+}
 
-    let url = format!(
-        "https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/{archive_stem}.{ext}"
-    );
-    println!(
-        "→ runtime {}({}/{}) desde {url}",
-        if gpu { "GPU " } else { "" },
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    );
+/// `--cuda 13` holds against everything but a card that cannot run it.
+fn forced_cuda_13(probe: Option<CudaProbe>) -> Result<(Flavor, Option<String>)> {
+    match probe.and_then(|card| card.compute) {
+        Some(compute) if compute < OLDEST_CARD_OF_CUDA_13 => bail!(
+            "CUDA 13 no soporta la tarjeta 0 (capacidad de cómputo {}.{}, anterior a Turing): \
+             usá --cuda 12",
+            compute.0,
+            compute.1
+        ),
+        _ => Ok((Flavor::Cuda13, None)),
+    }
+}
 
-    let extracted = materialize_dir(&dir, move |staging| async move {
-        let archive_path = staging.join(format!("{archive_stem}.{ext}"));
-        print!("  ↓ descargando ... ");
-        std::io::stdout().flush().ok();
-        download_to(&url, &archive_path)
-            .await
-            .context("descargando el runtime")?;
-        println!("{} MB", std::fs::metadata(&archive_path)?.len() / 1_048_576);
-
-        print!("  ⇢ extrayendo ... ");
-        std::io::stdout().flush().ok();
-        let extracted = extract_runtime(&archive_path, ext, lib_name, &staging, gpu)
-            .with_context(|| format!("extrayendo el runtime de {}", archive_path.display()))?;
-        std::fs::remove_file(&archive_path).ok();
-        Ok::<_, anyhow::Error>(extracted)
+/// The version of the driver decides below 13 without looking at the card; from 13 up
+/// the card decides, and a card that did not answer is CUDA 13 with a line that says so.
+fn cuda_the_driver_can_run(probe: Option<CudaProbe>) -> Result<(Flavor, Option<String>)> {
+    let Some(card) = probe else {
+        return Ok((
+            Flavor::Cuda13,
+            Some(
+                "no veo driver NVIDIA: bajo CUDA 13; con un driver de CUDA 12 o una tarjeta \
+                 anterior a Turing (SM < 7.5) usá --cuda 12"
+                    .to_string(),
+            ),
+        ));
+    };
+    if card.driver < 12000 {
+        bail!(
+            "el driver soporta CUDA {}; el runtime GPU necesita 12 o 13: actualizá el driver o \
+             bajá el de CPU sin --gpu",
+            cuda_version(card.driver)
+        );
+    }
+    if card.driver < 13000 {
+        return Ok((Flavor::Cuda12, None));
+    }
+    Ok(match card.compute {
+        None => (
+            Flavor::Cuda13,
+            Some(
+                "no pude leer la tarjeta 0: bajo CUDA 13; con una tarjeta anterior a Turing \
+                 (SM < 7.5) usá --cuda 12"
+                    .to_string(),
+            ),
+        ),
+        Some(compute) if compute < OLDEST_CARD_OF_CUDA_13 => (
+            Flavor::Cuda12,
+            Some(format!(
+                "CUDA 13 no soporta SM {}.{}: bajo CUDA 12",
+                compute.0, compute.1
+            )),
+        ),
+        Some(_) => (Flavor::Cuda13, None),
     })
-    .await?;
+}
+
+/// `libcuda`, loaded and asked, or `None` when there is no driver. The card is
+/// asked after the version and may not answer: that is a driver with no capability,
+/// not a machine with no driver. `cuDriverGetVersion` needs no `cuInit`; the
+/// capability does.
+fn probe_cuda() -> Option<CudaProbe> {
+    let name = if cfg!(windows) {
+        "nvcuda.dll"
+    } else if cfg!(target_os = "linux") {
+        "libcuda.so.1"
+    } else {
+        return None;
+    };
+    // SAFETY: loading the driver runs its initialisation and nothing of ours; a name
+    // that is not there is an `Err`, which is the answer «no driver».
+    let library = unsafe { libloading::Library::new(name) }.ok()?;
+    let probe = read_cuda(&library);
+    // The driver does not support being unloaded after `cuInit`; the process is a
+    // command that ends right after.
+    std::mem::forget(library);
+    probe
+}
+
+fn read_cuda(library: &libloading::Library) -> Option<CudaProbe> {
+    type DriverVersion = unsafe extern "system" fn(*mut i32) -> i32;
+    type Init = unsafe extern "system" fn(u32) -> i32;
+    type DeviceGet = unsafe extern "system" fn(*mut i32, i32) -> i32;
+    type Attribute = unsafe extern "system" fn(*mut i32, i32, i32) -> i32;
+    const COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+    const COMPUTE_CAPABILITY_MINOR: i32 = 76;
+
+    // SAFETY: the names and signatures are those of the CUDA driver API (`cuda.h`):
+    // `CUresult cuDriverGetVersion(int*)`, `cuInit(unsigned int)`, `cuDeviceGet(CUdevice*,
+    // int)` and `cuDeviceGetAttribute(int*, CUdevice_attribute, CUdevice)`, where
+    // `CUdevice` is an `int`. Each takes pointers to locals that outlive the call, and
+    // a nonzero `CUresult` is read as «no answer».
+    unsafe {
+        let version = library.get::<DriverVersion>(b"cuDriverGetVersion").ok()?;
+        let init = library.get::<Init>(b"cuInit").ok()?;
+        let device_get = library.get::<DeviceGet>(b"cuDeviceGet").ok()?;
+        let attribute = library.get::<Attribute>(b"cuDeviceGetAttribute").ok()?;
+        let (mut driver, mut device, mut major, mut minor) = (0, 0, 0, 0);
+        if version(&mut driver) != 0 {
+            return None;
+        }
+        let card_answered = init(0) == 0
+            && device_get(&mut device, 0) == 0
+            && attribute(&mut major, COMPUTE_CAPABILITY_MAJOR, device) == 0
+            && attribute(&mut minor, COMPUTE_CAPABILITY_MINOR, device) == 0;
+        Some(CudaProbe {
+            driver,
+            compute: card_answered.then_some((major, minor)),
+        })
+    }
+}
+
+/// The record `models runtime` writes beside the library: which package the
+/// directory holds. «The library exists» does not say which version it is, and
+/// loading it to find out would keep a DLL open in the process that is about to
+/// replace it.
+const RUNTIME_RECORD: &str = "runtime.json";
+
+pub(crate) struct RuntimeRecord {
+    pub(crate) version: String,
+    pub(crate) flavor: Flavor,
+    archive: String,
+}
+
+/// `None` for a record that is not there, does not parse or lacks a field: an
+/// unreadable record is no record, and must not stop a reinstall.
+pub(crate) fn read_runtime_record(dir: &Path) -> Option<RuntimeRecord> {
+    let text = std::fs::read_to_string(dir.join(RUNTIME_RECORD)).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let field = |name: &str| json.get(name)?.as_str().map(str::to_string);
+    Some(RuntimeRecord {
+        version: field("version")?,
+        flavor: Flavor::parse(&field("flavor")?)?,
+        archive: field("archive")?,
+    })
+}
+
+/// What a runtime directory holds, as far as it can be told without loading it.
+enum Installed {
+    Nothing,
+    Recorded {
+        version: String,
+        flavor: Flavor,
+    },
+    /// Every install made before the record existed: a library, and a CUDA
+    /// provider beside it or not.
+    Unrecorded {
+        gpu_provider: bool,
+    },
+}
+
+fn installed_runtime(dir: &Path, lib_name: &str) -> Installed {
+    if !has_content(&dir.join(lib_name)) {
+        return Installed::Nothing;
+    }
+    if let Some(record) = read_runtime_record(dir) {
+        return Installed::Recorded {
+            version: record.version,
+            flavor: record.flavor,
+        };
+    }
+    let gpu_provider = std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("_providers_cuda")
+        })
+    });
+    Installed::Unrecorded { gpu_provider }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeAction {
+    Keep,
+    Install(Flavor),
+}
+
+/// What `models runtime` does with the directory it finds. `gpu` is the flavor that
+/// `--gpu` resolved to; the caller resolves it also for an install with no record
+/// that holds a CUDA provider, which is a GPU runtime of an unknown major.
+///
+/// The directory stays only when its record names the pinned version and no other
+/// flavor is asked for. Anything else is replaced, with the flavor asked for, or
+/// else the one it already had.
+fn runtime_action(installed: &Installed, pinned: &str, gpu: Option<Flavor>) -> RuntimeAction {
+    match (installed, gpu) {
+        (Installed::Recorded { version, flavor }, wanted) if version == pinned => match wanted {
+            Some(other) if other != *flavor => RuntimeAction::Install(other),
+            _ => RuntimeAction::Keep,
+        },
+        (Installed::Recorded { flavor, .. }, None) => RuntimeAction::Install(*flavor),
+        (_, Some(flavor)) => RuntimeAction::Install(flavor),
+        (_, None) => RuntimeAction::Install(Flavor::Cpu),
+    }
+}
+
+/// What `models runtime` was asked for.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RuntimeArgs {
+    gpu: bool,
+    cuda: Option<u8>,
+    if_installed: bool,
+}
+
+fn parse_runtime_args(args: &[String]) -> Result<RuntimeArgs> {
+    let mut ask = RuntimeArgs::default();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--gpu" => ask.gpu = true,
+            "--if-installed" => ask.if_installed = true,
+            "--cuda" => {
+                ask.cuda = Some(match rest.next().map(String::as_str) {
+                    Some("12") => 12,
+                    Some("13") => 13,
+                    other => bail!("--cuda pide 12 o 13 (recibió {})", other.unwrap_or("nada")),
+                });
+            }
+            other => bail!(
+                "opción desconocida `{other}` (`memory-industry models help` dice cuáles hay)"
+            ),
+        }
+    }
+    if ask.cuda.is_some() && !ask.gpu {
+        bail!("--cuda elige qué runtime de GPU bajar y solo va con --gpu");
+    }
+    Ok(ask)
+}
+
+/// A package is deleted, and nothing of it extracted, when its sum is not the
+/// pinned one. A package with no pinned sum is refused as well: «no checksum
+/// registered» is acceptable for a model and not for a library the process loads.
+/// The table is handed in, so a test needs no real package.
+fn verify_pinned(table: &[(&str, &str)], dest: &Path, key: &str) -> Result<()> {
+    let Some((_, expected)) = table.iter().find(|(name, _)| *name == key) else {
+        std::fs::remove_file(dest).ok();
+        bail!(
+            "no hay suma fijada para {key}: el runtime no se extrae sin comprobarla. \
+             El archivo se borró."
+        );
+    };
+    let actual = sha256_file(dest)?;
+    if actual != *expected {
+        std::fs::remove_file(dest).ok();
+        bail!(
+            "checksum mismatch for {key}: expected {expected}, got {actual}. \
+             The file was deleted — the download was tampered with or corrupted."
+        );
+    }
+    println!("  ✓ checksum");
+    Ok(())
+}
+
+/// Checks the package against its pinned sum and only then extracts it.
+fn unpack_runtime(
+    table: &[(&str, &str)],
+    archive: &Path,
+    key: &str,
+    ext: &str,
+    lib_name: &str,
+    dir: &Path,
+    gpu: bool,
+) -> Result<Vec<String>> {
+    verify_pinned(table, archive, key)?;
+    print!("  ⇢ extrayendo ... ");
+    std::io::stdout().flush().ok();
+    extract_runtime(archive, ext, lib_name, dir, gpu)
+        .with_context(|| format!("extrayendo el runtime de {key}"))
+}
+
+/// The libraries the provider of each CUDA major loads, by their names on Windows
+/// and on Linux. Without a flavor, the two sets: an install that predates the
+/// record cannot say which one it needs. cuDNN is not in them: from 1.28 it is
+/// optional at run time.
+pub(crate) fn cuda_libraries(flavor: Option<Flavor>) -> String {
+    let set = |major: u8| {
+        format!(
+            "CUDA {major}: cudart64_{major}, cublas64_{major}, cublasLt64_{major} \
+             (libcudart.so.{major}, libcublas.so.{major}, libcublasLt.so.{major})"
+        )
+    };
+    match flavor {
+        Some(Flavor::Cuda12) => set(12),
+        Some(Flavor::Cuda13) => set(13),
+        Some(Flavor::Cpu) | None => format!("{} o {}", set(12), set(13)),
+    }
+}
+
+/// `<leaf>.downloading` is a package that came whole: its record is written last,
+/// after the sum was checked and the library extracted, so a directory with one is
+/// the install of a run that only failed to swap it in.
+fn staged_is_complete(staging: &Path, file: &str, flavor: Flavor, lib_name: &str) -> bool {
+    has_content(&staging.join(lib_name))
+        && read_runtime_record(staging).is_some_and(|record| {
+            record.version == ORT_VERSION && record.flavor == flavor && record.archive == file
+        })
+}
+
+/// Downloads, checks and extracts the package into an empty `staging`, and writes the
+/// record last.
+async fn fetch_runtime(
+    staging: &Path,
+    stem: &str,
+    ext: &str,
+    lib_name: &str,
+    flavor: Flavor,
+) -> Result<()> {
+    if std::fs::symlink_metadata(staging).is_ok() {
+        remove_entry(staging)?;
+    }
+    std::fs::create_dir_all(staging).with_context(|| format!("creando {}", staging.display()))?;
+    let file = format!("{stem}.{ext}");
+    let key = format!("onnxruntime/{file}");
+    let url =
+        format!("https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/{file}");
+    let archive = staging.join(&file);
+    print!("  ↓ descargando {url} ... ");
+    std::io::stdout().flush().ok();
+    download_to(&url, &archive)
+        .await
+        .context("descargando el runtime")?;
+    println!("{} MB", std::fs::metadata(&archive)?.len() / 1_048_576);
+
+    let extracted = unpack_runtime(
+        KNOWN_DIGESTS,
+        &archive,
+        &key,
+        ext,
+        lib_name,
+        staging,
+        flavor.is_gpu(),
+    )?;
+    std::fs::remove_file(&archive).ok();
     println!("ok ({} librerías)", extracted.len());
     for name in &extracted {
         println!("     {name}");
     }
+    let record = serde_json::json!({
+        "version": ORT_VERSION,
+        "flavor": flavor.as_str(),
+        "archive": file,
+        "sha256": expected_digest(&key),
+    });
+    std::fs::write(staging.join(RUNTIME_RECORD), record.to_string())
+        .context("escribiendo runtime.json")?;
+    Ok(())
+}
+
+/// The runtime of `staging` takes the place of `leaf` in two renames of the same
+/// parent directory, so there is no moment with files of two versions in one
+/// directory, and the old one is kept aside until the new one has loaded.
+///
+/// `rename` is handed in, as in `relocate_with`: on Linux a directory with a library
+/// mapped renames without complaint, and «in use» is something only Windows says.
+///
+/// A process can die between the two renames, so what each directory holds on
+/// entry is read before anything is deleted (`<leaf>` is the leaf, `.previous` the
+/// old runtime aside, `.failed` a package that did not load):
+/// - no leaf and a `.previous`: the cut. The old runtime is the only copy there is
+///   and it comes back (`recover_cut_swap`); nothing is deleted before that;
+/// - a leaf and a `.previous`: a swap that went through and did not finish retiring
+///   the old one. What the operator put in it moves to the leaf, and the swap does
+///   not go on while something stays (`retire_previous`);
+/// - a leaf and a `.failed`: deleted, nothing reads it;
+/// - no leaf, no `.previous`: a first install, and a `.failed` is left alone.
+///
+/// What stays on each failure:
+/// - the leaf is in use: nothing moved, the staging stays whole for the next run;
+/// - the new one does not load (`verify`): it is kept as `<leaf>.failed` and the old
+///   one comes back as the leaf. With no old one (a first install) there is no leaf.
+fn swap_runtime(
+    staging: &Path,
+    leaf: &Path,
+    verify: &dyn Fn(&Path) -> Result<()>,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let previous = sibling(leaf, "previous");
+    let failed = sibling(leaf, "failed");
+    recover_cut_swap(leaf, rename)?;
+    set_aside(leaf, &previous, &failed, rename)?;
+    if let Err(e) = rename(staging, leaf) {
+        let cause = in_use_or_itself(anyhow::Error::new(e).context(format!(
+            "moviendo {} a {}",
+            staging.display(),
+            leaf.display()
+        )));
+        return Err(restored(cause, &previous, leaf, rename));
+    }
+    if let Err(cause) = verify(leaf) {
+        if rename(leaf, &failed).is_err() {
+            let _ = std::fs::remove_dir_all(leaf);
+        }
+        let cause = cause.context("el runtime nuevo no pasó la comprobación y quedó el anterior");
+        return Err(restored(cause, &previous, leaf, rename));
+    }
+    if let Some(notice) = retire_previous(&previous, leaf) {
+        println!("  ({notice})");
+    }
+    Ok(())
+}
+
+/// A swap cut between its two renames leaves no leaf and the old runtime as
+/// `<leaf>.previous`, the only copy there is: it goes back to its place, and the
+/// line says so. With a leaf, or with nothing aside, there is nothing to undo.
+fn recover_cut_swap(
+    leaf: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let previous = sibling(leaf, "previous");
+    if std::fs::symlink_metadata(leaf).is_ok() || std::fs::symlink_metadata(&previous).is_err() {
+        return Ok(());
+    }
+    rename(&previous, leaf).map_err(|e| {
+        in_use_or_itself(anyhow::Error::new(e).context(format!(
+            "devolviendo {} a {}",
+            previous.display(),
+            leaf.display()
+        )))
+    })?;
+    println!(
+        "→ runtime: el runtime anterior vuelve a su sitio ({}): un reemplazo se cortó a medias",
+        leaf.display()
+    );
+    Ok(())
+}
+
+/// The first rename of the swap: the leaf, if there is one, goes aside as
+/// `.previous`, after the leftovers of an earlier swap are dealt with (a failed
+/// package is deleted, and an old runtime aside is retired, which can refuse).
+fn set_aside(
+    leaf: &Path,
+    previous: &Path,
+    failed: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    if std::fs::symlink_metadata(leaf).is_err() {
+        return Ok(());
+    }
+    if std::fs::symlink_metadata(failed).is_ok() {
+        remove_entry(failed).map_err(in_use_or_itself)?;
+    }
+    if let Some(notice) = retire_previous(previous, leaf) {
+        bail!("un reemplazo anterior dejó el runtime viejo aparte: {notice}");
+    }
+    rename(leaf, previous).map_err(|e| {
+        in_use_or_itself(anyhow::Error::new(e).context(format!(
+            "apartando {} como {}",
+            leaf.display(),
+            previous.display()
+        )))
+    })
+}
+
+/// What is not of the package (`runtime.json`, `onnxruntime*`, `libonnxruntime*`:
+/// the core and the providers of every system) is not the old runtime's to take
+/// with it: the hint of a provider that would not start tells the operator to put
+/// the CUDA libraries beside the runtime, and `models runtime` must not undo that.
+fn belongs_to_the_package(name: &str) -> bool {
+    name == RUNTIME_RECORD || name.starts_with("onnxruntime") || name.starts_with("libonnxruntime")
+}
+
+/// What of `previous` is not of the package, moved into `leaf`; the names that
+/// could not go (one with that name is already there, or the rename failed).
+fn carry_over(previous: &Path, leaf: &Path) -> std::io::Result<Vec<String>> {
+    let mut stayed = Vec::new();
+    for entry in std::fs::read_dir(previous)? {
+        let name = entry?.file_name();
+        let text = name.to_string_lossy().into_owned();
+        if belongs_to_the_package(&text) {
+            continue;
+        }
+        let to = leaf.join(&name);
+        if std::fs::symlink_metadata(&to).is_ok()
+            || std::fs::rename(previous.join(&name), &to).is_err()
+        {
+            stayed.push(text);
+        }
+    }
+    Ok(stayed)
+}
+
+/// The old runtime goes once the new one loaded, with what the operator put beside
+/// it moved to the new one first. `None` when `previous` is gone (or was never
+/// there); otherwise what remains and where, because a file of the operator is never
+/// deleted with the old package and the next run tries again.
+fn retire_previous(previous: &Path, leaf: &Path) -> Option<String> {
+    std::fs::symlink_metadata(previous).ok()?;
+    match carry_over(previous, leaf) {
+        Err(e) => Some(format!(
+            "no pude leer {}: {e}; la siguiente corrida lo vuelve a intentar",
+            previous.display()
+        )),
+        Ok(stayed) if !stayed.is_empty() => Some(format!(
+            "quedan en {}: {}. La siguiente corrida los vuelve a intentar; si siguen ahí, \
+             llevalos a mano a {} o borrá esa carpeta",
+            previous.display(),
+            stayed.join(", "),
+            leaf.display()
+        )),
+        Ok(_) => remove_entry(previous).err().map(|e| {
+            format!(
+                "no pude borrar el runtime anterior, {}: la siguiente corrida lo vuelve a intentar",
+                skip_reason(&e)
+            )
+        }),
+    }
+}
+
+fn in_use_or_itself(error: anyhow::Error) -> anyhow::Error {
+    if in_use(&error) {
+        anyhow::anyhow!(IN_USE)
+    } else {
+        error
+    }
+}
+
+/// The old runtime back where it was, and `cause` as the answer. A machine left
+/// without a runtime is worse than the failure that put it there, so a failure to
+/// restore is said in the same error, together with where the old one is.
+fn restored(
+    cause: anyhow::Error,
+    previous: &Path,
+    leaf: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> anyhow::Error {
+    if std::fs::symlink_metadata(previous).is_err() {
+        return cause;
+    }
+    match rename(previous, leaf) {
+        Ok(()) => cause,
+        Err(e) => cause.context(format!(
+            "y no pude devolver el runtime anterior ({e}); sigue en {}",
+            previous.display()
+        )),
+    }
+}
+
+/// The new runtime says it is the pinned version. Loaded through the same reading as
+/// the daemon's, and dropped before anything else touches the directory.
+fn loads_the_pinned_runtime(leaf: &Path, lib_name: &str) -> Result<()> {
+    let found = crate::embeddings::onnx::runtime_version(&leaf.join(lib_name))?;
+    anyhow::ensure!(
+        found == ORT_VERSION,
+        "el runtime dice ser la versión {found} y se esperaba la {ORT_VERSION}"
+    );
+    Ok(())
+}
+
+/// `--gpu` resolves to a flavor, and so does an install that has no record and a
+/// CUDA provider beside the library, which is a GPU runtime the CPU package would
+/// silently replace. That one stays on CUDA 12 without asking the driver: every
+/// install without a record is older than the record, the installer of then only
+/// fetched `…-gpu-<v>`, which is CUDA 12, and the libraries beside it are the
+/// ones of 12. Moving it to 13 is what `--gpu` is for.
+fn resolve_gpu(
+    ask: &RuntimeArgs,
+    installed: &Installed,
+    probe: &dyn Fn() -> Option<CudaProbe>,
+) -> Result<Option<Flavor>> {
+    if ask.gpu {
+        let (flavor, note) = choose_cuda(ask.cuda, probe)?;
+        if let Some(note) = note {
+            println!("  {note}");
+        }
+        return Ok(Some(flavor));
+    }
+    if matches!(installed, Installed::Unrecorded { gpu_provider: true }) {
+        println!(
+            "  runtime GPU sin registro (de antes de la 0.31): sigue en CUDA 12; \
+             `models runtime --gpu` elige por el driver"
+        );
+        return Ok(Some(Flavor::Cuda12));
+    }
+    Ok(None)
+}
+
+/// Two `models runtime` at once share one staging directory and one leaf, and
+/// the second would delete what the first is filling. One lock file in the cache
+/// root, taken without waiting: an `npm install` does not hang behind another run.
+const RUNTIME_LOCK: &str = "onnxruntime.lock";
+
+/// The lock, held for as long as the returned file lives, or `None` for a cache
+/// root that is not there when all that was asked is to update what exists: it
+/// has no runtime and no `.previous`, and creating it would change which root
+/// `gpu::runtime_dir` and `locate_onnxruntime` choose.
+fn lock_runtime(root: &Path, if_installed: bool) -> Result<Option<std::fs::File>> {
+    if !root.exists() {
+        if if_installed {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(root).with_context(|| format!("creando {}", root.display()))?;
+    }
+    take_lock(&root.join(RUNTIME_LOCK)).map(Some)
+}
+
+fn take_lock(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("abriendo {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "otro `memory-industry models runtime` está cambiando el runtime (candado {}): \
+             esperá a que termine y volvé a correr",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("tomando el candado {}", path.display()))
+        }
+    }
+}
+
+fn nothing_to_update() {
+    println!(
+        "→ runtime: no hay ninguno instalado; `memory-industry models runtime` baja el primero"
+    );
+}
+
+async fn download_runtime(ask: &RuntimeArgs) -> Result<()> {
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let (_, _, lib_name) = runtime_archive(os, arch, Flavor::Cpu)?;
+    let root = cache_root()?;
+    let Some(_lock) = lock_runtime(&root, ask.if_installed)? else {
+        nothing_to_update();
+        return Ok(());
+    };
+    let dir = root.join("onnxruntime");
+    let installed = installed_after_a_cut_swap(&dir, lib_name)?;
+
+    if ask.if_installed && matches!(installed, Installed::Nothing) {
+        nothing_to_update();
+        return Ok(());
+    }
+    let gpu = resolve_gpu(ask, &installed, &probe_cuda)?;
+    act_on_runtime(&dir, &installed, gpu).await
+}
+
+async fn act_on_runtime(dir: &Path, installed: &Installed, gpu: Option<Flavor>) -> Result<()> {
+    match runtime_action(installed, ORT_VERSION, gpu) {
+        RuntimeAction::Keep => {
+            if let Installed::Recorded { flavor, .. } = installed {
+                println!(
+                    "→ runtime: ya está ({ORT_VERSION}, {}) en {}",
+                    flavor.as_str(),
+                    dir.display()
+                );
+            }
+            Ok(())
+        }
+        RuntimeAction::Install(flavor) => install_runtime(dir, flavor).await,
+    }
+}
+
+/// What the directory holds once a swap that was cut has been finished or undone:
+/// «no hay ninguno» is only true after `.previous` had its chance to come back.
+fn installed_after_a_cut_swap(dir: &Path, lib_name: &str) -> Result<Installed> {
+    recover_cut_swap(dir, &|from, to| std::fs::rename(from, to))?;
+    Ok(installed_runtime(dir, lib_name))
+}
+
+async fn install_runtime(dir: &Path, flavor: Flavor) -> Result<()> {
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let (stem, ext, lib_name) = runtime_archive(os, arch, flavor)?;
+    let staging = sibling(dir, "downloading");
+    println!("→ runtime {} ({os}/{arch})", flavor.as_str());
+
+    if staged_is_complete(&staging, &format!("{stem}.{ext}"), flavor, lib_name) {
+        println!("  ✓ el paquete de un intento anterior está completo: no se baja de nuevo");
+    } else {
+        fetch_runtime(&staging, &stem, ext, lib_name, flavor).await?;
+    }
+
+    print!("  ⇄ reemplazando el runtime ... ");
+    std::io::stdout().flush().ok();
+    swap_runtime(
+        &staging,
+        dir,
+        &|leaf| loads_the_pinned_runtime(leaf, lib_name),
+        &|from, to| std::fs::rename(from, to),
+    )?;
+    println!("ok");
     println!(
         "  listo. MemoryIndustry lo encuentra en {} (o ORT_DYLIB_PATH=<ruta>)",
-        lib_dest.display()
+        dir.join(lib_name).display()
     );
-    if gpu {
+    if cfg!(not(windows)) {
         println!(
-            "  nota GPU: el provider CUDA necesita las libs de CUDA 12 + cuDNN 9 accesibles.\n\
-             \x20      si el doctor cae a CPU, agregá sus rutas a LD_LIBRARY_PATH (Linux) o PATH (Windows)."
+            "  un daemon que ya estaba corriendo sigue con el runtime anterior hasta que lo reinicies."
+        );
+    }
+    if flavor.is_gpu() {
+        println!(
+            "  nota GPU: el provider CUDA necesita las bibliotecas de {} accesibles; cuDNN es \
+             opcional.\n\
+             \x20      si el doctor cae a CPU, agregá sus rutas a LD_LIBRARY_PATH (Linux) o PATH (Windows).",
+            cuda_libraries(Some(flavor))
         );
     }
     Ok(())
@@ -464,9 +1214,31 @@ fn extract_runtime(
     }
 }
 
+/// How long a download waits for a peer that goes quiet. No limit on the whole: the
+/// GPU packages are up to 450 MB and a slow line is not a stalled one.
+#[derive(Clone, Copy)]
+struct Timeouts {
+    connect: Duration,
+    /// Between two reads, the wait for the headers included (reqwest's `read_timeout`).
+    read: Duration,
+}
+
+impl Timeouts {
+    const DOWNLOAD: Self = Self {
+        connect: Duration::from_secs(30),
+        read: Duration::from_secs(120),
+    };
+}
+
 async fn download_to(url: &str, dest: &Path) -> Result<()> {
+    download_to_with(url, dest, Timeouts::DOWNLOAD).await
+}
+
+async fn download_to_with(url: &str, dest: &Path, timeouts: Timeouts) -> Result<()> {
     let client = crate::http_client::builder()
         .user_agent(concat!("memory-industry/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
         .build()?;
     let resp = client.get(url).send().await?.error_for_status()?;
     let expected = resp.content_length();
@@ -529,8 +1301,10 @@ where
 }
 
 /// A leaf that does not exist yet appears in one rename. One that does (a
-/// model with a file still missing, a `runtime --gpu` over a CPU runtime)
-/// already existed before this run, so it takes the files one by one.
+/// model with a file still missing) already existed before this run, so it
+/// takes the files one by one. The runtime does not come through here: its
+/// directory is replaced whole (`swap_runtime`), because the files of two
+/// versions side by side are not a runtime.
 fn promote(staging: &Path, leaf: &Path) -> Result<()> {
     if !leaf.exists() {
         std::fs::rename(staging, leaf)?;
@@ -2109,16 +2883,43 @@ mod tests {
         }
     }
 
+    /// What `models runtime` writes beside the library, by hand and not through
+    /// the code under test: the format is the contract between one run and the
+    /// next, so the fixtures spell it out.
+    fn record_json(version: &str, flavor: &str, archive: &str) -> String {
+        format!(
+            r#"{{"version":"{version}","flavor":"{flavor}","archive":"{archive}","sha256":"00"}}"#
+        )
+    }
+
+    /// The runtime of this platform as the host would ask for it on the CPU: its
+    /// archive file name and the library it holds.
+    fn host_cpu_runtime() -> (String, &'static str) {
+        let (stem, ext, lib_name) =
+            runtime_archive(std::env::consts::OS, std::env::consts::ARCH, Flavor::Cpu)
+                .expect("a supported platform");
+        (format!("{stem}.{ext}"), lib_name)
+    }
+
+    /// CI-D5b (D5b.4). Whether a runtime is downloaded is decided by what the
+    /// record beside the library says, and the only way to see «no request» is a
+    /// proxy that counts them. «The file exists» used to answer for every
+    /// version: an install with the 1.26.0 library in place never got the
+    /// 1.31.1 one. `--cuda 12` is what makes the GPU row machine-independent:
+    /// a forced major answers without reading the driver, so a build host with
+    /// an old driver, or none, reaches the same request.
     #[tokio::test]
-    async fn the_runtime_is_downloaded_unless_a_cpu_one_is_there_and_gpu_was_not_asked() {
+    async fn the_runtime_is_downloaded_unless_the_recorded_one_is_the_pinned_one() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
         let home = Home::new("runtime-present");
         let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
         let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
         let proxy = DeadProxy::start().await;
-        let (_, _, lib_name) = runtime_target(false).expect("a supported platform");
+        let (archive, lib_name) = host_cpu_runtime();
+        let leaf = home.roots.preferred.join("onnxruntime");
+        let cpu = RuntimeArgs::default();
 
-        let nothing_there = download_runtime(false).await;
+        let nothing_there = download_runtime(&cpu).await;
         let attempted = proxy.hits();
         assert!(
             nothing_there.is_err() && attempted >= 1,
@@ -2127,24 +2928,39 @@ mod tests {
              {nothing_there:?}"
         );
 
-        put(
-            &home.roots.preferred.join("onnxruntime").join(lib_name),
-            b"runtime",
-        );
-        download_runtime(false)
-            .await
-            .expect("a CPU runtime that is already there is not downloaded again");
-        assert_eq!(
-            proxy.hits(),
-            attempted,
-            "a runtime that is already there makes no request at all"
+        put(&leaf.join(lib_name), b"runtime");
+        let unrecorded = download_runtime(&cpu).await;
+        let after_unrecorded = proxy.hits();
+        assert!(
+            unrecorded.is_err() && after_unrecorded > attempted,
+            "a library with no record beside it is a runtime of unknown version, and every \
+             install made before the record existed is one: it is downloaded again \
+             ({after_unrecorded} requests after {attempted}): {unrecorded:?}"
         );
 
-        let gpu = download_runtime(true).await;
+        put(
+            &leaf.join("runtime.json"),
+            record_json(ORT_VERSION, "cpu", &archive).as_bytes(),
+        );
+        download_runtime(&cpu)
+            .await
+            .expect("the recorded runtime is the pinned one: there is nothing to do");
+        assert_eq!(
+            proxy.hits(),
+            after_unrecorded,
+            "a runtime whose record names the pinned version makes no request at all"
+        );
+
+        let gpu = download_runtime(&RuntimeArgs {
+            gpu: true,
+            cuda: Some(12),
+            if_installed: false,
+        })
+        .await;
         assert!(
-            gpu.is_err() && proxy.hits() > attempted,
-            "`runtime --gpu` over a CPU runtime exists to fetch the GPU build: a CPU library \
-             in the directory must not answer for it: {gpu:?}"
+            gpu.is_err() && proxy.hits() > after_unrecorded,
+            "`runtime --gpu` over a recorded CPU runtime exists to fetch the GPU build: the \
+             pinned version of the CPU one must not answer for it: {gpu:?}"
         );
     }
 
@@ -2276,6 +3092,1268 @@ mod tests {
              runtime its own binary refuses. Raise ORT_VERSION, or lower the `api-NN` feature \
              of `ort` in Cargo.toml",
             ort::MINOR_VERSION
+        );
+    }
+
+    /// CI-D5b (D5b.1). The names of the packages are compared with the ones
+    /// the release `v1.31.1` of microsoft/onnxruntime publishes, copied from its
+    /// asset list, and not with a `format!` of the same pattern the code
+    /// uses: a pattern that is wrong would be wrong in both. `-gpu-` is the
+    /// name of 1.26.0 and answers 404 from 1.27.0 on, which is what the
+    /// `cuda12` row of this table guards.
+    #[test]
+    fn the_installer_asks_for_the_packages_of_the_release_by_platform_and_flavor() {
+        let rows: [(&str, &str, Flavor, &str, &str); 8] = [
+            (
+                "linux",
+                "x86_64",
+                Flavor::Cpu,
+                "onnxruntime-linux-x64-1.31.1.tgz",
+                "libonnxruntime.so",
+            ),
+            (
+                "linux",
+                "x86_64",
+                Flavor::Cuda12,
+                "onnxruntime-linux-x64-gpu_cuda12-1.31.1.tgz",
+                "libonnxruntime.so",
+            ),
+            (
+                "linux",
+                "x86_64",
+                Flavor::Cuda13,
+                "onnxruntime-linux-x64-gpu_cuda13-1.31.1.tgz",
+                "libonnxruntime.so",
+            ),
+            (
+                "linux",
+                "aarch64",
+                Flavor::Cpu,
+                "onnxruntime-linux-aarch64-1.31.1.tgz",
+                "libonnxruntime.so",
+            ),
+            (
+                "macos",
+                "aarch64",
+                Flavor::Cpu,
+                "onnxruntime-osx-arm64-1.31.1.tgz",
+                "libonnxruntime.dylib",
+            ),
+            (
+                "windows",
+                "x86_64",
+                Flavor::Cpu,
+                "onnxruntime-win-x64-1.31.1.zip",
+                "onnxruntime.dll",
+            ),
+            (
+                "windows",
+                "x86_64",
+                Flavor::Cuda12,
+                "onnxruntime-win-x64-gpu_cuda12-1.31.1.zip",
+                "onnxruntime.dll",
+            ),
+            (
+                "windows",
+                "x86_64",
+                Flavor::Cuda13,
+                "onnxruntime-win-x64-gpu_cuda13-1.31.1.zip",
+                "onnxruntime.dll",
+            ),
+        ];
+        assert_eq!(
+            ORT_VERSION, "1.31.1",
+            "the names above are the ones of the release the installer is pinned to"
+        );
+        for (os, arch, flavor, file, library) in rows {
+            let row = format!("{os}/{arch} {flavor:?}");
+            let (stem, ext, lib_name) = runtime_archive(os, arch, flavor)
+                .unwrap_or_else(|e| panic!("{row}: the release has this package: {e:#}"));
+            assert_eq!(
+                format!("{stem}.{ext}"),
+                file,
+                "{row}: the file name of the release"
+            );
+            assert_eq!(lib_name, library, "{row}: the library the loader looks for");
+        }
+
+        for flavor in [Flavor::Cpu, Flavor::Cuda13] {
+            let said = format!(
+                "{:#}",
+                runtime_archive("macos", "x86_64", flavor)
+                    .expect_err("there is no macOS x86_64 package since 1.24")
+            );
+            assert!(
+                said.contains("1.24") && said.contains("ORT_DYLIB_PATH"),
+                "macos/x86_64 {flavor:?}: the error says since when there is no package and what to \
+                 do instead, and not a 404 later: {said}"
+            );
+        }
+        for (os, arch) in [("linux", "aarch64"), ("macos", "aarch64")] {
+            for flavor in [Flavor::Cuda12, Flavor::Cuda13] {
+                let said = format!(
+                    "{:#}",
+                    runtime_archive(os, arch, flavor)
+                        .expect_err("Microsoft publishes no GPU core package for this platform")
+                );
+                assert!(
+                    said.contains("sin --gpu baja el de CPU"),
+                    "{os}/{arch} {flavor:?}: asking for a GPU where there is none must say so, not \
+                     hand over the CPU one in silence: {said}"
+                );
+            }
+        }
+        assert!(
+            runtime_archive("windows", "aarch64", Flavor::Cpu).is_err(),
+            "no package is promised for a platform the table does not know"
+        );
+    }
+
+    /// The eight packages of `the_installer_asks_for_the_packages_…` with the
+    /// first twelve characters of the digest GitHub shows for each asset of
+    /// the release. A pinned sum that belongs to another package of the table
+    /// is as wrong as a missing one, and a length check does not see it.
+    const PINNED_PACKAGES: [(&str, &str, Flavor, &str); 8] = [
+        ("linux", "x86_64", Flavor::Cpu, "c849e36a1ef3"),
+        ("linux", "x86_64", Flavor::Cuda12, "57cd51f677ec"),
+        ("linux", "x86_64", Flavor::Cuda13, "b2146862e691"),
+        ("linux", "aarch64", Flavor::Cpu, "5317505e2da9"),
+        ("macos", "aarch64", Flavor::Cpu, "2e1344a1926e"),
+        ("windows", "x86_64", Flavor::Cpu, "5869e26bb253"),
+        ("windows", "x86_64", Flavor::Cuda12, "5cbf65edc93d"),
+        ("windows", "x86_64", Flavor::Cuda13, "6c64508de9c0"),
+    ];
+
+    /// CI-D5b (D5b.2). The runtime used to be extracted without a checksum
+    /// while the models had one. Each package the installer can ask for has its
+    /// sum pinned under `onnxruntime/<file>`.
+    #[test]
+    fn every_package_the_installer_can_ask_for_has_its_pinned_checksum() {
+        for (os, arch, flavor, prefix) in PINNED_PACKAGES {
+            let (stem, ext, _) = runtime_archive(os, arch, flavor).expect("a package of the table");
+            let key = format!("onnxruntime/{stem}.{ext}");
+            let sum = expected_digest(&key).unwrap_or_else(|| {
+                panic!("{key} has no pinned checksum: the installer would extract it unchecked")
+            });
+            assert_eq!(sum.len(), 64, "{key}: a SHA-256 in hex");
+            assert!(
+                sum.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "{key}: lowercase hex, as `sha256_file` writes it"
+            );
+            assert!(
+                sum.starts_with(prefix),
+                "{key}: the pinned sum starts {} and the release says {prefix}: it is the sum of \
+                 another package, or of another version",
+                &sum[..12]
+            );
+        }
+    }
+
+    /// A tarball with one regular file, which is the shape of the CPU package
+    /// of Linux for what `extract_runtime` reads.
+    fn tiny_runtime_tgz(path: &Path, library: &[u8]) {
+        let file = std::fs::File::create(path).expect("the test owns this file");
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(library.len() as u64);
+        header.set_mode(0o755);
+        builder
+            .append_data(
+                &mut header,
+                "onnxruntime-linux-x64-1.2.3/lib/libonnxruntime.so.1.2.3",
+                library,
+            )
+            .expect("a name the writer takes");
+        builder
+            .into_inner()
+            .expect("the tar is closed")
+            .finish()
+            .expect("the gzip is closed");
+    }
+
+    /// CI-D5b (D5b.2). The checksum is judged before anything is extracted: a
+    /// package that does not match is deleted and leaves nothing behind, and a
+    /// package with no pinned sum is refused as well, because «no checksum
+    /// registered» is a line for a model and a hole for a library that is loaded
+    /// into the process. The table is handed in, so no real package is needed.
+    #[test]
+    fn a_package_that_does_not_match_its_checksum_is_deleted_and_nothing_is_extracted() {
+        let home = Home::new("runtime-checksum");
+        let leaf = home.root.join("onnxruntime");
+        put(&leaf.join("libonnxruntime.so"), b"the runtime in use");
+        let leaf_before = snapshot(&leaf);
+        let staging = sibling(&leaf, "downloading");
+        std::fs::create_dir_all(&staging).expect("the test owns this directory");
+        let archive = staging.join("pkg.tgz");
+        let key = "onnxruntime/pkg.tgz";
+
+        tiny_runtime_tgz(
+            &archive,
+            b"a library, long enough to be the one that is kept",
+        );
+        let right = sha256_file(&archive).expect("the archive is readable");
+        let wrong = "0".repeat(64);
+
+        let kept = unpack_runtime(
+            &[(key, right.as_str())],
+            &archive,
+            key,
+            "tgz",
+            "libonnxruntime.so",
+            &staging,
+            false,
+        )
+        .expect(
+            "an archive that matches its sum is extracted: this is the control of the rows below",
+        );
+        assert!(
+            kept.iter().any(|name| name == "libonnxruntime.so"),
+            "the library the loader looks for is among what was extracted: {kept:?}"
+        );
+        assert!(staging.join("libonnxruntime.so").is_file());
+        for name in &kept {
+            std::fs::remove_file(staging.join(name)).expect("the test owns this file");
+        }
+
+        let altered = unpack_runtime(
+            &[(key, wrong.as_str())],
+            &archive,
+            key,
+            "tgz",
+            "libonnxruntime.so",
+            &staging,
+            false,
+        )
+        .expect_err("a package that does not match its sum must not be extracted");
+        let said = format!("{altered:#}");
+        assert!(
+            said.contains("checksum mismatch") && said.contains(key),
+            "the error names the package and the mismatch: {said}"
+        );
+        assert!(
+            !archive.exists(),
+            "the package that did not match is deleted, as a model is"
+        );
+        assert!(
+            !staging.join("libonnxruntime.so").exists(),
+            "nothing is extracted from a package that did not match"
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            leaf_before,
+            "the runtime in use stays as it was"
+        );
+
+        tiny_runtime_tgz(
+            &archive,
+            b"a library, long enough to be the one that is kept",
+        );
+        let unpinned = unpack_runtime(
+            &[("onnxruntime/another.tgz", right.as_str())],
+            &archive,
+            key,
+            "tgz",
+            "libonnxruntime.so",
+            &staging,
+            false,
+        )
+        .expect_err("a package with no pinned sum must not be extracted");
+        assert!(
+            format!("{unpinned:#}").contains(key),
+            "the error names the package that has no sum: {unpinned:#}"
+        );
+        assert!(
+            !staging.join("libonnxruntime.so").exists(),
+            "nothing is extracted from a package that has no sum"
+        );
+    }
+
+    /// CI-D5b (D5b.3) and CI-D5c (A.5). One row per line of the table of the spec,
+    /// named in the message so a red says which machine it is. A driver whose card
+    /// does not answer (`compute: None`) still has a version, and the version
+    /// alone decides every row where the card would not have.
+    #[test]
+    fn cuda_comes_from_the_driver_and_the_card_and_the_flag_forces_it() {
+        let card = |driver: i32, compute: Option<(i32, i32)>| Some(CudaProbe { driver, compute });
+        let says = |driver: i32, compute: Option<(i32, i32)>, forced: Option<u8>| {
+            choose_cuda(forced, &|| card(driver, compute))
+        };
+
+        let (flavor, note) = choose_cuda(None, &|| None).expect("no driver is not an error");
+        assert_eq!(flavor, Flavor::Cuda13, "no driver: CUDA 13");
+        let note = note.expect("no driver says so");
+        assert!(
+            note.contains("no veo driver NVIDIA") && note.contains("--cuda 12"),
+            "the line that says what was not seen and how to ask for 12: {note}"
+        );
+
+        for (row, driver, compute, want) in [
+            ("driver 13.3, SM 8.9", 13030, Some((8, 9)), Flavor::Cuda13),
+            (
+                "driver 13.3, SM 7.5 (Turing)",
+                13030,
+                Some((7, 5)),
+                Flavor::Cuda13,
+            ),
+            (
+                "driver 13.3, SM 6.1 (Pascal)",
+                13030,
+                Some((6, 1)),
+                Flavor::Cuda12,
+            ),
+            ("driver 12.8, SM 8.9", 12080, Some((8, 9)), Flavor::Cuda12),
+            ("driver 12.0, SM 6.1", 12000, Some((6, 1)), Flavor::Cuda12),
+            ("driver 12.8, card not read", 12080, None, Flavor::Cuda12),
+            ("driver 13.3, card not read", 13030, None, Flavor::Cuda13),
+        ] {
+            let (got, _) = says(driver, compute, None)
+                .unwrap_or_else(|e| panic!("{row}: this machine can take a runtime: {e:#}"));
+            assert_eq!(got, want, "{row}");
+        }
+        let (_, pascal) = says(13030, Some((6, 1)), None).expect("CUDA 12 takes it");
+        assert!(
+            pascal.is_some_and(|line| line.contains("6.1")),
+            "falling to CUDA 12 because of the card says which capability it read"
+        );
+        let (_, healthy) = says(13030, Some((8, 9)), None).expect("CUDA 13 takes it");
+        assert_eq!(
+            healthy, None,
+            "a machine that needs no explanation gets none"
+        );
+        let (_, unread) = says(13030, None, None).expect("CUDA 13 takes a driver of 13.3");
+        assert!(
+            unread.is_some_and(|line| line.contains("tarjeta 0") && line.contains("--cuda 12")),
+            "a card that did not answer under a driver of 13 says it went to CUDA 13 without \
+             reading it, and how to ask for 12 if the card is older than Turing"
+        );
+        let (_, driver_12) = says(12080, None, None).expect("CUDA 12 takes a driver of 12.8");
+        assert_eq!(
+            driver_12, None,
+            "the version of the driver decides below 13: nothing to explain about a card that \
+             was never needed"
+        );
+
+        let (forced, _) = says(13030, Some((8, 9)), Some(12)).expect("12 is forced");
+        assert_eq!(
+            forced,
+            Flavor::Cuda12,
+            "--cuda 12 wins over a driver of 13.3"
+        );
+        let (forced, _) = says(12080, Some((8, 9)), Some(13)).expect("13 is forced");
+        assert_eq!(
+            forced,
+            Flavor::Cuda13,
+            "--cuda 13 wins over a driver of 12.8"
+        );
+        let (forced, _) = says(13030, None, Some(13)).expect("13 is forced");
+        assert_eq!(
+            forced,
+            Flavor::Cuda13,
+            "--cuda 13 over a card that did not answer: there is no capability to refuse it with"
+        );
+
+        let old = format!(
+            "{:#}",
+            says(11080, Some((8, 9)), None)
+                .expect_err("a driver older than CUDA 12 cannot run either package")
+        );
+        assert!(
+            old.contains("11.8") && old.contains("12 o 13"),
+            "the error says the version the driver supports and what the runtime needs: {old}"
+        );
+        let old_unread = format!(
+            "{:#}",
+            says(11080, None, None).expect_err("the driver version is not lost with the card")
+        );
+        assert!(
+            old_unread.contains("11.8") && old_unread.contains("12 o 13"),
+            "a driver older than CUDA 12 whose card did not answer is the same error, not CUDA \
+             13 for a driver that cannot run it: {old_unread}"
+        );
+        let pascal = format!(
+            "{:#}",
+            says(13030, Some((6, 1)), Some(13)).expect_err("forcing CUDA 13 does not fix the card")
+        );
+        assert!(
+            pascal.contains("6.1") && pascal.contains("--cuda 12"),
+            "the error says the capability it read and the way out: {pascal}"
+        );
+    }
+
+    /// CI-D5b (D5b.4). The table of §4.2 of the spec, one row per case. `gpu` is
+    /// the flavor `--gpu` resolved to (the caller resolves it for an install
+    /// without a record that holds a CUDA provider too, which is the last row
+    /// but one).
+    #[test]
+    fn a_runtime_is_replaced_only_when_its_record_does_not_name_the_version_and_flavor_asked() {
+        let recorded = |version: &str, flavor: Flavor| Installed::Recorded {
+            version: version.to_string(),
+            flavor,
+        };
+        let pinned = "1.31.1";
+        for (row, installed, gpu, want) in [
+            (
+                "nothing, CPU",
+                Installed::Nothing,
+                None,
+                RuntimeAction::Install(Flavor::Cpu),
+            ),
+            (
+                "nothing, --gpu (13)",
+                Installed::Nothing,
+                Some(Flavor::Cuda13),
+                RuntimeAction::Install(Flavor::Cuda13),
+            ),
+            (
+                "pinned CPU, CPU",
+                recorded(pinned, Flavor::Cpu),
+                None,
+                RuntimeAction::Keep,
+            ),
+            (
+                "pinned CUDA 13, no --gpu",
+                recorded(pinned, Flavor::Cuda13),
+                None,
+                RuntimeAction::Keep,
+            ),
+            (
+                "pinned CUDA 13, --gpu 13",
+                recorded(pinned, Flavor::Cuda13),
+                Some(Flavor::Cuda13),
+                RuntimeAction::Keep,
+            ),
+            (
+                "pinned CPU, --gpu 13",
+                recorded(pinned, Flavor::Cpu),
+                Some(Flavor::Cuda13),
+                RuntimeAction::Install(Flavor::Cuda13),
+            ),
+            (
+                "pinned CUDA 13, --gpu --cuda 12",
+                recorded(pinned, Flavor::Cuda13),
+                Some(Flavor::Cuda12),
+                RuntimeAction::Install(Flavor::Cuda12),
+            ),
+            (
+                "pinned CUDA 12, --gpu 13",
+                recorded(pinned, Flavor::Cuda12),
+                Some(Flavor::Cuda13),
+                RuntimeAction::Install(Flavor::Cuda13),
+            ),
+            (
+                "1.26.0 CPU, no --gpu: the same flavor",
+                recorded("1.26.0", Flavor::Cpu),
+                None,
+                RuntimeAction::Install(Flavor::Cpu),
+            ),
+            (
+                "1.26.0 CUDA 12, no --gpu: the same flavor",
+                recorded("1.26.0", Flavor::Cuda12),
+                None,
+                RuntimeAction::Install(Flavor::Cuda12),
+            ),
+            (
+                "1.26.0 CUDA 12, --gpu 13",
+                recorded("1.26.0", Flavor::Cuda12),
+                Some(Flavor::Cuda13),
+                RuntimeAction::Install(Flavor::Cuda13),
+            ),
+            (
+                "no record, no providers",
+                Installed::Unrecorded {
+                    gpu_provider: false,
+                },
+                None,
+                RuntimeAction::Install(Flavor::Cpu),
+            ),
+            (
+                "no record, a CUDA provider beside it (resolved to 13)",
+                Installed::Unrecorded { gpu_provider: true },
+                Some(Flavor::Cuda13),
+                RuntimeAction::Install(Flavor::Cuda13),
+            ),
+            (
+                "no record, no providers, --gpu 12",
+                Installed::Unrecorded {
+                    gpu_provider: false,
+                },
+                Some(Flavor::Cuda12),
+                RuntimeAction::Install(Flavor::Cuda12),
+            ),
+        ] {
+            assert_eq!(runtime_action(&installed, pinned, gpu), want, "row «{row}»");
+        }
+    }
+
+    /// CI-D5b (D5b.4). What the directory says about the runtime in it: the
+    /// record when there is one that reads, and otherwise the library and, to
+    /// tell the flavor, whether a CUDA provider sits beside it.
+    #[test]
+    fn the_runtime_in_a_directory_is_its_record_or_what_can_be_deduced_from_its_files() {
+        let lib = "libonnxruntime.so";
+        let dir_of = |tag: &str| {
+            let home = Home::new(tag);
+            let dir = home.root.join("onnxruntime");
+            (home, dir)
+        };
+
+        let (_empty, dir) = dir_of("installed-empty");
+        std::fs::create_dir_all(&dir).expect("the test owns this directory");
+        assert!(
+            matches!(installed_runtime(&dir, lib), Installed::Nothing),
+            "an empty directory is no runtime"
+        );
+        assert!(
+            matches!(
+                installed_runtime(&dir.join("not-there"), lib),
+                Installed::Nothing
+            ),
+            "a directory that does not exist is no runtime"
+        );
+
+        let (_lib_only, dir) = dir_of("installed-lib");
+        put(&dir.join(lib), b"core");
+        assert!(
+            matches!(
+                installed_runtime(&dir, lib),
+                Installed::Unrecorded {
+                    gpu_provider: false
+                }
+            ),
+            "a library with no record and no provider is a CPU runtime of unknown version"
+        );
+
+        let (_gpu, dir) = dir_of("installed-gpu");
+        put(&dir.join(lib), b"core");
+        put(&dir.join("libonnxruntime_providers_cuda.so"), b"provider");
+        assert!(
+            matches!(
+                installed_runtime(&dir, lib),
+                Installed::Unrecorded { gpu_provider: true }
+            ),
+            "a CUDA provider beside the library makes it a GPU runtime of unknown version"
+        );
+
+        let (_recorded, dir) = dir_of("installed-recorded");
+        put(&dir.join(lib), b"core");
+        put(
+            &dir.join("runtime.json"),
+            record_json(
+                "1.31.1",
+                "cuda13",
+                "onnxruntime-linux-x64-gpu_cuda13-1.31.1.tgz",
+            )
+            .as_bytes(),
+        );
+        match installed_runtime(&dir, lib) {
+            Installed::Recorded { version, flavor } => {
+                assert_eq!(version, "1.31.1");
+                assert_eq!(flavor, Flavor::Cuda13);
+            }
+            other => panic!(
+                "a readable record is what the directory says: {}",
+                describe(&other)
+            ),
+        }
+
+        let (_garbled, dir) = dir_of("installed-garbled");
+        put(&dir.join(lib), b"core");
+        put(&dir.join("runtime.json"), b"{ this is not json");
+        assert!(
+            matches!(
+                installed_runtime(&dir, lib),
+                Installed::Unrecorded {
+                    gpu_provider: false
+                }
+            ),
+            "a record that does not read is no record: it must not stop a reinstall"
+        );
+
+        let (_orphan, dir) = dir_of("installed-orphan-record");
+        put(
+            &dir.join("runtime.json"),
+            record_json("1.31.1", "cpu", "x").as_bytes(),
+        );
+        assert!(
+            matches!(installed_runtime(&dir, lib), Installed::Nothing),
+            "a record with no library beside it is not a runtime"
+        );
+    }
+
+    fn describe(installed: &Installed) -> &'static str {
+        match installed {
+            Installed::Nothing => "Nothing",
+            Installed::Recorded { .. } => "Recorded",
+            Installed::Unrecorded { .. } => "Unrecorded",
+        }
+    }
+
+    /// The files of a runtime directory of the old version and of the new one.
+    /// The old one has a provider the new one does not: that file is what a
+    /// swap file by file leaves behind, next to a core that is not its own.
+    fn old_and_new_runtime(home: &Home) -> (PathBuf, PathBuf) {
+        let leaf = home.root.join("onnxruntime");
+        let staging = sibling(&leaf, "downloading");
+        put(&leaf.join("libonnxruntime.so"), b"old core 1.26.0");
+        put(
+            &leaf.join("libonnxruntime_providers_cuda.so"),
+            b"old provider",
+        );
+        put(&staging.join("libonnxruntime.so"), b"new core 1.31.1");
+        put(
+            &staging.join("runtime.json"),
+            record_json("1.31.1", "cpu", "x").as_bytes(),
+        );
+        (leaf, staging)
+    }
+
+    fn really_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    /// CI-D5b (D5b.5). The new runtime takes the place of the old in one step,
+    /// and the old one comes back if the new does not load. «In one step» is
+    /// what the files say afterwards: a core of 1.31.1 beside a provider of
+    /// 1.26.0 is a runtime nobody built and nothing refuses.
+    #[test]
+    fn the_new_runtime_replaces_the_old_in_one_step_and_the_old_comes_back_if_the_new_does_not_load()
+     {
+        let home = Home::new("swap-accepts");
+        let (leaf, staging) = old_and_new_runtime(&home);
+        let new = snapshot(&staging);
+        swap_runtime(&staging, &leaf, &|_| Ok(()), &really_rename)
+            .expect("a runtime that loads replaces the old one");
+        assert_eq!(
+            snapshot(&leaf),
+            new,
+            "the directory has the files of the new runtime and no other: a provider of the old \
+             one beside the new core is the mix this swap exists to prevent"
+        );
+        assert!(
+            !sibling(&leaf, "previous").exists(),
+            "the old runtime is deleted once the new one has loaded"
+        );
+        assert!(
+            !staging.exists(),
+            "the staging directory became the runtime"
+        );
+
+        let home = Home::new("swap-refuses");
+        let (leaf, staging) = old_and_new_runtime(&home);
+        let old = snapshot(&leaf);
+        let new = snapshot(&staging);
+        let error = swap_runtime(
+            &staging,
+            &leaf,
+            &|_| Err(anyhow::anyhow!("the library says it is version 1.26.0")),
+            &really_rename,
+        )
+        .expect_err("a runtime that does not load does not replace the old one");
+        assert!(
+            format!("{error:#}").contains("the library says it is version 1.26.0"),
+            "the error carries the cause the check gave: {error:#}"
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            old,
+            "the old runtime is back, file for file: a machine must never be left without one"
+        );
+        assert!(
+            !sibling(&leaf, "previous").exists(),
+            "and the aside copy became the runtime again"
+        );
+        assert_eq!(
+            snapshot(&sibling(&leaf, "failed")),
+            new,
+            "the one that did not load is kept to be looked at, not deleted"
+        );
+    }
+
+    /// CI-D5b (D5b.6). On Windows a directory with a DLL loaded does not rename.
+    /// The runtime in use is not touched and the package already downloaded
+    /// stays, so the next run does not download it again.
+    #[test]
+    fn a_runtime_in_use_is_not_touched_and_its_download_stays_for_the_next_run() {
+        let home = Home::new("swap-in-use");
+        let (leaf, staging) = old_and_new_runtime(&home);
+        let old = snapshot(&leaf);
+        let new = snapshot(&staging);
+        let held = leaf.clone();
+        let error = swap_runtime(
+            &staging,
+            &leaf,
+            &|_| panic!("nothing was swapped, so there is nothing to load"),
+            &move |from, to| {
+                if from == held {
+                    Err(std::io::Error::from(std::io::ErrorKind::ResourceBusy))
+                } else {
+                    std::fs::rename(from, to)
+                }
+            },
+        )
+        .expect_err("a runtime another process holds is not replaced");
+        assert!(
+            format!("{error:#}").contains("en uso: para el daemon y vuelve a correr"),
+            "the operator is told what to do, in the words `cache migrate` already uses: {error:#}"
+        );
+        assert_eq!(snapshot(&leaf), old, "the runtime in use is intact");
+        assert_eq!(
+            snapshot(&staging),
+            new,
+            "the download is complete and stays: 300 MB are not fetched twice for a daemon that \
+             was running"
+        );
+        assert!(!sibling(&leaf, "previous").exists());
+    }
+
+    /// CI-D5b (D5b.6, the next run). A complete staging directory left by a swap
+    /// that found the runtime in use is the download of the next run: it makes
+    /// no request. Its library here is not one, so the swap puts the old runtime
+    /// back; what this pins is the request count and that nothing is lost.
+    #[tokio::test]
+    async fn a_complete_staging_directory_is_used_and_nothing_is_downloaded_again() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = Home::new("runtime-staged");
+        let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
+        let proxy = DeadProxy::start().await;
+        let (archive, lib_name) = host_cpu_runtime();
+        let leaf = home.roots.preferred.join("onnxruntime");
+        put(&leaf.join(lib_name), b"old core");
+        put(
+            &leaf.join("runtime.json"),
+            record_json("1.26.0", "cpu", &archive).as_bytes(),
+        );
+        let staging = sibling(&leaf, "downloading");
+        put(&staging.join(lib_name), b"not a library");
+        put(
+            &staging.join("runtime.json"),
+            record_json(ORT_VERSION, "cpu", &archive).as_bytes(),
+        );
+        let old = snapshot(&leaf);
+
+        let result = download_runtime(&RuntimeArgs::default()).await;
+
+        assert_eq!(
+            proxy.hits(),
+            0,
+            "the staging directory holds the package of this version, already checked and \
+             extracted: nothing is requested"
+        );
+        assert!(
+            result.is_err(),
+            "the library of the fixture is not a library, so the swap is refused: {result:?}"
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            old,
+            "and the runtime that was there is back as it was"
+        );
+    }
+
+    /// CI-D5b, P1-B. `npm install` runs `models runtime --if-installed` after it
+    /// fetches the binary: a machine that never had a runtime gets none from an
+    /// install (the first runtime is the operator's choice, CPU or GPU), and one
+    /// that has any gets the pinned one.
+    #[tokio::test]
+    async fn with_if_installed_a_machine_without_a_runtime_downloads_nothing() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = Home::new("runtime-if-installed");
+        let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
+        let proxy = DeadProxy::start().await;
+        let (_, lib_name) = host_cpu_runtime();
+        let ask = RuntimeArgs {
+            if_installed: true,
+            ..RuntimeArgs::default()
+        };
+
+        download_runtime(&ask)
+            .await
+            .expect("with no runtime there is nothing to update, and that is not an error");
+        assert_eq!(
+            proxy.hits(),
+            0,
+            "an install that finds no runtime must not download 450 MB nobody asked for"
+        );
+
+        put(
+            &home.roots.preferred.join("onnxruntime").join(lib_name),
+            b"runtime of an older version",
+        );
+        let updating = download_runtime(&ask).await;
+        assert!(
+            updating.is_err() && proxy.hits() >= 1,
+            "with a runtime of unknown version in place the update is attempted: {updating:?}"
+        );
+    }
+
+    /// CI-D5b. `--cuda` is the one flag that takes a value, so the reading of
+    /// the arguments is judged on its own: a typo of `--gpu` that downloads the
+    /// CPU package in silence is the failure.
+    #[test]
+    fn the_runtime_flags_are_read_and_the_ones_that_make_no_sense_are_refused() {
+        let args = |list: &[&str]| -> Vec<String> { list.iter().map(|a| a.to_string()).collect() };
+
+        let none = parse_runtime_args(&args(&[])).expect("no flags is the CPU runtime");
+        assert_eq!(
+            (none.gpu, none.cuda, none.if_installed),
+            (false, None, false)
+        );
+        let gpu = parse_runtime_args(&args(&["--gpu"])).expect("--gpu");
+        assert_eq!((gpu.gpu, gpu.cuda), (true, None));
+        let forced = parse_runtime_args(&args(&["--gpu", "--cuda", "12"])).expect("--cuda 12");
+        assert_eq!((forced.gpu, forced.cuda), (true, Some(12)));
+        let order = parse_runtime_args(&args(&["--cuda", "13", "--gpu"]))
+            .expect("the order of the flags does not matter");
+        assert_eq!((order.gpu, order.cuda), (true, Some(13)));
+        let update = parse_runtime_args(&args(&["--if-installed"])).expect("--if-installed");
+        assert!(update.if_installed && !update.gpu);
+
+        for (flags, words) in [
+            (vec!["--cuda", "12"], vec!["--gpu"]),
+            (vec!["--gpu", "--cuda", "11"], vec!["12", "13"]),
+            (vec!["--gpu", "--cuda"], vec!["--cuda"]),
+            (vec!["--gpus"], vec!["--gpus"]),
+        ] {
+            let said = format!(
+                "{:#}",
+                parse_runtime_args(&args(&flags)).expect_err("these flags are refused")
+            );
+            for word in words {
+                assert!(
+                    said.contains(word),
+                    "{flags:?}: the refusal names `{word}`: {said}"
+                );
+            }
+        }
+    }
+
+    /// The fixture of a swap cut between its two renames: the old runtime sits in
+    /// `<leaf>.previous` with a library of the operator's beside it, there is no
+    /// leaf, and the new package is whole in staging.
+    fn a_swap_cut_between_its_two_renames(home: &Home) -> (PathBuf, PathBuf, PathBuf) {
+        let leaf = home.root.join("onnxruntime");
+        let previous = sibling(&leaf, "previous");
+        let staging = sibling(&leaf, "downloading");
+        put(&previous.join("libonnxruntime.so"), b"old core 1.26.0");
+        put(
+            &previous.join("libonnxruntime_providers_cuda.so"),
+            b"old provider",
+        );
+        put(&previous.join("libcudart.so.12"), b"cudart of the operator");
+        put(&staging.join("libonnxruntime.so"), b"new core 1.31.1");
+        put(
+            &staging.join("runtime.json"),
+            record_json("1.31.1", "cpu", "x").as_bytes(),
+        );
+        assert!(
+            !leaf.exists(),
+            "the fixture is the machine a process killed between the renames leaves"
+        );
+        (leaf, previous, staging)
+    }
+
+    /// CI-D5c (A.1a). `swap_runtime` used to delete `<leaf>.previous` first and ask
+    /// afterwards whether there was a leaf: on a machine cut between the renames
+    /// that was the only copy of the runtime. Now it comes back before anything
+    /// is deleted, and a new package that does not load leaves it exactly as it was.
+    #[test]
+    fn a_previous_runtime_with_no_leaf_comes_back_before_anything_is_deleted() {
+        let home = Home::new("swap-cut-refused");
+        let (leaf, previous, staging) = a_swap_cut_between_its_two_renames(&home);
+        let old = snapshot(&previous);
+        let new = snapshot(&staging);
+
+        let error = swap_runtime(
+            &staging,
+            &leaf,
+            &|_| Err(anyhow::anyhow!("the new core does not load")),
+            &really_rename,
+        )
+        .expect_err("a runtime that does not load does not replace the old one");
+        assert!(
+            format!("{error:#}").contains("the new core does not load"),
+            "the error carries the cause the check gave: {error:#}"
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            old,
+            "the leaf has exactly the files of `.previous`: the only copy of the runtime was \
+             deleted before the swap looked for a leaf, and a machine cut here had none left"
+        );
+        assert!(
+            !previous.exists(),
+            "the aside copy became the runtime again"
+        );
+        assert_eq!(
+            snapshot(&sibling(&leaf, "failed")),
+            new,
+            "the package that did not load is kept to be looked at"
+        );
+
+        let home = Home::new("swap-cut-accepted");
+        let (leaf, previous, staging) = a_swap_cut_between_its_two_renames(&home);
+        let new = snapshot(&staging);
+        swap_runtime(&staging, &leaf, &|_| Ok(()), &really_rename)
+            .expect("a runtime that loads replaces the one that came back");
+        let mut want = new;
+        want.insert(
+            PathBuf::from("libcudart.so.12"),
+            Some(b"cudart of the operator".to_vec()),
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            want,
+            "the new core, the new record and the library of the operator, and nothing of the \
+             old package"
+        );
+        assert!(!previous.exists(), "nothing is left aside once it loaded");
+    }
+
+    /// CI-D5c (A.1b). The next run finds the leaf missing and `.previous` there.
+    /// With `--if-installed`, which is what `npm install` runs, it used to say
+    /// «no hay ninguno» and exit 0: a machine without a runtime for good.
+    #[tokio::test]
+    async fn if_installed_finishes_a_swap_cut_between_its_two_renames() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = Home::new("runtime-cut-swap");
+        let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
+        let proxy = DeadProxy::start().await;
+        let (_, lib_name) = host_cpu_runtime();
+        let leaf = home.roots.preferred.join("onnxruntime");
+        let previous = sibling(&leaf, "previous");
+        put(&previous.join(lib_name), b"runtime of an older version");
+        put(&previous.join("libcudart.so.12"), b"cudart of the operator");
+        let old = snapshot(&previous);
+        let ask = RuntimeArgs {
+            if_installed: true,
+            ..RuntimeArgs::default()
+        };
+
+        let updating = download_runtime(&ask).await;
+
+        let attempted = proxy.hits();
+        let said = format!("{updating:?}");
+        assert!(
+            updating.is_err() && attempted >= 1,
+            "the runtime that came back is one of unknown version, and `--if-installed` updates \
+             it: answering «no hay ninguno» over a leaf that was only renamed away leaves the \
+             machine without a runtime ({attempted} requests): {said}"
+        );
+        assert!(
+            said.contains("descargando el runtime"),
+            "the failure is the one of the download, not of the recovery: {said}"
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            old,
+            "after the failed update the leaf has the runtime it had, file for file"
+        );
+        assert!(!previous.exists(), "and nothing is left aside");
+    }
+
+    /// CI-D5c (A.2). The hint of a provider that would not start says to put the
+    /// CUDA libraries «junto al runtime de ONNX», and the replacement used to
+    /// delete the whole old directory: whoever followed it lost them on the first
+    /// update. What is not the package moves to the new directory; what is the
+    /// old package never does, or the mix of two versions comes back. The
+    /// fixture holds a library of each system on purpose: the rule is by name.
+    #[test]
+    fn what_the_operator_put_beside_the_runtime_survives_its_replacement() {
+        let home = Home::new("swap-keeps-the-operators-files");
+        let (leaf, staging) = old_and_new_runtime(&home);
+        put(
+            &leaf.join("runtime.json"),
+            record_json("1.26.0", "cuda12", "old").as_bytes(),
+        );
+        put(&leaf.join("libcudart.so.12"), b"cudart of the operator");
+        put(&leaf.join("cudnn64_9.dll"), b"cudnn of the operator");
+        let new = snapshot(&staging);
+
+        swap_runtime(&staging, &leaf, &|_| Ok(()), &really_rename)
+            .expect("a runtime that loads replaces the old one");
+
+        let mut want = new;
+        want.insert(
+            PathBuf::from("libcudart.so.12"),
+            Some(b"cudart of the operator".to_vec()),
+        );
+        want.insert(
+            PathBuf::from("cudnn64_9.dll"),
+            Some(b"cudnn of the operator".to_vec()),
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            want,
+            "the new core, its record, and the two libraries of the operator with their bytes; \
+             the old provider and the old record are the old package and do not pass"
+        );
+        assert!(
+            !leaf.join("libonnxruntime_providers_cuda.so").exists(),
+            "a provider of 1.26.0 beside the core of 1.31.1 is the mix the swap exists to prevent"
+        );
+        assert!(!sibling(&leaf, "previous").exists());
+
+        let home = Home::new("swap-keeps-previous-on-a-clash");
+        let (leaf, staging) = old_and_new_runtime(&home);
+        let previous = sibling(&leaf, "previous");
+        put(&leaf.join("libcudart.so.12"), b"cudart of the operator");
+        put(&staging.join("libcudart.so.12"), b"cudart of the package");
+
+        swap_runtime(&staging, &leaf, &|_| Ok(()), &really_rename)
+            .expect("a file that cannot move does not undo a runtime that loaded");
+
+        assert!(
+            previous.exists(),
+            "a file of the operator that could not move to the new directory is not deleted \
+             with the old one"
+        );
+        assert_eq!(
+            read(&previous.join("libcudart.so.12")),
+            b"cudart of the operator",
+            "it stays where it was, with its bytes"
+        );
+        assert_eq!(
+            read(&leaf.join("libcudart.so.12")),
+            b"cudart of the package",
+            "and the one the new package brought is not overwritten"
+        );
+        let said = retire_previous(&previous, &leaf)
+            .expect("the next attempt says again what stays, and where");
+        assert!(
+            said.contains("libcudart.so.12") && said.contains(&previous.display().to_string()),
+            "the message names the file and the directory it is in: {said}"
+        );
+
+        let again = sibling(&leaf, "downloading");
+        put(&again.join("libonnxruntime.so"), b"newer core");
+        let before = (snapshot(&leaf), snapshot(&again), snapshot(&previous));
+        let refused = swap_runtime(&again, &leaf, &|_| Ok(()), &really_rename).expect_err(
+            "a swap does not start over a directory that still holds the operator's files",
+        );
+        assert!(
+            format!("{refused:#}").contains("libcudart.so.12"),
+            "the refusal names the file that blocks it: {refused:#}"
+        );
+        assert_eq!(
+            (snapshot(&leaf), snapshot(&again), snapshot(&previous)),
+            before,
+            "a refused swap touches nothing: neither the runtime, nor the package waiting, nor \
+             the files of the operator"
+        );
+    }
+
+    /// CI-D5c (A.3, A.5). An install with a CUDA provider and no record predates
+    /// the record, and the installer of then fetched `…-gpu-<v>`, which is CUDA
+    /// 12: the libraries beside it are the ones of 12, so an unattended update
+    /// stays on 12 whatever the driver says. The driver is read only when its
+    /// answer decides: the table below counts the reads.
+    #[test]
+    fn an_unrecorded_gpu_install_stays_on_cuda_12_and_the_driver_is_read_only_when_it_decides() {
+        let reads = std::cell::Cell::new(0usize);
+        let driver_13_card_ada = || {
+            reads.set(reads.get() + 1);
+            Some(CudaProbe {
+                driver: 13030,
+                compute: Some((8, 9)),
+            })
+        };
+        let ask = |gpu: bool, cuda: Option<u8>| RuntimeArgs {
+            gpu,
+            cuda,
+            if_installed: false,
+        };
+        let gpu_without_record = Installed::Unrecorded { gpu_provider: true };
+        let cpu_without_record = Installed::Unrecorded {
+            gpu_provider: false,
+        };
+        let nothing = Installed::Nothing;
+
+        for (row, asked, installed, want, expected_reads) in [
+            (
+                "no record, a CUDA provider, no --gpu",
+                ask(false, None),
+                &gpu_without_record,
+                Some(Flavor::Cuda12),
+                0,
+            ),
+            (
+                "no record, a CUDA provider, --gpu --cuda 12",
+                ask(true, Some(12)),
+                &gpu_without_record,
+                Some(Flavor::Cuda12),
+                0,
+            ),
+            (
+                "--gpu --cuda 13",
+                ask(true, Some(13)),
+                &nothing,
+                Some(Flavor::Cuda13),
+                1,
+            ),
+            (
+                "--gpu alone",
+                ask(true, None),
+                &nothing,
+                Some(Flavor::Cuda13),
+                1,
+            ),
+            (
+                "no record, a CUDA provider, --gpu alone",
+                ask(true, None),
+                &gpu_without_record,
+                Some(Flavor::Cuda13),
+                1,
+            ),
+            (
+                "no record, no provider, no --gpu",
+                ask(false, None),
+                &cpu_without_record,
+                None,
+                0,
+            ),
+            (
+                "nothing installed, no --gpu",
+                ask(false, None),
+                &nothing,
+                None,
+                0,
+            ),
+        ] {
+            reads.set(0);
+            let got = resolve_gpu(&asked, installed, &driver_13_card_ada)
+                .unwrap_or_else(|e| panic!("{row}: {e:#}"));
+            assert_eq!(got, want, "{row}");
+            assert_eq!(
+                reads.get(),
+                expected_reads,
+                "{row}: reads of the driver. `--cuda 12` and an unrecorded GPU install are \
+                 answered without it, and `cuInit` on a machine with a card is not free"
+            );
+        }
+    }
+
+    /// CI-D5c (A.4a). A connection that is open and silent is the one failure a
+    /// download has no answer to: `npm install` would wait on it for ever. The
+    /// listener accepts and keeps the socket, so the wait is the client's. The 20
+    /// seconds of the test only end it when the limit is missing.
+    #[tokio::test]
+    async fn a_download_that_stops_answering_is_cut_and_leaves_no_part_file() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _no_proxy: Vec<ScopedEnv> = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+            .iter()
+            .map(|name| ScopedEnv::cleared(name))
+            .collect();
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port is free");
+        let url = format!(
+            "http://{}/runtime.tgz",
+            silent.local_addr().expect("it is bound")
+        );
+        let holding = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((stream, _)) = silent.accept().await {
+                sockets.push(stream);
+            }
+        });
+        let root = scratch_root("download-stalls");
+        std::fs::create_dir_all(&root).expect("the test owns this directory");
+        let dest = root.join("runtime.tgz");
+        let limits = Timeouts {
+            connect: std::time::Duration::from_millis(200),
+            read: std::time::Duration::from_millis(200),
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            download_to_with(&url, &dest, limits),
+        )
+        .await;
+        holding.abort();
+
+        let result = outcome.expect(
+            "the download is still waiting for a peer that never answers: the client has no read \
+             time limit, and only the 20 seconds of the test ended the wait",
+        );
+        assert!(
+            result.is_err(),
+            "a peer that never answers is an error, not a download"
+        );
+        assert!(
+            !dest.exists() && !dest.with_extension("part").exists(),
+            "nothing is left for the next run to take for a package: {:?}",
+            snapshot(&root).keys().collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CI-D5c (A.6). Two `models runtime` at once (two terminals, or `npm
+    /// install` while the operator runs it) shared one staging directory and one
+    /// leaf: the second deleted what the first was filling. The lock is a real
+    /// one on a real file, and a second handle of this process conflicts with
+    /// it as a second process does.
+    #[tokio::test]
+    async fn a_second_models_runtime_refuses_while_the_first_holds_the_lock_and_touches_nothing() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = Home::new("runtime-locked");
+        let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
+        let proxy = DeadProxy::start().await;
+        let (archive, lib_name) = host_cpu_runtime();
+        let leaf = home.roots.preferred.join("onnxruntime");
+        put(&leaf.join(lib_name), b"old core");
+        put(
+            &leaf.join("runtime.json"),
+            record_json("1.26.0", "cpu", &archive).as_bytes(),
+        );
+        let staging = sibling(&leaf, "downloading");
+        put(&staging.join("witness"), b"half a package, another run's");
+        let lock_path = home.roots.preferred.join(RUNTIME_LOCK);
+        let first = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("the test owns this directory");
+        first
+            .try_lock()
+            .expect("nobody else holds the lock of this home");
+        let before = snapshot(&home.roots.preferred);
+
+        let refused = download_runtime(&RuntimeArgs::default())
+            .await
+            .expect_err("a second run does not share the directory of the first");
+
+        let said = format!("{refused:#}");
+        assert!(
+            said.contains(RUNTIME_LOCK) && said.contains("esperá"),
+            "the error names the lock and says to wait: {said}"
+        );
+        assert_eq!(
+            snapshot(&home.roots.preferred),
+            before,
+            "the runtime and the staging directory of the first run are exactly as they were, \
+             witness file included"
+        );
+        assert_eq!(
+            proxy.hits(),
+            0,
+            "a refused run makes no request: it would be downloading into a directory that is \
+             not its own"
+        );
+
+        drop(first);
+        let later = download_runtime(&RuntimeArgs::default()).await;
+        assert!(
+            later.is_err() && proxy.hits() >= 1,
+            "once the first run lets go the lock is free again, and a run goes on to the \
+             download ({} requests): {later:?}",
+            proxy.hits()
         );
     }
 }

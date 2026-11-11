@@ -53,7 +53,13 @@ Build with the feature and point the runtime at the GPU libraries:
 `ORT_DYLIB_PATH` must name `onnxruntime.dll` / `libonnxruntime.so`, and the
 CUDA execution-provider libraries must sit **next to it** and be reachable on
 `PATH` (Windows) or `LD_LIBRARY_PATH` (Linux). `memory-industry models runtime
---gpu` fetches the provider libraries as well as the main one.
+--gpu` fetches the provider libraries as well as the main one, in the package of
+the CUDA major your driver and card can run (13, or 12 with `--cuda 12`; the
+choice is recorded in `onnxruntime/runtime.json`). The CUDA libraries of that major
+(`cudart64_13`, `cublas64_13`, `cublasLt64_13`, or the `_12` ones) must be on `PATH`
+or `LD_LIBRARY_PATH`; cuDNN is optional. To move an installed runtime to the version
+this release pins, run `memory-industry models runtime` with the daemon stopped on
+Windows. `doctor` says which runtime the process loaded and warns when it is older.
 
 **Do not set the arena cap by hand.** The planner measures it: the ceiling is
 all free VRAM minus the reserve, and what the model needs is read from the file

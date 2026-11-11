@@ -117,6 +117,10 @@ fn main() {
         "resource plan"
     );
     memory_industry::resources::apply(&plan);
+    // Next to the other writes of the environment and before the tokio runtime: ONNX
+    // Runtime 1.31 reports telemetry unless this is set before it starts, and `set_var`
+    // is only sound while no other thread reads the environment.
+    memory_industry::embeddings::onnx::keep_onnx_runtime_telemetry_off();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(plan.worker_threads)

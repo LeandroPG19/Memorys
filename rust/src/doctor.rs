@@ -719,6 +719,184 @@ fn runtime_role_check(user: &str, is_super: bool, app_role_ready: bool) -> Check
 /// created under the new name — `pgpass_app` at startup, `undo/` from `delete`
 /// — is enough for `models` to download again the gigabytes the legacy root
 /// already holds.
+/// The ONNX Runtime this process loaded, judged against the one `models runtime`
+/// installs. No row when nothing was loaded: `onnx_model` already says why.
+///
+/// The flavor comes from the record beside the library, and only when that record is
+/// about the version that was loaded: one left by an earlier install would name the
+/// wrong package.
+fn onnx_runtime_check() -> Option<Check> {
+    let loaded = onnx::loaded_runtime_version()?;
+    let flavor = onnx::locate_onnxruntime()
+        .and_then(|library| {
+            library
+                .parent()
+                .and_then(crate::models_cli::read_runtime_record)
+        })
+        .filter(|record| record.version == loaded)
+        .map(|record| record.flavor.as_str());
+    Some(runtime_version_check(
+        &loaded,
+        crate::models_cli::ORT_VERSION,
+        flavor,
+        onnx::explicit_runtime_path().is_some(),
+    ))
+}
+
+/// Pure: the version that was loaded against the pinned one. Older is a warning and
+/// never a failure, because `ort` takes any runtime from 1.24 on and `doctor` exits 1
+/// only on a failure. Where it came from is said, and not its path: the output is
+/// pasted into chats.
+fn runtime_version_check(
+    loaded: &str,
+    pinned: &str,
+    flavor: Option<&str>,
+    by_variable: bool,
+) -> Check {
+    let named = match flavor {
+        Some(flavor) => format!("{loaded} ({flavor})"),
+        None => loaded.to_string(),
+    };
+    let origin = if by_variable {
+        "ORT_DYLIB_PATH"
+    } else {
+        "la caché"
+    };
+    let numbers = |version: &str| -> Vec<u32> {
+        version
+            .split('.')
+            .map(|part| part.parse().unwrap_or(0))
+            .collect()
+    };
+    match numbers(loaded).cmp(&numbers(pinned)) {
+        std::cmp::Ordering::Equal => Check::ok("onnx_runtime", format!("{named}, de {origin}")),
+        std::cmp::Ordering::Greater => Check::ok(
+            "onnx_runtime",
+            format!(
+                "{named}, de {origin}: más nueva que la fijada {pinned}, no probada con esta \
+                 versión"
+            ),
+        ),
+        std::cmp::Ordering::Less => Check::warn(
+            "onnx_runtime",
+            format!("{named}, de {origin}: más vieja que la {pinned} que instala esta versión"),
+            if by_variable {
+                "apuntá ORT_DYLIB_PATH a una biblioteca de la versión fijada, o quitala y corré \
+                 `memory-industry models runtime`"
+            } else {
+                "memory-industry models runtime (en Windows, con el daemon parado)"
+            },
+        ),
+    }
+}
+
+/// A snapshot of old vectors older than this is a reminder, not a failure: it is the way back
+/// of a reembed, and a reembed that has been stable for a month does not need it.
+const SNAPSHOT_REMINDER_DAYS: u64 = 30;
+
+/// The vectors of the four tables against the label this process writes (the model and the ONNX
+/// Runtime loaded). Without a runtime loaded there is no label to compare with: `onnx_model` and
+/// `onnx_runtime` already say why, and counting would call every vector stale for no reason.
+async fn embedding_coverage_rows(pool: &PgPool) -> Vec<Check> {
+    if onnx::loaded_runtime_version().is_none() {
+        return vec![Check::warn(
+            "embedding_coverage",
+            "no verificable: no hay un ONNX Runtime cargado, y sin él no hay generación con la que comparar",
+            "memory-industry models runtime",
+        )];
+    }
+    let coverage =
+        match crate::embeddings::backfill::vector_coverage(pool, &onnx::vector_tag()).await {
+            Ok(coverage) => coverage,
+            Err(e) => {
+                return vec![Check::warn(
+                    "embedding_coverage",
+                    format!("no verificable: {e}"),
+                    "revisar esquema",
+                )];
+            }
+        };
+    let old_label = if coverage.stale() > 0 {
+        most_common_old_label(pool, &coverage.tag).await
+    } else {
+        None
+    };
+    let age = snapshot_age_days(pool).await;
+    embedding_coverage_checks(&coverage, old_label.as_deref(), age)
+}
+
+/// The label most of the vectors of another generation carry, to say what they were made with.
+async fn most_common_old_label(pool: &PgPool, current: &str) -> Option<String> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT label FROM (
+             SELECT embedding_model AS label FROM brain_observations
+              WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1
+             UNION ALL SELECT embedding_model FROM brain_episodes
+              WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1
+             UNION ALL SELECT embedding_model FROM brain_observation_chunks
+              WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1
+             UNION ALL SELECT embedding_model FROM brain_procedures
+              WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1
+         ) stale
+         GROUP BY label ORDER BY count(*) DESC, label LIMIT 1",
+    )
+    .bind(current)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    row.and_then(|(label,)| label)
+}
+
+async fn snapshot_age_days(pool: &PgPool) -> Option<u64> {
+    let node_id = crate::db::node_id(pool).await.ok()?.to_string();
+    let root = crate::reembed_cli::snapshot_root(&node_id).ok()?;
+    crate::reembed_cli::oldest_snapshot_age_days(&root)
+}
+
+/// Pure: what `doctor` says about the vectors. A warning and never a failure, because a database
+/// of another generation still answers searches (the score is off by a few thousandths), and the
+/// way out is one command. The row of the snapshot appears only when it is old enough to be
+/// forgotten.
+fn embedding_coverage_checks(
+    coverage: &crate::embeddings::backfill::VectorCoverage,
+    old_label: Option<&str>,
+    snapshot_age_days: Option<u64>,
+) -> Vec<Check> {
+    let (stale, missing) = (coverage.stale(), coverage.missing());
+    let mut checks = vec![if stale == 0 && missing == 0 {
+        Check::ok(
+            "embedding_coverage",
+            format!(
+                "{} filas, todas con vector de {}",
+                coverage.total(),
+                coverage.tag
+            ),
+        )
+    } else {
+        let from = old_label.map_or(String::new(), |label| format!(" (de {label})"));
+        Check::warn(
+            "embedding_coverage",
+            format!(
+                "{} filas: {missing} sin vector y {stale} vectores de otra generación{from}; \
+                 la actual es {}",
+                coverage.total(),
+                coverage.tag
+            ),
+            "memory-industry reembed (reanudable; guarda antes los vectores actuales; \
+             --rollback los devuelve)",
+        )
+    }];
+    if let Some(days) = snapshot_age_days.filter(|days| *days > SNAPSHOT_REMINDER_DAYS) {
+        checks.push(Check::warn(
+            "reembed_snapshot",
+            format!("hay una instantánea de vectores anteriores de hace {days} días"),
+            "memory-industry reembed --drop-snapshot <etiqueta> cuando la base lleve estable el tiempo que quieras",
+        ));
+    }
+    checks
+}
+
 fn legacy_cache_check(legacy: &std::path::Path) -> Check {
     let entries = std::fs::read_dir(legacy).map_or(0, |dir| dir.flatten().count());
     if entries == 0 {
@@ -1179,6 +1357,8 @@ pub async fn run_checks_with(
         ));
     }
 
+    checks.extend(onnx_runtime_check());
+
     checks.extend(
         crate::models_cli::CacheRoots::resolve()
             .ok()
@@ -1370,35 +1550,7 @@ pub async fn run_checks_with(
         )),
     }
 
-    match sqlx::query(
-        "SELECT count(*)::bigint AS total,
-                count(*) FILTER (WHERE embedding IS NULL)::bigint AS missing,
-                count(*) FILTER (WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1)::bigint AS stale
-         FROM brain_observations",
-    )
-    .bind(&model)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(row) => {
-            let total: i64 = row.try_get("total").unwrap_or(0);
-            let missing: i64 = row.try_get("missing").unwrap_or(0);
-            let stale: i64 = row.try_get("stale").unwrap_or(0);
-            if missing == 0 && stale == 0 {
-                checks.push(Check::ok(
-                    "embedding_coverage",
-                    format!("{total} observaciones, todas con vector del modelo actual"),
-                ));
-            } else {
-                checks.push(Check::warn(
-                    "embedding_coverage",
-                    format!("{total} observaciones: {missing} sin vector, {stale} de otro modelo"),
-                    "cuba_zafra action=reembed",
-                ));
-            }
-        }
-        Err(e) => checks.push(Check::warn("embedding_coverage", format!("no verificable: {e}"), "revisar esquema")),
-    }
+    checks.extend(embedding_coverage_rows(pool).await);
 
     match sqlx::query(
         "SELECT count(*)::bigint FROM brain_facts
@@ -3145,5 +3297,189 @@ mod account_tests {
                 "64 hex characters is a secret hash or a credential secret: {said}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod onnx_runtime_tests {
+    use super::*;
+
+    /// CI-D5b (D5b.7). What `doctor` says about the ONNX Runtime the process
+    /// loaded, against the version `models runtime` installs. A runtime older
+    /// than the pinned one still works (`ort` takes 1.24 on), so it is a
+    /// warning and never a failure: `doctor` exits 1 on a failure. The origin
+    /// is named and not its path, because the output is pasted into chats.
+    #[test]
+    fn doctor_says_which_onnx_runtime_it_loaded_and_warns_when_it_is_older_than_the_pinned_one() {
+        let pinned = "1.31.1";
+
+        let same = runtime_version_check("1.31.1", pinned, Some("cuda13"), false);
+        assert_eq!(same.name, "onnx_runtime");
+        assert_eq!(
+            same.status,
+            Status::Ok,
+            "the pinned version is the healthy case"
+        );
+        assert!(
+            same.detail.contains("1.31.1") && same.detail.contains("cuda13"),
+            "the version and the flavor that were loaded: {}",
+            same.detail
+        );
+
+        let newer = runtime_version_check("1.32.0", pinned, None, false);
+        assert_eq!(
+            newer.status,
+            Status::Ok,
+            "a newer runtime works: `ort` takes any minor from 24 on"
+        );
+        assert!(
+            newer.detail.contains("1.32.0") && newer.detail.contains("no probada"),
+            "but it says it was not tried with this version: {}",
+            newer.detail
+        );
+
+        let older = runtime_version_check("1.26.0", pinned, None, false);
+        assert_eq!(
+            older.status,
+            Status::Warn,
+            "a runtime older than the one this version installs is a warning, not a failure"
+        );
+        assert!(
+            older.detail.contains("1.26.0") && older.detail.contains("más vieja"),
+            "it names the version it loaded and says it is older: {}",
+            older.detail
+        );
+        assert!(
+            older
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("memory-industry models runtime")),
+            "the way out of a runtime from the cache is the command that replaces it: {:?}",
+            older.hint
+        );
+
+        let by_variable = runtime_version_check("1.24.4", pinned, None, true);
+        assert_eq!(
+            by_variable.status,
+            Status::Warn,
+            "the only official DirectML build is 1.24.4 and an operator may point at it on \
+             purpose: it is still older than the pinned one, and `doctor` says so"
+        );
+        assert!(
+            by_variable
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("ORT_DYLIB_PATH")),
+            "a runtime the operator pointed at is changed in the variable and not by \
+             `models runtime`, which would install one the process does not read: {:?}",
+            by_variable.hint
+        );
+
+        for check in [&same, &newer, &older, &by_variable] {
+            assert!(
+                !check.detail.contains('/') && !check.detail.contains('\\'),
+                "no path in the detail, only where it came from: {}",
+                check.detail
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod embedding_coverage_tests {
+    use super::*;
+    use crate::embeddings::backfill::{TableCoverage, VectorCoverage};
+
+    const CURRENT: &str = "multilingual-e5-small@onnxruntime-1.31.1";
+
+    fn with_observations_of_another_generation(stale: i64) -> VectorCoverage {
+        VectorCoverage {
+            tag: CURRENT.to_string(),
+            observations: TableCoverage {
+                total: 10,
+                missing: 0,
+                stale,
+            },
+            ..VectorCoverage::default()
+        }
+    }
+
+    /// CI-D5c (B.4). A vector counts as current only when its label is the model and the runtime
+    /// loaded now, so after the runtime changes every stored vector is «of another generation»
+    /// until `reembed` rewrites it. `doctor` says how many, what they were made with and the one
+    /// command that fixes it, as a warning (the search still answers, see the spec's §2.3), and
+    /// reminds that the snapshot `reembed` keeps is not meant to stay forever.
+    #[test]
+    fn the_coverage_check_names_the_generation_and_the_order() {
+        let clean =
+            embedding_coverage_checks(&with_observations_of_another_generation(0), None, None);
+        assert_eq!(clean.len(), 1, "nothing pending and no snapshot: one row");
+        assert_eq!(clean[0].name, "embedding_coverage");
+        assert_eq!(clean[0].status, Status::Ok);
+        assert!(
+            clean[0].detail.contains(CURRENT),
+            "the healthy row says which generation every vector belongs to: {}",
+            clean[0].detail
+        );
+
+        let pending = embedding_coverage_checks(
+            &with_observations_of_another_generation(7),
+            Some("multilingual-e5-small"),
+            None,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "embedding_coverage");
+        assert_eq!(
+            pending[0].status,
+            Status::Warn,
+            "a database of another generation still answers searches: a warning, never a failure"
+        );
+        for wanted in ["7", CURRENT, "multilingual-e5-small"] {
+            assert!(
+                pending[0].detail.contains(wanted),
+                "the detail has to carry {wanted:?}: {}",
+                pending[0].detail
+            );
+        }
+        assert!(
+            pending[0]
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("memory-industry reembed")),
+            "and the hint is the command that rewrites them: {:?}",
+            pending[0].hint
+        );
+
+        let kept =
+            embedding_coverage_checks(&with_observations_of_another_generation(0), None, Some(40));
+        assert_eq!(kept.len(), 2, "a snapshot of 40 days adds its own row");
+        assert_eq!(
+            kept[0].status,
+            Status::Ok,
+            "and does not touch the coverage row"
+        );
+        assert_eq!(kept[1].name, "reembed_snapshot");
+        assert_eq!(kept[1].status, Status::Warn);
+        assert!(
+            kept[1].detail.contains("40"),
+            "it says how old it is: {}",
+            kept[1].detail
+        );
+        assert!(
+            kept[1]
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("memory-industry reembed --drop-snapshot")),
+            "and how it is dropped: {:?}",
+            kept[1].hint
+        );
+
+        let recent =
+            embedding_coverage_checks(&with_observations_of_another_generation(0), None, Some(3));
+        assert_eq!(
+            recent.len(),
+            1,
+            "a snapshot of three days is the safety net doing its job, not something to warn about"
+        );
     }
 }

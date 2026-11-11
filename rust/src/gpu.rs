@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ort::environment::Environment;
 use ort::session::builder::SessionBuilder;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Workload {
@@ -408,13 +408,22 @@ pub fn status_after_sessions(base: GpuStatus, refused: &[(Workload, String)]) ->
         detail: format!(
             "el provider GPU no inicializó → estas sesiones corren en CPU · {sessions}"
         ),
-        hint: Some(
-            "faltan DLL de CUDA 12 / cuDNN 9 junto al runtime de ONNX o en PATH (Windows) / \
-             LD_LIBRARY_PATH (Linux): cudart64_12, cublas64_12, cublasLt64_12, cudnn64_9. La \
-             colocación se decide al abrir la sesión: reiniciá el daemon después"
-                .to_string(),
-        ),
+        hint: Some(format!(
+            "faltan bibliotecas de CUDA junto al runtime de ONNX o en PATH (Windows) / \
+             LD_LIBRARY_PATH (Linux): {}. cuDNN es opcional con este runtime. La colocación se \
+             decide al abrir la sesión: reiniciá el daemon después",
+            crate::models_cli::cuda_libraries(installed_cuda_flavor())
+        )),
     }
+}
+
+/// The CUDA package `models runtime` recorded beside the runtime, or `None` for an
+/// install that predates the record or holds the CPU one: the hint then names both majors.
+fn installed_cuda_flavor() -> Option<crate::models_cli::Flavor> {
+    runtime_dir()
+        .and_then(|dir| crate::models_cli::read_runtime_record(&dir))
+        .map(|record| record.flavor)
+        .filter(|flavor| flavor.is_gpu())
 }
 
 pub fn placement_summary() -> String {
@@ -609,17 +618,40 @@ fn runtime_has_gpu_provider(provider: &str) -> bool {
 /// be told apart from the other by a test or by a mutant — the same argument
 /// that collapsed `restrict` into one body in 0.27.
 fn nvidia_driver_present() -> bool {
-    if std::path::Path::new("/proc/driver/nvidia/version").exists() {
-        return true;
-    }
+    Path::new("/proc/driver/nvidia/version").exists() || nvidia_smi().is_some()
+}
+
+/// Where WSL2 keeps the tools of the Windows driver. It is on nobody's `PATH`, and
+/// `/proc/driver/nvidia` does not exist there, so without this directory a machine
+/// with a card under WSL reads as a machine without one.
+const WSL_LIB: &str = "/usr/lib/wsl/lib";
+
+/// The `nvidia-smi` this process can run, or `None`: the one on the `PATH` first, as
+/// the operator's shell would pick it, and then the one under WSL. Also what
+/// `resources::vram_free_mb` runs. `gpu-placement-check.sh` mirrors the search.
+pub(crate) fn nvidia_smi() -> Option<PathBuf> {
+    nvidia_smi_from(std::env::var_os("PATH").as_deref(), Path::new(WSL_LIB))
+}
+
+/// `nvidia_smi` with both places handed in, so a test needs neither a card nor WSL.
+pub(crate) fn nvidia_smi_from(
+    path_var: Option<&std::ffi::OsStr>,
+    wsl_lib: &Path,
+) -> Option<PathBuf> {
     let exe = if cfg!(windows) {
         "nvidia-smi.exe"
     } else {
         "nvidia-smi"
     };
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|p| p.join(exe).exists()))
-        .unwrap_or(false)
+    let on_path = path_var.and_then(|path| {
+        std::env::split_paths(path)
+            .map(|dir| dir.join(exe))
+            .find(|candidate| candidate.exists())
+    });
+    on_path.or_else(|| {
+        let under_wsl = wsl_lib.join("nvidia-smi");
+        under_wsl.exists().then_some(under_wsl)
+    })
 }
 
 #[cfg(test)]
@@ -1974,5 +2006,150 @@ mod placement_tests {
             "`configure` builds DirectML by hand again, and the choice about `error_on_failure` \
              is made in two places"
         );
+    }
+
+    /// CI-D5b (D5b.9). Under WSL2 `nvidia-smi` lives in `/usr/lib/wsl/lib`, which
+    /// is on nobody's `PATH`, and `/proc/driver/nvidia` does not exist: the
+    /// binary saw no card and the reranker never went to it. The search takes
+    /// the directory as an argument so that a test needs no WSL, and the file
+    /// is named the way the product names it on each system (`.exe` on Windows)
+    /// where it is on the `PATH`; the one under WSL is a Linux file whatever
+    /// system runs the test.
+    #[test]
+    fn nvidia_smi_is_found_in_the_wsl_directory_when_the_path_does_not_have_it() {
+        let root = scratch_root("nvidia-smi");
+        let smi_on_path = if cfg!(windows) {
+            "nvidia-smi.exe"
+        } else {
+            "nvidia-smi"
+        };
+        let on_path = root.join("on-path");
+        let wsl = root.join("wsl");
+        let empty = root.join("empty");
+        let without = root.join("without-the-file");
+        for dir in [&on_path, &wsl, &empty, &without] {
+            std::fs::create_dir_all(dir).expect("the test owns this directory");
+        }
+        std::fs::write(on_path.join(smi_on_path), b"#!/bin/sh\n").expect("temp dir is writable");
+        std::fs::write(wsl.join("nvidia-smi"), b"#!/bin/sh\n").expect("temp dir is writable");
+        let joined = |dirs: &[&PathBuf]| {
+            std::env::join_paths(dirs.iter().map(|d| d.as_path())).expect("directories without ':'")
+        };
+
+        let path_without_it = joined(&[&empty]);
+        assert_eq!(
+            nvidia_smi_from(Some(path_without_it.as_os_str()), &wsl),
+            Some(wsl.join("nvidia-smi")),
+            "a PATH with no nvidia-smi and the directory of WSL with one: the card is there. Without \
+             this the daemon under WSL reports no card and the reranker stays on the CPU"
+        );
+        assert_eq!(
+            nvidia_smi_from(None, &wsl),
+            Some(wsl.join("nvidia-smi")),
+            "a process with no PATH at all still finds it in the directory of WSL"
+        );
+        let both = joined(&[&empty, &on_path]);
+        assert_eq!(
+            nvidia_smi_from(Some(both.as_os_str()), &wsl),
+            Some(on_path.join(smi_on_path)),
+            "the one on the PATH wins: it is the one the operator's shell would run"
+        );
+        assert_eq!(
+            nvidia_smi_from(Some(path_without_it.as_os_str()), &without),
+            None,
+            "neither on the PATH nor in the directory of WSL: there is no card to talk to"
+        );
+        assert_eq!(nvidia_smi_from(None, &without), None);
+
+        std::fs::remove_dir_all(&root).expect("the test owns this directory");
+    }
+
+    /// CI-D5b (D5b.10). The libraries the CUDA provider needs depend on which
+    /// package was installed: `cuda12` and `cuda13` do not share a cudart or a
+    /// cuBLAS, and a hint that names the other major sends the operator to
+    /// fetch libraries the provider will not load. The package is read from the
+    /// record `models runtime` writes beside the runtime; `ORT_DYLIB_PATH`
+    /// points there, and `runtime_dir` takes it as the operator's word even when
+    /// the library itself is not there.
+    #[tokio::test]
+    async fn the_hint_of_a_provider_that_did_not_start_names_the_libraries_of_the_installed_flavor()
+    {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+
+        let root = scratch_root("hint-flavor");
+        let runtime = root.join("onnxruntime");
+        std::fs::create_dir_all(&runtime).expect("the test owns this directory");
+        let _explicit = ScopedEnv::set(
+            "ORT_DYLIB_PATH",
+            &runtime.join("libonnxruntime.so").display().to_string(),
+        );
+        let refused = [(Workload::Reranker, PROVIDER_REFUSAL.to_string())];
+        let hint_now = || {
+            status_after_sessions(status_from(Some("cuda"), true, true), &refused)
+                .hint
+                .expect("a refused provider has a way out")
+        };
+        let record = |flavor: &str| {
+            std::fs::write(
+                runtime.join("runtime.json"),
+                format!(
+                    r#"{{"version":"1.31.1","flavor":"{flavor}","archive":"x","sha256":"00"}}"#
+                ),
+            )
+            .expect("temp dir is writable");
+        };
+
+        let unrecorded = hint_now();
+        for name in [
+            "cudart64_12",
+            "cublasLt64_12",
+            "cudart64_13",
+            "cublasLt64_13",
+        ] {
+            assert!(
+                unrecorded.contains(name),
+                "with no record the hint cannot know the major and names both: {unrecorded}"
+            );
+        }
+
+        record("cuda13");
+        let thirteen = hint_now();
+        for name in ["cudart64_13", "cublas64_13", "cublasLt64_13"] {
+            assert!(
+                thirteen.contains(name),
+                "an install of CUDA 13 needs `{name}`: {thirteen}"
+            );
+        }
+        assert!(
+            !thirteen.contains("_12"),
+            "and says nothing of the CUDA 12 libraries, which this provider does not load: {thirteen}"
+        );
+
+        record("cuda12");
+        let twelve = hint_now();
+        for name in ["cudart64_12", "cublas64_12", "cublasLt64_12"] {
+            assert!(
+                twelve.contains(name),
+                "an install of CUDA 12 needs `{name}`: {twelve}"
+            );
+        }
+        assert!(
+            !twelve.contains("_13"),
+            "and says nothing of the CUDA 13 libraries: {twelve}"
+        );
+
+        for hint in [&unrecorded, &thirteen, &twelve] {
+            assert!(
+                hint.contains("cuDNN") && hint.contains("opcional"),
+                "from 1.28 cuDNN is optional and the hint no longer sends anybody to fetch it as \
+                 if the session needed it: {hint}"
+            );
+            assert!(
+                !hint.contains("cudnn64_9"),
+                "the old hint named cuDNN 9 as required: {hint}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
