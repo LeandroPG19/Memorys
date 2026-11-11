@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
@@ -274,15 +274,16 @@ async fn resolve(pool: &PgPool, args: &Value) -> Result<Value> {
             "beta"
         };
         for (source,) in &sources {
-            let sql = format!(
+            // sql-safe: col is the literal "alpha" or "beta"; outcome only chooses which
+            let sql = AssertSqlSafe(format!(
                 "INSERT INTO brain_source_trust (source, alpha, beta, updated_at)
                  VALUES ($1, 1.0, 1.0, NOW())
                  ON CONFLICT (source) DO UPDATE
                    SET {col} = brain_source_trust.{col} + 1.0,
                        updated_at = NOW()",
                 col = column
-            );
-            if sqlx::query(&sql).bind(source).execute(pool).await.is_ok() {
+            ));
+            if sqlx::query(sql).bind(source).execute(pool).await.is_ok() {
                 sources_updated += 1;
             }
         }

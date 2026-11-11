@@ -264,3 +264,69 @@ fn a_file_an_applied_migration_tells_you_to_run_still_exists() {
          permanent comments lie again"
     );
 }
+
+static EMBEDDED: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+const CHECKSUM_OF_VERSION_1: &str = "c2f6e4b4e9a6a2bc7ca56aebf53a5a4bea8c13f553023448be904c561326c93bc8b134ede294144ad8bcd0f42ed89db7";
+const CHECKSUM_OF_VERSION_60: &str = "7dc8c0070711f53f8eb7806d1ec74c9d2c8fe0646e11715060144eb83500e0266a428fd9be12ce7878e0e70c23f16542";
+
+#[test]
+fn every_embedded_migration_carries_the_sha384_of_its_file_so_an_installed_database_still_starts() {
+    use sha2::{Digest, Sha384};
+
+    let on_disk: BTreeMap<i64, Vec<u8>> = up_migrations()
+        .into_iter()
+        .map(|(stem, body)| {
+            let version: i64 = stem
+                .get(..4)
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{stem}: a migration file starts with its version"));
+            (version, Sha384::digest(body.as_bytes()).to_vec())
+        })
+        .collect();
+    let embedded: BTreeMap<i64, Vec<u8>> = EMBEDDED
+        .iter()
+        .filter(|m| m.migration_type.is_up_migration())
+        .map(|m| (m.version, m.checksum.to_vec()))
+        .collect();
+
+    assert!(
+        on_disk.len() >= 65,
+        "the scan found {} up-migration files and there are at least 65; a scan that found almost \
+         none proves nothing",
+        on_disk.len()
+    );
+    assert_eq!(
+        embedded.keys().collect::<Vec<_>>(),
+        on_disk.keys().collect::<Vec<_>>(),
+        "sqlx::migrate! embeds one up-migration per .up.sql file, with the same versions"
+    );
+
+    let moved: Vec<String> = embedded
+        .iter()
+        .filter(|(version, sum)| on_disk[*version] != **sum)
+        .map(|(version, sum)| {
+            format!(
+                "{version}: embeds {}, its file hashes to {}",
+                hex::encode(sum),
+                hex::encode(&on_disk[version])
+            )
+        })
+        .collect();
+    assert!(
+        moved.is_empty(),
+        "sqlx stores the SHA-384 of each migration file in _sqlx_migrations and refuses to start a \
+         database whose stored sum differs from the one this binary embeds. These do not match \
+         the bytes of their files, so every database a binary with the other sums already migrated \
+         would be refused: {moved:#?}"
+    );
+
+    for (version, literal) in [(1_i64, CHECKSUM_OF_VERSION_1), (60, CHECKSUM_OF_VERSION_60)] {
+        assert_eq!(
+            hex::encode(&embedded[&version]),
+            literal,
+            "migration {version} embeds a different sum than the one `sha384sum` gave its file \
+             when the databases in the field were migrated"
+        );
+    }
+}

@@ -25,7 +25,7 @@
 
 use std::future::Future;
 
-use sqlx::{Connection, Executor, PgConnection};
+use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection};
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL").expect(
@@ -56,14 +56,16 @@ where
         .await
         .expect("connecting to the maintenance database");
     admin
-        .execute(format!("CREATE DATABASE {scratch}").as_str())
+        .execute(AssertSqlSafe(format!("CREATE DATABASE {scratch}")))
         .await
         .expect("creating the scratch database");
 
     let outcome = tokio::spawn(body(sibling_url(&url, &scratch))).await;
 
     admin
-        .execute(format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)").as_str())
+        .execute(AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"
+        )))
         .await
         .expect("dropping the scratch database");
     if let Err(joined) = outcome {

@@ -443,7 +443,7 @@ async fn migrate_and_provision(pool: &PgPool) -> Result<()> {
 ///
 /// A failed run leaves its session holding the migration lock: run_direct
 /// takes a session-level `pg_advisory_lock` first and returns on the error
-/// without reaching its unlock (sqlx-core 0.8.6, migrate/migrator.rs:147-189).
+/// without reaching its unlock (sqlx-core 0.9.0, migrate/migrator.rs:238-291).
 /// Back in the pool, that connection would keep the lock while it idles, and a
 /// retry on another connection would wait on it for as long as the pool keeps
 /// it. Closing it ends the session, the lock and the failed migration's
@@ -463,8 +463,11 @@ async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
 
 /// run_direct, not run: run on `&mut PgConnection` asks for `Acquire<'a>` for
 /// every lifetime, which rustc refuses ("implementation of `Acquire` is not
-/// general enough"); sqlx-core 0.8.6 keeps run_direct public for exactly that
-/// (migrate/migrator.rs:140-145). Boxed so rustc proves Send here, with
+/// general enough"); sqlx-core 0.9.0 keeps run_direct public for exactly that
+/// (migrate/migrator.rs:225-236). It is called with `None` and `false`: no
+/// target version and no skip, which is what `run` itself passes (:182). A
+/// `skip` of `true` would record every migration as applied without running
+/// it. Boxed so rustc proves Send here, with
 /// concrete lifetimes: inferred, Migrator::run left create_pool's future !Send
 /// (v043 spawns it) once provision_app_role took a tx. The box holds
 /// run_direct's own future, not an async block around it, so what this
@@ -472,7 +475,7 @@ async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
 async fn realign_then_migrate(conn: &mut sqlx::PgConnection) -> Result<(), MigrateError> {
     realign_line_ending_checksums(conn).await?;
     let run: Pin<Box<dyn Future<Output = Result<(), MigrateError>> + Send + '_>> =
-        Box::pin(MIGRATOR.run_direct(&mut *conn));
+        Box::pin(MIGRATOR.run_direct(None, &mut *conn, false));
     run.await
 }
 
@@ -492,8 +495,9 @@ async fn realign_then_migrate(conn: &mut sqlx::PgConnection) -> Result<(), Migra
 /// changed in between is not overwritten. It runs before run_direct takes the
 /// migration lock, which is why it has to be conditional.
 ///
-/// sqlx::Connection::begin and sqlx::Executor's own methods return a BoxFuture
-/// that is already Send, for the reason given at write_app_role_password.
+/// sqlx::Connection::begin returns an `impl Future + Send` and sqlx::Executor's
+/// own methods a BoxFuture, both already Send, for the reason given at
+/// write_app_role_password.
 async fn realign_line_ending_checksums(conn: &mut sqlx::PgConnection) -> sqlx::Result<()> {
     let mut tx = sqlx::Connection::begin(conn).await?;
     for (version, recorded) in applied_checksums(&mut tx).await? {
@@ -546,7 +550,7 @@ fn realigned_checksum_for(version: i64, recorded: &[u8]) -> Option<&'static [u8]
         .iter()
         .filter(|m| !m.migration_type.is_down_migration())
         .find(|m| m.version == version)
-        .and_then(|m| realigned_checksum(&m.sql, &m.checksum, recorded))
+        .and_then(|m| realigned_checksum(m.sql.as_str(), &m.checksum, recorded))
 }
 
 /// `embedded` when `recorded` is the SHA-384 of `sql` with every line ending
@@ -598,7 +602,7 @@ const CATALOG_RACE_ATTEMPTS: u32 = 5;
 ///
 /// Repeating what init_schema hands it is safe. A migration runs in one
 /// transaction together with the insert of its `_sqlx_migrations` row
-/// (sqlx-postgres 0.8.6, migrate.rs:214-225 and 275-298; none of ours starts
+/// (sqlx-postgres 0.9.0, migrate.rs:222-244 and 315-338; none of ours starts
 /// with `-- no-transaction`), so one that lost the race left no row, and no
 /// row with `success = false`, which is what sqlx calls dirty; the next run
 /// applies it from the start. write_app_role_password is one transaction too.
@@ -698,6 +702,7 @@ pub async fn assert_embedding_dim(pool: &PgPool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::AssertSqlSafe;
 
     #[test]
     fn migrator_loaded() {
@@ -1190,7 +1195,8 @@ mod tests {
             .connect(&shared)
             .await
             .expect("connect to the server DATABASE_URL names");
-        sqlx::query(&format!("CREATE DATABASE {name}"))
+        // sql-safe: name is the database name this test generated above
+        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&observer)
             .await
             .expect("create the private database");
@@ -1248,9 +1254,12 @@ mod tests {
         .await;
 
         crate::session::clear();
-        let dropped = sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-            .execute(&observer)
-            .await;
+        // sql-safe: name is the database name this test generated above
+        let dropped = sqlx::query(AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+        )))
+        .execute(&observer)
+        .await;
         let (user, own, foreign, at_start, open_before, open_after) = observed.expect(
             "the row scenario needs the private database and the application role: without \
              a pgpass_app password the URL stays the admin's, and the scenario fails here",
@@ -1432,7 +1441,7 @@ mod tests {
             .iter()
             .filter(|m| !m.migration_type.is_down_migration())
         {
-            let lf = up.sql.replace("\r\n", "\n");
+            let lf = up.sql.as_str().replace("\r\n", "\n");
             let crlf = lf.replace('\n', "\r\n");
             let other = if sha384(&lf) == *up.checksum {
                 crlf
@@ -1461,7 +1470,7 @@ mod tests {
             .iter()
             .filter(|m| m.migration_type.is_down_migration())
         {
-            let lf = down.sql.replace("\r\n", "\n");
+            let lf = down.sql.as_str().replace("\r\n", "\n");
             let crlf = lf.replace('\n', "\r\n");
             for variant in [lf, crlf] {
                 assert_eq!(
@@ -1714,7 +1723,8 @@ mod tests {
             .connect(&shared)
             .await
             .expect("connect to the server DATABASE_URL names");
-        sqlx::query(&format!("CREATE DATABASE {name}"))
+        // sql-safe: name is the database name this test generated above
+        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&observer)
             .await
             .expect("create the private database");
@@ -1793,10 +1803,13 @@ mod tests {
                 Err(failure) => failures.push(failure),
             }
         }
-        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-            .execute(&observer)
-            .await
-            .expect("drop the private database");
+        // sql-safe: name is the database name this test generated above
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+        )))
+        .execute(&observer)
+        .await
+        .expect("drop the private database");
         if let Some(failure) = failures.into_iter().next() {
             std::panic::resume_unwind(failure.into_panic());
         }

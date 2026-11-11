@@ -22,6 +22,8 @@ mod gate_lane_token_contract;
 mod migrations_contract;
 #[path = "group_no_server/scram_verifier_contract.rs"]
 mod scram_verifier_contract;
+#[path = "group_no_server/sql_safe_contract.rs"]
+mod sql_safe_contract;
 #[path = "group_no_server/v026_the_panel_is_not_a_second_door.rs"]
 mod v026_the_panel_is_not_a_second_door;
 #[path = "group_no_server/v029_apply_keeps_what_the_operator_set.rs"]

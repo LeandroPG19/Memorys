@@ -5,7 +5,7 @@ use crate::handlers;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
@@ -888,11 +888,12 @@ async fn run_rem_consolidation_locked(pool: &PgPool) -> Result<()> {
             .await?
             .rows_affected()
     } else {
-        let sql_with_protection = format!(
+        // sql-safe: stratified_decay_sql is a literal of this function and the clause appended is a literal too
+        let sql_with_protection = AssertSqlSafe(format!(
             "{} AND entity_id NOT IN (SELECT UNNEST($1::uuid[]))",
             stratified_decay_sql
-        );
-        sqlx::query(&sql_with_protection)
+        ));
+        sqlx::query(sql_with_protection)
             .bind(&protected_entity_ids)
             .execute(pool)
             .await?
@@ -1141,7 +1142,9 @@ async fn rem_refresh_planner_stats(pool: &PgPool) -> usize {
         if !never_analyzed && !churned {
             continue;
         }
-        match sqlx::query(&format!("ANALYZE {table}")).execute(pool).await {
+        // sql-safe: table is one of the four literals of PLANNER_STAT_TABLES
+        let analyze = AssertSqlSafe(format!("ANALYZE {table}"));
+        match sqlx::query(analyze).execute(pool).await {
             Ok(_) => analyzed += 1,
             Err(why) => tracing::warn!(error = %why, table, "ANALYZE failed"),
         }

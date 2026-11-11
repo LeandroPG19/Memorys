@@ -3,7 +3,6 @@
 # scripts/advisory-exceptions.txt; merge-gate.sh is red when this ignore list
 # differs from it by one ID either way. cargo-audit takes only bare IDs here.
 ignore = [
-    "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0459",
 ]

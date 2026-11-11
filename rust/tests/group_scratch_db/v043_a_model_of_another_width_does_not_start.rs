@@ -1,6 +1,6 @@
 // needs-a-server: creates and drops its own database where DATABASE_URL points
 use crate::empty_db::in_an_empty_database;
-use sqlx::{Executor, PgPool};
+use sqlx::{AssertSqlSafe, Executor, PgPool};
 
 #[tokio::test]
 async fn the_daemon_refuses_a_vector_column_of_another_width_and_names_both() {
@@ -21,14 +21,18 @@ async fn the_daemon_refuses_a_vector_column_of_another_width_and_names_both() {
         pool.execute("CREATE EXTENSION IF NOT EXISTS vector")
             .await
             .expect("pgvector in the scratch database");
-        pool.execute(format!("CREATE TABLE fits (embedding vector({runtime}))").as_str())
-            .await
-            .expect("a column as wide as the model");
+        pool.execute(AssertSqlSafe(format!(
+            "CREATE TABLE fits (embedding vector({runtime}))"
+        )))
+        .await
+        .expect("a column as wide as the model");
         let matching = memory_industry::db::assert_embedding_dim(&pool).await;
 
-        pool.execute(format!("CREATE TABLE left_behind (embedding vector({other}))").as_str())
-            .await
-            .expect("a column from another model");
+        pool.execute(AssertSqlSafe(format!(
+            "CREATE TABLE left_behind (embedding vector({other}))"
+        )))
+        .await
+        .expect("a column from another model");
         let mismatched = memory_industry::db::assert_embedding_dim(&pool).await;
         pool.close().await;
 

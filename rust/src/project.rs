@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use std::env;
 use uuid::Uuid;
 
@@ -82,11 +82,11 @@ pub async fn backfill_unscoped(
 ) -> Result<serde_json::Value> {
     let mut counts = serde_json::Map::new();
     for table in BACKFILL_TABLES {
-        let n: i64 = sqlx::query_scalar(&format!(
+        // sql-safe: table is one of the five literals of BACKFILL_TABLES
+        let count_sql = AssertSqlSafe(format!(
             "SELECT count(*) FROM {table} WHERE project_id IS NULL"
-        ))
-        .fetch_one(pool)
-        .await?;
+        ));
+        let n: i64 = sqlx::query_scalar(count_sql).fetch_one(pool).await?;
         counts.insert(table.to_string(), serde_json::json!(n));
     }
     if !apply {
@@ -100,8 +100,14 @@ pub async fn backfill_unscoped(
     let mut moved = serde_json::Map::new();
     let mut tx = begin_write_scope(pool).await?;
     for table in BACKFILL_TABLES {
-        let q = format!("UPDATE {table} SET project_id = $1 WHERE project_id IS NULL");
-        let rows = sqlx::query(&q).bind(project_id).execute(&mut *tx).await?;
+        // sql-safe: table is one of the five literals of BACKFILL_TABLES
+        let update_sql = AssertSqlSafe(format!(
+            "UPDATE {table} SET project_id = $1 WHERE project_id IS NULL"
+        ));
+        let rows = sqlx::query(update_sql)
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?;
         moved.insert(table.to_string(), serde_json::json!(rows.rows_affected()));
     }
     tx.commit().await?;

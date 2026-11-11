@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use memory_industry::db;
 use sha2::{Digest, Sha384};
-use sqlx::{Connection, Executor, PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, PgPool};
 use tokio::sync::OnceCell;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -90,7 +90,7 @@ fn refuse(step: &str, why: &sqlx::Error) -> ! {
 
 async fn run(admin: &mut PgConnection, statement: &str, step: &str) {
     admin
-        .execute(statement)
+        .execute(AssertSqlSafe(statement))
         .await
         .unwrap_or_else(|why| refuse(step, &why));
 }
@@ -173,7 +173,9 @@ async fn build_the_template(url: &str) -> String {
         panic!("emptying the template before publishing it: {who}");
     }
     match admin
-        .execute(format!("ALTER DATABASE {building} RENAME TO {name}").as_str())
+        .execute(AssertSqlSafe(format!(
+            "ALTER DATABASE {building} RENAME TO {name}"
+        )))
         .await
     {
         Ok(_) => {}
@@ -203,13 +205,12 @@ pub async fn close_and_seal(
     database: &str,
     within: Duration,
 ) -> Result<(), String> {
+    // sqlx-core 0.8.6's `Pool::close()` returned with a connection that was being returned still
+    // open (CI-E32); 0.9.0 closes every connection before it returns (launchbadge/sqlx#3952), so
+    // the builder needs nothing of its own (CI-E36). The test that watches the dependency is
+    // `a_pool_closed_while_a_connection_returns_leaves_no_session_on_the_sealed_database`: do not
+    // put a `drop(pool)` back to make it pass.
     pool.close().await;
-    // sqlx-core 0.8.6 (`pool/inner.rs:97-115`): `close()` empties the idle queue once per permit
-    // and never after the last wait, so a connection that was being returned (its `after_release`
-    // still running) lands in the queue just as it releases the permit `close()` waits for, and
-    // stays open for as long as a `Pool` lives. Dropping the last handle drops `PoolInner` with
-    // its queue and closes that socket.
-    drop(pool);
     run(
         admin,
         &format!("ALTER DATABASE {database} WITH ALLOW_CONNECTIONS false"),
@@ -318,7 +319,9 @@ where
     let outcome = tokio::spawn(body(sibling_url(&url, &scratch))).await;
 
     admin
-        .execute(format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)").as_str())
+        .execute(AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"
+        )))
         .await
         .expect("dropping the scratch database");
     if let Err(joined) = outcome {

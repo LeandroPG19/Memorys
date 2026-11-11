@@ -159,7 +159,7 @@ async fn shape_of(pool: &sqlx::PgPool) -> Shape {
 /// for the trait object and not for the whole async block.
 async fn run<'a>(migrator: &'a Migrator, conn: &'a mut PgConnection) -> Result<(), MigrateError> {
     let run: Pin<Box<dyn Future<Output = Result<(), MigrateError>> + Send + 'a>> =
-        Box::pin(migrator.run_direct(conn));
+        Box::pin(migrator.run_direct(None, conn, false));
     run.await
 }
 

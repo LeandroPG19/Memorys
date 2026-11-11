@@ -6209,10 +6209,9 @@ fn a_lane_cluster_is_the_judges_own_throwaway_server() {
                 .await
                 .expect("connecting to lane t1 through its socket");
             let mut answers: Vec<Result<String, String>> = Vec::new();
-            for (query, _) in &expected {
-                let sql: &str = query;
+            for &(query, _) in &expected {
                 let answer: Result<String, sqlx::Error> =
-                    sqlx::query_scalar(sql).fetch_one(&mut conn).await;
+                    sqlx::query_scalar(query).fetch_one(&mut conn).await;
                 answers.push(answer.map_err(|why| why.to_string()));
             }
             let division = match sqlx::query("select 1/0").execute(&mut conn).await {
