@@ -1915,8 +1915,9 @@ mod tests {
     /// library starts, and the only place that runs ahead of it in the daemon is
     /// `main`, which calls this. An operator who set the variable keeps their
     /// value, whatever it is: it is theirs to decide, and `set_var` over it
-    /// would be a second opinion nobody asked for. The environment is only
-    /// written under the global guard: `set_var` is unsound next to a reader.
+    /// would be a second opinion nobody asked for, except an empty one, which is
+    /// no word at all (the judge reads it that way: CI-D5c, A.7). The environment
+    /// is only written under the global guard: `set_var` is unsound next to a reader.
     #[tokio::test]
     async fn the_daemon_turns_onnx_runtime_telemetry_off_and_leaves_the_operators_word_alone() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
@@ -1938,6 +1939,17 @@ mod tests {
                 std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref(),
                 Some("0"),
                 "an operator who set it to \"0\" asked for telemetry on, and the daemon respects it"
+            );
+        }
+        {
+            let _empty = ScopedEnv::set("ORT_DISABLE_TELEMETRY", "");
+            keep_onnx_runtime_telemetry_off();
+            assert_eq!(
+                std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref(),
+                Some("1"),
+                "set and empty counts as unset, the rule of `gate-lock.sh` (CI-D5c, A.7): two \
+                 rules for one variable leave the daemon with telemetry on where the judge \
+                 measured it off"
             );
         }
     }

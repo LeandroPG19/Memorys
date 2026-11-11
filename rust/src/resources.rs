@@ -1078,4 +1078,42 @@ mod tests {
             );
         }
     }
+
+    /// CI-D5c (A.8). `nvidia-smi` runs at the start of every command of a build
+    /// with `cuda`, `models runtime --if-installed` from `npm install` included:
+    /// one that hangs (a driver in a bad state, WSL after a suspend) hung them
+    /// all. The children are `sh`, as in `service.rs`: the one that waits is the
+    /// child, not the test, and the 20 seconds only pass if the limit is gone.
+    #[cfg(unix)]
+    #[test]
+    fn an_nvidia_smi_that_does_not_answer_is_cut_and_reads_as_no_vram() {
+        let shell = |script: &str| {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+
+        assert_eq!(
+            vram_free_from(shell("echo 5900"), std::time::Duration::from_secs(2)),
+            Some(5900),
+            "an answer inside the limit is the number it printed"
+        );
+
+        let started = std::time::Instant::now();
+        let silent = vram_free_from(
+            shell("exec sleep 30"),
+            std::time::Duration::from_millis(200),
+        );
+        let waited = started.elapsed();
+        assert_eq!(
+            silent, None,
+            "a process that never answers reads as no VRAM measured, and the plan does what it \
+             does without `nvidia-smi`"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(20),
+            "it took {waited:?} to give up on a child that sleeps 30 seconds: the limit of \
+             200 ms was not applied"
+        );
+    }
 }

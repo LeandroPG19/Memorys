@@ -3135,13 +3135,18 @@ mod tests {
         );
     }
 
-    /// CI-D5b (D5b.3). One row per line of the table of the spec, named in the
-    /// message so a red says which machine it is.
+    /// CI-D5b (D5b.3) and CI-D5c (A.5). One row per line of the table of the spec,
+    /// named in the message so a red says which machine it is. A driver whose card
+    /// does not answer (`compute: None`) still has a version, and the version
+    /// alone decides every row where the card would not have.
     #[test]
     fn cuda_comes_from_the_driver_and_the_card_and_the_flag_forces_it() {
-        let card = |driver: i32, compute: (i32, i32)| Some(CudaProbe { driver, compute });
+        let card = |driver: i32, compute: Option<(i32, i32)>| Some(CudaProbe { driver, compute });
+        let says = |driver: i32, compute: Option<(i32, i32)>, forced: Option<u8>| {
+            choose_cuda(forced, &|| card(driver, compute))
+        };
 
-        let (flavor, note) = choose_cuda(None, None).expect("no driver is not an error");
+        let (flavor, note) = choose_cuda(None, &|| None).expect("no driver is not an error");
         assert_eq!(flavor, Flavor::Cuda13, "no driver: CUDA 13");
         let note = note.expect("no driver says so");
         assert!(
@@ -3149,62 +3154,92 @@ mod tests {
             "the line that says what was not seen and how to ask for 12: {note}"
         );
 
-        for (row, probe, want) in [
-            ("driver 13.3, SM 8.9", card(13030, (8, 9)), Flavor::Cuda13),
+        for (row, driver, compute, want) in [
+            ("driver 13.3, SM 8.9", 13030, Some((8, 9)), Flavor::Cuda13),
             (
                 "driver 13.3, SM 7.5 (Turing)",
-                card(13030, (7, 5)),
+                13030,
+                Some((7, 5)),
                 Flavor::Cuda13,
             ),
             (
                 "driver 13.3, SM 6.1 (Pascal)",
-                card(13030, (6, 1)),
+                13030,
+                Some((6, 1)),
                 Flavor::Cuda12,
             ),
-            ("driver 12.8, SM 8.9", card(12080, (8, 9)), Flavor::Cuda12),
-            ("driver 12.0, SM 6.1", card(12000, (6, 1)), Flavor::Cuda12),
+            ("driver 12.8, SM 8.9", 12080, Some((8, 9)), Flavor::Cuda12),
+            ("driver 12.0, SM 6.1", 12000, Some((6, 1)), Flavor::Cuda12),
+            ("driver 12.8, card not read", 12080, None, Flavor::Cuda12),
+            ("driver 13.3, card not read", 13030, None, Flavor::Cuda13),
         ] {
-            let (got, _) = choose_cuda(None, probe)
+            let (got, _) = says(driver, compute, None)
                 .unwrap_or_else(|e| panic!("{row}: this machine can take a runtime: {e:#}"));
             assert_eq!(got, want, "{row}");
         }
-        let (_, pascal) = choose_cuda(None, card(13030, (6, 1))).expect("CUDA 12 takes it");
+        let (_, pascal) = says(13030, Some((6, 1)), None).expect("CUDA 12 takes it");
         assert!(
             pascal.is_some_and(|line| line.contains("6.1")),
             "falling to CUDA 12 because of the card says which capability it read"
         );
-        let (_, healthy) = choose_cuda(None, card(13030, (8, 9))).expect("CUDA 13 takes it");
+        let (_, healthy) = says(13030, Some((8, 9)), None).expect("CUDA 13 takes it");
         assert_eq!(
             healthy, None,
             "a machine that needs no explanation gets none"
         );
+        let (_, unread) = says(13030, None, None).expect("CUDA 13 takes a driver of 13.3");
+        assert!(
+            unread.is_some_and(|line| line.contains("tarjeta 0") && line.contains("--cuda 12")),
+            "a card that did not answer under a driver of 13 says it went to CUDA 13 without \
+             reading it, and how to ask for 12 if the card is older than Turing"
+        );
+        let (_, driver_12) = says(12080, None, None).expect("CUDA 12 takes a driver of 12.8");
+        assert_eq!(
+            driver_12, None,
+            "the version of the driver decides below 13: nothing to explain about a card that \
+             was never needed"
+        );
 
-        let (forced, _) = choose_cuda(Some(12), card(13030, (8, 9))).expect("12 is forced");
+        let (forced, _) = says(13030, Some((8, 9)), Some(12)).expect("12 is forced");
         assert_eq!(
             forced,
             Flavor::Cuda12,
             "--cuda 12 wins over a driver of 13.3"
         );
-        let (forced, _) = choose_cuda(Some(13), card(12080, (8, 9))).expect("13 is forced");
+        let (forced, _) = says(12080, Some((8, 9)), Some(13)).expect("13 is forced");
         assert_eq!(
             forced,
             Flavor::Cuda13,
             "--cuda 13 wins over a driver of 12.8"
         );
+        let (forced, _) = says(13030, None, Some(13)).expect("13 is forced");
+        assert_eq!(
+            forced,
+            Flavor::Cuda13,
+            "--cuda 13 over a card that did not answer: there is no capability to refuse it with"
+        );
 
         let old = format!(
             "{:#}",
-            choose_cuda(None, card(11080, (8, 9)))
+            says(11080, Some((8, 9)), None)
                 .expect_err("a driver older than CUDA 12 cannot run either package")
         );
         assert!(
             old.contains("11.8") && old.contains("12 o 13"),
             "the error says the version the driver supports and what the runtime needs: {old}"
         );
+        let old_unread = format!(
+            "{:#}",
+            says(11080, None, None).expect_err("the driver version is not lost with the card")
+        );
+        assert!(
+            old_unread.contains("11.8") && old_unread.contains("12 o 13"),
+            "a driver older than CUDA 12 whose card did not answer is the same error, not CUDA \
+             13 for a driver that cannot run it: {old_unread}"
+        );
         let pascal = format!(
             "{:#}",
-            choose_cuda(Some(13), card(13030, (6, 1)))
-                .expect_err("forcing CUDA 13 does not fix the card")
+            says(13030, Some((6, 1)), Some(13)).expect_err("forcing CUDA 13 does not fix the card")
         );
         assert!(
             pascal.contains("6.1") && pascal.contains("--cuda 12"),
@@ -3659,5 +3694,431 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The fixture of a swap cut between its two renames: the old runtime sits in
+    /// `<leaf>.previous` with a library of the operator's beside it, there is no
+    /// leaf, and the new package is whole in staging.
+    fn a_swap_cut_between_its_two_renames(home: &Home) -> (PathBuf, PathBuf, PathBuf) {
+        let leaf = home.root.join("onnxruntime");
+        let previous = sibling(&leaf, "previous");
+        let staging = sibling(&leaf, "downloading");
+        put(&previous.join("libonnxruntime.so"), b"old core 1.26.0");
+        put(
+            &previous.join("libonnxruntime_providers_cuda.so"),
+            b"old provider",
+        );
+        put(&previous.join("libcudart.so.12"), b"cudart of the operator");
+        put(&staging.join("libonnxruntime.so"), b"new core 1.31.1");
+        put(
+            &staging.join("runtime.json"),
+            record_json("1.31.1", "cpu", "x").as_bytes(),
+        );
+        assert!(
+            !leaf.exists(),
+            "the fixture is the machine a process killed between the renames leaves"
+        );
+        (leaf, previous, staging)
+    }
+
+    /// CI-D5c (A.1a). `swap_runtime` used to delete `<leaf>.previous` first and ask
+    /// afterwards whether there was a leaf: on a machine cut between the renames
+    /// that was the only copy of the runtime. Now it comes back before anything
+    /// is deleted, and a new package that does not load leaves it exactly as it was.
+    #[test]
+    fn a_previous_runtime_with_no_leaf_comes_back_before_anything_is_deleted() {
+        let home = Home::new("swap-cut-refused");
+        let (leaf, previous, staging) = a_swap_cut_between_its_two_renames(&home);
+        let old = snapshot(&previous);
+        let new = snapshot(&staging);
+
+        let error = swap_runtime(
+            &staging,
+            &leaf,
+            &|_| Err(anyhow::anyhow!("the new core does not load")),
+            &really_rename,
+        )
+        .expect_err("a runtime that does not load does not replace the old one");
+        assert!(
+            format!("{error:#}").contains("the new core does not load"),
+            "the error carries the cause the check gave: {error:#}"
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            old,
+            "the leaf has exactly the files of `.previous`: the only copy of the runtime was \
+             deleted before the swap looked for a leaf, and a machine cut here had none left"
+        );
+        assert!(
+            !previous.exists(),
+            "the aside copy became the runtime again"
+        );
+        assert_eq!(
+            snapshot(&sibling(&leaf, "failed")),
+            new,
+            "the package that did not load is kept to be looked at"
+        );
+
+        let home = Home::new("swap-cut-accepted");
+        let (leaf, previous, staging) = a_swap_cut_between_its_two_renames(&home);
+        let new = snapshot(&staging);
+        swap_runtime(&staging, &leaf, &|_| Ok(()), &really_rename)
+            .expect("a runtime that loads replaces the one that came back");
+        let mut want = new;
+        want.insert(
+            PathBuf::from("libcudart.so.12"),
+            Some(b"cudart of the operator".to_vec()),
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            want,
+            "the new core, the new record and the library of the operator, and nothing of the \
+             old package"
+        );
+        assert!(!previous.exists(), "nothing is left aside once it loaded");
+    }
+
+    /// CI-D5c (A.1b). The next run finds the leaf missing and `.previous` there.
+    /// With `--if-installed`, which is what `npm install` runs, it used to say
+    /// «no hay ninguno» and exit 0: a machine without a runtime for good.
+    #[tokio::test]
+    async fn if_installed_finishes_a_swap_cut_between_its_two_renames() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = Home::new("runtime-cut-swap");
+        let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
+        let proxy = DeadProxy::start().await;
+        let (_, lib_name) = host_cpu_runtime();
+        let leaf = home.roots.preferred.join("onnxruntime");
+        let previous = sibling(&leaf, "previous");
+        put(&previous.join(lib_name), b"runtime of an older version");
+        put(&previous.join("libcudart.so.12"), b"cudart of the operator");
+        let old = snapshot(&previous);
+        let ask = RuntimeArgs {
+            if_installed: true,
+            ..RuntimeArgs::default()
+        };
+
+        let updating = download_runtime(&ask).await;
+
+        let attempted = proxy.hits();
+        let said = format!("{updating:?}");
+        assert!(
+            updating.is_err() && attempted >= 1,
+            "the runtime that came back is one of unknown version, and `--if-installed` updates \
+             it: answering «no hay ninguno» over a leaf that was only renamed away leaves the \
+             machine without a runtime ({attempted} requests): {said}"
+        );
+        assert!(
+            said.contains("descargando el runtime"),
+            "the failure is the one of the download, not of the recovery: {said}"
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            old,
+            "after the failed update the leaf has the runtime it had, file for file"
+        );
+        assert!(!previous.exists(), "and nothing is left aside");
+    }
+
+    /// CI-D5c (A.2). The hint of a provider that would not start says to put the
+    /// CUDA libraries «junto al runtime de ONNX», and the replacement used to
+    /// delete the whole old directory: whoever followed it lost them on the first
+    /// update. What is not the package moves to the new directory; what is the
+    /// old package never does, or the mix of two versions comes back. The
+    /// fixture holds a library of each system on purpose: the rule is by name.
+    #[test]
+    fn what_the_operator_put_beside_the_runtime_survives_its_replacement() {
+        let home = Home::new("swap-keeps-the-operators-files");
+        let (leaf, staging) = old_and_new_runtime(&home);
+        put(
+            &leaf.join("runtime.json"),
+            record_json("1.26.0", "cuda12", "old").as_bytes(),
+        );
+        put(&leaf.join("libcudart.so.12"), b"cudart of the operator");
+        put(&leaf.join("cudnn64_9.dll"), b"cudnn of the operator");
+        let new = snapshot(&staging);
+
+        swap_runtime(&staging, &leaf, &|_| Ok(()), &really_rename)
+            .expect("a runtime that loads replaces the old one");
+
+        let mut want = new;
+        want.insert(
+            PathBuf::from("libcudart.so.12"),
+            Some(b"cudart of the operator".to_vec()),
+        );
+        want.insert(
+            PathBuf::from("cudnn64_9.dll"),
+            Some(b"cudnn of the operator".to_vec()),
+        );
+        assert_eq!(
+            snapshot(&leaf),
+            want,
+            "the new core, its record, and the two libraries of the operator with their bytes; \
+             the old provider and the old record are the old package and do not pass"
+        );
+        assert!(
+            !leaf.join("libonnxruntime_providers_cuda.so").exists(),
+            "a provider of 1.26.0 beside the core of 1.31.1 is the mix the swap exists to prevent"
+        );
+        assert!(!sibling(&leaf, "previous").exists());
+
+        let home = Home::new("swap-keeps-previous-on-a-clash");
+        let (leaf, staging) = old_and_new_runtime(&home);
+        let previous = sibling(&leaf, "previous");
+        put(&leaf.join("libcudart.so.12"), b"cudart of the operator");
+        put(&staging.join("libcudart.so.12"), b"cudart of the package");
+
+        swap_runtime(&staging, &leaf, &|_| Ok(()), &really_rename)
+            .expect("a file that cannot move does not undo a runtime that loaded");
+
+        assert!(
+            previous.exists(),
+            "a file of the operator that could not move to the new directory is not deleted \
+             with the old one"
+        );
+        assert_eq!(
+            read(&previous.join("libcudart.so.12")),
+            b"cudart of the operator",
+            "it stays where it was, with its bytes"
+        );
+        assert_eq!(
+            read(&leaf.join("libcudart.so.12")),
+            b"cudart of the package",
+            "and the one the new package brought is not overwritten"
+        );
+        let said = retire_previous(&previous, &leaf)
+            .expect("the next attempt says again what stays, and where");
+        assert!(
+            said.contains("libcudart.so.12") && said.contains(&previous.display().to_string()),
+            "the message names the file and the directory it is in: {said}"
+        );
+
+        let again = sibling(&leaf, "downloading");
+        put(&again.join("libonnxruntime.so"), b"newer core");
+        let before = (snapshot(&leaf), snapshot(&again), snapshot(&previous));
+        let refused = swap_runtime(&again, &leaf, &|_| Ok(()), &really_rename).expect_err(
+            "a swap does not start over a directory that still holds the operator's files",
+        );
+        assert!(
+            format!("{refused:#}").contains("libcudart.so.12"),
+            "the refusal names the file that blocks it: {refused:#}"
+        );
+        assert_eq!(
+            (snapshot(&leaf), snapshot(&again), snapshot(&previous)),
+            before,
+            "a refused swap touches nothing: neither the runtime, nor the package waiting, nor \
+             the files of the operator"
+        );
+    }
+
+    /// CI-D5c (A.3, A.5). An install with a CUDA provider and no record predates
+    /// the record, and the installer of then fetched `…-gpu-<v>`, which is CUDA
+    /// 12: the libraries beside it are the ones of 12, so an unattended update
+    /// stays on 12 whatever the driver says. The driver is read only when its
+    /// answer decides: the table below counts the reads.
+    #[test]
+    fn an_unrecorded_gpu_install_stays_on_cuda_12_and_the_driver_is_read_only_when_it_decides() {
+        let reads = std::cell::Cell::new(0usize);
+        let driver_13_card_ada = || {
+            reads.set(reads.get() + 1);
+            Some(CudaProbe {
+                driver: 13030,
+                compute: Some((8, 9)),
+            })
+        };
+        let ask = |gpu: bool, cuda: Option<u8>| RuntimeArgs {
+            gpu,
+            cuda,
+            if_installed: false,
+        };
+        let gpu_without_record = Installed::Unrecorded { gpu_provider: true };
+        let cpu_without_record = Installed::Unrecorded {
+            gpu_provider: false,
+        };
+        let nothing = Installed::Nothing;
+
+        for (row, asked, installed, want, expected_reads) in [
+            (
+                "no record, a CUDA provider, no --gpu",
+                ask(false, None),
+                &gpu_without_record,
+                Some(Flavor::Cuda12),
+                0,
+            ),
+            (
+                "no record, a CUDA provider, --gpu --cuda 12",
+                ask(true, Some(12)),
+                &gpu_without_record,
+                Some(Flavor::Cuda12),
+                0,
+            ),
+            (
+                "--gpu --cuda 13",
+                ask(true, Some(13)),
+                &nothing,
+                Some(Flavor::Cuda13),
+                1,
+            ),
+            (
+                "--gpu alone",
+                ask(true, None),
+                &nothing,
+                Some(Flavor::Cuda13),
+                1,
+            ),
+            (
+                "no record, a CUDA provider, --gpu alone",
+                ask(true, None),
+                &gpu_without_record,
+                Some(Flavor::Cuda13),
+                1,
+            ),
+            (
+                "no record, no provider, no --gpu",
+                ask(false, None),
+                &cpu_without_record,
+                None,
+                0,
+            ),
+            (
+                "nothing installed, no --gpu",
+                ask(false, None),
+                &nothing,
+                None,
+                0,
+            ),
+        ] {
+            reads.set(0);
+            let got = resolve_gpu(&asked, installed, &driver_13_card_ada)
+                .unwrap_or_else(|e| panic!("{row}: {e:#}"));
+            assert_eq!(got, want, "{row}");
+            assert_eq!(
+                reads.get(),
+                expected_reads,
+                "{row}: reads of the driver. `--cuda 12` and an unrecorded GPU install are \
+                 answered without it, and `cuInit` on a machine with a card is not free"
+            );
+        }
+    }
+
+    /// CI-D5c (A.4a). A connection that is open and silent is the one failure a
+    /// download has no answer to: `npm install` would wait on it for ever. The
+    /// listener accepts and keeps the socket, so the wait is the client's. The 20
+    /// seconds of the test only end it when the limit is missing.
+    #[tokio::test]
+    async fn a_download_that_stops_answering_is_cut_and_leaves_no_part_file() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let _no_proxy: Vec<ScopedEnv> = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+            .iter()
+            .map(|name| ScopedEnv::cleared(name))
+            .collect();
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port is free");
+        let url = format!(
+            "http://{}/runtime.tgz",
+            silent.local_addr().expect("it is bound")
+        );
+        let holding = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((stream, _)) = silent.accept().await {
+                sockets.push(stream);
+            }
+        });
+        let root = scratch_root("download-stalls");
+        std::fs::create_dir_all(&root).expect("the test owns this directory");
+        let dest = root.join("runtime.tgz");
+        let limits = Timeouts {
+            connect: std::time::Duration::from_millis(200),
+            read: std::time::Duration::from_millis(200),
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            download_to_with(&url, &dest, limits),
+        )
+        .await;
+        holding.abort();
+
+        let result = outcome.expect(
+            "the download is still waiting for a peer that never answers: the client has no read \
+             time limit, and only the 20 seconds of the test ended the wait",
+        );
+        assert!(
+            result.is_err(),
+            "a peer that never answers is an error, not a download"
+        );
+        assert!(
+            !dest.exists() && !dest.with_extension("part").exists(),
+            "nothing is left for the next run to take for a package: {:?}",
+            snapshot(&root).keys().collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CI-D5c (A.6). Two `models runtime` at once (two terminals, or `npm
+    /// install` while the operator runs it) shared one staging directory and one
+    /// leaf: the second deleted what the first was filling. The lock is a real
+    /// one on a real file, and a second handle of this process conflicts with
+    /// it as a second process does.
+    #[tokio::test]
+    async fn a_second_models_runtime_refuses_while_the_first_holds_the_lock_and_touches_nothing() {
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let home = Home::new("runtime-locked");
+        let _h = ScopedEnv::set("HOME", &home.root.display().to_string());
+        let _u = ScopedEnv::set("USERPROFILE", &home.root.display().to_string());
+        let proxy = DeadProxy::start().await;
+        let (archive, lib_name) = host_cpu_runtime();
+        let leaf = home.roots.preferred.join("onnxruntime");
+        put(&leaf.join(lib_name), b"old core");
+        put(
+            &leaf.join("runtime.json"),
+            record_json("1.26.0", "cpu", &archive).as_bytes(),
+        );
+        let staging = sibling(&leaf, "downloading");
+        put(&staging.join("witness"), b"half a package, another run's");
+        let lock_path = home.roots.preferred.join(RUNTIME_LOCK);
+        let first = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("the test owns this directory");
+        first
+            .try_lock()
+            .expect("nobody else holds the lock of this home");
+        let before = snapshot(&home.roots.preferred);
+
+        let refused = download_runtime(&RuntimeArgs::default())
+            .await
+            .expect_err("a second run does not share the directory of the first");
+
+        let said = format!("{refused:#}");
+        assert!(
+            said.contains(RUNTIME_LOCK) && said.contains("esperá"),
+            "the error names the lock and says to wait: {said}"
+        );
+        assert_eq!(
+            snapshot(&home.roots.preferred),
+            before,
+            "the runtime and the staging directory of the first run are exactly as they were, \
+             witness file included"
+        );
+        assert_eq!(
+            proxy.hits(),
+            0,
+            "a refused run makes no request: it would be downloading into a directory that is \
+             not its own"
+        );
+
+        drop(first);
+        let later = download_runtime(&RuntimeArgs::default()).await;
+        assert!(
+            later.is_err() && proxy.hits() >= 1,
+            "once the first run lets go the lock is free again, and a run goes on to the \
+             download ({} requests): {later:?}",
+            proxy.hits()
+        );
     }
 }

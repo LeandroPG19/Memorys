@@ -162,6 +162,44 @@ test("postinstall fetches the binary first and refreshes the runtime with it, an
   return done;
 });
 
+// CI-D5c (A.4b). The download can reach 450 MB and a connection that stays open without data would hold
+// `npm install` for ever: the binary gets its time, and past it the refresh is a failed refresh like any other
+// (false, the command to run by hand, exit 0 for npm). The child is a real node that outlives the test by far, so the
+// limit is what ends it; without it `refreshRuntime` would answer true after 20 seconds.
+test("refreshRuntime gives up on a binary that does not answer within its time", () => {
+  assert.strictEqual(typeof mod.runBinary, "function", "runBinary must be exported: it is where the time limit lives");
+  const logged = [];
+  let ok;
+  assert.doesNotThrow(() => {
+    ok = mod.refreshRuntime(
+      "/x/cuba-memorys",
+      () => mod.runBinary(process.execPath, ["-e", "setTimeout(() => {}, 20000)"], 200),
+      (m) => logged.push(m)
+    );
+  }, "a binary that does not answer must not make npm install fail");
+  const said = logged.join("\n");
+  assert.strictEqual(ok, false, "a binary cut at its time is not a refreshed runtime: " + said);
+  assert.ok(said.includes("timed out after 200 ms"), `the message names the time that ran out: ${said}`);
+  assert.ok(said.includes("memory-industry models runtime"), `and the command to run by hand: ${said}`);
+});
+
+// CI-D5c (A.4b, the log). `postinstall` has a log of its own (console.log when it runs as the package script) and
+// used to hand the refresh none, so what the refresh said went to stderr by another route.
+test("postinstall hands its own log to the refresh", () => {
+  const log = () => {};
+  const given = [];
+  return mod
+    .postinstall({
+      ensure: async () => "/x/cuba-memorys",
+      refresh: (bin, run, forwarded) => {
+        given.push(forwarded === log);
+        return true;
+      },
+      log,
+    })
+    .then(() => assert.deepStrictEqual(given, [true], "the refresh must get the log of the postinstall"));
+});
+
 Promise.resolve().then(() => {
   setTimeout(() => {
     if (failures) {
