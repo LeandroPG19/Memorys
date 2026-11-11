@@ -70,11 +70,23 @@ jobs:
       # scripts/codigo-muerto.sh fails if a marked file has no reason or that
       # step of run-all-tests.sh stops being a plain `cargo test`.
       # Owner: implementador 0.28 (seguimientos W3). Expires: 2027-03-22.
+      # A third exclusion of the same kind and read the same way: a file whose
+      # plain tests open a model (a tokenizer.json, an ONNX session) opens with
+      # `// needs-the-models: <why>`. This job has no models, and such a file does
+      # not pass empty without them: it fails saying what is missing, so the only
+      # place it runs is the local gate, in the plain pass of
+      # scripts/run-all-tests.sh, which exports the model paths. Today only
+      # rust/tests/model_parity.rs carries it (CI-D4: the guard that a new
+      # tokenizers or tiktoken-rs moves no token id and no stored vector).
+      # rust/tests/ci_contract.rs fails if that file loses the line, if any file
+      # carries it with no reason, or if this step stops reading it.
+      # Owner: implementador CI-D4. Expires: 2027-05-11.
       - name: Select the test targets this job can run
         run: |
           : >"$RUNNER_TEMP/test-targets"
           for file in tests/*.rs; do
             [[ "$(head -n 1 "$file")" == '// needs-a-server:'* ]] && continue
+            [[ "$(head -n 1 "$file")" == '// needs-the-models:'* ]] && continue
             printf '%s\n' --test "$(basename "$file" .rs)" >>"$RUNNER_TEMP/test-targets"
           done
 
