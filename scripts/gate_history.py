@@ -14,7 +14,8 @@ an illegible manifest is exit 2. What was not measured is written as null, never
 is diagnosis only.
 
 Library use (the planner and the contract tests): run_start, step_start, step_end, units,
-run_end, lower_bounds, camino_critico, leer_jsonl, usl_point, keep_timings, solape_s, serie_final. The planner writes
+run_end, lower_bounds, camino_critico, leer_jsonl, usl_point, keep_timings, solape_s, serie_final, coste_de,
+coste_base, comparar, lineas_de_coste. The planner writes
 `unidades.jsonl` and `flaky.jsonl` itself (CI-E28): `record_step` calls `units` on the log of every row that ended, was not stopped and
 shows a `Running` or `Doc-tests` header of cargo; a row that ran no test binary (fmt, clippy, the audits) asks nothing of `test-times.sh`. `anon_max` of a step is its anonymous memory plus the pages its
 tmpfs holds (`shmem`): what is charged to the scope and cannot be reclaimed without swap. CLI (the serial writer): `registrar`, a JSON manifest on stdin.
@@ -24,6 +25,10 @@ CI-E4: a step and a run also carry `nucleos` (CPU seconds over the seconds of th
 mem_muestra, serie_final_s and serie_cola_s of a run). The reason is the one the caller gave; this module derives only the one of
 `nucleos` (the one of `cpu_s`, or a duration of 0 s) and never invents another. `serie_final` is the one function of the
 seconds a run spent with one row alive and another ready, or with one row alive at the end.
+
+CI-E2: a green run also carries `coste` (null when it has none), the cost per test and the share of its 10 slowest binaries,
+from the units of the rows that are timed; `lineas_de_coste` gives the `cost:` lines the planner prints and the record,
+against the median of the last 10 green runs of the same mode and table. Its alarms never change a verdict.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -58,6 +64,13 @@ COTAS = ("camino", "cpu", "ram", "paso")
 TIMINGS_DIAS = 30
 # CI-K4 (D-K4h): what cargo writes on stderr when it saves a report, the only place that says which report a call made.
 INFORME_RE = re.compile(r"^\s*Timing report saved to (.+?)\s*$")
+# CI-E2 (D-E2e): the numbers of docs/ci/metodologia-de-escala.md:162-165, 170. The base is the last 10 green runs of the same mode
+# and table; a cost per test over 1.10 x its median alarms, and so does a binary that enters the 10 slowest without having been
+# in them in any of those runs. The `self-test:` lines of CI-E3 are seconds that `local_gate_contract` already holds.
+COSTE_BASE = 10
+COSTE_TOP = 10
+COSTE_UMBRAL = 1.10
+AUTOTEST = "self-test:"
 
 _avisado = False
 _candado_roto = False
@@ -581,10 +594,12 @@ def _unidades(corrida: Corrida, paso: Paso, salida: str, log_path: str) -> list[
 
 
 @_sin_veredicto
-def units(corrida: Corrida, paso: Paso, log_path: str) -> None:
+def units(corrida: Corrida, paso: Paso, log_path: str) -> list[dict[str, Any]] | None:
+    """The records it wrote, for the planner to cost (CI-E2); None when the log could not be read: a row with no units is not a
+    row with no tests."""
     salida = _test_times_units(log_path)
     if salida is None:
-        return
+        return None
     registros = _unidades(corrida, paso, salida, log_path)
     for reg in registros:
         if _es_flaky(corrida, paso, reg):
@@ -602,6 +617,215 @@ def units(corrida: Corrida, paso: Paso, log_path: str) -> None:
             )
     for reg in registros:
         _escribir("unidades.jsonl", reg)
+    return registros
+
+
+def _por_test(centesimas: int, tests: int) -> float | None:
+    return centesimas / 100 / tests if tests else None
+
+
+def _cuota(parte: float, total: float) -> float:
+    return parte / total if total else 0.0
+
+
+def coste_de(unidades: list[dict[str, Any]], cronometradas: set[str]) -> dict[str, Any]:
+    """CI-E2 (D-E2c): the cost of one run from its unit records. Only the units of a row in `cronometradas` count, and never
+    the `self-test:` ones. `seg` and `por_test` are the seconds and the seconds per test of the run and of each row; `top10`
+    and `cuota_top10`, the slowest binaries (a binary in two rows adds up, as in test-times.sh) and their share of `seg`;
+    `claves`, the seconds of every binary. Centiseconds are added as integers, so the order of the units changes nothing."""
+    por_clave: dict[str, int] = {}
+    por_fila: dict[str, list[int]] = {}
+    for unidad in unidades:
+        if unidad["id"] not in cronometradas or unidad["clave"].startswith(AUTOTEST):
+            continue
+        centesimas = round(unidad["finished_in"] * 100)
+        por_clave[unidad["clave"]] = por_clave.get(unidad["clave"], 0) + centesimas
+        fila = por_fila.setdefault(unidad["id"], [unidad.get("idx", 0), 0, 0])
+        fila[1] += centesimas
+        fila[2] += unidad["tests"]
+    total = sum(por_clave.values())
+    tests = sum(fila[2] for fila in por_fila.values())
+    top = sorted(por_clave.items(), key=lambda par: (-par[1], par[0]))[:COSTE_TOP]
+    return {
+        "tests": tests,
+        "seg": total / 100,
+        "por_test": _por_test(total, tests),
+        "cuota_top10": _cuota(sum(cs for _, cs in top), total),
+        "filas": {
+            fila_id: {"tests": fila[2], "seg": fila[1] / 100, "por_test": _por_test(fila[1], fila[2])}
+            for fila_id, fila in sorted(por_fila.items(), key=lambda par: (par[1][0], par[0]))
+        },
+        "top10": [{"clave": clave, "seg": cs / 100} for clave, cs in top],
+        "claves": {clave: cs / 100 for clave, cs in por_clave.items()},
+    }
+
+
+def _dias_del_historial() -> list[str]:
+    """Every day folder of the history, oldest first; a name that is not a day is not one."""
+    try:
+        carpetas = os.listdir(history_root())
+    except OSError:
+        return []
+    dias = []
+    for carpeta in carpetas:
+        try:
+            datetime.strptime(carpeta, "%Y%m%d")
+        except ValueError:
+            continue
+        dias.append(carpeta)
+    return sorted(dias)
+
+
+def coste_base(modo: str, tabla: str | None, run: str, cronometradas: set[str]) -> list[dict[str, Any]]:
+    """CI-E2 (D-E2d): the `coste_de` of each of the last COSTE_BASE runs with rc 0 of this mode and table in `corridas.jsonl`
+    (without `run`), oldest first. Their units are read from the day before the oldest of those runs onward, because a run
+    that crosses midnight UTC writes in two folders. A run with no units of a timed row (one from before CI-E28) is no base."""
+    raiz = history_root()
+    dias = _dias_del_historial()
+    verdes = [
+        (dia, reg["run"])
+        for dia in dias
+        for reg in leer_jsonl(os.path.join(raiz, dia, "corridas.jsonl"))
+        if reg.get("modo") == modo and reg.get("tabla") == tabla and reg.get("rc") == 0 and reg.get("run") != run
+    ][-COSTE_BASE:]
+    if not verdes:
+        return []
+    desde = (datetime.strptime(verdes[0][0], "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+    corridas = {corrida_run for _, corrida_run in verdes}
+    unidades: dict[str, list[dict[str, Any]]] = {}
+    for dia in (d for d in dias if d >= desde):
+        for unidad in leer_jsonl(os.path.join(raiz, dia, "unidades.jsonl")):
+            if unidad.get("run") in corridas:
+                unidades.setdefault(unidad["run"], []).append(unidad)
+    costes = [coste_de(unidades.get(corrida_run, []), cronometradas) for _, corrida_run in verdes]
+    return [coste for coste in costes if coste["filas"]]
+
+
+def _mediana(valores: list[float | None]) -> float | None:
+    """The median of the values of the base, or None while there are not COSTE_BASE of them: fewer is no median (D-E2d)."""
+    medidos = [v for v in valores if v is not None]
+    return statistics.median(medidos) if len(medidos) >= COSTE_BASE else None
+
+
+def _razon(valor: float | None, mediana: float | None) -> float | None:
+    return None if valor is None or not mediana else valor / mediana
+
+
+def _txt(valor: float | None, formato: str) -> str:
+    return "n/a" if valor is None else format(valor, formato)
+
+
+def _alarma_por_test(que: str, valor: float | None, mediana: float | None) -> str | None:
+    """D-E2e, A1 and A2: strictly over COSTE_UMBRAL x the median, on the numbers as they are and not as they are printed."""
+    if valor is None or not mediana or valor <= COSTE_UMBRAL * mediana:
+        return None
+    return (
+        f"cost: ALARM {que} per_test {valor:.4f} is {valor / mediana:.2f} x its median {mediana:.4f} "
+        f"(alarm over {COSTE_UMBRAL:.2f} x); the verdict does not change"
+    )
+
+
+def _lineas_de_filas(actual: dict[str, Any], base: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    lineas: list[str] = []
+    alarmas: list[str] = []
+    for fila_id, fila in actual["filas"].items():
+        mediana = _mediana([c["filas"][fila_id]["por_test"] for c in base if fila_id in c["filas"]])
+        lineas.append(
+            f"cost: row {fila_id} tests={fila['tests']} seg={fila['seg']:.2f} per_test={_txt(fila['por_test'], '.4f')} "
+            f"median={_txt(mediana, '.4f')} ratio={_txt(_razon(fila['por_test'], mediana), '.2f')}"
+        )
+        alarma = _alarma_por_test(f"row {fila_id}", fila["por_test"], mediana)
+        if alarma:
+            alarmas.append(alarma)
+    return lineas, alarmas
+
+
+def _lineas_del_top(actual: dict[str, Any], base: list[dict[str, Any]], modo: str) -> tuple[list[str], list[str]]:
+    """D-E2e, A3: with a full base, a binary of the top that is in the top of none of its runs alarms and its line ends in ` new`."""
+    estuvieron = {t["clave"] for c in base for t in c["top10"]}
+    lineas: list[str] = []
+    alarmas: list[str] = []
+    for rango, binario in enumerate(actual["top10"], 1):
+        clave, seg = binario["clave"], binario["seg"]
+        mediana = _mediana([c["claves"][clave] for c in base if clave in c["claves"]])
+        nuevo = len(base) >= COSTE_BASE and clave not in estuvieron
+        lineas.append(
+            f"cost: top {rango} {clave} seg={seg:.2f} share={_cuota(seg, actual['seg']):.3f} "
+            f"median={_txt(mediana, '.2f')} ratio={_txt(_razon(seg, mediana), '.2f')}" + (" new" if nuevo else "")
+        )
+        if nuevo:
+            alarmas.append(
+                f"cost: ALARM top {rango} {clave} entered the {COSTE_TOP} slowest: it was in none of the {COSTE_TOP} slowest "
+                f"of the last {COSTE_BASE} green {modo} runs of this table; the verdict does not change"
+            )
+    return lineas, alarmas
+
+
+def comparar(actual: dict[str, Any], base: list[dict[str, Any]], modo: str) -> tuple[list[str], list[str]]:
+    """CI-E2 (D-E2d to D-E2f): the `cost:` lines of a run (a `coste_de`) against its base (the `coste_base`), and apart the
+    ones that are alarms, which are also in the lines. The run first, then its rows, then its top, then the alarms."""
+    k = len(base)
+    por_test = _mediana([c["por_test"] for c in base])
+    cuota = _mediana([c["cuota_top10"] for c in base])
+    lineas = [
+        f"cost: run mode={modo} tests={actual['tests']} seg={actual['seg']:.2f} per_test={_txt(actual['por_test'], '.4f')} "
+        f"median={_txt(por_test, '.4f')} ratio={_txt(_razon(actual['por_test'], por_test), '.2f')} "
+        f"top10_share={actual['cuota_top10']:.3f} median_share={_txt(cuota, '.3f')} baseline={k}/{COSTE_BASE}"
+    ]
+    if k < COSTE_BASE:
+        lineas.append(f"cost: no median yet: {k} of {COSTE_BASE} green {modo} runs of this table")
+    alarma = _alarma_por_test("run", actual["por_test"], por_test)
+    alarmas = [alarma] if alarma else []
+    for lineas_de, alarmas_de in (_lineas_de_filas(actual, base), _lineas_del_top(actual, base, modo)):
+        lineas += lineas_de
+        alarmas += alarmas_de
+    return lineas + alarmas, alarmas
+
+
+def _registro_de_coste(actual: dict[str, Any], base: int, alarmas: list[str]) -> dict[str, Any]:
+    """D-E2g: what `corridas.jsonl` keeps of the cost. The per-binary seconds of the run are not kept, only its top."""
+    return {
+        "tests": actual["tests"],
+        "seg": _r(actual["seg"], 2),
+        "por_test": _r(actual["por_test"], 4),
+        "cuota_top10": _r(actual["cuota_top10"], 3),
+        "filas": {
+            fila_id: {"tests": fila["tests"], "seg": _r(fila["seg"], 2), "por_test": _r(fila["por_test"], 4)}
+            for fila_id, fila in actual["filas"].items()
+        },
+        "top10": [{"clave": t["clave"], "seg": _r(t["seg"], 2)} for t in actual["top10"]],
+        "base": base,
+        "alarmas": alarmas,
+    }
+
+
+@_sin_veredicto
+def lineas_de_coste(
+    corrida: Corrida,
+    unidades_por_fila: dict[str, list[dict[str, Any]] | None],
+    cronometradas: set[str],
+    code: int,
+) -> tuple[list[str], dict[str, Any] | None, str | None]:
+    """CI-E2 (D-E2a, D-E2h): `(lineas, coste, motivo)` for the planner, the one caller. `unidades_por_fila` is what `units` gave
+    for each row that ran test binaries (None: it could not be read). A red run and a row whose units are unread have no cost,
+    and `motivo` says why for `sin_medida`. A run that ran no test binary has none either, with no `motivo`: it is not a field
+    the planner measures. A failure inside is the one `history:` line and None: the verdict is the rows'."""
+    if code != 0:
+        motivo = f"the run is red (exit {code}); a red run stops rows before their end"
+        return [f"cost: not computed: {motivo}"], None, motivo
+    for fila_id, registros in unidades_por_fila.items():
+        if fila_id in cronometradas and registros is None:
+            motivo = f"the units of row {fila_id} could not be read"
+            return [f"cost: not computed: {motivo}"], None, motivo
+    actual = coste_de(
+        [u for fila_id, registros in unidades_por_fila.items() if fila_id in cronometradas for u in registros or []],
+        cronometradas,
+    )
+    if not actual["filas"]:
+        return ["cost: not computed: no timed row ran a test binary"], None, None
+    base = coste_base(corrida.modo, corrida.tabla, corrida.run, cronometradas)
+    lineas, alarmas = comparar(actual, base, corrida.modo)
+    return lineas, _registro_de_coste(actual, len(base), alarmas), None
 
 
 def _brecha(total: float | None, cota: float | None) -> float | None:
@@ -630,6 +854,7 @@ def _cerrar(
     serie_final_s: float | None = None,
     serie_cola_s: float | None = None,
     sin_medida: dict[str, str] | None = None,
+    coste: dict[str, Any] | None = None,
 ) -> None:
     cpus = _todos_medidos(corrida.cpus)
     cpu_total = None if cpus is None else sum(cpus)
@@ -663,6 +888,7 @@ def _cerrar(
         "serie_final_s": _r(serie_final_s),
         "serie_cola_s": _r(serie_cola_s),
         "sin_medida": motivos,
+        "coste": coste,
         "fecha": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     _escribir("corridas.jsonl", registro)
@@ -689,10 +915,11 @@ def run_end(
     serie_final_s: float | None = None,
     serie_cola_s: float | None = None,
     sin_medida: dict[str, str] | None = None,
+    coste: dict[str, Any] | None = None,
 ) -> None:
     """The library's own run end: a missing T is the module clock's. What nobody measured is None. `plan` is what the
     planner measured of the machine and decided (D-K4q); `mem_muestra`, the two `serie_*` and `sin_medida` are the planner's
-    (CI-E4), as given."""
+    (CI-E4), as given. `coste` is the planner's `lineas_de_coste` record (CI-E2), null when the run has none."""
     _cerrar(
         corrida,
         rc,
@@ -711,6 +938,7 @@ def run_end(
         serie_final_s=serie_final_s,
         serie_cola_s=serie_cola_s,
         sin_medida=sin_medida,
+        coste=coste,
     )
 
 

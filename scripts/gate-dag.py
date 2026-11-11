@@ -1069,6 +1069,10 @@ class Planner:
         self.pools = pool_reference(steps)
         self.red: Step | None = None
         self.no_verdict: str | None = None
+        # CI-E2 (D-E2b): the units each row that ran test binaries gave (None: unreadable), and the cost of the run.
+        self.unidades: dict[str, list[dict[str, Any]] | None] = {}
+        self.coste: dict[str, Any] | None = None
+        self.coste_sin_medida: dict[str, str] = {}
         self.cursor = 0
         self.last_sample = 0.0
         self.lb_ref: float | None = None
@@ -1506,7 +1510,7 @@ class Planner:
             jobs=self.jobs_of(step),
         )
         if step.log and not step.parado and ran_test_binaries(step.log):
-            gate_history.units(self.corrida, step.paso, step.log)
+            self.unidades[step.id] = gate_history.units(self.corrida, step.paso, step.log)
 
     # verdict
 
@@ -1660,6 +1664,7 @@ class Planner:
         if self.no_verdict:
             self.leave_logs()
             sys.stderr.write(self.no_verdict + "\n")
+            self.coste_sin_medida = {"coste": "no verdict"}
             self.annotate_run(2)
             return 2
         self.flush()
@@ -1668,6 +1673,7 @@ class Planner:
             print(f"FAIL: {self.red.id} exited {self.red.rc} (lowest index that failed; the serial order stops here)")
             code = self.red.rc
         self.summary()
+        self.print_cost(code)
         self.annotate_run(code)
         if code == 0 and self.run_dir:
             shutil.rmtree(self.run_dir, ignore_errors=True)
@@ -1744,6 +1750,24 @@ class Planner:
         print(self.resources_line(total))
         for step in self.ran_steps():
             print(self.step_line(step))
+
+    def print_cost(self, code: int) -> None:
+        """CI-E2 (D-E2b): the cost per test of the run, after the `dag: step` lines. The timed rows are the ones that are not
+        `untimed`, the set test-times.sh judges. The history never changes the verdict: a failure inside is its one `history:`
+        line and no cost line, and `annotate_run` keeps what this left in `coste` and `sin_medida`."""
+        if self.corrida is None:
+            return
+        timed = {s.id for s in self.steps if s.clase != "untimed"}
+        by_row = {s.id: self.unidades[s.id] for s in self.steps if s.id in self.unidades}
+        answer = gate_history.lineas_de_coste(self.corrida, by_row, timed, code)
+        if answer is None:
+            self.coste_sin_medida = {"coste": "the cost failed: the `history:` line on stderr says why"}
+            return
+        lines, self.coste, reason = answer
+        for line in lines:
+            print(line)
+        if reason:
+            self.coste_sin_medida = {"coste": reason}
 
     def run_cpu(self) -> float | None:
         """D-E4b: the CPU seconds of the run are the sum of its steps'; null while one of them is null."""
@@ -1858,7 +1882,8 @@ class Planner:
             mem_muestra=self.mem_record(),
             serie_final_s=None if serie is None else serie[0],
             serie_cola_s=None if serie is None else serie[1],
-            sin_medida=why,
+            sin_medida={**why, **self.coste_sin_medida},
+            coste=self.coste,
         )
 
 
