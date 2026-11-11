@@ -1920,7 +1920,7 @@ const SELF_TEST_END: &str = "# --- self-test end ---";
 /// Every script of `scripts/` that has a `--self-test` mode, in the order
 /// `read_dir` + sort gives. Two-way on purpose: a script that gains a mode, or
 /// loses its own, is red until this list says so.
-const SCRIPTS_WITH_SELF_TEST: [&str; 14] = [
+const SCRIPTS_WITH_SELF_TEST: [&str; 15] = [
     "advisory-exceptions.sh",
     "codigo-muerto.sh",
     "crap-gate.sh",
@@ -1931,6 +1931,7 @@ const SCRIPTS_WITH_SELF_TEST: [&str; 14] = [
     "mutants-gate.sh",
     "qg-weekly-audit.sh",
     "quality-gate.sh",
+    "recibo-vale.sh",
     "release.sh",
     "run-all-tests.sh",
     "test-times.sh",
@@ -10267,4 +10268,319 @@ fn cygpath_without_ostype(code: &str) -> Vec<usize> {
         })
         .map(|(index, _)| index + 1)
         .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// CI-E29: `rapido`, and the receipt that still holds after a change of documentation
+
+/// E29b.k1. A receipt that holds for anything is a paragraph.
+///
+/// `scripts/recibo-vale.sh` says whether the receipt of `merge-gate.sh` is still the verdict of what is in the tree: the same
+/// commit, or a commit whose later changes are all documentation (a list of the judge's own). A judge that lets code through
+/// as documentation, forgets that the list itself is the judge, takes a red run for a pass or uses the receipt of a branch
+/// that HEAD never merged prints the same "holds" over every tree. Its `--self-test` builds a throwaway git repository for
+/// each of those cases, runs the script through its CLI and reports whether each one broke.
+#[test]
+fn the_docs_only_receipt_can_actually_fail() {
+    let out = &judge_env_self_test("recibo-vale.sh").output;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "recibo-vale.sh --self-test did not pass, so a receipt can hold for a tree it was not made for, or fail to hold \
+         for one it was. stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Same anchor as the other self-tests: the mode's label.
+    assert!(
+        stdout.contains("self-test:"),
+        "the self-test exited 0 without saying it ran. An exit code alone is what let codigo-muerto.sh pass for months \
+         while doing nothing. stdout: {stdout}"
+    );
+}
+
+/// The matches of the pattern `~/.claude/hooks/parada.js:19` looks for in `scripts/como-el-ci.sh` to know that the repo has a
+/// quick mode: `/(?:=\s*"?rapido"?|\brapido\))/`, as the byte offset of each match and whether it is the second form, the arm
+/// of a `case`. The hook is not part of this repository and no regex crate is, so the pattern is written out by hand here; if
+/// the hook changes it, this is the function to change.
+fn stop_hook_matches(text: &str) -> Vec<(usize, bool)> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    for (at, _) in text.match_indices('=') {
+        let rest = text[at + 1..].trim_start();
+        let rest = rest.strip_prefix('"').unwrap_or(rest);
+        if rest.starts_with("rapido") {
+            found.push((at, false));
+        }
+    }
+    for (at, _) in text.match_indices("rapido)") {
+        let word_before =
+            at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+        if !word_before {
+            found.push((at, true));
+        }
+    }
+    found
+}
+
+/// The body of the arm of `case` that the hook's pattern finds, from what follows the `)` up to the `;;` that closes it, or
+/// `None` when the pattern finds nothing in the form of an arm.
+fn rapido_arm_body(text: &str) -> Option<String> {
+    let arm_at = stop_hook_matches(text)
+        .into_iter()
+        .filter(|(_, is_arm)| *is_arm)
+        .map(|(at, _)| at)
+        .find(|at| {
+            let line_start = text[..*at].rfind('\n').map_or(0, |n| n + 1);
+            let before = text[line_start..*at].trim_start();
+            !before.starts_with('#') && (before.is_empty() || before.ends_with('|'))
+        })?;
+    let after = &text[arm_at + "rapido)".len()..];
+    let end = after.find(";;").unwrap_or(after.len());
+    Some(after[..end].to_string())
+}
+
+/// E29a.8. The stop hook of the operator runs `bash scripts/como-el-ci.sh rapido` in every Stop of a session that edited code,
+/// but only in a repo whose `como-el-ci.sh` the pattern above finds, and it reads `.gate/ultima-corrida.json` only if that same
+/// text says `ultima-corrida`. Both are decided by the text of one file, so this reads it the way the hook does: `rapido` has to be
+/// the arm of the `case` and not a word somewhere, that arm has to hand over to `merge-gate.sh --rapido`, the file has to name the
+/// receipt of the hook, and `merge-gate.sh` has to write the file it names (or the mention would be a lie).
+#[test]
+fn the_stop_hook_finds_rapido_and_the_last_run() {
+    // The scan has to be able to fail before a clean answer from it means anything.
+    let before = "QUE=\"${1:-todo}\"\ncase \"$QUE\" in\n  todo|all|extra|\"\")\n    exec \"$ROOT/scripts/merge-gate.sh\"\n    ;;\n  quality)\n    exec \"$ROOT/scripts/quality-gate.sh\"\n    ;;\nesac\n";
+    assert!(
+        stop_hook_matches(before).is_empty(),
+        "the pattern of the hook found rapido in the file as it was before CI-E29, which has no such mode"
+    );
+    let quoted = "case \"$QUE\" in\n  \"rapido\")\n    exec \"$ROOT/scripts/merge-gate.sh\" --rapido\n    ;;\nesac\n";
+    assert!(
+        rapido_arm_body(quoted).is_none(),
+        "an arm spelled \"rapido\") is not what the hook's pattern finds, and it is the way to write the arm that hides it"
+    );
+    let honest = "case \"$QUE\" in\n  rapido)\n    exec \"$ROOT/scripts/merge-gate.sh\" --rapido\n    ;;\n  quality)\n    exec q\n    ;;\nesac\n";
+    let body =
+        rapido_arm_body(honest).expect("the scan did not see an arm written as the hook reads it");
+    assert!(
+        body.contains("--rapido") && !body.contains("quality"),
+        "the body of the arm is read up to its `;;`, not past it: {body:?}"
+    );
+
+    let text = read("scripts/como-el-ci.sh");
+    assert!(
+        !stop_hook_matches(&text).is_empty(),
+        "~/.claude/hooks/parada.js:19 finds no `rapido` in scripts/como-el-ci.sh, so the hook runs nothing in this repo in every Stop"
+    );
+    let body = rapido_arm_body(&text).expect(
+        "the hook's pattern has to find `rapido` as the arm of the `case` of scripts/como-el-ci.sh (`rapido)` at the start of a \
+         line), not as a word in a comment or a string: the branch is what the hook launches",
+    );
+    assert!(
+        body.contains("merge-gate.sh") && body.contains("--rapido"),
+        "the `rapido)` arm of scripts/como-el-ci.sh has to hand over to `merge-gate.sh --rapido`, where the four checks live \
+         (D-E29c): {body:?}"
+    );
+    assert!(
+        text.contains("ultima-corrida"),
+        "scripts/como-el-ci.sh does not name `ultima-corrida`, which is what parada.js:34 looks for before it reads the receipt \
+         of the last run; without it the hook accepts any \"green\" in this repo"
+    );
+    let gate = read("scripts/merge-gate.sh");
+    assert!(
+        outside_self_test(&gate).iter().any(|(_, line)| {
+            !line.trim_start().starts_with('#') && line.contains("ultima-corrida.json")
+        }),
+        "scripts/merge-gate.sh writes no .gate/ultima-corrida.json outside its self-test, so the mention in como-el-ci.sh would be \
+         a promise nothing keeps"
+    );
+}
+
+/// What git answers to `git check-ignore -q <path>` in this repository: 0 ignored, 1 not ignored.
+fn git_ignores(path: &str) -> Option<i32> {
+    std::process::Command::new("git")
+        .args(["check-ignore", "-q", "--", path])
+        .current_dir(repo_root())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .status()
+        .expect("git has to be reachable: what a repository ignores is decided by git, not by the text of .gitignore")
+        .code()
+}
+
+/// E29b.k2. The judge writes `.gate/ultima-corrida.json` inside the tree it judges, for the stop hook to read. Without the
+/// directory in `.gitignore` the file would dirty the tree its own gate has just judged, and the next run would leave no receipt.
+#[test]
+fn the_gate_directory_of_the_hook_is_ignored() {
+    assert_eq!(
+        git_ignores("scripts/merge-gate.sh"),
+        Some(1),
+        "git check-ignore does not tell a path that is tracked from one that is ignored here, so the answer about .gate/ \
+         below proves nothing"
+    );
+    assert_eq!(
+        git_ignores("docs/a-note-that-is-nobodys.md"),
+        Some(0),
+        "git check-ignore does not see the `docs/*` of .gitignore, so the answer about .gate/ below proves nothing"
+    );
+    assert_eq!(
+        git_ignores(".gate/ultima-corrida.json"),
+        Some(0),
+        ".gate/ is not in .gitignore: the file the judge leaves for the stop hook shows up in `git status` and dirties the tree \
+         that was just judged"
+    );
+}
+
+/// What a line has to start with, trimmed, to be a comment in the files the judge is made of (shell, Python, YAML, Rust).
+fn is_comment_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with('#') || line.starts_with("//")
+}
+
+/// The lines of `text` that are not comments, as one text.
+fn lines_that_are_not_comments(text: &str) -> String {
+    text.lines()
+        .filter(|line| !is_comment_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every file under `dir` (any depth) with the extension, or any extension when `None`, in path order.
+fn files_under(dir: &Path, extension: Option<&str>) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if extension
+                .is_none_or(|wanted| path.extension().is_some_and(|ext| ext == wanted))
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// What the judge reads, outside comments: every line of `scripts/` (but the list of what is documentation, which is the
+/// definition and not a reader of the files it names), of the `.rs` of `rust/tests/` and `rust/src/`, of `rust/build.rs` and of
+/// `.github/` (D-E29m). A file that is not UTF-8 is not text the judge reads by name.
+fn what_the_judge_reads() -> String {
+    let root = repo_root();
+    let mut files = files_under(&root.join("scripts"), None);
+    files.retain(|path| !path.ends_with("scripts/recibo-lista-blanca.txt"));
+    files.extend(files_under(&root.join("rust/tests"), Some("rs")));
+    files.extend(files_under(&root.join("rust/src"), Some("rs")));
+    files.push(root.join("rust/build.rs"));
+    files.extend(files_under(&root.join(".github"), None));
+    files
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .map(|text| lines_that_are_not_comments(&text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The tracked files whose path is written in `corpus`, whatever surrounds it (`"$ROOT/docs/gate.md"` names `docs/gate.md`).
+fn tracked_files_named_in(corpus: &str, tracked: &[String]) -> Vec<String> {
+    tracked
+        .iter()
+        .filter(|path| corpus.contains(path.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The paths of `paths` that `scripts/recibo-vale.sh --is-doc` does not call "not documentation": one line for each that is not
+/// one, and the exit 1 that goes with it. A script that exits with anything but 0 or 1 judged nothing, and that is a panic.
+fn paths_the_list_calls_documentation(paths: &[String]) -> Vec<String> {
+    let out = std::process::Command::new(git_bash())
+        .arg(repo_root().join("scripts/recibo-vale.sh"))
+        .arg("--is-doc")
+        .args(paths)
+        .current_dir(repo_root())
+        .output()
+        .expect("running scripts/recibo-vale.sh --is-doc");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        matches!(out.status.code(), Some(0 | 1)),
+        "scripts/recibo-vale.sh --is-doc exited {:?}, not 0 (all documentation) or 1 (one line for each path that is not): {said}",
+        out.status.code()
+    );
+    paths
+        .iter()
+        .filter(|path| !said.lines().any(|line| line.contains(path.as_str())))
+        .cloned()
+        .collect()
+}
+
+/// E29b.k3 (D-E29m). The list of what is documentation (`scripts/recibo-lista-blanca.txt`) is what lets a receipt survive a
+/// commit, so it must never call documentation a file the judge reads: a `.md` that a contract opens, a `rust-toolchain` that
+/// a walk of the tree finds, a file that is packed into a zip. This asks the matching itself, `recibo-vale.sh --is-doc`, about
+/// every tracked file outside `scripts/` and `rust/` whose path is written in what the judge reads. If tomorrow a contract
+/// starts to read `backlog/x.md`, this is red until the list negates it. The limit is the text: a path built at run time
+/// (`format!("docs/{name}")`) is not written anywhere.
+#[test]
+fn the_docs_list_never_names_a_file_the_judge_reads() {
+    // The scan has to be able to fail before a clean answer from it means anything.
+    let tracked = vec!["backlog/x.md".to_string(), "backlog/y.md".to_string()];
+    assert_eq!(
+        tracked_files_named_in("let a = read(\"backlog/x.md\");\n", &tracked),
+        ["backlog/x.md"],
+        "the scan did not see a tracked file written in a `read(\"...\")` of the corpus"
+    );
+    assert_eq!(
+        lines_that_are_not_comments(
+            "// backlog/y.md\nlet a = 1;\n  # backlog/y.md\nread(\"docs/gate.md\")"
+        ),
+        "let a = 1;\nread(\"docs/gate.md\")",
+        "a comment is not something the judge reads"
+    );
+    assert_eq!(
+        paths_the_list_calls_documentation(&["backlog/fixture-note.md".to_string()]),
+        ["backlog/fixture-note.md"],
+        "the list does not call documentation a path under backlog/, so a contract that read one would not be seen"
+    );
+
+    let listing = std::process::Command::new("git")
+        .args(["ls-files"])
+        .current_dir(repo_root())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git has to be reachable to list the tracked files");
+    assert!(
+        listing.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let tracked: Vec<String> = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter(|path| !path.starts_with("scripts/") && !path.starts_with("rust/"))
+        .map(str::to_string)
+        .collect();
+    let named = tracked_files_named_in(&what_the_judge_reads(), &tracked);
+    for anchor in ["AGENTS.md", "README.md", "docs/gate.md"] {
+        assert!(
+            named.iter().any(|path| path == anchor),
+            "the scan did not find {anchor} written in what the judge reads, and some contract opens it: it is the scan that is \
+             broken. It found {named:?}"
+        );
+    }
+    let documentation = paths_the_list_calls_documentation(&named);
+    assert!(
+        documentation.is_empty(),
+        "scripts/recibo-lista-blanca.txt calls documentation files that the judge reads by name, so a commit that edits them would \
+         leave the receipt valid over a verdict that never saw them. Negate each with a `!` line: {documentation:#?}"
+    );
 }

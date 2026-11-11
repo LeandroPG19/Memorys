@@ -66,6 +66,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
     local t="$tmp/$1" s
     mkdir -p "$t/scripts" "$t/rust" "$t/bin" "$t/home/.cache/cuba-gate"
     cp "$ROOT/scripts/merge-gate.sh" "$ROOT/scripts/gate-lock.sh" "$t/scripts/"
+    # CI-E29: the entry of the hook (como-el-ci.sh), the judge of the receipt (recibo-vale.sh) and a docs-only list of the
+    # fixture, with the content of D-E29j: what is documentation and the files the judge reads inside docs/.
+    cp "$ROOT/scripts/como-el-ci.sh" "$ROOT/scripts/recibo-vale.sh" "$t/scripts/"
+    printf '%s\n' '# fixture list' 'backlog/*.md' 'docs/*.md' '!docs/gate.md' '!docs/despliegue-lan.md' '!docs/visita-pc-madre.md' \
+      '!*rust-toolchain*' >"$t/scripts/recibo-lista-blanca.txt"
     # CI-F3.3b-2: the steps run through the planner (gate-dag.py) from the table of gate-dag.txt, which
     # reads gate_history.py beside it, so the stand-in tree carries all three.
     cp "$ROOT/scripts/gate-dag.py" "$ROOT/scripts/gate_history.py" "$ROOT/scripts/gate-dag.txt" "$t/scripts/"
@@ -328,23 +333,57 @@ FAKE
         "$BASH" "$tmp/$name/scripts/merge-gate.sh" >"$tmp/$name.out" 2>&1 </dev/null || rc=$?; } 2>/dev/null
     (( rc != 124 )) || self_fail "$name: the gate was still running after $row_s s, so it is waiting for something that does not come: $(tail -n 5 "$tmp/$name.out" 2>/dev/null)"
   }
+  # CI-E29: run_ci NAME MODE [VAR=value ...] launches the entry of the hook, `bash scripts/como-el-ci.sh MODE` from the root of the
+  # copy, with the environment run_copy_as gives the gate and no DATABASE_URL unless a VAR=value names one. $rc and NAME.out as
+  # in run_copy_as.
+  run_ci() {
+    local name="$1" mode="$2"
+    shift 2
+    rc=0
+    ( cd "$tmp/$name" && "${row_bound[@]}" env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u DATABASE_URL -u PGPORT -u CARGO_BUILD_JOBS -u CARGO_TARGET_DIR -u GATE_DAG HOME="$tmp/$name/home" \
+        PATH="$tmp/$name/bin:$gitdir:/usr/bin:/bin" SKIP_BACKUP=1 FAIL_AT= \
+        GATE_CGROUP_ROOT="$tmp/sin-cgroup/raiz" GATE_PROC_SELF_CGROUP="$tmp/sin-cgroup/propio" "$@" \
+        "$BASH" scripts/como-el-ci.sh "$mode" ) >"$tmp/$name.out" 2>&1 </dev/null || rc=$?
+    (( rc != 124 )) || self_fail "$name: como-el-ci.sh $mode was still running after $row_s s: $(tail -n 5 "$tmp/$name.out" 2>/dev/null)"
+  }
   exit_file() { cat "$tmp/$1/home/.cache/cuba-gate/run.exit" 2>/dev/null || true; }
   # git_tree NAME RUN_ALL_TESTS_BODY: a fake_tree committed whole, its home
   # ignored the way the real HOME is outside the real tree.
   git_tree() {
     fake_tree "$1" "$2"
-    printf 'home/\n' >"$tmp/$1/.gitignore"
+    printf 'home/\n.gate/\n' >"$tmp/$1/.gitignore"
     git -C "$tmp/$1" init -q
     git -C "$tmp/$1" add -A
     git -C "$tmp/$1" commit -q -m fixture
   }
   receipt_of() { cat "$tmp/$1/home/.cache/cuba-gate/receipts/$2" 2>/dev/null || true; }
   receipts_of() { ls "$tmp/$1/home/.cache/cuba-gate/receipts" 2>/dev/null || true; }
-  # A tree where no receipt may appear, and the run has to say why in a line.
+  # CI-E29 (D-E29f): the mark of a run that started over a commit and did not end with its receipt: a red one, one that a
+  # signal cut, one whose tree or HEAD changed, one whose log was not clean. It is next to the receipt, named <sha>.started.
+  started_of() { cat "$tmp/$1/home/.cache/cuba-gate/receipts/$2.started" 2>/dev/null || true; }
+  # marked NAME SHA WHAT: no receipt for SHA, and the mark of the run that did not pass, with its line.
+  marked() {
+    local name="$1" sha="$2" what="$3"
+    [[ ! -e "$tmp/$name/home/.cache/cuba-gate/receipts/$sha" ]] \
+      || self_fail "$what left a receipt for $sha: $(receipts_of "$name")"
+    [[ "$(started_of "$name" "$sha")" == "local-gate: STARTED $sha "* ]] \
+      || self_fail "$what left no mark 'local-gate: STARTED $sha ...' for the run that did not pass, so an earlier receipt of the same code could still be taken for its verdict (receipts: '$(receipts_of "$name")', mark: '$(started_of "$name" "$sha")')"
+  }
+  # pointer_field NAME KEY: the JSON value of KEY in .gate/ultima-corrida.json of the tree, as JSON (a string and a number differ).
+  pointer_field() {
+    python3 -I -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))[sys.argv[2]]))' "$tmp/$1/.gate/ultima-corrida.json" "$2" 2>/dev/null \
+      || echo "<no such field in the file of the hook, or no file>"
+  }
+  # A tree where no receipt may appear, and the run has to say why in a line. A tree that started clean leaves the mark of its
+  # run (D-E29f); one that started with something that is not documentation (`unmarked`) judged no commit and leaves nothing.
   no_receipt() {
-    local what="$1" name="$2"
+    local what="$1" name="$2" sha="$3" mark="${4:-marked}"
     (( rc == 0 )) || self_fail "$what exited $rc, and it passed: the receipt is not the verdict: $(cat "$tmp/$name.out")"
-    [[ -z "$(receipts_of "$name")" ]] || self_fail "$what left a receipt: $(receipts_of "$name")"
+    if [[ "$mark" == unmarked ]]; then
+      [[ -z "$(receipts_of "$name")" ]] || self_fail "$what left a receipt or a mark: $(receipts_of "$name")"
+    else
+      marked "$name" "$sha" "$what"
+    fi
     grep -q '^no receipt: ' "$tmp/$name.out" \
       || self_fail "$what wrote no receipt without saying why: $(cat "$tmp/$name.out")"
   }
@@ -392,14 +431,17 @@ FAKE
   # One signal, not one per lane: the signal waits for the gate's verdict in its exit trap, and a second one
   # would kill it there (CI-F3.3b-2: the planner runs more than one call of run-all-tests).
   git_tree stopped_term '[ -e "$HOME/signalled" ] || { touch "$HOME/signalled"; kill -TERM "$(printf "%s\n" "$CUBA_GATE_LOCK_OWNER" | sed -n "s/^pid=\([0-9]*\) .*/\1/p")"; }; exit 0'
+  sha="$(git -C "$tmp/stopped_term" rev-parse HEAD)"
   run_copy stopped_term
   (( rc != 0 )) || self_fail "G9: a gate stopped by SIGTERM exited 0: $(cat "$tmp/stopped_term.out")"
   [[ "$(exit_file stopped_term)" == 2 ]] \
     || self_fail "G9: a gate stopped by SIGTERM left '$(exit_file stopped_term)' in its exit file, not 2: an unfinished run read as a verdict"
   grep -q 'stopped before its last step' "$tmp/stopped_term.out" \
     || self_fail "G9: a gate stopped by SIGTERM did not say so: $(cat "$tmp/stopped_term.out")"
-  [[ -z "$(receipts_of stopped_term)" ]] \
-    || self_fail "G9: a gate stopped by SIGTERM over a clean tree left a receipt: $(receipts_of stopped_term)"
+  # CI-E29 (E29b.g3): no receipt, but the mark of its run (D-E29f), and the file of the hook says 2, the status of «could not judge».
+  marked stopped_term "$sha" "G9: a gate stopped by SIGTERM over a clean tree"
+  [[ "$(pointer_field stopped_term salida)" == 2 ]] \
+    || self_fail "E29b.g3: a gate stopped by SIGTERM left $(pointer_field stopped_term salida) as the salida of .gate/ultima-corrida.json, not 2: $(cat "$tmp/stopped_term.out")"
 
   # A second gate, refused by a live one's lock: the file belongs to that one.
   fake_tree refused 'exit 0'
@@ -427,32 +469,50 @@ FAKE
   grep -qx 'local-gate-summary: mutants caught=9 missed=1 timeout=0 unviable=0 kill_rate=0.900 min=0.800' <<<"$r" \
     || self_fail "the receipt lost the gate's kill_rate line: $r"
   grep -q '^local-gate-summary: MERGE GATE PASSED' <<<"$r" || self_fail "the receipt lost the gate's verdict line: $r"
+  # CI-E29 (E29b.g1): a pass leaves no mark (the receipt took it away) and leaves the file the stop hook reads, in the shape of the
+  # formula 2: the mode, the exit as a number, the head the gate judged, the sha256 of what `git diff HEAD --binary` says (nothing,
+  # over a clean tree) and the fingerprint of the judge.
+  [[ ! -e "$tmp/receipt/home/.cache/cuba-gate/receipts/$sha.started" ]] \
+    || self_fail "E29b.g1: a green gate that wrote its receipt left the mark of a run that did not pass: $(started_of receipt "$sha")"
+  [[ -f "$tmp/receipt/.gate/ultima-corrida.json" ]] \
+    || self_fail "E29b.g1: a green gate left no .gate/ultima-corrida.json for the stop hook: $(cat "$tmp/receipt.out")"
+  receipt_diff="$(git -C "$tmp/receipt" diff HEAD --binary | sha256sum | cut -d' ' -f1)"
+  for pair in 'modo|"todo"' 'salida|0' "head|\"$sha\"" 'formula|2' "diff_sha256|\"$receipt_diff\""; do
+    [[ "$(pointer_field receipt "${pair%%|*}")" == "${pair#*|}" ]] \
+      || self_fail "E29b.g1: the key ${pair%%|*} of .gate/ultima-corrida.json is $(pointer_field receipt "${pair%%|*}"), not ${pair#*|}: $(cat "$tmp/receipt/.gate/ultima-corrida.json")"
+  done
+  [[ "$(pointer_field receipt juez_sha256)" =~ ^\"[0-9a-f]{64}\"$ ]] \
+    || self_fail "E29b.g1: juez_sha256 of .gate/ultima-corrida.json is not 64 hex digits: $(cat "$tmp/receipt/.gate/ultima-corrida.json")"
 
   # An untracked file when the gate starts, gone before it ends: what passed is
   # not a commit, and only the look at the start can tell.
   git_tree dirty 'rm -f stray.rs'
   echo x >"$tmp/dirty/stray.rs"
+  sha="$(git -C "$tmp/dirty" rev-parse HEAD)"
   run_copy dirty
-  no_receipt "a gate over an untracked file" dirty
+  # CI-E29 (E29b.g7): a stray file that is not documentation judges no commit: no receipt and no mark either.
+  no_receipt "a gate over an untracked file" dirty "$sha" unmarked
 
   # A tree dirtied while the gate ran.
   git_tree dirtied 'echo x >stray.rs'
+  sha="$(git -C "$tmp/dirtied" rev-parse HEAD)"
   run_copy dirtied
-  no_receipt "a gate whose tree changed while it ran" dirtied
+  no_receipt "a gate whose tree changed while it ran" dirtied "$sha"
 
   # HEAD moved while the gate ran: neither commit was judged whole.
   git_tree moved 'git commit -q --allow-empty -m "landed while the gate ran"'
   sha="$(git -C "$tmp/moved" rev-parse HEAD)"
   run_copy moved
   [[ "$(git -C "$tmp/moved" rev-parse HEAD)" != "$sha" ]] || self_fail "the fixture's HEAD never moved, so it proves nothing"
-  no_receipt "a gate whose HEAD moved while it ran" moved
+  no_receipt "a gate whose HEAD moved while it ran" moved "$sha"
 
   # Exit 0 over a SKIPPED line: release.sh's own judge of the log says no.
   # No colon after the word: local_gate_contract.rs refuses that spelling
   # anywhere in this file, fixtures included.
   git_tree skipped 'echo "SKIPPED (tests that need the NLI model)"'
+  sha="$(git -C "$tmp/skipped" rev-parse HEAD)"
   run_copy skipped
-  no_receipt "a gate that exited 0 over SKIPPED" skipped
+  no_receipt "a gate that exited 0 over SKIPPED" skipped "$sha"
   grep -q '^no receipt: .*SKIPPED' "$tmp/skipped.out" \
     || self_fail "the SKIPPED run did not say that was why: $(cat "$tmp/skipped.out")"
 
@@ -464,8 +524,48 @@ FAKE
   printf 'local-gate: MERGE GATE PASSED %s\n' "$sha" >"$tmp/reddened/home/.cache/cuba-gate/receipts/$sha"
   run_copy reddened deny
   (( rc == 1 )) || self_fail "a gate whose cargo deny failed exited $rc, not 1: $(cat "$tmp/reddened.out")"
-  [[ -z "$(receipts_of reddened)" ]] \
-    || self_fail "a red gate on $sha left the receipt of an earlier pass on it: $(receipts_of reddened)"
+  # CI-E29 (E29b.g2): the receipt goes and the mark of the red run stays in its place, and the hook's file says 1.
+  marked reddened "$sha" "a red gate on $sha"
+  [[ "$(pointer_field reddened salida)" == 1 ]] \
+    || self_fail "E29b.g2: a gate that exited 1 left $(pointer_field reddened salida) as the salida of .gate/ultima-corrida.json, not 1: $(cat "$tmp/reddened.out")"
+
+  # CI-E29 (E29b.g4): documentation edited and created before the gate starts is not a dirty tree: the receipt is written, and the
+  # run does not say it leaves none.
+  git_tree docs_start 'exit 0'
+  mkdir -p "$tmp/docs_start/backlog"
+  echo a >"$tmp/docs_start/backlog/a.md"
+  git -C "$tmp/docs_start" add backlog/a.md
+  git -C "$tmp/docs_start" commit -q -m "a note"
+  sha="$(git -C "$tmp/docs_start" rev-parse HEAD)"
+  echo edited >>"$tmp/docs_start/backlog/a.md"
+  echo new >"$tmp/docs_start/backlog/nuevo.md"
+  run_copy docs_start
+  (( rc == 0 )) || self_fail "E29b.g4: a green gate over a tree with only documentation edited exited $rc: $(cat "$tmp/docs_start.out")"
+  r="$(receipt_of docs_start "$sha")"
+  [[ "$(sed -n 1p <<<"$r")" == "local-gate: MERGE GATE PASSED $sha" && "$(wc -l <<<"$r")" -eq 4 ]] \
+    || self_fail "E29b.g4: a green gate over a tree with backlog/a.md edited and backlog/nuevo.md untracked left no receipt of $sha ('$r', receipts: '$(receipts_of docs_start)'): $(cat "$tmp/docs_start.out")"
+  ! grep -q '^no receipt: ' "$tmp/docs_start.out" \
+    || self_fail "E29b.g4: the gate wrote its receipt and also said it left none: $(grep '^no receipt: ' "$tmp/docs_start.out")"
+
+  # CI-E29 (E29b.g5): documentation written while the gate runs is not a tree that changed under it.
+  git_tree docs_during 'mkdir -p backlog; echo x >backlog/durante.md'
+  sha="$(git -C "$tmp/docs_during" rev-parse HEAD)"
+  run_copy docs_during
+  (( rc == 0 )) || self_fail "E29b.g5: a green gate exited $rc: $(cat "$tmp/docs_during.out")"
+  [[ -f "$tmp/docs_during/backlog/durante.md" ]] || self_fail "E29b.g5: the fixture never wrote backlog/durante.md, so it proves nothing"
+  [[ "$(sed -n 1p <<<"$(receipt_of docs_during "$sha")")" == "local-gate: MERGE GATE PASSED $sha" ]] \
+    || self_fail "E29b.g5: a note written in backlog/ while the gate ran took the receipt of $sha away (receipts: '$(receipts_of docs_during)'): $(cat "$tmp/docs_during.out")"
+
+  # CI-E29 (E29b.g6): the list of what is documentation is the judge's own, so an edit of it, not committed, leaves no receipt, and the
+  # line that says why names it. It judged no commit, so there is no mark either.
+  git_tree list_edited 'exit 0'
+  echo '# edited' >>"$tmp/list_edited/scripts/recibo-lista-blanca.txt"
+  run_copy list_edited
+  (( rc == 0 )) || self_fail "E29b.g6: a green gate exited $rc: $(cat "$tmp/list_edited.out")"
+  [[ -z "$(receipts_of list_edited)" ]] \
+    || self_fail "E29b.g6: a gate over an edited scripts/recibo-lista-blanca.txt left a receipt or a mark: $(receipts_of list_edited)"
+  grep '^no receipt: ' "$tmp/list_edited.out" | grep -qF 'scripts/recibo-lista-blanca.txt' \
+    || self_fail "E29b.g6: no 'no receipt: ' line names scripts/recibo-lista-blanca.txt: $(cat "$tmp/list_edited.out")"
 
   # The order of the steps, read from $HOME/steps (one line per cargo call, and
   # one for run-all-tests.sh). cargo audit is the only step that judges RustSec
@@ -895,7 +995,7 @@ FAKE
   if grep -q 'MERGE GATE PASSED' "$tmp/times_red.out"; then
     self_fail "times_red: a gate whose test times were red passed: $(cat "$tmp/times_red.out")"
   fi
-  [[ -z "$(receipts_of times_red)" ]] || self_fail "times_red: a red gate left a receipt: $(receipts_of times_red)"
+  marked times_red "$(git -C "$tmp/times_red" rev-parse HEAD)" "times_red: a red gate"
   mutants_at="$(step_at times_red '^mutants-gate$')"
   times_at="$(step_at times_red '^test-times ')"
   [[ -n "$mutants_at" && -n "$times_at" ]] && (( mutants_at < times_at )) \
@@ -2102,12 +2202,184 @@ exit 1'
   grep -qxF PGCONNECT_TIMEOUT=10 "$tmp/j14i_ext/home/psql.env" \
     || self_fail "J14i: the identity query of the external server has no deadline of its own: $(cat "$tmp/j14i_ext/home/psql.env")"
 
+  # CI-E29 (E29a): `rapido` is the four checks of `todo` that need no compile, no network, no database and no lock, and it is not a
+  # verdict. The stop hook of the operator runs `bash scripts/como-el-ci.sh rapido` in every Stop, with no turn (parada.js), so every
+  # row launches that entry from the root of the copy. The checks are fmt, codigo-muerto, the npm smoke and the judgement of the
+  # planner's table; the stand-ins of fake_tree record the first three in $HOME/steps and the table is judged by the copy of the
+  # real planner.
+  # A line of the planner's judgement of its table: `OK`, and the table it judged.
+  table_judged() { grep -qE '^OK +.*gate-dag\.txt' "$tmp/$1.out"; }
+  rapido_steps="$(printf '%s\n' 'cargo fmt --check' 'codigo-muerto' 'node npm/install.test.js')"
+
+  # E29a.1: the four checks, in the order of step_P, nothing else, and the first and last line say it is not a verdict.
+  fake_tree rapido_ok "$run_all_steps"
+  run_ci rapido_ok rapido
+  (( rc == 0 )) || self_fail "E29a.1: como-el-ci.sh rapido over a tree whose checks all pass exited $rc, not 0: $(cat "$tmp/rapido_ok.out")"
+  [[ "$(steps_of rapido_ok)" == "$rapido_steps" ]] \
+    || self_fail "E29a.1: rapido did not run cargo fmt --check, codigo-muerto and node npm/install.test.js in that order and nothing else (no audit, deny, clippy, build, test, run-all-tests, check or lane): $(steps_of rapido_ok)"
+  table_judged rapido_ok || self_fail "E29a.1: rapido printed no OK line for the judgement of the planner's table (gate-dag.txt): $(cat "$tmp/rapido_ok.out")"
+  [[ "$(head -n 1 "$tmp/rapido_ok.out")" == 'rapido: NOT a verdict'* ]] \
+    || self_fail "E29a.1: the first line of rapido does not start with 'rapido: NOT a verdict': $(head -n 3 "$tmp/rapido_ok.out")"
+  [[ "$(tail -n 1 "$tmp/rapido_ok.out")" == 'rapido: GREEN (4 of 4) - NOT a verdict'* ]] \
+    || self_fail "E29a.1: the last line of rapido does not start with 'rapido: GREEN (4 of 4) - NOT a verdict': $(tail -n 3 "$tmp/rapido_ok.out")"
+  if grep -q 'MERGE GATE PASSED' "$tmp/rapido_ok.out"; then
+    self_fail "E29a.1: rapido printed MERGE GATE PASSED, the line the receipt and the release read as a verdict: $(cat "$tmp/rapido_ok.out")"
+  fi
+
+  # E29a.2: what rapido runs is a subsequence of what todo runs (the steps of the row F2.1), in the same relative order, so a
+  # check added to the cheap steps of the gate reaches both and rapido cannot go red where todo goes green.
+  [[ -s "$tmp/f2order/home/steps" ]] || self_fail "E29a.2: the steps of the row F2.1 are not there, so the row proves nothing"
+  awk 'NR == FNR { want[++n] = $0; next } { if (i < n && $0 == want[i + 1]) i++ } END { exit !(n > 0 && i == n) }' \
+    "$tmp/rapido_ok/home/steps" "$tmp/f2order/home/steps" 2>/dev/null \
+    || self_fail "E29a.2: the steps of rapido ($(tr '\n' ',' <"$tmp/rapido_ok/home/steps" 2>/dev/null)) are not a subsequence of those of the whole gate ($(tr '\n' ',' <"$tmp/f2order/home/steps"))"
+
+  # E29a.3: a check that is red does not stop the others, and the last line names it.
+  fake_tree rapido_red "$run_all_steps"
+  run_ci rapido_red rapido FAKE_CODIGO_MUERTO_EXIT=1
+  (( rc == 1 )) || self_fail "E29a.3: rapido over a red codigo-muerto exited $rc, not 1: $(cat "$tmp/rapido_red.out")"
+  muerto_at="$(step_at rapido_red '^codigo-muerto$')"
+  npm_at="$(step_at rapido_red '^node npm/install.test.js$')"
+  if [[ -z "$muerto_at" || -z "$npm_at" ]] || (( muerto_at >= npm_at )); then
+    self_fail "E29a.3: the npm smoke did not run after the red codigo-muerto, so the first red hid the checks after it (codigo-muerto '$muerto_at', npm '$npm_at'): $(steps_of rapido_red)"
+  fi
+  [[ "$(tail -n 1 "$tmp/rapido_red.out")" == 'rapido: RED (1 of 4: codigo-muerto) - NOT a verdict' ]] \
+    || self_fail "E29a.3: the last line of rapido is not 'rapido: RED (1 of 4: codigo-muerto) - NOT a verdict': $(tail -n 3 "$tmp/rapido_red.out")"
+
+  # E29a.4: a check that could not judge (exit 2) is 2 for rapido, and the others ran.
+  fake_tree rapido_cannot "$run_all_steps"
+  run_ci rapido_cannot rapido FAKE_NODE_EXIT=2
+  (( rc == 2 )) || self_fail "E29a.4: rapido over an npm smoke that exited 2 exited $rc, not 2: $(cat "$tmp/rapido_cannot.out")"
+  for step in 'cargo fmt --check' 'codigo-muerto' 'node npm/install.test.js'; do
+    grep -qxF "$step" "$tmp/rapido_cannot/home/steps" || self_fail "E29a.4: '$step' did not run: $(steps_of rapido_cannot)"
+  done
+  table_judged rapido_cannot || self_fail "E29a.4: the planner's table was not judged after the npm smoke that exited 2: $(cat "$tmp/rapido_cannot.out")"
+
+  # E29a.5: rapido runs beside a gate that is alive and touches nothing of it: not its lock, its exit file, its log, its receipts,
+  # its marks, the history of the planner or the file of the hook.
+  fake_tree rapido_busy 'exit 0'
+  busy="$tmp/rapido_busy"
+  mkdir -p "$busy/home/.cache/cuba-gate/lock" "$busy/home/.cache/cuba-gate/receipts" "$busy/.gate"
+  owner_record "$live" fixture-live >"$busy/home/.cache/cuba-gate/lock/owner"
+  printf 'the log of the other gate\n' >"$busy/home/.cache/cuba-gate/merge-gate.log"
+  printf 'local-gate: MERGE GATE PASSED %040d\n' 1 >"$busy/home/.cache/cuba-gate/receipts/$(printf '%040d' 1)"
+  printf 'local-gate: STARTED %040d 2026-11-10T12:30:00Z pid=1\n' 2 >"$busy/home/.cache/cuba-gate/receipts/$(printf '%040d' 2).started"
+  printf '{"modo":"todo","salida":0,"head":"%040d","diff_sha256":"x","juez_sha256":null,"formula":2}\n' 1 >"$busy/.gate/ultima-corrida.json"
+  busy_state() {
+    ( cd "$busy" && find home/.cache -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum && sha256sum .gate/ultima-corrida.json )
+  }
+  busy_before="$(busy_state)"
+  run_ci rapido_busy rapido
+  (( rc == 0 )) || self_fail "E29a.5: rapido beside a live gate exited $rc, not 0: $(cat "$tmp/rapido_busy.out")"
+  if grep -q 'another gate is running' "$tmp/rapido_busy.out"; then
+    self_fail "E29a.5: rapido was refused by the lock of a live gate, so it takes the lock of the judge: $(cat "$tmp/rapido_busy.out")"
+  fi
+  [[ "$(busy_state)" == "$busy_before" ]] \
+    || self_fail "E29a.5: rapido changed, added or removed a file of the gate that holds the lock (its lock, exit file, log, receipts, marks, history or .gate/ultima-corrida.json): $(busy_state | diff - <(printf '%s\n' "$busy_before") || true)"
+  [[ "$(exit_file rapido_busy)" == 0 ]] || self_fail "E29a.5: rapido wrote '$(exit_file rapido_busy)' into the exit file of the gate that holds the lock"
+
+  # E29a.6: rapido does not behave differently when the hook launches it. A gate that is another gate when somebody looks is a
+  # gate that proves nothing: the same tree, run again with GATE_DESDE_HOOK=1, gives the same output, the same exit and the same steps.
+  cp "$tmp/rapido_ok.out" "$tmp/rapido_ok.first"
+  cp "$tmp/rapido_ok/home/steps" "$tmp/rapido_ok.first-steps"
+  rm -f "$tmp/rapido_ok/home/steps"
+  run_ci rapido_ok rapido GATE_DESDE_HOOK=1
+  (( rc == 0 )) || self_fail "E29a.6: rapido exited $rc when the hook launched it and 0 when it did not: $(cat "$tmp/rapido_ok.out")"
+  cmp -s "$tmp/rapido_ok.first" "$tmp/rapido_ok.out" \
+    || self_fail "E29a.6: the output of rapido changes with GATE_DESDE_HOOK=1: $(diff "$tmp/rapido_ok.first" "$tmp/rapido_ok.out" || true)"
+  cmp -s "$tmp/rapido_ok.first-steps" "$tmp/rapido_ok/home/steps" \
+    || self_fail "E29a.6: what rapido runs changes with GATE_DESDE_HOOK=1: $(steps_of rapido_ok)"
+
+  # E29a.7: a mode that does not exist is 2, the usage names the modes that do (rapido and parcial among them) and nothing runs.
+  fake_tree rapido_typo 'exit 0'
+  run_ci rapido_typo rapidisimo
+  (( rc == 2 )) || self_fail "E29a.7: a mode that does not exist exited $rc, not 2: $(cat "$tmp/rapido_typo.out")"
+  for mode in todo rapido parcial; do
+    grep -qw "$mode" "$tmp/rapido_typo.out" || self_fail "E29a.7: the usage of a mode that does not exist does not name '$mode': $(cat "$tmp/rapido_typo.out")"
+  done
+  [[ ! -e "$tmp/rapido_typo/home/steps" ]] || self_fail "E29a.7: a mode that does not exist ran something: $(steps_of rapido_typo)"
+
+  # CI-E29 (E29c): `parcial` is P, B1, CT and DBG through the planner: the first look at the build and the contracts that is not the judge. It takes
+  # the lock (it compiles in the target of `todo` and uses its clusters), has an exit file and a log of its own, and writes no
+  # receipt, no mark and no file for the hook. Each row has a receipt for the HEAD of its tree that nothing may touch.
+  parcial_tree() {
+    local name="$1" body="$2" dir sha
+    git_tree "$name" "$body"
+    dir="$tmp/$name/home/.cache/cuba-gate"
+    sha="$(git -C "$tmp/$name" rev-parse HEAD)"
+    mkdir -p "$dir/receipts"
+    printf '%s\n' "local-gate: MERGE GATE PASSED $sha" 'local-gate-date: 2026-11-10T12:00:00Z' \
+      'local-gate-summary: mutants caught=9 missed=1 timeout=0 unviable=0 kill_rate=0.900 min=0.800' \
+      'local-gate-summary: MERGE GATE PASSED' >"$dir/receipts/$sha"
+    cp "$dir/receipts/$sha" "$tmp/$name.receipt"
+    printf 'the log of an earlier gate\n' >"$dir/merge-gate.log"
+    cp "$dir/merge-gate.log" "$tmp/$name.log"
+  }
+  # parcial_untouched NAME: the receipt, the log and the exit file of the whole gate are as they were, and there is no mark and no file for the hook.
+  parcial_untouched() {
+    local name="$1" sha dir
+    sha="$(git -C "$tmp/$name" rev-parse HEAD)"
+    dir="$tmp/$name/home/.cache/cuba-gate"
+    cmp -s "$dir/receipts/$sha" "$tmp/$name.receipt" || self_fail "$name: parcial changed or removed the receipt of $sha: $(receipt_of "$name" "$sha")"
+    [[ ! -e "$dir/receipts/$sha.started" ]] || self_fail "$name: parcial left a mark of a run: $(started_of "$name" "$sha")"
+    [[ ! -e "$tmp/$name/.gate/ultima-corrida.json" ]] || self_fail "$name: parcial wrote .gate/ultima-corrida.json for the stop hook"
+    cmp -s "$dir/merge-gate.log" "$tmp/$name.log" || self_fail "$name: parcial wrote into merge-gate.log, the log of the whole gate: $(cat "$dir/merge-gate.log")"
+    [[ "$(exit_file "$name")" == 0 ]] || self_fail "$name: parcial wrote '$(exit_file "$name")' into run.exit, the exit file of the whole gate"
+  }
+  parcial_exit() { cat "$tmp/$1/home/.cache/cuba-gate/parcial.exit" 2>/dev/null || true; }
+
+  # E29c.4: parcial runs four rows, writes nothing of the verdict and says it is not one.
+  parcial_tree parcial_ok "$lane_body"
+  run_ci parcial_ok parcial DATABASE_URL="$judge_test_url"
+  (( rc == 0 )) || self_fail "E29c.4: parcial over a tree whose rows all pass exited $rc, not 0: $(cat "$tmp/parcial_ok.out")"
+  [[ "$(grep '^run-all-tests --lane' "$tmp/parcial_ok/home/steps" | LC_ALL=C sort)" == "$(printf '%s\n' 'run-all-tests --lane CL --lane B1' 'run-all-tests --lane CT' 'run-all-tests --lane D1')" ]] \
+    || self_fail "E29c.4: the run-all-tests of parcial was not called for the lanes CL and B1, CT and D1 and for no other: $(steps_of parcial_ok)"
+  parcial_untouched parcial_ok
+  [[ "$(parcial_exit parcial_ok)" == 0 ]] || self_fail "E29c.4: parcial.exit says '$(parcial_exit parcial_ok)', not 0"
+  if grep -q '^test-times ' "$tmp/parcial_ok/home/steps"; then
+    self_fail "E29c.4: parcial judged the test times, which a subset of the rows cannot be judged by: $(steps_of parcial_ok)"
+  fi
+  table_rows="$(python3 -I "$tmp/parcial_ok/scripts/gate-dag.py" rows --table "$tmp/parcial_ok/scripts/gate-dag.txt" | awk '$1 == "row" { print $2 }')"
+  grep -qxF "test times: not judged (parcial runs 4 of the $(wc -l <<<"$table_rows") rows of gate-dag.txt)" "$tmp/parcial_ok.out" \
+    || self_fail "E29c.4: parcial did not say 'test times: not judged (parcial runs 4 of the $(wc -l <<<"$table_rows") rows of gate-dag.txt)': $(cat "$tmp/parcial_ok.out")"
+  if grep -q 'MERGE GATE PASSED' "$tmp/parcial_ok.out"; then
+    self_fail "E29c.4: parcial printed MERGE GATE PASSED: $(cat "$tmp/parcial_ok.out")"
+  fi
+  [[ "$(tail -n 1 "$tmp/parcial_ok.out")" == 'parcial: 4 rows green (P B1 CT DBG) - NOT a verdict, no receipt. The judge is ./scripts/como-el-ci.sh todo' ]] \
+    || self_fail "E29c.4: the last line of parcial is not 'parcial: 4 rows green (P B1 CT DBG) - NOT a verdict, no receipt. The judge is ./scripts/como-el-ci.sh todo': $(tail -n 3 "$tmp/parcial_ok.out")"
+  parcial_header="$(grep '^parcial: ' "$tmp/parcial_ok.out" | sed '$d' || true)"
+  while IFS= read -r row; do
+    grep -qE "(^|[^A-Za-z0-9_])$row([^A-Za-z0-9_]|$)" <<<"$parcial_header" \
+      || self_fail "E29c.4: the lines 'parcial: ' that open the run do not name the row $row of the table that parcial does not run: $(grep '^parcial: ' "$tmp/parcial_ok.out")"
+  done < <(grep -vxE 'P|B1|CT|DBG' <<<"$table_rows" || true)
+
+  # E29c.5: a red parcial is red for itself and takes the pass away from nobody.
+  parcial_tree parcial_red "$lane_body"
+  run_ci parcial_red parcial DATABASE_URL="$judge_test_url" FAKE_CODIGO_MUERTO_EXIT=1
+  (( rc == 1 )) || self_fail "E29c.5: parcial over a red codigo-muerto exited $rc, not 1: $(cat "$tmp/parcial_red.out")"
+  [[ "$(parcial_exit parcial_red)" == 1 ]] || self_fail "E29c.5: parcial.exit says '$(parcial_exit parcial_red)', not 1"
+  parcial_untouched parcial_red
+
+  # E29c.6: parcial takes the lock of the judge, so it is refused by a gate that is alive, and leaves that gate's exit file as it was.
+  fake_tree parcial_busy 'exit 0'
+  mkdir -p "$tmp/parcial_busy/home/.cache/cuba-gate/lock"
+  owner_record "$live" fixture-live >"$tmp/parcial_busy/home/.cache/cuba-gate/lock/owner"
+  run_ci parcial_busy parcial DATABASE_URL="$judge_test_url"
+  grep -q "another gate is running: pid $live" "$tmp/parcial_busy.out" \
+    || self_fail "E29c.6: parcial was not refused by the live gate (exit $rc): $(cat "$tmp/parcial_busy.out")"
+  [[ "$(exit_file parcial_busy)" == 0 ]] \
+    || self_fail "E29c.6: a refused parcial wrote '$(exit_file parcial_busy)' into the exit file of the gate that holds the lock"
+
   echo "OK  self-test: the exit file says running while a gate runs and holds the whole"
   echo "    gate's verdict at the end, a step after the tests included; a gate killed"
   echo "    in the middle leaves 'running', never an old 0; a refused gate leaves it alone."
   echo "    A green gate over a clean tree leaves a receipt for its commit; an untracked"
   echo "    file, a tree or HEAD that changed during the run and an exit 0 over SKIPPED"
-  echo "    leave none and say why; a red run on a commit removes its earlier receipt."
+  echo "    leave none and say why; a red run on a commit removes its earlier receipt and leaves the mark of its run."
+  echo "    (receipts/<sha>.started), which a green run takes away; the file of the stop hook (.gate/ultima-corrida.json) says"
+  echo "    the verdict of every end; documentation, edited or created before the gate or while it runs, does not take the"
+  echo "    receipt away, and the docs-only list is the judge's own and does."
+  echo "    rapido runs the four checks of todo that need no lock, no compile and no network, never says it is a verdict"
+  echo "    and touches nothing of a gate that is alive; parcial runs P, B1, CT and DBG, takes the lock and writes no receipt."
   echo "    gate_linux_env keeps a CARGO_TARGET_DIR that was set and otherwise puts it"
   echo "    outside the tree, moves a TMPDIR that is unset or tmpfs under the cache, keeps"
   echo "    one on a disk, refuses with 2 a node that is missing, older than engines.node"

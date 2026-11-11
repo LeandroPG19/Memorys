@@ -6103,3 +6103,195 @@ fn j18b_2_a_target_that_leaves_its_root_writes_nothing_outside_and_starts_nothin
         "the target `../../../escape` was made outside its root"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// CI-E29 (E29c, D-E29c1): `run --rows <id,...>` runs a subset of the table, the one `parcial` of merge-gate.sh is made of.
+
+impl Fixture {
+    /// `run` with `--rows`: the planner of only the rows named, as `merge-gate.sh --parcial` starts it.
+    fn run_rows(&self, gate_dag: &str, rows: &str) -> Run {
+        let mut command = Command::new("python3");
+        command
+            .arg("-I")
+            .arg(repo_root().join("scripts/gate-dag.py"))
+            .arg("run")
+            .arg("--table")
+            .arg(&self.table)
+            .arg("--rows")
+            .arg(rows);
+        self.run_command(command, gate_dag, &[])
+    }
+}
+
+/// The rows the subset is made of in the real table (P, then B1 that builds, then DBG and CT that read what B1 built) and two that
+/// it leaves out: D2, which also reads B1, and B3, which only waits for P.
+fn table_of_a_subset(fx: &mut Fixture) {
+    fx.table(&[
+        (10, "P", "-", "0.1", ""),
+        (15, "B1", "P", "0.1", ""),
+        (20, "DBG", "B1", "0.1", ""),
+        (21, "CT", "B1", "0.1", ""),
+        (22, "D2", "B1", "0.1", ""),
+        (30, "B3", "P", "0.1", ""),
+    ]);
+}
+
+/// E29c.1. A subset of the rows runs those rows and no other, each once, with the order of its dependencies, in series and as a
+/// DAG. The second run is a DAG on purpose: the first one, in series, is the history of the subset, and it has to be the history
+/// the second one reads (E29c.3), or it would say there is none and run in series again.
+#[test]
+fn rows_runs_only_the_rows_it_is_given_and_respects_their_dependencies() {
+    let mut fx = Fixture::new("e29c1", CPU_FOUR, MEM_OPEN);
+    table_of_a_subset(&mut fx);
+    for (gate_dag, what) in [("0", "in series"), ("1", "as a DAG")] {
+        let before = snapshot(&fx.history, "pasos.jsonl");
+        let run = fx.run_rows(gate_dag, "P,B1,CT,DBG");
+        assert_green(&run, &format!("--rows P,B1,CT,DBG {what}"));
+        if gate_dag == "1" {
+            assert!(
+                !run.text().contains("note: no serial history"),
+                "the second run of the same subset did not find the history of the first: {}",
+                run.text()
+            );
+        }
+        for id in ["P", "B1", "CT", "DBG"] {
+            assert_eq!(
+                run.out.matches(&format!("=== {id} banner")).count(),
+                1,
+                "{what}: {id} did not run exactly once: {}",
+                run.out
+            );
+        }
+        for id in ["D2", "B3"] {
+            assert!(
+                !run.out.contains(&format!("=== {id} banner"))
+                    && !fx.control.join(format!("env-{id}.txt")).exists(),
+                "{what}: {id} ran although --rows does not name it: {}",
+                run.out
+            );
+        }
+        let pasos = appended(&fx.history, "pasos.jsonl", &before);
+        assert_eq!(
+            pasos.len(),
+            4,
+            "{what}: the history has a record for each row that ran and for no other: {pasos:?}"
+        );
+        let (p, b1, ct, dbg) = (
+            by_id(&pasos, "P"),
+            by_id(&pasos, "B1"),
+            by_id(&pasos, "CT"),
+            by_id(&pasos, "DBG"),
+        );
+        assert!(
+            num(b1, "inicio") >= num(p, "fin"),
+            "{what}: B1 started before P ended"
+        );
+        for reader in [ct, dbg] {
+            assert!(
+                num(reader, "inicio") >= num(b1, "fin"),
+                "{what}: {reader} started before B1 ended, and it reads what B1 builds"
+            );
+        }
+    }
+}
+
+/// E29c.2. The planner refuses a subset that is not a subset before it starts any row, with exit 2 and the name of what is wrong:
+/// an id that is not in the table, a row whose dependency is left out, and an empty list.
+#[test]
+fn rows_refuses_an_unknown_id_a_missing_dependency_or_an_empty_list_before_starting_any_row() {
+    // The control: a subset that is valid is accepted, so that the refusals below are the planner's judgement of the list and not
+    // the answer to an option it does not know.
+    let mut control = Fixture::new("e29c2-control", CPU_FOUR, MEM_OPEN);
+    table_of_a_subset(&mut control);
+    assert_green(
+        &control.run_rows("0", "P"),
+        "--rows P, a subset with no dependency",
+    );
+
+    let mut fx = Fixture::new("e29c2", CPU_FOUR, MEM_OPEN);
+    table_of_a_subset(&mut fx);
+    let cases = [
+        ("an id that is not in the table", "P,B1,XX", vec!["XX"]),
+        ("a row without the row it needs", "CT", vec!["CT", "B1"]),
+        ("an empty list", "", vec![]),
+    ];
+    for (defect, rows, named) in cases {
+        let run = fx.run_rows("0", rows);
+        assert!(
+            !run.timed_out,
+            "{defect}: the planner did not answer in 30 s"
+        );
+        assert_eq!(
+            run.code,
+            Some(2),
+            "{defect}: exit {:?}, want 2\n{}{}",
+            run.code,
+            run.out,
+            run.err
+        );
+        assert!(
+            !run.err.trim().is_empty(),
+            "{defect}: the planner refused with nothing said on stderr"
+        );
+        assert!(
+            named.is_empty()
+                || run
+                    .err
+                    .lines()
+                    .any(|line| named.iter().all(|word| line.contains(*word))),
+            "{defect}: no line of the refusal names {named:?}: {}",
+            run.err
+        );
+        assert!(
+            fx.started().is_empty(),
+            "{defect}: a row started although the subset is refused: {:?}",
+            fx.started()
+        );
+    }
+}
+
+/// E29c.3. The history of a subset is not the history of the whole table: the key of the history of `--rows` is the key of the
+/// table with `:rows=` and the ids in order, so a green series of the whole table does not make the first `parcial` a DAG (its
+/// durations are not those of the subset, and `test-times` would read them as the table's). The first run of a subset is in
+/// series and says why.
+#[test]
+fn rows_keep_a_history_apart_from_the_whole_table_and_the_first_run_is_in_series() {
+    let mut fx = Fixture::new("e29c3", CPU_FOUR, MEM_OPEN);
+    table_of_a_subset(&mut fx);
+    fx.seed();
+    let seeded = appended(&fx.history, "pasos.jsonl", &HashMap::new());
+    let key = by_id(&seeded, "P")["tabla"]
+        .as_str()
+        .expect("the series records the key of the table")
+        .to_string();
+    let expected = format!("{key}:rows=B1,CT,DBG,P");
+
+    let before_steps = snapshot(&fx.history, "pasos.jsonl");
+    let before_runs = snapshot(&fx.history, "corridas.jsonl");
+    let run = fx.run_rows("auto", "P,B1,CT,DBG");
+    assert_green(&run, "--rows with a serial history of the whole table only");
+    assert!(
+        run.text()
+            .contains("note: no serial history for this table"),
+        "the history of the whole table was used for a subset of its rows: {}",
+        run.text()
+    );
+    let steps = appended(&fx.history, "pasos.jsonl", &before_steps);
+    for id in ["P", "B1", "CT", "DBG"] {
+        assert_eq!(
+            by_id(&steps, id)["tabla"].as_str(),
+            Some(expected.as_str()),
+            "the key of {id} is not the key of the table with `:rows=B1,CT,DBG,P`"
+        );
+    }
+    assert!(
+        !overlaps(by_id(&steps, "CT"), by_id(&steps, "DBG")),
+        "the first run of a subset had CT and DBG alive together, so it was not in series"
+    );
+    let runs = appended(&fx.history, "corridas.jsonl", &before_runs);
+    assert!(
+        runs.iter()
+            .any(|record| record["tabla"].as_str() == Some(expected.as_str())),
+        "no record of the run carries the key {expected}: {runs:?}"
+    );
+}
