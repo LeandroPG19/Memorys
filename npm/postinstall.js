@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+const { spawnSync } = require("child_process");
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
@@ -98,14 +99,48 @@ async function ensureBinary(log = (m) => process.stderr.write(m + "\n")) {
   return dest;
 }
 
-module.exports = { ensureBinary, binPath, artifactName, download };
+// The binary decides whether there is a runtime to update (`--if-installed`): the cache roots, HOME or
+// USERPROFILE and the name of the library per system live in Rust, in one place. The download can reach
+// 450 MB (the CUDA 12 package of Linux), so the binary's own output goes straight to the terminal.
+function runBinary(bin, args) {
+  const result = spawnSync(bin, args, { stdio: "inherit" });
+  if (result.error) throw result.error;
+  return result.status;
+}
+
+function refreshRuntime(bin, run = runBinary, log = (m) => process.stderr.write(m + "\n")) {
+  const manual =
+    "run `memory-industry models runtime` when you can (on Windows, with the daemon stopped)";
+  let status;
+  try {
+    status = run(bin, ["models", "runtime", "--if-installed"]);
+  } catch (err) {
+    log(`memory-industry: could not update the ONNX Runtime — ${err.message}; ${manual}`);
+    return false;
+  }
+  if (status !== 0) {
+    log(`memory-industry: could not update the ONNX Runtime (exit ${status}); ${manual}`);
+    return false;
+  }
+  return true;
+}
+
+// A failed refresh never fails the install: the package without its binary is worse than a runtime
+// that is one version behind, which `doctor` reports and the command above fixes.
+async function postinstall({ ensure = ensureBinary, refresh = refreshRuntime, log } = {}) {
+  const bin = await ensure(log);
+  refresh(bin);
+  return bin;
+}
+
+module.exports = { ensureBinary, binPath, artifactName, download, refreshRuntime, postinstall };
 
 if (require.main === module) {
   if (process.env.CUBA_MEMORYS_SKIP_INSTALL) {
     console.log("memory-industry: skipping binary install (CUBA_MEMORYS_SKIP_INSTALL set)");
     process.exit(0);
   }
-  ensureBinary((m) => console.log(m)).catch((err) => {
+  postinstall({ log: (m) => console.log(m) }).catch((err) => {
     console.warn(`memory-industry: postinstall could not fetch the binary — ${err.message}`);
     console.warn("  It will be retried automatically the first time you run memory-industry.");
     process.exit(0);

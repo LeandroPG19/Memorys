@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ort::environment::Environment;
 use ort::session::builder::SessionBuilder;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Workload {
@@ -408,13 +408,22 @@ pub fn status_after_sessions(base: GpuStatus, refused: &[(Workload, String)]) ->
         detail: format!(
             "el provider GPU no inicializó → estas sesiones corren en CPU · {sessions}"
         ),
-        hint: Some(
-            "faltan DLL de CUDA 12 / cuDNN 9 junto al runtime de ONNX o en PATH (Windows) / \
-             LD_LIBRARY_PATH (Linux): cudart64_12, cublas64_12, cublasLt64_12, cudnn64_9. La \
-             colocación se decide al abrir la sesión: reiniciá el daemon después"
-                .to_string(),
-        ),
+        hint: Some(format!(
+            "faltan bibliotecas de CUDA junto al runtime de ONNX o en PATH (Windows) / \
+             LD_LIBRARY_PATH (Linux): {}. cuDNN es opcional con este runtime. La colocación se \
+             decide al abrir la sesión: reiniciá el daemon después",
+            crate::models_cli::cuda_libraries(installed_cuda_flavor())
+        )),
     }
+}
+
+/// The CUDA package `models runtime` recorded beside the runtime, or `None` for an
+/// install that predates the record or holds the CPU one: the hint then names both majors.
+fn installed_cuda_flavor() -> Option<crate::models_cli::Flavor> {
+    runtime_dir()
+        .and_then(|dir| crate::models_cli::read_runtime_record(&dir))
+        .map(|record| record.flavor)
+        .filter(|flavor| flavor.is_gpu())
 }
 
 pub fn placement_summary() -> String {
@@ -609,17 +618,40 @@ fn runtime_has_gpu_provider(provider: &str) -> bool {
 /// be told apart from the other by a test or by a mutant — the same argument
 /// that collapsed `restrict` into one body in 0.27.
 fn nvidia_driver_present() -> bool {
-    if std::path::Path::new("/proc/driver/nvidia/version").exists() {
-        return true;
-    }
+    Path::new("/proc/driver/nvidia/version").exists() || nvidia_smi().is_some()
+}
+
+/// Where WSL2 keeps the tools of the Windows driver. It is on nobody's `PATH`, and
+/// `/proc/driver/nvidia` does not exist there, so without this directory a machine
+/// with a card under WSL reads as a machine without one.
+const WSL_LIB: &str = "/usr/lib/wsl/lib";
+
+/// The `nvidia-smi` this process can run, or `None`: the one on the `PATH` first, as
+/// the operator's shell would pick it, and then the one under WSL. Also what
+/// `resources::vram_free_mb` runs. `gpu-placement-check.sh` mirrors the search.
+pub(crate) fn nvidia_smi() -> Option<PathBuf> {
+    nvidia_smi_from(std::env::var_os("PATH").as_deref(), Path::new(WSL_LIB))
+}
+
+/// `nvidia_smi` with both places handed in, so a test needs neither a card nor WSL.
+pub(crate) fn nvidia_smi_from(
+    path_var: Option<&std::ffi::OsStr>,
+    wsl_lib: &Path,
+) -> Option<PathBuf> {
     let exe = if cfg!(windows) {
         "nvidia-smi.exe"
     } else {
         "nvidia-smi"
     };
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|p| p.join(exe).exists()))
-        .unwrap_or(false)
+    let on_path = path_var.and_then(|path| {
+        std::env::split_paths(path)
+            .map(|dir| dir.join(exe))
+            .find(|candidate| candidate.exists())
+    });
+    on_path.or_else(|| {
+        let under_wsl = wsl_lib.join("nvidia-smi");
+        under_wsl.exists().then_some(under_wsl)
+    })
 }
 
 #[cfg(test)]

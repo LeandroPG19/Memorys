@@ -716,7 +716,7 @@ pub async fn model_loaded() -> bool {
 /// loaded: the type does not let it. It is never dropped, so `ort` does not
 /// release it at exit, as the sessions in the statics beside it are not
 /// either; CI-E31 and the E2E watch that the process still leaves with 0.
-static RUNTIME: OnceLock<std::result::Result<(libloading::Library, Environment), String>> =
+static RUNTIME: OnceLock<std::result::Result<(libloading::Library, Environment, String), String>> =
     OnceLock::new();
 
 /// Loads ONNX Runtime from `path` before any session opens.
@@ -734,8 +734,34 @@ pub(crate) fn load_onnxruntime(path: &std::path::Path) -> Result<&'static Enviro
          unset it and run `memory-industry models runtime`"
     );
     match RUNTIME.get_or_init(|| load_onnxruntime_once(path).map_err(|e| format!("{e:#}"))) {
-        Ok((_library, environment)) => Ok(environment),
+        Ok((_library, environment, _version)) => Ok(environment),
         Err(reason) => Err(anyhow::anyhow!("{reason}")),
+    }
+}
+
+/// The version string the runtime this process loaded gave (`1.31.1`), or `None` while
+/// nothing has loaded one or the load failed. What `doctor` says about the runtime and
+/// what `tests/model_parity.rs` compares with the version `models runtime` installs.
+pub fn loaded_runtime_version() -> Option<String> {
+    let (_library, _environment, version) = RUNTIME.get()?.as_ref().ok()?;
+    Some(version.clone())
+}
+
+/// Turns the telemetry of ONNX Runtime off for a process that has not loaded it yet,
+/// unless the operator decided: a value already set stays, whatever it is.
+///
+/// From 1.31 the official builds send telemetry to Microsoft over HTTPS by default, with
+/// a persistent device identifier. `Environment::with_telemetry(false)` (`load_onnxruntime_once`)
+/// stops what it can, but ONNX Runtime may have emitted its first event by then: only
+/// this variable, set before the library starts, prevents the uploader and the
+/// identifier from being created. `main` calls this next to `resources::apply`, before
+/// the tokio runtime exists, because `set_var` is only sound while one thread reads
+/// the environment.
+pub fn keep_onnx_runtime_telemetry_off() {
+    if std::env::var_os("ORT_DISABLE_TELEMETRY").is_none() {
+        // SAFETY: called from `main` before the runtime and any thread of ours; the
+        // test that exercises it holds `GLOBAL_STATE_GUARD`.
+        unsafe { std::env::set_var("ORT_DISABLE_TELEMETRY", "1") };
     }
 }
 
@@ -769,24 +795,33 @@ pub(crate) fn load_onnxruntime(path: &std::path::Path) -> Result<&'static Enviro
 /// any other: no session opens, and the answer is kept like the rest. Its
 /// text names the environment and not the path, so `/health` has no second
 /// place to redact.
-fn load_onnxruntime_once(path: &std::path::Path) -> Result<(libloading::Library, Environment)> {
+fn load_onnxruntime_once(
+    path: &std::path::Path,
+) -> Result<(libloading::Library, Environment, String)> {
     let path = std::path::absolute(path)
         .with_context(|| format!("resolving the ONNX Runtime path {}", path.display()))?;
-    let library = open_runtime_library(&path)?;
+    let (library, version) = open_runtime_library(&path)?;
     let environment = ort::init_from(&path)
         .map_err(|e| anyhow::anyhow!("loading ONNX Runtime from {}: {e}", path.display()))?
         .with_telemetry(false)
         .build()
         .map_err(|e| anyhow::anyhow!("creating the ONNX Runtime environment: {e}"))?;
-    Ok((library, environment))
+    Ok((library, environment, version))
 }
 
 /// `OrtGetApiBase` as `ort-sys` declares it.
 type GetApiBase = unsafe extern "system" fn() -> *const ort::sys::OrtApiBase;
 
+/// The version of the ONNX Runtime library at `path`, read the way the daemon reads it
+/// and without calling into `ort`. The library is closed again before this returns,
+/// which on Windows is what lets `models runtime` rename the directory it was read from.
+pub(crate) fn runtime_version(path: &std::path::Path) -> Result<String> {
+    open_runtime_library(path).map(|(_library, version)| version)
+}
+
 /// The library at `path`, opened and checked the way `ort`'s loader is about
-/// to check it, without calling into `ort`.
-fn open_runtime_library(path: &std::path::Path) -> Result<libloading::Library> {
+/// to check it, without calling into `ort`, and the version it reports.
+fn open_runtime_library(path: &std::path::Path) -> Result<(libloading::Library, String)> {
     // SAFETY: the same `Library::new` on the same path that `ort` makes a
     // moment later. Loading runs the library's own initialisation and nothing
     // else of it; a file that is not a library is refused by the platform
@@ -826,7 +861,7 @@ fn open_runtime_library(path: &std::path::Path) -> Result<libloading::Library> {
         path.display(),
         ort::MINOR_VERSION
     );
-    Ok(library)
+    Ok((library, version))
 }
 
 /// The minor number of an ONNX Runtime version, read the way `ort` reads it:

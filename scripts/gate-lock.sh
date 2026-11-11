@@ -666,6 +666,9 @@ gate_model_env() {
   export CUBA_EMBEDDING_DIM="${CUBA_EMBEDDING_DIM:-384}"
   export CUBA_EMBED_MODEL="${CUBA_EMBED_MODEL:-e5-small}"
   export CUBA_POOLING="${CUBA_POOLING:-cls}"
+  # CI-D5b: the official builds of ONNX Runtime 1.31 send telemetry to Microsoft by default, and a process of a test must open no
+  # connection. Not a model name (CI-J5), and a value the caller set stays: the variable is read before the library starts.
+  export ORT_DISABLE_TELEMETRY="${ORT_DISABLE_TELEMETRY:-1}"
 }
 
 # --- the judge's server (CI-J, D-J1a) ----------------------------------------

@@ -719,6 +719,77 @@ fn runtime_role_check(user: &str, is_super: bool, app_role_ready: bool) -> Check
 /// created under the new name — `pgpass_app` at startup, `undo/` from `delete`
 /// — is enough for `models` to download again the gigabytes the legacy root
 /// already holds.
+/// The ONNX Runtime this process loaded, judged against the one `models runtime`
+/// installs. No row when nothing was loaded: `onnx_model` already says why.
+///
+/// The flavor comes from the record beside the library, and only when that record is
+/// about the version that was loaded: one left by an earlier install would name the
+/// wrong package.
+fn onnx_runtime_check() -> Option<Check> {
+    let loaded = onnx::loaded_runtime_version()?;
+    let flavor = onnx::locate_onnxruntime()
+        .and_then(|library| {
+            library
+                .parent()
+                .and_then(crate::models_cli::read_runtime_record)
+        })
+        .filter(|record| record.version == loaded)
+        .map(|record| record.flavor.as_str());
+    Some(runtime_version_check(
+        &loaded,
+        crate::models_cli::ORT_VERSION,
+        flavor,
+        onnx::explicit_runtime_path().is_some(),
+    ))
+}
+
+/// Pure: the version that was loaded against the pinned one. Older is a warning and
+/// never a failure, because `ort` takes any runtime from 1.24 on and `doctor` exits 1
+/// only on a failure. Where it came from is said, and not its path: the output is
+/// pasted into chats.
+fn runtime_version_check(
+    loaded: &str,
+    pinned: &str,
+    flavor: Option<&str>,
+    by_variable: bool,
+) -> Check {
+    let named = match flavor {
+        Some(flavor) => format!("{loaded} ({flavor})"),
+        None => loaded.to_string(),
+    };
+    let origin = if by_variable {
+        "ORT_DYLIB_PATH"
+    } else {
+        "la caché"
+    };
+    let numbers = |version: &str| -> Vec<u32> {
+        version
+            .split('.')
+            .map(|part| part.parse().unwrap_or(0))
+            .collect()
+    };
+    match numbers(loaded).cmp(&numbers(pinned)) {
+        std::cmp::Ordering::Equal => Check::ok("onnx_runtime", format!("{named}, de {origin}")),
+        std::cmp::Ordering::Greater => Check::ok(
+            "onnx_runtime",
+            format!(
+                "{named}, de {origin}: más nueva que la fijada {pinned}, no probada con esta \
+                 versión"
+            ),
+        ),
+        std::cmp::Ordering::Less => Check::warn(
+            "onnx_runtime",
+            format!("{named}, de {origin}: más vieja que la {pinned} que instala esta versión"),
+            if by_variable {
+                "apuntá ORT_DYLIB_PATH a una biblioteca de la versión fijada, o quitala y corré \
+                 `memory-industry models runtime`"
+            } else {
+                "memory-industry models runtime (en Windows, con el daemon parado)"
+            },
+        ),
+    }
+}
+
 fn legacy_cache_check(legacy: &std::path::Path) -> Check {
     let entries = std::fs::read_dir(legacy).map_or(0, |dir| dir.flatten().count());
     if entries == 0 {
@@ -1178,6 +1249,8 @@ pub async fn run_checks_with(
              o seteá ONNX_MODEL_PATH y ORT_DYLIB_PATH.",
         ));
     }
+
+    checks.extend(onnx_runtime_check());
 
     checks.extend(
         crate::models_cli::CacheRoots::resolve()

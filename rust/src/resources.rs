@@ -319,7 +319,7 @@ fn vram_free_mb() -> Option<u64> {
     if !cfg!(any(feature = "cuda", feature = "directml")) {
         return None;
     }
-    let output = std::process::Command::new("nvidia-smi")
+    let output = std::process::Command::new(crate::gpu::nvidia_smi()?)
         .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
         .output()
         .ok()?;

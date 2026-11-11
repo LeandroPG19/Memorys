@@ -177,11 +177,19 @@ provider_lib_present() {
   return 1
 }
 
+# Mirrors nvidia_driver_present() in rust/src/gpu.rs: the driver's own file, an nvidia-smi on the
+# PATH, and the one WSL2 keeps in /usr/lib/wsl/lib, which is on nobody's PATH and is where a card
+# under WSL shows up. The two places are arguments with the real ones as their defaults, so the
+# self-test can put each row in a machine of its own.
 nvidia_device_present() {
-  if [[ -e /proc/driver/nvidia/version ]]; then
+  local wsl_lib="${1:-/usr/lib/wsl/lib}" driver_file="${2:-/proc/driver/nvidia/version}"
+  if [[ -e "$driver_file" ]]; then
     return 0
   fi
   if command -v nvidia-smi >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ -e "$wsl_lib/nvidia-smi" ]]; then
     return 0
   fi
   return 1
