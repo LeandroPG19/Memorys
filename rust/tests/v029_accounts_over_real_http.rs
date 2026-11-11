@@ -33,8 +33,8 @@ use memory_industry::accounts::{
 use memory_industry::accounts_db::{self as db, CandidateState, ClaimOutcome, CredentialState};
 use memory_industry::http::{Brake, PairOutcome, Reason, pair_core};
 use serde_json::{Value, json};
-use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{Connection, Executor, PgConnection, PgPool};
 use uuid::Uuid;
 
 const SHARED: &str = "g-shared-token-for-the-lan-0123456789ab";
@@ -1871,15 +1871,25 @@ async fn g15_last_seen_is_written_by_the_first_request_and_not_by_every_one() {
         // table, even one that matches no row (the throttled one), and the test waits until it
         // has seen one per request. Then no write can still be on its way when `last_seen_at`
         // is read, and a pause that a stalled machine could outlast is not needed.
+        // The pool has stepped down to `cuba_app`, which cannot create in `public`, so the counter
+        // is built, and read, on a connection of the owner (the one `DATABASE_URL` names, on this
+        // scratch database): `cuba_app` has no grant on `touches`. The function is SECURITY
+        // DEFINER so that `cuba_app`'s UPDATE can write the counter without one: it runs as the
+        // owner of `touches`. Nothing else in the schema is in the way: the credentials table
+        // has no trigger of its own and no row security.
+        let mut owner = PgConnection::connect(&url_)
+            .await
+            .expect("an owner connection to the scratch database");
         for statement in [
-            "CREATE TABLE touches (at timestamptz NOT NULL DEFAULT now())",
-            "CREATE FUNCTION count_touch() RETURNS trigger LANGUAGE plpgsql AS \
-             $$ BEGIN INSERT INTO touches DEFAULT VALUES; RETURN NULL; END $$",
-            "CREATE TRIGGER count_touch AFTER UPDATE ON brain_account_credentials \
-             FOR EACH STATEMENT EXECUTE FUNCTION count_touch()",
+            "CREATE TABLE public.touches (at timestamptz NOT NULL DEFAULT now())",
+            "CREATE FUNCTION public.count_touch() RETURNS trigger LANGUAGE plpgsql \
+             SECURITY DEFINER SET search_path = public \
+             AS $$ BEGIN INSERT INTO public.touches DEFAULT VALUES; RETURN NULL; END $$",
+            "CREATE TRIGGER count_touch AFTER UPDATE ON public.brain_account_credentials \
+             FOR EACH STATEMENT EXECUTE FUNCTION public.count_touch()",
         ] {
-            sqlx::query(statement)
-                .execute(&pool)
+            owner
+                .execute(statement)
                 .await
                 .expect("a counter of the daemon's writes in the scratch database");
         }
@@ -1888,8 +1898,8 @@ async fn g15_last_seen_is_written_by_the_first_request_and_not_by_every_one() {
         }
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let touches: i64 = sqlx::query_scalar("SELECT count(*) FROM touches")
-                .fetch_one(&pool)
+            let touches: i64 = sqlx::query_scalar("SELECT count(*) FROM public.touches")
+                .fetch_one(&mut owner)
                 .await
                 .expect("counting the daemon's writes");
             if touches >= 5 {
@@ -1903,6 +1913,7 @@ async fn g15_last_seen_is_written_by_the_first_request_and_not_by_every_one() {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        owner.close().await.expect("closing the owner connection");
         assert_eq!(
             last_seen(&pool, id).await,
             Some(first),
