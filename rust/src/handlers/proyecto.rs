@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 use crate::project;
@@ -238,8 +238,11 @@ async fn merge(pool: &PgPool, from: &str, to: &str) -> Result<Value> {
     ];
     let mut moved: Vec<(String, u64)> = Vec::with_capacity(tables.len());
     for t in tables {
-        let q = format!("UPDATE {t} SET project_id = $1 WHERE project_id = $2");
-        let rows = sqlx::query(&q)
+        // sql-safe: t is one of the six literal table names above
+        let q = AssertSqlSafe(format!(
+            "UPDATE {t} SET project_id = $1 WHERE project_id = $2"
+        ));
+        let rows = sqlx::query(q)
             .bind(to_id)
             .bind(from_id)
             .execute(&mut *tx)

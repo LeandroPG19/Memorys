@@ -20,7 +20,7 @@ use std::future::Future;
 
 use crate::empty_db::in_an_empty_database;
 use memory_industry::secure_cli::{AppRole, ensure_app_role};
-use sqlx::{Connection, Executor, PgConnection, PgPool, Row};
+use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, PgPool, Row};
 
 const PUBLISHED_PASSWORD: &str = "app2026";
 const CREATE_APP_ROLE_SQL: &str = include_str!("../../embed/create-app-role.sql");
@@ -81,7 +81,7 @@ where
             .await
             .expect("connecting to the maintenance database to drop the probe role");
         admin
-            .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+            .execute(AssertSqlSafe(format!("DROP ROLE IF EXISTS {role}")))
             .await
             .unwrap_or_else(|e| panic!("dropping the probe role {role}: {e}"));
     }
@@ -145,7 +145,9 @@ async fn a_role_that_already_exists_keeps_the_password_its_daemon_uses() {
             .expect("connecting to the scratch database as the admin role");
         let known = fresh_secret();
         admin
-            .execute(format!("CREATE ROLE {role} LOGIN CREATEDB PASSWORD '{known}'").as_str())
+            .execute(AssertSqlSafe(format!(
+                "CREATE ROLE {role} LOGIN CREATEDB PASSWORD '{known}'"
+            )))
             .await
             .unwrap_or_else(|e| panic!("creating {role} the way an older install left it: {e}"));
         assert!(
@@ -209,7 +211,9 @@ async fn provisioning_moves_an_existing_role_onto_the_new_password_and_off_the_o
             .expect("connecting to the scratch database as the admin role");
         let old = fresh_secret();
         admin
-            .execute(format!("CREATE ROLE {role} LOGIN PASSWORD '{old}'").as_str())
+            .execute(AssertSqlSafe(format!(
+                "CREATE ROLE {role} LOGIN PASSWORD '{old}'"
+            )))
             .await
             .unwrap_or_else(|e| panic!("creating {role} with the password it had before: {e}"));
         assert!(
@@ -255,12 +259,9 @@ async fn admin_pool_that_marks_server_side_hashing(url: &str) -> PgPool {
         .await
         .expect("connecting to the scratch database to set its scram_iterations");
     setup
-        .execute(
-            format!(
-                "DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET scram_iterations = {SERVER_SIDE_ITERATIONS}', current_database()); END $$"
-            )
-            .as_str(),
-        )
+        .execute(AssertSqlSafe(format!(
+            "DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET scram_iterations = {SERVER_SIDE_ITERATIONS}', current_database()); END $$"
+        )))
         .await
         .expect("setting scram_iterations on the scratch database (PostgreSQL 16 or later)");
     setup
@@ -318,7 +319,9 @@ async fn provisioning_hands_the_server_a_verifier_and_never_the_password() {
         let admin = admin_pool_that_marks_server_side_hashing(&url).await;
         let old = fresh_secret();
         admin
-            .execute(format!("CREATE ROLE {role} LOGIN PASSWORD '{old}'").as_str())
+            .execute(AssertSqlSafe(format!(
+                "CREATE ROLE {role} LOGIN PASSWORD '{old}'"
+            )))
             .await
             .unwrap_or_else(|e| panic!("creating {role} with a password in the clear: {e}"));
         let hashed_by_the_server = stored_verifier(&admin, &role).await;

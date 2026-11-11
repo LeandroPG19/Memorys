@@ -10,7 +10,7 @@
 //! touched.
 
 use crate::common::in_a_scratch_database;
-use sqlx::{Executor, PgPool};
+use sqlx::{AssertSqlSafe, Executor, PgPool};
 use std::path::Path;
 
 const NEW_TABLES: [&str; 4] = [
@@ -55,14 +55,14 @@ async fn migrated(url: &str) -> PgPool {
 }
 
 async fn exec(pool: &PgPool, sql: &str) {
-    pool.execute(sql)
+    pool.execute(AssertSqlSafe(sql))
         .await
         .unwrap_or_else(|e| panic!("this statement must succeed ({e}):\n{sql}"));
 }
 
 /// The SQLSTATE the database answered with, or `None` when it accepted the statement.
 async fn sqlstate_of(pool: &PgPool, sql: &str) -> Option<String> {
-    match pool.execute(sql).await {
+    match pool.execute(AssertSqlSafe(sql)).await {
         Ok(_) => None,
         Err(sqlx::Error::Database(e)) => Some(e.code().map(|c| c.to_string()).unwrap_or_default()),
         Err(other) => panic!("a non-database failure on a plain statement: {other}\n{sql}"),
@@ -147,13 +147,15 @@ async fn replaying_the_migration_changes_nothing_and_keeps_the_host_id() {
         .await;
 
         let up = migration("0065_accounts.up.sql");
-        pool.execute(up.as_str()).await.unwrap_or_else(|e| {
-            panic!(
-                "running the body of 0065 a second time must not abort ({e}): sqlx replays \
+        pool.execute(AssertSqlSafe(up.as_str()))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "running the body of 0065 a second time must not abort ({e}): sqlx replays \
                  migrations against a database that already has the objects, and PostgreSQL \
                  has no IF NOT EXISTS for constraints, so every object here is guarded"
-            )
-        });
+                )
+            });
 
         let after: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT host_id FROM brain_host_identity")
             .fetch_all(&pool)
@@ -182,12 +184,14 @@ async fn the_down_migration_removes_exactly_what_the_up_added_and_the_up_works_a
         let pool = migrated(&url).await;
 
         let down = migration("0065_accounts.down.sql");
-        pool.execute(down.as_str()).await.unwrap_or_else(|e| {
-            panic!(
-                "0065_accounts.down.sql must run on a migrated database ({e}); the tables are \
+        pool.execute(AssertSqlSafe(down.as_str()))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "0065_accounts.down.sql must run on a migrated database ({e}); the tables are \
                  dropped from the referencing one to the referenced one"
-            )
-        });
+                )
+            });
         for table in NEW_TABLES {
             assert!(
                 !table_exists(&pool, table).await,
@@ -202,7 +206,7 @@ async fn the_down_migration_removes_exactly_what_the_up_added_and_the_up_works_a
         );
 
         let up = migration("0065_accounts.up.sql");
-        pool.execute(up.as_str())
+        pool.execute(AssertSqlSafe(up.as_str()))
             .await
             .expect("the up migration must work again after the down one");
         for table in NEW_TABLES {

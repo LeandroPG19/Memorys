@@ -23,8 +23,10 @@
 //!     under load): `common::wait_until_no_session_is_left` outlasts a session that leaves late
 //!     and, when one never leaves, names it;
 //!   - a pool closed while one of its connections is being returned leaves no session on the
-//!     sealed database (CI-E32: sqlx 0.8.6's `Pool::close()` returns with that connection open in
-//!     the idle queue, and the builder's wait ran out on it twice on 10-nov-2026);
+//!     sealed database (CI-E32: sqlx 0.8.6's `Pool::close()` returned with that connection open in
+//!     the idle queue, and the builder's wait ran out on it twice on 10-nov-2026; 0.9.0 closes every
+//!     connection before returning, launchbadge/sqlx#3952, so the builder needs nothing of its own
+//!     (CI-E36) and this test now watches the dependency);
 //!   - `empty_db::in_an_empty_database` still hands out a database with no schema at all, which
 //!     v045_databases_of_one_server_migrate_at_once, v044_* and v043_a_model_of_another_width need.
 //!
@@ -41,7 +43,7 @@ use std::time::{Duration, Instant};
 use common::in_a_scratch_database;
 use empty_db::in_an_empty_database;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, Connection, PgConnection, PgPool};
 use tokio::sync::Notify;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -136,11 +138,12 @@ async fn read_a_clone(pool: &PgPool, started: &str) -> Result<Seen, String> {
     .map_err(|e| format!("listing the columns with a random default: {e}"))?;
     let mut identities = Vec::new();
     for (table, column) in columns {
-        let values: Vec<Option<String>> =
-            sqlx::query_scalar(&format!("SELECT \"{column}\"::text FROM \"{table}\""))
-                .fetch_all(pool)
-                .await
-                .map_err(|e| format!("reading {table}.{column}: {e}"))?;
+        let values: Vec<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT \"{column}\"::text FROM \"{table}\""
+        )))
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("reading {table}.{column}: {e}"))?;
         identities.extend(
             values
                 .into_iter()
@@ -472,9 +475,10 @@ async fn a_session_that_never_leaves_is_named_when_the_time_runs_out() {
 }
 
 /// CI-E32. A connection that is being returned when the pool closes is the one sqlx 0.8.6's
-/// `Pool::close()` leaves behind: the connection goes into the idle queue just before it releases
-/// its permit, that permit is what lets `close()` finish, and `close()` does not empty the queue
-/// again. The connection then stays open for as long as the `Pool` lives. This test builds that
+/// `Pool::close()` left behind (0.9.0 closes it, launchbadge/sqlx#3952: CI-E36): the connection
+/// goes into the idle queue just before it releases its permit, that permit is what lets `close()`
+/// finish, and `close()` did not empty the queue again. The connection then stayed open for as long
+/// as the `Pool` lived. This test builds that
 /// order with two `Notify`: the pool's `after_release` says it entered and waits, the test closes
 /// the pool, and only when the pool says it is closed (`close_event`) does it let the hook go.
 /// No clock orders anything (the 30 s is only how long a failure waits before it is named), and
@@ -531,9 +535,9 @@ async fn a_pool_closed_while_a_connection_returns_leaves_no_session_on_the_seale
             outcome,
             Ok(()),
             "closing the pool while a connection was being returned left a session on the sealed \
-             database, so the template could not be published: sqlx 0.8.6's `Pool::close()` \
-             returns with that connection open in the idle queue, and it lives until the last \
-             `Pool` is dropped"
+             database, so the template could not be published: `Pool::close()` returned with that \
+             connection open in the idle queue (sqlx 0.8.6 did, CI-E32; 0.9.0 closes it, CI-E36), \
+             and it lives until the last `Pool` is dropped"
         );
 
         let accepts: bool =

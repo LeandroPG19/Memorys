@@ -16,7 +16,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use memory_industry::accounts::{self, Secret, code_key, normalize_code};
 use memory_industry::accounts_db::{self as db, ClaimOutcome, CredentialState};
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 fn t0() -> DateTime<Utc> {
@@ -105,9 +105,10 @@ async fn tables_containing(pool: &PgPool, needles: &[String]) -> Vec<String> {
     let patterns: Vec<String> = needles.iter().map(|n| format!("%{n}%")).collect();
     let mut hits = Vec::new();
     for table in tables {
-        let sql =
-            format!("SELECT EXISTS (SELECT 1 FROM \"{table}\" r WHERE r::text ILIKE ANY($1))");
-        let found: bool = sqlx::query_scalar(&sql)
+        let sql = AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM \"{table}\" r WHERE r::text ILIKE ANY($1))"
+        ));
+        let found: bool = sqlx::query_scalar(sql)
             .bind(&patterns)
             .fetch_one(pool)
             .await

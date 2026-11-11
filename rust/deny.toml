@@ -51,7 +51,6 @@ yanked = "deny"
 # does not report unmaintained crates deep in the tree. cargo audit reads Cargo.lock
 # and does see them, and cargo audit is the judge.
 ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
     { id = "RUSTSEC-2024-0436", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
     { id = "RUSTSEC-2026-0459", reason = "owner, expiry and why: scripts/advisory-exceptions.txt" },
 ]

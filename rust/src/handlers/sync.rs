@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1527,9 +1527,9 @@ fn recompute_digest(root: &Path, project_id: Option<Uuid>) -> Result<String> {
 pub const SYNC_LOCK_WAIT: Duration = Duration::from_secs(10);
 pub const SYNC_STATEMENT_BUDGET: &str = "300s";
 
-/// The wait as whole milliseconds, the only form `take_sync_lock` writes into its statement: `SET` takes no bound
-/// parameters, so what reaches it has to be an integer and not text the caller composed. The statement itself is
-/// written beside the transaction that runs it, where a reader (and the static guard) can see it is not on a pool.
+/// The wait as whole milliseconds, the only form `take_sync_lock` binds as the value of the setting: what reaches
+/// Postgres is an integer and a unit, never text the caller composed. The statement itself runs on the transaction
+/// that takes the lock, where a reader can see it is not on a pool.
 pub fn lock_timeout_millis(wait: Duration) -> Result<u128> {
     let millis = wait.as_millis();
     if millis == 0 {
@@ -1545,16 +1545,16 @@ pub async fn take_sync_lock(
     wait: Duration,
 ) -> Result<()> {
     let millis = lock_timeout_millis(wait)?;
-    sqlx::query(&format!("SET LOCAL lock_timeout = '{millis}ms'"))
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(format!("{millis}ms"))
         .execute(&mut **tx)
         .await
         .context("bounding how long this sync may wait for the lock")?;
-    sqlx::query(&format!(
-        "SET LOCAL statement_timeout = '{SYNC_STATEMENT_BUDGET}'"
-    ))
-    .execute(&mut **tx)
-    .await
-    .context("bounding how long a single sync statement may run")?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(SYNC_STATEMENT_BUDGET)
+        .execute(&mut **tx)
+        .await
+        .context("bounding how long a single sync statement may run")?;
 
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(SYNC_LOCK)
@@ -1582,11 +1582,8 @@ pub const TOMBSTONED_TABLES: [(&str, &str); 8] = [
     ("brain_facts", "fact_id"),
 ];
 
-fn tombstone_key(table: &str) -> Option<&'static str> {
-    TOMBSTONED_TABLES
-        .iter()
-        .find(|(t, _)| *t == table)
-        .map(|(_, k)| *k)
+fn tombstone_entry(table: &str) -> Option<(&'static str, &'static str)> {
+    TOMBSTONED_TABLES.iter().find(|(t, _)| *t == table).copied()
 }
 
 const TOMBSTONE_ALARM_RATIO: f64 = 0.10;
@@ -1626,7 +1623,7 @@ async fn apply_tombstones(
         ) else {
             continue;
         };
-        if tombstone_key(table).is_none() {
+        if tombstone_entry(table).is_none() {
             anyhow::bail!(
                 "tombstones.json names table {table:?}, which this build does not delete from. \
                  A tombstone is a licence to destroy rows; honouring one for a table nobody \
@@ -1655,13 +1652,13 @@ async fn apply_tombstones(
 
     let mut would_delete = 0i64;
     for (table, ids) in &by_table {
-        let key = tombstone_key(table).expect("checked above");
-        let present: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*) FROM {table} WHERE {key} = ANY($1)"
-        ))
-        .bind(ids)
-        .fetch_one(&mut **tx)
-        .await?;
+        let (name, key) = tombstone_entry(table).expect("checked above");
+        // sql-safe: name and key are the const strings of TOMBSTONED_TABLES; the bundle only picks the entry
+        let count_sql = AssertSqlSafe(format!("SELECT count(*) FROM {name} WHERE {key} = ANY($1)"));
+        let present: i64 = sqlx::query_scalar(count_sql)
+            .bind(ids)
+            .fetch_one(&mut **tx)
+            .await?;
         would_delete += present;
     }
     if would_delete > 0 && !confirm {
@@ -1684,11 +1681,10 @@ async fn apply_tombstones(
     }
 
     for (table, ids) in by_table.iter().filter(|(t, _)| *t != "brain_entities") {
-        let key = tombstone_key(table).expect("checked above");
-        let done = sqlx::query(&format!("DELETE FROM {table} WHERE {key} = ANY($1)"))
-            .bind(ids)
-            .execute(&mut **tx)
-            .await?;
+        let (name, key) = tombstone_entry(table).expect("checked above");
+        // sql-safe: name and key are the const strings of TOMBSTONED_TABLES; the bundle only picks the entry
+        let delete_sql = AssertSqlSafe(format!("DELETE FROM {name} WHERE {key} = ANY($1)"));
+        let done = sqlx::query(delete_sql).bind(ids).execute(&mut **tx).await?;
         if done.rows_affected() > 0 {
             applied
                 .deleted
@@ -1955,7 +1951,8 @@ async fn import(
             .collect();
 
         if !batch.is_empty() {
-            let r = sqlx::query(&format!(
+            // sql-safe: the only interpolation is one of two literal ON CONFLICT clauses, chosen by overwrite
+            let sql = AssertSqlSafe(format!(
                 "INSERT INTO brain_projects (id, name, created_at)
                  SELECT u.id, u.name, u.created_at
                  FROM jsonb_to_recordset($1::jsonb) AS u(
@@ -1966,10 +1963,11 @@ async fn import(
                 } else {
                     "NOTHING"
                 }
-            ))
-            .bind(Value::Array(batch))
-            .execute(&mut *tx)
-            .await?;
+            ));
+            let r = sqlx::query(sql)
+                .bind(Value::Array(batch))
+                .execute(&mut *tx)
+                .await?;
             inserted += r.rows_affected() as u32;
         }
     }
@@ -2022,7 +2020,8 @@ async fn import(
         }
 
         if !entity_rows.is_empty() {
-            let r = sqlx::query(&format!(
+            // sql-safe: the only interpolation is one of two literal ON CONFLICT clauses, chosen by overwrite
+            let sql = AssertSqlSafe(format!(
                 "INSERT INTO brain_entities
                     (id, name, entity_type, importance, access_count, project_id, created_at)
                  SELECT u.id, u.name, u.entity_type, u.importance, u.access_count,
@@ -2041,10 +2040,11 @@ async fn import(
                      importance = GREATEST(brain_entities.importance, EXCLUDED.importance), \
                      access_count = GREATEST(brain_entities.access_count, EXCLUDED.access_count)"
                 }
-            ))
-            .bind(Value::Array(entity_rows))
-            .execute(&mut *tx)
-            .await?;
+            ));
+            let r = sqlx::query(sql)
+                .bind(Value::Array(entity_rows))
+                .execute(&mut *tx)
+                .await?;
             inserted += r.rows_affected() as u32;
         }
 
@@ -2126,7 +2126,8 @@ async fn import(
                 diverged.extend(already);
             }
 
-            let landed: Vec<Uuid> = sqlx::query_scalar(&format!(
+            // sql-safe: the only interpolation is one of two literal ON CONFLICT clauses, chosen by overwrite
+            let sql = AssertSqlSafe(format!(
                 "INSERT INTO brain_observations
                     (id, entity_id, content, observation_type, source, importance,
                      tags, session_id, project_id, embedding_model, created_at, trust,
@@ -2172,10 +2173,11 @@ async fn import(
                 } else {
                     "NOTHING"
                 }
-            ))
-            .bind(&batch)
-            .fetch_all(&mut *tx)
-            .await?;
+            ));
+            let landed: Vec<Uuid> = sqlx::query_scalar(sql)
+                .bind(&batch)
+                .fetch_all(&mut *tx)
+                .await?;
 
             inserted += landed.len() as u32;
             for id in &landed {
@@ -2226,7 +2228,8 @@ async fn import(
         }
 
         if !batch.is_empty() {
-            let landed: Vec<Uuid> = sqlx::query_scalar(&format!(
+            // sql-safe: the only interpolation is one of two literal ON CONFLICT clauses, chosen by overwrite
+            let sql = AssertSqlSafe(format!(
                 "INSERT INTO brain_episodes
                     (id, entity_id, content, actors, artifacts, importance,
                      project_id, started_at, ended_at, trust)
@@ -2248,10 +2251,11 @@ async fn import(
                 } else {
                     "NOTHING"
                 }
-            ))
-            .bind(Value::Array(batch))
-            .fetch_all(&mut *tx)
-            .await?;
+            ));
+            let landed: Vec<Uuid> = sqlx::query_scalar(sql)
+                .bind(Value::Array(batch))
+                .fetch_all(&mut *tx)
+                .await?;
             inserted += landed.len() as u32;
             for id in &landed {
                 if let Some(pattern) = reasons.get(id) {
@@ -2299,7 +2303,8 @@ async fn import(
         }
 
         if !batch.is_empty() {
-            let landed: Vec<Uuid> = sqlx::query_scalar(&format!(
+            // sql-safe: the only interpolation is one of two literal ON CONFLICT clauses, chosen by overwrite
+            let sql = AssertSqlSafe(format!(
                 "INSERT INTO brain_errors
                     (id, error_type, error_message, solution, resolved,
                      project, project_id, created_at, trust)
@@ -2320,10 +2325,11 @@ async fn import(
                 } else {
                     "NOTHING"
                 }
-            ))
-            .bind(Value::Array(batch))
-            .fetch_all(&mut *tx)
-            .await?;
+            ));
+            let landed: Vec<Uuid> = sqlx::query_scalar(sql)
+                .bind(Value::Array(batch))
+                .fetch_all(&mut *tx)
+                .await?;
             inserted += landed.len() as u32;
             for id in &landed {
                 if let Some(pattern) = reasons.get(id) {
@@ -2528,7 +2534,8 @@ async fn import(
             .collect();
 
         if !batch.is_empty() {
-            let r = sqlx::query(&format!(
+            // sql-safe: the only interpolation is one of two literal ON CONFLICT clauses, chosen by overwrite
+            let sql = AssertSqlSafe(format!(
                 "INSERT INTO brain_procedures
                     (id, name, steps, created_at, updated_at, trigger_context, preconditions,
                      verification, success_count, failure_count, last_outcome, last_used_at,
@@ -2562,10 +2569,11 @@ async fn import(
                      failure_count = GREATEST(brain_procedures.failure_count, \
                          EXCLUDED.failure_count)"
                 }
-            ))
-            .bind(Value::Array(batch))
-            .execute(&mut *tx)
-            .await?;
+            ));
+            let r = sqlx::query(sql)
+                .bind(Value::Array(batch))
+                .execute(&mut *tx)
+                .await?;
             inserted += r.rows_affected() as u32;
         }
     }
@@ -2622,7 +2630,8 @@ async fn import(
         }
 
         if !batch.is_empty() {
-            let r = sqlx::query(&format!(
+            // sql-safe: the only interpolation is one of two literal ON CONFLICT clauses, chosen by overwrite
+            let sql = AssertSqlSafe(format!(
                 "INSERT INTO brain_relations
                     (id, from_entity, to_entity, relation_type, strength,
                      bidirectional, project_id, created_at, provenance)
@@ -2642,10 +2651,11 @@ async fn import(
                     "UPDATE SET \
                      strength = GREATEST(brain_relations.strength, EXCLUDED.strength)"
                 }
-            ))
-            .bind(Value::Array(batch))
-            .execute(&mut *tx)
-            .await?;
+            ));
+            let r = sqlx::query(sql)
+                .bind(Value::Array(batch))
+                .execute(&mut *tx)
+                .await?;
             inserted += r.rows_affected() as u32;
         }
     }

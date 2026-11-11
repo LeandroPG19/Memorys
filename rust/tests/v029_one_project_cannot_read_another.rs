@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-async fn as_app_role(pool: &sqlx::PgPool, project: Uuid, sql: &str) -> Vec<String> {
+async fn as_app_role(pool: &sqlx::PgPool, project: Uuid, sql: &'static str) -> Vec<String> {
     let mut conn = pool.acquire().await.expect("a connection");
     sqlx::query("SET ROLE cuba_app")
         .execute(&mut *conn)

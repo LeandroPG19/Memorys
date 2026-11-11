@@ -398,9 +398,9 @@ async fn the_dead_database_hangs_up_at_once_instead_of_timing_out() {
          sqlx: on Windows the close arrives as a RST and the error is Io (os error 10054); on \
          Linux it arrives as an EOF while reading the answer to the SSLRequest and the error is \
          Protocol(\"unexpected response from SSLRequest: 0x00\") (measured 2026-10-13, 659 \
-         us). What this must reject is PoolTimedOut: sqlx 0.8 retries a refused connection \
-         until the pool's acquire_timeout (5 s, db.rs) and then returns it, so a port with no \
-         listener, or a listener that never answers, is slow and ends in that error. A URL \
+         us). What this must reject is PoolTimedOut: sqlx (0.8 and 0.9, pool/inner.rs:378) retries a \
+         refused connection until the pool's acquire_timeout (5 s, db.rs) and then returns it, so a \
+         port with no listener, or a listener that never answers, is slow and ends in that error. A URL \
          that does not parse is no better: create_lazy_pool falls back to localhost:5432 and \
          the PG* variables, which could reach a real server"
     );

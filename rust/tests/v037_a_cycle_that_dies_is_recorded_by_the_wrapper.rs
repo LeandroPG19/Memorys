@@ -1,4 +1,4 @@
-use sqlx::{Connection, Executor, PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, PgPool};
 
 const CYCLES_TABLE: &str = "CREATE TABLE brain_rem_cycles (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -42,7 +42,7 @@ async fn a_cycle_that_dies_is_written_down_by_the_caller_that_watched_it_die() {
     let scratch = format!("brain_remfail_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
     let mut conn = admin().await;
-    conn.execute(format!("CREATE DATABASE {scratch}").as_str())
+    conn.execute(AssertSqlSafe(format!("CREATE DATABASE {scratch}")))
         .await
         .expect("creating the scratch database");
     drop(conn);
@@ -64,9 +64,11 @@ async fn a_cycle_that_dies_is_written_down_by_the_caller_that_watched_it_die() {
 
     pool.close().await;
     let mut conn = admin().await;
-    conn.execute(format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)").as_str())
-        .await
-        .ok();
+    conn.execute(AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"
+    )))
+    .await
+    .ok();
 
     assert!(
         outcome.is_err(),

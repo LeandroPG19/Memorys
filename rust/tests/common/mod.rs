@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use memory_industry::db;
 use sha2::{Digest, Sha384};
-use sqlx::{Connection, Executor, PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, PgPool};
 use tokio::sync::OnceCell;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -90,7 +90,7 @@ fn refuse(step: &str, why: &sqlx::Error) -> ! {
 
 async fn run(admin: &mut PgConnection, statement: &str, step: &str) {
     admin
-        .execute(statement)
+        .execute(AssertSqlSafe(statement))
         .await
         .unwrap_or_else(|why| refuse(step, &why));
 }
@@ -173,7 +173,9 @@ async fn build_the_template(url: &str) -> String {
         panic!("emptying the template before publishing it: {who}");
     }
     match admin
-        .execute(format!("ALTER DATABASE {building} RENAME TO {name}").as_str())
+        .execute(AssertSqlSafe(format!(
+            "ALTER DATABASE {building} RENAME TO {name}"
+        )))
         .await
     {
         Ok(_) => {}
@@ -317,7 +319,9 @@ where
     let outcome = tokio::spawn(body(sibling_url(&url, &scratch))).await;
 
     admin
-        .execute(format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)").as_str())
+        .execute(AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"
+        )))
         .await
         .expect("dropping the scratch database");
     if let Err(joined) = outcome {
