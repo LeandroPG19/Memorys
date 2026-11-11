@@ -229,14 +229,14 @@ fn model_tag_follows_the_environment() {
     let _env = own_the_environment();
     unsafe { std::env::remove_var("CUBA_EMBED_MODEL") };
     assert_eq!(
-        memory_industry::embeddings::onnx::current_model(),
+        memory_industry::embeddings::onnx::vector_tag(),
         "multilingual-e5-small",
         "with nothing set, the default stands"
     );
 
     unsafe { std::env::set_var("CUBA_EMBED_MODEL", "bge-m3") };
     assert_eq!(
-        memory_industry::embeddings::onnx::current_model(),
+        memory_industry::embeddings::onnx::vector_tag(),
         "bge-m3",
         "CUBA_EMBED_MODEL must win — it is the only thing that knows which model ran"
     );

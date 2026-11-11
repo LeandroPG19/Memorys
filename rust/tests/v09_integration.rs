@@ -261,6 +261,13 @@ async fn test_v09_all() {
         .await
         .expect("read the row back");
 
+        // CI-D5c: the label of a vector is the model and the runtime that made it, so what the
+        // row has to say is the label of the custom model under the runtime this process loaded.
+        // Read before the variable goes: afterwards the model is the default again.
+        let expected_label = memory_industry::embeddings::onnx::vector_tag_of(
+            &tag,
+            memory_industry::embeddings::onnx::loaded_runtime_version().as_deref(),
+        );
         unsafe { std::env::remove_var("CUBA_EMBED_MODEL") };
 
         let (stored_tag, has_vector) = row;
@@ -275,7 +282,7 @@ async fn test_v09_all() {
             );
             assert_eq!(
                 stored_tag.as_deref(),
-                Some(tag.as_str()),
+                Some(expected_label.as_str()),
                 "a vector was written, so its label must name the model that produced it. \
                  Writing one model's vector under another model's name makes the row \
                  permanently, invisibly stale."

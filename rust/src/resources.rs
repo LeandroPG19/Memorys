@@ -315,23 +315,66 @@ fn cgroup_limit_mb() -> Option<u64> {
     best.map(|bytes| bytes / MIB)
 }
 
+/// How long `nvidia-smi` has to answer before the plan goes on without a VRAM
+/// reading. It runs at the start of every command of a build with `cuda` or
+/// `directml`, `models runtime --if-installed` of an `npm install` included, and
+/// a card in a bad state (a driver half loaded, WSL after a suspend) does not
+/// answer for as long as it is left.
+const NVIDIA_SMI_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn vram_free_mb() -> Option<u64> {
     if !cfg!(any(feature = "cuda", feature = "directml")) {
         return None;
     }
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
-        .output()
+    let mut command = std::process::Command::new(crate::gpu::nvidia_smi()?);
+    command.args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"]);
+    vram_free_from(command, NVIDIA_SMI_DEADLINE)
+}
+
+/// The first line `command` prints, as a number, or `None` when it fails, prints
+/// something else or does not finish inside `deadline`; in that case the child is
+/// killed and reaped, so a hung `nvidia-smi` does not outlive the command that asked.
+/// The output is read on a thread because the wait must be on the channel, not on
+/// the pipe.
+fn vram_free_from(
+    mut command: std::process::Command,
+    deadline: std::time::Duration,
+) -> Option<u64> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    let mut stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        let _ = sender.send(text);
+    });
+
+    let text = receiver.recv_timeout(deadline).ok();
+    // Still running after its output ended, or never answered: it does not outlive this call.
+    let exited = child.try_wait().ok().flatten();
+    if exited.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let Some(text) = text else {
+        tracing::warn!(
+            "nvidia-smi no contestó en {} s: sin VRAM medida",
+            deadline.as_secs_f64()
+        );
+        return None;
+    };
+    if exited.is_some_and(|status| !status.success()) {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    text.lines().next()?.trim().parse().ok()
 }
 
 pub fn probe() -> Machine {
@@ -1077,5 +1120,67 @@ mod tests {
                 "a machine that can run the model must not be handed the sentinel: that would disable it on every box with room for it"
             );
         }
+    }
+
+    /// CI-D5c (A.8). `nvidia-smi` runs at the start of every command of a build
+    /// with `cuda`, `models runtime --if-installed` from `npm install` included:
+    /// one that hangs (a driver in a bad state, WSL after a suspend) hung them
+    /// all. The children are `sh`, as in `service.rs`. No clock is asserted: the
+    /// call runs on a thread the test waits on with a generous bound (the child
+    /// sleeps 30 s, so without the limit the bound is what ends the wait), and what
+    /// proves the child was cut is its pid, which must be gone and reaped (`kill -0`
+    /// succeeds on a zombie) once the call has returned.
+    #[cfg(unix)]
+    #[test]
+    fn an_nvidia_smi_that_does_not_answer_is_cut_and_reads_as_no_vram() {
+        let shell = |script: &str| {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+
+        assert_eq!(
+            vram_free_from(shell("echo 5900"), std::time::Duration::from_secs(2)),
+            Some(5900),
+            "an answer inside the limit is the number it printed"
+        );
+
+        let dir = crate::envs::scratch_root("nvidia-smi-hangs");
+        std::fs::create_dir_all(&dir).expect("the test owns this directory");
+        let pid_file = dir.join("pid");
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", &script]);
+            let _ = sender.send(vram_free_from(command, std::time::Duration::from_secs(1)));
+        });
+
+        let silent = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect(
+                "vram_free_from is still waiting for a child that sleeps 30 seconds: the limit \
+                 it was given was not applied",
+            );
+        assert_eq!(
+            silent, None,
+            "a process that never answers reads as no VRAM measured, and the plan does what it \
+             does without `nvidia-smi`"
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the child wrote its pid before it was cut")
+            .trim()
+            .to_string();
+        let alive = std::process::Command::new("sh")
+            .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+            .status()
+            .expect("sh runs")
+            .success();
+        assert!(
+            !alive,
+            "the child {pid} is still there, running or not reaped: a hung `nvidia-smi` would \
+             outlive the command that asked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

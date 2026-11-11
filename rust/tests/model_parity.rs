@@ -5,7 +5,7 @@
 //! An install keeps every embedding in its database and does not keep the tokens that made it, so a
 //! library that cut one character differently would mix two spaces of vectors without a word. What is
 //! pinned lives in `model_parity/expected.rs` and is what the libraries of the day gave: `tokenizers`
-//! 0.21.4, `tiktoken-rs` 0.7.0 (its half is in `search::budget`), ONNX Runtime 1.26.0. This file builds
+//! 0.21.4, `tiktoken-rs` 0.7.0 (its half is in `search::budget`), ONNX Runtime 1.31.1. This file builds
 //! the same inputs again and compares.
 //!
 //! * The three tokenizers are built here with the parameters the product gives them (512 and
@@ -563,4 +563,42 @@ async fn the_embedder_vectors_through_the_product_path_stay_within_the_noise_of_
     }
 
     judge_vectors(&vectors, expected::EMBEDDER_ENV, expected::VECTORS);
+}
+
+/// CI-D5b (D5b.11). This file measures the vectors of the embedder with the ONNX Runtime the judge loads, and
+/// `models runtime` installs the one `ORT_VERSION` pins. If the two differ the guard above is judging a runtime
+/// nobody installs: the vectors would stay green against the runtime the judge kept for as long as it kept it, and
+/// the day an install got the pinned one they would move without a test saying so. Read here and not in `gate_model_env`, because
+/// what is loaded is only known by loading it.
+#[tokio::test]
+async fn the_judge_measures_the_runtime_the_installer_downloads() {
+    use memory_industry::embeddings::onnx;
+
+    assert!(
+        onnx::model_loaded().await,
+        "the embedder did not load, so no runtime was loaded either (ONNX_MODEL_PATH = {:?}, ORT_DYLIB_PATH = {:?}). \
+         {WITHOUT_THE_MODELS}",
+        std::env::var("ONNX_MODEL_PATH").ok(),
+        std::env::var("ORT_DYLIB_PATH").ok()
+    );
+    assert_eq!(
+        onnx::failure_reason(),
+        None,
+        "the embedder found its files and the session did not open"
+    );
+
+    let pinned = memory_industry::models_cli::ORT_VERSION;
+    let loaded = onnx::loaded_runtime_version().expect(
+        "the embedder is loaded, so the process holds the runtime it loaded and knows its version",
+    );
+    assert_eq!(
+        loaded,
+        pinned,
+        "this judge loads ONNX Runtime {loaded} (ORT_DYLIB_PATH = {:?}) and `memory-industry models runtime` installs \
+         {pinned}: the vectors above are measured on a runtime nobody installs. The judge loads ONNX Runtime from \
+         GATE_RUNTIME_HOME (default ~/.cache/memory-industry-gate/runtime-home), never from the cache of the live service: \
+         fill it with `HOME=<GATE_RUNTIME_HOME> memory-industry models runtime` (a plain `memory-industry models runtime` \
+         would replace the runtime of the service) and run again, or point ORT_DYLIB_PATH at a {pinned} library inside it",
+        std::env::var("ORT_DYLIB_PATH").ok()
+    );
 }
