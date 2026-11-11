@@ -406,6 +406,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
   mkdir -p "$hermetic/sin-cgroup/raiz"
   : >"$hermetic/sin-cgroup/propio"
   export GATE_CGROUP_ROOT="$hermetic/sin-cgroup/raiz" GATE_PROC_SELF_CGROUP="$hermetic/sin-cgroup/propio"
+  # CI-G1: the judge asks the card of the machine unless GATE_GPU says `cpu` (gate_gpu_probe, lane R). This self-test is
+  # hermetic about the card as well: the rows that are not about the GPU run with `cpu`, and the lock, the GPU home and the
+  # directory of WSL are its own, so no row asks the real card or writes the lock in /tmp that the other judge of the machine
+  # reads. The rows of CI-G1 below give the machine they need.
+  export GATE_GPU=cpu GATE_GPU_HOME="$hermetic/gpu-home" GATE_GPU_LOCK="$hermetic/gpu-juez.lock" GATE_WSL_LIB_DIR="$hermetic/sin-wsl"
   tmp="$(mktemp -d)"
   sleep 300 &
   live=$!
@@ -1530,6 +1535,241 @@ FAKE
   (( rc == 0 )) || self_fail "F3.3b-1: --lane E alone exits $rc, not 0: $(cat "$tmp/lane_e_alone.out")"
   [[ "$(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null || true)" == 1 ]] \
     || self_fail "F3.3b-1: --lane E alone did not provision brain_gate (CREATE DATABASE brain_gate seen $(grep -c 'CREATE DATABASE brain_gate -c' "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null || echo 0) times): $(cat "$tmp/lane_e_alone/home/psql.calls" 2>/dev/null)"
+
+  # --- CI-G1 (spec ci-rapido-G1, G1.5 to G1.7): lane R runs the real reranker on the card only when the judge admits it. The
+  # machine is the row's: an nvidia-smi that answers a card (10692 MiB free, 3210 once a run has gone red), a CPU runtime and a
+  # GPU runtime of the judge (1.31.1, cuda13) with the libraries of CUDA 13, an `ldd` that resolves them from the LD_LIBRARY_PATH
+  # it is given, a lock file of the row's own, and a release binary whose `--version` writes the line `resource plan` the product
+  # writes (its `plan` says `reranker=true (GPU)` unless the row says another). The cargo of the tree notes the environment of
+  # each call it gets (g1.env) and the `timeout` the arguments of each (timeout.args); nothing here asks the real card, and no
+  # row sleeps: a hang is a `timeout` that answers 124 at once, and a held lock is a process that proves it holds it before the
+  # lane starts.
+  # g1_run NAME [VAR=value ...] [-- LANE...]: the lanes (R by default) in NAME's tree; $rc and $tmp/NAME.out as full_run leaves
+  # them. HOLD="<owner line>" makes a process of this row hold the GPU lock, with that line in the file, for the run.
+  g1_run() {
+    local name="$1" t="$tmp/$1" held="" holder="" hold=""
+    local gpu_home="$tmp/$1/gpu-home"
+    local cpu_rt="$tmp/$1/home/.cache/memory-industry/onnxruntime" gpu_rt="$tmp/$1/gpu-home/.cache/memory-industry/onnxruntime"
+    local -a lanes=(--lane R) extra=()
+    shift
+    while (( $# )); do
+      if [[ "$1" == -- ]]; then shift; lanes=("$@"); break; fi
+      case "$1" in
+        HOLD=*) hold="${1#HOLD=}" ;;
+        *) extra+=("$1") ;;
+      esac
+      shift
+    done
+    full_tree "$name"
+    printf '{"content":"fake observation"}\n%.0s' 1 2 3 4 5 >"$t/rust/eval-datasets/smoke-corpus.jsonl"
+    mkdir -p "$cpu_rt" "$gpu_rt" "$gpu_home/cuda13/nvidia/cublas/lib" "$gpu_home/cuda13/nvidia/cuda_runtime/lib"
+    : >"$cpu_rt/libonnxruntime.so"
+    : >"$gpu_rt/libonnxruntime.so"
+    : >"$gpu_rt/libonnxruntime_providers_cuda.so"
+    printf '{"version":"1.31.1","flavor":"cpu","archive":"x.tgz","sha256":"00"}' >"$cpu_rt/runtime.json"
+    printf '{"version":"1.31.1","flavor":"cuda13","archive":"x.tgz","sha256":"00"}' >"$gpu_rt/runtime.json"
+    : >"$gpu_home/cuda13/nvidia/cuda_runtime/lib/libcudart.so.13"
+    : >"$gpu_home/cuda13/nvidia/cublas/lib/libcublas.so.13"
+    : >"$gpu_home/cuda13/nvidia/cublas/lib/libcublasLt.so.13"
+    printf '%s\n' '# fixture' \
+      'linux v017_rerank_gpu 37 127 orquestador 2099-12-31 the reranker on the CPU (the fixture of the CI-G1 rows)' \
+      >"$t/scripts/test-time-ceilings.txt"
+    cat >"$t/bin/nvidia-smi" <<'FAKE'
+#!/bin/sh
+echo "$*" >>"$HOME/nvidia-smi.calls"
+if [ -e "$HOME/g1.red" ]; then free="${FAKE_G1_VRAM_NOW:-3210}"; else free=10692; fi
+echo "NVIDIA GeForce RTX 4070 Ti, $free, 8.9"
+FAKE
+    cat >"$t/bin/ldd" <<'FAKE'
+#!/bin/sh
+printf '\tlinux-vdso.so.1 (0x00007ffc0)\n'
+for lib in libcudart.so.13 libcublas.so.13 libcublasLt.so.13; do
+  found=
+  old=$IFS; IFS=:
+  for d in $LD_LIBRARY_PATH; do [ -e "$d/$lib" ] && found="$d/$lib"; done
+  IFS=$old
+  if [ -n "$found" ]; then printf '\t%s => %s (0x00007f00)\n' "$lib" "$found"; else printf '\t%s => not found\n' "$lib"; fi
+done
+FAKE
+    cat >"$t/bin/timeout" <<'FAKE'
+#!/bin/sh
+echo "$*" >>"$HOME/timeout.args"
+case "$*" in *--ignored*) [ -z "${FAKE_G1_TIMEOUT_RC-}" ] || exit "$FAKE_G1_TIMEOUT_RC" ;; esac
+exec /usr/bin/timeout "$@"
+FAKE
+    mv "$t/bin/cargo" "$t/bin/cargo.real"
+    cat >"$t/bin/cargo" <<'FAKE'
+#!/bin/sh
+printf 'ORT=%s LD=%s INTRA=%s :: %s\n' "${ORT_DYLIB_PATH-unset}" "${LD_LIBRARY_PATH-unset}" "${CUBA_RERANK_INTRA_THREADS-unset}" "$*" >>"$HOME/g1.env"
+case "$*" in
+  *v017_rerank_gpu*--ignored*)
+    echo "G1-RERANK-MODEL-CALL" >&2
+    if [ -n "${FAKE_G1_RERANK_RC-}" ]; then
+      [ -z "${FAKE_G1_RERANK_OUT-}" ] || echo "$FAKE_G1_RERANK_OUT" >&2
+      touch "$HOME/g1.red"
+      exit "$FAKE_G1_RERANK_RC"
+    fi ;;
+esac
+exec "$(dirname "$0")/cargo.real" "$@"
+FAKE
+    mv "$t/standin/memory-industry" "$t/standin/memory-industry.orig"
+    {
+      printf '#!/bin/sh\nORIG="%s"\n' "$t/standin/memory-industry.orig"
+      cat <<'FAKE'
+if [ "$1" = --version ]; then
+  echo "ORT=${ORT_DYLIB_PATH-unset} LD=${LD_LIBRARY_PATH-unset}" >>"$HOME/g1.version.env"
+  printf '%s\n' "{\"timestamp\":\"2026-11-11T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"resource plan\",\"vram_free_mb\":${FAKE_G1_PLAN_VRAM:-10692},\"plan\":\"nivel=alto (x) - modelos: embebedor=true reranker=${FAKE_G1_PLAN_RERANKER:-true (GPU)} nli=true - hilos: embed=4 rerank=2 nli=2\"}}" >&2
+  echo "memory-industry 0.31.0"
+  exit 0
+fi
+exec "$ORIG" "$@"
+FAKE
+    } >"$t/standin/memory-industry"
+    printf '%s\n' 'import os' \
+      'open(os.environ["HOME"] + "/g1.e2e.env", "w").write(os.environ.get("ORT_DYLIB_PATH", "unset") + " " + os.environ.get("LD_LIBRARY_PATH", "unset"))' \
+      >"$t/rust/tests/e2e_all_tools.py"
+    chmod +x "$t"/bin/* "$t"/standin/*
+    cp "$t/standin/memory-industry" "$t/target/release/memory-industry"
+    sha256sum "$t/target/release/memory-industry" >"$t/target/release/.gate-release.sha256"
+    if [[ -n "$hold" ]]; then
+      printf '%s\n' "$hold" >"$t/gpu-juez.lock"
+      mkfifo "$t/g1.ready"
+      (
+        exec 9>>"$t/gpu-juez.lock"
+        if flock -n 9; then echo held >"$t/g1.ready"; else echo not-held >"$t/g1.ready"; fi
+        exec sleep 40
+      ) &
+      holder=$!
+      IFS= read -r held <"$t/g1.ready"
+      [[ "$held" == held ]] || self_fail "CI-G1: the process of the row could not take the GPU lock it was to hold (it said '$held')"
+    fi
+    rc=0
+    env -u CUBA_GATE_LOCK_OWNER -u CUBA_GATE_EXIT_FILE -u PGPORT -u GATE_GPU -u ORT_DYLIB_PATH -u LD_LIBRARY_PATH \
+        -u CUBA_RERANK_INTRA_THREADS -u CUBA_EMBED_INTRA_THREADS -u CUBA_NLI_INTRA_THREADS \
+      HOME="$t/home" PATH="$t/bin:/usr/bin:/bin" DATABASE_URL="$rat_url" CARGO_TARGET_DIR="$t/target" \
+      CUBA_GATE_SWEEP_BELOW_GB=0 CUBA_GATE_MIN_FREE_GB=0 \
+      ONNX_MODEL_PATH="$t/models" CUBA_RERANKER_PATH="$t/reranker" CUBA_NLI_PATH="$t/nli-model" \
+      MEMORY_INDUSTRY_LLM_PROVIDER=ollama \
+      GATE_GPU_HOME="$gpu_home" GATE_GPU_LOCK="$t/gpu-juez.lock" GATE_WSL_LIB_DIR="$t/sin-wsl" \
+      ${extra[@]+"${extra[@]}"} \
+      /usr/bin/timeout 30 "$BASH" "$t/scripts/run-all-tests.sh" "${lanes[@]}" >"$tmp/$name.out" 2>&1 || rc=$?
+    if [[ -n "$holder" ]]; then
+      kill "$holder" 2>/dev/null || true
+      wait "$holder" 2>/dev/null || true
+    fi
+  }
+  # g1_fields LINE: the ORT_DYLIB_PATH, LD_LIBRARY_PATH and CUBA_RERANK_INTRA_THREADS ($g1_ort, $g1_ld, $g1_intra) that a line
+  # of g1.env says its cargo call got (`unset` when it got none).
+  g1_fields() {
+    [[ "$1" =~ ^ORT=([^\ ]*)\ LD=([^\ ]*)\ INTRA=([^\ ]*)\ ::\  ]] || self_fail "CI-G1: a line of g1.env that has no ORT, LD and INTRA: $1"
+    g1_ort="${BASH_REMATCH[1]}" g1_ld="${BASH_REMATCH[2]}" g1_intra="${BASH_REMATCH[3]}"
+  }
+  # g1_marker NAME: the line `=== models device: ...` that NAME's run printed for the reranker ('' when there is none).
+  g1_marker() { grep -F '=== models device:' "$tmp/$1.out" | grep -F 'v017_rerank_gpu' | head -n 1 || true; }
+  # g1_rerank_call NAME: the line of g1.env of the cargo call that runs the real reranker ('' when it was not made).
+  g1_rerank_call() { grep -E 'v017_rerank_gpu.*--ignored' "$tmp/$1/home/g1.env" 2>/dev/null | head -n 1 || true; }
+  # g1_cpu_call NAME WHAT: the reranker call of NAME is the one of before CI-G1: the ORT_DYLIB_PATH of gate_model_env, no
+  # LD_LIBRARY_PATH, no thread count, and no `timeout` around it.
+  g1_cpu_call() {
+    local line
+    line="$(g1_rerank_call "$1")"
+    [[ -n "$line" ]] || self_fail "G1.6 ($2): the call of the real reranker was not made: $(tail -n 30 "$tmp/$1.out")"
+    g1_fields "$line"
+    [[ "$g1_ort" == "$tmp/$1/home/.cache/memory-industry/onnxruntime/libonnxruntime.so" && "$g1_ld" == unset && "$g1_intra" == unset ]] \
+      || self_fail "G1.6 ($2): the call of the real reranker is not the one of today (ORT=$g1_ort LD=$g1_ld INTRA=$g1_intra): $line"
+    if grep -q -- '--ignored' "$tmp/$1/home/timeout.args" 2>/dev/null; then
+      self_fail "G1.6 ($2): the call of the real reranker on the CPU runs inside a timeout: $(cat "$tmp/$1/home/timeout.args")"
+    fi
+  }
+
+  # G1.5: admitted. The chain D1, D2, NLI, R and E, to see what each one is given: only the call of the reranker that R makes
+  # gets the runtime of the card, two threads and a timeout of the ceiling of the CPU line; every other call of every other
+  # row gets the ORT_DYLIB_PATH that gate_model_env chose, and the product's line `resource plan` is not in the log.
+  g1_run g1_ok -- --lane D1 --lane D2 --lane NLI --lane R --lane E
+  (( rc == 0 )) || self_fail "G1.5: the chain D1, D2, NLI, R and E on a machine with a card exited $rc, not 0: $(tail -n 30 "$tmp/g1_ok.out")"
+  g1_gpu_ort="$tmp/g1_ok/gpu-home/.cache/memory-industry/onnxruntime/libonnxruntime.so"
+  g1_cpu_ort="$tmp/g1_ok/home/.cache/memory-industry/onnxruntime/libonnxruntime.so"
+  g1_line="$(g1_marker g1_ok)"
+  [[ "$g1_line" == '=== models device: gpu for v017_rerank_gpu ('* ]] \
+    || self_fail "G1.5: no line '=== models device: gpu for v017_rerank_gpu (' in the log of an admitted row (the marker was '${g1_line:-none}'): $(tail -n 30 "$tmp/g1_ok.out")"
+  g1_marker_at="$(grep -nF '=== models device: gpu for v017_rerank_gpu (' "$tmp/g1_ok.out" | head -n 1 | cut -d: -f1)"
+  g1_call_at="$(grep -n 'G1-RERANK-MODEL-CALL' "$tmp/g1_ok.out" | head -n 1 | cut -d: -f1)"
+  [[ -n "$g1_call_at" ]] && (( g1_marker_at < g1_call_at )) \
+    || self_fail "G1.5: the marker (line ${g1_marker_at:-none}) is not before the call of the real reranker (line ${g1_call_at:-none})"
+  g1_line="$(g1_rerank_call g1_ok)"
+  [[ -n "$g1_line" ]] || self_fail "G1.5: the call of the real reranker was not made: $(tail -n 30 "$tmp/g1_ok.out")"
+  g1_fields "$g1_line"
+  [[ "$g1_ort" == "$g1_gpu_ort" ]] \
+    || self_fail "G1.5: the call of the real reranker got ORT_DYLIB_PATH=$g1_ort, not the runtime of the judge's GPU ($g1_gpu_ort)"
+  [[ "$g1_ld" == *"$tmp/g1_ok/gpu-home/cuda13/nvidia/cublas/lib"* && "$g1_ld" == *"$tmp/g1_ok/gpu-home/cuda13/nvidia/cuda_runtime/lib"* ]] \
+    || self_fail "G1.5: the call of the real reranker got LD_LIBRARY_PATH=$g1_ld, not the CUDA 13 directories of GATE_GPU_HOME"
+  g1_gpu_ld="$g1_ld"
+  [[ "$g1_intra" == 2 ]] || self_fail "G1.5: the call of the real reranker got CUBA_RERANK_INTRA_THREADS=$g1_intra, not 2"
+  g1_timeout="$(grep -- '--ignored' "$tmp/g1_ok/home/timeout.args" 2>/dev/null | head -n 1 || true)"
+  [[ "$g1_timeout" =~ (^|\ )127s?\  ]] \
+    || self_fail "G1.5: the call of the real reranker is not inside a timeout of 127 s, the ceiling of the line linux v017_rerank_gpu (timeout saw '${g1_timeout:-no call}')"
+  while IFS= read -r g1_l; do
+    [[ "$g1_l" =~ v017_rerank_gpu.*--ignored ]] && continue
+    g1_fields "$g1_l"
+    [[ "$g1_ort" == "$g1_cpu_ort" && "$g1_ld" == unset && "$g1_intra" == unset ]] \
+      || self_fail "G1.5: a call of cargo that is not the real reranker got ORT=$g1_ort LD=$g1_ld INTRA=$g1_intra, not the ORT_DYLIB_PATH of gate_model_env ($g1_cpu_ort) and nothing else: $g1_l"
+  done <"$tmp/g1_ok/home/g1.env"
+  [[ "$(cat "$tmp/g1_ok/home/g1.e2e.env" 2>/dev/null)" == "$g1_cpu_ort unset" ]] \
+    || self_fail "G1.5: the E2E got '$(cat "$tmp/g1_ok/home/g1.e2e.env" 2>/dev/null || echo nothing)', not the ORT_DYLIB_PATH of gate_model_env ($g1_cpu_ort) and no LD_LIBRARY_PATH"
+  [[ "$(head -n 1 "$tmp/g1_ok/home/g1.version.env" 2>/dev/null)" == "ORT=$g1_gpu_ort LD=$g1_gpu_ld" ]] \
+    || self_fail "G1.5: the plan of the product was not asked of the release binary with the runtime of the card ($(cat "$tmp/g1_ok/home/g1.version.env" 2>/dev/null || echo 'it was not asked'))"
+  if grep -qF '"message":"resource plan"' "$tmp/g1_ok.out"; then
+    self_fail "G1.5: the line resource plan that the admission read is in the log of the row, and plan_rc would judge it there"
+  fi
+  [[ -s "$tmp/g1_ok/gpu-juez.lock" ]] && (( $(wc -w <"$tmp/g1_ok/gpu-juez.lock") >= 3 )) \
+    || self_fail "G1.5: the lock of the GPU does not say who took it (<repo> <pid> <date>): '$(cat "$tmp/g1_ok/gpu-juez.lock" 2>/dev/null)'"
+
+  # G1.6: not admitted, the reranker runs as before, in the CPU, and the log says why. A plan that keeps the reranker off the
+  # card is the product's own refusal (it read the memory the card has now), a held lock is another judge's turn and is not
+  # waited for, GATE_GPU=cpu does not ask the card, and GATE_GPU=gpu does not accept any of them quietly.
+  g1_run g1_vram FAKE_G1_PLAN_RERANKER=true FAKE_G1_PLAN_VRAM=2000
+  (( rc == 0 )) || self_fail "G1.6 (a plan with no GPU): exited $rc, not 0: $(tail -n 30 "$tmp/g1_vram.out")"
+  g1_line="$(g1_marker g1_vram)"
+  [[ "$g1_line" == '=== models device: cpu for v017_rerank_gpu ('* && "$g1_line" == *'vram_free_mb=2000'* ]] \
+    || self_fail "G1.6 (a plan with no GPU): the marker is '${g1_line:-none}', not '=== models device: cpu for v017_rerank_gpu (...vram_free_mb=2000...) ==='"
+  g1_cpu_call g1_vram "a plan with no GPU"
+
+  g1_run g1_held HOLD="mapupita 4242 2026-11-11T00:00:00"
+  (( rc != 124 )) || self_fail "G1.6 (a lock held): the lane waited for the GPU lock, and the 30 s of the row ran out. It does not wait: it runs on the CPU"
+  (( rc == 0 )) || self_fail "G1.6 (a lock held): exited $rc, not 0: $(tail -n 30 "$tmp/g1_held.out")"
+  g1_line="$(g1_marker g1_held)"
+  [[ "$g1_line" == '=== models device: cpu for v017_rerank_gpu ('* && "$g1_line" == *'mapupita 4242'* ]] \
+    || self_fail "G1.6 (a lock held): the marker is '${g1_line:-none}', not '=== models device: cpu for v017_rerank_gpu (...mapupita 4242...) ==='"
+  g1_cpu_call g1_held "a lock held"
+
+  g1_run g1_cpu GATE_GPU=cpu
+  (( rc == 0 )) || self_fail "G1.6 (GATE_GPU=cpu): exited $rc, not 0: $(tail -n 30 "$tmp/g1_cpu.out")"
+  g1_line="$(g1_marker g1_cpu)"
+  [[ "$g1_line" == '=== models device: cpu for v017_rerank_gpu ('* && "$g1_line" == *'GATE_GPU=cpu'* ]] \
+    || self_fail "G1.6 (GATE_GPU=cpu): the marker is '${g1_line:-none}', not '=== models device: cpu for v017_rerank_gpu (...GATE_GPU=cpu...) ==='"
+  g1_cpu_call g1_cpu "GATE_GPU=cpu"
+  [[ ! -e "$tmp/g1_cpu/home/nvidia-smi.calls" ]] \
+    || self_fail "G1.6 (GATE_GPU=cpu): the card was asked: $(cat "$tmp/g1_cpu/home/nvidia-smi.calls")"
+
+  g1_run g1_demanded GATE_GPU=gpu FAKE_G1_PLAN_RERANKER=true FAKE_G1_PLAN_VRAM=2000
+  (( rc == 1 )) || self_fail "G1.6 (GATE_GPU=gpu, a plan with no GPU): exited $rc, not 1: $(tail -n 30 "$tmp/g1_demanded.out")"
+  grep -qF 'FAIL: GATE_GPU=gpu and the GPU was not admitted' "$tmp/g1_demanded.out" \
+    || self_fail "G1.6 (GATE_GPU=gpu, a plan with no GPU): no 'FAIL: GATE_GPU=gpu and the GPU was not admitted': $(tail -n 30 "$tmp/g1_demanded.out")"
+  [[ -z "$(g1_rerank_call g1_demanded)" ]] \
+    || self_fail "G1.6 (GATE_GPU=gpu, a plan with no GPU): the real reranker was called after the refusal: $(g1_rerank_call g1_demanded)"
+
+  # G1.7: a card that hangs or has no memory is a red that says so. The `timeout` of the row answers 124 for the call of the
+  # reranker without running it; the cargo of the row answers 101 with the text of the memory arena.
+  g1_run g1_hang FAKE_G1_TIMEOUT_RC=124
+  (( rc == 1 )) || self_fail "G1.7 (a timeout): the row exited $rc, not 1: $(tail -n 30 "$tmp/g1_hang.out")"
+  for g1_word in 'passed the CPU ceiling of 127 s' 'hung GPU'; do
+    grep -qF "$g1_word" "$tmp/g1_hang.out" \
+      || self_fail "G1.7 (a timeout): the log does not say '$g1_word': $(tail -n 30 "$tmp/g1_hang.out")"
+  done
+  g1_run g1_arena FAKE_G1_RERANK_RC=101 FAKE_G1_RERANK_OUT='Error: BFCArena::AllocateRawInternal failed to allocate memory'
+  (( rc == 1 )) || self_fail "G1.7 (a card with no memory): the row exited $rc, not 1: $(tail -n 30 "$tmp/g1_arena.out")"
+  grep -qF 'GPU memory: 10692 MiB free at admission, 3210 MiB free now' "$tmp/g1_arena.out" \
+    || self_fail "G1.7 (a card with no memory): no 'GPU memory: 10692 MiB free at admission, 3210 MiB free now' (the card had 10692 at the admission and 3210 after the red): $(tail -n 30 "$tmp/g1_arena.out")"
 
   # CI-F3.4 (D-F34i, R1): B3 leaves the sha256 of the release binary next to it (`<sha>  <path>`), and R and E, each in a
   # process of its own, hold the binary against it. A binary rewritten after B3 is refused by E before it provisions

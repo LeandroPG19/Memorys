@@ -470,6 +470,91 @@ if [[ "${1:-}" == "--self-test" ]]; then
   cmp -s "$tmp/K4count.clean" "$tmp/K4count.timed" \
     || self_fail "K4h: --count counts other binaries or tests with the timing lines in the log"
 
+  # G1.8 (CI-G1, D-G1e): a binary is judged with the ceiling of the device where it ran. The log says it with
+  # `=== models device: gpu for <binary> (<card>, <n> MiB free, onnxruntime <v> <flavor>) ===` before the block of the
+  # binary. The line `<os>/gpu <binary>` judges it; without that line the default of 10 s judges it and never the line
+  # `<os> <binary>` of the CPU, whose floor (37 s) a run on the card would always be under. A binary with no marker, or with a
+  # `cpu` or `unmanaged` one, is judged as ever. A marker for a binary that is not in the log would be a lie, and is red. Here
+  # the card is the fixture's: a made-up line of the log, nothing asks a real one.
+  : >"$tmp/tests/v017_rerank_gpu.rs"
+  g1_gpu_marker='=== models device: gpu for v017_rerank_gpu (NVIDIA GeForce RTX 4070 Ti, 10692 MiB free, onnxruntime 1.31.1 cuda13) ==='
+  # g1_log FILE SECONDS [MARKER]: slow and the lib as in the base log, the reranker with SECONDS, and fast; MARKER (a whole
+  # line, or none) comes right before the block of the reranker, where the judge prints it.
+  g1_log() {
+    {
+      bin_block linux slow 40.00
+      bin_block linux lib:memory_industry 21.51
+      [[ -z "${3:-}" ]] || emit linux "$3"
+      bin_block linux v017_rerank_gpu "$2"
+      bin_block linux fast 0.31
+      emit linux "$BOUND"
+    } >"$1"
+  }
+  # g1_ceilings FILE [LINE...]: the base ceilings, and the CPU line of the reranker (37 to 127 s), then LINE...
+  g1_ceilings() {
+    local file="$1"
+    shift
+    c1 linux windows 'linux v017_rerank_gpu 37 127 owner-a 2026-12-31 the reranker on the CPU' "$@" >"$file"
+  }
+  g1_ceilings "$tmp/G1.both.txt" 'linux/gpu v017_rerank_gpu 3 15 owner-a 2026-12-31 the reranker on the card'
+  g1_ceilings "$tmp/G1.cpu-only.txt"
+
+  g1_log "$tmp/G1a.log" 8.00 "$g1_gpu_marker"
+  tt G1a linux "$tmp/G1a.log" "$tmp/G1.both.txt"
+  want_rc G1a 0
+  has G1a 'OK  test times on linux'
+  lacks G1a 'did not run' FAIL
+
+  g1_log "$tmp/G1b.log" 20.00 "$g1_gpu_marker"
+  tt G1b linux "$tmp/G1b.log" "$tmp/G1.both.txt"
+  want_rc G1b 1
+  fail_with G1b v017_rerank_gpu 20.00 '15 s'
+
+  g1_log "$tmp/G1c.log" 8.00 "$g1_gpu_marker"
+  tt G1c linux "$tmp/G1c.log" "$tmp/G1.cpu-only.txt"
+  want_rc G1c 0
+  lacks G1c 'did not run' FAIL
+  g1_log "$tmp/G1c2.log" 12.00 "$g1_gpu_marker"
+  tt G1c2 linux "$tmp/G1c2.log" "$tmp/G1.cpu-only.txt"
+  want_rc G1c2 1
+  fail_with G1c2 v017_rerank_gpu 12.00 default
+  g1_reds="$(grep '^FAIL: ' "$tmp/G1c2.out" || true)"
+  [[ "$g1_reds" != *'37 s'* ]] \
+    || self_fail "G1.8: a reranker that ran on the card with no linux/gpu line was judged against the floor of the CPU line (37 s): $g1_reds"
+
+  g1_log "$tmp/G1d.log" 8.00
+  tt G1d linux "$tmp/G1d.log" "$tmp/G1.both.txt"
+  want_rc G1d 1
+  fail_with G1d v017_rerank_gpu 8.00 floor '37 s'
+  lacks G1d 'did not run'
+  g1_log "$tmp/G1d2.log" 8.00 '=== models device: cpu for v017_rerank_gpu (GATE_GPU=cpu) ==='
+  tt G1d2 linux "$tmp/G1d2.log" "$tmp/G1.both.txt"
+  want_rc G1d2 1
+  fail_with G1d2 v017_rerank_gpu 8.00 floor '37 s'
+  g1_log "$tmp/G1d3.log" 60.00 '=== models device: unmanaged for v017_rerank_gpu (MINGW64_NT: the runtime gate_model_env chose decides) ==='
+  tt G1d3 linux "$tmp/G1d3.log" "$tmp/G1.both.txt"
+  want_rc G1d3 0
+
+  tt9 G1e "not '" 'linux/cuda v017_rerank_gpu 3 15 owner-a 2026-12-31 r' drop
+
+  g1_log "$tmp/G1f.log" 60.00 '=== models device: gpu for ghost_binary (NVIDIA GeForce RTX 4070 Ti, 10692 MiB free, onnxruntime 1.31.1 cuda13) ==='
+  tt G1f linux "$tmp/G1f.log" "$tmp/G1.both.txt"
+  want_rc G1f 1
+  fail_with G1f ghost_binary
+
+  g1_log "$tmp/G1g.log" 8.00 "$g1_gpu_marker"
+  rc=0
+  bash "$SELF" --units "$tmp/G1g.log" >"$tmp/G1g.out" 2>&1 || rc=$?
+  want_rc G1g 0
+  [[ "$(cat "$tmp/G1g.out")" == "$(printf '%s\n' 'slow 4000 1 0' 'lib:memory_industry 2151 1 0' 'v017_rerank_gpu@gpu 800 1 0' 'fast 31 1 0')" ]] \
+    || self_fail "G1.8: --units printed '$(cat "$tmp/G1g.out")' for a log whose marker says the reranker ran on the card, not 'v017_rerank_gpu@gpu 800 1 0' for it and the plain key and time of the others"
+  g1_log "$tmp/G1g2.log" 8.00 '=== models device: cpu for v017_rerank_gpu (GATE_GPU=cpu) ==='
+  rc=0
+  bash "$SELF" --units "$tmp/G1g2.log" >"$tmp/G1g2.out" 2>&1 || rc=$?
+  want_rc G1g2 0
+  grep -qxF 'v017_rerank_gpu 800 1 0' "$tmp/G1g2.out" \
+    || self_fail "G1.8: --units gave '$(cat "$tmp/G1g2.out")' for a binary whose marker says cpu, not its plain key 'v017_rerank_gpu 800 1 0'"
+
   echo "OK  self-test: test-times sums each binary's finished-in over both cargo shapes up to the boundary, prints the 10 slowest, and is red for a ceiling passed, the default passed, a floor undercut, a dead or expired line and a malformed one, all in one run; a log it cannot read is exit 2"
   exit 0
 fi
