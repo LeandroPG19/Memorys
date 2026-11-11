@@ -650,7 +650,7 @@ fn catalog_race_backoff(retry: u32, random: u64) -> Duration {
 }
 
 pub async fn assert_embedding_dim(pool: &PgPool) -> Result<()> {
-    if !crate::embeddings::onnx::is_model_loaded() {
+    if !crate::embeddings::onnx::model_configured() {
         return Ok(());
     }
     let runtime_dim = crate::embeddings::onnx::embedding_dim();

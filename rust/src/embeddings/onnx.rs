@@ -210,16 +210,77 @@ fn resolve_model_dir() -> Option<PathBuf> {
     None
 }
 
-fn get_model_status() -> &'static ModelStatus {
-    MODEL_STATUS.get_or_init(|| {
-        let Some(model_dir) = resolve_model_dir() else {
+/// What the machine has for the embedder, read off the environment and the
+/// disk without opening anything.
+///
+/// The four stops are the ones the load used to find one after the other inside
+/// its `get_or_init`. Keeping them here is what lets the guard of
+/// `assert_embedding_dim` ask «is there a model to load» at start-up without
+/// loading it, and lets the load itself never disagree with the guard.
+enum Located {
+    /// No model directory named, and nothing under the home cache.
+    Absent,
+    NoRuntime {
+        model_dir: PathBuf,
+    },
+    NoFile {
+        model_file: PathBuf,
+    },
+    Ready {
+        model_file: PathBuf,
+        model_dir: PathBuf,
+    },
+}
+
+/// The one rule for «a model is configured». It logs nothing, opens neither the
+/// runtime nor the session, and keeps no answer: every call reads the
+/// environment and the disk again.
+fn locate_model() -> Located {
+    let Some(model_dir) = resolve_model_dir() else {
+        return Located::Absent;
+    };
+
+    if locate_onnxruntime().is_none() {
+        return Located::NoRuntime { model_dir };
+    }
+
+    let model_file = if model_dir.is_dir() {
+        let quantized = model_dir.join("model_quantized.onnx");
+        if quantized.exists() {
+            quantized
+        } else {
+            model_dir.join("model.onnx")
+        }
+    } else {
+        model_dir.clone()
+    };
+
+    if !model_file.exists() {
+        return Located::NoFile { model_file };
+    }
+
+    Located::Ready {
+        model_file,
+        model_dir,
+    }
+}
+
+/// True when a model, the runtime and the model file are all there: the load
+/// would open a session. It does not open it, so it is the question for start-up
+/// code that must not pay the load.
+pub fn model_configured() -> bool {
+    matches!(locate_model(), Located::Ready { .. })
+}
+
+fn load_model_status() -> ModelStatus {
+    let (model_file, model_dir) = match locate_model() {
+        Located::Absent => {
             tracing::info!(
                 "no ONNX embedder found — set ONNX_MODEL_PATH or run `memory-industry models embed`"
             );
             return ModelStatus::Fallback;
-        };
-
-        if locate_onnxruntime().is_none() {
+        }
+        Located::NoRuntime { model_dir } => {
             tracing::error!(
                 "encontré el modelo en {} pero no la librería de ONNX Runtime. \
                  `ort` la carga dinámicamente: sin ella el servidor NO falla — se cuelga en el \
@@ -229,47 +290,75 @@ fn get_model_status() -> &'static ModelStatus {
             );
             return ModelStatus::Fallback;
         }
-
-        let model_file = if model_dir.is_dir() {
-            let quantized = model_dir.join("model_quantized.onnx");
-            if quantized.exists() {
-                quantized
-            } else {
-                model_dir.join("model.onnx")
-            }
-        } else {
-            model_dir.clone()
-        };
-
-        if !model_file.exists() {
+        Located::NoFile { model_file } => {
             tracing::warn!(path = %model_file.display(), "ONNX model file not found — using fallback");
             return ModelStatus::Fallback;
         }
+        Located::Ready {
+            model_file,
+            model_dir,
+        } => (model_file, model_dir),
+    };
 
-        match init_onnx_session(&model_file, &model_dir) {
-            Ok(()) => {
-                tracing::info!(path = %model_file.display(), "ONNX model loaded successfully");
-                ModelStatus::Loaded
-            }
-            Err(e) => {
-                // The only one of the four branches above that is a fault:
-                // everything this needed was on the machine and the session
-                // still did not open. `{e:#}` rather than `{e}` because the
-                // useful half is usually in the context `init_onnx_session`
-                // attached — which tokenizer, which builder step — and not in
-                // the outermost line.
-                let reason = format!("{e:#}");
-                tracing::warn!(error = %reason, "Failed to load ONNX model — using fallback");
-                ModelStatus::Failed(reason)
-            }
+    match init_onnx_session(&model_file, &model_dir) {
+        Ok(()) => {
+            tracing::info!(path = %model_file.display(), "ONNX model loaded successfully");
+            ModelStatus::Loaded
         }
-    })
+        Err(e) => {
+            // The only one of the four branches above that is a fault:
+            // everything this needed was on the machine and the session
+            // still did not open. `{e:#}` rather than `{e}` because the
+            // useful half is usually in the context `init_onnx_session`
+            // attached — which tokenizer, which builder step — and not in
+            // the outermost line.
+            let reason = format!("{e:#}");
+            tracing::warn!(error = %reason, "Failed to load ONNX model — using fallback");
+            ModelStatus::Failed(reason)
+        }
+    }
+}
+
+fn get_model_status() -> &'static ModelStatus {
+    MODEL_STATUS.get_or_init(load_model_status)
+}
+
+/// Resolves `cell` without holding an executor thread for the load.
+///
+/// The load runs inside `spawn_blocking` on the cell itself, so it is not
+/// cancelled when the caller is: a handler that times out, or a client that
+/// leaves, drops the wait and the load still finishes and leaves the cell
+/// resolved for the next one. A cancellable async init would start the load
+/// again, and the second attempt finds the session already set and leaves the
+/// model `Failed` for good. `OnceLock` also makes a caller that arrives during
+/// the load wait for it instead of starting its own.
+///
+/// `None` is a load that panicked. The cell stays unresolved, so the next call
+/// tries again.
+async fn resolve_off_executor<F>(
+    cell: &'static OnceLock<ModelStatus>,
+    load: F,
+) -> Option<&'static ModelStatus>
+where
+    F: FnOnce() -> ModelStatus + Send + 'static,
+{
+    if let Some(status) = cell.get() {
+        return Some(status);
+    }
+    match tokio::task::spawn_blocking(move || cell.get_or_init(load)).await {
+        Ok(status) => Some(status),
+        Err(e) => {
+            tracing::error!(error = %e, "the embedder load panicked — treating it as no model");
+            None
+        }
+    }
 }
 
 /// Why the embedder is not loaded, when something already tried to load it.
 ///
 /// `None` means it loaded, or there was nothing to load, or nobody has asked
-/// yet. Reading the resolved cell rather than forcing it is what makes this
+/// yet (a process that started and has not embedded anything is in that last
+/// case: the model opens on first use). Reading the resolved cell rather than forcing it is what makes this
 /// callable from `/health`: `is_model_loaded()` resolves the cell that loads
 /// the model, and on a cold process that is a multi-second call.
 ///
@@ -590,8 +679,19 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a * norm_b)
 }
 
+/// Blocks the calling thread while the model loads, when nobody has loaded it
+/// yet. Code that runs on the executor asks `model_loaded()` instead.
 pub fn is_model_loaded() -> bool {
     matches!(get_model_status(), ModelStatus::Loaded)
+}
+
+/// `is_model_loaded()` for async callers: the first one to ask opens the model
+/// on a blocking thread and the rest wait for that one load.
+pub async fn model_loaded() -> bool {
+    matches!(
+        resolve_off_executor(&MODEL_STATUS, load_model_status).await,
+        Some(ModelStatus::Loaded)
+    )
 }
 
 /// What the first attempt to load ONNX Runtime answered, and the library it

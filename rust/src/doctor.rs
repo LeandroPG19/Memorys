@@ -1166,7 +1166,7 @@ pub async fn run_checks_with(
     }
 
     let model = onnx::current_model();
-    if onnx::is_model_loaded() {
+    if onnx::model_loaded().await {
         checks.push(Check::ok("onnx_model", format!("cargado ({model})")));
     } else {
         let path = std::env::var("ONNX_MODEL_PATH").unwrap_or_else(|_| "<auto/cache>".into());

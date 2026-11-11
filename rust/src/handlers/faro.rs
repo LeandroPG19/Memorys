@@ -1179,7 +1179,7 @@ async fn verify_claim(pool: &PgPool, claim: &str, project_id: Option<uuid::Uuid>
     .await?;
 
     let semantic_evidence: Vec<(uuid::Uuid, String, f64, String, String)> =
-        if crate::embeddings::onnx::is_model_loaded() {
+        if crate::embeddings::onnx::model_loaded().await {
             match crate::embeddings::onnx::embed(claim).await {
                 Ok(emb) => sqlx::query_as(
                     "SELECT o.id, o.content,
@@ -1554,7 +1554,7 @@ async fn vector_search(
         return Ok(Vec::new());
     }
 
-    if !crate::embeddings::onnx::is_model_loaded() {
+    if !crate::embeddings::onnx::model_loaded().await {
         anyhow::bail!(
             "no hay modelo de embeddings cargado (ONNX_MODEL_PATH ausente o sin librería de \
              ONNX Runtime); la búsqueda vectorial no puede ejecutarse"
@@ -2025,7 +2025,7 @@ async fn check_ood(
 ) -> Option<Value> {
     use crate::search::ood::{MIN_SAMPLES_FOR_OOD, default_threshold};
 
-    if !crate::embeddings::onnx::is_model_loaded() {
+    if !crate::embeddings::onnx::model_loaded().await {
         return None;
     }
     let query_emb = crate::embeddings::onnx::embed_passage(query).await.ok()?;
