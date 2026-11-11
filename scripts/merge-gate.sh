@@ -2032,6 +2032,9 @@ exit 0'
     || self_fail "untimed: the judge does not hold the block of DC, the last timed row: $(cat "$judged" 2>/dev/null)"
   grep -qF 'finished in 99.00s' "$judged" \
     && self_fail "untimed: the output of an untimed row (crap-gate, a finished-in line) reached the judge of the test times"
+  # As the last command of a function, `grep && self_fail` returns the 1 of a grep that finds nothing, which is the green case, and
+  # the call of this function in st_part_3 would end the part under `set -e` with no message. At the top level it was harmless.
+  return 0
   }
   st_rows_step_mode() {
   # The step mode is not a gate: it takes no lock and writes no verdict, and it runs only with the ticket the planner
@@ -2482,26 +2485,37 @@ exit 1'
     return "$bad"
   }
 
-  # E3c.1: run_parts waits for every part, and a part that fails makes the whole red. The first part opens a fifo for writing, writes into it
-  # and fails; the second reads the fifo until nothing holds it open, which is when the first part has ended, and only then makes its file.
+  # E3c.1: run_parts waits for every part, and a part that fails makes the whole red. The first part holds a fifo open for writing, writes into
+  # it and fails; the second reads the fifo until nothing holds it open, which is when the first part has ended, and only then makes its file.
   # So the file is there only if run_parts waited for the second part after the first one had failed. Nothing sleeps: the fifo gives the order,
   # and the file is made by a program (touch) and not by a redirection, so that the second part ends later than a run_parts that did not wait
   # for it takes to look at the file, which is the first thing the row does.
+  # No open of the fifo can wait for ever (the rule of run_copy_as): the writer opens it for reading and writing, which does not wait for a
+  # reader, before anything else; the reader opens it for reading only once the writer's pid file says that is done, so its open does not
+  # wait for a writer either; the writer only goes on to write and fail once the reader has opened (the file `opened`), so the reader
+  # cannot miss it. Every wait between the two is st_fixture_until, which has the deadline of a row and ends the part with 3, and the row
+  # then says so (it finds no `hecho`, or a part that exited 3).
+  # The rows run run_parts with MERGE_GATE_SELFTEST_SERIAL empty: the serial mode is for the real parts, and these two wait for each other.
+  st_fixture_until() { "${row_bound[@]}" "$BASH" -c 'until [[ -e "$1" ]]; do :; done' _ "$1"; }
   mkdir -p "$tmp/run_parts"
   mkfifo "$tmp/run_parts/fifo"
   st_fixture_fails() {
+    exec 9<>"$tmp/run_parts/fifo"
     echo "$BASHPID" >"$tmp/run_parts/fails.pid"
-    exec 9>"$tmp/run_parts/fifo"
+    st_fixture_until "$tmp/run_parts/opened" || exit 3
     echo go >&9
     self_fail "parte uno"
   }
   st_fixture_waits() {
     echo "$BASHPID" >"$tmp/run_parts/waits.pid"
-    "${row_bound[@]}" cat "$tmp/run_parts/fifo" >/dev/null || exit 3
+    st_fixture_until "$tmp/run_parts/fails.pid" || exit 3
+    exec 8<"$tmp/run_parts/fifo"
+    : >"$tmp/run_parts/opened"
+    "${row_bound[@]}" cat <&8 >/dev/null || exit 3
     touch "$tmp/run_parts/hecho"
   }
   rp_rc=0
-  run_parts st_fixture_fails st_fixture_waits >"$tmp/run_parts/out" 2>"$tmp/run_parts/err" || rp_rc=$?
+  MERGE_GATE_SELFTEST_SERIAL= run_parts st_fixture_fails st_fixture_waits >"$tmp/run_parts/out" 2>"$tmp/run_parts/err" || rp_rc=$?
   [[ -e "$tmp/run_parts/hecho" ]] \
     || self_fail "E3c.1: run_parts returned before the second part ended, so a part that failed hid what the other one did: $(cat "$tmp/run_parts/err")"
   [[ "$rp_rc" == 1 ]] || self_fail "E3c.1: run_parts over a part that failed exited $rp_rc, not 1: $(cat "$tmp/run_parts/err")"
@@ -2519,7 +2533,7 @@ exit 1'
   st_fixture_ends() { :; }
   st_fixture_leaves() { exit 0; }
   rp_rc=0
-  run_parts st_fixture_ends st_fixture_leaves >"$tmp/run_parts/out2" 2>"$tmp/run_parts/err2" || rp_rc=$?
+  MERGE_GATE_SELFTEST_SERIAL= run_parts st_fixture_ends st_fixture_leaves >"$tmp/run_parts/out2" 2>"$tmp/run_parts/err2" || rp_rc=$?
   [[ "$rp_rc" == 1 ]] || self_fail "E3c.2: run_parts over a part that exited 0 without its OK line exited $rp_rc, not 1: $(cat "$tmp/run_parts/err2")"
   grep -qF 'part 2 of 2 ended without its OK line' "$tmp/run_parts/err2" \
     || self_fail "E3c.2: the stderr of run_parts does not say that part 2 of 2 ended without its OK line: $(cat "$tmp/run_parts/err2")"
