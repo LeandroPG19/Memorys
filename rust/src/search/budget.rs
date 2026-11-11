@@ -82,11 +82,28 @@ mod tests {
     /// They are never edited by hand: a number that moves here is a budget that moves for every stored
     /// answer, and the library that moved it has to be the one that is refused, not the table.
     #[rustfmt::skip]
-    const FIXED_IDS: &[(&str, &[u32])] = &[];
+    const FIXED_IDS: &[(&str, &[u32])] = &[
+        ("es_acentos", &[31282, 35, 1832, 43441, 60286, 1832, 1208, 34122, 3739, 30, 1717, 239, 438, 6792, 11, 31098, 2448, 3394, 379, 90164, 25, 36916, 220, 2366, 21, 13]),
+        ("codigo", &[8998, 1925, 368, 314, 1095, 348, 25, 11564, 35937, 23, 29, 284, 7638, 21362, 15, 9448, 26, 220, 845, 5378, 14069, 90028, 85, 77575, 92, 5146, 335]),
+        ("blancos_al_final", &[5589, 262]),
+        ("blancos_en_serie", &[64, 1432, 2355, 65]),
+        ("unicode", &[38623, 28584, 11, 356, 35170, 76502, 22656, 45918, 252, 11, 19216, 81, 8393, 24252, 11318, 30925, 22071, 5821, 11, 384, 54939]),
+        ("endoftext", &[100257]),
+        ("a_x150", &[70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 70540, 29558, 5418]),
+        ("igual_x120", &[8315, 19311, 895]),
+        ("mezcla_117", &[45202, 45202, 45202, 45202, 45202, 4513, 10961, 22, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 29289, 10266]),
+    ];
     #[rustfmt::skip]
-    const FIXED_COUNTS: &[(&str, usize)] = &[];
+    const FIXED_COUNTS: &[(&str, usize)] = &[
+        ("blancos_130", 3),
+        ("espanol_4000", 3841),
+        ("json_200", 2203),
+    ];
     #[rustfmt::skip]
-    const FIXED_PREFIXES: &[(&str, &str)] = &[];
+    const FIXED_PREFIXES: &[(&str, &str)] = &[
+        ("cafe_x100", "cafécaféca"),
+        ("espanol_4000", "El servidor guarda cada decisión con su motivo, y la próxima sesión la encuentra sin que nadie la repita. El servidor guarda cada decisión con su motivo, y la próxima sesión la encuentra sin que nadie la repita. El servidor"),
+    ];
 
     fn spanish_long() -> String {
         "El servidor guarda cada decisión con su motivo, y la próxima sesión la encuentra sin que nadie la repita. "
