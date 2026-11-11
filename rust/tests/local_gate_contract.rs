@@ -11312,6 +11312,7 @@ impl GpuMachine {
             .arg(&script)
             .current_dir(&self.dir)
             .env_clear()
+            .env("MEMORY_INDUSTRY_REQUIRE_DATABASE_URL", "1")
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("GATE_GPU_HOME", &self.gpu_home)
