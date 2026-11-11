@@ -200,7 +200,7 @@ fn a_migration_that_has_already_shipped_cannot_be_edited() {
         hasher.update(name.as_bytes());
         hasher.update(std::fs::read(dir.join(name)).expect("a listed migration is readable"));
     }
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
 
     assert_eq!(
         digest,

@@ -126,9 +126,9 @@ pub fn scram_sha_256_verifier(password: &str, salt: &[u8]) -> String {
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
-    let mut mac =
-        <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
+        .expect("HMAC accepts a key of any length");
     mac.update(message);
     let mut out = [0; 32];
     out.copy_from_slice(&mac.finalize().into_bytes());
