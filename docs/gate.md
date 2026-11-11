@@ -283,6 +283,8 @@ Replay any log without cargo:
 ./scripts/test-times.sh --self-test
 ```
 
+`./scripts/merge-gate.sh --self-test` runs its rows in three parts at once, each with a `HOME` and a cache of its own, and prints `self-test part <i> of 3: OK in <S.SS> s` for each (CI-E3c: 24 s instead of 48–71 s); a part that exits non-zero, or ends without its line, is red. `MERGE_GATE_SELFTEST_SERIAL=1` runs them one after another in reverse order, to show that no part leans on another.
+
 ## Test counts per section and per binary
 
 Every `cargo test` of `run-all-tests.sh` goes through `run_counted`, which counts the tests the call ran (passed + failed over its `test result:` lines, read by `test-times.sh --count`) and holds the number against `scripts/test-section-counts.txt`. A section that ran more or fewer tests than its line says is red: a test that stops being run is the same silence as one that is skipped.
@@ -518,6 +520,7 @@ verdict: a history that cannot be written is one `history:` line on stderr.
   its reason: `sin_medida`, `{field: reason}`, in the record, and a `note: not measured (<fields>):
   <reason>` line in the output. A scope that is not delegated is not measured at all: every number of the
   run is null with that reason.
+- After the `dag: step` lines the planner prints the cost per test (CI-E2): `cost: run mode=… tests=… seg=… per_test=… median=… ratio=… top10_share=… median_share=… baseline=<k>/10`, one `cost: row <id> …` per timed row that ran test binaries, and one `cost: top <rank> <binary> seg=… share=… median=… ratio=…` for each of the 10 slowest. The seconds are the `finished in` of every test binary of the rows before the boundary, the set `test-times.sh` judges, and the tests are the passed and failed of each binary's `test result` line. A binary in two rows adds up in the top, as in `test-times.sh`. The median is the one of the last 10 green runs of the same mode and the same table that left units; with fewer it prints `cost: no median yet: <k> of 10 …`. A cost per test over 1.10 x its median, of the run or of a row, and a binary that enters the 10 slowest without having been in them in any of those 10 runs, print `cost: ALARM …`: the history never changes the verdict. A red run, a row whose units could not be read, and a run with no verdict have no cost and print `cost: not computed: …` (nothing for no verdict); so does a run that ran no test binary. The run's record carries the numbers in `coste`, null when there are none, and for a red run, an unreadable row or no verdict the reason is in `sin_medida.coste`. The cost is not in the receipt a tag carries: it stays in the history and in the log.
 
 ## Calibrating the jobs of a row (`gate_usl.py`)
 
