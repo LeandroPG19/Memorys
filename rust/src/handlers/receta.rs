@@ -107,7 +107,7 @@ async fn add(pool: &PgPool, args: &Value) -> Result<Value> {
     let embedding = crate::embeddings::onnx::embed_passage(&embed_text)
         .await
         .ok();
-    let model = crate::embeddings::onnx::current_model();
+    let model = crate::embeddings::onnx::vector_tag();
 
     let row = sqlx::query(
         "INSERT INTO brain_procedures

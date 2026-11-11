@@ -57,7 +57,7 @@ async fn persist_searchable(
             "UPDATE brain_observations SET embedding = $1::vector, embedding_model = $2 WHERE id = $3",
         )
         .bind(pgvector::Vector::from(emb))
-        .bind(crate::embeddings::onnx::current_model())
+        .bind(crate::embeddings::onnx::vector_tag())
         .bind(obs_id)
         .execute(pool)
         .await?;
@@ -913,7 +913,7 @@ async fn episode_add(pool: &PgPool, entity_name: &str, args: &Value) -> Result<V
             )
             .await
             {
-                let model = crate::embeddings::onnx::current_model();
+                let model = crate::embeddings::onnx::vector_tag();
                 let stored = sqlx::query(
                     "UPDATE brain_episodes SET embedding = $1::vector, embedding_model = $2 WHERE id = $3",
                 )

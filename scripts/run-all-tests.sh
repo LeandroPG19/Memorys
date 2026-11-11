@@ -2024,6 +2024,7 @@ fi
 
 # The model paths are chosen once, in gate_model_env (gate-lock.sh, CI-J5); merge-gate.sh calls it too.
 gate_model_env
+gate_refuse_the_users_runtime
 
 # D-F2b (CI-F1): merge-gate.sh asks for the models before its first compile, with the paths
 # exported above, so a missing model is seconds and not the first section. Nothing compiles.

@@ -10,7 +10,22 @@ versioning is independent (`1.{cargo_minor+2}.{patch}` — Cargo 0.26.0 → PyPI
 The real machine and a judge that does not lose the hour. 0.30.0 was proved and deployed on the user's PC on
 2026-10-14; what it left, plus what its own proving cost, is closed here.
 
+### Read before upgrading
+
+**ONNX Runtime 1.31.1 computes slightly different embeddings than 1.26.0** (measured: up to 1.4e-3 in `1 - cos` on the
+embedder). Stored vectors are now tagged with the model and the runtime that made them
+(`multilingual-e5-small@onnxruntime-1.31.1`); every vector stored before 0.31 counts as another generation. Search keeps
+working on a mixed database, with scores off by a few thousandths. To bring the database to the new runtime:
+stop the daemon, `memory-industry models runtime`, start it, `memory-industry reembed`. `reembed` now covers chunks and
+procedures, keeps the old vectors in a snapshot on disk before it rewrites any row, resumes where it stopped, refuses a
+second run at once, and `reembed --rollback` brings the old vectors back (with the previous runtime loaded).
+`reembed --drop-snapshot <label>` deletes a snapshot once nothing is left to rewrite. No migration: 0.30 still starts on a
+0.31 database. Upgrade together the machines that sync with each other. `doctor` and `/health` (full scope) say how many
+vectors are of another generation, and the daemon says so when it starts. (CI-D5c)
+
 ### Fixed
+
+- **Vectors restored by `cuba_sync` import keep the tag of the row they came with.** The restore wrote the vector of the bundle and left the row's label alone, so a vector made by another runtime could sit under the label of this one, where neither `doctor` nor `reembed` could tell it from a good one. (CI-D5c)
 
 - **The GPU is seen under WSL.** `nvidia-smi` lives in `/usr/lib/wsl/lib`, which is not on `PATH`, and without it the reranker never went to the card. `models runtime` on an Intel Mac says there is no official package since 1.24 instead of failing with a 404. `models runtime --gpu` asked for `…-gpu-<version>`, a name that does not exist from 1.27 on, and extracted the runtime without checking a sum. (CI-D5b)
 

@@ -36,6 +36,23 @@ pub fn current_model() -> String {
     std::env::var("CUBA_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
 }
 
+/// What a stored vector says made it: the model and the ONNX Runtime that computed it
+/// (`multilingual-e5-small@onnxruntime-1.31.1`). Two runtimes do not compute the same numbers
+/// (1.26.0 against 1.31.1: up to 1.4e-3 in `1 - cos`, measured), and a vector is only
+/// interchangeable with another of the same label. Without a runtime loaded the label is the model
+/// alone, which no loaded process writes: a vector is only written after one embedded.
+pub fn vector_tag_of(model: &str, runtime: Option<&str>) -> String {
+    match runtime {
+        Some(runtime) => format!("{model}@onnxruntime-{runtime}"),
+        None => model.to_string(),
+    }
+}
+
+/// The label of a vector this process writes now.
+pub fn vector_tag() -> String {
+    vector_tag_of(&current_model(), loaded_runtime_version().as_deref())
+}
+
 static CACHE: OnceLock<std::sync::Mutex<TtlLruCache<Vec<f32>>>> = OnceLock::new();
 
 static ONNX_SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
