@@ -2403,7 +2403,8 @@ split_tests() {
   PLAIN_TESTS=()
   CONTRACT_TESTS=()
   for file in tests/*.rs; do
-    name="$(basename "$file" .rs)"
+    name="${file##*/}"
+    name="${name%.rs}"
     if [[ "$contracts" == *" $name "* ]]; then
       CONTRACT_TESTS+=(--test "$name")
     else
@@ -2467,7 +2468,8 @@ DISCOVERED=()
 DEFERRED_SECTIONS=()
 local elsewhere=" ${RUN_ELSEWHERE[*]} "
 for file in tests/*.rs; do
-  name="$(basename "$file" .rs)"
+  name="${file##*/}"
+  name="${name%.rs}"
   if [[ "$elsewhere" == *" $name "* ]]; then
     DEFERRED_SECTIONS+=("$name")
   else
