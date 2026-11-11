@@ -1,0 +1,15 @@
+# What is documentation for the receipt of merge-gate.sh (CI-E29, D-E29j): a path that differs from the judged commit and
+# matches a line below, and no line that starts with `!`, does not take the receipt away (scripts/recibo-vale.sh). One
+# pattern per line; `#` comments. The match is bash's [[ path == pattern ]], where `*` crosses `/`.
+#
+# A path under scripts/ or rust/ is never documentation, whatever this file says, and this file is under scripts/: changing it
+# invalidates every receipt. Nothing here may name a file the judge reads (a contract opens it, a walk of the tree finds it, a
+# zip packs it): rust/tests/local_gate_contract.rs asks recibo-vale.sh --is-doc about every file the judge names.
+backlog/*.md
+docs/*.md
+# What a contract reads inside docs/, or a zip packs (scripts/empaquetar-visita.sh).
+!docs/gate.md
+!docs/despliegue-lan.md
+!docs/visita-pc-madre.md
+# local_gate_contract.rs walks the whole tree looking for rust-toolchain files, so one in backlog/ would change a verdict.
+!*rust-toolchain*

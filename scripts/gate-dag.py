@@ -1936,7 +1936,24 @@ def stop_on_signal(_signum: int, _frame: object) -> NoReturn:
     raise SystemExit(2)
 
 
-def run_table(path: str, timed_end: str | None = None) -> int:
+def rows_asked(rows: str, steps: list[Step]) -> list[str]:
+    """CI-E29 (D-E29c1): the ids `--rows` names, sorted. The list is refused before any row starts if it is empty, names an
+    id that is no row, or leaves out a row that one of its rows waits for (a subset that cannot run is not a subset)."""
+    ids = sorted({row_id for row_id in rows.split(",") if row_id})
+    if not ids:
+        die("--rows names no row")
+    known = {step.id for step in steps}
+    unknown = [row_id for row_id in ids if row_id not in known]
+    if unknown:
+        die(f"--rows names {', '.join(unknown)}, which is no row of the table")
+    for step in steps:
+        missing = [dep for dep in step.deps if step.id in ids and dep not in ids]
+        if missing:
+            die(f"{step.id} needs {', '.join(missing)}, which --rows does not name")
+    return ids
+
+
+def run_table(path: str, timed_end: str | None = None, rows: str | None = None) -> int:
     # CI-E24: nobody asking is `auto`, with the same falls to the series as an `auto` that was written; `0` or `serie` forces the series.
     mode = os.environ.get("GATE_DAG", "auto")
     if mode not in ASKED:
@@ -1944,7 +1961,13 @@ def run_table(path: str, timed_end: str | None = None) -> int:
     for signum in STOP_SIGNALS:
         signal.signal(signum, stop_on_signal)
     steps = parse_table(path)
-    return Planner(steps, ASKED[mode], table_key(path), timed_end).execute()
+    key = table_key(path)
+    if rows is not None:
+        ids = rows_asked(rows, steps)
+        steps = [step for step in steps if step.id in ids]
+        # A subset has the history of its own: its durations are not those of the table, and the first run of it is in series.
+        key = f"{key}:rows={','.join(ids)}"
+    return Planner(steps, ASKED[mode], key, timed_end).execute()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1953,6 +1976,7 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="run a step table: GATE_DAG=0 or serie, or 1, maximo or auto (unset: auto)")
     run.add_argument("--table", required=True)
     run.add_argument("--timed-end", default=None, help="the line printed before the first untimed block (CI-F3.3b-2)")
+    run.add_argument("--rows", default=None, help="run only these rows, ids separated by commas (CI-E29, D-E29c1)")
     rows = commands.add_parser("rows", help="say the rows of a step table and the pairs that can be alive together (CI-J18)")
     rows.add_argument("--table", required=True)
     commands.add_parser("allowed-env", help="print the closed list of a step's environment, one name per line (CI-J13)")
@@ -1972,7 +1996,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "rows":
             sys.stdout.write(rows_text(parse_table(args.table)))
             return 0
-        return run_table(args.table, args.timed_end)
+        return run_table(args.table, args.timed_end, args.rows)
     except Refusal as err:
         sys.stderr.write(f"FAIL: {err}\n")
         return 2

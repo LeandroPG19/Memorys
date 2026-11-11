@@ -2407,14 +2407,41 @@ fi
 
 # The receipt scripts/release.sh publishes from instead of running this gate a
 # second time (gate-lock.sh says why). It names one commit, so it is written
-# only when that commit is all that was judged: the tree clean, untracked files
-# included, when the gate starts and when it ends, and HEAD where it started.
-# The log it is judged from is this run's own output, teed below, and the judge
-# is gate_log_verdict, the one release.sh uses on its own log.
+# only when that commit is all that was judged: no path that differs from HEAD,
+# tracked or untracked, outside the docs-only list (recibo-vale.sh --dirty) when
+# the gate starts and when it ends, and HEAD where it started. A note written in
+# backlog/ while the gate runs is not a change of what it judges: the list is the
+# files the judge never reads. The log it is judged from is this run's own
+# output, teed below, and the judge is gate_log_verdict, the one release.sh uses
+# on its own log.
 GATE_LOG="$HOME/.cache/cuba-gate/merge-gate.log"
 GATE_START_HEAD=""
 GATE_NO_RECEIPT=""
 GATE_TEE=""
+# todo is the judge. parcial (CI-E29) is its flow over four rows of the table: it is no verdict, so it leaves no receipt, no
+# mark and no file for the stop hook, and its exit file and log are its own.
+GATE_MODE=todo
+PARCIAL_ROWS=(P B1 CT DBG)
+GATE_PLANNER_ROWS=()
+GATE_TABLE_ROWS=()
+
+# D-E29f: a run that starts over a commit takes its receipt away and leaves its mark, receipts/<sha>.started, until a green
+# end writes the receipt again. Whatever else ends the run (red, a signal, the kernel) leaves the mark, so a receipt of an
+# earlier commit that only differs from this one in documentation cannot pass for the verdict of a run that did not pass.
+# A start over a tree with something that is not documentation judged no commit, so it leaves every receipt alone.
+begin_receipt() {
+  local not_docs
+  GATE_START_HEAD="$(git -C "$ROOT" rev-parse --verify -q HEAD 2>/dev/null || true)"
+  if [[ -z "$GATE_START_HEAD" ]]; then
+    GATE_NO_RECEIPT="$ROOT has no commit git can name, so a pass here is not a pass of any commit"
+  elif ! not_docs="$(bash "$ROOT/scripts/recibo-vale.sh" --dirty "$ROOT")" || [[ -n "$not_docs" ]]; then
+    GATE_NO_RECEIPT="the working tree has paths that are not documentation when the gate started, so what it judges is not $GATE_START_HEAD: ${not_docs//$'\n'/ }"
+  else
+    mkdir -p "$GATE_RECEIPTS"
+    rm -f "$GATE_RECEIPTS/$GATE_START_HEAD"
+    printf 'local-gate: STARTED %s %s pid=%s\n' "$GATE_START_HEAD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" >"$GATE_RECEIPTS/$GATE_START_HEAD.started"
+  fi
+}
 
 write_receipt() {
   local status receipt
@@ -2426,8 +2453,8 @@ write_receipt() {
     echo "no receipt: HEAD moved from $GATE_START_HEAD while the gate ran, so no one commit was judged whole"
     return 0
   fi
-  if ! status="$(git -C "$ROOT" status --porcelain)" || [[ -n "$status" ]]; then
-    echo "no receipt: the working tree changed while the gate ran, so what passed is not $GATE_START_HEAD"
+  if ! status="$(bash "$ROOT/scripts/recibo-vale.sh" --dirty "$ROOT")" || [[ -n "$status" ]]; then
+    echo "no receipt: the working tree changed while the gate ran, so what passed is not $GATE_START_HEAD: ${status//$'\n'/ }"
     return 0
   fi
   if ! gate_log_verdict "$GATE_LOG"; then
@@ -2438,11 +2465,21 @@ write_receipt() {
   if mkdir -p "$GATE_RECEIPTS" \
     && gate_receipt_lines "$GATE_START_HEAD" >"$receipt.new.$$" \
     && mv -f "$receipt.new.$$" "$receipt"; then
+    rm -f "$receipt.started"
     echo "receipt: $receipt (scripts/release.sh publishes $GATE_START_HEAD from it without running this gate again)"
   else
     rm -f "$receipt.new.$$"
     echo "no receipt: $receipt could not be written"
   fi
+}
+
+# The file the stop hook of the operator reads (.gate/ultima-corrida.json, recibo.js): what this run said and which tree it
+# judged, in every end, green, red or cut by a signal. gate-lock.sh keeps the shape, which recibo-vale.sh --write-pointer shares.
+write_pointer() {
+  local diff_sha judge_sha
+  diff_sha="$(git -C "$ROOT" diff HEAD --binary | sha256sum | cut -d' ' -f1)"
+  judge_sha="$(bash "$ROOT/scripts/recibo-vale.sh" --judge-fingerprint "$ROOT")" || judge_sha=""
+  gate_write_pointer "$ROOT" "$1" "$GATE_START_HEAD" "$diff_sha" "$judge_sha"
 }
 
 # The exit file is this gate's whole verdict, not its first half's: the rules
@@ -2507,9 +2544,25 @@ on_exit() {
     fi
   fi
   (( stopped == 0 )) || echo "FAIL: the gate was stopped before its last step (a signal), so it has no verdict: exit 2, no receipt."
-  (( code != 0 )) || write_receipt || echo "no receipt: writing it failed"
+  if [[ "$GATE_MODE" == todo ]]; then
+    (( code != 0 )) || write_receipt || echo "no receipt: writing it failed"
+    write_pointer "$code" || echo "note: .gate/ultima-corrida.json could not be written, so the stop hook has nothing about this run"
+  fi
   exit_file_verdict "$code"
   release_gate_lock
+}
+
+# The rows parcial runs and the ones it leaves out, read from the planner so that this file keeps no second list of the table
+# (CI-J18): said at the top, because a green parcial is not the judge. It also fills what the planner is asked for.
+parcial_header() {
+  local row left_out=()
+  mapfile -t GATE_TABLE_ROWS < <(python3 -I -B "$ROOT/scripts/gate-dag.py" rows --table "$ROOT/scripts/gate-dag.txt" | awk '$1 == "row" { print $2 }')
+  for row in "${GATE_TABLE_ROWS[@]}"; do
+    [[ " ${PARCIAL_ROWS[*]} " == *" $row "* ]] || left_out+=("$row")
+  done
+  GATE_PLANNER_ROWS=(--rows "$(IFS=,; echo "${PARCIAL_ROWS[*]}")")
+  echo "parcial: NOT a verdict. It runs ${PARCIAL_ROWS[*]} and does not run ${left_out[*]}: no receipt, no mark, no test times. The judge is ./scripts/como-el-ci.sh todo"
+  echo ""
 }
 
 gate_main() {
@@ -2530,15 +2583,8 @@ export MEMORY_INDUSTRY_REQUIRE_DATABASE_URL=1
 
 # Whatever this commit's earlier receipt said, this run is its verdict now: a
 # red run on it takes it away, and a green one writes it again. A dirty start
-# judges no commit, so it leaves every receipt alone.
-GATE_START_HEAD="$(git -C "$ROOT" rev-parse --verify -q HEAD 2>/dev/null || true)"
-if [[ -z "$GATE_START_HEAD" ]]; then
-  GATE_NO_RECEIPT="$ROOT has no commit git can name, so a pass here is not a pass of any commit"
-elif ! gate_start_status="$(git -C "$ROOT" status --porcelain)" || [[ -n "$gate_start_status" ]]; then
-  GATE_NO_RECEIPT="the working tree was not clean when the gate started, so what it judges is not $GATE_START_HEAD"
-else
-  rm -f "$GATE_RECEIPTS/$GATE_START_HEAD"
-fi
+# judges no commit, so it leaves every receipt alone. parcial is nobody's verdict.
+[[ "$GATE_MODE" != todo ]] || begin_receipt
 mkdir -p "$(dirname "$GATE_LOG")"
 exec 3>&1 4>&2
 exec > >(tee "$GATE_LOG") 2>&1
@@ -2563,6 +2609,7 @@ echo "╔═══════════════════════�
 echo "║  CUBA-MEMORYS MERGE GATE (local CI — sole merge judge)   ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
+[[ "$GATE_MODE" != parcial ]] || parcial_header
 echo "WHAT THIS GATE DOES NOT CHECK — read before trusting a green run:"
 echo "  · the reranker in E2E   e2e_all_tools.py forces CUBA_RERANKER_PATH at an"
 echo "                          empty dir so its calls exercise the identity"
@@ -2753,12 +2800,22 @@ fi
 TIMED_STEPS_END='=== end of timed steps ==='
 # In the background and waited for: a signal to this gate interrupts the wait and its exit trap stops the planner, which
 # stops its steps, so a stopped gate does not go on with the rows after the one it was in (found on 2026-11-07 with INT).
-python3 -I "$ROOT/scripts/gate-dag.py" run --table "$ROOT/scripts/gate-dag.txt" --timed-end "$TIMED_STEPS_END" &
+python3 -I "$ROOT/scripts/gate-dag.py" run --table "$ROOT/scripts/gate-dag.txt" --timed-end "$TIMED_STEPS_END" "${GATE_PLANNER_ROWS[@]}" &
 GATE_PLANNER=$!
 planner_rc=0
 wait "$GATE_PLANNER" || planner_rc=$?
 GATE_PLANNER=""
 (( planner_rc == 0 )) || exit "$planner_rc"
+
+# A subset of the rows has no times to judge: test-times.sh reads a line of ceilings for every binary and reds the ones this run
+# did not run. parcial ends here, green for itself and no verdict.
+if [[ "$GATE_MODE" == parcial ]]; then
+  echo "test times: not judged (parcial runs ${#PARCIAL_ROWS[@]} of the ${#GATE_TABLE_ROWS[@]} rows of gate-dag.txt)"
+  GATE_REACHED_END=1
+  echo ""
+  echo "parcial: ${#PARCIAL_ROWS[@]} rows green (${PARCIAL_ROWS[*]}) - NOT a verdict, no receipt. The judge is ./scripts/como-el-ci.sh todo"
+  return 0
+fi
 
 echo "=== test times (scripts/test-time-ceilings.txt) ==="
 # Last, so a time red (drift, not broken behaviour) still leaves the verdicts of
@@ -2864,15 +2921,11 @@ fi
 # The cheap steps before the first compile (CI-F1, D-F2a and D-F2b): a red here is seconds,
 # not the twenty minutes of run-all-tests.sh. fmt runs again in run-all-tests.sh, a second
 # look of one second that keeps that script whole when it runs alone. The models are asked
-# by run-all-tests.sh --check-models, with the paths its own run exports.
-echo "=== cargo fmt --check ==="
-(cd "$ROOT/rust" && cargo fmt --check)
-
-echo "=== codigo-muerto ==="
-"$ROOT/scripts/codigo-muerto.sh"
-
-echo "=== npm wrapper smoke ==="
-node npm/install.test.js
+# by run-all-tests.sh --check-models, with the paths its own run exports. The three that
+# need no compile, no network and no lock are OFFLINE_CHECKS, which `rapido` runs too.
+for check in "${OFFLINE_CHECKS[@]}"; do
+  "$check"
+done
 
 echo "=== models (run-all-tests.sh --check-models) ==="
 "$ROOT/scripts/run-all-tests.sh" --check-models
@@ -2880,6 +2933,23 @@ echo "=== models (run-all-tests.sh --check-models) ==="
 # The copy of the real corpus is not a judge step (P1 a): respaldo-memoria.timer,
 # outside this repo, makes it. The judge never touches the live server.
 }
+
+# CI-E29 (D-E29b): the checks of P that cost seconds and need no compile, no network, no database and no lock. One list, two
+# readers: step_P stops at the first red, as it always did, and `rapido` runs them all and adds up the reds. Defined after
+# step_P, which calls them, so that the cheap steps still read after cargo deny and before the first build (F2.1).
+check_fmt() {
+  echo "=== cargo fmt --check ==="
+  (cd "$ROOT/rust" && cargo fmt --check)
+}
+check_codigo_muerto() {
+  echo "=== codigo-muerto ==="
+  "$ROOT/scripts/codigo-muerto.sh"
+}
+check_npm_smoke() {
+  echo "=== npm wrapper smoke ==="
+  node npm/install.test.js
+}
+OFFLINE_CHECKS=(check_fmt check_codigo_muerto check_npm_smoke)
 
 step_B1() {
   run_in_lane b1 "$ROOT/scripts/run-all-tests.sh" --lane CL --lane B1
@@ -2958,10 +3028,58 @@ gate_step_main() {
   "step_$id"
 }
 
-# The dispatch: one row of the table, or the whole gate. Bash reads this file from the top, and the rows and gate_main
-# are defined before this line, so the call always finds them.
+# CI-E29 (D-E29a, D-E29c, D-E29d): `rapido` is what the stop hook runs in every Stop, with no turn and 300 s: the offline checks
+# of P and the planner's judgement of its table, and nothing more. It takes no lock and writes nothing (no receipt, no mark, no
+# exit file, no log, no history), prints no clock, and does not read GATE_DESDE_HOOK: a gate that behaves differently when
+# somebody watches proves nothing. The reds are added up, as `completo` does, and it never says what only the judge says.
+rapido_main() {
+  local checks=("${OFFLINE_CHECKS[@]}" check_planner_table) names=() red=() worst=0 rc i
+  # Courtesy to the gate that holds the lock and compiles; a refusal of the kernel changes no verdict.
+  if [[ "$OSTYPE" == linux* ]]; then
+    renice -n 19 -p $$ >/dev/null 2>&1 || true
+    ionice -c3 -p $$ >/dev/null 2>&1 || true
+  fi
+  for i in "${!checks[@]}"; do
+    names[i]="${checks[i]#check_}"
+    names[i]="${names[i]//_/-}"
+  done
+  echo "rapido: NOT a verdict: ${#names[@]} offline checks of todo (${names[*]}); no lock, no receipt. The judge is ./scripts/como-el-ci.sh todo"
+  gate_linux_env
+  for i in "${!checks[@]}"; do
+    rc=0
+    "${checks[i]}" || rc=$?
+    (( rc == 0 )) || red+=("${names[i]}")
+    if (( rc == 2 )); then
+      worst=2
+    elif (( rc != 0 && worst == 0 )); then
+      worst=1
+    fi
+  done
+  if (( worst == 0 )); then
+    echo "rapido: GREEN (${#names[@]} of ${#names[@]}) - NOT a verdict, no receipt was written"
+  else
+    echo "rapido: RED (${#red[@]} of ${#names[@]}: ${red[*]}) - NOT a verdict"
+  fi
+  exit "$worst"
+}
+check_planner_table() {
+  echo "=== the planner's table (scripts/gate-dag.txt) ==="
+  # `|| return`: rapido calls this inside a `||`, where errexit is off, and the line below must not print OK over a refusal.
+  python3 -I -B "$ROOT/scripts/gate-dag.py" rows --table "$ROOT/scripts/gate-dag.txt" >/dev/null || return
+  echo "OK  the planner judged its table (scripts/gate-dag.txt)"
+}
+
+# The dispatch: one row of the table, the whole gate, or one of its two reduced forms. Bash reads this file from the top, and
+# the rows and gate_main are defined before this line, so the call always finds them.
 if [[ "${1:-}" == --step ]]; then
   gate_step_main "${2:-}"
+elif [[ "${1:-}" == --rapido ]]; then
+  rapido_main
+elif [[ "${1:-}" == --parcial ]]; then
+  GATE_MODE=parcial
+  GATE_EXIT_FILE="$HOME/.cache/cuba-gate/parcial.exit"
+  GATE_LOG="$HOME/.cache/cuba-gate/parcial.log"
+  gate_main
 else
   gate_main
 fi

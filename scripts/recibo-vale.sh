@@ -8,10 +8,11 @@
 #   bash scripts/recibo-vale.sh --write-pointer [root]  .gate/ultima-corrida.json for the stop hook, only if the receipt holds
 #   bash scripts/recibo-vale.sh --self-test
 #
-# Pass 1 of CI-E29 (tests: written): only the self-test below exists. The rest of the script is a body that
-# says "not implemented" and exits 2, so every row of the self-test is red for what the script does not do
-# and not because the file is missing. Pass 2 writes the script after the closing marker and leaves the
-# region as it is.
+# The receipt (~/.cache/cuba-gate/receipts/<sha>) names one commit. It still holds for HEAD when that commit is HEAD, or an
+# ancestor on the first-parent line of HEAD whose receipt nothing red has overtaken (receipts/<sha>.started), and everything that
+# changed since is documentation: a path of scripts/recibo-lista-blanca.txt. A path under scripts/ or rust/ is never
+# documentation, and the list itself is under scripts/, so changing it invalidates the receipt. The stop hook of the operator
+# runs this script with no arguments (recibo.js); merge-gate.sh asks --dirty and --judge-fingerprint, release.sh asks the verdict.
 set -euo pipefail
 # CI-K9a: the judge does not use the interop of Windows. On Linux the PATH that WSL adds (/mnt/..., by 9p) goes before anything looks for a command: each one that is not found walks all of it. The same filter as gate_path_without_windows (gate-lock.sh), which this script cannot load first.
 if [[ "$OSTYPE" == linux* ]]; then k9_kept=""; IFS=: read -ra k9_dirs <<<"$PATH"; for k9_d in "${k9_dirs[@]}"; do [[ "$k9_d" == /mnt/* ]] || k9_kept="${k9_kept:+$k9_kept:}$k9_d"; done; PATH="$k9_kept"; unset k9_dirs k9_d k9_kept; fi
@@ -318,5 +319,172 @@ if [[ "${1:-}" == "--self-test" ]]; then
 fi
 # --- self-test end ---
 
-echo "recibo-vale.sh: not implemented (CI-E29 pass 1: only --self-test exists)" >&2
-exit 2
+# shellcheck source=scripts/gate-lock.sh
+source "$ROOT/scripts/gate-lock.sh"
+
+LIST="$ROOT/scripts/recibo-lista-blanca.txt"
+positive=()
+negative=()
+paths=()
+
+say() {
+  echo "$2"
+  exit "$1"
+}
+
+# The patterns of the list: `#` comments, `!` negates, anything else is a pattern.
+load_list() {
+  local line
+  [[ -r "$LIST" ]] || say 2 "could not check: scripts/recibo-lista-blanca.txt is not there, so nothing says what is documentation"
+  while read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+      "") ;;
+      '!'*) negative+=("${line#!}") ;;
+      *) positive+=("$line") ;;
+    esac
+  done <"$LIST"
+}
+
+# The directory no list can make documentation a path of: the judge is scripts/, and rust/ is what it judges.
+floor_of() {
+  case "$1" in
+    scripts/*) echo scripts ;;
+    rust/*) echo rust ;;
+  esac
+}
+
+# Exit 0 and the reason, in one line, if PATH is not documentation; exit 1 and nothing if it is. A path is documentation when it
+# matches a pattern of the list and none that starts with `!`; the floor goes before the list.
+not_documentation() {
+  local path="$1" floor pattern
+  floor="$(floor_of "$path")"
+  if [[ -n "$floor" ]]; then
+    echo "$path is under $floor/: the judge is never documentation"
+    return 0
+  fi
+  for pattern in "${negative[@]}"; do
+    # shellcheck disable=SC2053 # the list's patterns are globs
+    if [[ "$path" == $pattern ]]; then
+      echo "$path is not documentation (the list negates it: !$pattern)"
+      return 0
+    fi
+  done
+  for pattern in "${positive[@]}"; do
+    # shellcheck disable=SC2053
+    if [[ "$path" == $pattern ]]; then
+      return 1
+    fi
+  done
+  echo "$path is not documentation (it is not in the list)"
+}
+
+# The sha256 of the sha256 of every file of scripts/, tracked or not and not ignored, in the order of the C locale so that the same
+# tree gives the same one under any LANG. A tracked file that is no longer on disk counts as a change: its absence is hashed.
+# The algorithm of the judge of Mapupita-Rust, so the field juez_sha256 means the same in both.
+judge_fingerprint() {
+  local file
+  while IFS= read -r -d '' file; do
+    if [[ -f "$file" ]]; then
+      sha256sum -- "$file"
+    else
+      printf 'AUSENTE  %s\n' "$file"
+    fi
+  done < <(git ls-files -z -co --exclude-standard -- scripts | LC_ALL=C sort -z) | sha256sum | cut -d' ' -f1
+}
+
+# Fills `paths` with what differs from COMMIT in the working tree, once each: the tracked ones (with what is staged; a rename is
+# two paths) and the untracked ones that are not ignored. The list ends with an empty element only if git answered every time:
+# a git that failed is "could not check", never an empty list that says "holds".
+paths_since() {
+  mapfile -d '' -t paths < <({ git diff --name-only --no-renames -z "$1" && git ls-files -o --exclude-standard -z; } | LC_ALL=C sort -zu && printf '\0')
+  (( ${#paths[@]} > 0 )) && [[ -z "${paths[-1]}" ]] || say 2 "could not check: git did not list what changed since ${1:0:12}"
+  unset 'paths[-1]'
+}
+
+mode=verdict
+case "${1:-}" in
+  --is-doc)
+    shift
+    load_list
+    status=0
+    for path in "$@"; do
+      not_documentation "$path" && status=1
+    done
+    exit "$status"
+    ;;
+  --judge-fingerprint | --dirty | --write-pointer)
+    mode="${1#--}"
+    shift
+    ;;
+  --*)
+    sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    exit 2
+    ;;
+esac
+
+root="${1:-$ROOT}"
+cd "$root" 2>/dev/null || say 2 "could not check: $root is not a directory"
+git rev-parse --verify -q HEAD >/dev/null 2>&1 || say 2 "could not check: $root has no git repository, or no commit to compare with"
+
+case "$mode" in
+  judge-fingerprint)
+    judge_fingerprint
+    exit 0
+    ;;
+  dirty)
+    load_list
+    paths_since HEAD
+    for path in "${paths[@]}"; do
+      if not_documentation "$path" >/dev/null; then
+        echo "$path"
+      fi
+    done
+    exit 0
+    ;;
+esac
+
+# The first of these that a commit has, from HEAD back along the first-parent line, decides: the mark of a run that did not pass
+# (D-E29f) is looked at before the receipt of the same commit, so a red run after the receipt wins over it. A receipt of a commit
+# of another branch is not used even if HEAD merged it.
+candidate=""
+while read -r commit; do
+  if [[ -f "$GATE_RECEIPTS/$commit.started" ]]; then
+    say 1 "does not hold: the last run on ${commit:0:12} did not pass (red, stopped or still running): $(<"$GATE_RECEIPTS/$commit.started")"
+  fi
+  if [[ -f "$GATE_RECEIPTS/$commit" ]]; then
+    is_receipt_for "$GATE_RECEIPTS/$commit" "$commit" || say 1 "does not hold: $GATE_RECEIPTS/$commit is not in the shape merge-gate.sh writes"
+    candidate="$commit"
+    break
+  fi
+done < <(git rev-list --first-parent --max-count=200 HEAD)
+[[ -n "$candidate" ]] || say 1 "does not hold: no receipt for HEAD or for its last 200 first-parent ancestors"
+
+load_list
+paths_since "$candidate"
+# The floor is looked at for every path before the list is looked at for any, so the answer for a commit that changes the list
+# and a file the new list would call documentation is the list, not the file.
+for path in "${paths[@]}"; do
+  [[ "$path" != scripts/recibo-lista-blanca.txt ]] || say 1 "does not hold: the docs-only list changed since ${candidate:0:12}"
+  [[ -z "$(floor_of "$path")" ]] || say 1 "does not hold: $(not_documentation "$path")"
+done
+for path in "${paths[@]}"; do
+  if reason="$(not_documentation "$path")"; then
+    say 1 "does not hold: $reason"
+  fi
+done
+
+if (( ${#paths[@]} > 0 )); then
+  message="holds by the docs-only list: ${#paths[@]} paths since ${candidate:0:12}"
+elif [[ "$candidate" == "$(git rev-parse HEAD)" ]]; then
+  message="holds: merge-gate.sh passed on ${candidate:0:12}"
+else
+  message="holds: HEAD's tree is ${candidate:0:12}'s"
+fi
+# For the juez that ran in another tree than this one: what the stop hook reads here is the receipt this script has just judged,
+# and the tree it judged was clean, so the diff it names is that of nothing.
+if [[ "$mode" == write-pointer ]]; then
+  gate_write_pointer "$PWD" 0 "$candidate" "$(printf '' | sha256sum | cut -d' ' -f1)" "$(judge_fingerprint)"
+fi
+say 0 "$message"

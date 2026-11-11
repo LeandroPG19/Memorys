@@ -25,12 +25,16 @@
 # tree, leaves its verdict in ~/.cache/cuba-gate/receipts/<sha> (gate-lock.sh
 # says why), and a release of that exact commit copies it into the tag instead
 # of spending another hour judging the same thing. No receipt, or one for
-# another commit, and the gate runs here as it always did.
+# another commit, and the gate runs here as it always did. The exception is a
+# HEAD that only adds documentation on top of a commit with a receipt
+# (recibo-vale.sh says so): the gate does not run and the tag goes on the commit
+# it judged.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# RECEIPT_PREFIX, GATE_RECEIPTS, gate_log_verdict and gate_receipt_lines: the
-# judge of the log and the shape of the receipt, shared with merge-gate.sh.
+# RECEIPT_PREFIX, GATE_RECEIPTS, gate_log_verdict, gate_receipt_lines and
+# is_receipt_for: the judge of the log and the shape of the receipt, shared with
+# merge-gate.sh.
 # shellcheck source=scripts/gate-lock.sh
 source "$ROOT/scripts/gate-lock.sh"
 ONLY_WAY="The only way to publish is ./scripts/release.sh vX.Y.Z: it runs ./scripts/merge-gate.sh on the commit origin/main holds and writes the receipt into an annotated tag."
@@ -126,21 +130,20 @@ run_the_gate() {
   RECEIPT_LINES="$(gate_receipt_lines "$sha")"
 }
 
-# Step 3, already done: a receipt merge-gate.sh left for this commit, in the
-# four lines it writes and nothing else. The file's name is not enough: a copy
-# of another commit's receipt under this name is not a pass of this one.
-is_receipt_for() {
-  local file="$1" sha="$2" lines
-  mapfile -t lines < <(tr -d '\r' <"$file")
-  (( ${#lines[@]} == 4 )) \
-    && [[ "${lines[0]}" == "$RECEIPT_PREFIX $sha" ]] \
-    && [[ "${lines[1]}" =~ ^local-gate-date:\ [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
-    && [[ "${lines[2]}" == "local-gate-summary: "*kill_rate=* ]] \
-    && [[ "${lines[3]}" == "local-gate-summary: "*"MERGE GATE PASSED"* ]]
+# Step 3, a receipt of an earlier commit: recibo-vale.sh says the receipt of C still holds for HEAD because only
+# documentation came after it. Prints C. A mark of a run that did not pass, code after C, or a receipt of C that is not in
+# the shape merge-gate.sh writes, are not that, and the gate runs.
+judged_commit_before_documentation() {
+  local said commit
+  said="$(bash "$ROOT/scripts/recibo-vale.sh" "$ROOT")" || return 1
+  [[ "$said" =~ ^holds\ by\ the\ docs-only\ list:\ [0-9]+\ paths\ since\ ([0-9a-f]{12})$ ]] || return 1
+  commit="$(git rev-parse --verify -q "${BASH_REMATCH[1]}^{commit}")" || return 1
+  is_receipt_for "$GATE_RECEIPTS/$commit" "$commit" || return 1
+  printf '%s\n' "$commit"
 }
 
 release() {
-  local dry_run="$1" rerun="$2" tag="$3" sha receipt msg
+  local dry_run="$1" rerun="$2" tag="$3" sha receipt msg judged
   cd "$ROOT"
   # With no receipt, the gate below runs as a child of this script and takes the
   # target, TMPDIR and node from here: launch this one inside `pesado` too.
@@ -155,8 +158,14 @@ release() {
     echo "--rerun-gate: merge-gate.sh runs on $sha whatever receipt it left"
     run_the_gate "$tag" "$sha"
   elif [[ ! -f "$receipt" ]]; then
-    echo "no receipt for $sha in $GATE_RECEIPTS: merge-gate.sh runs on it now"
-    run_the_gate "$tag" "$sha"
+    if judged="$(judged_commit_before_documentation)"; then
+      echo "HEAD ${sha:0:12} only adds documentation since ${judged:0:12}, which merge-gate.sh passed: the tag goes on ${judged:0:12}"
+      sha="$judged"
+      RECEIPT_LINES="$(tr -d '\r' <"$GATE_RECEIPTS/$sha")"
+    else
+      echo "no receipt for $sha in $GATE_RECEIPTS: merge-gate.sh runs on it now"
+      run_the_gate "$tag" "$sha"
+    fi
   elif ! is_receipt_for "$receipt" "$sha"; then
     echo "$receipt is not a receipt for $sha in the shape merge-gate.sh writes: merge-gate.sh runs on it now"
     run_the_gate "$tag" "$sha"
