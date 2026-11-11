@@ -93,3 +93,7 @@ sandbox/
 
 # Output of scripts/empaquetar-visita.sh: a zip with the Windows .exe, not source
 dist-visita/
+
+# What the last run of the judge said, for the stop hook (scripts/merge-gate.sh writes it into the tree it judged): an ignored file
+# does not dirty the tree its own gate has just judged.
+.gate/

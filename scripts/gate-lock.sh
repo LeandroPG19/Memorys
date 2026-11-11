@@ -432,6 +432,35 @@ gate_receipt_lines() {
   printf 'local-gate-summary: %s\n' "$GATE_PASSED_LINE"
 }
 
+# A receipt merge-gate.sh left for this commit, in the four lines it writes and
+# nothing else. The file's name is not enough: a copy of another commit's receipt
+# under this name is not a pass of this one. release.sh and recibo-vale.sh ask
+# it, so there is one judge of the shape.
+is_receipt_for() {
+  local file="$1" sha="$2" lines
+  mapfile -t lines < <(tr -d '\r' <"$file")
+  (( ${#lines[@]} == 4 )) \
+    && [[ "${lines[0]}" == "$RECEIPT_PREFIX $sha" ]] \
+    && [[ "${lines[1]}" =~ ^local-gate-date:\ [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+    && [[ "${lines[2]}" == "local-gate-summary: "*kill_rate=* ]] \
+    && [[ "${lines[3]}" == "local-gate-summary: "*"MERGE GATE PASSED"* ]]
+}
+
+# The file the stop hook of the operator reads to know what the last run said (.gate/ultima-corrida.json, in the shape of
+# the formula 2): the mode, the exit as a number, the commit it judged, the sha256 of what `git diff HEAD --binary` said then and
+# the fingerprint of scripts/ (recibo-vale.sh --judge-fingerprint), or null when there is none. Written whole and moved into
+# place, so the hook never reads half of it. The mode is always todo: here extra is the same judge (como-el-ci.sh).
+# merge-gate.sh writes it at every end, and recibo-vale.sh --write-pointer from a receipt that holds.
+gate_write_pointer() {
+  local root="$1" exit_code="$2" head="$3" diff_sha="$4" judge_sha="$5" file judge_json=null
+  file="$root/.gate/ultima-corrida.json"
+  [[ -z "$judge_sha" ]] || judge_json="\"$judge_sha\""
+  mkdir -p "$root/.gate"
+  printf '{"modo":"todo","salida":%s,"head":"%s","diff_sha256":"%s","juez_sha256":%s,"formula":2}\n' \
+    "$exit_code" "$head" "$diff_sha" "$judge_json" >"$file.new.$$"
+  mv -f "$file.new.$$" "$file"
+}
+
 # --- the Linux environment of a gate run -------------------------------------
 # Written for Git Bash on Windows, this gate now runs on Linux (WSL2, ext4), and
 # three things that were true there are not true here:
