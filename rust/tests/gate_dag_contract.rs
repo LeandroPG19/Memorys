@@ -963,6 +963,9 @@ fn a_step_environment_differs_only_by_the_closed_list() {
                 "GATE_PROC_MEMINFO",
                 "GATE_CGROUP_ROOT",
                 "GATE_PROC_SELF_CGROUP",
+                // CI-G1: `without_judge_env` gives every planner of this file GATE_GPU=cpu. Like GATE_PROC_MEMINFO it is a name the
+                // test hands the planner, which passes it on unchanged: the closed list is for what the planner itself changes.
+                "GATE_GPU",
                 "PWD",
                 "OLDPWD",
                 "SHLVL",
@@ -4982,7 +4985,9 @@ fn the_battery_is_measured_and_changes_nothing() {
             !line.contains(" failed="),
             "{tag}: a battery that cannot be read is not a failed measure: {line}"
         );
-        tails.push((tag, line.split(" jobs=").nth(1).unwrap_or("").to_string()));
+        // CI-G1: the line ends in ` gpu=<decision> (<why>)`, and what this test compares is the jobs and the mode.
+        let tail = line.split(" jobs=").nth(1).unwrap_or("");
+        tails.push((tag, tail.split(" gpu=").next().unwrap_or("").to_string()));
     }
     let (first_tag, first) = &tails[0];
     for (tag, tail) in &tails {
