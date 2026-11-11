@@ -220,8 +220,8 @@
 - [ ] **60.** **Backlog**. 15 / 0.
   - [ ] **60a.** La constancia de todo lo de «Trabajo en curso» (17:14–18:02) y de P-1. Tras la foto existe `a0dea6c` (`docs(backlog)`: la orden de cerrar todo hoy, tres tajadas entregadas, `pesado`); comprobar que no falta nada.
   - [ ] **60b.** La tabla del lote está vieja (B:38 dice `wal_level=minimal` y el código usa `replica`).
-- [ ] **61.** **(H)** **«La lista del release» no existe.** B:1027 y B:1039 mandan ahí H7 y la medida en Windows; no hay tal fichero. Debe recoger los puntos 10, 54, 55, 84, 85, 86, 88 y 89. 15 / 0.
-- [ ] **62.** **Cierres por escrito**: decisiones cuyo dato ya existe y solo falta anotar. 30 / 0.
+- [x] **61.** **(H)** **«La lista del release» no existe.** B:1027 y B:1039 mandan ahí H7 y la medida en Windows; no hay tal fichero. Debe recoger los puntos 10, 54, 55, 84, 85, 86, 88 y 89. 15 / 0. — **HECHO 10-nov 18:23:** creada backlog/lista-del-release-0.31.md (15 puntos con casilla, quién, fuente y comando).
+- [ ] **62.** **Cierres por escrito**: decisiones cuyo dato ya existe y solo falta anotar. 30 / 0. — **EN CURSO 10-nov 18:23:** 11 cierres escritos en la bitácora (entrada de las 18:19); sigue abierta la sonda de wal_level (48a, opcional) y quedan para Leandro: adoptar juez-cuda (ahorro tope 5-10 s) y T2.
   - [ ] **62a.** F3.5, lanzador por binario (B:863): la condición no se cumple con lo medido (162 s de holgura).
   - [ ] **62b.** **(H)** F5b `juez-cuda`: `recomendar` dice «yes (B3 slack 0.0 s)» desde las corridas de las 15:27 (`CR/campana-final-20261110-152701/usl-recomendar-final.log:18`) y B:1128 sigue con «no». Los `--timings` dicen que ganaría como mucho 7–8 s; lo razonable es anotarlo y cerrarla.
   - [ ] **62c.** **(H)** T2: la unidad `cuba-memorys` cuesta 100,8 s de 167,9 (60 %), así que cumple el criterio de K7.spec:403 para llevárselo a Leandro (92b); el ahorro de reloj sería casi nulo.
@@ -233,17 +233,17 @@
   - [ ] **62i.** **(H)** `wal_level` (se queda `replica`; ver 48a y 60b).
   - [ ] **62j.** La spec de E10 nombra `lock_timeout_sql` y el código `lock_timeout_millis` (B:1100).
   - [ ] **62k.** B:863 («el resto como tareas del backlog de Mapupita») contradice D-F7d (F7.spec:137).
-- [ ] **63.** **`docs/gate.md`** (lo lee el juez: va en un commit antes del veredicto final). 20 / 0.
+- [x] **63.** **`docs/gate.md`** (lo lee el juez: va en un commit antes del veredicto final). 20 / 0. — **HECHO 10-nov 18:23:** docs/gate.md: hora de la auditoría decidida, los dos bins con test = false, juez de Windows una vez por release con la comprobación de Python de CI-E25b.
   - [ ] **63a.** `:263` dice que el temporizador está «pending the hours», y ya está decidido (domingo 02:00).
   - [ ] **63b.** **(H)** No dice que los dos bins llevan `test = false` ni que el aviso de cargo sigue (D-F5y; F5.spec:160).
   - [ ] **63c.** **(H)** Ni `gate.md` ni `AGENTS.md` dicen que el juez de Windows corre una vez por release, antes de `release.sh` (P:377 «así queda»).
-- [ ] **64.** **`AGENTS.md`**. 10 / 0.
+- [x] **64.** **`AGENTS.md`**. 10 / 0. — **HECHO 10-nov 18:23:** AGENTS.md: clústeres propios del juez (F2), fixture sembrado por MCP, coste en los traspasos (CI-E6), guardas hechas y abiertas, juez de Windows una vez por release.
   - [ ] **64a.** **(H)** Sin la parte de F2 (clústeres propios, PGDG; F2.spec:496; B:843).
   - [ ] **64b.** `:67` dice «a fixed snapshot restored» y lo real es un fixture sembrado por MCP (D-J3a).
   - [ ] **64c.** Sin la frase de CI-E6 en «Six-pack» (`docs/gate.md:585` sí la tiene).
   - [ ] **64d.** «missing guards (CI-E1 to CI-E8)» ya es falso.
-- [ ] **65.** **(H)** **CHANGELOG `[0.31.0]`**: no menciona T-RLS (el arreglo de seguridad del producto, B:746), ni `MEMORY_INDUSTRY_REQUIRE_DATABASE_URL` (T-DBURL; el README sí, `:367`), ni el juez en DAG. Sí están E10, K7, K7b y K8. 15 / 0.
-- [ ] **66.** **Locales, sin versionar**. 20 / 0.
+- [x] **65.** **(H)** **CHANGELOG `[0.31.0]`**: no menciona T-RLS (el arreglo de seguridad del producto, B:746), ni `MEMORY_INDUSTRY_REQUIRE_DATABASE_URL` (T-DBURL; el README sí, `:367`), ni el juez en DAG. Sí están E10, K7, K7b y K8. 15 / 0. — **HECHO 10-nov 18:23:** CHANGELOG [0.31.0]: T-RLS (fbe6632), MEMORY_INDUSTRY_REQUIRE_DATABASE_URL (5314a6d) y el juez en DAG por omisión. Anotado que tampoco nombra F2, CI-K3 ni CI-E4/E6/E7a (son del juez, no del producto: no se añaden).
+- [x] **66.** **Locales, sin versionar**. 20 / 0. — **HECHO 10-nov 18:23:** sección «Estado al 10-nov-2026» añadida a los dos ficheros locales, sin borrar nada.
   - [ ] **66a.** `docs/ci/metodologia-de-escala.md`: las tablas de `:185-209` siguen dando por «Missing» E1, E4, E6, E7 y E8, y por `pendiente` 13 líneas. Siguen sin medir: recuento y tabla por binario del árbol actual, `quality` entero, ahorro de K3 y K8, K9 en máquina sana y la mediana de 10 corridas. Queda una «Decision pending» para Leandro (93a).
   - [ ] **66b.** `docs/ci/plantilla-aplicada.md` es del 9-nov y dice «does not» para lo ya hecho (K4.spec:342 y K3.spec:447 mandan pegar ahí los números).
 - [ ] **67.** **Traspasos**. 15–30 / 3 para los segundos.
