@@ -199,12 +199,12 @@ gate_cluster_up() {
   echo "OK  cluster $lane up in $((t2 - t0)) ms (initdb $((t1 - t0)) ms, ready $((t2 - t1)) ms)"
 }
 
-# Takes LANE's postgres down and keeps its log in GATE_CLUSTER_LOGS (K7). Without a pid registered (the
+# Takes LANE's postgres down and keeps its log in GATE_CLUSTER_LOGS (K7), and in the run directory of the planner when there is one (CI-E23). Without a pid registered (the
 # window between the & and its assignment, K2) it asks the postmaster.pid of the directory, with the same
 # identity check. The directory goes only when its owner is this gate's and its pid is gone (K1, D-F2h).
 # Returns 1 and leaves the directory when the pid is not the lane's: nothing is signalled.
 gate_cluster_down() {
-  local lane="$1" dir="${GATE_CLUSTER_DIR[$1]:-}" pid="${GATE_CLUSTER_PID[$1]:-}" logs
+  local lane="$1" dir="${GATE_CLUSTER_DIR[$1]:-}" pid="${GATE_CLUSTER_PID[$1]:-}" logs run
   [[ -n "$dir" ]] || return 0
   unset "GATE_CLUSTER_DIR[$lane]" "GATE_CLUSTER_PID[$lane]"
   if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
@@ -217,6 +217,13 @@ gate_cluster_down() {
   if [[ "$pid" =~ ^[0-9]+$ ]]; then wait "$pid" 2>/dev/null || true; fi
   logs="${GATE_CLUSTER_LOGS:-${XDG_CACHE_HOME:-$HOME/.cache}/memory-industry-gate/clusters}"
   mkdir -p "$logs" && cp "$dir/server.log" "$logs/$lane.log" 2>/dev/null || true
+  # CI-E23: the name under $logs is fixed, so the next run overwrites it and the log of a run that failed is lost. Inside a
+  # planner's run (its row's TMPDIR is <run>/tmp/<row>, and <run> holds the planner.pid) the log is also kept in
+  # <run>/clusters/<lane>.log: a red run keeps that directory and names it (`dag: run directory:`), a green one deletes it.
+  run="$(dirname "$(dirname "${TMPDIR:-/nonexistent/x}")")"
+  if [[ -f "$run/planner.pid" ]]; then
+    mkdir -p "$run/clusters" && cp "$dir/server.log" "$run/clusters/$lane.log" 2>/dev/null || true
+  fi
   if [[ "$dir" == "$GATE_CLUSTER_ROOT/$lane."* && -f "$dir/owner" && "$(<"$dir/owner")" == "$GATE_OWNER"* ]]; then
     rm -rf -- "$dir"
   else

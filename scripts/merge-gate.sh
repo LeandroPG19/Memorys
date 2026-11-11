@@ -2464,7 +2464,7 @@ fi
 # CI-F3.3b-2 (D-F3b, spec F3.3b-1b): the rows of scripts/gate-dag.txt run here, one `merge-gate.sh --step <id>` each,
 # in the planner's order: GATE_DAG=0 (or serie) is the series in idx order; GATE_DAG=1, maximo and auto (CI-E7a-1) are one
 # DAG, whose rows start when scripts/gate-dag.py `admission` lets them: the CPU, the RAM, the models and the jobs of the
-# rows alive (the jobs they name in CARGO_BUILD_JOBS, row_jobs, add up to no more than the machine's) have room for them.
+# rows alive (the jobs they name in CARGO_BUILD_JOBS, as share_jobs of gate-dag.py scales them to the turn, add up to no more than the machine's) have room for them.
 # Its verdict is this gate's: a red row stops the gate with its own code, and the rows after it do not start.
 # The line where the timed steps end (D-F2c, spec F3.3b-1b-iii): test-times.sh judges the log up to it. The planner
 # prints it before the first untimed row (CV, class untimed in gate-dag.txt), so the output of CV and M is not judged.

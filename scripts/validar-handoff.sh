@@ -296,9 +296,11 @@ evidencia() { # <fichero.yml>
   ' "$1"
 }
 
+# CI-J19: la tabla tiene un solo lector, el planificador (`gate-dag.py rows`, CI-J18): las filas salen en el orden de idx, y
+# una tabla que el planificador rechaza no da ninguna (su FAIL sale por stderr). Sin tabla, o sin lector, tampoco hay filas.
 filas_dag() { # los ids de las filas de scripts/gate-dag.txt de ESTE arbol, uno por linea
-  [[ -f "$ROOT/scripts/gate-dag.txt" ]] || return 0
-  awk '{ sub(/\r$/, "") } /^[[:space:]]*(#|$)/ { next } { print $2 }' "$ROOT/scripts/gate-dag.txt"
+  [[ -f "$ROOT/scripts/gate-dag.txt" && -f "$ROOT/scripts/gate-dag.py" ]] || return 0
+  python3 -I -B "$ROOT/scripts/gate-dag.py" rows --table "$ROOT/scripts/gate-dag.txt" | awk '$1 == "row" { print $2 }'
 }
 
 # Imprime lo que esta mal de un carril, o nada si es una fila de la tabla.
@@ -309,7 +311,7 @@ carril_problema() { # <id> <ids, uno por linea>
     if [[ "$fila" == "$1" ]]; then return 0; fi
     filas="${filas:+$filas }$fila"
   done <<<"$2"
-  echo "$1 no es una fila de scripts/gate-dag.txt (filas: ${filas:-ninguna, el fichero no existe o esta vacio})"
+  echo "$1 no es una fila de scripts/gate-dag.txt (filas: ${filas:-ninguna: el fichero no existe, esta vacio o el planificador lo rechaza})"
 }
 
 # Imprime lo que esta mal de un `segundos:`, o nada. `<S> s; <orden acotada>[; <su ultima linea>]`
