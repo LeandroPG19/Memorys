@@ -608,7 +608,7 @@ mod tests {
 
         let obs_id = seed_observation(&pool, &entity_name, entity_type, content, 0.5, None).await;
 
-        let rows: Vec<StaleObservation> = sqlx::query_as(
+        let rows: Vec<StaleRow> = sqlx::query_as(
             "SELECT o.id, o.content, e.entity_type, e.name AS entity_name
              FROM brain_observations o
              JOIN brain_entities e ON e.id = o.entity_id
@@ -619,7 +619,13 @@ mod tests {
         .await
         .expect("reading back the observation the way reembed does");
 
-        let (updated, failed) = reembed_batch(&pool, &rows, "test-reembed-model").await;
+        let (updated, failed) = reembed_batch(
+            &pool,
+            crate::embeddings::backfill::VectorTable::Observations,
+            &rows,
+            "test-reembed-model",
+        )
+        .await;
         assert_eq!(
             (updated, failed),
             (1, 0),
