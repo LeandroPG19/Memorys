@@ -335,8 +335,17 @@ fn vram_free_mb() -> Option<u64> {
 }
 
 pub fn probe() -> Machine {
-    let mut system = sysinfo::System::new();
-    system.refresh_memory();
+    // sysinfo 0.40 answers `Err` where the OS gives it no system to read: zero memory, as a
+    // /proc/meminfo that cannot be read always gave, and the plan already copes with it.
+    let (ram_total, ram_available, swap_total) =
+        sysinfo::System::new().ok().map_or((0, 0, 0), |mut system| {
+            system.refresh_memory();
+            (
+                system.total_memory(),
+                system.available_memory(),
+                system.total_swap(),
+            )
+        });
 
     let cores_logical = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -346,9 +355,9 @@ pub fn probe() -> Machine {
         .max(1);
 
     Machine {
-        ram_total_mb: system.total_memory() / MIB,
-        ram_available_mb: system.available_memory() / MIB,
-        swap_total_mb: system.total_swap() / MIB,
+        ram_total_mb: ram_total / MIB,
+        ram_available_mb: ram_available / MIB,
+        swap_total_mb: swap_total / MIB,
         cgroup_limit_mb: cgroup_limit_mb(),
         cores_logical,
         cores_physical,
@@ -1012,6 +1021,36 @@ mod tests {
 
         let p = plan(&m);
         assert!(p.worker_threads >= 1, "{}", p.describe());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn meminfo_kib(field: &str) -> u64 {
+        std::fs::read_to_string("/proc/meminfo")
+            .expect("/proc/meminfo is how this test knows the machine's memory apart from sysinfo")
+            .lines()
+            .find_map(|line| {
+                let rest = line.strip_prefix(field)?.strip_prefix(':')?;
+                rest.split_whitespace().next()?.parse().ok()
+            })
+            .unwrap_or_else(|| panic!("/proc/meminfo has no `{field}` line"))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_reads_ram_and_swap_in_mib_as_the_kernel_reports_them() {
+        let m = probe();
+
+        assert_eq!(
+            m.ram_total_mb,
+            meminfo_kib("MemTotal") / 1024,
+            "ram_total_mb has to be MemTotal in MiB: {m:?}. A unit slip here (kB, bytes, MB of 10^6) \
+             changes the budget every model and every worker is sized from, on every install"
+        );
+        assert_eq!(
+            m.swap_total_mb,
+            meminfo_kib("SwapTotal") / 1024,
+            "swap_total_mb has to be SwapTotal in MiB: {m:?}"
+        );
     }
 
     #[test]
