@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use memory_industry::db;
 use sha2::{Digest, Sha384};
-use sqlx::{Connection, Executor, PgConnection};
+use sqlx::{Connection, Executor, PgConnection, PgPool};
 use tokio::sync::OnceCell;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -168,16 +168,7 @@ async fn build_the_template(url: &str) -> String {
     let pool = db::create_admin_pool(&sibling_url(url, &building))
         .await
         .expect("migrating the template");
-    pool.close().await;
-    run(
-        &mut admin,
-        &format!("ALTER DATABASE {building} WITH ALLOW_CONNECTIONS false"),
-        "sealing the template",
-    )
-    .await;
-    if let Err(who) =
-        wait_until_no_session_is_left(&mut admin, &building, SESSIONS_LEAVE_WITHIN).await
-    {
+    if let Err(who) = close_and_seal(pool, &mut admin, &building, SESSIONS_LEAVE_WITHIN).await {
         panic!("emptying the template before publishing it: {who}");
     }
     match admin
@@ -197,6 +188,28 @@ async fn build_the_template(url: &str) -> String {
         Err(why) => refuse("publishing the template", &why),
     }
     name
+}
+
+/// Closes `pool`, seals `database` with ALLOW_CONNECTIONS false over `admin` and waits, up to
+/// `within`, until `pg_stat_activity` shows nobody on it: what the template needs before its
+/// RENAME. The pool comes by value because nothing of the caller may stay alive on the database
+/// while it waits; `Err` names who is still connected when `within` runs out. Taking `within`
+/// lets a test that provokes the failure pay for a short wait instead of
+/// `SESSIONS_LEAVE_WITHIN`.
+pub async fn close_and_seal(
+    pool: PgPool,
+    admin: &mut PgConnection,
+    database: &str,
+    within: Duration,
+) -> Result<(), String> {
+    pool.close().await;
+    run(
+        admin,
+        &format!("ALTER DATABASE {database} WITH ALLOW_CONNECTIONS false"),
+        "sealing the template",
+    )
+    .await;
+    wait_until_no_session_is_left(admin, database, within).await
 }
 
 /// Polls `pg_stat_activity` over `admin` (a session on another database) until nobody is connected
