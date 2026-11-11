@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use sqlx::PgPool;
 
+use crate::embeddings::backfill::VectorTable;
+
 async fn refresh_ood_cache(pool: &PgPool, project_id: Option<uuid::Uuid>) -> Result<()> {
     use crate::search::ood::{MIN_SAMPLES_FOR_OOD, OodStats};
     let raw: Vec<(pgvector::Vector,)> = sqlx::query_as(
@@ -25,7 +27,7 @@ async fn refresh_ood_cache(pool: &PgPool, project_id: Option<uuid::Uuid>) -> Res
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct StaleObservation {
+pub struct StaleRow {
     pub id: uuid::Uuid,
     pub content: String,
     pub entity_type: String,
@@ -34,7 +36,8 @@ pub struct StaleObservation {
 
 pub async fn reembed_batch(
     pool: &PgPool,
-    rows: &[StaleObservation],
+    table: VectorTable,
+    rows: &[StaleRow],
     model: &str,
 ) -> (usize, usize) {
     let mut updated = 0usize;
@@ -49,23 +52,21 @@ pub async fn reembed_batch(
         let embedding = match embedding {
             Ok(embedding) => embedding,
             Err(e) => {
-                tracing::warn!(obs_id = %row.id, error = %e, "reembed: ONNX failed for observation");
+                tracing::warn!(row_id = %row.id, table = ?table, error = %e, "reembed: ONNX failed for row");
                 failed += 1;
                 continue;
             }
         };
-        let written = sqlx::query(
-            "UPDATE brain_observations SET embedding = $1::vector, embedding_model = $2 WHERE id = $3",
-        )
-        .bind(pgvector::Vector::from(embedding))
-        .bind(model)
-        .bind(row.id)
-        .execute(pool)
-        .await;
+        let written = sqlx::query(table.update_sql())
+            .bind(pgvector::Vector::from(embedding))
+            .bind(model)
+            .bind(row.id)
+            .execute(pool)
+            .await;
         match written {
             Ok(_) => updated += 1,
             Err(e) => {
-                tracing::warn!(obs_id = %row.id, error = %e, "reembed: could not persist embedding");
+                tracing::warn!(row_id = %row.id, table = ?table, error = %e, "reembed: could not persist embedding");
                 failed += 1;
             }
         }
@@ -406,7 +407,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(500);
             let current_model = crate::embeddings::onnx::current_model();
-            let obs: Vec<StaleObservation> = sqlx::query_as(
+            let observations: Vec<StaleRow> = sqlx::query_as(
                 "SELECT o.id, o.content, e.entity_type, e.name AS entity_name
                  FROM brain_observations o
                  JOIN brain_entities e ON e.id = o.entity_id
@@ -419,9 +420,22 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             .bind(&current_model)
             .fetch_all(pool)
             .await?;
+            let episodes: Vec<StaleRow> = sqlx::query_as(
+                "SELECT ep.id, ep.content, e.entity_type, e.name AS entity_name
+                 FROM brain_episodes ep
+                 JOIN brain_entities e ON e.id = ep.entity_id
+                 WHERE ep.embedding IS NULL OR ep.embedding_model IS DISTINCT FROM $2
+                 ORDER BY ep.importance DESC
+                 LIMIT $1",
+            )
+            .bind(batch_size)
+            .bind(&current_model)
+            .fetch_all(pool)
+            .await?;
 
-            let total = obs.len();
-            let mut updated = 0usize;
+            let total = observations.len() + episodes.len();
+            let mut updated_observations = 0usize;
+            let mut updated_episodes = 0usize;
 
             let progress_token = args
                 .get("_meta")
@@ -431,24 +445,34 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
             let progress_step = (total / 20).max(1);
 
             let mut done = 0usize;
-            for slice in obs.chunks(progress_step) {
-                let (ok, _failed) = reembed_batch(pool, slice, &current_model).await;
-                updated += ok;
-                done += slice.len();
-                if total > 50 {
-                    crate::protocol::notify_progress(
-                        &progress_token,
-                        done as f64,
-                        Some(total as f64),
-                        Some(&format!("re-embedded {}/{}", done, total)),
-                    );
+            for (table, rows) in [
+                (VectorTable::Observations, &observations),
+                (VectorTable::Episodes, &episodes),
+            ] {
+                for slice in rows.chunks(progress_step) {
+                    let (ok, _failed) = reembed_batch(pool, table, slice, &current_model).await;
+                    match table {
+                        VectorTable::Observations => updated_observations += ok,
+                        VectorTable::Episodes => updated_episodes += ok,
+                    }
+                    done += slice.len();
+                    if total > 50 {
+                        crate::protocol::notify_progress(
+                            &progress_token,
+                            done as f64,
+                            Some(total as f64),
+                            Some(&format!("re-embedded {}/{}", done, total)),
+                        );
+                    }
                 }
             }
 
             Ok(serde_json::json!({
                 "action": "reembed",
+                "observations": {"fetched": observations.len(), "updated": updated_observations},
+                "episodes": {"fetched": episodes.len(), "updated": updated_episodes},
                 "total_fetched": total,
-                "updated": updated,
+                "updated": updated_observations + updated_episodes,
                 "model": current_model,
                 "dim": crate::embeddings::onnx::embedding_dim(),
                 "note": "Run after switching embedding models to ensure vector search consistency"
@@ -608,7 +632,7 @@ mod tests {
 
         let obs_id = seed_observation(&pool, &entity_name, entity_type, content, 0.5, None).await;
 
-        let rows: Vec<StaleObservation> = sqlx::query_as(
+        let rows: Vec<StaleRow> = sqlx::query_as(
             "SELECT o.id, o.content, e.entity_type, e.name AS entity_name
              FROM brain_observations o
              JOIN brain_entities e ON e.id = o.entity_id
@@ -619,7 +643,13 @@ mod tests {
         .await
         .expect("reading back the observation the way reembed does");
 
-        let (updated, failed) = reembed_batch(&pool, &rows, "test-reembed-model").await;
+        let (updated, failed) = reembed_batch(
+            &pool,
+            crate::embeddings::backfill::VectorTable::Observations,
+            &rows,
+            "test-reembed-model",
+        )
+        .await;
         assert_eq!(
             (updated, failed),
             (1, 0),

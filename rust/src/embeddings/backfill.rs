@@ -11,6 +11,48 @@ pub struct BackfillReport {
     pub chunked: usize,
 }
 
+/// The tables that carry a vector a model has to produce. One literal statement per table: the
+/// table name is never spliced into SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorTable {
+    Observations,
+    Episodes,
+}
+
+impl VectorTable {
+    pub const fn update_sql(self) -> &'static str {
+        match self {
+            Self::Observations => {
+                "UPDATE brain_observations SET embedding = $1::vector, embedding_model = $2 WHERE id = $3"
+            }
+            Self::Episodes => {
+                "UPDATE brain_episodes SET embedding = $1::vector, embedding_model = $2 WHERE id = $3"
+            }
+        }
+    }
+
+    const fn missing_sql(self) -> &'static str {
+        match self {
+            Self::Observations => {
+                "SELECT o.id, o.content, e.entity_type, e.name
+                 FROM brain_observations o
+                 JOIN brain_entities e ON e.id = o.entity_id
+                 WHERE o.embedding IS NULL AND o.observation_type != 'superseded'
+                 ORDER BY o.importance DESC, o.created_at DESC
+                 LIMIT $1"
+            }
+            Self::Episodes => {
+                "SELECT ep.id, ep.content, e.entity_type, e.name
+                 FROM brain_episodes ep
+                 JOIN brain_entities e ON e.id = ep.entity_id
+                 WHERE ep.embedding IS NULL
+                 ORDER BY ep.importance DESC, ep.created_at DESC
+                 LIMIT $1"
+            }
+        }
+    }
+}
+
 pub async fn store_chunks(
     pool: &PgPool,
     observation_id: uuid::Uuid,
@@ -124,59 +166,54 @@ fn parse_limit(raw: Option<&str>) -> i64 {
 
 pub async fn count_missing(pool: &PgPool) -> Result<i64> {
     let (n,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM brain_observations
-         WHERE embedding IS NULL AND observation_type != 'superseded'",
+        "SELECT (SELECT count(*) FROM brain_observations
+                 WHERE embedding IS NULL AND observation_type != 'superseded')
+              + (SELECT count(*) FROM brain_episodes WHERE embedding IS NULL)",
     )
     .fetch_one(pool)
     .await?;
     Ok(n)
 }
 
+/// Fills what is missing in both tables, up to `limit` rows of each. Without a loaded model it
+/// writes nothing: the hash fallback stored under the real model's name is a vector `reembed`
+/// would take for a good one.
 pub async fn backfill_missing(pool: &PgPool, limit: i64) -> Result<BackfillReport> {
-    if limit == 0 {
+    if limit == 0 || !crate::embeddings::onnx::model_loaded().await {
         return Ok(BackfillReport::default());
     }
 
-    let rows: Vec<(uuid::Uuid, String, String, String)> = sqlx::query_as(
-        "SELECT o.id, o.content, e.entity_type, e.name
-         FROM brain_observations o
-         JOIN brain_entities e ON e.id = o.entity_id
-         WHERE o.embedding IS NULL AND o.observation_type != 'superseded'
-         ORDER BY o.importance DESC, o.created_at DESC
-         LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-
     let model = crate::embeddings::onnx::current_model();
-    let mut report = BackfillReport {
-        attempted: rows.len(),
-        ..Default::default()
-    };
-
-    for (id, content, entity_type, entity_name) in rows {
-        let vector =
-            crate::embeddings::onnx::embed_passage_contextual(&content, &entity_type, &entity_name)
-                .await;
-        let Ok(vector) = vector else {
-            report.failed += 1;
-            continue;
-        };
-        let written = sqlx::query(
-            "UPDATE brain_observations SET embedding = $1::vector, embedding_model = $2
-             WHERE id = $3",
-        )
-        .bind(pgvector::Vector::from(vector))
-        .bind(&model)
-        .bind(id)
-        .execute(pool)
-        .await;
-        match written {
-            Ok(_) => report.embedded += 1,
-            Err(e) => {
-                tracing::warn!(error = %e, obs_id = %id, "backfill: could not persist embedding");
+    let mut report = BackfillReport::default();
+    for table in [VectorTable::Observations, VectorTable::Episodes] {
+        let rows: Vec<(uuid::Uuid, String, String, String)> = sqlx::query_as(table.missing_sql())
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
+        report.attempted += rows.len();
+        for (id, content, entity_type, entity_name) in rows {
+            let vector = crate::embeddings::onnx::embed_passage_contextual(
+                &content,
+                &entity_type,
+                &entity_name,
+            )
+            .await;
+            let Ok(vector) = vector else {
                 report.failed += 1;
+                continue;
+            };
+            let written = sqlx::query(table.update_sql())
+                .bind(pgvector::Vector::from(vector))
+                .bind(&model)
+                .bind(id)
+                .execute(pool)
+                .await;
+            match written {
+                Ok(_) => report.embedded += 1,
+                Err(e) => {
+                    tracing::warn!(error = %e, row_id = %id, table = ?table, "backfill: could not persist embedding");
+                    report.failed += 1;
+                }
             }
         }
     }

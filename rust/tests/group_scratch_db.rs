@@ -25,3 +25,5 @@ mod v043_calibration_and_export_read_what_was_written;
 mod v044_a_migration_recorded_in_crlf_still_starts;
 #[path = "group_scratch_db/v044_a_new_app_role_does_not_get_a_published_password.rs"]
 mod v044_a_new_app_role_does_not_get_a_published_password;
+#[path = "group_scratch_db/v048_an_episode_that_lost_its_vector_gets_it_back.rs"]
+mod v048_an_episode_that_lost_its_vector_gets_it_back;

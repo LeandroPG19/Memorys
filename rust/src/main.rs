@@ -82,11 +82,7 @@ Docs: https://github.com/LeandroPG19/cuba-memorys",
 async fn drain_background_tasks() {
     let lost = memory_industry::tasks::drain(DRAIN_TIMEOUT).await;
     if lost > 0 {
-        tracing::error!(
-            lost,
-            "background tasks did not finish before shutdown — some embeddings \
-             were not persisted; recover with cuba_zafra action=reembed"
-        );
+        tracing::error!(lost, "{}", memory_industry::tasks::LOST_AT_SHUTDOWN);
     }
 }
 
