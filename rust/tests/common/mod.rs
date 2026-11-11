@@ -114,9 +114,10 @@ fn template_key() -> String {
 /// so the builder closes its only pool, seals with ALLOW_CONNECTIONS false (which keeps new
 /// sessions out), waits until `pg_stat_activity` shows nobody on it and only then publishes under
 /// the final name. `pool.close()` returns once the Terminate message is sent, not once the backend
-/// has exited: 10-nov-2026 two builds in a row failed their RENAME with 55006 on a judge at 14
-/// cores of 24, and the server's log of that run was lost, so who stayed connected is not known
-/// (the wait names it if it happens again). STRATEGY FILE_COPY is not used: it
+/// has exited, and it can return with a connection still open in the pool's idle queue (see
+/// `close_and_seal`): 10-nov-2026 two builds in a row failed their RENAME with 55006 on a judge at
+/// 14 cores of 24, and the session the wait named was that connection's last `after_release`
+/// query. STRATEGY FILE_COPY is not used: it
 /// forces a checkpoint, 0.86-3.4 s per clone against 0.11-0.37 s with the default WAL_LOG.
 async fn the_template(url: &str) -> &'static str {
     TEMPLATE.get_or_init(|| build_the_template(url)).await
@@ -203,6 +204,12 @@ pub async fn close_and_seal(
     within: Duration,
 ) -> Result<(), String> {
     pool.close().await;
+    // sqlx-core 0.8.6 (`pool/inner.rs:97-115`): `close()` empties the idle queue once per permit
+    // and never after the last wait, so a connection that was being returned (its `after_release`
+    // still running) lands in the queue just as it releases the permit `close()` waits for, and
+    // stays open for as long as a `Pool` lives. Dropping the last handle drops `PoolInner` with
+    // its queue and closes that socket.
+    drop(pool);
     run(
         admin,
         &format!("ALTER DATABASE {database} WITH ALLOW_CONNECTIONS false"),
