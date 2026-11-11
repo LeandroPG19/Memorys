@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::db;
 use crate::handlers;
 
@@ -428,23 +429,7 @@ fn server_info(params: Option<&Value>) -> Value {
     })
 }
 
-pub async fn run_mcp() -> Result<()> {
-    let database_url = crate::setup::resolve_database_url().await;
-
-    let (pool, connected) = match db::create_pool(&database_url).await {
-        Ok(pool) => {
-            db::assert_embedding_dim(&pool).await?;
-            (pool, true)
-        }
-        Err(why) => {
-            tracing::warn!(
-                error = %format!("{why:#}"),
-                "starting without PostgreSQL — tools will fail until it is reachable"
-            );
-            (db::create_lazy_pool(&database_url), false)
-        }
-    };
-
+pub async fn run_mcp(database_url: String, pool: PgPool, connected: bool) -> Result<()> {
     let rem_handle = connected.then(|| {
         let rem_pool = pool.clone();
         tokio::spawn(async move {
