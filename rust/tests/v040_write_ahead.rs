@@ -263,7 +263,7 @@ async fn contexto_recall_includes_entity_from_this_session_write() {
 /// finished: the vector is there when `drain` comes back, not "soon". `is_model_loaded()` is asked after
 /// the `episode_add`, so that this test is not the one that opens the model: the handler is.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs DATABASE_URL and the ONNX embedding model; the judge runs it in the --ignored section (D2)"]
 async fn an_episode_has_its_vector_when_the_drain_returns() {
     let _graph_db = own_the_environment().await;
     let pool = pool().await;

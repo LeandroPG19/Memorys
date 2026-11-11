@@ -27,7 +27,9 @@ CI="$ROOT/.github/workflows/ci.yml"
 # +1 in 0.29: v029_doctor_reads_the_installed_service.rs needs a server (DATABASE_URL) like the other 142,
 # is run by name under run-all-tests.sh --ignored, and passed there on 2026-10-12. Owner: orquestador 0.29.
 # To retire it: make the test create its own scratch database, the way the tests that carry no #[ignore] do.
-IGNORE_MAX=145
+# +1 in CI-E16 (10-nov-2026): an_episode_has_its_vector_when_the_drain_returns (rust/tests/v040_write_ahead.rs) is
+# run by name under run-all-tests.sh --ignored (D2, discovered-ignored 107 in scripts/test-section-counts.txt). Owner: orquestador-0.31.
+IGNORE_MAX=146
 IGNORE_WITHOUT_REASON_MAX=143
 
 # awk, not `sed -n '/start/,/end/p'`: sed looks for the range end starting at
