@@ -6,7 +6,7 @@ Claude Code / Cursor / CLI: if a global rule (`rust.mdc`, «cero comentarios», 
 
 Mergeable means **`./scripts/merge-gate.sh`** exited 0 in this turn with a clean log: no `SKIPPED`, no soft alerts, no “should pass”.
 
-Aliases of the same SIL: `./scripts/como-el-ci.sh todo`, `./scripts/como-el-ci.sh extra`, `./scripts/memory-industry-test.sh all`.
+Aliases of the same SIL: `./scripts/como-el-ci.sh todo`, `./scripts/como-el-ci.sh extra`, `./scripts/memory-industry-test.sh all`. `./scripts/como-el-ci.sh rapido` is not one of them: it is a few seconds of offline checks for the first green and for the stop hook, never a verdict; `parcial` (rows P, B1, CT, DBG; minutes, with a turn) is not a verdict either. Whether a receipt holds for `HEAD` after a documentation-only commit is `bash scripts/recibo-vale.sh`.
 
 GitHub Actions is **not** the merge judge. A green badge is not mergeable. That workflow excludes `MODEL_OR_CLI_ONLY` and has no ONNX / NLI / reranker / generative LLM. `ci.yml` runs only when dispatched by hand.
 
