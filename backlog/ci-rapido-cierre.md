@@ -80,8 +80,8 @@
   - Tras 12 corridas del 10-nov no existe el fichero en `~/.cache/ci-tiempos/memory-industry/20261110/`.
   - B:1025 decía «nace con CI-E4» y no nació.
   - Bloquea CI-E2 (punto 12), la marca de intermitente y D-F5e.
-- [ ] **12.** **CI-E2** · coste por test y cuota de los 10 más caros. B:1009, 1025. Depende del punto 11. Lleva la decisión de los números en el recibo (punto 92). 60 / 2. — **NOTA 10-nov 20:10:** CI-E2 especificada 20:07; pasada 1 en curso (Memorys-ci-e2). Decisión 92a: el coste no va en el recibo del tag (D-E2i)
-- [ ] **13.** **CI-E3 y L1–L3** · segundos por autotest con techo; paralelizar los casos del autotest de `merge-gate.sh` (62 → 71 s tras CI-E15). B:1009, 1025, 1076. Los datos ya están medidos. 60–90 / 3. — **NOTA 10-nov 20:09:** CI-E3 especificada; E3c en curso (Memorys-ci-e3); no hay autotest duplicado que quitar
+- [ ] **12.** **CI-E2** · coste por test y cuota de los 10 más caros. B:1009, 1025. Depende del punto 11. Lleva la decisión de los números en el recibo (punto 92). 60 / 2. — **NOTA 10-nov 20:10:** CI-E2 especificada 20:07; pasada 1 en curso (Memorys-ci-e2). Decisión 92a: el coste no va en el recibo del tag (D-E2i) — **NOTA 10-nov 22:07:** CI-E2 vista en rojo (13) y verde (70 de 70), fusionada ba43ec5; falta el juez (bloque del veredicto)
+- [ ] **13.** **CI-E3 y L1–L3** · segundos por autotest con techo; paralelizar los casos del autotest de `merge-gate.sh` (62 → 71 s tras CI-E15). B:1009, 1025, 1076. Los datos ya están medidos. 60–90 / 3. — **NOTA 10-nov 20:09:** CI-E3 especificada; E3c en curso (Memorys-ci-e3); no hay autotest duplicado que quitar — **NOTA 10-nov 22:07:** CI-E3c vista en rojo y verde, autotest 48-71 s → 24 s, fusionada 16d7d9a; E3a/E3b (segundos por autotest con techo) sin hacer
 - [x] **14.** **CI-E5** · regresión por punto de cambio. B:1009, 1025. Necesita historial (10 corridas por modo). Después. — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
 - [ ] **15.** **(H)** `mutants_seed_prune` no borra los `<clave>.tmp-<pid>` de un pid muerto (`scripts/mutants-gate.sh:690-693`). Anotado en B:875 («después de F6»), nunca abierto. 20–40 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: mutants_seed_prune borra los <clave>.tmp-<pid> de pid muerto del mismo usuario; autotest verde; falta el juez.
 - [ ] **16.** **CI-E7b** · J de DBG y B3 desde barridos fiables. B:1031, 1212; E7.spec:205-227. Depende del punto 39. 45 / lo de los barridos.
@@ -104,7 +104,7 @@
   - [ ] **25c.** La pasada del mejorador de F2a/F2b nunca se hizo (B:478).
 - [ ] **26.** **(H)** `pasos.jsonl` no lleva `jobs` por paso (D-F3s). Menor. 15 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: pasos.jsonl lleva jobs (los que el paso recibió, o null); falta el juez.
 - [ ] **27.** **(H)** Hueco en `validar-handoff.sh:567-571`: una nota del implementador con `commit: none` pasa sin coste ni `written`/`frozen` (D-E6e). Así pasaron E13, E14, E15, E18 y E21. 40 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: una nota del implementador a otro rol que nombra tests lleva segundos:. Los cinco traspasos de hoy (E13, E14, E15, E18, E21) dejan de pasar hasta que tengan su línea con los segundos medidos: se miden en la cadena de la noche.
-- [ ] **28.** **R-A1-3** · stdout atascado: `runtime.shutdown_timeout` (B:1055; E10.spec:387). Sin identificador y fuera de B:1212. Prioridad baja. 30 / 2.
+- [ ] **28.** **R-A1-3** · stdout atascado: `runtime.shutdown_timeout` (B:1055; E10.spec:387). Sin identificador y fuera de B:1212. Prioridad baja. 30 / 2. — **NOTA 10-nov 22:07:** ES CI-E31: runtime.shutdown_timeout(1 s) en main.rs, rojo y verde vistos, 0 rojas de 9 sesiones vivas con el binario arreglado, fusionada 099c03f; falta el juez
 - [ ] **29.** **M0 y A2** del segundo perfil del camino crítico. B:1047, 1049. Fuera de B:1212. 30 + 45 / 5.
   - [ ] **29a.** M0: hora por sección dentro de cada fila (`$EPOCHREALTIME`).
   - [ ] **29b.** A2: carriles dentro de E2E (−17 a −19 s); espera a la medida de M0.
@@ -127,7 +127,7 @@
 
 ## (B) Verificaciones y medidas por correr
 
-- [ ] **37.** **Dos vueltas seguidas del `todo` sobre el SHA final** (`verificacion.md`; P:420; F3.spec:803). El par verde es de `0bd4421`; después cambió `scripts/` (`e6a68f9`, `a28d946`) y sobre `5bec0b6` hay una sola corrida (565 s). El SHA vuelve a cambiar con E12, E16 y E26: va al final. 5 / 2×10 compartida.
+- [ ] **37.** **Dos vueltas seguidas del `todo` sobre el SHA final** (`verificacion.md`; P:420; F3.spec:803). El par verde es de `0bd4421`; después cambió `scripts/` (`e6a68f9`, `a28d946`) y sobre `5bec0b6` hay una sola corrida (565 s). El SHA vuelve a cambiar con E12, E16 y E26: va al final. 5 / 2×10 compartida. — **NOTA 10-nov 22:07:** veredicto de 18:30 invalidado como prueba de estabilidad (tres intermitentes con la máquina entera); bloque mi-noche-b2 encolado: dos vueltas sobre la cabeza del lote
 - [ ] **38.** **Blindaje de esta noche** (B:1114, 1212). — **EN CURSO 10-nov 19:00:** cadena de la noche escrita y revisada (noche/: noche.sh, sabotajes.sh, ab.sh, medidas.py, 56 parches que aplican limpios con git apply --check, 13 filas sin parche con su porqué). Bloque 1 exclusivo a las ~19:45; bloque 2 tras las 3 h de Mapupita.
   - [ ] **38a.** 16 sabotajes de CI-E10: la fase `c` de `CR/medir-e10.sh` no ha corrido nunca. 60–70 compartida.
   - [ ] **38b.** **(H)** S-A1-4, S-B2-3 y la mitad E2E de S-A1-1 no los cubre el guion. 15 / 10.
@@ -135,8 +135,8 @@
   - [ ] **38d.** **(H)** 3 sabotajes de CI-E21 (`ci-rapido-E21.yml`), fuera de la lista. 15 / 5.
   - [ ] **38e.** **(H)** Sabotajes reales de E11 (S6b, S8, S14, S15) y el escenario E11-16. 15 / 20–30.
   - [ ] **38f.** **(H)** Sabotajes de CI-E1 en el árbol real (corridas A y B, S-R4, S-C1–5); hay que rederivarlos tras E11. 20 / 15–20.
-  - [ ] **38g.** Antes y después de CI-E10 con A/B intercalados (B:1143). 5 / 15–20 en exclusiva.
-  - [ ] **38h.** ABBA serie/DAG (B:1005; F3.spec:854). 10 / unos 50 en exclusiva.
+  - [x] **38g.** Antes y después de CI-E10 con A/B intercalados (B:1143). 5 / 15–20 en exclusiva. — **HECHO 10-nov 22:07:** A/B intercalado en exclusiva 20:00: tools/list 1,160 → 0,660 s, +0,507 s por par, IC95 [+0,452, +0,564]
+  - [ ] **38h.** ABBA serie/DAG (B:1005; F3.spec:854). 10 / unos 50 en exclusiva. — **NOTA 10-nov 22:07:** corrida 20:16-20:41: las cuatro vueltas rojas (tres intermitentes); no vale como medida; se repite con el lote estable
     - **(H)** La etiqueta `juez-0.31-serie` de P:359 no existe.
     - `CR/campana-final.sh:184` no calcula el IC95 por bootstrap ni el n de P:418.
   - [ ] **38i.** Humo de quality-gate (`--study full`, 8–15) y estudio Q2 (`QG_BASE=v0.30.0 … --study legacy`, 3,5–4,5 h en exclusiva, tope de 6 h). B:895, 1005.
@@ -187,7 +187,7 @@
 - [ ] **52.** Sin reproducir ni causa.
   - [ ] **52a.** `gate-cluster.sh --self-test` rc=1 con carga (B:1076, 1090).
   - [ ] **52b.** El directorio temporal perdido de F6c.3 (B:999, 1027).
-  - [ ] **52c.** La causa raíz de CI-E21 (B:1178; depende del punto 6).
+  - [x] **52c.** La causa raíz de CI-E21 (B:1178; depende del punto 6). — **HECHO 10-nov 22:07:** causa raíz: Pool::close() de sqlx-core 0.8.6 deja abierta la conexión a media devolución mientras viva el Pool; CI-E32 (drop tras close), rojo y verde vistos, fusionada 0e5eca3
   - [ ] **52d.** El `cgroup.kill` real con `comm` de CI-E15, solo ejercitado con fixture (B:1176).
 - [ ] **53.** Menores de E10. 10 / 0.
   - [ ] **53a.** La cuenta de la fila E2E contra los 180,7 s del 8-nov (E10.spec §6).
