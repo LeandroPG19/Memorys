@@ -3,7 +3,7 @@
 # says the same). rust/tests/ci_contract.rs compares this list with the lock in both directions: a new duplicate, a
 # changed count and a line whose crate is no longer duplicated are all red, and the test names each one.
 base64 3 0.13.1 by spm_precompiled; 0.22.1 by sqlx-core, sqlx-postgres, tiktoken-rs; 0.23.1 by hyper-util, pem, reqwest
-bit-vec 2 0.6.3 by bit-set; 0.9.1 by yasna
+bit-vec 2 0.8.0 by bit-set; 0.9.1 by yasna
 block-buffer 2 0.10.4 by digest; 0.12.1 by digest
 cpufeatures 2 0.2.17 by sha2; 0.3.1 by chacha20, sha1, sha2
 crypto-common 2 0.1.7 by digest; 0.2.2 by digest

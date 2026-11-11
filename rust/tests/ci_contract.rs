@@ -564,6 +564,121 @@ fn a_test_file_that_needs_a_server_says_so_where_ci_reads_it() {
     );
 }
 
+/// The first line of a test file whose plain tests open a model (a `tokenizer.json`, an ONNX session),
+/// with the reason after the colon (CI-D4). The check job of ci.yml has no models and leaves those files
+/// out by reading this line, the way it does for `NEEDS_A_SERVER`; the local gate runs them in its plain
+/// pass, which exports the model paths, and without the models they fail and do not pass empty.
+const NEEDS_THE_MODELS: &str = "// needs-the-models:";
+
+/// The files that must carry `NEEDS_THE_MODELS`. Unlike a scratch database, which two helpers give away,
+/// opening a model has no call to look for, so the file is named: a file that starts to open a model joins
+/// this list in the same edit.
+const LOADS_A_MODEL: [&str; 1] = ["model_parity"];
+
+/// The files whose first line and whose duty disagree, each with what is wrong: a file of `LOADS_A_MODEL`
+/// without the marker, which the check job would run and fail; or the marker with no reason after it.
+fn models_marker_problems(files: &[(String, String)]) -> Vec<String> {
+    files
+        .iter()
+        .filter_map(|(name, body)| {
+            let first = body.lines().next().unwrap_or("").trim_end();
+            let reason = first.strip_prefix(NEEDS_THE_MODELS).map(str::trim);
+            let loads_a_model = LOADS_A_MODEL.contains(&name.as_str());
+            match (reason, loads_a_model) {
+                (None, true) => Some(format!(
+                    "{name}: opens a model in a plain test and does not open with \
+                     `{NEEDS_THE_MODELS} <why>`"
+                )),
+                (Some(""), _) => Some(format!(
+                    "{name}: {NEEDS_THE_MODELS} with nothing after it; say which model and why"
+                )),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn the_models_marker_check_fails_on_each_way_a_file_can_disagree() {
+    let plain = "#[test]\nfn plain() {}\n";
+    let rows: [(&str, String, bool); 8] = [
+        (
+            "model_parity",
+            format!("{NEEDS_THE_MODELS} it reads three tokenizers\n{plain}"),
+            false,
+        ),
+        (
+            "model_parity",
+            format!("{NEEDS_THE_MODELS} it reads three tokenizers\r\n{plain}"),
+            false,
+        ),
+        ("a_file_that_opens_no_model", plain.to_string(), false),
+        ("model_parity", plain.to_string(), true),
+        ("model_parity", format!("{NEEDS_THE_MODELS}\n{plain}"), true),
+        (
+            "model_parity",
+            format!("//! a file\n{NEEDS_THE_MODELS} too late for ci.yml to read\n{plain}"),
+            true,
+        ),
+        (
+            "another_file",
+            format!("{NEEDS_THE_MODELS}   \n{plain}"),
+            true,
+        ),
+        (
+            "another_file",
+            format!("{NEEDS_THE_MODELS} says which model\n{plain}"),
+            false,
+        ),
+    ];
+
+    for (name, body, flagged) in rows {
+        let problems = models_marker_problems(&[(name.to_string(), body)]);
+        assert_eq!(
+            !problems.is_empty(),
+            flagged,
+            "{name}: expected {}, got {problems:?}",
+            if flagged { "a problem" } else { "none" }
+        );
+    }
+}
+
+#[test]
+fn a_test_file_that_needs_the_models_says_so_where_ci_reads_it() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let files: Vec<(String, String)> = test_file_stems()
+        .into_iter()
+        .filter(|stem| stem != "ci_contract")
+        .map(|stem| {
+            let body = root_and_modules(&dir, &stem);
+            (stem, body)
+        })
+        .collect();
+
+    assert!(
+        files
+            .iter()
+            .any(|(name, _)| LOADS_A_MODEL.contains(&name.as_str())),
+        "the scan found none of {LOADS_A_MODEL:?} in rust/tests, and the guard of CI-D4 lives in them. \
+         A check that found nothing to check would pass for any tree"
+    );
+    let problems = models_marker_problems(&files);
+    assert!(
+        problems.is_empty(),
+        "these test files and their first line disagree:\n{}",
+        problems.join("\n")
+    );
+
+    let yaml = ci_yaml();
+    let reads_the_marker = format!("== '{NEEDS_THE_MODELS}'*");
+    assert!(
+        yaml.contains(&reads_the_marker),
+        "the check job of ci.yml has no models, and it has to leave out the files that open with \
+         `{NEEDS_THE_MODELS}` by reading that line (`{reads_the_marker}` on `head -n 1` of each file). \
+         Without it tests/model_parity.rs runs there and fails for want of the models"
+    );
+}
+
 const SELF_TEST_BEGIN: &str = "# --- self-test begin ---";
 const SELF_TEST_END: &str = "# --- self-test end ---";
 
