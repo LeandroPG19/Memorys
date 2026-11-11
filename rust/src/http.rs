@@ -3718,6 +3718,61 @@ mod tests {
         );
     }
 
+    /// CI-D5c (B.5). Which generation the stored vectors are and how many are still of another one
+    /// is an inventory of the machine, like the models: the full scope sees it, an anonymous
+    /// caller sees the verdict in `status` and nothing else, and `status` itself does not move
+    /// (a database of another generation still answers searches, so it is not «degraded»).
+    #[tokio::test]
+    async fn health_shows_the_vector_generation_only_to_the_full_scope() {
+        use crate::embeddings::backfill::{TableCoverage, VectorCoverage, set_last_coverage};
+        const CURRENT: &str = "multilingual-e5-small@onnxruntime-1.31.1";
+        let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
+        let state = state_with_clients(Some("s3cret"), &["editor-a"]);
+        let full_scope = || headers_with("authorization", "Bearer s3cret");
+
+        set_last_coverage(None);
+        let before = health_body(state.clone(), full_scope()).await;
+        assert!(
+            before["runtime"].get("vectors").is_none(),
+            "nothing has been counted yet, and a number nobody measured is not shown: {before}"
+        );
+
+        set_last_coverage(Some(VectorCoverage {
+            tag: CURRENT.to_string(),
+            observations: TableCoverage {
+                total: 12,
+                missing: 0,
+                stale: 7,
+            },
+            ..VectorCoverage::default()
+        }));
+        let full = health_body(state.clone(), full_scope()).await;
+        let anonymous = health_body(state, HeaderMap::new()).await;
+        set_last_coverage(None);
+
+        let vectors = &full["runtime"]["vectors"];
+        assert_eq!(vectors["tag"], CURRENT);
+        assert_eq!(vectors["stale"], 7);
+        assert_eq!(vectors["missing"], 0);
+        assert_eq!(
+            vectors["command"], "memory-industry reembed",
+            "the block says what to run, not only what is wrong"
+        );
+        assert_eq!(
+            full["status"], before["status"],
+            "vectors of another generation do not degrade the verdict"
+        );
+
+        assert!(
+            anonymous.get("runtime").is_none(),
+            "the runtime block is the inventory an anonymous caller does not get: {anonymous}"
+        );
+        assert!(
+            !anonymous.to_string().contains("onnxruntime-1.31.1"),
+            "nor does the label of the runtime leak somewhere else: {anonymous}"
+        );
+    }
+
     #[tokio::test]
     async fn health_without_a_configured_token_still_names_them() {
         let state = state_with_clients(None, &["editor-a"]);

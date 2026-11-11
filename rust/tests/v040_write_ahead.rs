@@ -308,7 +308,7 @@ async fn an_episode_has_its_vector_when_the_drain_returns() {
         );
         assert_eq!(
             model.as_deref(),
-            Some(memory_industry::embeddings::onnx::current_model().as_str()),
+            Some(memory_industry::embeddings::onnx::vector_tag().as_str()),
             "a vector was written, so its label must name the model that produced it"
         );
     } else {

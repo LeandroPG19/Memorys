@@ -595,8 +595,10 @@ async fn the_judge_measures_the_runtime_the_installer_downloads() {
         loaded,
         pinned,
         "this judge loads ONNX Runtime {loaded} (ORT_DYLIB_PATH = {:?}) and `memory-industry models runtime` installs \
-         {pinned}: the vectors above are measured on a runtime nobody installs. Install the pinned one with \
-         `memory-industry models runtime` and run again, or point ORT_DYLIB_PATH at a {pinned} library",
+         {pinned}: the vectors above are measured on a runtime nobody installs. The judge loads ONNX Runtime from \
+         GATE_RUNTIME_HOME (default ~/.cache/memory-industry-gate/runtime-home), never from the cache of the live service: \
+         fill it with `HOME=<GATE_RUNTIME_HOME> memory-industry models runtime` (a plain `memory-industry models runtime` \
+         would replace the runtime of the service) and run again, or point ORT_DYLIB_PATH at a {pinned} library inside it",
         std::env::var("ORT_DYLIB_PATH").ok()
     );
 }

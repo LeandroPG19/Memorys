@@ -3305,3 +3305,102 @@ mod onnx_runtime_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod embedding_coverage_tests {
+    use super::*;
+    use crate::embeddings::backfill::{TableCoverage, VectorCoverage};
+
+    const CURRENT: &str = "multilingual-e5-small@onnxruntime-1.31.1";
+
+    fn with_observations_of_another_generation(stale: i64) -> VectorCoverage {
+        VectorCoverage {
+            tag: CURRENT.to_string(),
+            observations: TableCoverage {
+                total: 10,
+                missing: 0,
+                stale,
+            },
+            ..VectorCoverage::default()
+        }
+    }
+
+    /// CI-D5c (B.4). A vector counts as current only when its label is the model and the runtime
+    /// loaded now, so after the runtime changes every stored vector is «of another generation»
+    /// until `reembed` rewrites it. `doctor` says how many, what they were made with and the one
+    /// command that fixes it, as a warning (the search still answers, see the spec's §2.3), and
+    /// reminds that the snapshot `reembed` keeps is not meant to stay forever.
+    #[test]
+    fn the_coverage_check_names_the_generation_and_the_order() {
+        let clean =
+            embedding_coverage_checks(&with_observations_of_another_generation(0), None, None);
+        assert_eq!(clean.len(), 1, "nothing pending and no snapshot: one row");
+        assert_eq!(clean[0].name, "embedding_coverage");
+        assert_eq!(clean[0].status, Status::Ok);
+        assert!(
+            clean[0].detail.contains(CURRENT),
+            "the healthy row says which generation every vector belongs to: {}",
+            clean[0].detail
+        );
+
+        let pending = embedding_coverage_checks(
+            &with_observations_of_another_generation(7),
+            Some("multilingual-e5-small"),
+            None,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "embedding_coverage");
+        assert_eq!(
+            pending[0].status,
+            Status::Warn,
+            "a database of another generation still answers searches: a warning, never a failure"
+        );
+        for wanted in ["7", CURRENT, "multilingual-e5-small"] {
+            assert!(
+                pending[0].detail.contains(wanted),
+                "the detail has to carry {wanted:?}: {}",
+                pending[0].detail
+            );
+        }
+        assert!(
+            pending[0]
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("memory-industry reembed")),
+            "and the hint is the command that rewrites them: {:?}",
+            pending[0].hint
+        );
+
+        let kept =
+            embedding_coverage_checks(&with_observations_of_another_generation(0), None, Some(40));
+        assert_eq!(kept.len(), 2, "a snapshot of 40 days adds its own row");
+        assert_eq!(
+            kept[0].status,
+            Status::Ok,
+            "and does not touch the coverage row"
+        );
+        assert_eq!(kept[1].name, "reembed_snapshot");
+        assert_eq!(kept[1].status, Status::Warn);
+        assert!(
+            kept[1].detail.contains("40"),
+            "it says how old it is: {}",
+            kept[1].detail
+        );
+        assert!(
+            kept[1]
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("memory-industry reembed --drop-snapshot")),
+            "and how it is dropped: {:?}",
+            kept[1].hint
+        );
+
+        let recent =
+            embedding_coverage_checks(&with_observations_of_another_generation(0), None, Some(3));
+        assert_eq!(
+            recent.len(),
+            1,
+            "a snapshot of three days is the safety net doing its job, not something to warn about"
+        );
+    }
+}

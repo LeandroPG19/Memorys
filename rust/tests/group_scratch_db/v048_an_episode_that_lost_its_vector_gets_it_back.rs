@@ -18,7 +18,7 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use crate::common::in_a_scratch_database;
-use memory_industry::embeddings::onnx::{current_model, embedding_dim, is_model_loaded};
+use memory_industry::embeddings::onnx::{embedding_dim, is_model_loaded, vector_tag};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::io::AsyncWriteExt;
@@ -251,7 +251,7 @@ fn the_tool_reply(stdout: &[u8]) -> Value {
 #[tokio::test]
 async fn reembed_gives_an_episode_its_vector_by_the_rule_of_observations() {
     assert!(is_model_loaded(), "{NEEDS_A_MODEL}");
-    let model = current_model();
+    let model = vector_tag();
     in_a_scratch_database("e22_reembed", |url| {
         reembed_repairs_episodes_like_observations(url, model)
     })
@@ -513,7 +513,7 @@ async fn without_a_model_the_episode_stays_as_it_was(url: String) {
 #[tokio::test]
 async fn the_reembed_command_repairs_the_episodes() {
     assert!(is_model_loaded(), "{NEEDS_A_MODEL}");
-    let model = current_model();
+    let model = vector_tag();
     in_a_scratch_database("e22_cmd_all", |url| {
         the_command_repairs_an_episode_next_to_an_observation(url, model)
     })
@@ -596,7 +596,7 @@ async fn the_command_repairs_an_episode_with_no_observation_pending(url: String)
 #[tokio::test]
 async fn backfill_fills_the_episodes_and_does_not_repeat() {
     assert!(is_model_loaded(), "{NEEDS_A_MODEL}");
-    let model = current_model();
+    let model = vector_tag();
     in_a_scratch_database("e22_backfill", |url| {
         the_backfill_takes_its_limit_from_each_table(url, model)
     })

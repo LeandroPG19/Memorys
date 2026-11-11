@@ -1321,6 +1321,28 @@ mod tests {
         unsafe { std::env::remove_var("CUBA_EMBED_CONCURRENCY") };
     }
 
+    /// CI-D5c (B.1). A stored vector says which model and which ONNX Runtime made it, because
+    /// 1.26.0 and 1.31.1 do not compute the same numbers (measured on 11 Nov: up to 1.4e-3 in
+    /// `1 - cos`) and two vectors under one label have to be interchangeable. The three strings
+    /// are written by hand, not built the way the function under test builds them.
+    #[test]
+    fn the_vector_tag_names_the_model_and_the_runtime_that_made_it() {
+        assert_eq!(
+            vector_tag_of("multilingual-e5-small", Some("1.31.1")),
+            "multilingual-e5-small@onnxruntime-1.31.1"
+        );
+        assert_eq!(
+            vector_tag_of("e5-small", Some("1.26.0")),
+            "e5-small@onnxruntime-1.26.0",
+            "the runtime is part of the label whatever the model is called"
+        );
+        assert_eq!(
+            vector_tag_of("multilingual-e5-small", None),
+            "multilingual-e5-small",
+            "with no runtime loaded there is nothing to name, and no vector is written either"
+        );
+    }
+
     /// The file name `locate_onnxruntime` searches for, written once for the
     /// fixtures instead of once per test.
     ///

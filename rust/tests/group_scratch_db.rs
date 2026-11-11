@@ -1,4 +1,4 @@
-// needs-a-server: nine modules that create and drop their own database where DATABASE_URL points, cloned from the migrated template (common) or empty (empty_db)
+// needs-a-server: ten modules that create and drop their own database where DATABASE_URL points, cloned from the migrated template (common) or empty (empty_db)
 //
 // The scratch-database files with no process state, in one test binary: see group_no_server.rs for
 // why and for what a module may not do. This root is the one ci.yml reads the first line of, so the
@@ -27,3 +27,5 @@ mod v044_a_migration_recorded_in_crlf_still_starts;
 mod v044_a_new_app_role_does_not_get_a_published_password;
 #[path = "group_scratch_db/v048_an_episode_that_lost_its_vector_gets_it_back.rs"]
 mod v048_an_episode_that_lost_its_vector_gets_it_back;
+#[path = "group_scratch_db/v051_vectors_of_another_runtime.rs"]
+mod v051_vectors_of_another_runtime;
