@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ort::environment::Environment;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use std::path::PathBuf;
@@ -234,8 +235,8 @@ fn init_session(model_dir: &std::path::Path) -> Result<()> {
 
     // A factory, not a builder: if the GPU provider refuses to start we
     // need a second, clean builder for the CPU path.
-    let make_builder = || {
-        Session::builder()
+    let make_builder = |environment: &Environment| {
+        Session::builder(environment)
             .map_err(|e| anyhow::anyhow!("session builder: {e}"))?
             .with_intra_threads(intra_threads())
             .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?

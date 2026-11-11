@@ -1,5 +1,6 @@
 use crate::search::cache::TtlLruCache;
 use anyhow::{Context, Result};
+use ort::environment::Environment;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use std::path::PathBuf;
@@ -396,8 +397,8 @@ fn intra_threads() -> usize {
 fn init_onnx_session(model_file: &std::path::Path, model_dir: &std::path::Path) -> Result<()> {
     // A factory, not a builder: if the GPU provider refuses to start we
     // need a second, clean builder for the CPU path.
-    let make_builder = || {
-        Session::builder()
+    let make_builder = |environment: &Environment| {
+        Session::builder(environment)
             .map_err(|e| anyhow::anyhow!("session builder: {e}"))?
             .with_intra_threads(intra_threads())
             .map_err(|e| anyhow::anyhow!("intra threads: {e}"))?
@@ -694,8 +695,8 @@ pub async fn model_loaded() -> bool {
     )
 }
 
-/// What the first attempt to load ONNX Runtime answered, and the library it
-/// opened, for the life of the process.
+/// What the first attempt to load ONNX Runtime answered, and the library and
+/// the `Environment` it opened, for the life of the process.
 ///
 /// One attempt and not one per caller: the embedder, the reranker and NLI all
 /// reach `load_onnxruntime` from their own threads, and `get_or_init` holds
@@ -705,7 +706,18 @@ pub async fn model_loaded() -> bool {
 ///
 /// The library is kept here, loaded, so the module `ort::init_from` asks the
 /// loader for a moment later is the one this crate already opened and checked.
-static RUNTIME: OnceLock<std::result::Result<libloading::Library, String>> = OnceLock::new();
+///
+/// The `Environment` is here too, and it is the only one the process will
+/// have: since rc.14 every session is built from one, and `build` refuses a
+/// second for good (`only one environment is allowed per process`), even
+/// after the first is dropped. It lives beside the runtime because this is
+/// the one place that already runs once per process, and `gpu::open` hands it
+/// to each factory, so a session cannot be built before the runtime is
+/// loaded: the type does not let it. It is never dropped, so `ort` does not
+/// release it at exit, as the sessions in the statics beside it are not
+/// either; CI-E31 and the E2E watch that the process still leaves with 0.
+static RUNTIME: OnceLock<std::result::Result<(libloading::Library, Environment), String>> =
+    OnceLock::new();
 
 /// Loads ONNX Runtime from `path` before any session opens.
 ///
@@ -713,43 +725,60 @@ static RUNTIME: OnceLock<std::result::Result<libloading::Library, String>> = Onc
 /// `ort` reads an empty path as none and loads the bare `onnxruntime.dll`,
 /// which on Windows is the Windows ML build in System32, and `ort::init_from`
 /// answers `Ok` for any path once some library is loaded.
-pub(crate) fn load_onnxruntime(path: &std::path::Path) -> Result<()> {
+///
+/// Answers the process's one `Environment`, which every session opens through.
+pub(crate) fn load_onnxruntime(path: &std::path::Path) -> Result<&'static Environment> {
     anyhow::ensure!(
         !path.as_os_str().is_empty(),
         "the ONNX Runtime library path is empty: point ORT_DYLIB_PATH at the library file or \
          unset it and run `memory-industry models runtime`"
     );
     match RUNTIME.get_or_init(|| load_onnxruntime_once(path).map_err(|e| format!("{e:#}"))) {
-        Ok(_) => Ok(()),
+        Ok((_library, environment)) => Ok(environment),
         Err(reason) => Err(anyhow::anyhow!("{reason}")),
     }
 }
 
 /// Opens and checks the library first, and only hands `ort` a library that
-/// passed.
+/// passed; then builds the process's one `Environment` from it.
 ///
-/// `ort` 2.0.0-rc.12 cannot report a library that does not load: it hangs
-/// the calling thread forever. `load_dylib_from_path` runs inside the `Once`
-/// of `G_ORT_LIB`; when the load fails it builds an `ort::Error`, and
-/// `Error::new` calls `ort::api()`, which calls `setup_api`, which calls
-/// `load_dylib_from_path` again and waits on the same `Once` its own thread
-/// holds. Measured with cdb on the hung daemon: the embedder or reranker
+/// `ort` 2.0.0-rc.12 could not report a library that did not load: it hung
+/// the calling thread forever. `load_dylib_from_path` ran inside the `Once`
+/// of `G_ORT_LIB`; when the load failed it built an `ort::Error`, and
+/// `Error::new` called `ort::api()`, which called `setup_api`, which called
+/// `load_dylib_from_path` again and waited on the same `Once` its own thread
+/// held. Measured with cdb on the hung daemon: the embedder or reranker
 /// thread in that wait, NLI queued behind it, warm-up never ending. Every
-/// early return of that loader goes the same way — the file is not a library,
-/// it has no `OrtGetApiBase`, or its version is older than `ort` accepts — so
-/// all three are checked here, where a failure is an ordinary `Err`.
+/// early return of that loader went the same way — the file is not a library,
+/// it has no `OrtGetApiBase`, or its version is older than `ort` accepts.
+/// rc.13 fixed it (pykeio/ort 17ed727): `init_from` answers a
+/// `LoadDynamicError` and never calls `ort::api()` on that path. The check
+/// stays, for what `ort` does not give: an error that names the file and the
+/// way out (`models runtime`, `ORT_DYLIB_PATH`), which is what `/health`
+/// redacts and shows, and no library kept by `ort` that this crate did not
+/// open first.
 ///
 /// The path is made absolute first so both loads resolve the same file: `ort`
 /// reads a relative path against the executable's directory, the search that
 /// found it read it against the working directory.
-fn load_onnxruntime_once(path: &std::path::Path) -> Result<libloading::Library> {
+///
+/// The environment is built here with telemetry off. ONNX Runtime builds from
+/// Microsoft send telemetry events unless told not to (`with_telemetry` in
+/// `ort`); this is the one place where that is said, and it is inert on the
+/// builds that send none. A failure to build it is an error of the load, like
+/// any other: no session opens, and the answer is kept like the rest. Its
+/// text names the environment and not the path, so `/health` has no second
+/// place to redact.
+fn load_onnxruntime_once(path: &std::path::Path) -> Result<(libloading::Library, Environment)> {
     let path = std::path::absolute(path)
         .with_context(|| format!("resolving the ONNX Runtime path {}", path.display()))?;
     let library = open_runtime_library(&path)?;
-    ort::init_from(&path)
-        .map(drop)
-        .map_err(|e| anyhow::anyhow!("loading ONNX Runtime from {}: {e}", path.display()))?;
-    Ok(library)
+    let environment = ort::init_from(&path)
+        .map_err(|e| anyhow::anyhow!("loading ONNX Runtime from {}: {e}", path.display()))?
+        .with_telemetry(false)
+        .build()
+        .map_err(|e| anyhow::anyhow!("creating the ONNX Runtime environment: {e}"))?;
+    Ok((library, environment))
 }
 
 /// `OrtGetApiBase` as `ort-sys` declares it.
@@ -811,10 +840,11 @@ fn minor_version(version: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// The runtime `locate_onnxruntime` found, loaded. `ort` keeps the first
-/// library it loads for the life of the process, so the calls after the first
-/// cost a search and nothing else.
-pub(crate) fn load_located_onnxruntime() -> Result<()> {
+/// The runtime `locate_onnxruntime` found, loaded, and the `Environment` the
+/// process opens its sessions through. `ort` keeps the first library it loads
+/// for the life of the process, so the calls after the first cost a search and
+/// nothing else.
+pub(crate) fn load_located_onnxruntime() -> Result<&'static Environment> {
     let runtime = locate_onnxruntime().context(
         "no ONNX Runtime library found: run `memory-industry models runtime` or point \
          ORT_DYLIB_PATH at the library",

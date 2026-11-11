@@ -191,8 +191,10 @@ fn two_sessions_of_one_process_open_through_the_single_environment() {
         None,
         "algo abrió el embedder en este binario: sin el hueco vacío, lo que sigue no prueba nada"
     );
-    let make_builder =
-        || ort::session::Session::builder().map_err(|e| anyhow::anyhow!("session builder: {e}"));
+    let make_builder = |environment: &ort::environment::Environment| {
+        ort::session::Session::builder(environment)
+            .map_err(|e| anyhow::anyhow!("session builder: {e}"))
+    };
     for which in ["first", "second"] {
         memory_industry::gpu::open(make_builder, embedder, |_builder| Ok(())).unwrap_or_else(|e| {
             panic!(
@@ -266,8 +268,10 @@ async fn warming_up_leaves_the_reranker_ready() {
         None,
         "algo abrió la NLI en este binario: sin el hueco vacío, lo que sigue no prueba nada"
     );
-    let make_builder =
-        || ort::session::Session::builder().map_err(|e| anyhow::anyhow!("session builder: {e}"));
+    let make_builder = |environment: &ort::environment::Environment| {
+        ort::session::Session::builder(environment)
+            .map_err(|e| anyhow::anyhow!("session builder: {e}"))
+    };
     let refused = memory_industry::gpu::open(make_builder, nli, |_builder| {
         Err::<(), _>(anyhow::anyhow!("commit refused k3-4718"))
     });
