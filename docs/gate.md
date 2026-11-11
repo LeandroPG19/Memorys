@@ -458,6 +458,9 @@ contracts) and `lane_E` (the E2E, the doctor, the MCP live session and the eval 
   be measured (then with one job). The run is recorded with the mode that ran. So the first run of a table, every run
   with an operator's `DATABASE_URL` and every run outside a delegated cgroup (outside `pesado`, and on Windows) is a
   series.
+- A planner born inside the `juez` an earlier planner left (the shell that ran that judge is still in it) reuses it when no
+  `gate-dag.py run` is alive in it and no `paso-*` of its parent holds processes, and says `dag: scope: reusing`; otherwise it
+  runs in series and says why (CI-J17, CI-E35).
 - Before the first row the planner measures the machine, with the same count `gate_cargo_jobs` makes, and
   prints its plan in one line: `plan: nproc=… cgroup_cpu=… ram_free=… GiB disk_free=… GB battery=… jobs=N
   (gate|operator|failed) asked=<serie|auto|maximo> runs=<serie|dag>`, followed by the reason in
