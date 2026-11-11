@@ -2757,6 +2757,94 @@ require_generative_llm "tests that need a generative LLM (extract / relation-sca
              -- --ignored --nocapture
 }
 
+# CI-G1 (spec ci-rapido-G1): the call of lane R that loads the real reranker (4.3 GB, 61 s of the 63-89 s of the row on the CPU, 450 to
+# 540 CPU-s) runs on the card of the machine when the judge admits it, and no other call does: DBG, D2, NLI, E and the other two
+# calls of R load the runtime of the CPU, which is the one model_parity and the placement check judge. The verdict is the one of the
+# CPU (same tests, same counts: check_section_lines judges them in every run), and what changes is the device: the log says which in
+# `=== models device: <gpu|cpu|unmanaged> for v017_rerank_gpu (<why>) ===`, and test-times.sh judges the time with that device's
+# ceiling. Admitted when, in this order:
+#   1. gate_gpu_probe (gate-lock.sh) says candidate: a card, two runtimes of one version and the libraries of CUDA;
+#   2. the lock of the card (GATE_GPU_LOCK, /tmp/gpu-juez.lock) is free. flock -n: a judge never waits for the card, it runs on the
+#      CPU and says who had it;
+#   3. the plan of the product, asked of the release binary itself (`--version` writes the line `resource plan` before it parses
+#      anything), puts the reranker on the card with the memory free now. The admission is the product's (resources::plan), not a
+#      copy of its constants, and the line is read here and not printed: plan_rc of the planner judges the plans of the log.
+# GATE_GPU=gpu turns any "not admitted" of the three into a red, so a measure of the card cannot fall to the CPU unseen.
+# On the card the call runs with prefix assignments, never an export (CI-J5: the names of the models are set in one place), two
+# threads (the product's own value for a reranker on the card) and inside the ceiling of the CPU line of the same binary: a run on
+# the card that is slower than the CPU one is a hung card. The memory is not capped from here: v017 refuses the arena variables.
+# A call on the card that ends red says the memory the card had at the admission and has now.
+rerank_on_the_card() {
+  local ceiling="$1" rc=0
+  shift
+  ORT_DYLIB_PATH="$GATE_GPU_ORT" LD_LIBRARY_PATH="$GATE_GPU_LIBS" CUBA_RERANK_INTRA_THREADS=2 \
+    timeout -k 10 "$ceiling" "$@" || rc=$?
+  if (( rc == 0 )); then
+    return 0
+  fi
+  if (( rc == 124 )); then
+    echo "FAIL: the GPU run of v017_rerank_gpu passed the CPU ceiling of $ceiling s (test-time-ceilings.txt) and was stopped: a GPU run slower than the CPU one is a hung GPU" >&2
+  fi
+  echo "GPU memory: ${GATE_GPU_VRAM_FREE_MB:-unknown} MiB free at admission, $(gate_gpu_free_now) MiB free now" >&2
+  return 1
+}
+
+# Sets REL_DEVICE (gpu, cpu or unmanaged) and REL_DEVICE_WHY, and REL_CEILING and REL_LOCK_FD when it is gpu.
+rerank_device() {
+  local lock="${GATE_GPU_LOCK:-/tmp/gpu-juez.lock}" owner plan_out vram rc=0
+  REL_DEVICE=cpu REL_DEVICE_WHY="" REL_CEILING="" REL_LOCK_FD=""
+  gate_gpu_probe
+  REL_DEVICE_WHY="$GATE_GPU_WHY"
+  if [[ "$GATE_GPU_DECISION" == unmanaged ]]; then
+    REL_DEVICE=unmanaged
+    return 0
+  fi
+  [[ "$GATE_GPU_DECISION" == candidate ]] || return 0
+  REL_CEILING="$(awk '$1 == "linux" && $2 == "v017_rerank_gpu" { print $4; exit }' "$ROOT/scripts/test-time-ceilings.txt" 2>/dev/null || true)"
+  if [[ ! "$REL_CEILING" =~ ^[0-9]+$ ]]; then
+    REL_DEVICE_WHY="test-time-ceilings.txt has no line 'linux v017_rerank_gpu', so there is no ceiling to stop a hung GPU with"
+    return 0
+  fi
+  # The group keeps the 2>/dev/null to the open: on `exec` itself it would stay on the shell, and silence the rest of the lane.
+  if ! { exec {REL_LOCK_FD}>>"$lock"; } 2>/dev/null; then
+    REL_DEVICE_WHY="the GPU lock $lock cannot be opened"
+    return 0
+  fi
+  flock -n "$REL_LOCK_FD" || rc=$?
+  if (( rc != 0 )); then
+    owner="$(head -n 1 "$lock" 2>/dev/null || true)"
+    REL_DEVICE_WHY="the GPU is held by ${owner:-another judge}"
+    if (( rc != 1 )); then REL_DEVICE_WHY="the GPU lock $lock could not be taken (flock exit $rc)"; fi
+    exec {REL_LOCK_FD}>&-
+    REL_LOCK_FD=""
+    return 0
+  fi
+  printf '%s %s %s\n' "${ROOT##*/}" "$$" "$(date -u +%FT%TZ)" >"$lock"
+  plan_out="$(ORT_DYLIB_PATH="$GATE_GPU_ORT" LD_LIBRARY_PATH="$GATE_GPU_LIBS" "$REL_BIN" --version 2>&1 || true)"
+  if grep -qE 'reranker=[^ ]+ \(GPU\)' <<<"$plan_out"; then
+    REL_DEVICE=gpu
+    return 0
+  fi
+  vram="$(sed -n 's/.*"vram_free_mb":\([0-9]*\).*/\1/p' <<<"$plan_out" | head -n 1)"
+  REL_DEVICE_WHY="the product's plan keeps the reranker off the GPU: vram_free_mb=${vram:-unknown}"
+  exec {REL_LOCK_FD}>&-
+  REL_LOCK_FD=""
+}
+
+# The call of lane R that loads the real reranker, on the device rerank_device chose. One run_counted call: the section is counted once.
+lane_R_reranker_model() {
+  local -a runner=()
+  rerank_device
+  echo "=== models device: $REL_DEVICE for v017_rerank_gpu ($REL_DEVICE_WHY) ==="
+  if [[ "$REL_DEVICE" == cpu && "${GATE_GPU:-auto}" == gpu ]]; then
+    echo "FAIL: GATE_GPU=gpu and the GPU was not admitted: $REL_DEVICE_WHY" >&2
+    exit 1
+  fi
+  if [[ "$REL_DEVICE" == gpu ]]; then runner=(rerank_on_the_card "$REL_CEILING"); fi
+  run_counted reranker-model 1 ${runner[@]+"${runner[@]}"} cargo test --release --features docs,cuda --test v017_rerank_gpu --timings -- --ignored --nocapture
+  if [[ -n "$REL_LOCK_FD" ]]; then exec {REL_LOCK_FD}>&-; fi
+}
+
 # The release build carries --features docs,cuda, the set that publish.yml publishes on Linux x64 (CI-K8, D-K8e, D-K8f:
 # written out, so the build does not depend on what the default is, and a contract holds it equal to the published one).
 # Without cuda, gpu::wants_gpu() returns false
@@ -2869,7 +2957,7 @@ run_counted placement-table 0 cargo test --release --features docs,cuda --lib gp
 
 require_present "reranker tests (release: 387s in debug, seconds here)" \
   "$CUBA_RERANKER_PATH/model.onnx" \
-  run_counted reranker-model 1 cargo test --release --features docs,cuda --test v017_rerank_gpu --timings -- --ignored --nocapture
+  lane_R_reranker_model
 
 check_section_lines
 
