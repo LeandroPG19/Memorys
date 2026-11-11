@@ -17,6 +17,39 @@
 # that leaves the baseline takes its comment with it, and regenerating names
 # both. Everything above the next line is rewritten by the script.
 # Regenerate with: ./scripts/quality-gate.sh --update-lizard-baseline
+# CI-E28 (10-nov-2026): the judge's own python, gate-dag.py and gate_usl.py, as run_lizard measures a .py of the diff (the
+# root as the cwd, the path as `git diff` names it, ceiling 8, with radon absent). They were not here, so a diff that touched
+# either left the second judge at exit 2 over 25 functions that were already there. These are the numbers of that day:
+# exact, so the next increase is red and so is a decrease the file does not follow. Not split here: that is the mejorador's.
+# --update-lizard-baseline measures rust/src only and drops these lines (it names them): put them back with
+# lizard --csv scripts/gate-dag.py scripts/gate_usl.py and the rule of this file. mcp_live_session_test.py::main#1 (CC 44)
+# is not here either: it is not a file of the judge, and nobody asked for it.
+# Owner: mejorador 0.31.
+scripts/gate-dag.py::admission#1 15
+scripts/gate-dag.py::battery_state#1 10
+scripts/gate-dag.py::check_reader_profile#1 10
+scripts/gate-dag.py::check_resource_kinds#1 10
+scripts/gate-dag.py::check_target_order#1 15
+scripts/gate-dag.py::finish#1 11
+scripts/gate-dag.py::measure_machine#1 9
+scripts/gate-dag.py::parse_row#1 15
+scripts/gate-dag.py::plan_problem#1 14
+scripts/gate-dag.py::plan_rc#1 12
+scripts/gate-dag.py::remove_cgroup#1 12
+scripts/gate-dag.py::step_env#1 11
+scripts/gate-dag.py::sweep_old_run_dirs#1 11
+scripts/gate_usl.py::__init__#2 15
+scripts/gate_usl.py::_base_filas#1 12
+scripts/gate_usl.py::_buscar#1 13
+scripts/gate_usl.py::_calibrar#1 19
+scripts/gate_usl.py::_correr#1 9
+scripts/gate_usl.py::_motivo#1 10
+scripts/gate_usl.py::_recta_ram#1 10
+scripts/gate_usl.py::_usar_corridas#1 9
+scripts/gate_usl.py::cmd_barrido#1 17
+scripts/gate_usl.py::holguras#1 12
+scripts/gate_usl.py::recomendar#1 11
+scripts/gate_usl.py::simular#1 19
 src/bridge/mod.rs::cli_reconnect#1 9
 src/bridge/proxy.rs::a_body_over_eight_mib_is_refused_without_calling_the_host#1 10
 src/calibrate_cli.rs::run_cli#1 20

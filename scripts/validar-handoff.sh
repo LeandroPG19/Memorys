@@ -362,7 +362,7 @@ coste_traspaso() { # <fichero.yml> <commit> [ruta...] -> 0 si esta, 1 si falta o
   done
 
   if (( ${#segundos[@]} == 0 )); then
-    echo "FALTA segundos: un traspaso del implementador con commit lleva, dentro de 'evidence: |' y en su propia linea sangrada,"
+    echo "FALTA segundos: un traspaso del implementador con commit, o una nota suya a otro rol que nombra tests, lleva, dentro de 'evidence: |' y en su propia linea sangrada,"
     echo "  segundos: <S> s; <orden acotada que corrio los tests nuevos>[; <su ultima linea>]"
     echo "En una 'evidence:' de una sola linea no cuenta, y en columna 0 seria una clave mas."
     mal=1
@@ -372,7 +372,9 @@ coste_traspaso() { # <fichero.yml> <commit> [ruta...] -> 0 si esta, 1 si falta o
     if [[ -n "$problema" ]]; then echo "$problema"; mal=1; fi
   done
 
-  mapfile -t tocados < <(toca_el_juez "$commit" "$@")
+  # Sin commit no hay contra que diffear: una nota no dice que toca el juez (CI-E28), y sus lineas `carril:` no se juzgan.
+  tocados=()
+  [[ "$commit" == "none" ]] || mapfile -t tocados < <(toca_el_juez "$commit" "$@")
   if (( ${#tocados[@]} > 0 )); then
     ids="$(filas_dag)"
     if (( ${#carriles[@]} == 0 )); then
@@ -559,10 +561,23 @@ exento_por_lista() { # <fichero.yml>
   return 0
 }
 
-# Dos traspasos se juzgan por su coste: del especificador al implementador (su spec,
-# de cualquier type) y del implementador con git_handoff y commit (sus segundos y,
-# si toca el juez, su carril). La nota del implementador, el mejorador, el
-# endurecedor y el especificador hacia otro rol no entregan tests que medir.
+# CI-E28: lo que el traspaso del implementador llama tests: un fichero de rust/tests, el recuento de las secciones
+# (scripts/test-section-counts.txt, que sube con cada binario que gana tests) o un --self-test. Es lo que distingue la
+# nota que ENTREGA tests (la pasada roja, que el orquestador commitea despues: commit none) de la que dice «un test parece
+# incorrecto», que no nombra ninguno y va al especificador.
+nombra_tests() { # <task> <evidence> <fichero.yml> -> 0 si alguno de los tres textos nombra tests
+  local n
+  n="$({ printf '%s\n%s\n' "$1" "$2"; evidencia "$3"; } | grep -Ec 'rust/tests/[A-Za-z0-9_./-]+\.rs|test-section-counts\.txt|self-test' || true)"
+  (( ${n:-0} > 0 ))
+}
+
+# Tres traspasos se juzgan por su coste: del especificador al implementador (su spec,
+# de cualquier type), del implementador con git_handoff y commit (sus segundos y,
+# si toca el juez, su carril) y, desde CI-E28, la nota o el git_handoff sin commit
+# del implementador a un rol que no es el especificador cuando nombra tests (sus
+# segundos: el hueco de D-E6e, por el que pasaron cinco traspasos sin coste). La nota
+# del implementador al especificador, el mejorador, el endurecedor y el especificador
+# hacia otro rol no entregan tests que medir.
 juzgar_coste() { # <fichero.yml> <from> <to> <type> <commit> <task> <evidence> [ruta...]
   local path="$1" from="$2" to="$3" tipo="$4" commit="$5" task="$6" evidence="$7" alcance="" salida rc=0 exencion ex=0
   shift 7
@@ -570,6 +585,8 @@ juzgar_coste() { # <fichero.yml> <from> <to> <type> <commit> <task> <evidence> [
     alcance=spec
   elif [[ "$from" == "implementador" && "$tipo" == "git_handoff" && "$commit" != "none" ]]; then
     alcance=traspaso
+  elif [[ "$from" == "implementador" && "$to" != "especificador" ]] && nombra_tests "$task" "$evidence" "$path"; then
+    alcance=nota
   fi
   [[ -n "$alcance" ]] || return 0
   if [[ "$alcance" == "spec" ]]; then

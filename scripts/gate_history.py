@@ -14,7 +14,9 @@ an illegible manifest is exit 2. What was not measured is written as null, never
 is diagnosis only.
 
 Library use (the planner and the contract tests): run_start, step_start, step_end, units,
-run_end, lower_bounds, camino_critico, leer_jsonl, usl_point, keep_timings, solape_s, serie_final. `anon_max` of a step is its anonymous memory plus the pages its
+run_end, lower_bounds, camino_critico, leer_jsonl, usl_point, keep_timings, solape_s, serie_final. The planner writes
+`unidades.jsonl` and `flaky.jsonl` itself (CI-E28): `record_step` calls `units` on the log of every row that ended, was not stopped and
+shows a `Running` or `Doc-tests` header of cargo; a row that ran no test binary (fmt, clippy, the audits) asks nothing of `test-times.sh`. `anon_max` of a step is its anonymous memory plus the pages its
 tmpfs holds (`shmem`): what is charged to the scope and cannot be reclaimed without swap. CLI (the serial writer): `registrar`, a JSON manifest on stdin.
 
 CI-E4: a step and a run also carry `nucleos` (CPU seconds over the seconds of the step, over the T of the run) and
@@ -283,6 +285,7 @@ def _paso(
     timings: dict[str, Any] | None = None,
     solape_s: float | None = None,
     sin_medida: dict[str, str] | None = None,
+    jobs: int | None = None,
 ) -> None:
     """A step's line. A time nobody gave is null: the registrar never invents one."""
     corrida.cpus.append(cpu_s)
@@ -312,6 +315,7 @@ def _paso(
             "psi": psi,
             "timings": timings,
             "solape_s": _r(solape_s),
+            "jobs": jobs,
             "sin_medida": motivos,
         },
     )
@@ -336,9 +340,10 @@ def step_end(
     timings: dict[str, Any] | None = None,
     solape_s: float | None = None,
     sin_medida: dict[str, str] | None = None,
+    jobs: int | None = None,
 ) -> None:
     """The library's own step: a missing inicio or fin is the module clock's. `sin_medida` is the reason of each null the caller
-    knows (D-E4h)."""
+    knows (D-E4h). `jobs` is the CARGO_BUILD_JOBS the step was given, None for a row that names none (D-F3s)."""
     _paso(
         corrida,
         paso,
@@ -356,6 +361,7 @@ def step_end(
         timings,
         solape_s,
         sin_medida,
+        jobs,
     )
 
 

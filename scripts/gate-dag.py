@@ -151,6 +151,20 @@ def read_text(path: str) -> str | None:
         return None
 
 
+# CI-E28: a binary of tests prints, in every shape test-times.sh reads, the header cargo gives it (`Running tests/x.rs (...)`,
+# `Running unittests src/lib.rs (...)`, `Doc-tests crate`) and a summary with its time (`... finished in 0.31s`). A row whose
+# log lacks either ran no test (fmt, clippy, the audits) or is not a cargo log, and asking `test-times.sh` about it is a bash
+# for nothing and a `history:` warning for a log that was never one: the fake steps of the planner's contracts print a
+# header and a result with no time, and the stand-ins of merge-gate.sh's self-test print the time with no header.
+TEST_BINARY_RE = re.compile(r"^\s*(Running|Doc-tests) ", re.MULTILINE)
+TEST_TIME_RE = re.compile(r"finished in [0-9.]+s")
+
+
+def ran_test_binaries(log: str) -> bool:
+    text = read_text(log)
+    return text is not None and TEST_BINARY_RE.search(text) is not None and TEST_TIME_RE.search(text) is not None
+
+
 def read_kv(path: str) -> dict[str, int] | None:
     text = read_text(path)
     if text is None:
@@ -1231,14 +1245,19 @@ class Planner:
         named = named_jobs(step)
         return row_jobs(named, self.jobs_cap) if self.solo else share_jobs(named, self.jobs_cap)
 
+    def jobs_of(self, step: Step) -> int | None:
+        """The CARGO_BUILD_JOBS the step is given, which `step_env` sets and the history records (D-F3s): None for a row that names none."""
+        return self.cargo_jobs(step) if named_jobs(step) else None
+
     def step_env(self, step: Step, token: str | None = None) -> dict[str, str]:
         tmp = os.path.join(self.run_dir, "tmp", step.id)
         os.makedirs(tmp, exist_ok=True)
         env = dict(os.environ)
         env["TMPDIR"] = tmp
         env.update(step.env)
-        if named_jobs(step):
-            env["CARGO_BUILD_JOBS"] = str(self.cargo_jobs(step))
+        jobs = self.jobs_of(step)
+        if jobs is not None:
+            env["CARGO_BUILD_JOBS"] = str(jobs)
         targets = [r[len("target:"):] for r in step.recursos if r.startswith("target:")]
         if targets:
             env["CARGO_TARGET_DIR"] = target_dir(targets[0])
@@ -1484,7 +1503,10 @@ class Planner:
             timings=timings,
             solape_s=step.solape_s,
             sin_medida=step.sin_medida,
+            jobs=self.jobs_of(step),
         )
+        if step.log and not step.parado and ran_test_binaries(step.log):
+            gate_history.units(self.corrida, step.paso, step.log)
 
     # verdict
 

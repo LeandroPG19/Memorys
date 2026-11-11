@@ -1884,6 +1884,13 @@ while [[ "${1:-}" == --lane ]]; do
   esac
   shift 2
 done
+# CI-E28: what is left after the lanes is nothing, or --check-models. Anything else used to start the whole judge, and the
+# argument was ignored: a misspelt --lane ran every lane. The modes with their own arguments (--print-paths, --check-fresh,
+# --check-eval, --check-counts, --self-test) are answered above, before this point.
+if [[ $# -gt 0 && "$1" != --check-models ]]; then
+  echo "FAIL: unknown argument: $1 (this script takes --lane <id> (repeatable, ids: ${DAG_LANES[*]}), --check-models, --print-paths, --check-fresh FILE, --check-eval JSON QUERIES_LINES, --check-counts SECTION LOG, --self-test, or nothing to run every lane)" >&2
+  exit 2
+fi
 
 # CI-F3.3b-1b-i: a lane the planner started presents its token and inherits, or exits 2 (gate-lock.sh).
 inherit_or_acquire_gate_lock "$GATE_LOCK" || exit $?
@@ -1994,7 +2001,8 @@ if [[ "$(free_gb)" -lt "$MIN_FREE_GB" ]]; then
   echo "      target directory currently holds: $(du -sh "$(gate_target_dir)" 2>/dev/null | cut -f1)" >&2
   echo "      Free it with: cargo clean --manifest-path $RUST_DIR/Cargo.toml" >&2
   echo "      (or raise the bar with CUBA_GATE_MIN_FREE_GB if you know what you are doing)" >&2
-  exit 1
+  # 2, like every refusal of the machine of this judge (gate_refuse): it is the environment, not a red of the product (CI-E28).
+  exit 2
 fi
 
 # --- the test counts (CI-J, D-J4b): the judgement is section_count_verdict, above --------

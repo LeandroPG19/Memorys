@@ -690,6 +690,10 @@ mutants_seed_inputs() { # the inputs the key is the hash of (D-F4d)
 mutants_seed_prune() { # keeps the two newest keys under the seed root, and only those
   find "$SEED_ROOT" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9a-f]{64}' -printf '%T@ %p\n' \
     | LC_ALL=C sort -rn | tail -n +3 | cut -d' ' -f2- | while IFS= read -r d; do rm -rf -- "$d"; done
+  # A build killed in the middle leaves its <key>.tmp-<pid> (mutants_seed_ensure) and nothing else ever removes it: gigabytes of
+  # dependencies. Only the ones of this user whose pid is gone; the one a live build is filling stays.
+  find "$SEED_ROOT" -mindepth 1 -maxdepth 1 -type d -user "$(id -u)" -regextype posix-extended -regex '.*/[0-9a-f]{64}\.tmp-[0-9]+' -print \
+    | while IFS= read -r d; do kill -0 "${d##*.tmp-}" 2>/dev/null || rm -rf -- "$d"; done
 }
 mutants_seed_ensure() {
   local key tmpdir pkg start left
