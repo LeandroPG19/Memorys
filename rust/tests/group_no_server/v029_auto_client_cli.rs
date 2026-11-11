@@ -8,9 +8,8 @@
 //! the resolver or the LAN sweep: each one gives it an address that verifies first (`--host`, or
 //! the last good one), and a verified answer ends the search there.
 //!
-//! "No bridge running" is a state whose loopback port refuses connections: a port this test
-//! reserved with a socket that never listens (`ClosedPort`). A refused connect answers at once
-//! (ci-rapido.md).
+//! "No bridge running" is a state whose loopback port refuses connections: the port of a listener
+//! this test bound and closed. A refused connect answers at once (ci-rapido.md).
 //!
 //! Unix only, like v029_bridge_cli.rs: the state file is `$HOME/.local/share/MemoryIndustry/bridge.json`.
 
@@ -107,26 +106,10 @@ fn new_pairing() -> Pairing {
     }
 }
 
-/// A loopback port nothing listens on, for as long as this value lives: a socket that is bound
-/// and never listens, so a connect to the port is refused at once. It is not a listener opened
-/// and dropped: while it lived it was in LISTEN, and a child process another test forks in that
-/// window keeps the LISTEN socket until its `execve`, so the binary this test runs could connect
-/// to it and find something that answers. Without SO_REUSEADDR nothing else can bind the port
-/// either. The test keeps the value until the binary has run.
-struct ClosedPort {
-    port: u16,
-    _bound: tokio::net::TcpSocket,
-}
-
-fn refused_port() -> ClosedPort {
-    let bound = tokio::net::TcpSocket::new_v4().expect("a socket to reserve a port with");
-    bound
-        .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("a free loopback port");
-    ClosedPort {
-        port: bound.local_addr().expect("its address").port(),
-        _bound: bound,
-    }
+/// A loopback port nothing listens on: bound, read, closed. A connect to it is refused at once.
+fn refused_port() -> u16 {
+    let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a free loopback port");
+    held.local_addr().expect("its address").port()
 }
 
 /// `bridge.json` from the documented field names, not with the production writer.
@@ -267,8 +250,7 @@ fn reconnect_con_host_y_sin_puente_en_marcha_verifica_guarda_y_sale_0() {
     let home = Home::new("reconnect-host");
     let pairing = new_pairing();
     let host = FakeHost::start(&pairing);
-    let closed = refused_port();
-    write_state(&home, &pairing, &[], None, closed.port);
+    write_state(&home, &pairing, &[], None, refused_port());
 
     let out = bridge(&home, &["reconnect", "--host", &host.addr.to_string()])
         .output()
@@ -312,8 +294,13 @@ fn reconnect_sin_host_y_sin_puente_en_marcha_encuentra_la_ultima_buena_y_sale_0(
     let home = Home::new("reconnect-plain");
     let pairing = new_pairing();
     let host = FakeHost::start(&pairing);
-    let closed = refused_port();
-    write_state(&home, &pairing, &[host.addr], Some(host.addr), closed.port);
+    write_state(
+        &home,
+        &pairing,
+        &[host.addr],
+        Some(host.addr),
+        refused_port(),
+    );
 
     let out = bridge(&home, &["reconnect"])
         .output()
@@ -337,8 +324,7 @@ fn reconnect_sin_host_y_sin_puente_en_marcha_encuentra_la_ultima_buena_y_sale_0(
 fn status_dice_que_no_hay_puente_en_marcha_cuando_su_puerto_no_contesta() {
     let home = Home::new("status-not-running");
     let pairing = new_pairing();
-    let closed = refused_port();
-    let port = closed.port;
+    let port = refused_port();
     write_state(&home, &pairing, &[], None, port);
 
     let out = bridge(&home, &["status"])

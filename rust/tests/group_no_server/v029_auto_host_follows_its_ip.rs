@@ -29,19 +29,12 @@ const NEW_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
 const WITHOUT_IP: Duration = Duration::from_secs(5);
 const WITH_IP: Duration = Duration::from_secs(10);
 
-/// A loopback port the host can bind. It is reserved with a socket that is bound and never
-/// listens: a listener opened and dropped here is in LISTEN while it lives, and a child process
-/// another test forks in that window keeps the LISTEN socket until its `execve`, so the host's
-/// bind on this port would fail with «address in use». A socket that never listened cannot
-/// block the host's bind, here or in a child's copy, because both ends set SO_REUSEADDR (tokio
-/// does on Unix).
 fn free_port() -> u16 {
-    let reserved = tokio::net::TcpSocket::new_v4().expect("a socket to reserve a port with");
-    reserved.set_reuseaddr(true).expect("SO_REUSEADDR");
-    reserved
-        .bind(at(Ipv4Addr::LOCALHOST, 0))
-        .expect("a free loopback port");
-    reserved.local_addr().expect("the reserved address").port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn at(ip: Ipv4Addr, port: u16) -> SocketAddr {
@@ -151,35 +144,12 @@ async fn answers(addr: SocketAddr, why: &str) {
     );
 }
 
-/// The address is closed: nothing that belongs to the host answers there. A bind would not
-/// show it (another test's client can hold the port), and neither does a bare connect: this
-/// binary runs ~100 tests at once and forks child processes, and between a child's `fork` and
-/// its `execve` it holds a copy of every socket of the process, so a listener the host has just
-/// closed still completes the handshake for a few milliseconds. What tells the two apart is what
-/// comes next, and it is read on a blocking socket on purpose: the tests that call this are
-/// `#[tokio::test]` on ONE thread, so while this blocks the host cannot `accept`. A listener of
-/// the host that is still open leaves the connection in its queue and the read times out; the
-/// copy in a child dies in the `execve` and the read ends in a close or a reset. A caller on a
-/// multi-thread runtime would let the host answer and this would pass on an open listener.
-fn refused(addr: SocketAddr, why: &str) {
-    use std::io::{ErrorKind, Read};
-
-    let closed = [ErrorKind::ConnectionRefused, ErrorKind::ConnectionReset];
-    let mut stream = match std::net::TcpStream::connect_timeout(&addr, GUARD) {
-        Ok(stream) => stream,
-        Err(e) if closed.contains(&e.kind()) => return,
-        Err(e) => panic!("{why}: connecting to {addr} gave {e:?}, not a refused connection"),
-    };
-    stream
-        .set_read_timeout(Some(GUARD))
-        .expect("a read timeout on a connected socket");
-    match stream.read(&mut [0u8; 1]) {
-        Ok(0) => {}
-        Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
-        other => panic!(
-            "{why}: {addr} accepted a connection and kept it open ({other:?}): \
-             something still listens there"
-        ),
+/// A refused connection, never a bind: a bind can fail because another test's client holds
+/// the port, and that would read as «the host still listens».
+async fn refused(addr: SocketAddr, why: &str) {
+    match TcpStream::connect(addr).await {
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+        other => panic!("{why}: connecting to {addr} gave {other:?}, not a refused connection"),
     }
 }
 
@@ -271,7 +241,8 @@ async fn the_host_follows_its_ip_and_loopback_never_stops_answering() {
     refused(
         at(OLD_IP, port),
         "the old address must be closed once the new one is published",
-    );
+    )
+    .await;
     answers(at(NEW_IP, port), "the new address answers once published").await;
     answers(loopback, "loopback keeps answering through the change").await;
 
@@ -322,7 +293,8 @@ async fn without_a_private_ip_it_serves_loopback_and_takes_the_ip_when_it_appear
     refused(
         at(OLD_IP, port),
         "nothing is bound on an IP the host was not given",
-    );
+    )
+    .await;
 
     *ip.lock().unwrap() = Some(OLD_IP);
     ticker.wake();
