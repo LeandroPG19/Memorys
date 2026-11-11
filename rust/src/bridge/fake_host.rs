@@ -77,7 +77,7 @@ pub(crate) fn tiny_timing() -> Timing {
 }
 
 pub(crate) fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::http_client::builder()
         .no_proxy()
         .build()
         .expect("a plain HTTP client")

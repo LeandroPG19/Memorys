@@ -243,7 +243,7 @@ fn timing() -> Timing {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+    memory_industry::http_client::builder()
         .no_proxy()
         .build()
         .expect("a plain HTTP client")

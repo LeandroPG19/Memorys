@@ -1056,7 +1056,7 @@ pub async fn announce_to_peers(pool: &PgPool) -> Result<u32> {
     }
 
     let token = peer_token_or_refuse()?;
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .build()
         .context("building the peer client")?;
     let node_id = crate::db::node_id(pool).await.ok();
@@ -1117,7 +1117,7 @@ async fn fetch(pool: &PgPool, args: &Value, conflict: &str, confirm: bool) -> Re
     };
     let token = peer_token_or_refuse()?;
 
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .build()
         .context("building the peer client")?;
 

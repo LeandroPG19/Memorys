@@ -52,7 +52,7 @@ pub fn client_config(public_url: &str, token: &str) -> String {
 }
 
 async fn probe_mcp(addr: &str) -> Option<reqwest::StatusCode> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;

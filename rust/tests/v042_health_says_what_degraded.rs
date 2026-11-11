@@ -191,7 +191,7 @@ async fn daemon() -> u16 {
     });
 
     let url = format!("http://127.0.0.1:{port}/connect");
-    let client = reqwest::Client::builder()
+    let client = memory_industry::http_client::builder()
         .timeout(PROBE_BUDGET)
         .build()
         .expect("a probe client with a bounded attempt");
@@ -231,7 +231,10 @@ async fn daemon() -> u16 {
 }
 
 async fn health(port: u16, token: Option<&str>) -> (u16, Value) {
-    let mut request = reqwest::Client::new().get(format!("http://127.0.0.1:{port}/health"));
+    let mut request = memory_industry::http_client::builder()
+        .build()
+        .expect("the HTTP client builds")
+        .get(format!("http://127.0.0.1:{port}/health"));
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }

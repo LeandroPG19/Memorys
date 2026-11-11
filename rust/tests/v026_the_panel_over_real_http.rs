@@ -82,7 +82,7 @@ async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
 /// waiting on it would fail a daemon that was working.
 async fn wait_until_it_serves(port: u16, daemon: &tokio::task::JoinHandle<()>) {
     let url = format!("http://127.0.0.1:{port}/health");
-    let client = reqwest::Client::builder()
+    let client = memory_industry::http_client::builder()
         .timeout(PROBE_BUDGET)
         .build()
         .expect("a probe client with a bounded attempt");
@@ -177,7 +177,9 @@ async fn daemon(panel: bool, public: bool) -> (sqlx::PgPool, u16) {
 }
 
 async fn rpc(port: u16, token: &str, method: &str) -> (u16, serde_json::Value) {
-    let client = reqwest::Client::new();
+    let client = memory_industry::http_client::builder()
+        .build()
+        .expect("the HTTP client builds");
     let r = client
         .post(format!("http://127.0.0.1:{port}/mcp"))
         .bearer_auth(token)
@@ -229,7 +231,9 @@ async fn a_peer_token_cannot_open_the_admin_surface() {
 async fn the_panel_route_stays_shut_unless_it_is_switched_on() {
     let _env = ENV_GUARD.lock().await;
     let (_pool, port) = daemon(false, false).await;
-    let client = reqwest::Client::new();
+    let client = memory_industry::http_client::builder()
+        .build()
+        .expect("the HTTP client builds");
 
     let off = client
         .get(format!("http://127.0.0.1:{port}/panel"))
@@ -261,7 +265,9 @@ async fn the_panel_route_stays_shut_unless_it_is_switched_on() {
 async fn the_panel_refuses_a_request_that_arrived_through_a_tunnel() {
     let _env = ENV_GUARD.lock().await;
     let (_pool, port) = daemon(true, false).await;
-    let client = reqwest::Client::new();
+    let client = memory_industry::http_client::builder()
+        .build()
+        .expect("the HTTP client builds");
 
     let direct = client
         .get(format!("http://127.0.0.1:{port}/panel"))

@@ -3511,7 +3511,11 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let answer = reqwest::get(format!("http://127.0.0.1:{port}/answers"))
+        let answer = crate::http_client::builder()
+            .build()
+            .expect("the HTTP client builds")
+            .get(format!("http://127.0.0.1:{port}/answers"))
+            .send()
             .await
             .expect("the layered router answers");
         assert_eq!(
@@ -3579,7 +3583,7 @@ mod tests {
         // The client outlasts the router deliberately: with the two budgets the
         // other way round, a layer that never fired would be cut by this
         // client's own clock and read as the layer working.
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .timeout(budget * 2)
             .build()
             .expect("a client that outlasts the router's budget");

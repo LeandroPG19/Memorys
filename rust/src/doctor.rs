@@ -454,7 +454,7 @@ async fn lan_facts(configured: String) -> LanFacts {
         Listen::Fixed(addr) => addr,
         Listen::Auto(_) => std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
     };
-    let health = match reqwest::Client::builder()
+    let health = match crate::http_client::builder()
         .timeout(LAN_HEALTH_BUDGET)
         .no_proxy()
         .build()
