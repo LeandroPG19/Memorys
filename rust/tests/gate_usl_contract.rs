@@ -338,10 +338,7 @@ impl Fx {
             .file_name()
             .and_then(|n| n.to_str())
             .expect("tree name");
-        let hash = format!(
-            "{:x}",
-            Sha256::digest(real.to_str().expect("utf-8").as_bytes())
-        );
+        let hash = hex::encode(Sha256::digest(real.to_str().expect("utf-8").as_bytes()));
         format!("{nombre}-{}", &hash[..12])
     }
 }
@@ -2042,7 +2039,7 @@ fn clave_de_tabla(texto: &str) -> String {
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect();
     filas.sort();
-    format!("{:x}", Sha256::digest(filas.join("\n").as_bytes()))
+    hex::encode(Sha256::digest(filas.join("\n").as_bytes()))
 }
 
 #[test]

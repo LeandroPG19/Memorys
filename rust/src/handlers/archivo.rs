@@ -460,4 +460,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&only_legacy_root);
     }
+
+    /// CI-D2: the two seals the chain writes into `brain_audit_log`, pinned to
+    /// values computed outside this crate.
+    ///
+    /// `v020_audit_hmac` rebuilds its expected hash with the same `sha2`, so it
+    /// rises and falls with the crate: a release of `sha2` or `hmac` that
+    /// changed one byte of either seal would have made `classify_hash` answer
+    /// `Neither` for every old row and no test would have said so. Calls the two
+    /// private functions, not `compute_hash`, which reads `CUBA_AUDIT_KEY` and the disk.
+    #[test]
+    fn the_audit_chain_reproduces_two_stamps_computed_apart() {
+        const PREV: &[u8] = b"\x01\x02\x03";
+        const ACTION: &str = "append";
+        const PAYLOAD: &[u8] = b"{\"a\":1}";
+        const STAMP: &str = "2026-08-11T00:00:00.000000+00:00";
+
+        // printf '\x01\x02\x03|append|{"a":1}|2026-08-11T00:00:00.000000+00:00' | sha256sum
+        assert_eq!(
+            hex::encode(compute_sha256(PREV, ACTION, PAYLOAD, STAMP)),
+            "2a79ab519b3b1a283e4048b4548948192e5c01b5064de95977ac4457952a27d2",
+            "the unkeyed chain is SHA-256 over prev|action|payload|stamp, byte for byte. Rows \
+             written by earlier releases are compared against this value"
+        );
+        // The same bytes through `openssl dgst -sha256 -mac HMAC -macopt key:a-real-secret`,
+        // cross-checked with python3 `hmac.new(b"a-real-secret", …, sha256)`.
+        assert_eq!(
+            hex::encode(compute_hmac(b"a-real-secret", PREV, ACTION, PAYLOAD, STAMP)),
+            "aef6dc75bf885c2096036bf5f4c1e8e376db6e527bc6cfd0d1047cc1135420fc",
+            "the keyed chain is HMAC-SHA-256 of the same bytes. A different value here makes \
+             `verify` report every row signed before the upgrade as broken"
+        );
+    }
 }
