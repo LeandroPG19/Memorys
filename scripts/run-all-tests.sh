@@ -391,7 +391,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
   # CI-F2 (D-F2i): the lane of a step is not inherited either (JUDGE_ENVIRONMENT).
   # CI-J9: nor the lane token. A row that spends a ticket sets it itself; a second gate that inherits
   # one is refused by name, and the self-test is red for a reason that is not the row's.
-  unset GATE_SERVER_SYSTEM_ID GATE_LANE CUBA_BINARY_PATH ONNX_MODEL_PATH CUBA_RERANKER_PATH CUBA_NLI_PATH \
+  # CI-D5c: nor ORT_DYLIB_PATH, which gate_refuse_the_users_runtime now reads: a foreign one is a runtime that is nothing.
+  unset GATE_SERVER_SYSTEM_ID GATE_LANE CUBA_BINARY_PATH ONNX_MODEL_PATH ORT_DYLIB_PATH CUBA_RERANKER_PATH CUBA_NLI_PATH \
     CUBA_EMBEDDING_DIM CUBA_GATE_LANE_TOKEN
   # D-J7b (A2): this self-test is hermetic. HOME and XDG_CACHE_HOME are a directory of its own,
   # removed on exit, so a row that does not give them one never reaches the real cache.

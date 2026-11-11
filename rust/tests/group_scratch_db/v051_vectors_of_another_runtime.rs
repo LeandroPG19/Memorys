@@ -23,7 +23,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::common::in_a_scratch_database;
@@ -32,9 +32,10 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use memory_industry::embeddings::backfill::vector_coverage;
 use memory_industry::embeddings::onnx::embedding_dim;
-use memory_industry::reembed_cli::{EmbedInput, Plan, REEMBED_LOCK, reembed, rollback};
+use memory_industry::reembed_cli::{EmbedInput, Plan, reembed, rollback};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 const BIN: &str = env!("CARGO_BIN_EXE_memory-industry");
@@ -774,7 +775,35 @@ async fn the_second_one_refuses(url: String) {
     let admin = connect_as_admin(&url).await;
     let world = a_world_of_the_old_runtime(&admin).await;
     let root = Scratch::new();
-    let snapshots = root.0.join("snapshots");
+    let first_root = root.0.join("first");
+    let second_root = root.0.join("second");
+
+    // «The other reembed» is a real one: it runs in a task and stops inside its encoder, on the
+    // first row, with the lock taken and nothing written. The barrier is the encoder itself, so
+    // the test holds no lock of its own and waits for no time.
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let pausing = {
+        let (entered, release, stopped) = (entered.clone(), release.clone(), stopped.clone());
+        move |_input: EmbedInput| -> BoxFuture<'static, Result<Vec<f32>>> {
+            let (entered, release, stopped) = (entered.clone(), release.clone(), stopped.clone());
+            async move {
+                if !stopped.swap(true, Ordering::SeqCst) {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                anyhow::Ok(flat(0.5))
+            }
+            .boxed()
+        }
+    };
+    let first = tokio::spawn({
+        let (pool, plan) = (admin.clone(), plan(&first_root));
+        async move { reembed(&pool, &plan, &pausing).await }
+    });
+    entered.notified().await;
+
     let before: Vec<String> = {
         let mut xmins = Vec::new();
         for (table, id, ..) in world.rows() {
@@ -782,21 +811,9 @@ async fn the_second_one_refuses(url: String) {
         }
         xmins
     };
-
-    // «The other reembed»: a connection that holds the advisory lock.
-    let mut holder = admin
-        .acquire()
-        .await
-        .expect("a connection for the first reembed");
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(REEMBED_LOCK)
-        .execute(&mut *holder)
-        .await
-        .expect("taking the lock of the reembed");
-
     let calls = Calls::default();
     let encode = calls.encoder();
-    let refusal = reembed(&admin, &plan(&snapshots), &encode)
+    let refusal = reembed(&admin, &plan(&second_root), &encode)
         .await
         .expect_err("a reembed while another one runs has to refuse");
     let said = format!("{refusal:#}");
@@ -805,7 +822,7 @@ async fn the_second_one_refuses(url: String) {
         "the refusal says another one is running: {said}"
     );
     assert!(
-        !snapshots.exists(),
+        !second_root.exists(),
         "it made no snapshot: the second one did nothing at all"
     );
     assert!(calls.seen().is_empty(), "and encoded nothing");
@@ -818,19 +835,23 @@ async fn the_second_one_refuses(url: String) {
         );
     }
 
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(REEMBED_LOCK)
-        .execute(&mut *holder)
+    release.notify_one();
+    let done = first
         .await
-        .expect("releasing the lock");
-    drop(holder);
-    let after = reembed(&admin, &plan(&snapshots), &encode)
-        .await
-        .expect("with the lock free the same reembed runs");
+        .expect("the first reembed was not cut")
+        .expect("the first reembed ends well once its encoder answers");
     assert_eq!(
-        after.total().rewritten,
+        done.total().rewritten,
         4,
-        "control: the refusal was about the lock and nothing else: {after:?}"
+        "control: the first one was a reembed like any other, so the refusal was about the lock: {done:?}"
+    );
+    let after = reembed(&admin, &plan(&second_root), &encode)
+        .await
+        .expect("with the lock free the same second reembed runs");
+    assert_eq!(
+        after.total().fetched,
+        0,
+        "and finds nothing left of the old generation: {after:?}"
     );
     admin.close().await;
 }

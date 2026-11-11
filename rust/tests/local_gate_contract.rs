@@ -4286,7 +4286,7 @@ fn the_judge_turns_onnx_runtime_telemetry_off_unless_the_caller_decided() {
 /// in a bash with a HOME of its own, so what is read is what it exports and not what this machine had in its cache.
 #[test]
 fn the_judge_loads_onnx_runtime_from_its_own_cache_and_never_from_the_users() {
-    let home = std::env::temp_dir().join(format!("gate-runtime-home-{}", std::process::id()));
+    let home = std::env::temp_dir().join(format!("gate-own-caches-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     let library = if cfg!(windows) {
         "onnxruntime.dll"
