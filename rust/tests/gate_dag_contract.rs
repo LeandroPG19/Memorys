@@ -2968,6 +2968,79 @@ fn a_planner_deletes_the_run_directories_of_more_than_seven_days_whose_planner_i
     );
 }
 
+/// CI-E25: the sweep of CI-E15 asks `os.getuid()` and `os.kill(pid, 0)`, and neither is there to ask in Windows: `os.getuid` does
+/// not exist, and `os.kill` with a signal that is not a console event ends the process it names (TerminateProcess, with the
+/// signal as its exit code), so asking whether a planner lives would kill it. A platform without `getuid`, or that is not
+/// `posix`, sweeps nothing and says so in one `note:`, and `make_run_dir` goes on. By hand, with three run directories (8 days
+/// with no pid, 9 days with the pid of a dead process, 6 days): with either guard down all three stay and `os.kill` is never
+/// called; on a platform with both the first two go, the third stays and nothing is said. The module is loaded, not run.
+const BODY_SWEEP_WITHOUT_POSIX: &str = r#"
+import contextlib, io, shutil, subprocess, tempfile, time
+root = tempfile.mkdtemp(prefix="e25-")
+
+def aged(name, days, pid=None):
+    path = os.path.join(root, name)
+    os.makedirs(os.path.join(path, "pasos"))
+    if pid is not None:
+        with open(os.path.join(path, "planner.pid"), "w", encoding="utf-8") as fh:
+            fh.write(f"{pid}\n")
+    when = time.time() - days * 24 * 3600
+    os.utime(path, (when, when))
+    return path
+
+dead = subprocess.Popen(["true"])
+dead.wait()
+old = aged("memory-industry-dag.old000", 8)
+old_dead = aged("memory-industry-dag.dead00", 9, dead.pid)
+young = aged("memory-industry-dag.young0", 6)
+kills = []
+real_kill, real_getuid, real_name = os.kill, os.getuid, os.name
+
+def counting_kill(pid, sig):
+    kills.append((pid, sig))
+    real_kill(pid, sig)
+
+def sweep():
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        dag.sweep_old_run_dirs(root)
+    return [line for line in out.getvalue().splitlines() if line.startswith("note:")]
+
+def nothing_went(why, notes):
+    assert all(os.path.isdir(d) for d in (old, old_dead, young)), f"{why}: a run directory was deleted"
+    assert kills == [], f"{why}: os.kill was called {kills}"
+    assert len(notes) == 1 and notes[0].startswith("note: the run directories of earlier runs are not swept"), f"{why}: the notes are {notes}"
+
+os.kill = counting_kill
+try:
+    del os.getuid
+    nothing_went("no os.getuid", sweep())
+    with contextlib.redirect_stdout(io.StringIO()):
+        made = dag.make_run_dir()
+    assert os.path.isfile(os.path.join(made, "planner.pid")), "make_run_dir with no os.getuid made no run directory"
+    shutil.rmtree(made)
+    os.getuid = real_getuid
+    os.name = "nt"
+    nothing_went("os.name nt", sweep())
+    os.name = real_name
+    notes = sweep()
+finally:
+    os.kill, os.getuid, os.name = real_kill, real_getuid, real_name
+assert notes == [], f"a posix platform with getuid says {notes}"
+assert not os.path.exists(old) and not os.path.exists(old_dead), "the posix sweep no longer deletes the run directories of more than 7 days whose planner is gone"
+assert os.path.isdir(young), "the posix sweep deleted a run directory of 6 days"
+assert len(kills) == 1 and kills[0][1] == 0, f"the posix sweep asks the one planner.pid it has with signal 0: {kills}"
+shutil.rmtree(root)
+print("sweep without posix ok")
+"#;
+
+/// CI-E25: see `BODY_SWEEP_WITHOUT_POSIX`.
+#[test]
+fn a_platform_without_getuid_or_posix_sweeps_no_run_directory_and_says_so_in_one_note() {
+    let out = property_of(BODY_SWEEP_WITHOUT_POSIX);
+    assert!(out.contains("sweep without posix ok"), "{out}");
+}
+
 /// J14c: `anon` does not see the pages a tmpfs holds (`shmem`), which the postgres of each lane writes under the
 /// cluster root and which are charged to the scope. What the planner samples and records is anon + shmem: here 1 GiB
 /// and 2 GiB are 3 GiB.
@@ -4010,10 +4083,11 @@ echo "Running unittests fake $id"
 echo "test result: ok. 1 passed; 0 failed"
 "#;
 
-/// Spec E7a.5 (D-E7c, D-E7e): the jobs of the rows alive never add up past the jobs of the machine, and `auto` and `maximo`
-/// are one DAG. Three rows with no dependency and no shared resource, each naming 8 jobs, with almost no CPU or RAM in the
-/// history, so that only the jobs can hold one back. With J = 16 two fit (8 + 8) and the third waits with `jobs`, in
-/// `auto` and in `maximo`; with J = 24 the three are inside together and none waits for `lanes` or `jobs`. The barrier is
+/// Spec E7a.5 (D-E7c, D-E7e; CI-E26, D-E26a): the jobs of the rows alive never add up past the jobs of the machine, and `auto`
+/// and `maximo` are one DAG. Three rows with no dependency and no shared resource, with almost no CPU or RAM in the history,
+/// so that only the jobs can hold one back. In the DAG a row gets its share of the 24 threads of the table: with J = 16 the
+/// rows that name 12 get 8 each, so two fit (8 + 8) and the third waits with `jobs`, in `auto` and in `maximo`; with J = 24 the
+/// rows that name 8 get 8 each and the three are inside together, and none waits for `lanes` or `jobs`. The barrier is
 /// a directory of marks that no row leaves before `want` have entered, with a deadline of 20 s that runs out only if the
 /// planner cannot start the rows, so what the test says does not depend on how long a row takes to start. Where only two
 /// fit, nobody can see the third not coming in by waiting for it: the planner says it, with the reason `jobs` of the row
@@ -4022,29 +4096,30 @@ echo "test result: ok. 1 passed; 0 failed"
 fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_maximo() {
     // 20 s of barrier, under the 30 s `run_command` gives a planner: it is spent only if the rows the barrier waits for cannot
     // be inside together, which is what a red of this test is. `want` is how many rows must be inside together to leave.
-    let drive = |name: &str, cpu_max: &str, nproc: &str, mem_gib: u64, want: &str| {
-        let mut fx = Fixture::new(name, cpu_max, MEM_OPEN);
-        let script = fx.base.join("barrera.sh");
-        write(&script, BARRIER_SH);
-        let rows = ["a", "b", "c"]
-            .into_iter()
-            .zip([10, 20, 30])
-            .map(|(id, idx)| StepRow {
-                script: script.clone(),
-                env: "CARGO_BUILD_JOBS=8",
-                ..fx.row(idx, id, "-", "1")
-            })
-            .collect::<Vec<_>>();
-        table_of(&mut fx, &rows);
-        for id in ["a", "b", "c"] {
-            fx.usage(id, 10_000);
-        }
-        fx.seed();
-        write(&fx.control.join("want"), want);
-        write(&fx.control.join("ticks"), "200");
-        let host = machine(&fx, "jobs-vivos", nproc, mem_gib * KIB_PER_GIB);
-        (fx, host)
-    };
+    let drive =
+        |name: &str, cpu_max: &str, nproc: &str, mem_gib: u64, want: &str, named: &'static str| {
+            let mut fx = Fixture::new(name, cpu_max, MEM_OPEN);
+            let script = fx.base.join("barrera.sh");
+            write(&script, BARRIER_SH);
+            let rows = ["a", "b", "c"]
+                .into_iter()
+                .zip([10, 20, 30])
+                .map(|(id, idx)| StepRow {
+                    script: script.clone(),
+                    env: named,
+                    ..fx.row(idx, id, "-", "1")
+                })
+                .collect::<Vec<_>>();
+            table_of(&mut fx, &rows);
+            for id in ["a", "b", "c"] {
+                fx.usage(id, 10_000);
+            }
+            fx.seed();
+            write(&fx.control.join("want"), want);
+            write(&fx.control.join("ticks"), "200");
+            let host = machine(&fx, "jobs-vivos", nproc, mem_gib * KIB_PER_GIB);
+            (fx, host)
+        };
     let go = |fx: &Fixture, host: &Machine, mode: &str| -> (u32, Vec<Value>, String) {
         let _ = fs::remove_file(fx.control.join("counts"));
         for name in ["in", "out"] {
@@ -4073,7 +4148,14 @@ fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_max
             .collect()
     };
 
-    let (fx, host) = drive("e7a-jobs-16", "1600000 100000", "16", 40, "2");
+    let (fx, host) = drive(
+        "e7a-jobs-16",
+        "1600000 100000",
+        "16",
+        40,
+        "2",
+        "CARGO_BUILD_JOBS=12",
+    );
     for mode in ["auto", "maximo"] {
         let (inside, steps, line) = go(&fx, &host, mode);
         assert!(
@@ -4083,7 +4165,7 @@ fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_max
         assert_eq!(
             inside,
             2,
-            "{mode} with J = 16: two rows of 8 jobs are inside together and never three (the counts each row saw: {})",
+            "{mode} with J = 16: two rows that name 12 (8 jobs each) are inside together and never three (the counts each row saw: {})",
             read(&fx.control.join("counts"))
         );
         let why = reasons(&steps);
@@ -4117,7 +4199,14 @@ fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_max
         );
     }
 
-    let (fx, host) = drive("e7a-jobs-24", "max 100000", "24", 64, "3");
+    let (fx, host) = drive(
+        "e7a-jobs-24",
+        "max 100000",
+        "24",
+        64,
+        "3",
+        "CARGO_BUILD_JOBS=8",
+    );
     let (inside, steps, line) = go(&fx, &host, "auto");
     assert!(
         line.contains(" jobs=24 (gate) asked=auto runs=dag"),
@@ -4137,11 +4226,15 @@ fn the_jobs_of_the_rows_alive_never_pass_the_jobs_of_the_machine_and_auto_is_max
     );
 }
 
-/// Spec E7a.4 (D-E7d): a row that names its jobs (12) gets min(12, J) in every mode: the number it names is its ceiling,
-/// and `maximo` does not leave it above the jobs of the machine. J = 16 on a machine of 16 threads and 40 GiB (room for
-/// 20), J = 7 on one of 7 threads. An operator that names 1 job leaves the row 1.
+/// Spec E7a.4 (D-E7d; CI-E26, D-E26a): a row that names its jobs (12) gets, in the series, min(12, J): the number it names is
+/// its ceiling, and a row alone has the whole turn. In the DAG, where the rows share the jobs of the turn, it gets its share of
+/// the 24 threads the table was written for, 12 x J // 24 and at least 1, which is never above min(12, J): `maximo` does
+/// not leave it above the jobs of the machine either. J = 16 on a machine of 16 threads and 40 GiB (room for 20: the DAG gives
+/// 8, the series 12), J = 7 on one of 7 threads (3 and 7), J = 24 on one of 24 threads and 64 GiB (12 in both). An operator that
+/// names 1 job leaves the row 1 in both.
 #[test]
-fn a_row_that_names_its_jobs_gets_the_lower_of_them_and_the_jobs_of_the_machine_in_every_mode() {
+fn a_row_that_names_its_jobs_gets_its_share_in_the_dag_and_the_lower_of_them_and_the_jobs_of_the_machine_in_the_series()
+ {
     let mut fx = Fixture::new("k4-reparto", "max 100000", MEM_OPEN);
     fx.table(&[(10, "w", "-", "0.2", "CARGO_BUILD_JOBS=12")]);
     let seen = |fx: &Fixture| -> String {
@@ -4152,10 +4245,15 @@ fn a_row_that_names_its_jobs_gets_the_lower_of_them_and_the_jobs_of_the_machine_
     };
     let wide = machine(&fx, "ancha", "16", 40 * KIB_PER_GIB);
     let narrow = machine(&fx, "estrecha", "7", 40 * KIB_PER_GIB);
-    for (host, jobs) in [(&wide, "12"), (&narrow, "7")] {
+    let whole = machine(&fx, "entera", "24", 64 * KIB_PER_GIB);
+    for (host, in_series, in_the_dag) in [
+        (&wide, "12", "8"),
+        (&narrow, "7", "3"),
+        (&whole, "12", "12"),
+    ] {
         let run = fx.run_env("serie", &host.env());
         assert_green(&run, "serie");
-        assert_eq!(seen(&fx), jobs, "serie: min(12, J)");
+        assert_eq!(seen(&fx), in_series, "serie: min(12, J)");
         for mode in ["auto", "maximo"] {
             let run = fx.run_env(mode, &host.env());
             assert_green(&run, mode);
@@ -4164,14 +4262,18 @@ fn a_row_that_names_its_jobs_gets_the_lower_of_them_and_the_jobs_of_the_machine_
                 "{}",
                 run.out
             );
-            assert_eq!(seen(&fx), jobs, "{mode}: min(12, J)");
+            assert_eq!(seen(&fx), in_the_dag, "{mode}: 12 x J // 24");
         }
     }
     let mut one = wide.env();
     one.push(("CARGO_BUILD_JOBS", "1"));
     let run = fx.run_env("auto", &one);
     assert_green(&run, "auto with the 1 job of the operator");
-    assert_eq!(seen(&fx), "1", "auto: min(12, 1)");
+    assert_eq!(
+        seen(&fx),
+        "1",
+        "auto: 1 job of the operator, the share is at least 1"
+    );
 }
 
 /// Spec K4-B, D-K4n, D-F3x, E7a.6 (D-E7c): 0 and serie are the series, 1, maximo and auto are the DAG, and the plan says
@@ -5249,7 +5351,7 @@ def step(i, c, r_gib, named, models=False, exclusive=False):
                     c, r_gib, 1.0, env, ["true"])
 
 def claimed(s, jobs):
-    return dag.row_jobs(int(s.env["CARGO_BUILD_JOBS"]), jobs) if "CARGO_BUILD_JOBS" in s.env else 0
+    return dag.share_jobs(int(s.env["CARGO_BUILD_JOBS"]), jobs) if "CARGO_BUILD_JOBS" in s.env else 0
 
 def random_step(i, models_p=0.15, exclusive_p=0.05, named_from=(0, 1, 2, 4, 8, 12, 16)):
     return step(i, rng.choice([0.25, 0.5, 1, 2, 4]), rng.choice([0.5, 1, 2, 4, 8]), rng.choice(named_from),
@@ -5270,6 +5372,98 @@ for named in range(1, 33):
 for named, jobs, want in [(12, 16, 12), (12, 7, 7), (1, 24, 1), (8, 24, 8), (32, 1, 1), (5, 5, 5)]:
     assert dag.row_jobs(named, jobs) == want, f"row_jobs({named}, {jobs}) is not {want}"
 print("row_jobs pairs=1024")
+"#;
+
+/// CI-E26 (D-E26a), share_jobs: in the DAG the rows share the jobs of the turn, so the number a row names is its share of
+/// the TABLE_THREADS (24) the table was written for: `named x jobs // 24` (rounded down), at least 1 and never above
+/// `named` or `jobs`. From 24 jobs up nothing changes (it is `row_jobs`, over every pair up to 32 x 64); below, the literal
+/// answers worked out by hand, monotone in both arguments, and rows whose names add up to 24 or less fit together at any cap.
+const BODY_SHARE_JOBS: &str = r#"
+assert dag.TABLE_THREADS == 24, f"the table was written for {dag.TABLE_THREADS} threads, not 24"
+for named in range(1, 33):
+    for jobs in range(24, 65):
+        assert dag.share_jobs(named, jobs) == dag.row_jobs(named, jobs), f"share_jobs({named}, {jobs}) is not row_jobs: nothing changes from 24 jobs up"
+for named in range(1, 33):
+    for jobs in range(1, 65):
+        value = dag.share_jobs(named, jobs)
+        assert 1 <= value <= min(named, jobs), f"share_jobs({named}, {jobs}) = {value} is outside 1..{min(named, jobs)}"
+        if named < 32:
+            assert dag.share_jobs(named + 1, jobs) >= value, f"share_jobs fell when named went from {named} to {named + 1} at {jobs}"
+        if jobs < 64:
+            assert dag.share_jobs(named, jobs + 1) >= value, f"share_jobs fell when jobs went from {jobs} to {jobs + 1} at {named}"
+for named, jobs, want in [(12, 12, 6), (8, 12, 4), (4, 12, 2), (2, 12, 1), (1, 12, 1), (3, 12, 1), (5, 12, 2),
+                          (12, 16, 8), (8, 16, 5), (12, 7, 3), (12, 1, 1), (12, 24, 12), (12, 32, 12), (32, 24, 24), (8, 23, 7)]:
+    assert dag.share_jobs(named, jobs) == want, f"share_jobs({named}, {jobs}) is {dag.share_jobs(named, jobs)}, not {want}"
+together = 0
+for _ in range(400):
+    jobs = rng.randint(2, 23)
+    low = -(-24 // jobs)
+    names, total = [], 0
+    while total + low <= 24:
+        names.append(rng.randint(low, 24 - total))
+        total += names[-1]
+    rows = [step(i, 1, 1, n) for i, n in enumerate(names)]
+    for k, row in enumerate(rows):
+        assert dag.admission(row, rows[:k], False, 1e9, 1e15, jobs, 1e15) is None, f"rows that name {names} (24 or less) do not fit together in {jobs} jobs: the row {k} waits"
+    together += len(rows) >= 2
+assert together >= 200, f"the generator is not mixed: {together} sets of two rows or more"
+print("share_jobs pairs=%d" % (32 * 64))
+"#;
+
+/// CI-E26 (D-E26a), the table as the planner reads it: the three rows that are ready after `P` (`B3`, `B1` and `M`: 12 + 8 +
+/// 4 = the 24 threads the table was written for) are admitted one after the other in a turn of 24 jobs, with the jobs the
+/// table names, and in a turn of 12 with half of them (6, 4 and 2), and in both the next row that names jobs (`DC`) waits for
+/// `jobs`. On 2026-11-10, in a shared turn of 12, `B3` took 12 alone and `B1` waited 340 to 411 s. CPU and RAM are left
+/// wide open: only the jobs can say no. Every row of the table gets what it names with 24 jobs.
+const BODY_TABLE_SHARES: &str = r#"
+steps = {s.id: s for s in dag.parse_table(os.path.join(sys.argv[1], "gate-dag.txt"))}
+after_p = [steps[i] for i in ("B3", "B1", "M")]
+assert all(s.deps == ["P"] for s in after_p), f"B3, B1 and M no longer wait for P alone: {[s.deps for s in after_p]}"
+for jobs, want in ((24, [12, 8, 4]), (12, [6, 4, 2])):
+    got = [dag.share_jobs(dag.named_jobs(s), jobs) for s in after_p]
+    assert got == want, f"with {jobs} jobs B3, B1 and M get {got}, not {want}"
+    alive = []
+    for s in after_p:
+        why = dag.admission(s, alive, False, 1e9, 1e15, jobs, 1e15)
+        assert why is None, f"with {jobs} jobs {s.id} waits for {why} after {[a.id for a in alive]}"
+        alive.append(s)
+    why = dag.admission(steps["DC"], alive, False, 1e9, 1e15, jobs, 1e15)
+    assert why == "jobs", f"with {jobs} jobs DC is admitted beside B3, B1 and M that fill them: {why}"
+for s in steps.values():
+    named = dag.named_jobs(s)
+    if named:
+        assert dag.share_jobs(named, 24) == named, f"with 24 jobs {s.id} gets {dag.share_jobs(named, 24)}, not the {named} it names"
+print("table shares rows=%d" % len(steps))
+"#;
+
+/// CI-E26 (D-E26a), what cargo is given: the `CARGO_BUILD_JOBS` of a step is the number the admission counted for its row.
+/// In the DAG it is `share_jobs`, in the series `row_jobs` (a row alone has the whole turn: nothing is shared), and for pairs
+/// of rows over several turns the second is admitted exactly when the two numbers cargo is given add up to the jobs of the turn.
+const BODY_STEP_ENV: &str = r#"
+import contextlib, io, shutil, tempfile
+planner = dag.Planner.__new__(dag.Planner)
+planner.run_dir = tempfile.mkdtemp(prefix="e26-")
+
+def given(named, jobs, solo):
+    planner.jobs_cap = jobs
+    planner.solo = solo
+    with contextlib.redirect_stdout(io.StringIO()):
+        return int(planner.step_env(step(0, 1, 1, named))["CARGO_BUILD_JOBS"])
+
+for jobs in (1, 4, 7, 12, 16, 24, 32):
+    for named in (1, 2, 4, 8, 12):
+        assert given(named, jobs, False) == dag.share_jobs(named, jobs), f"DAG, {jobs} jobs, a row that names {named}: cargo is given {given(named, jobs, False)}"
+        assert given(named, jobs, True) == dag.row_jobs(named, jobs), f"series, {jobs} jobs, a row that names {named}: cargo is given {given(named, jobs, True)}"
+checked = 0
+for jobs in (6, 12, 13, 16, 20, 24):
+    for a in (2, 4, 8, 12):
+        for b in (2, 4, 8, 12):
+            fits = given(a, jobs, False) + given(b, jobs, False) <= jobs
+            admitted = dag.admission(step(1, 1, 1, b), [step(0, 1, 1, a)], False, 1e9, 1e15, jobs, 1e15) is None
+            assert admitted == fits, f"{jobs} jobs, rows that name {a} and {b}: cargo is given {given(a, jobs, False)} + {given(b, jobs, False)} and the admission says {admitted}"
+            checked += 1
+shutil.rmtree(planner.run_dir)
+print("step env checked=%d" % checked)
 "#;
 
 /// P6 (E7a.P6), admission, three properties over seeded states:
@@ -5293,11 +5487,17 @@ for _ in range(2000):
         waited += 1
         continue
     admitted += 1
-    for axis in range(4):
+    # CI-E26 (D-E26a): under the threads the table was written for the share of each row is rounded down, so a bigger
+    # machine can give a row one more job and fill up where a smaller one still had room (5 + 5 + 5 + 5 + 5 jobs fit in 23
+    # and not in 24). The jobs axis is monotone from 24 up, where a row gets what it names; below it, the rows that add up
+    # to 24 or less fit at any cap (the property after this one).
+    axes = [0, 1, 3] + ([2] if caps[2] >= 24 else [])
+    steps = [rng.uniform(0, 10), rng.randint(0, 10) * GIB, rng.randint(0, 10), rng.randint(0, 10) * GIB]
+    for axis in axes:
         more = list(caps)
-        more[axis] += [rng.uniform(0, 10), rng.randint(0, 10) * GIB, rng.randint(0, 10), rng.randint(0, 10) * GIB][axis]
+        more[axis] += steps[axis]
         assert dag.admission(candidate, alive, earlier, *more) is None, f"admitted with {caps}, not with {more}"
-    more = [c + e for c, e in zip(caps, [rng.uniform(0, 10), rng.randint(0, 10) * GIB, rng.randint(0, 10), rng.randint(0, 10) * GIB])]
+    more = [c + (e if axis in axes else 0) for axis, (c, e) in enumerate(zip(caps, steps))]
     assert dag.admission(candidate, alive, earlier, *more) is None, f"admitted with {caps}, not with {more}"
 assert admitted >= 300 and waited >= 300, f"the states are not mixed: {admitted} admitted, {waited} waited"
 
@@ -5327,9 +5527,9 @@ assert dag.admission(lone, [], False, 0, 0, 1, 0) is None
 assert dag.admission(lone, [], True, 16, 40 * GIB, 16, 64 * GIB) == "exclusive"
 assert dag.admission(step(0, 1, 1, 8), [], True, 0, 0, 1, 0) is None
 
-a, b = step(0, 1, 1, 8), step(1, 1, 1, 8)
-assert dag.admission(b, [a], False, 16, 40 * GIB, 16, 64 * GIB) is None, "8 + 8 jobs fit in 16"
-assert dag.admission(b, [a], False, 16, 40 * GIB, 15, 64 * GIB) == "jobs", "8 + 8 jobs do not fit in 15"
+a, b = step(0, 1, 1, 13), step(1, 1, 1, 13)
+assert dag.admission(b, [a], False, 16, 40 * GIB, 16, 64 * GIB) is None, "13 named is 8 jobs of 16 (8.67 rounded down): 8 + 8 fit in 16"
+assert dag.admission(b, [a], False, 16, 40 * GIB, 15, 64 * GIB) == "jobs", "13 named is 8 jobs of 15 (8.125 rounded down): 8 + 8 do not fit in 15"
 assert dag.admission(b, [a], False, 1.5, 40 * GIB, 15, 64 * GIB) == "cpu", "the CPU is judged before the jobs: 1 + 1 > 1.5"
 assert dag.admission(b, [a], False, 16, 1.5 * GIB, 15, 64 * GIB) == "jobs", "the jobs are judged before the RAM"
 assert dag.admission(b, [a], False, 16, 1.5 * GIB, 16, 64 * GIB) == "ram", "1 + 1 GiB do not fit in 1.5 GiB"
@@ -5378,6 +5578,29 @@ fn property_of(body: &str) -> String {
 fn row_jobs_is_the_lower_of_the_two_numbers_with_a_floor_of_one() {
     let out = property_of(BODY_ROW_JOBS);
     assert!(out.contains("row_jobs pairs=1024"), "{out}");
+}
+
+/// CI-E26 (D-E26a): in the DAG a row gets its share of the 24 threads the table was written for, not the number it names up to
+/// the jobs of the turn. Nothing changes from 24 jobs up; below, by hand: 12 of 12 is 6, 8 is 4, 4 is 2, 12 of 16 is 8, 12 of
+/// 7 is 3 (3.5 rounded down), and a row keeps at least 1 job.
+#[test]
+fn a_row_in_the_dag_gets_its_share_of_the_threads_the_table_was_written_for() {
+    let out = property_of(BODY_SHARE_JOBS);
+    assert!(out.contains("share_jobs pairs=2048"), "{out}");
+}
+
+/// CI-E26 (D-E26a): in a turn of 12 jobs the three rows that are ready after `P` are admitted together, as in one of 24.
+#[test]
+fn the_three_rows_that_are_ready_after_p_fit_together_in_a_turn_of_12_jobs_and_in_one_of_24() {
+    let out = property_of(BODY_TABLE_SHARES);
+    assert!(out.contains("table shares rows="), "{out}");
+}
+
+/// CI-E26 (D-E26a): what a row asks for in the admission and what cargo is given are one number, in the DAG and in the series.
+#[test]
+fn the_cargo_jobs_a_step_is_given_are_the_ones_the_admission_counted_for_its_row() {
+    let out = property_of(BODY_STEP_ENV);
+    assert!(out.contains("step env checked=96"), "{out}");
 }
 
 /// Spec E7a.P6 (D-E7e, D-E7f): the admission is a pure function of the module, monotone in each cap, it never lets the jobs

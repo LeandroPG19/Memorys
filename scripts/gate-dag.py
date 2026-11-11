@@ -5,7 +5,8 @@
 GATE_DAG unset (the default since CI-E24), 1, maximo or auto plans the DAG: a step starts when its dependencies exited 0,
 and it is admitted by exclusivity, models, CPU, jobs and RAM (`admission`), recomputed on every event (a child exit, and
 a 1 s tick as a backup). The jobs of the machine are the threads of its cap, and a row gets min(the jobs it names, the
-jobs of the machine) in every mode (CI-K4, D-K4n; CI-E7a, D-E7c, D-E7d). The verdict is the series one: the red with the lowest idx wins, the steps before it
+jobs of the machine) in the series, and its share of the 24 threads the table was written for in the DAG, where the rows alive share
+them (CI-K4, D-K4n; CI-E7a, D-E7c, D-E7d; CI-E26, D-E26a). The verdict is the series one: the red with the lowest idx wins, the steps before it
 finish, the ones after it are stopped with TERM and, after a grace, KILL (D-F3d, J14g). A kernel kill (OOM, or a
 signal the planner did not send) gives no verdict: exit 2 (D-F3f), and so does a failure of the planner itself (J14e).
 A run is recorded with the mode that ran (J14a): a DAG (asked for, or the default) with no delegated scope, with no serial
@@ -25,7 +26,8 @@ it is null, with the reason in `sin_medida`, and a `note: not measured (...)` li
 CI-E15: the planner cleans up after itself. The TMPDIR of a row that ends green is deleted when it ends, and the whole run
 directory (`<TMPDIR>/memory-industry-dag.*`, with the logs of the rows) when the run ends with exit 0 and a verdict. A red run
 names its directory (`dag: run directory:`) and keeps it, as a run with no verdict does, with the TMPDIR of every row that did
-not end green; the next planner deletes the ones that are more than 7 days old and whose planner (`planner.pid`) is gone.
+not end green; the next planner deletes the ones that are more than 7 days old and whose planner (`planner.pid`) is gone
+(CI-E25: only where `os.getuid` exists and the platform is `posix`; elsewhere it sweeps nothing and says so in one note).
 Not in the planner: the per-binary launcher (D-F3u).
 `exclusive` runs alone, after every lower idx: the conservative form of D-F3l, and with a
 delegated scope no other step's cgroup may still have processes when one starts or ends (D-F34o). The
@@ -860,9 +862,23 @@ def ranks(steps: list[Step], dur: dict[str, float]) -> tuple[dict[str, float], d
 
 
 def row_jobs(named: int, jobs: int) -> int:
-    """D-E7d: the jobs a row that names `named` gets: the number is its ceiling, never above the jobs of the machine, and
-    cargo refuses 0."""
+    """D-E7d: the jobs a row that names `named` gets in the series, where it is alone: the number is its ceiling, never above
+    the jobs of the machine, and cargo refuses 0. In the DAG it is `share_jobs` (D-E26a)."""
     return max(1, min(named, jobs))
+
+
+# CI-E26 (D-E26a): the threads the numbers of gate-dag.txt were written for: B3 12 + B1 8 + M 4 = 24 are the three rows that
+# are ready when P ends.
+TABLE_THREADS = 24
+
+
+def share_jobs(named: int, jobs: int) -> int:
+    """D-E26a: the jobs a row that names `named` gets in the DAG, where the rows alive share the jobs of the turn: its share of
+    the TABLE_THREADS, `named x jobs // TABLE_THREADS` (rounded down, so rows that name 24 or less in all never add up to more
+    than the jobs, whatever they are), at least 1 (cargo refuses 0) and never above `named` or `jobs`: from TABLE_THREADS jobs
+    up the share is `named` and it is `row_jobs`, a bigger machine does not stretch the table. The admission counts these and
+    the step is given these (`Planner.cargo_jobs`): one number for both."""
+    return max(1, min(named, jobs, named * jobs // TABLE_THREADS))
 
 
 def named_jobs(step: Step) -> int:
@@ -890,7 +906,7 @@ def admission(
     """D-E7f: why a row that is ready has to wait, or None when it starts. One function for the planner and for the
     simulation of gate_usl.py. In this order: `exclusive`; with nobody alive it starts; `models` (two alive) and `ram` (the
     MemAvailable `mem_free` under MODELS_FLOOR plus its estimate); `cpu` (the sum of c over C); `jobs` (the sum of
-    row_jobs over the jobs cap, for the rows that name jobs, D-E7e); `ram` (the sum of what each live row holds, the
+    share_jobs over the jobs cap, for the rows that name jobs, D-E7e, D-E26a); `ram` (the sum of what each live row holds, the
     larger of its anon now and its estimate, over R). `earlier_pending` is whether a row of lower idx is still pending."""
     if exclusive_wait(step, alive, earlier_pending):
         return "exclusive"
@@ -903,7 +919,7 @@ def admission(
             return "ram"
     if sum(o.c for o in alive) + step.c > cpu_cap:
         return "cpu"
-    claimed = [row_jobs(n, jobs_cap) for n in map(named_jobs, [*alive, step]) if n]
+    claimed = [share_jobs(n, jobs_cap) for n in map(named_jobs, [*alive, step]) if n]
     if sum(claimed) > jobs_cap:
         return "jobs"
     if sum(max(o.anon_now or 0, o.r) for o in alive) + step.r > ram_cap:
@@ -931,7 +947,13 @@ def planner_alive(run_dir: str) -> bool:
 
 
 def sweep_old_run_dirs(root: str) -> None:
-    """CI-E15: the run directories of this user in `root` that are older than RUN_DIR_KEEP_S and whose planner is gone."""
+    """CI-E15: the run directories of this user in `root` that are older than RUN_DIR_KEEP_S and whose planner is gone.
+    CI-E25: only where both questions can be asked. Without `os.getuid` the directories of this user cannot be told, and
+    off `posix` `os.kill(pid, 0)` is not a probe: on Windows any signal that is not a console event ends the process it names,
+    so asking whether a planner lives would kill it. Such a platform sweeps nothing and says so in one note."""
+    if os.name != "posix" or not hasattr(os, "getuid"):
+        print("note: the run directories of earlier runs are not swept: this platform has no os.getuid or no safe way to ask whether a planner is alive (os.kill with signal 0 ends a process on Windows)")
+        return
     cutoff = time.time() - RUN_DIR_KEEP_S
     try:
         entries = list(os.scandir(root))
@@ -1203,6 +1225,12 @@ class Planner:
             fh.write(token)
         return token
 
+    def cargo_jobs(self, step: Step) -> int:
+        """D-E26a: the CARGO_BUILD_JOBS of a row that names jobs. In the series the row is alone and has the turn (`row_jobs`);
+        in the DAG it is the number the admission counted for it (`share_jobs`)."""
+        named = named_jobs(step)
+        return row_jobs(named, self.jobs_cap) if self.solo else share_jobs(named, self.jobs_cap)
+
     def step_env(self, step: Step, token: str | None = None) -> dict[str, str]:
         tmp = os.path.join(self.run_dir, "tmp", step.id)
         os.makedirs(tmp, exist_ok=True)
@@ -1210,7 +1238,7 @@ class Planner:
         env["TMPDIR"] = tmp
         env.update(step.env)
         if named_jobs(step):
-            env["CARGO_BUILD_JOBS"] = str(row_jobs(named_jobs(step), self.jobs_cap))
+            env["CARGO_BUILD_JOBS"] = str(self.cargo_jobs(step))
         targets = [r[len("target:"):] for r in step.recursos if r.startswith("target:")]
         if targets:
             env["CARGO_TARGET_DIR"] = target_dir(targets[0])
