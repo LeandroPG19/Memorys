@@ -52,7 +52,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
   tmp="$(mktemp -d)"
   sleep 300 &
   live=$!
-  trap 'kill "$live" 2>/dev/null || true; rm -rf "$tmp" "$hermetic"' EXIT
+  st_part_pids=()
+  trap 'kill "$live" ${st_part_pids[@]+"${st_part_pids[@]}"} 2>/dev/null || true; rm -rf "$tmp" "$hermetic"' EXIT
   self_fail() { echo "FAIL self-test: $*" >&2; exit 1; }
   # What the planner prints between the OK of the judge's server and the banner of its first block: the plan
   # of the machine (CI-K4), the note that the scope is not delegated (CI-E4; the stand-in cgroup tree of the
@@ -389,9 +390,14 @@ FAKE
   }
   reads_while_running='echo "stand-in run-all-tests: run.exit reads: $(cat "$HOME/.cache/cuba-gate/run.exit")"'
 
+  # CI-E3c (D-E3e): from here to the end of the rows, each stretch of rows is a st_rows_* function, and a part of the self-test (st_part_1..3,
+  # below the last row) is a list of them. The rows keep the indentation and the text they had, so that the change of CI-E3c adds lines and
+  # takes none from them. What they share stays outside the functions (the helpers and the strings of the stand-ins, run once before the parts
+  # start); what a stretch leans on of another one is in its comment.
   # The presence anchor: every step passes, so the file ends at 0, and while
   # the first half ran it said the gate was still running. A file that ends at
   # 0 proves nothing on its own: it started there.
+  st_rows_receipt() {
   fake_tree green "$reads_while_running"
   run_copy green
   (( rc == 0 )) || self_fail "a gate whose every step passed exited $rc: $(cat "$tmp/green.out")"
@@ -566,6 +572,7 @@ FAKE
     || self_fail "E29b.g6: a gate over an edited scripts/recibo-lista-blanca.txt left a receipt or a mark: $(receipts_of list_edited)"
   grep '^no receipt: ' "$tmp/list_edited.out" | grep -qF 'scripts/recibo-lista-blanca.txt' \
     || self_fail "E29b.g6: no 'no receipt: ' line names scripts/recibo-lista-blanca.txt: $(cat "$tmp/list_edited.out")"
+  }
 
   # The order of the steps, read from $HOME/steps (one line per cargo call, and
   # one for run-all-tests.sh). cargo audit is the only step that judges RustSec
@@ -617,6 +624,7 @@ FAKE
     done
   }
 
+  st_rows_advisories() {
   fake_tree adv_order "$tests_step"
   run_copy adv_order
   (( rc == 0 )) || self_fail "adv_order: a gate whose every step passed exited $rc: $(cat "$tmp/adv_order.out")"
@@ -741,6 +749,7 @@ FAKE
     [[ -n "$(step_at "adv_exc_json_exit$json_exit" '^advisory-exceptions --judge ')" ]] \
       || self_fail "adv_exc_json_exit$json_exit: the exceptions were not judged: $(steps_of "adv_exc_json_exit$json_exit")"
   done
+  }
 
   # G4/A1: a cargo target inside rust/ is copied whole into every job of the mutation
   # step, the last one of this gate, and it used to be refused only there: ~20 min of
@@ -767,6 +776,7 @@ FAKE
     fi
   }
 
+  st_rows_cargo_target() {
   a1_tree a1_tag
   mkdir -p "$tmp/a1_tag/rust/target-x"
   : >"$tmp/a1_tag/rust/target-x/CACHEDIR.TAG"
@@ -799,6 +809,7 @@ FAKE
   adv_stopped a1_ok 1
   [[ "$(steps_of a1_ok)" == "cargo audit" ]] \
     || self_fail "a1_ok: a CARGO_TARGET_DIR outside rust/ was refused: $(steps_of a1_ok) / $(cat "$tmp/a1_ok.out")"
+  }
 
   # CI-J13 (D4): the target of a tree that no longer exists is swept, and nothing else is. The judge keeps a
   # target per row and per tree in <CARGO_TARGET_DIR>/<tree>-<12 hex of its realpath>/T_x, each with a
@@ -841,6 +852,7 @@ FAKE
       || self_fail "J13d: want $1 'note: swept' lines: $(cat "$tmp/sweep.out")"
   }
 
+  st_rows_sweep_and_times() {
   # The scenario: a gone tree (two targets, and a path with a space), a live one and a key with no marker.
   mkdir -p "$tmp/sweep/root1" "$tmp/sweep/live-tree"
   sweep_key "$tmp/sweep/root1" gone-aaaaaaaaaaaa "$tmp/sweep/gone tree" T_dbg T_rel
@@ -1008,6 +1020,7 @@ FAKE
   if grep -q 'MERGE GATE PASSED' "$tmp/times_cannot.out"; then
     self_fail "times_cannot: a gate whose test times could not be judged passed: $(cat "$tmp/times_cannot.out")"
   fi
+  }
 
   # The readiness check: libpq reads DATABASE_URL, and the gate says which port
   # it answered on. With WSL2 in mirrored mode the localhost:5488 of Windows is
@@ -1137,6 +1150,7 @@ FAKE
       self_fail "$name: what the gate printed carries the password of DATABASE_URL: $(cat "$tmp/$name.out")"
     fi
   }
+  st_rows_no_url() {
   # J1.1, rewritten by CI-F2 (D-F2c, D-F2k): without DATABASE_URL, unset or empty, on Linux the
   # judge makes its own lanes, so J1.1's refusal moves to the step that makes them. Here the bindir
   # has no initdb (A2, "sin initdb"): the gate stops before pg_isready, psql or cargo, and its FAIL
@@ -1170,11 +1184,13 @@ FAKE
     || self_fail "a3_not_linux: initdb was called off Linux: $(cat "$tmp/a3_not_linux/home/initdb.calls")"
   fail_line_with a3_not_linux DATABASE_URL 'docs/gate.md' \
     || self_fail "a3_not_linux: no FAIL line names DATABASE_URL and docs/gate.md: $(cat "$tmp/a3_not_linux.out")"
+  }
   # CI-F2 (F2b-1), the caller's rows. Without DATABASE_URL on Linux, merge-gate.sh makes one lane per
   # step (dbg, docs, cov, mut), each with its own URL and GATE_LANE, and takes it down after its step.
   # run-all-tests.sh records what it was given for the full run; the lanes' stand-in (fake_tree) records
   # every call in the steps. lane_body is the run-all-tests stand-in of every row below.
   lane_body='echo "run-all-tests${*:+ $*}" >>"$HOME/steps"; [ "${1:-}" = --check-models ] || echo "${GATE_LANE-unset} ${DATABASE_URL-unset} ${GATE_SERVER_SYSTEM_ID-unset}" >>"$HOME/run-all.lanes"'
+  st_rows_lanes() {
   # A1: the cheap check and the sweep of the lanes come before the first cargo (the audit).
   fake_tree a1 "$lane_body"
   run_copy_as unset a1 ""
@@ -1286,9 +1302,11 @@ down mut'
     "$tmp/j5/home/cargo.models" 2>/dev/null | wc -l | tr -d ' ')"
   (( j5_docs == 1 && j5_docs == j5_docs_ok )) \
     || self_fail "J5: the build without docs was given ONNX_MODEL_PATH or CUBA_EMBEDDING_DIM, and it reads no model; it got: $(cat "$tmp/j5/home/cargo.models" 2>/dev/null || true)"
+  }
   # C5: a DATABASE_URL the operator gives still governs, as it does today: no lane is made, every step
   # gets that URL, and the gate says the lanes share that server.
   ext='postgresql://gate:pw0@127.0.0.1:5489/brain'
+  st_rows_lane_exits() {
   fake_tree c5 "$lane_body"
   run_copy_as "$ext" c5 "" FAKE_PG_ANSWER='127.0.0.1:5489 - accepting connections' FAKE_PSQL_CLUSTER_NAME=memory-industry-gate
   (( rc == 0 )) || self_fail "C5: a gate with an external DATABASE_URL exited $rc: $(cat "$tmp/c5.out")"
@@ -1318,6 +1336,8 @@ down mut'
     grep -qx 'down-all' "$tmp/d2_$sig/home/steps" \
       || self_fail "D2: a gate stopped by $sig did not take its lane down (down-all): $(cat "$tmp/d2_$sig/home/steps" 2>/dev/null)"
   done
+  }
+  st_rows_judge_server() {
   # J1.2: a server that answers but is not marked is refused whatever its port,
   # and the refusal says the port, the cluster_name it read and the system_identifier.
   judge_refused j12_empty 'postgresql://gate:pw0@127.0.0.1:5488/brain' '127.0.0.1:5488 - accepting connections' pw0 FAKE_PSQL_CLUSTER_NAME=
@@ -1433,6 +1453,7 @@ down mut'
   [[ ! -e "$tmp/pg_two_at/home/pg_isready.args" ]] \
     || self_fail "pg_two_at: pg_isready was asked about a URL with two '@': $(pg_args pg_two_at)"
   pg_refused pg_double_at 'postgresql://gate:S3cr3tW2@@127.0.0.1:5575/brain' '%40' "more than one '@'"
+  }
 
   # Without pg_isready the gate asks docker, and the container is the one that
   # publishes the port of DATABASE_URL, not one picked by its name: on Windows the
@@ -1444,6 +1465,9 @@ down mut'
   # psql: a pg_isready of the machine running this test would turn every row green
   # (Debian puts one in /usr/bin), and a real psql would ask the identity of a
   # server the row never named (the judge's guard, J1.4, is what must find none).
+  # CI-E3c: the wrappers are made by the part that runs these rows (st_sysbin, first), not before the parts: on a machine with
+  # thousands of programs in /usr/bin that is seconds in which nothing else runs.
+  st_sysbin() {
   mkdir -p "$tmp/sysbin"
   for d in "$gitdir" /usr/bin /bin; do
     for f in "$d"/*; do
@@ -1456,6 +1480,7 @@ down mut'
     done
   done
   chmod +x "$tmp"/sysbin/*
+  }
   ran_body="echo run-all-tests >>\"\$HOME/steps\"; echo \"$ran_marker\""
   # dk_prepare NAME: the tree, with no pg_isready, and a check that the PATH of
   # the row finds none and still finds git.
@@ -1531,6 +1556,7 @@ down mut'
       || self_fail "$name: no FAIL line holds all of: $* : $(cat "$tmp/$name.out")"
   }
 
+  st_rows_docker() {
   # The container is picked by the port, whatever it is called.
   dk_green dk_port 'postgresql://gate:pw0@127.0.0.1:5489/brain' 5489 memory-industry-dbwin-20261012 pw0
   # The port is read the way libpq reads it.
@@ -1597,7 +1623,9 @@ down mut'
   pg_stopped j14_nopsql 2 pw0
   fail_line_with j14_nopsql psql \
     || self_fail "j14_nopsql: no FAIL line names psql: $(cat "$tmp/j14_nopsql.out")"
+  }
 
+  st_rows_server_identity() {
   # J1.5: every step after the guard gets the verified URL, and the system_identifier
   # the guard read is handed to run-all-tests.sh as GATE_SERVER_SYSTEM_ID.
   j15_url='postgresql://gate:pw0@127.0.0.1:5489/brain'
@@ -1626,6 +1654,7 @@ down mut'
   if grep -qF '=== cargo clippy --all-targets --no-default-features' "$tmp/j2doc.out"; then
     self_fail "J1.6: the build without docs ran after the server changed: $(cat "$tmp/j2doc.out")"
   fi
+  }
 
   # gate_linux_env (gate-lock.sh): what a gate run on Linux hands to cargo, to the
   # mutation tool and to node. Each row runs it in a fresh bash with an empty
@@ -1665,6 +1694,7 @@ down mut'
   }
   env_var() { sed -n "s/^$2=//p" "$tmp/$1.out"; }
 
+  st_rows_gate_linux_env() {
   # The cargo target: left as it is when set, else absolute and outside the tree.
   env_run target_default
   (( rc == 0 )) || self_fail "gate_linux_env on Linux exited $rc: $(cat "$tmp/target_default.out")"
@@ -1778,6 +1808,7 @@ down mut'
     || self_fail "K9b: without rust-toolchain.toml the gate did not say so: $(cat "$tmp/pin_missing.out")"
   [[ "$(env_var not_linux RUSTUP_TOOLCHAIN)" == unset ]] \
     || self_fail "K9b: gate_linux_env pinned a toolchain on a machine that is not Linux"
+  }
 
   # --- CI-F1 rows (spec §4, F1 and F2): the cores the gate counts, the order of the cheap
   # steps, and the boundary test-times judges. cg_tree NAME CPU_MAX builds a cgroup v2 scope
@@ -1790,6 +1821,7 @@ down mut'
     printf '0::/app/pesado.scope\n' >"$d/self"
   }
 
+  st_rows_cores() {
   # F1.1 (D-F1a): the gate counts its cores once, before its first cargo call: the cgroup's
   # CPUs under nproc's (8 under 24 here), exports CARGO_BUILD_JOBS with them and says so.
   # CI-K4 (D-K4k, D-K4l), CI-E7a (D-E7a): the jobs are min(nproc, the CPUs of the cgroup, free RAM / 2 GiB), and the line
@@ -1864,6 +1896,7 @@ down mut'
   fi
   grep -q '^5 ' "$tmp/f1ceil/home/cargo.jobs" \
     || self_fail "F1.2 ceiling: no cargo call saw the 5 jobs that bound the row of DC: $(cat "$tmp/f1ceil/home/cargo.jobs")"
+  }
 
   # F2: the run-all-tests stand-in of the rows below answers --check-models (its verdict is
   # FAKE_CHECK_MODELS_EXIT) and records a full run as one step. Anything else is a full run.
@@ -1871,6 +1904,8 @@ down mut'
 echo run-all-tests >>"$HOME/steps"
 exit 0'
 
+  # st_rows_planner leaves the steps of the row F2.1 (f2order) that st_rows_rapido reads in E29a.2: the two go in the same part, this one first.
+  st_rows_planner() {
   # F2.1 (D-F2a): fmt, codigo-muerto, npm and the models run after cargo deny and before the
   # first cargo call that compiles.
   fake_tree f2order "$run_all_steps"
@@ -1997,6 +2032,8 @@ exit 0'
     || self_fail "untimed: the judge does not hold the block of DC, the last timed row: $(cat "$judged" 2>/dev/null)"
   grep -qF 'finished in 99.00s' "$judged" \
     && self_fail "untimed: the output of an untimed row (crap-gate, a finished-in line) reached the judge of the test times"
+  }
+  st_rows_step_mode() {
   # The step mode is not a gate: it takes no lock and writes no verdict, and it runs only with the ticket the planner
   # hands it (D-F3k). Without one it exits 2 before any step, and says what it needs.
   fake_tree step_alone "$run_all_steps"
@@ -2145,7 +2182,9 @@ exit 0'
   [[ -z "$(steps_of step_lock)" && ! -e "$tmp/step_lock/home/lane.owners" ]] \
     || self_fail "J15d: --step with another GATE_LOCK made a lane or ran a step: $(steps_of step_lock)"
   [[ "$(cat "$step_lock/lanes/20-DBG")" == tok-lock ]] || self_fail "J15d: --step with another GATE_LOCK spent the ticket"
+  }
 
+  st_rows_killed_steps() {
   # CI-J14h: a row that dies by KILL runs no trap, so the cluster it made stays under the root with this gate's owner on
   # it. The gate's exit, once it has collected the planner, takes down the directories of the root whose owner is its own
   # (the identity check of the library decides what is a postgres of theirs) and no other. The row makes three: this
@@ -2201,6 +2240,7 @@ exit 1'
   (( rc == 0 )) || self_fail "J14i: a gate with an external DATABASE_URL and PGHOSTADDR in its environment exited $rc, not 0: $(cat "$tmp/j14i_ext.out")"
   grep -qxF PGCONNECT_TIMEOUT=10 "$tmp/j14i_ext/home/psql.env" \
     || self_fail "J14i: the identity query of the external server has no deadline of its own: $(cat "$tmp/j14i_ext/home/psql.env")"
+  }
 
   # CI-E29 (E29a): `rapido` is the four checks of `todo` that need no compile, no network, no database and no lock, and it is not a
   # verdict. The stop hook of the operator runs `bash scripts/como-el-ci.sh rapido` in every Stop, with no turn (parada.js), so every
@@ -2211,6 +2251,8 @@ exit 1'
   table_judged() { grep -qE '^OK +.*gate-dag\.txt' "$tmp/$1.out"; }
   rapido_steps="$(printf '%s\n' 'cargo fmt --check' 'codigo-muerto' 'node npm/install.test.js')"
 
+  # st_rows_rapido reads the steps of the row F2.1 that st_rows_planner made (E29a.2): it goes after it, in the same part.
+  st_rows_rapido() {
   # E29a.1: the four checks, in the order of step_P, nothing else, and the first and last line say it is not a verdict.
   fake_tree rapido_ok "$run_all_steps"
   run_ci rapido_ok rapido
@@ -2297,6 +2339,7 @@ exit 1'
     grep -qw "$mode" "$tmp/rapido_typo.out" || self_fail "E29a.7: the usage of a mode that does not exist does not name '$mode': $(cat "$tmp/rapido_typo.out")"
   done
   [[ ! -e "$tmp/rapido_typo/home/steps" ]] || self_fail "E29a.7: a mode that does not exist ran something: $(steps_of rapido_typo)"
+  }
 
   # CI-E29 (E29c): `parcial` is P, B1, CT and DBG through the planner: the first look at the build and the contracts that is not the judge. It takes
   # the lock (it compiles in the target of `todo` and uses its clusters), has an exit file and a log of its own, and writes no
@@ -2327,6 +2370,7 @@ exit 1'
   }
   parcial_exit() { cat "$tmp/$1/home/.cache/cuba-gate/parcial.exit" 2>/dev/null || true; }
 
+  st_rows_parcial() {
   # E29c.4: parcial runs four rows, writes nothing of the verdict and says it is not one.
   parcial_tree parcial_ok "$lane_body"
   run_ci parcial_ok parcial DATABASE_URL="$judge_test_url"
@@ -2368,6 +2412,124 @@ exit 1'
     || self_fail "E29c.6: parcial was not refused by the live gate (exit $rc): $(cat "$tmp/parcial_busy.out")"
   [[ "$(exit_file parcial_busy)" == 0 ]] \
     || self_fail "E29c.6: a refused parcial wrote '$(exit_file parcial_busy)' into the exit file of the gate that holds the lock"
+  }
+
+  # CI-E3c (D-E3e): a part of this self-test is a list of the st_rows_* functions above, and the three parts run at the same time. The cut is
+  # by what the rows cost (each part prints the seconds it took, so a part that grows says so) and by what they lean on: st_rows_planner goes
+  # before st_rows_rapido, in the same part (E29a.2 reads the steps of the row F2.1), and no other row reads a tree that another row made.
+  # The helpers and the strings of the stand-ins sit outside the functions: they ran once, before the parts, and are the same in all of them.
+  st_part_1() { st_rows_receipt; st_rows_advisories; st_rows_cargo_target; st_sysbin; st_rows_docker; st_rows_gate_linux_env; st_rows_parcial; }
+  st_part_2() { st_rows_no_url; st_rows_lanes; st_rows_lane_exits; st_rows_judge_server; st_rows_server_identity; }
+  st_part_3() { st_rows_sweep_and_times; st_rows_cores; st_rows_planner; st_rows_step_mode; st_rows_killed_steps; st_rows_rapido; }
+
+  # run_parts PART...: runs the parts at the same time, each in a subshell of its own with a HOME and an XDG_CACHE_HOME of its own (two parts
+  # never share a lock, a receipt, a cargo target root or a history) and its stdout and stderr in files (what two parts print never mixes). It
+  # waits for every part, so one that fails does not hide what the others found; then it prints what each part wrote, in the order of the
+  # parts, and returns 1 if a part exited with anything but 0 or exited 0 without its line `self-test part <i> of <n>: OK in <S.SS> s`, which
+  # the subshell prints once the part has returned: an `exit 0` halfway through a part is what a part that lost its rows looks like from
+  # outside, and it is not a pass. MERGE_GATE_SELFTEST_SERIAL=1 runs the parts one after another, last first: a part that leans on a tree or
+  # a file of another one is red there, and not by the luck of who started first. It makes no use of `set -e`; the rows of the parts do, so
+  # the call of the parts below is not the left side of a `||` (that would turn `set -e` off in all of them).
+  st_parts=""
+  st_part_start() { # I N PART: the part I of N in a subshell, in the background; its pid is left in st_part_pid
+    local i="$1" n="$2" part="$3" dir="$st_parts/part-$1"
+    mkdir -p "$dir/home" "$dir/cache"
+    (
+      export HOME="$dir/home" XDG_CACHE_HOME="$dir/cache"
+      started="$(date +%s%3N)"
+      "$part"
+      elapsed=$(( $(date +%s%3N) - started ))
+      printf 'self-test part %s of %s: OK in %d.%02d s\n' "$i" "$n" $(( elapsed / 1000 )) $(( elapsed % 1000 / 10 ))
+    ) >"$dir.out" 2>"$dir.err" </dev/null &
+    st_part_pid=$!
+  }
+  run_parts() {
+    local n=$# i rc bad=0
+    local -a parts=("$@") rcs=()
+    st_parts="$(mktemp -d "$hermetic/parts.XXXXXX")"
+    st_part_pids=()
+    if [[ -n "${MERGE_GATE_SELFTEST_SERIAL:-}" ]]; then
+      for (( i = n; i >= 1; i-- )); do
+        st_part_start "$i" "$n" "${parts[i - 1]}"
+        st_part_pids=("$st_part_pid")
+        rc=0
+        wait "$st_part_pid" || rc=$?
+        rcs[i]=$rc
+      done
+    else
+      for (( i = 1; i <= n; i++ )); do
+        st_part_start "$i" "$n" "${parts[i - 1]}"
+        st_part_pids+=("$st_part_pid")
+      done
+      for (( i = 1; i <= n; i++ )); do
+        rc=0
+        wait "${st_part_pids[i - 1]}" || rc=$?
+        rcs[i]=$rc
+      done
+    fi
+    st_part_pids=()
+    for (( i = 1; i <= n; i++ )); do
+      if (( rcs[i] != 0 )); then
+        echo "FAIL self-test: part $i of $n exited ${rcs[i]}; what it printed follows" >&2
+        bad=1
+      elif ! grep -Eqx "self-test part $i of $n: OK in [0-9]+\.[0-9]{2} s" "$st_parts/part-$i.out"; then
+        echo "FAIL self-test: part $i of $n ended without its OK line (it exited 0)" >&2
+        bad=1
+      fi
+      cat "$st_parts/part-$i.out"
+      cat "$st_parts/part-$i.err" >&2
+    done
+    return "$bad"
+  }
+
+  # E3c.1: run_parts waits for every part, and a part that fails makes the whole red. The first part opens a fifo for writing, writes into it
+  # and fails; the second reads the fifo until nothing holds it open, which is when the first part has ended, and only then makes its file.
+  # So the file is there only if run_parts waited for the second part after the first one had failed. Nothing sleeps: the fifo gives the order,
+  # and the file is made by a program (touch) and not by a redirection, so that the second part ends later than a run_parts that did not wait
+  # for it takes to look at the file, which is the first thing the row does.
+  mkdir -p "$tmp/run_parts"
+  mkfifo "$tmp/run_parts/fifo"
+  st_fixture_fails() {
+    echo "$BASHPID" >"$tmp/run_parts/fails.pid"
+    exec 9>"$tmp/run_parts/fifo"
+    echo go >&9
+    self_fail "parte uno"
+  }
+  st_fixture_waits() {
+    echo "$BASHPID" >"$tmp/run_parts/waits.pid"
+    "${row_bound[@]}" cat "$tmp/run_parts/fifo" >/dev/null || exit 3
+    touch "$tmp/run_parts/hecho"
+  }
+  rp_rc=0
+  run_parts st_fixture_fails st_fixture_waits >"$tmp/run_parts/out" 2>"$tmp/run_parts/err" || rp_rc=$?
+  [[ -e "$tmp/run_parts/hecho" ]] \
+    || self_fail "E3c.1: run_parts returned before the second part ended, so a part that failed hid what the other one did: $(cat "$tmp/run_parts/err")"
+  [[ "$rp_rc" == 1 ]] || self_fail "E3c.1: run_parts over a part that failed exited $rp_rc, not 1: $(cat "$tmp/run_parts/err")"
+  grep -qxF 'FAIL self-test: parte uno' "$tmp/run_parts/err" \
+    || self_fail "E3c.1: the FAIL line of the part that failed is not in the stderr of run_parts: $(cat "$tmp/run_parts/err")"
+  grep -qE '^self-test part 2 of 2: OK in [0-9]+\.[0-9]{2} s$' "$tmp/run_parts/out" \
+    || self_fail "E3c.1: the part that did not fail has no OK line in the stdout of run_parts: $(cat "$tmp/run_parts/out")"
+  for fixture in fails waits; do
+    ! kill -0 "$(cat "$tmp/run_parts/$fixture.pid")" 2>/dev/null \
+      || self_fail "E3c.1: a process of the part '$fixture' is still alive after run_parts returned"
+  done
+
+  # E3c.2: a part that exits 0 without having ended is red, and run_parts says which one by its place. The second part leaves with an `exit 0`
+  # before the line that the subshell prints once a part returns; the first part ends as one should, and has its line.
+  st_fixture_ends() { :; }
+  st_fixture_leaves() { exit 0; }
+  rp_rc=0
+  run_parts st_fixture_ends st_fixture_leaves >"$tmp/run_parts/out2" 2>"$tmp/run_parts/err2" || rp_rc=$?
+  [[ "$rp_rc" == 1 ]] || self_fail "E3c.2: run_parts over a part that exited 0 without its OK line exited $rp_rc, not 1: $(cat "$tmp/run_parts/err2")"
+  grep -qF 'part 2 of 2 ended without its OK line' "$tmp/run_parts/err2" \
+    || self_fail "E3c.2: the stderr of run_parts does not say that part 2 of 2 ended without its OK line: $(cat "$tmp/run_parts/err2")"
+  if grep -qF 'part 1 of 2' "$tmp/run_parts/err2"; then
+    self_fail "E3c.2: the part that ended as it should was named in a FAIL line: $(cat "$tmp/run_parts/err2")"
+  fi
+  grep -qE '^self-test part 1 of 2: OK in [0-9]+\.[0-9]{2} s$' "$tmp/run_parts/out2" \
+    || self_fail "E3c.2: the part that ended as it should has no OK line in the form the contract reads: $(cat "$tmp/run_parts/out2")"
+
+  run_parts st_part_1 st_part_2 st_part_3
 
   echo "OK  self-test: the exit file says running while a gate runs and holds the whole"
   echo "    gate's verdict at the end, a step after the tests included; a gate killed"
