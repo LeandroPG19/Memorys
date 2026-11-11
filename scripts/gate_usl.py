@@ -933,8 +933,10 @@ class Calibrada:
         self.usadas: list[tuple[str, int, float]] = []
 
     def efectivo(self, j: int) -> int:
-        """The jobs a row that names `j` gets on this machine (D-E7d)."""
-        return gate_dag().row_jobs(j, self.j_maquina)
+        """The jobs a row that names `j` in the table gets in the DAG on this machine: its share (D-E7d, D-E26a). The one
+        function that scales is `dag.share_jobs`, the planner's: the J of a candidate is the number of the table, the
+        simulation hands it to the admission as it is, and what the fits ask for is this number."""
+        return gate_dag().share_jobs(j, self.j_maquina)
 
     def t(self, j: int) -> float:
         a = self.ajuste
@@ -948,9 +950,17 @@ class Calibrada:
         return None if recta is None else SEGURIDAD_RAM * (recta["r0"] + recta["r1"] * j)
 
     def candidatos(self, ram_max: float) -> list[int]:
+        """The J of the table to try. A sweep level is jobs that cargo gets, so each one that fits stands for the smallest J of
+        the table that gives it here (D-E26a): from 24 jobs up that is the level itself. The J now in the table is one more,
+        held at the largest number the table can tell apart on this machine."""
         medidos = {j for j in self.ajuste["niveles"] if j <= self.tope_j}
-        cabe = [j for j in medidos if self.ram(j) is None or self.ram(j) <= ram_max]
-        return sorted(set(cabe) | {self.efectivo(self.actual)})
+        cabe = {j for j in medidos if self.ram(j) is None or self.ram(j) <= ram_max}
+        dag = gate_dag()
+        tope_tabla = max(dag.TABLE_THREADS, self.j_maquina)
+        de_tabla: dict[int, int] = {}
+        for j in range(1, tope_tabla + 1):
+            de_tabla.setdefault(dag.share_jobs(j, self.j_maquina), j)
+        return sorted({de_tabla[e] for e in cabe if e in de_tabla} | {min(self.actual, tope_tabla)})
 
 
 def _usar_corridas(cal: Calibrada, hist: Historial, conocidas: dict[str, bytes], notas: list[str]) -> None:
@@ -991,7 +1001,7 @@ def _estado_de(
             j = eleccion[f["id"]]
             efectivo = cal.efectivo(j)
             nueva["d"] = cal.duracion(efectivo)
-            nueva["jobs"] = efectivo
+            nueva["jobs"] = j
             if j != cal.actual:
                 nueva["c"] = float(max(efectivo, cal.pool))
             ram = cal.ram(efectivo)
@@ -1041,7 +1051,7 @@ def _diff(tabla: str, cambios: dict[str, tuple[int, int, int | None]]) -> str:
 
 
 def _ram_gb_nueva(cal: Calibrada, j: int, actual_gb: float) -> int | None:
-    ram = cal.ram(j)
+    ram = cal.ram(cal.efectivo(j))
     if ram is None or ram <= actual_gb * GIB:
         return None
     return math.ceil(ram / GIB)
