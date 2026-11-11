@@ -21,6 +21,10 @@ Publishing is **`./scripts/release.sh vX.Y.Z`** and nothing else. When `merge-ga
 
 The SIL runs its rows as a DAG by default since 2026-11-10 (about 6.5 min alone, 10 min in a shared turn of `pesado -p`); `GATE_DAG=0` forces the series (16.5 min). The first run of a changed table, a run with an operator's `DATABASE_URL` and a run outside `pesado` are a series by themselves: `docs/gate.md` says why.
 
+On Linux with no `DATABASE_URL` the judge starts its own Postgres for each row that names a `cluster:` in `scripts/gate-dag.txt` (one per lane): PGDG 18.6 with pgvector 0.8.7, socket only, `fsync` off, marked `cluster_name=memory-industry-gate-<lane>`, and taken down when the row ends (CI-F2). Versions, the one-time install and the checks that refuse to start are in `docs/gate.md`, «The judge's servers». The judge also exports `MEMORY_INDUSTRY_REQUIRE_DATABASE_URL=1`: a command that loses its `DATABASE_URL` exits 2 instead of falling back on the live corpus (T-DBURL).
+
+The Windows judge (GPU, CUDA) runs once per release, before `./scripts/release.sh`, and not on every change (Leandro, 2026-11-05): `docs/gate.md`, «Running the gate on Windows».
+
 `quality-gate` after the SIL when the change touched `rust/src` or Python. A missing lizard / cargo-mutants is exit 2: the hardener does not close.
 
 ## Six-pack
@@ -28,6 +32,8 @@ The SIL runs its rows as a DAG by default since 2026-11-10 (about 6.5 min alone,
 Behaviour change: **especificador → implementador → mejorador → arquitecto → endurecedor → qa**.
 
 Handoffs: `.cursor/handoffs/*.yml`. Judge: `./scripts/validar-handoff.sh`. Example: `.cursor/handoffs/handoff.example.yml`.
+
+A handoff carries the cost of its tests (CI-E6): the specifier's spec has a `Level | Seconds | Lane` table, one row per scenario, and the implementer's handoff has `segundos:` (and `carril:` when the slice touches `scripts/`) inside `evidence: |`. `validar-handoff.sh` judges them; the format is in `.cursor/handoffs/handoff.example.yml`.
 
 It judges shape **and the two-pass protocol**. `commit` must exist, not just look hexadecimal, and `tests: written|frozen` is required whenever `commit != none`: `written` fails if no test region moved since that commit, `frozen` fails if one did. A test region is a `#[cfg(test)]` region of a `.rs`, a whole `.rs` under `tests/`, or in a `.sh` the lines between `# --- self-test begin ---` and `# --- self-test end ---` (column 0, the whole line). Every gate script with a `--self-test` mode wraps all of it in them: the block or the function, its helpers and the `case` arm that dispatches it. A script whose dispatch sits outside a region, or whose markers do not pair, is refused, and `local_gate_contract.rs` checks every script that has the mode (`SCRIPTS_WITH_SELF_TEST`) on every run. With several agents in one tree, list the slice in `paths:` and only the files under it are compared. `./scripts/validar-handoff.sh --self-test` proves each guard still refuses its fixture. Until 0.28 this checked shape only, so the green pass rested on the agent being honest; until 0.31 the self-tests of the gate scripts were frozen by hand with `sed` and `cmp`.
 
@@ -64,7 +70,7 @@ Encode models (embed / NLI / reranker) stay ONNX via `memory-industry models all
 
 ## Immutable fixtures
 
-Mutating tests use throwaway DBs (`brain_gate` / peer). No judge step reads or writes the live corpus (`:5488`), not even read-only: the eval smoke scores a fixed snapshot restored into the judge's own server. The nightly copy of the live corpus is `respaldo-memoria.timer` (systemd user unit, outside the repo), not a judge step.
+Mutating tests use throwaway DBs (`brain_gate` / peer). No judge step reads or writes the live corpus (`:5488`), not even read-only: the eval smoke scores a synthetic fixture (`rust/eval-datasets/smoke-corpus.jsonl`) that `scripts/eval_seed.py` seeds through MCP, by the binary itself, into the judge's own `brain_gate_eval`. The nightly copy of the live corpus is `respaldo-memoria.timer` (systemd user unit, outside the repo), not a judge step.
 
 Published migrations through **0060** are frozen (SHA-384). Wrong shipped SQL gets a **new** migration.
 
@@ -80,4 +86,4 @@ Published migrations through **0060** are frozen (SHA-384). Wrong shipped SQL ge
 
 - Progress lives in `backlog/` (the source of truth for what is done); git is the source of truth for the code.
 - Notion is the management view: the MemoryIndustry space, https://app.notion.com/p/410c9ec4d5d2814ea7e2c981c25ae20b (Cortes, Tareas, Decisiones, Bugs y lecciones, Despliegues, Conocimiento). A task is not opened, moved or closed in one without the other.
-- Judge timings as the project grows: when closing a batch, adding tests or steps to the judge, or when a run takes longer than before, apply the `ci-escala` skill. This repo's starting numbers, budgets and missing guards (CI-E1 to CI-E8) are in `docs/ci/metodologia-de-escala.md` (internal, kept local like the rest of `docs/*`).
+- Judge timings as the project grows: when closing a batch, adding tests or steps to the judge, or when a run takes longer than before, apply the `ci-escala` skill. This repo's starting numbers, budgets and guards are in `docs/ci/metodologia-de-escala.md` (internal, kept local like the rest of `docs/*`). Of its guards CI-E1, E4, E6, E7a and E8 are done; CI-E2, E3, E5 and E7b are still open (`backlog/ci-rapido.md`).
