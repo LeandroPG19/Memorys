@@ -17,7 +17,7 @@ pub fn truncate_to_budget(text: &str, max_tokens: usize) -> String {
         return text.to_string();
     }
     let truncated = &tokens[..max_tokens];
-    enc.decode(truncated.to_vec()).unwrap_or_else(|_| {
+    enc.decode(truncated).unwrap_or_else(|_| {
         let approx = max_tokens.saturating_mul(4);
         let mut end = approx.min(text.len());
         while !text.is_char_boundary(end) && end > 0 {
