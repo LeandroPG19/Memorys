@@ -51,25 +51,25 @@
 
 ## (A) Código o tests del repo por hacer
 
-- [ ] **1.** **CI-E16** · carga perezosa del embedder (producto). B:1147, 1159, 1212; E16.spec. — **EN CURSO 10-nov 18:17:** pasada 2 commiteada 6935b8d; verde con cargo a las 18:08 (compila a la primera; los 5 tests nuevos de onnx pasan, 25 de 25); fusionada en feat/ci-rapido (f4f54d5). Falta: el juez, los sabotajes y la medida A/B.
+- [ ] **1.** **CI-E16** · carga perezosa del embedder (producto). B:1147, 1159, 1212; E16.spec. — **EN CURSO 10-nov 18:17:** pasada 2 commiteada 6935b8d; verde con cargo a las 18:08 (compila a la primera; los 5 tests nuevos de onnx pasan, 25 de 25); fusionada en feat/ci-rapido (f4f54d5). Falta: el juez, los sabotajes y la medida A/B. — **NOTA 10-nov 18:40:** JUEZ VERDE sobre 87346f6 (18:30-18:39, 540 s): la fila E2E pasa de 113-150 s a 42,8 s. Integrada. Faltan solo los sabotajes (noche) y la medida A/B intercalada (noche).
   - **EN CURSO (10-nov 18:07):** pasada 1 en commit `bed6489` (`test(rojo)`, 18:04) y pasada 2 `6935b8d` (18:07) en `feat/ci-e16`. Falta: verde con cargo, integrar, sabotajes y medida.
   - Lo que tocaba: pasada 2 en `onnx.rs`, `db.rs:653`, los nueve llamantes de `cronica`, `faro`, `zafra`, `doctor` y `reembed_cli` (las líneas de la spec siguen valiendo) y CHANGELOG; 19 sabotajes; medida ABBA; un `todo`.
   - Depende de CI-E10 (ya en la rama).
   - La spec tiene 20 escenarios + 3 criterios y 19 sabotajes; B:1159 dice 22 y 20.
   - Tamaño: 60–90 / rojo y verde 15, sabotajes 60–70, medida 15 en exclusiva más dos builds de release.
-- [ ] **2.** **CI-E26** · reparto en turno de 12 CPUs (unos 170 s). B:1193, 1199, 1212.
+- [ ] **2.** **CI-E26** · reparto en turno de 12 CPUs (unos 170 s). B:1193, 1199, 1212. — **NOTA 10-nov 18:40:** juez verde sobre 87346f6. Medido en turno de 12 CPUs: B1 espera 264 s (antes 338-411), pero ahora por cpu, no por jobs (M usa 6 núcleos), y B3 con 6 jobs y compañía tarda 299 s (antes 169-216 sola): T 565 → 539 s, casi todo por E2E. Queda abierto como punto nuevo: en un turno de 12, que B1 entre antes que M (simular antes de tocar).
   - **EN CURSO (10-nov 18:05):** commits `2cc9606` (`test(rojo)`) y `d2292cc`, fusionados en `feat/ci-rapido` (`ebbc710`). Falta el juez.
   - Cambia la clave de la tabla: pide una serie de siembra. Tamaño: 45–60 / 30–40 compartida.
   - [ ] **2a.** El backlog solo habla de jobs. No recoge que el semáforo `models` ya muerde: DBG espera 84–91 s y REL 226 s en el veredicto de 12 CPUs. Comprobar que el arreglo lo cubre o anotarlo.
   - [ ] **2b.** **(H)** S1 de E11, «DBG sin `models`» (`scripts/gate-dag.txt:41`; E11.spec §11).
-- [ ] **3.** **CI-E12** · seis tests de `gate_dag_contract` con muro de tiempo. B:1102, 1141, 1207. Es lo que permite bajar los techos subidos hoy (punto 55). 30–45 / 3.
+- [x] **3.** **CI-E12** · seis tests de `gate_dag_contract` con muro de tiempo. B:1102, 1141, 1207. Es lo que permite bajar los techos subidos hoy (punto 55). 30–45 / 3. — **HECHO 10-nov 18:40:** juez verde sobre 87346f6; gate_dag_contract 17,3 s con 99 tests (techo 23).
   - **EN CURSO (10-nov 18:05):** commit `8cfb106`, fusionado en `feat/ci-rapido` (`57ae0b9`). Falta el juez.
-- [ ] **4.** **CI-E19** · esperas fijas fuera del detector. B:1155. La spec añade D-E11j.3 (`start_paused`). 45 / 5.
+- [x] **4.** **CI-E19** · esperas fijas fuera del detector. B:1155. La spec añade D-E11j.3 (`start_paused`). 45 / 5. — **HECHO 10-nov 18:40:** juez verde sobre 87346f6 (el test g15 arreglado en c57ab09 pasa). Sus 9 sabotajes de producto van en la cadena de la noche.
   - **EN CURSO (10-nov 18:05):** commit `8cfb106`, fusionado en `feat/ci-rapido` (`57ae0b9`). Falta el juez.
 - [ ] **5.** **(H)** `v09` y `v040` exigen `ready` y verían `pending` con un embebido de más de 2 s. B:1064 lo declara como riesgo, sin tarea ni guarda, y no estaba en la lista de CI-E19. 20–30 / 2.
-- [ ] **6.** **CI-E23** · el log del clúster va al directorio de la corrida. B:1178. 20–30 / 1.
+- [x] **6.** **CI-E23** · el log del clúster va al directorio de la corrida. B:1178. 20–30 / 1. — **HECHO 10-nov 18:40:** juez verde sobre 87346f6.
   - **EN CURSO (10-nov 18:05):** commits `2cc9606`/`d2292cc`, fusionados (`ebbc710`). Falta el juez.
-- [ ] **7.** **CI-J19** · `validar-handoff.sh` (`filas_dag`) usa el lector único de la tabla. B:1123. 20 / 1.
+- [x] **7.** **CI-J19** · `validar-handoff.sh` (`filas_dag`) usa el lector único de la tabla. B:1123. 20 / 1. — **HECHO 10-nov 18:40:** juez verde sobre 87346f6.
   - **EN CURSO (10-nov 18:05):** commits `2cc9606`/`d2292cc`, fusionados (`ebbc710`). Falta el juez.
 - [ ] **8.** **CI-E22** · bug de producto: un episodio sin vector no lo recupera `reembed` (H1 de E16). B:1160. O `reembed` cubre `brain_episodes`, o el mensaje de `main.rs:84-90` deja de prometerlo. 30–60 / 5. — **EN CURSO 10-nov 18:37:** CI-E22 especificada (ci-rapido-E22.spec.md, 11 escenarios, 18 sabotajes, sin migración: brain_episodes.embedding existe desde 0002): reembed (cuba_zafra y la CLI) y el backfill cubren los episodios con la misma regla que las observaciones; faro sí busca episodios por vector y filtra los que no lo tienen, así que el arreglo no puede ser solo de texto. Pasada 1 en curso en feat/ci-e22.
 - [ ] **9.** **CI-E17** · dos pools al arrancar (`main.rs:354-369`, `protocol.rs:434`). B:1161. Va después de medir E16; hay que decidir qué mensaje gana con la base caída. 45 / 5. — **EN CURSO 10-nov 18:37:** CI-E17 especificada (ci-rapido-E17.spec.md): main abre el pool una vez y lo pasa a run_mcp; con la base caída un solo aviso («starting without PostgreSQL…»); va en serie tras CI-E22 (las dos tocan main.rs).
@@ -387,5 +387,5 @@
   - `scripts/gate_history.py:29` hace `import fcntl` y `scripts/gate-dag.py:90` usa `signal.SIGHUP`; falta la lista de las demás llamadas solo-POSIX.
   - Se comprueba en la medida de Windows (punto 84) con `python3 -I -B scripts/gate-dag.py rows --table scripts/gate-dag.txt`.
   - Relacionado con CI-E25 (punto 10).
-- [ ] **98.** **CI-E27** · el remate del doble escalado de `gate_usl`. — **EN CURSO 10-nov 18:17:** CI-E27 commiteada eaa4651/f309e83 y fusionada (593d90f): efectivo(j) = share_jobs; con J_m ≥ 24 idéntico (81 combinaciones); falta el juez.
+- [x] **98.** **CI-E27** · el remate del doble escalado de `gate_usl`. — **EN CURSO 10-nov 18:17:** CI-E27 commiteada eaa4651/f309e83 y fusionada (593d90f): efectivo(j) = share_jobs; con J_m ≥ 24 idéntico (81 combinaciones); falta el juez. — **HECHO 10-nov 18:40:** juez verde sobre 87346f6.
   - **EN CURSO (10-nov, tras la foto).**
