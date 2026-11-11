@@ -82,10 +82,10 @@
   - Bloquea CI-E2 (punto 12), la marca de intermitente y D-F5e.
 - [ ] **12.** **CI-E2** · coste por test y cuota de los 10 más caros. B:1009, 1025. Depende del punto 11. Lleva la decisión de los números en el recibo (punto 92). 60 / 2.
 - [ ] **13.** **CI-E3 y L1–L3** · segundos por autotest con techo; paralelizar los casos del autotest de `merge-gate.sh` (62 → 71 s tras CI-E15). B:1009, 1025, 1076. Los datos ya están medidos. 60–90 / 3.
-- [ ] **14.** **CI-E5** · regresión por punto de cambio. B:1009, 1025. Necesita historial (10 corridas por modo). Después.
+- [x] **14.** **CI-E5** · regresión por punto de cambio. B:1009, 1025. Necesita historial (10 corridas por modo). Después. — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
 - [ ] **15.** **(H)** `mutants_seed_prune` no borra los `<clave>.tmp-<pid>` de un pid muerto (`scripts/mutants-gate.sh:690-693`). Anotado en B:875 («después de F6»), nunca abierto. 20–40 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: mutants_seed_prune borra los <clave>.tmp-<pid> de pid muerto del mismo usuario; autotest verde; falta el juez.
 - [ ] **16.** **CI-E7b** · J de DBG y B3 desde barridos fiables. B:1031, 1212; E7.spec:205-227. Depende del punto 39. 45 / lo de los barridos.
-  - [ ] **16a.** E7b.2 (`--modo serie|dag`) no existe y con el DAG por omisión conviene cerrarla como «no se hace».
+  - [x] **16a.** E7b.2 (`--modo serie|dag`) no existe y con el DAG por omisión conviene cerrarla como «no se hace». — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md:1235 (entrada de las 18:19) y repetido en la entrada «Cierres por escrito, segunda tanda», B:1271**
   - [ ] **16b.** **(H)** Quitar el prefijo `CARGO_BUILD_JOBS` de D-F1b bajo cargo-mutants (F6.spec:176).
 - [ ] **17.** **CI-E1b y CI-E1c** (B:1037): solo anotados. E1c pide que `test-times.sh --count` dé `ignored`. Unos 60 / 2.
 - [ ] **18.** **(H)** E1 §9, tercer seguimiento: rechazar una línea `plain/…` que cambia sin tocar las fuentes de su binario (E1.spec:383). 45–60 / 1.
@@ -116,14 +116,14 @@
   - [ ] **33b.** `rust/tests/local_gate_contract.rs:2076-2079` («against the live cluster»).
   - [ ] **33c.** `rust/tests/common/mod.rs:254-256` (F2.spec:495).
 - [ ] **34.** **(H)** «12 GB por copia» en `mutants-gate.sh:257-263` es la cifra de Windows (D-F4k; `docs/gate.md:165`). Medir en 20 / 3, o descartarlo por escrito.
-- [ ] **35.** Tareas de producto para después de la 0.31 que no existen en ningún backlog (5 cada una para abrirlas).
-  - [ ] **35a.** La conexión LISTEN de `protocol.rs` sin ámbito RLS (B:865).
-  - [ ] **35b.** **(H)** La reserva de `rerank.rs:51` sigue con `wants_gpu` (F3.4.spec:114; B:855).
-  - [ ] **35c.** **(H)** CI-K3c: los 59 ficheros de D2 a base desechable (K3.spec:463).
-  - [ ] **35d.** K6e (OnceLock por guion, K6.spec:19), Q2-e y Q1-f (F6.spec:126, 131).
-- [ ] **36.** **T7 y T6**, después de la 0.31.
-  - [ ] **36a.** T7, flujos de GitHub (B:950). La spec de K7 le añade: el bloque muerto de OpenSSL en `publish.yml:200-242`, los pasos `--features docs` duplicados en `ci.yml:94-101`, y `dtolnay/rust-toolchain@stable` con el fichero de toolchain presente.
-  - [ ] **36b.** T6, crate `search-core` (B:952).
+- [x] **35.** Tareas de producto para después de la 0.31 que no existen en ningún backlog (5 cada una para abrirlas). — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
+  - [x] **35a.** La conexión LISTEN de `protocol.rs` sin ámbito RLS (B:865). — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
+  - [x] **35b.** **(H)** La reserva de `rerank.rs:51` sigue con `wants_gpu` (F3.4.spec:114; B:855). — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
+  - [x] **35c.** **(H)** CI-K3c: los 59 ficheros de D2 a base desechable (K3.spec:463). — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
+  - [x] **35d.** K6e (OnceLock por guion, K6.spec:19), Q2-e y Q1-f (F6.spec:126, 131). — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
+- [x] **36.** **T7 y T6**, después de la 0.31. — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
+  - [x] **36a.** T7, flujos de GitHub (B:950). La spec de K7 le añade: el bloque muerto de OpenSSL en `publish.yml:200-242`, los pasos `--features docs` duplicados en `ci.yml:94-101`, y `dtolnay/rust-toolchain@stable` con el fichero de toolchain presente. — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
+  - [x] **36b.** T6, crate `search-core` (B:952). — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
 
 ## (B) Verificaciones y medidas por correr
 
@@ -221,18 +221,18 @@
   - [ ] **60a.** La constancia de todo lo de «Trabajo en curso» (17:14–18:02) y de P-1. Tras la foto existe `a0dea6c` (`docs(backlog)`: la orden de cerrar todo hoy, tres tajadas entregadas, `pesado`); comprobar que no falta nada.
   - [ ] **60b.** La tabla del lote está vieja (B:38 dice `wal_level=minimal` y el código usa `replica`).
 - [x] **61.** **(H)** **«La lista del release» no existe.** B:1027 y B:1039 mandan ahí H7 y la medida en Windows; no hay tal fichero. Debe recoger los puntos 10, 54, 55, 84, 85, 86, 88 y 89. 15 / 0. — **HECHO 10-nov 18:23:** creada backlog/lista-del-release-0.31.md (15 puntos con casilla, quién, fuente y comando).
-- [ ] **62.** **Cierres por escrito**: decisiones cuyo dato ya existe y solo falta anotar. 30 / 0. — **EN CURSO 10-nov 18:23:** 11 cierres escritos en la bitácora (entrada de las 18:19); sigue abierta la sonda de wal_level (48a, opcional) y quedan para Leandro: adoptar juez-cuda (ahorro tope 5-10 s) y T2.
-  - [ ] **62a.** F3.5, lanzador por binario (B:863): la condición no se cumple con lo medido (162 s de holgura).
-  - [ ] **62b.** **(H)** F5b `juez-cuda`: `recomendar` dice «yes (B3 slack 0.0 s)» desde las corridas de las 15:27 (`CR/campana-final-20261110-152701/usl-recomendar-final.log:18`) y B:1128 sigue con «no». Los `--timings` dicen que ganaría como mucho 7–8 s; lo razonable es anotarlo y cerrarla.
-  - [ ] **62c.** **(H)** T2: la unidad `cuba-memorys` cuesta 100,8 s de 167,9 (60 %), así que cumple el criterio de K7.spec:403 para llevárselo a Leandro (92b); el ahorro de reloj sería casi nulo.
-  - [ ] **62d.** **(H)** A2 de F3 (diagnóstico con factor 2,0: ya no aplica; F3.spec:802).
-  - [ ] **62e.** **(H)** O4 de F4 (línea base sobre el 10 % del paso: sigue descartada; F4.spec:86).
-  - [ ] **62f.** **(H)** Monte Carlo (menos de 20 corridas) y `nice` por criticidad (F3.spec:159).
-  - [ ] **62g.** **(H)** `RUST_TEST_THREADS` y el `wait` sin plazo de `on_exit` (J14.spec:32, 55).
-  - [ ] **62h.** **(H)** R5 de E11 (shmem 0,21 GiB con cuatro clústeres en tmpfs).
-  - [ ] **62i.** **(H)** `wal_level` (se queda `replica`; ver 48a y 60b).
-  - [ ] **62j.** La spec de E10 nombra `lock_timeout_sql` y el código `lock_timeout_millis` (B:1100).
-  - [ ] **62k.** B:863 («el resto como tareas del backlog de Mapupita») contradice D-F7d (F7.spec:137).
+- [ ] **62.** **Cierres por escrito**: decisiones cuyo dato ya existe y solo falta anotar. 30 / 0. — **EN CURSO 10-nov 18:23:** 11 cierres escritos en la bitácora (entrada de las 18:19); sigue abierta la sonda de wal_level (48a, opcional) y quedan para Leandro: adoptar juez-cuda (ahorro tope 5-10 s) y T2. — **NOTA 10-nov: segunda tanda escrita (entrada «Cierres por escrito, segunda tanda», B:1271); siguen abiertos 62b (adopción de juez-cuda, de Leandro) y 62c (T2, de Leandro)**
+  - [x] **62a.** F3.5, lanzador por binario (B:863): la condición no se cumple con lo medido (162 s de holgura). — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md:1225 (entrada de las 18:19); marcado en la segunda tanda (B:1271)**
+  - [ ] **62b.** **(H)** F5b `juez-cuda`: `recomendar` dice «yes (B3 slack 0.0 s)» desde las corridas de las 15:27 (`CR/campana-final-20261110-152701/usl-recomendar-final.log:18`) y B:1128 sigue con «no». Los `--timings` dicen que ganaría como mucho 7–8 s; lo razonable es anotarlo y cerrarla. — **NOTA 10-nov: dato anotado en backlog/ci-rapido.md:1226; no se cierra, decide Leandro (entrada «Cierres por escrito, segunda tanda», B:1271)**
+  - [ ] **62c.** **(H)** T2: la unidad `cuba-memorys` cuesta 100,8 s de 167,9 (60 %), así que cumple el criterio de K7.spec:403 para llevárselo a Leandro (92b); el ahorro de reloj sería casi nulo. — **NOTA 10-nov: estado anotado en backlog/ci-rapido.md:1271 (sin cierre escrito); no se cierra, decide Leandro (entrada «Cierres por escrito, segunda tanda», B:1271)**
+  - [x] **62d.** **(H)** A2 de F3 (diagnóstico con factor 2,0: ya no aplica; F3.spec:802). — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md:1227 (entrada de las 18:19); marcado en la segunda tanda (B:1271)**
+  - [x] **62e.** **(H)** O4 de F4 (línea base sobre el 10 % del paso: sigue descartada; F4.spec:86). — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md:1228 (entrada de las 18:19); marcado en la segunda tanda (B:1271)**
+  - [x] **62f.** **(H)** Monte Carlo (menos de 20 corridas) y `nice` por criticidad (F3.spec:159). — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md:1229 (entrada de las 18:19); marcado en la segunda tanda (B:1271)**
+  - [x] **62g.** **(H)** `RUST_TEST_THREADS` y el `wait` sin plazo de `on_exit` (J14.spec:32, 55). — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md:1230 (entrada de las 18:19); marcado en la segunda tanda (B:1271)**
+  - [x] **62h.** **(H)** R5 de E11 (shmem 0,21 GiB con cuatro clústeres en tmpfs). — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md:1231 (entrada de las 18:19); marcado en la segunda tanda (B:1271)**
+  - [x] **62i.** **(H)** `wal_level` (se queda `replica`; ver 48a y 60b). — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md:1232 (entrada de las 18:19); marcado en la segunda tanda (B:1271)**
+  - [x] **62j.** La spec de E10 nombra `lock_timeout_sql` y el código `lock_timeout_millis` (B:1100). — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md:1233 (entrada de las 18:19); marcado en la segunda tanda (B:1271)**
+  - [x] **62k.** B:863 («el resto como tareas del backlog de Mapupita») contradice D-F7d (F7.spec:137). — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md, entrada «Cierres por escrito, segunda tanda», B:1271**
 - [x] **63.** **`docs/gate.md`** (lo lee el juez: va en un commit antes del veredicto final). 20 / 0. — **HECHO 10-nov 18:23:** docs/gate.md: hora de la auditoría decidida, los dos bins con test = false, juez de Windows una vez por release con la comprobación de Python de CI-E25b.
   - [ ] **63a.** `:263` dice que el temporizador está «pending the hours», y ya está decidido (domingo 02:00).
   - [ ] **63b.** **(H)** No dice que los dos bins llevan `test = false` ni que el aviso de cargo sigue (D-F5y; F5.spec:160).
@@ -303,7 +303,7 @@
   - **HECHO (10-nov 18:01):** batería `~/herramientas/pesado.test.sh` con 7 filas (k), 193 en verde; rojo en 2 con la versión anterior; `maquina-compartida.md` actualizada; scope `run-pesado-<pid>-<epoch>`.
   - Lo que había en la foto: el arreglo instalado a las 17:43 (`~/.local/bin/pesado:512-530`; copia `pesado.antes-scope-20261110`), sin fila en la batería ni regla.
   - Quedan fuera de esta casilla la memoria (69a) y el backlog (60a).
-- [ ] **81.** **Unidades `qg-auditoria-semanal.service/.timer`** (domingo 02:00): no están instaladas (comprobado). B:903 las deja para después de la 0.31, porque lanzan el guion del clon principal. La primera corrida necesita `QG_AUDIT_BASE` (`scripts/qg-weekly-audit.sh:9-11`) y será la que mida por primera vez el reloj de Q1. 15 / la auditoría, en exclusiva.
+- [x] **81.** **Unidades `qg-auditoria-semanal.service/.timer`** (domingo 02:00): no están instaladas (comprobado). B:903 las deja para después de la 0.31, porque lanzan el guion del clon principal. La primera corrida necesita `QG_AUDIT_BASE` (`scripts/qg-weekly-audit.sh:9-11`) y será la que mida por primera vez el reloj de Q1. 15 / la auditoría, en exclusiva. — **CERRADO 10-nov: tarea abierta en backlog/despues-de-la-0.31.md**
 - [ ] **82.** **(H)** `~/herramientas/cuidar-disco.sh` y `vigilar-disco.sh` no conocen `~/.cache/cargo-target/memory-industry*` ni `~/.cache/memory-industry-gate` (P:65; J-F1.spec:64; F3.spec:911; F6.spec:516). 20 / 0, o descartarlo por escrito; es cambio de sistema y va a memoria.
 - [ ] **83.** **Reglas y guiones**.
   - [ ] **83a.** `~/.claude/agents/{especificador,implementador}.md` de WSL difieren de los de `/mnt/c/Users/emman/.claude/agents/` (deriva anotada en B:1039, sin arreglar).
@@ -337,7 +337,7 @@
   - [ ] **92a.** Los números de CI-E4 en el recibo, que se copian a cada tag (B:1033).
   - [ ] **92b.** T2: quitar o compartir el segundo bin (62c).
   - [ ] **92c.** NPM-OIDC: su tarea para después de la 0.31 (B:45, 344).
-- [ ] **93.** Decisiones menores nunca lanzadas.
+- [ ] **93.** Decisiones menores nunca lanzadas. — **NOTA 10-nov: recomendación escrita de cada una (o su ausencia) en la entrada «Cierres por escrito, segunda tanda», B:1271; las cuatro quedan para Leandro, sin decidir por él**
   - [ ] **93a.** No volver a correr un binario cuyas entradas no cambiaron (`metodologia-de-escala.md:209`).
   - [ ] **93b.** **(H)** Techos por máquina, con clave de host (K4.spec:303).
   - [ ] **93c.** **(H)** P1 de F2: la zona horaria del vivo (F2.spec:129).
@@ -350,8 +350,8 @@
   - [ ] **95d.** Cadena de suministro: herramientas fijadas por sha, `global-min-publish-age` y control positivo del escáner (P:78; `deny.toml` sí tiene `[sources]`).
   - [ ] **95e.** Batería de defectos sembrados (P:75; es el punto 42).
 - [ ] **96.** **(H)** Restos del plan sin cierre escrito.
-  - [ ] **96a.** F0 corrida 2 (P:364 pedía dos corridas completas del juez viejo): B:330 dice que el contenedor viejo se quedaba para ella y nunca consta.
-  - [ ] **96b.** Los cambios 11–18 de I0 (B:102: replay del LLM en Rust, reloj inyectado, Monte Carlo, aviso HNSW) solo se nombran una vez.
+  - [x] **96a.** F0 corrida 2 (P:364 pedía dos corridas completas del juez viejo): B:330 dice que el contenedor viejo se quedaba para ella y nunca consta. — **CERRADO 10-nov: cierre escrito en backlog/ci-rapido.md:1234 (entrada de las 18:19) y repetido en la entrada «Cierres por escrito, segunda tanda», B:1271**
+  - [ ] **96b.** Los cambios 11–18 de I0 (B:102: replay del LLM en Rust, reloj inyectado, Monte Carlo, aviso HNSW) solo se nombran una vez. — **NOTA 10-nov: cierre parcial en la entrada «Cierres por escrito, segunda tanda», B:1271 (lanzador, Monte Carlo, admisión y T/LB con su dato); siguen abiertos replay del LLM, reloj inyectado, hilos de ORT por carril y aviso de HNSW**
 
 ## Los huérfanos que más importan
 
