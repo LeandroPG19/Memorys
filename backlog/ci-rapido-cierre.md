@@ -319,14 +319,14 @@
 - [ ] **85.** **Borrado único**.
   - [x] **85a.** `mtime-exp.zTha` (4,0 GB) y lo anterior al 8-nov de esa carpeta (B:1168, 1212). — **HECHO 10-nov 18:17:** hecho con el punto 73.
   - [ ] **85b.** El `drop` de los tres stashes del punto 72. — **NOTA 10-nov 18:17:** la guarda de comandos bloquea el borrado de stashes también para el orquestador: lo corre Leandro (comando en la lista para él).
-- [ ] **86.** **Subir sqlx** para salir de RUSTSEC-2026-0459 (y de 2023-0071) antes del 30-nov, o aceptar la renovación (B:1121, 1212). Es dependencia de producto: socket y osv antes.
-- [ ] **87.** Decisiones que cambian lo que se verifica (B:1047, 1135, 1212).
+- [ ] **86.** **Subir sqlx** para salir de RUSTSEC-2026-0459 (y de 2023-0071) antes del 30-nov, o aceptar la renovación (B:1121, 1212). Es dependencia de producto: socket y osv antes. — **NOTA 10-nov 19:22:** decidido por Leandro: subir sqlx va tras la 0.31 como tarea propia; si la 0.31 no ha salido el 30-nov, las tres excepciones se renuevan con fecha y motivo.
+- [ ] **87.** Decisiones que cambian lo que se verifica (B:1047, 1135, 1212). — **NOTA 10-nov 19:22:** decidido por el agente (se informó a Leandro): NLI se queda exclusiva.
   - [ ] **87a.** **C2 · NLI deja de ser exclusiva** (−18 s): las corridas DAG que pedía E11 ya existen (NLI esperó 301,7 s y 147,7 s).
   - [ ] **87b.** **A3**: grupos del E2E en paralelo con bases clonadas.
 - [ ] **88.** **(H)** Dos decisiones de E16 que no están en la lista de B:1212.
   - [ ] **88a.** **D-E16b**: un modelo configurado que no abre deja de arrancar (B:1159 «a revisar por Leandro»; E16.spec:92).
   - [ ] **88b.** **H3 de E16**: el reranker de stdio se calienta en fondo (`protocol.rs:476-490`).
-- [ ] **89.** **Integrar y publicar** (P:375): `feat/ci-rapido` iba 500 commits por delante de `release/0.31.0` (`fbe6632`) en la foto, no tiene rama remota y no está integrada. Empujar y `release.sh v0.31.0` piden su orden.
+- [ ] **89.** **Integrar y publicar** (P:375): `feat/ci-rapido` iba 500 commits por delante de `release/0.31.0` (`fbe6632`) en la foto, no tiene rama remota y no está integrada. Empujar y `release.sh v0.31.0` piden su orden. — **NOTA 10-nov 19:22:** decidido por Leandro: integrar feat/ci-rapido en release/0.31.0 y empujar las ramas, tras el veredicto final; no publica versión.
   - [ ] **89a.** **(H)** Decisión asociada: el producto del lote (K7, K7b, K8a, T-DBURL, CI-E10, CI-E16) entró directo en la integración, sin el six-pack sobre `release/0.31.0` que B:901 prometía «como T-RLS».
   - [ ] **89b.** Integrar en `release/0.31.0`, veredicto con dos vueltas y recibo sobre ese SHA (punto 37), y `release.sh` con su orden.
 - [ ] **90.** **Publish en seco** (`cross` y maturin con `rust-toolchain.toml`, B:934). `cargo xwin` baja el SDK de MSVC (licencia; 47g).
@@ -343,7 +343,7 @@
   - [ ] **93c.** **(H)** P1 de F2: la zona horaria del vivo (F2.spec:129).
   - [ ] **93d.** El rojo barato «juez real contra `:5488`» (J-F1.spec:515), que consulta el corpus vivo en lectura.
 - [ ] **94.** **(H)** Propuesta a cargo-mutants de que su copia conserve el mtime (F4.spec:450): toca a un tercero.
-- [ ] **95.** **(H)** Técnicas del §1 del plan marcadas ✅ o 🔧 sin ningún rastro en el backlog ni en el repo. Decide si se hacen o se descartan por escrito.
+- [ ] **95.** **(H)** Técnicas del §1 del plan marcadas ✅ o 🔧 sin ningún rastro en el backlog ni en el repo. Decide si se hacen o se descartan por escrito. — **NOTA 10-nov 19:22:** decidido por Leandro: hoy el modo rapido y el recibo de solo-docs (CI-E29: rapido barato + parcial; release.sh etiqueta el commit juzgado); Squawk, herramientas por hash y la batería de defectos, tareas para después de la 0.31. CI-E29 pasada 1 d992aed (43 escenarios; rojo visto en los tres autotests); pasada 2 en curso.
   - [ ] **95a.** Modo `rapido` de `como-el-ci.sh` (P:56; el guion solo tiene `todo|extra|quality|…`).
   - [ ] **95b.** Recibo atado a la huella del juez, con la lista blanca de solo-docs y el hook de parada (P:71).
   - [ ] **95c.** Squawk para las migraciones (P:79).
