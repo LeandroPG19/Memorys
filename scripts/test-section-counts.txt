@@ -26,7 +26,7 @@ embedding-model 2 v016_chunking (F0 corrida 2)
 nli 10 nli_entailment + nli_cost + nli_probe (F0 corrida 2)
 generative-llm 4 v016_extract_without_sampling + v017_relation_scan (F0 corrida 2)
 reranker-placement 5 v017_rerank_gpu sin --ignored, con cuda y release (F0 corrida 2) y CI-D5 +1 test (two_sessions_of_one_process_open_through_the_single_environment)
-placement-table 23 cargo test --release --features docs,cuda --lib gpu:: (F0 corrida 2: 23 passed en release/deps con cuda, log línea ~5479)
+placement-table 25 cargo test --release --features docs,cuda --lib gpu:: (F0 corrida 2: 23 passed en release/deps con cuda, log línea ~5479) y CI-D5b +2 tests (nvidia_smi_is_found_in_the_wsl_directory_when_the_path_does_not_have_it, the_hint_of_a_provider_that_did_not_start_names_the_libraries_of_the_installed_flavor; 25 passed en REL del todo del 11-nov sobre 7ace6b5)
 reranker-model 2 v017_rerank_gpu --ignored, con cuda y release (F0 corrida 2: "running 2 tests" en la corrida release de v017_rerank_gpu, log línea ~8700)
 # CI-E1, CI-E11 (D-E11e): las 100 líneas del pase llano, una por binario y con los prefijos de E11 (91 `plain`, 8 `contracts`,
 # 1 `doc`), medidas una sola vez por la pasada llana del 10-nov sobre b51e027 (pasada-llana-20261110-124505 de
