@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -353,7 +353,8 @@ async fn merge_entity(pool: &PgPool, loser: &Entity, winner: &Entity) -> Result<
         .context("moviendo hechos")?;
 
     for col in ["from_entity", "to_entity"] {
-        sqlx::query(&format!(
+        // sql-safe: col is one of the two literal column names of the loop above
+        let redirect = AssertSqlSafe(format!(
             "UPDATE brain_relations SET {col} = $1
              WHERE {col} = $2
                AND NOT EXISTS (
@@ -363,12 +364,13 @@ async fn merge_entity(pool: &PgPool, loser: &Entity, winner: &Entity) -> Result<
                    AND r2.relation_type = brain_relations.relation_type
                    AND r2.id != brain_relations.id
                )"
-        ))
-        .bind(winner.id)
-        .bind(loser.id)
-        .execute(&mut *tx)
-        .await
-        .with_context(|| format!("redirigiendo relaciones ({col})"))?;
+        ));
+        sqlx::query(redirect)
+            .bind(winner.id)
+            .bind(loser.id)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("redirigiendo relaciones ({col})"))?;
     }
 
     sqlx::query("DELETE FROM brain_relations WHERE from_entity = $1 OR to_entity = $1")

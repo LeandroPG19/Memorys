@@ -81,7 +81,8 @@ pub async fn handle(args: &Value) -> Result<Value> {
             let html = fetch::get(&url)
                 .await
                 .with_context(|| format!("trayendo la documentación de `{library}` desde {url}"))?;
-            let t = fetch::html_to_text(&html, 100);
+            let t = fetch::html_to_text(&html, 100)
+                .with_context(|| format!("convirtiendo a texto la página de {url}"))?;
             cache()
                 .lock()
                 .map_err(|e| anyhow::anyhow!("cache envenenada: {e}"))?

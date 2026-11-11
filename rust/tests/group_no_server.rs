@@ -14,6 +14,10 @@ mod cli_contract;
 mod connect_surface_contract;
 #[path = "group_no_server/doc_contract.rs"]
 mod doc_contract;
+// `net` exists only with the `docs` feature, a default one: without it there is no html2text to judge.
+#[cfg(feature = "docs")]
+#[path = "group_no_server/docs_text_contract.rs"]
+mod docs_text_contract;
 #[path = "group_no_server/e2e_tool_matrix_contract.rs"]
 mod e2e_tool_matrix_contract;
 #[path = "group_no_server/gate_lane_token_contract.rs"]
@@ -22,6 +26,8 @@ mod gate_lane_token_contract;
 mod migrations_contract;
 #[path = "group_no_server/scram_verifier_contract.rs"]
 mod scram_verifier_contract;
+#[path = "group_no_server/sql_safe_contract.rs"]
+mod sql_safe_contract;
 #[path = "group_no_server/v026_the_panel_is_not_a_second_door.rs"]
 mod v026_the_panel_is_not_a_second_door;
 #[path = "group_no_server/v029_apply_keeps_what_the_operator_set.rs"]

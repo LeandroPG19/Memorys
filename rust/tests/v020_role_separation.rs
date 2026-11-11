@@ -40,10 +40,10 @@ async fn the_application_role_is_not_a_superuser_and_cannot_bypass_rls() {
 #[ignore]
 async fn the_audit_log_rejects_mutation_from_the_application_role() {
     let admin = admin_pool().await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER ROLE cuba_app PASSWORD '{}'",
         memory_industry::setup::app_role_password().expect("an app password")
-    ))
+    )))
     .execute(&admin)
     .await
     .expect("setting the app role password");

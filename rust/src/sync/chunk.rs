@@ -214,7 +214,7 @@ pub fn payload_hash_bytes(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 pub fn payload_hash(s: &str) -> String {
@@ -234,6 +234,21 @@ pub(crate) mod tests {
         assert_eq!(payload_hash("brain"), payload_hash("brain"));
         assert_ne!(payload_hash("a"), payload_hash("b"));
         assert_eq!(payload_hash("x").len(), 64);
+    }
+
+    /// CI-D2: `the_hash_is_sha256_and_deterministic` pins the digest of the empty
+    /// string, which has no byte under `0x10`, so it cannot tell two hex digits
+    /// per byte from the unpadded spelling a `{:x}` of each byte would give. The
+    /// digest of «abc» (FIPS 180-2, appendix B.1) has a `01`, a `03` and a `00`.
+    #[test]
+    fn the_payload_hash_is_the_fips_vector_in_lowercase_hex() {
+        // printf abc | sha256sum
+        assert_eq!(
+            payload_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "the hash of every row and file in a sync bundle is compared by the other node \
+             as text: a byte spelled with one digit, or in capitals, is a different bundle"
+        );
     }
 
     #[test]

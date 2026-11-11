@@ -163,11 +163,28 @@ const KNOWN_DIGESTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// `sha2` 0.11 hashers no longer implement `io::Write` (`digest` 0.11 is `no_std`).
+/// `io::copy` already retries `Interrupted` and handles short reads, so the hasher
+/// is fed through a writer instead of a read loop of our own.
+struct HashWriter<'a>(&'a mut sha2::Sha256);
+
+impl Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn sha256_file(path: &std::path::Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
+    std::io::copy(&mut file, &mut HashWriter(&mut hasher))?;
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -2203,6 +2220,37 @@ mod tests {
             !root.join("escaped").exists(),
             "an entry that climbs out of the directory writes nothing outside it"
         );
+        std::fs::remove_dir_all(&root).expect("the test owns this directory");
+    }
+
+    /// CI-D2: `sha256_file` decides whether a downloaded model is kept or
+    /// deleted as a «checksum mismatch», and `cache migrate` fingerprints files
+    /// with it. The second file is a million bytes, far past the 8 KiB buffer of
+    /// `io::copy`, so the sum has to survive more than one read: a writer that
+    /// drops or repeats part of a chunk still gets «abc» right.
+    #[test]
+    fn the_file_checksum_is_the_fips_vector_whatever_the_reads() {
+        let root = scratch_root("sha256-file");
+        std::fs::create_dir_all(&root).expect("the test owns this directory");
+        let short = root.join("abc.bin");
+        let long = root.join("million-a.bin");
+        std::fs::write(&short, b"abc").expect("temp dir is writable");
+        std::fs::write(&long, vec![b'a'; 1_000_000]).expect("temp dir is writable");
+
+        // FIPS 180-2, appendix B.1; `printf abc | sha256sum`.
+        assert_eq!(
+            sha256_file(&short).expect("the file is readable"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "the digest of a file that fits in one read"
+        );
+        // FIPS 180-2, appendix B.3; `head -c 1000000 /dev/zero | tr '\0' a | sha256sum`.
+        assert_eq!(
+            sha256_file(&long).expect("the file is readable"),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+            "a file larger than one read has to be hashed whole: a short sum deletes a good \
+             model and a long one keeps a truncated download"
+        );
+
         std::fs::remove_dir_all(&root).expect("the test owns this directory");
     }
 }

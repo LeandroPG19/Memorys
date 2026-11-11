@@ -199,7 +199,7 @@ mod tests {
     }
 
     /// The password the daemon logs in with: sqlx parses DATABASE_URL with
-    /// `PgConnectOptions::from_str`. sqlx-postgres 0.8.6 has no getter for the
+    /// `PgConnectOptions::from_str`. sqlx-postgres (0.8.6 and 0.9.0) has no getter for the
     /// password, so it is read back through `to_url_lossy`, which rebuilds the
     /// URL from the parsed options (`build_url` percent-encodes the stored
     /// password with NON_ALPHANUMERIC); decoding that is exactly what was stored.

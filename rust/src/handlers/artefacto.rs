@@ -480,3 +480,25 @@ fn require_path(args: &Value) -> Result<&str> {
     }
     Ok(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CI-D2: `brain_artifacts.content_hash` is what `list`, `get` and `put` hand
+    /// to clients and what a sync bundle carries to the other node, and nothing
+    /// tested the value itself. «abc» is the FIPS 180-2 vector (appendix B.1); its
+    /// digest has a `01`, a `03` and a `00`, so a spelling that drops the leading
+    /// zero of a byte, or writes capitals, shows here.
+    #[test]
+    fn the_artifact_hash_is_the_fips_vector_in_lowercase_hex() {
+        // printf abc | sha256sum
+        assert_eq!(
+            content_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "the stored hash is the lowercase SHA-256 of the content: the rows already in \
+             `brain_artifacts` and in the peers were written that way, and a different spelling \
+             gives the same text two hashes"
+        );
+    }
+}

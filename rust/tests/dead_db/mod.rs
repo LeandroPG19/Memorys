@@ -4,7 +4,7 @@
 // a single public item because each binary that declares it (a loose file, or the root of a group)
 // compiles its own copy and one that leaves an item unused trips dead_code under clippy `-D warnings` (the same rule as `common/mod.rs`).
 //
-// Why a listener that hangs up and not a port nobody listens on (`127.0.0.1:1`): sqlx 0.8 treats
+// Why a listener that hangs up and not a port nobody listens on (`127.0.0.1:1`): sqlx (0.8 and 0.9, `pool/inner.rs:378`) treats
 // a refused connection as "the server is starting" and retries it with backoff until
 // `acquire_timeout` (5 s, `db.rs`), then returns `PoolTimedOut`. That is sqlx, not Windows, so it
 // costs the same on Linux. Measured with `memory-industry serve` against three dead databases:

@@ -33,7 +33,7 @@ jobs:
     name: The tag carries the local gate's receipt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: The tag must be annotated and name this commit as gated
         env:
@@ -98,18 +98,24 @@ jobs:
             features: docs,cuda,directml
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install the compiler rust-toolchain.toml pins
+        id: pin
+        working-directory: .
+        shell: bash
+        run: |
+          channel="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          [ -n "$channel" ] || { echo "::error::rust-toolchain.toml names no channel" >&2; exit 1; }
+          rustup toolchain install "$channel" --profile minimal --target ${{ matrix.target }}
+          echo "channel=$channel" >>"$GITHUB_OUTPUT"
 
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --quiet
+        run: cargo install cross --locked --version 0.2.5 --quiet
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -160,7 +166,7 @@ jobs:
           cp rust/target/${{ matrix.target }}/release/cuba-memorys.exe ${{ matrix.artifact }}
           cp rust/target/${{ matrix.target }}/release/memory-industry.exe ${{ matrix.artifact_new }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -174,15 +180,15 @@ jobs:
     needs: build-binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist/
           merge-multiple: true
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: MemoryIndustry ${{ github.ref_name }}
@@ -244,11 +250,23 @@ jobs:
       name: pypi
       url: https://pypi.org/project/memory-industry/
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Install the compiler rust-toolchain.toml pins
+        id: pin
+        working-directory: .
+        shell: bash
+        run: |
+          channel="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          [ -n "$channel" ] || { echo "::error::rust-toolchain.toml names no channel" >&2; exit 1; }
+          rustup toolchain install "$channel" --profile minimal
+          echo "channel=$channel" >>"$GITHUB_OUTPUT"
 
       - name: Build wheel (memory-industry)
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.16.0
+          rust-toolchain: ${{ steps.pin.outputs.channel }}
           command: build
           args: --release --features docs --out dist
           target: ${{ matrix.target }}
@@ -269,6 +287,8 @@ jobs:
       - name: Build wheel (cuba-memorys alias)
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.16.0
+          rust-toolchain: ${{ steps.pin.outputs.channel }}
           command: build
           args: --release --features docs --out dist
           target: ${{ matrix.target }}
@@ -278,6 +298,8 @@ jobs:
       - name: Upload to PyPI
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.16.0
+          rust-toolchain: ${{ steps.pin.outputs.channel }}
           command: upload
           # --skip-existing makes re-runs idempotent (no 400 "file already exists")
           args: --skip-existing dist/*.whl
@@ -293,11 +315,12 @@ jobs:
       name: npm
       url: https://www.npmjs.com/package/memory-industry
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
+          package-manager-cache: false
           registry-url: "https://registry.npmjs.org"
 
       - name: Publish to npm (cuba-memorys alias + memory-industry)
@@ -335,7 +358,7 @@ jobs:
     needs: [publish-pypi, publish-npm]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install mcp-publisher
         run: |

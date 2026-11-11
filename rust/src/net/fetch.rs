@@ -81,6 +81,11 @@ async fn read_capped(mut resp: reqwest::Response) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-pub fn html_to_text(html: &str, width: usize) -> String {
-    html2text::from_read(html.as_bytes(), width)
+/// `from_read` `expect`s its own conversion, so a page nested deeper than `width` (each `<blockquote>` takes
+/// columns) took the handler down with a panic. A page that does not fit is text wider than `width`, and
+/// what still cannot be converted is an error of the tool.
+pub fn html_to_text(html: &str, width: usize) -> Result<String> {
+    Ok(html2text::config::plain()
+        .allow_width_overflow()
+        .string_from_read(html.as_bytes(), width)?)
 }

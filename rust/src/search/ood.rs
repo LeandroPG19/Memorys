@@ -401,6 +401,40 @@ mod tests {
         );
     }
 
+    // Worked by hand, with no nalgebra in the arithmetic. The four points have mean 0 and sample covariance
+    // diag(2/3, 2/3); that is already its own shrinkage target mu*I (mu = 2/3), so the intensity is 0 and
+    // what the fit adds is the floor mu*1e-6 on the diagonal: c = (2/3)(1 + 1e-6). The inverse is
+    // diag(1/c, 1/c), so d(2,0)^2 = 4/c and d(1,1)^2 = 2/c, that is sqrt(6/1.000001) and sqrt(3/1.000001),
+    // evaluated to 40 digits and rounded to the nearest f64.
+    #[test]
+    fn a_hand_solved_case_gives_the_distance_worked_out_on_paper() {
+        let samples = vec![
+            vec![1.0_f32, 0.0],
+            vec![-1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![0.0, -1.0],
+        ];
+        let stats = Some(samples.as_slice())
+            .and_then(OodStats::fit)
+            .expect("four points in the plane make a model");
+
+        for (query, expected) in [
+            ([2.0_f32, 0.0], 2.4494885180392254_f64),
+            ([1.0, 1.0], 1.732049941544123),
+        ] {
+            let got = stats
+                .mahalanobis(&query)
+                .expect("same dimension as the model");
+            let relative = (got - expected).abs() / expected;
+            assert!(
+                relative < 1e-12,
+                "the distance to {query:?} is {got} and the hand-solved one is {expected}, relative \
+                 error {relative:e}. This number is the abstention verdict of faro: a move of the \
+                 linear algebra, or of the floor, that shifts it shifts which queries are refused"
+            );
+        }
+    }
+
     #[test]
     fn wrong_dim_query_returns_none() {
         let center = vec![0.0_f32; 8];

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 fn repo_root() -> std::path::PathBuf {
@@ -928,5 +928,178 @@ fn the_lock_guard_names_each_forbidden_package() {
         ),
         Vec::<String>::new(),
         "the guard reads the `name =` of each package, not the dependency lists"
+    );
+}
+
+const LOCK_DUPLICATES_LIST: &str = "scripts/lock-duplicates.txt";
+
+fn lock_duplicates_entries(list: &str) -> Vec<&str> {
+    list.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
+fn lock_duplicate_problems(lock: &str, list: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut listed: BTreeMap<&str, usize> = BTreeMap::new();
+    for line in lock_duplicates_entries(list) {
+        let mut parts = line.split_whitespace();
+        let name = parts.next().unwrap_or_default();
+        let Some(n) = parts
+            .next()
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|n| *n >= 2)
+        else {
+            problems.push(format!(
+                "{LOCK_DUPLICATES_LIST}: `{line}` needs a whole number n >= 2 after the crate name"
+            ));
+            continue;
+        };
+        if parts.next().is_none() {
+            problems.push(format!(
+                "{LOCK_DUPLICATES_LIST}: `{line}` has no reason; the format is `<crate> <n> <reason>`"
+            ));
+        }
+        if listed.contains_key(name) {
+            problems.push(format!("{LOCK_DUPLICATES_LIST}: `{name}` is listed twice"));
+            continue;
+        }
+        listed.insert(name, n);
+    }
+
+    let mut carried: BTreeMap<String, usize> = BTreeMap::new();
+    for name in package_names(lock) {
+        *carried.entry(name).or_default() += 1;
+    }
+    for (name, n) in carried.iter().filter(|(_, n)| **n > 1) {
+        match listed.get(name.as_str()) {
+            None => problems.push(format!(
+                "{name}: {n} versions in Cargo.lock and no line in {LOCK_DUPLICATES_LIST}"
+            )),
+            Some(m) if m != n => problems.push(format!(
+                "{name}: Cargo.lock carries {n} versions and {LOCK_DUPLICATES_LIST} says {m}"
+            )),
+            Some(_) => {}
+        }
+    }
+    for (name, m) in &listed {
+        let n = carried.get(*name).copied().unwrap_or(0);
+        if n < 2 {
+            problems.push(format!(
+                "{name}: no longer in more than one version in Cargo.lock (it carries {n}) \
+                 and {LOCK_DUPLICATES_LIST} says {m}"
+            ));
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_lock_duplicates_only_the_crates_its_list_names() {
+    let lock_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
+    let lock = std::fs::read_to_string(&lock_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", lock_path.display()));
+    let list_path = repo_root().join(LOCK_DUPLICATES_LIST);
+    let list = std::fs::read_to_string(&list_path).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}. The crates Cargo.lock carries in more than one version are listed there, \
+             one `<crate> <n> <reason>` line each",
+            list_path.display()
+        )
+    });
+
+    let packages = package_names(&lock).len();
+    let entries = lock_duplicates_entries(&list).len();
+    assert!(
+        packages >= 300 && entries >= 1,
+        "{} lists {packages} packages and {LOCK_DUPLICATES_LIST} has {entries} lines; the guard \
+         below compares the two, and an empty lock or an empty list would pass it for any tree",
+        lock_path.display()
+    );
+
+    let problems = lock_duplicate_problems(&lock, &list);
+    assert!(
+        problems.is_empty(),
+        "Cargo.lock and {LOCK_DUPLICATES_LIST} disagree:\n  {}\nA new duplicate is a second \
+         copy of a crate that every build compiles and every audit reads: add its line, with who \
+         brings each version (`cargo tree -i <crate>@<version>`), or move the dependency that \
+         brings it. A line whose crate is no longer duplicated goes away",
+        problems.join("\n  ")
+    );
+}
+
+#[test]
+fn the_lock_duplicates_guard_names_each_way_the_list_can_disagree() {
+    let lock = |packages: &[(&str, &str)]| -> String {
+        packages
+            .iter()
+            .map(|(name, version)| {
+                format!("[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n\n")
+            })
+            .collect()
+    };
+    let base = [("a", "1.0.0"), ("b", "1.0.0"), ("b", "2.0.0")];
+    let list = "# who brings each version\n\nb 2 a pulls 1.0.0 and c pulls 2.0.0\n";
+
+    assert_eq!(
+        lock_duplicate_problems(&lock(&base), list),
+        Vec::<String>::new(),
+        "a lock whose only duplicate is the listed one, with its count, has no problems"
+    );
+
+    let mut with_c = base.to_vec();
+    with_c.extend([("c", "1.0.0"), ("c", "2.0.0")]);
+    assert_eq!(
+        lock_duplicate_problems(&lock(&with_c), list),
+        vec!["c: 2 versions in Cargo.lock and no line in scripts/lock-duplicates.txt"],
+        "a crate that became duplicated and is not in the list has to be named"
+    );
+
+    let mut with_third_b = base.to_vec();
+    with_third_b.push(("b", "3.0.0"));
+    assert_eq!(
+        lock_duplicate_problems(&lock(&with_third_b), list),
+        vec!["b: Cargo.lock carries 3 versions and scripts/lock-duplicates.txt says 2"],
+        "a listed crate with another count has to be named, whichever way the count went"
+    );
+
+    assert_eq!(
+        lock_duplicate_problems(&lock(&base[..2]), list),
+        vec![
+            "b: no longer in more than one version in Cargo.lock (it carries 1) \
+             and scripts/lock-duplicates.txt says 2"
+        ],
+        "a listed crate that is no longer duplicated has to be named, so the list cannot keep \
+         lines nobody needs"
+    );
+
+    assert_eq!(
+        lock_duplicate_problems(&lock(&base), "b 2\n"),
+        vec![
+            "scripts/lock-duplicates.txt: `b 2` has no reason; the format is `<crate> <n> <reason>`"
+        ],
+        "a line with no reason is a problem"
+    );
+    assert_eq!(
+        lock_duplicate_problems(&lock(&base), "b 2 first\nb 2 second\n"),
+        vec!["scripts/lock-duplicates.txt: `b` is listed twice"],
+        "a crate listed twice is a problem"
+    );
+    assert_eq!(
+        lock_duplicate_problems(&lock(&base), "b 1 not duplicated\n"),
+        vec![
+            "scripts/lock-duplicates.txt: `b 1 not duplicated` needs a whole number n >= 2 after the crate name",
+            "b: 2 versions in Cargo.lock and no line in scripts/lock-duplicates.txt"
+        ],
+        "a line with n below 2 is a problem and does not count as listing the crate"
+    );
+    assert_eq!(
+        lock_duplicate_problems(&lock(&base), "b two whatever\n"),
+        vec![
+            "scripts/lock-duplicates.txt: `b two whatever` needs a whole number n >= 2 after the crate name",
+            "b: 2 versions in Cargo.lock and no line in scripts/lock-duplicates.txt"
+        ],
+        "a count that is not a number is a problem"
     );
 }

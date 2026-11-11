@@ -5898,6 +5898,94 @@ fn the_check_of_the_production_image_can_fail() {
     );
 }
 
+/// CI-D7 (D-D7h): the `image:` lines of a compose file that name no tag, an empty one or `latest`, one line each with its
+/// number. A tag that moves means the next `docker compose pull` changes the server under a project that never touched it
+/// (`falkordb/falkordb:latest` went from 4.x to a rewrite in Rust on 2026-11-05 and nothing said so). An image pinned by
+/// digest (`name@sha256:...`) is pinned whatever its tag says. A `#` line is not an image, and a `:` in the registry host
+/// (`localhost:5000/img`) is a port, not a tag: only the last path segment is read.
+fn untagged_compose_images(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (at, raw) in text.lines().enumerate() {
+        let Some(value) = raw.trim().strip_prefix("image:") else {
+            continue;
+        };
+        let value = value
+            .split(" #")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches(['"', '\'']);
+        if value.contains('@') {
+            continue;
+        }
+        let name = value.rsplit('/').next().unwrap_or(value);
+        let reason = match name.split_once(':') {
+            None | Some((_, "")) => "has no tag",
+            Some((_, "latest")) => "floats on `latest`",
+            Some(_) => continue,
+        };
+        found.push(format!("line {}: image `{value}` {reason}", at + 1));
+    }
+    found
+}
+
+/// CI-D7 (E-D7.3): every image of docker-compose.yml has a tag and none is `latest`.
+#[test]
+fn no_compose_image_goes_without_a_tag_or_on_latest() {
+    let compose = read("docker-compose.yml");
+    let images = compose
+        .lines()
+        .filter(|line| line.trim_start().starts_with("image:"))
+        .count();
+    assert!(
+        images >= 2,
+        "docker-compose.yml has {images} `image:` lines and the project runs Postgres and the graph: the check would pass over nothing (CI-D7)"
+    );
+    let problems: Vec<String> = untagged_compose_images(&compose)
+        .into_iter()
+        .map(|problem| format!("docker-compose.yml: {problem}"))
+        .collect();
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// CI-D7 (E-D7.4): the check of the image tags is judged first, on a compose with a pinned Postgres and a pinned Redis and on
+/// each way to stop being pinned, one problem each and naming its line.
+#[test]
+fn the_check_of_the_compose_image_tags_goes_red_with_each_sabotage_and_only_with_it() {
+    let compose =
+        "services:\n  db:\n    image: pgvector/pgvector:pg18\n  cache:\n    image: redis:7.4.1\n";
+    let clean = untagged_compose_images(compose);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let image_line = compose.lines().count() + 2;
+    for (extra, reason) in [
+        ("image: falkordb/falkordb:latest", "floats on `latest`"),
+        ("image: \"falkordb/falkordb:latest\"", "floats on `latest`"),
+        ("image: falkordb/falkordb", "has no tag"),
+        ("image: falkordb/falkordb:", "has no tag"),
+        ("image: localhost:5000/falkordb", "has no tag"),
+    ] {
+        let sabotaged = format!("{compose}  graph:\n    {extra}\n");
+        let problems = untagged_compose_images(&sabotaged);
+        assert_eq!(problems.len(), 1, "{extra}: {problems:#?}");
+        assert!(
+            problems[0].starts_with(&format!("line {image_line}:"))
+                && problems[0].contains("falkordb")
+                && problems[0].ends_with(reason),
+            "{extra}: {problems:#?}"
+        );
+    }
+    for pinned in [
+        "image: falkordb/falkordb@sha256:0123abcd",
+        "image: falkordb/falkordb:latest@sha256:0123abcd",
+        "image: falkordb/falkordb:6.0.4 # moved on purpose, 2026-11-11",
+        "image: localhost:5000/falkordb:6.0.4",
+        "# image: falkordb/falkordb:latest",
+    ] {
+        let allowed = untagged_compose_images(&format!("{compose}  graph:\n    {pinned}\n"));
+        assert!(allowed.is_empty(), "{pinned}: {allowed:#?}");
+    }
+}
+
 /// CI-F2, C4: no gate script builds a TCP URL for a lane. The one construction of a lane's URL is
 /// gate_cluster_url in gate-cluster.sh, a socket directory as the host; outside the self-test
 /// regions and the comments, no script names the live corpus port, listens on TCP, or writes a
@@ -6209,10 +6297,9 @@ fn a_lane_cluster_is_the_judges_own_throwaway_server() {
                 .await
                 .expect("connecting to lane t1 through its socket");
             let mut answers: Vec<Result<String, String>> = Vec::new();
-            for (query, _) in &expected {
-                let sql: &str = query;
+            for &(query, _) in &expected {
                 let answer: Result<String, sqlx::Error> =
-                    sqlx::query_scalar(sql).fetch_one(&mut conn).await;
+                    sqlx::query_scalar(query).fetch_one(&mut conn).await;
                 answers.push(answer.map_err(|why| why.to_string()));
             }
             let division = match sqlx::query("select 1/0").execute(&mut conn).await {
@@ -9642,6 +9729,146 @@ fn toolchain_k1_finds_a_second_toolchain_file_anywhere_but_in_build_output() {
     let found = other_toolchain_files(&root);
     std::fs::remove_dir_all(&root).expect("clean the scratch tree");
     assert_eq!(found, ["a/b/rust-toolchain.toml", "rust/rust-toolchain"]);
+}
+
+/// CI-D7 (D-D7a, D-D7h): what in a workflow asks for a Rust that moves (`stable`, `beta`, `nightly`), one line each with its
+/// number: the action `dtolnay/rust-toolchain` (it installs the channel its tag names, and the pinned one is never that), a `toolchain:` or `rust-toolchain:` key with such a channel, and `rustup default` or `rustup override set`
+/// with one. The compiler a workflow builds with is the one rust-toolchain.toml pins (CI-K1); a variable that holds it
+/// (`"$channel"`, `${{ steps.pin.outputs.channel }}`) is not a channel. A line whose first character is `#` is not read.
+fn moving_toolchain_in_workflow(text: &str) -> Vec<String> {
+    let moves = |word: &str| {
+        let word = word.trim_matches(['"', '\'']);
+        ["stable", "beta", "nightly"]
+            .iter()
+            .any(|&channel| word.starts_with(channel))
+    };
+    let mut found = Vec::new();
+    for (at, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("- ").unwrap_or(line);
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let key_with_a_channel = ["toolchain:", "rust-toolchain:"]
+            .iter()
+            .filter_map(|&key| line.strip_prefix(key))
+            .any(|value| moves(value.trim()));
+        let rustup_with_a_channel = words
+            .windows(3)
+            .any(|w| w[..2] == ["rustup", "default"] && moves(w[2]))
+            || words
+                .windows(4)
+                .any(|w| w[..3] == ["rustup", "override", "set"] && moves(w[3]));
+        let reason = if line.contains("dtolnay/rust-toolchain") {
+            "installs the channel its tag names, not the one rust-toolchain.toml pins"
+        } else if key_with_a_channel {
+            "asks for a channel that moves"
+        } else if rustup_with_a_channel {
+            "makes a channel that moves the compiler"
+        } else {
+            continue;
+        };
+        found.push(format!("line {}: `{}` {reason}", at + 1, raw.trim()));
+    }
+    found
+}
+
+/// CI-D7 (E-D7.1): no workflow installs a compiler other than the one rust-toolchain.toml pins, and the two that build Rust
+/// say where they read it from.
+#[test]
+fn no_workflow_installs_a_compiler_other_than_the_one_rust_toolchain_toml_pins() {
+    let mut problems = Vec::new();
+    for workflow in ["ci", "publish", "announce"] {
+        let path = format!(".github/workflows/{workflow}.yml");
+        let text = read(&path);
+        let uses = text
+            .lines()
+            .filter(|line| {
+                line.trim_start()
+                    .trim_start_matches("- ")
+                    .starts_with("uses:")
+            })
+            .count();
+        assert!(
+            uses >= 1,
+            "{path} has no `uses:` line: the check would pass over nothing (CI-D7)"
+        );
+        problems.extend(
+            moving_toolchain_in_workflow(&text)
+                .into_iter()
+                .map(|problem| format!("{path}: {problem}")),
+        );
+    }
+    for workflow in ["ci", "publish"] {
+        let path = format!(".github/workflows/{workflow}.yml");
+        let names_the_file = read(&path)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .any(|line| line.contains("rust-toolchain.toml"));
+        if !names_the_file {
+            problems.push(format!(
+                "{path} installs no compiler from rust-toolchain.toml: no line outside a comment names it (D-D7a)"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// CI-D7 (E-D7.2): the check of the compiler of the workflows is judged first, on the step that reads rust-toolchain.toml and
+/// on each way to ask for a moving Rust, one problem each and naming its line.
+#[test]
+fn the_check_of_the_workflow_compiler_goes_red_with_each_sabotage_and_only_with_it() {
+    let workflow = r#"jobs:
+  check:
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the compiler rust-toolchain.toml pins
+        id: pin
+        shell: bash
+        run: |
+          channel="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+          rustup default "$channel"
+          echo "channel=$channel" >>"$GITHUB_OUTPUT"
+      - uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: ${{ steps.pin.outputs.channel }}
+"#;
+    let clean = moving_toolchain_in_workflow(workflow);
+    assert!(clean.is_empty(), "the control is not clean: {clean:#?}");
+    let sabotage_line = workflow.lines().count() + 1;
+    for (extra, expected) in [
+        (
+            "      - uses: dtolnay/rust-toolchain@stable",
+            "dtolnay/rust-toolchain@stable",
+        ),
+        ("        toolchain: nightly", "toolchain: nightly"),
+        ("        toolchain: \"stable\"", "toolchain: \"stable\""),
+        ("        rust-toolchain: beta", "rust-toolchain: beta"),
+        ("          rustup default stable", "rustup default stable"),
+        (
+            "          rustup override set nightly",
+            "rustup override set nightly",
+        ),
+    ] {
+        let problems = moving_toolchain_in_workflow(&format!("{workflow}{extra}\n"));
+        assert_eq!(problems.len(), 1, "{extra}: {problems:#?}");
+        assert!(
+            problems[0].starts_with(&format!("line {sabotage_line}:"))
+                && problems[0].contains(expected),
+            "{extra}: {problems:#?}"
+        );
+    }
+    for allowed in [
+        "      # - uses: dtolnay/rust-toolchain@stable",
+        "        # toolchain: nightly",
+        "          rustup default \"$channel\"",
+        "        rust-toolchain: 1.99.0",
+    ] {
+        let problems = moving_toolchain_in_workflow(&format!("{workflow}{allowed}\n"));
+        assert!(problems.is_empty(), "{allowed}: {problems:#?}");
+    }
 }
 
 // --- CI-K4: the profile of the judge in the table, and the DAG that stays off by default --------------------------------

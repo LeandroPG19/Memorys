@@ -35,7 +35,7 @@ fn up_migration(version: i64) -> &'static sqlx::migrate::Migration {
 /// one was built from a CRLF checkout.
 fn checksum_in_the_other_line_endings(version: i64) -> Vec<u8> {
     let up = up_migration(version);
-    let lf = up.sql.replace("\r\n", "\n");
+    let lf = up.sql.as_str().replace("\r\n", "\n");
     let crlf = lf.replace('\n', "\r\n");
     [lf, crlf]
         .iter()

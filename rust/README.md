@@ -219,17 +219,24 @@ All dependencies: MIT/Apache-2.0. Zero GPL/AGPL.
 
 ## Docker
 
-Multi-stage Dockerfile (Builder -> Tester -> Production):
+Two images, both built from the **repo root** (`rust-toolchain.toml`, which pins the compiler, lives there and not in `rust/`;
+`.dockerignore` keeps everything else out of the context). Their base images are pinned by digest, and neither runs the tests: the
+local judge does.
 
 ```bash
-docker build -t cuba-memorys .
-docker run -e DATABASE_URL="..." cuba-memorys
+# The server: Rust build, Debian 13 runtime.
+docker build -f rust/Dockerfile -t memory-industry-server:20261111 .
+docker run --rm -e DATABASE_URL="..." memory-industry-server:20261111
+
+# The PyPI route: the wheel `pip install memory-industry` fetches, built from this tree and installed into python:3.14-slim.
+docker build -t memory-industry-wheel:20261111 .
 ```
 
-- Non-root user (`appuser`)
-- `HEALTHCHECK` via process monitor
+- Non-root user (`app`)
 - `STOPSIGNAL SIGTERM` (exec form, PID 1)
-- Stripped binary (7.6MB)
+- `MEMORY_INDUSTRY_REQUIRE_DATABASE_URL=1`: without `DATABASE_URL` the server refuses instead of looking for Docker inside the container
+- No `HEALTHCHECK`: an MCP server speaks over stdin/stdout and the images carry no `pgrep`, so the old process check could only fail
+- ONNX Runtime is not in the image; mount it and set `ORT_DYLIB_PATH` and `ONNX_MODEL_PATH`
 
 ---
 
