@@ -2253,4 +2253,29 @@ mod tests {
 
         std::fs::remove_dir_all(&root).expect("the test owns this directory");
     }
+
+    /// CI-D5: `memory-industry models runtime` downloads `ORT_VERSION`, and the
+    /// binary refuses any runtime whose minor number is below
+    /// `ort::MINOR_VERSION`, the one the `api-24` feature of `ort` sets. The two
+    /// live in different files and nothing tied them: raising `api-NN` above the
+    /// download would leave every new install with a runtime its own binary
+    /// rejects. The minor is read the way `ort` reads it (the number after the
+    /// first dot, 0 when there is none), and the floor is `ort`'s, not a literal
+    /// repeated here.
+    #[test]
+    fn the_runtime_the_installer_fetches_meets_the_floor_of_ort() {
+        let fetched_minor = ORT_VERSION
+            .split('.')
+            .nth(1)
+            .and_then(|minor| minor.parse::<u32>().ok())
+            .unwrap_or(0);
+        assert!(
+            fetched_minor >= ort::MINOR_VERSION,
+            "`models runtime` downloads ONNX Runtime {ORT_VERSION} (minor {fetched_minor}) and \
+             this build of `ort` loads only 1.{}.x or newer: every new install would get a \
+             runtime its own binary refuses. Raise ORT_VERSION, or lower the `api-NN` feature \
+             of `ort` in Cargo.toml",
+            ort::MINOR_VERSION
+        );
+    }
 }

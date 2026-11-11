@@ -1215,7 +1215,7 @@ mod placement_tests {
             "a GPU that silently became a CPU is the defect this whole path exists to stop: the fallback has to be logged at error"
         );
         assert!(
-            body[failure..].contains("configure_cpu(make_builder()?"),
+            body[failure..].contains("configure_cpu(make_builder("),
             "and it has to actually keep working. A machine without the CUDA runtime ran on CPU before and must keep doing so; failing the session there turns a slow daemon into a dead one."
         );
         // Structural on purpose, like the two checks above: this arm only runs

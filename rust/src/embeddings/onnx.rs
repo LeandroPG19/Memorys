@@ -1534,7 +1534,7 @@ mod tests {
     /// the environment — the reason `ScopedEnv` exists — and the daemon calls
     /// this from a multi-threaded tokio runtime, on whichever worker first asks
     /// for an embedding or an NLI verdict. Nothing needs the write either:
-    /// `ort` 2.0.0-rc.12 takes the library path by API, `ort::init_from`.
+    /// `ort` (rc.12 to rc.15) takes the library path by API, `ort::init_from`.
     #[tokio::test]
     async fn finding_the_runtime_does_not_write_ort_dylib_path_into_the_process() {
         let _one_at_a_time = crate::session::GLOBAL_STATE_GUARD.lock().await;
@@ -1657,7 +1657,7 @@ mod tests {
     /// An empty runtime path is refused, with an error that says it is empty,
     /// before anything reaches `ort` — and in bounded time.
     ///
-    /// `ort` does not refuse it. `setup_api` (ort 2.0.0-rc.12, `src/lib.rs`)
+    /// `ort` does not refuse it. `setup_api` (ort rc.12 to rc.15, `src/lib.rs`)
     /// reads an empty `ORT_DYLIB_PATH` as unset and loads the bare name
     /// `onnxruntime.dll`, which Windows resolves to the Windows ML build in
     /// System32 — the load described at `get_model_status` as a hang on the
@@ -1696,11 +1696,15 @@ mod tests {
     /// A runtime file that is not a library is an error, in bounded time, and
     /// never reaches `ort`.
     ///
-    /// Handed to `ort::init_from`, it hangs the thread forever: rc.12 builds
-    /// the load error through `ort::api()`, which re-enters the `Once` the
-    /// failing load still holds (the stack is written out at
-    /// `load_onnxruntime_once`). So the ten seconds below are not a
-    /// performance budget; they turn that hang into a failure with a name.
+    /// Handed to `ort::init_from` in rc.12, it hung the thread forever: rc.12
+    /// built the load error through `ort::api()`, which re-entered the `Once`
+    /// the failing load still held. rc.13 fixed that (pykeio/ort 17ed727) and
+    /// `init_from` now answers with a `LoadDynamicError`; the check stays for
+    /// what `ort` does not give: an error that names the file and the way out
+    /// (`models runtime`, `ORT_DYLIB_PATH`), and no library kept by `ort` that
+    /// this crate did not open first. The ten seconds below are not a
+    /// performance budget; they turn a hang, should one come back, into a
+    /// failure with a name.
     ///
     /// `load_onnxruntime_once` and not `load_onnxruntime`: the second keeps the
     /// first answer in a cell that belongs to the process, and a broken
@@ -1729,9 +1733,9 @@ mod tests {
         });
 
         let answer = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
-            "loading a runtime that is not a library did not answer in 10 s. That is ort \
-             rc.12 deadlocking on its own `Once`: the file went to `ort::init_from` without \
-             being opened and checked here first",
+            "loading a runtime that is not a library did not answer in 10 s. In ort rc.12 that \
+             was a deadlock on its own `Once` (fixed in rc.13, pykeio/ort 17ed727): the file \
+             went to `ort::init_from` without being opened and checked here first",
         );
         let reason = answer.expect_err(
             "a file of bytes that is not a library loaded as ONNX Runtime. If `ort` already held \
@@ -1768,9 +1772,9 @@ mod tests {
         assert!(
             minor_version("1.17.3") < ort::MINOR_VERSION,
             "the Windows ML ONNX Runtime in System32 is 1.17, and this build of `ort` refuses it \
-             — through the same deadlocking error path as a file that is not a library. If \
-             this fails, `ort` accepts 1.17 again and the check above is refusing a runtime it \
-             would have loaded"
+             — in rc.12 through the error path that deadlocked for a file that is not a \
+             library. If this fails, `ort` accepts 1.17 again and the check above is refusing a \
+             runtime it would have loaded"
         );
     }
 
@@ -1826,7 +1830,8 @@ mod tests {
             .expect_err(
                 "no runtime anywhere in the chain and the load answered Ok. `ort` is left \
                  uninitialised and the first session loads whatever onnxruntime the platform \
-                 loader finds — on Windows the Windows ML build in System32, which hangs",
+                 loader finds — on Windows the Windows ML build in System32, which hangs in \
+                 rc.12 and panics in rc.15",
             );
         assert!(
             reason.contains("no ONNX Runtime library found"),
