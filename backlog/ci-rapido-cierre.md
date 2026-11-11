@@ -71,11 +71,11 @@
   - **EN CURSO (10-nov 18:05):** commits `2cc9606`/`d2292cc`, fusionados (`ebbc710`). Falta el juez.
 - [x] **7.** **CI-J19** · `validar-handoff.sh` (`filas_dag`) usa el lector único de la tabla. B:1123. 20 / 1. — **HECHO 10-nov 18:40:** juez verde sobre 87346f6.
   - **EN CURSO (10-nov 18:05):** commits `2cc9606`/`d2292cc`, fusionados (`ebbc710`). Falta el juez.
-- [ ] **8.** **CI-E22** · bug de producto: un episodio sin vector no lo recupera `reembed` (H1 de E16). B:1160. O `reembed` cubre `brain_episodes`, o el mensaje de `main.rs:84-90` deja de prometerlo. 30–60 / 5. — **EN CURSO 10-nov 18:37:** CI-E22 especificada (ci-rapido-E22.spec.md, 11 escenarios, 18 sabotajes, sin migración: brain_episodes.embedding existe desde 0002): reembed (cuba_zafra y la CLI) y el backfill cubren los episodios con la misma regla que las observaciones; faro sí busca episodios por vector y filtra los que no lo tienen, así que el arreglo no puede ser solo de texto. Pasada 1 en curso en feat/ci-e22.
+- [ ] **8.** **CI-E22** · bug de producto: un episodio sin vector no lo recupera `reembed` (H1 de E16). B:1160. O `reembed` cubre `brain_episodes`, o el mensaje de `main.rs:84-90` deja de prometerlo. 30–60 / 5. — **EN CURSO 10-nov 18:37:** CI-E22 especificada (ci-rapido-E22.spec.md, 11 escenarios, 18 sabotajes, sin migración: brain_episodes.embedding existe desde 0002): reembed (cuba_zafra y la CLI) y el backfill cubren los episodios con la misma regla que las observaciones; faro sí busca episodios por vector y filtra los que no lo tienen, así que el arreglo no puede ser solo de texto. Pasada 1 en curso en feat/ci-e22. — **EN CURSO 10-nov 18:49:** pasada 1 f3e5bef (rojo de compilación visto: 9 errores) y pasada 2 05bd51a (compila a la primera; 7 tests de lib en verde, incluido el del mensaje del drenaje); fusionada (bf619b7). Falta: los 4 tests de v048 con base (pasada completa en curso), su rojo devolviendo el producto (noche) y el juez.
 - [ ] **9.** **CI-E17** · dos pools al arrancar (`main.rs:354-369`, `protocol.rs:434`). B:1161. Va después de medir E16; hay que decidir qué mensaje gana con la base caída. 45 / 5. — **EN CURSO 10-nov 18:37:** CI-E17 especificada (ci-rapido-E17.spec.md): main abre el pool una vez y lo pasa a run_mcp; con la base caída un solo aviso («starting without PostgreSQL…»); va en serie tras CI-E22 (las dos tocan main.rs).
 - [ ] **10.** **CI-E25** · `os.getuid` y `os.kill(pid, 0)` de CI-E15 son solo POSIX. B:1186. Depende de la medida en Windows (punto 84). 20 / —.
   - **EN CURSO (10-nov 18:05):** commits `2cc9606`/`d2292cc`, fusionados (`ebbc710`). Falta el juez. Ver también CI-E25b en «Añadidos después de la foto».
-- [ ] **11.** **(H)** `unidades.jsonl` y `flaky.jsonl` no se escriben nunca. Es el huérfano que más bloquea. 30–45 / 2.
+- [ ] **11.** **(H)** `unidades.jsonl` y `flaky.jsonl` no se escriben nunca. Es el huérfano que más bloquea. 30–45 / 2. — **EN CURSO 10-nov 18:49:** CI-E28 (b4fb912/0ed9bb4, fusionada 538f250): el planificador llama a gate_history.units para cada fila cuyo log trae binarios de test con su tiempo; falta verlo escribir unidades.jsonl en una corrida real del juez.
   - `gate_history.units()` solo la llama `registrar`, una CLI sin llamadores (`scripts/gate_history.py:578-598`, `:793-834`).
   - Tras 12 corridas del 10-nov no existe el fichero en `~/.cache/ci-tiempos/memory-industry/20261110/`.
   - B:1025 decía «nace con CI-E4» y no nació.
@@ -83,18 +83,18 @@
 - [ ] **12.** **CI-E2** · coste por test y cuota de los 10 más caros. B:1009, 1025. Depende del punto 11. Lleva la decisión de los números en el recibo (punto 92). 60 / 2.
 - [ ] **13.** **CI-E3 y L1–L3** · segundos por autotest con techo; paralelizar los casos del autotest de `merge-gate.sh` (62 → 71 s tras CI-E15). B:1009, 1025, 1076. Los datos ya están medidos. 60–90 / 3.
 - [ ] **14.** **CI-E5** · regresión por punto de cambio. B:1009, 1025. Necesita historial (10 corridas por modo). Después.
-- [ ] **15.** **(H)** `mutants_seed_prune` no borra los `<clave>.tmp-<pid>` de un pid muerto (`scripts/mutants-gate.sh:690-693`). Anotado en B:875 («después de F6»), nunca abierto. 20–40 / 1.
+- [ ] **15.** **(H)** `mutants_seed_prune` no borra los `<clave>.tmp-<pid>` de un pid muerto (`scripts/mutants-gate.sh:690-693`). Anotado en B:875 («después de F6»), nunca abierto. 20–40 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: mutants_seed_prune borra los <clave>.tmp-<pid> de pid muerto del mismo usuario; autotest verde; falta el juez.
 - [ ] **16.** **CI-E7b** · J de DBG y B3 desde barridos fiables. B:1031, 1212; E7.spec:205-227. Depende del punto 39. 45 / lo de los barridos.
   - [ ] **16a.** E7b.2 (`--modo serie|dag`) no existe y con el DAG por omisión conviene cerrarla como «no se hace».
   - [ ] **16b.** **(H)** Quitar el prefijo `CARGO_BUILD_JOBS` de D-F1b bajo cargo-mutants (F6.spec:176).
 - [ ] **17.** **CI-E1b y CI-E1c** (B:1037): solo anotados. E1c pide que `test-times.sh --count` dé `ignored`. Unos 60 / 2.
 - [ ] **18.** **(H)** E1 §9, tercer seguimiento: rechazar una línea `plain/…` que cambia sin tocar las fuentes de su binario (E1.spec:383). 45–60 / 1.
-- [ ] **19.** Un primer argumento desconocido de `run-all-tests.sh` arranca el juez entero (`:1855-1866`). B:1037; sin identificador y fuera de B:1212. 20–30 / 1.
+- [ ] **19.** Un primer argumento desconocido de `run-all-tests.sh` arranca el juez entero (`:1855-1866`). B:1037; sin identificador y fuera de B:1212. 20–30 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: un argumento desconocido de run-all-tests.sh sale 2 antes del candado; falta el juez.
 - [ ] **20.** **(H)** `rust/build.rs` con `rerun-if-changed=migrations`. P:68 lo marcaba ✅; B:113-115 lo vio en la práctica y no abrió tarea; no existe. Es producto: hay que decidir si entra en la 0.31. 15 / una compilación.
-- [ ] **21.** **(H)** Rama inalcanzable en `scripts/eval_seed.py` (deuda del mejorador, B:263). 5 / 0.
-- [ ] **22.** ¿Debe el juez rechazar un `TMPDIR` que no existe? B:485 («deuda»); `gate-lock.sh:540-544` sigue igual. Es además la excepción del punto 57. 20 / 1.
-- [ ] **23.** **(H)** `run-all-tests.sh:1966-1973` sale con 1 (rojo de producto) por falta de disco; es entorno y debería ser 2 (K4.spec:310). 20 / 1.
-- [ ] **24.** **(H)** El mejorador no ha pasado por el Python del juez. Fijar la línea base: 10. Partirlas: 2–4 h / 2.
+- [ ] **21.** **(H)** Rama inalcanzable en `scripts/eval_seed.py` (deuda del mejorador, B:263). 5 / 0. — **EN CURSO 10-nov 18:49:** CI-E28: quitada la rama inalcanzable de seed() en eval_seed.py.
+- [ ] **22.** ¿Debe el juez rechazar un `TMPDIR` que no existe? B:485 («deuda»); `gate-lock.sh:540-544` sigue igual. Es además la excepción del punto 57. 20 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: un TMPDIR definido que no es directorio se rechaza con exit 2 (no se crea); la excepción NOT_HANDED_DOWN se queda (TMPDIR se sigue exportando), con su razón actualizada; falta el juez.
+- [ ] **23.** **(H)** `run-all-tests.sh:1966-1973` sale con 1 (rojo de producto) por falta de disco; es entorno y debería ser 2 (K4.spec:310). 20 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: disco bajo sale 2 (entorno), no 1; falta el juez.
+- [ ] **24.** **(H)** El mejorador no ha pasado por el Python del juez. Fijar la línea base: 10. Partirlas: 2–4 h / 2. — **EN CURSO 10-nov 18:49:** CI-E28: lizard-baseline.txt gana las 25 funciones de gate-dag.py y gate_usl.py sobre CC 8 (la línea base dice la verdad; partirlas sigue siendo trabajo del mejorador). Anotado: --update-lizard-baseline solo mide rust/src y borraría estas líneas; scripts/mcp_live_session_test.py::main tiene CC 44 y no está.
   - 25 funciones sobre CC 8 (13 en `gate-dag.py`, 12 en `gate_usl.py`: `simular` 19, `admission` 15, `parse_row` 15, `plan_problem` 14…).
   - `scripts/lizard-baseline.txt` no tiene ninguna línea `scripts/gate*`.
   - Según el lector de E1–E9, `quality-gate` saldría con 2 si su diff las incluye (`quality-gate.sh:3999`).
@@ -102,8 +102,8 @@
   - [ ] **25a.** El camino crítico está en tres sitios (`gate-dag.py:844`, `gate_history.py:718`, `gate_usl.py:697`; D-E7g).
   - [ ] **25b.** `planned_pool` (`gate-dag.py:562`) copia la regla de `resources.rs` (B:1133).
   - [ ] **25c.** La pasada del mejorador de F2a/F2b nunca se hizo (B:478).
-- [ ] **26.** **(H)** `pasos.jsonl` no lleva `jobs` por paso (D-F3s). Menor. 15 / 1.
-- [ ] **27.** **(H)** Hueco en `validar-handoff.sh:567-571`: una nota del implementador con `commit: none` pasa sin coste ni `written`/`frozen` (D-E6e). Así pasaron E13, E14, E15, E18 y E21. 40 / 1.
+- [ ] **26.** **(H)** `pasos.jsonl` no lleva `jobs` por paso (D-F3s). Menor. 15 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: pasos.jsonl lleva jobs (los que el paso recibió, o null); falta el juez.
+- [ ] **27.** **(H)** Hueco en `validar-handoff.sh:567-571`: una nota del implementador con `commit: none` pasa sin coste ni `written`/`frozen` (D-E6e). Así pasaron E13, E14, E15, E18 y E21. 40 / 1. — **EN CURSO 10-nov 18:49:** CI-E28: una nota del implementador a otro rol que nombra tests lleva segundos:. Los cinco traspasos de hoy (E13, E14, E15, E18, E21) dejan de pasar hasta que tengan su línea con los segundos medidos: se miden en la cadena de la noche.
 - [ ] **28.** **R-A1-3** · stdout atascado: `runtime.shutdown_timeout` (B:1055; E10.spec:387). Sin identificador y fuera de B:1212. Prioridad baja. 30 / 2.
 - [ ] **29.** **M0 y A2** del segundo perfil del camino crítico. B:1047, 1049. Fuera de B:1212. 30 + 45 / 5.
   - [ ] **29a.** M0: hora por sección dentro de cada fila (`$EPOCHREALTIME`).
@@ -111,7 +111,7 @@
 - [ ] **30.** **(H)** S2 de E11: enseñar a `gate-audit.sh` los ficheros de cargo entre lectores (E11.spec:488). Depende del punto 41. 20 / 1.
 - [ ] **31.** S3 de E11: la sonda `claude -p` de D3 (hasta 60 s) sigue esperando a la red (B:1047). Prioridad baja.
 - [ ] **32.** Tabla de clases versionada para `--compare-classes` (B:308). Hoy la referencia de F4 vive en `~/.cache/memory-industry-gate/f0/` (punto 74). 30 / 0.
-- [ ] **33.** Tres comentarios falsos o viejos. 10 / 0.
+- [ ] **33.** Tres comentarios falsos o viejos. 10 / 0. — **EN CURSO 10-nov 18:49:** CI-E28: corregidos test-time-ceilings.txt (v025: 10,32 → 1,29 s) y local_gate_contract.rs ≈2076; common/mod.rs ≈254 ya estaba bien.
   - [ ] **33a.** **(H)** `scripts/test-time-ceilings.txt:87` dice «pending» para v025 y el número existe (1,29 s, B:1138). Toca `scripts/`: va con el próximo commit que ya pida `todo`.
   - [ ] **33b.** `rust/tests/local_gate_contract.rs:2076-2079` («against the live cluster»).
   - [ ] **33c.** `rust/tests/common/mod.rs:254-256` (F2.spec:495).
