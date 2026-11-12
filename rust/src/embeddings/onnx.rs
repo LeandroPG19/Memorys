@@ -1589,16 +1589,22 @@ mod tests {
     /// the background; a search and a second row ask in that order. Nothing sleeps and nothing is
     /// timed: each future is polled once at each step and the test says whether it is ready, so the
     /// order is the thing under test, not a clock. The permit goes to the search, and the second row
-    /// does not start until the search has let go of it.
+    /// does not start until the search has let go of it. No step awaits the gate: a gate that made
+    /// the background wait with nobody searching would hang an `.await` and say nothing.
     #[tokio::test]
     async fn a_search_that_arrives_while_the_service_reembeds_goes_before_its_next_row() {
+        use futures::FutureExt as _;
         use std::task::Poll;
         let gate = EmbedGate::new(1);
+        assert_eq!(gate.in_flight(), 0, "a new gate has nobody searching");
 
         let first_row = gate
             .background()
-            .await
-            .expect("with nothing searching, the first row of the background starts");
+            .now_or_never()
+            .expect(
+                "with nothing searching, the first row of the background starts without waiting",
+            )
+            .expect("the gate is not closed");
         let mut search = std::pin::pin!(gate.foreground());
         assert!(
             futures::poll!(search.as_mut()).is_pending(),
@@ -1642,13 +1648,16 @@ mod tests {
     /// would wait for ever behind a search that no longer exists.
     #[tokio::test]
     async fn the_background_does_not_start_a_row_while_a_search_is_embedding() {
+        use futures::FutureExt as _;
         use std::task::Poll;
         let gate = EmbedGate::new(2);
+        assert_eq!(gate.in_flight(), 0, "a new gate has nobody searching");
 
         let search = gate
             .foreground()
-            .await
-            .expect("an idle gate lets a search in");
+            .now_or_never()
+            .expect("an idle gate lets a search in without waiting")
+            .expect("the gate is not closed");
         let mut row = std::pin::pin!(gate.background());
         assert!(
             futures::poll!(row.as_mut()).is_pending(),
@@ -1664,8 +1673,14 @@ mod tests {
         assert_eq!(gate.in_flight(), 0);
 
         let held = [
-            gate.background().await.expect("the first permit"),
-            gate.background().await.expect("the second permit"),
+            gate.background()
+                .now_or_never()
+                .expect("nobody is searching: the first permit is given without waiting")
+                .expect("the gate is not closed"),
+            gate.background()
+                .now_or_never()
+                .expect("nobody is searching: the second permit is given without waiting")
+                .expect("the gate is not closed"),
         ];
         let mut waiting_search = Box::pin(gate.foreground());
         assert!(

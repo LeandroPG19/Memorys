@@ -1801,12 +1801,24 @@ mod tests {
         Ok(vec![0.5, 0.25])
     }
 
+    /// Says whether the future polled with it was woken, so a test can tell «it may go on» from
+    /// «it still waits» without awaiting it.
+    struct Woken(std::sync::atomic::AtomicBool);
+
+    impl futures::task::ArcWake for Woken {
+        fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+            arc_self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// CI-D5c-C2 (A3). The real encoder of the background, without ONNX: the computation is a
     /// function that answers at once and the gate has two permits, one held by a search. The row
     /// waits for the search even with a permit free (a row that took the gate as a foreground embed
     /// would count as in flight and would not wait), it is counted in the progress `/health` shows,
     /// and its time is the one of the last row. Nothing sleeps: the search lets go and the row is
-    /// awaited.
+    /// awaited. The row is awaited only once the gate has said, without a clock, that it let the
+    /// row through (nobody in flight, and the row woken by the search that ended): a gate that
+    /// kept it waiting would otherwise hang the `.await` instead of failing.
     #[tokio::test]
     async fn the_encoder_of_the_background_waits_for_the_searches_and_counts_its_rows() {
         use crate::embeddings::onnx::EmbedGate;
@@ -1825,9 +1837,16 @@ mod tests {
                 text: "una fila".to_string()
             }
         ));
+        let woken = std::sync::Arc::new(Woken(std::sync::atomic::AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
         assert!(
-            futures::poll!(row.as_mut()).is_pending(),
+            std::future::Future::poll(row.as_mut(), &mut cx).is_pending(),
             "the row of the background waits while a search is embedding"
+        );
+        assert!(
+            !woken.0.load(std::sync::atomic::Ordering::SeqCst),
+            "and nothing has told it to go on yet"
         );
         assert_eq!(
             gate.in_flight(),
@@ -1836,6 +1855,16 @@ mod tests {
         );
 
         drop(search);
+        assert_eq!(
+            gate.in_flight(),
+            0,
+            "the search is over: nobody is in flight"
+        );
+        assert!(
+            woken.0.load(std::sync::atomic::Ordering::SeqCst),
+            "the search that ended wakes the row that waited for it; without that the row waits \
+             for ever"
+        );
         let vector = row.await.expect("the search let go: the row is encoded");
         assert_eq!(vector, vec![0.5, 0.25]);
         let shown = auto_progress();

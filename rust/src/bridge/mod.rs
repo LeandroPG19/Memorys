@@ -1256,6 +1256,88 @@ mod tests {
             "the operator is told the code is mistyped, not shown a network error. Got: {err:#}"
         );
     }
+
+    /// A loopback listener on a port the system picks that answers every connection with
+    /// `response` (nothing at all when it is `None`) and closes. The request is read first, so
+    /// the close is a clean end and not a reset over unread bytes.
+    async fn a_port_that_answers(response: Option<&'static str>) -> u16 {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free loopback port");
+        let port = listener.local_addr().expect("its address").port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let Some(response) = response else {
+                    continue;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(n) if n > 0 => request.extend_from_slice(&chunk[..n]),
+                        _ => break,
+                    }
+                }
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        port
+    }
+
+    /// `bridge status` with no bridge running: something accepts on the port and closes without a
+    /// word, which fails at once (a port nobody listens on is the same line, and slower on Windows).
+    #[tokio::test]
+    async fn the_status_says_no_bridge_runs_when_the_port_gives_no_answer() {
+        let port = a_port_that_answers(None).await;
+        assert_eq!(
+            running_bridge(port)
+                .await
+                .expect("a silent port is not an error"),
+            format!("not running on 127.0.0.1:{port}")
+        );
+    }
+
+    /// `bridge status` with the port answering: a bridge is named with the state it reports, and
+    /// any other program that holds the port is told apart from it.
+    #[tokio::test]
+    async fn the_status_names_the_state_of_the_bridge_that_answers_and_tells_a_stranger_apart() {
+        let bridge = a_port_that_answers(Some(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 18\r\n\
+             connection: close\r\n\r\n{\"state\":\"linked\"}",
+        ))
+        .await;
+        assert_eq!(
+            running_bridge(bridge).await.expect("a health that answers"),
+            format!("running on 127.0.0.1:{bridge} (state: linked)")
+        );
+
+        let stateless = a_port_that_answers(Some(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\
+             connection: close\r\n\r\n{}",
+        ))
+        .await;
+        assert_eq!(
+            running_bridge(stateless)
+                .await
+                .expect("a health with no state"),
+            format!("running on 127.0.0.1:{stateless} (state: unknown)")
+        );
+
+        let stranger = a_port_that_answers(Some(
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        ))
+        .await;
+        assert_eq!(
+            running_bridge(stranger)
+                .await
+                .expect("a port another program holds"),
+            format!(
+                "127.0.0.1:{stranger} answers, but not as a bridge: another program holds the port"
+            )
+        );
+    }
 }
 
 #[cfg(test)]
