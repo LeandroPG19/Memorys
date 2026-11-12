@@ -1231,6 +1231,21 @@ async fn accounts_report(pool: &PgPool) -> Vec<Check> {
     account_checks(&facts)
 }
 
+/// A base that a newer binary migrated starts here, but this binary does not know what the
+/// versions it does not embed changed.
+fn migrations_applied(total: i64, unknown: &[i64]) -> Check {
+    if unknown.is_empty() {
+        return Check::ok("migrations", format!("{total} aplicadas, ninguna dirty"));
+    }
+    Check::warn(
+        "migrations",
+        format!(
+            "{total} aplicadas, ninguna dirty; este binario no conoce las versiones {unknown:?}"
+        ),
+        "la base la migró un binario más nuevo: actualizá este binario a esa versión",
+    )
+}
+
 pub async fn run_checks(pool: &PgPool, url: &str) -> Vec<Check> {
     let mut runner = crate::setup_agent::SystemRunner;
     run_checks_with(pool, url, false, &mut runner).await
@@ -1348,10 +1363,10 @@ pub async fn run_checks_with(
                     "una migración quedó a medias: restaurá desde backup antes de seguir",
                 ));
             } else {
-                checks.push(Check::ok(
-                    "migrations",
-                    format!("{total} aplicadas, ninguna dirty"),
-                ));
+                let unknown = crate::db::applied_but_unknown(pool)
+                    .await
+                    .unwrap_or_default();
+                checks.push(migrations_applied(total, &unknown));
             }
         }
         Err(e) => checks.push(Check::fail(

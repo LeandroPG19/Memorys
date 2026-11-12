@@ -6,7 +6,34 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::time::Duration;
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+/// `ignore_missing`: a base a newer binary already migrated records versions this one does not
+/// embed (a roll back), and sqlx would refuse it with «migration N was previously applied but is
+/// missing in the resolved migrations». The binary starts on it and says so
+/// (warn_about_newer_migrations); a modified checksum or a failed migration is still refused.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate::Migrator {
+    ignore_missing: true,
+    ..sqlx::migrate!("./migrations")
+};
+
+/// The database answered and its schema was refused (a migration that fails, a checksum that does
+/// not match, a base behind this binary under CUBA_SKIP_MIGRATIONS). It travels as the context of
+/// that error so a caller can tell it from a database that is not there, without reading the text
+/// (see `schema_refused`).
+#[derive(Debug)]
+struct SchemaRefused;
+
+impl std::fmt::Display for SchemaRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the database answered, but its schema was refused")
+    }
+}
+
+/// Whether `create_pool` failed after PostgreSQL answered. Such a database must not be served from
+/// a lazy pool: that pool connects as the role of DATABASE_URL (the owner), with no RLS and no
+/// audit trigger. One that does not answer may come up later and is served that way.
+pub fn schema_refused(why: &anyhow::Error) -> bool {
+    why.downcast_ref::<SchemaRefused>().is_some()
+}
 
 fn connect_options(database_url: &str) -> Result<PgConnectOptions> {
     Ok(PgConnectOptions::from_str(database_url)
@@ -299,7 +326,7 @@ pub async fn create_admin_pool(database_url: &str) -> Result<PgPool> {
 
     tracing::info!("connected to PostgreSQL");
 
-    init_schema(&pool).await?;
+    init_schema(&pool).await.context(SchemaRefused)?;
     Ok(pool)
 }
 
@@ -417,6 +444,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
         .context("failed to set timezone to UTC")?;
 
     tracing::info!("schema initialized (timezone=UTC)");
+    warn_about_newer_migrations(pool).await;
 
     let pgvector_check: Option<(String,)> =
         sqlx::query_as("SELECT extname::text FROM pg_extension WHERE extname = 'vector'")
@@ -434,6 +462,29 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The versions recorded in `_sqlx_migrations` that this binary does not embed: what a newer
+/// binary applied before this one was put back. Empty on a base this binary migrated itself.
+pub async fn applied_but_unknown(pool: &PgPool) -> sqlx::Result<Vec<i64>> {
+    let embedded: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
+    sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations WHERE version <> ALL($1) ORDER BY version",
+    )
+    .bind(embedded)
+    .fetch_all(pool)
+    .await
+}
+
+async fn warn_about_newer_migrations(pool: &PgPool) {
+    let unknown = applied_but_unknown(pool).await.unwrap_or_default();
+    if !unknown.is_empty() {
+        tracing::warn!(
+            versions = ?unknown,
+            "this database records migrations this binary does not embed (versions {unknown:?}): \
+             a newer binary migrated it. Starting anyway; what they changed is unknown here"
+        );
+    }
 }
 
 /// The migrations, then cuba_app's password, each tried again when it loses a

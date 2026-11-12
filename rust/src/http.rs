@@ -645,6 +645,7 @@ pub async fn serve(addr: &str) -> Result<()> {
             crate::db::assert_embedding_dim(&pool).await?;
             (pool, true)
         }
+        Err(why) if crate::db::schema_refused(&why) => return Err(why),
         Err(why) => {
             tracing::warn!(
                 error = %format!("{why:#}"),

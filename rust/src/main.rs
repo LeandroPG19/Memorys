@@ -359,7 +359,8 @@ async fn async_main() {
     );
 
     let database_url = memory_industry::setup::resolve_database_url().await;
-    let (pool, connected) = match memory_industry::db::create_pool(&database_url).await {
+    let created = stop_on_a_refused_schema(memory_industry::db::create_pool(&database_url).await);
+    let (pool, connected) = match created {
         Ok(pool) => {
             if let Err(e) = memory_industry::db::assert_embedding_dim(&pool).await {
                 tracing::error!(error = %format!("{e:#}"), "arranque abortado");
@@ -409,6 +410,20 @@ async fn async_main() {
     }
 
     drain_background_tasks().await;
+}
+
+/// A database that answered and whose schema was refused is not served from a lazy pool (that one
+/// connects as the owner, without RLS or the audit trigger): the start ends here. Any other
+/// failure, a database that is not there, goes on to the match that starts without PostgreSQL.
+fn stop_on_a_refused_schema(created: anyhow::Result<sqlx::PgPool>) -> anyhow::Result<sqlx::PgPool> {
+    if let Err(why) = &created
+        && memory_industry::db::schema_refused(why)
+    {
+        tracing::error!(error = %format!("{why:#}"), "arranque abortado");
+        eprintln!("\nMemoryIndustry NO puede arrancar:\n\n{why:#}\n");
+        std::process::exit(1);
+    }
+    created
 }
 
 /// The address `serve` listens on, or None once its help is printed.
