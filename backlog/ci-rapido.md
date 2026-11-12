@@ -1470,3 +1470,9 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
 - Ronda estrecha: `cargo fmt --check` rc=0; `cargo test --lib -- bridge::tests embeddings::onnx::tests reembed_cli::tests` 51 passed en 0,07 s (16 s con compilar); `clippy --all-targets -D warnings` rc=0.
 - Mutación acotada, primer intento parado a los 19 min (18:22) a pedido de la sesión de Mapupita: 53 mutantes por un filtro demasiado ancho y 4 copias compilando en frío; 2 de 53 hechos. Reencolada con 12 mutantes exactos, 1 trabajo, detrás del juez exclusivo `cierre24b` de Mapupita (lote 24 a planta esta noche).
 - Pendiente: resultado de la acotada → `todo` sobre el SHA final → push. Sin veredicto aún.
+
+### 11-nov-2026 19:30 — mutación acotada limpia y `todo` VERDE sobre `df69590`
+
+- Mutación acotada (12 mutantes, 1 trabajo, 7 min): los 2 de `running_bridge` y los 8 de `InFlight`/`EmbedGate` cazados o inviables (7 cazados, 3 inviables), 0 colgados. Los 2 «missed» de `init_onnx_session` (586, 594) entraron por el filtro y solo corrieron tres módulos de tests; en la corrida completa de 610 no sobrevivieron. Diagnóstico, no veredicto: el `quality` completo no se repitió sobre el árbol nuevo (va al blindaje).
+- `GATE_GPU=auto bash scripts/como-el-ci.sh todo` sobre `df69590`, turno compartido: MERGE GATE PASSED, 2156 tests, 101 binarios dentro de techo. Reloj 470 s, espera 2368 s (detrás del juez exclusivo de Mapupita), 7,4 núcleos, pico 19,5 GB. Recibo en `~/.cache/cuba-gate/receipts/df69590…`.
+- Disco: a pedido de `l24-ci-f3` (501 GB libres) se borraron 46 GB propios (`memory-industry-verif/{test,gpu,rel}`, carpetas de prueba del runtime); quedó en 560 GB.
