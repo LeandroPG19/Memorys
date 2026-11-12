@@ -1476,3 +1476,7 @@ The critical path is ≈500 s (mutants and release + reranker tie); the estimate
 - Mutación acotada (12 mutantes, 1 trabajo, 7 min): los 2 de `running_bridge` y los 8 de `InFlight`/`EmbedGate` cazados o inviables (7 cazados, 3 inviables), 0 colgados. Los 2 «missed» de `init_onnx_session` (586, 594) entraron por el filtro y solo corrieron tres módulos de tests; en la corrida completa de 610 no sobrevivieron. Diagnóstico, no veredicto: el `quality` completo no se repitió sobre el árbol nuevo (va al blindaje).
 - `GATE_GPU=auto bash scripts/como-el-ci.sh todo` sobre `df69590`, turno compartido: MERGE GATE PASSED, 2156 tests, 101 binarios dentro de techo. Reloj 470 s, espera 2368 s (detrás del juez exclusivo de Mapupita), 7,4 núcleos, pico 19,5 GB. Recibo en `~/.cache/cuba-gate/receipts/df69590…`.
 - Disco: a pedido de `l24-ci-f3` (501 GB libres) se borraron 46 GB propios (`memory-industry-verif/{test,gpu,rel}`, carpetas de prueba del runtime); quedó en 560 GB.
+
+### 11-nov-2026 21:11 — juez de mutación del lote: VERDE
+
+`QG_BASE=fbe6632 bash scripts/como-el-ci.sh quality` sobre `df69590`, turno compartido: 610 mutantes en 68 min, 511 cazados, 99 inviables, 0 sobrevivientes, 0 colgados; `quality rc=0`. Reloj 4072 s, espera 0 s, 4,6 núcleos, pico 15,2 GB. Punto 11 de la lista de salida de la 0.31 cerrado. Queda de Leandro el juez de Windows (mañana, 12-nov).
