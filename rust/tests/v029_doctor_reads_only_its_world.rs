@@ -251,6 +251,61 @@ async fn g16_the_schema_check_counts_the_account_tables() {
 }
 
 #[tokio::test]
+async fn g16_doctor_names_the_migrations_a_newer_binary_applied() {
+    in_a_scratch_database("brain_g_newer", |url_| async move {
+        const NEWER_VERSION: i64 = 9066;
+        let _env = ENV_GUARD.lock().await;
+        let mut world = DoctorWorld::new("g16-newer");
+        let pool = migrated(&url_).await;
+        let migrations = |checks: Vec<memory_industry::doctor::Check>| {
+            checks
+                .into_iter()
+                .find(|c| c.name == "migrations")
+                .expect("doctor always reports `migrations`")
+        };
+
+        let known = migrations(world.run_checks(&pool, &url_).await);
+        assert_eq!(
+            known.status,
+            memory_industry::doctor::Status::Ok,
+            "a database this binary migrated, with nothing it does not know, is not a warning: {}",
+            known.detail
+        );
+
+        let mut owner = PgConnection::connect(&url_)
+            .await
+            .expect("the owner connection");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES ($1, $2, TRUE, $3, 0)",
+        )
+        .bind(NEWER_VERSION)
+        .bind("applied by a newer binary")
+        .bind(b"a migration this binary does not embed".to_vec())
+        .execute(&mut owner)
+        .await
+        .expect("recording a migration this binary does not embed, as a newer one would");
+        let ahead = migrations(world.run_checks(&pool, &url_).await);
+        owner.close().await.expect("closing the owner connection");
+        pool.close().await;
+
+        assert_eq!(
+            ahead.status,
+            memory_industry::doctor::Status::Warn,
+            "a base a newer binary already migrated is a warning, because this binary starts on it \
+             but does not know what that migration changed: {}",
+            ahead.detail
+        );
+        assert!(
+            ahead.detail.contains(&NEWER_VERSION.to_string()),
+            "the warning has to name the version this binary does not embed: {}",
+            ahead.detail
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn g16_doctor_reads_only_the_world_the_test_built() {
     in_a_scratch_database("brain_g_world", |url_| async move {
         const CANARY: &str = "MEMORY_INDUSTRY_T1_CANARY";
